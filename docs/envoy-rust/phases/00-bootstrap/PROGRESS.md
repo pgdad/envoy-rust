@@ -509,3 +509,29 @@ and bracketed ADR list `[ADR-0002, ADR-0003, ADR-0004, ADR-0005,
 ADR-0006, ADR-0007]` per BOOTSTRAP_PROMPT §5.3. Per §5.1, this session
 advances exactly one state (5 → 6-prep) and exits; the next session
 enters state 6 via the BOOTSTRAP_PROMPT §5.3 final-commit procedure.
+
+## State 6 — Final phase commit (2026-04-23)
+
+- **N1 closure (SPEC deviation note)** — SPEC.md §D3.2 lines 114–115
+  ("Any field not covered here … is ignored by envoy-rust in phase 00")
+  is **superseded** by the landed `deny_unknown_fields` behavior from
+  commit `fca3aba` ("phase 00: `deny_unknown_fields` on YAML schemas"):
+  envoy-rust's YAML loader now hard-rejects unknown fields on all 9
+  documented schema sites with a serde `"unknown field"` error rather
+  than ignoring them. Strictly safer (reject-on-typo), covered by four
+  TDD regression tests, and recommended by the state-5 prior REVIEW.md.
+  No dedicated ADR; this one-line deviation note closes re-review N1
+  per the state-6 routing in STATE.md.
+- **N2 deferred** — the 5-of-9 `deny_unknown_fields` regression-test
+  coverage gap (root `Bootstrap` + nested `Listener` covered; the 5
+  deeper structs `StaticResources`, `Address`, `SocketAddress`,
+  `FilterChain`, `NetworkFilter` carry the attribute but are not
+  individually regression-tested) is carried forward to a future
+  Minor-cleanup commit per the state-5 re-review recommendation.
+- Pre-existing Minors M1, M2, M4, M5, M6, M7, M8 remain open with
+  prior classification and carry forward into later phases.
+- Final commit lands per BOOTSTRAP_PROMPT §5.3 with bracketed ADR list
+  `[ADR-0002, ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0007]`.
+  ROADMAP.md phase-00 row flips `planned → done`; STATE.md advances to
+  phase 01 at lifecycle state 1 (row exists in ROADMAP with status
+  `planned`, phase directory not yet created).
