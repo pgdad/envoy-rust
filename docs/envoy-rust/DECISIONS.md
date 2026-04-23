@@ -52,3 +52,20 @@ Each ADR uses the structure:
 - Consequences:
   - The single CI job lives at `.github/workflows/ci.yml`, running on `ubuntu-latest`. macOS and Windows runners are explicitly out of scope (Envoy's production posture is Linux; see SPEC §4).
   - A future "CI scale-out" phase (adding matrix runs, release workflows, etc.) lands as its own phase with its own ADR. The only artifact this ADR commits to is a single linting/build/test job.
+
+---
+
+## ADR-0003: Rust edition 2024 for all workspace crates
+
+- Date: 2026-04-23
+- Status: accepted
+- Context: Every crate introduced starting in phase 00 declares an `edition = "…"` in its `Cargo.toml`. We must commit to a single edition at bootstrap to avoid a mass edition-bump phase later, which would touch every crate root's macro behavior, Pin/disjoint-borrow rules, and `expect`/`assume` forward-compatibility semantics.
+- Options considered:
+  - **Edition 2024** — stabilized in rustc 1.85. Our toolchain pin is 1.95.0 (D-3.9), well past the stabilization point. Tightens closure capture rules, `async fn` in traits, Pin semantics.
+  - **Edition 2021** — the still-most-popular edition; safe and boring.
+  - **Edition 2018** — legacy; picks up none of the last six years of ergonomics work.
+- Decision: Edition 2024 for every workspace crate.
+- Rationale: since the toolchain pin (1.95.0) strictly dominates the 2024 stabilization threshold (1.85), there is no compatibility cost. Future edition bumps become the next-edition problem, not the "we-already-skipped-three-editions" problem.
+- Consequences:
+  - Every new `Cargo.toml` this phase and later specifies `edition = "2024"`. The phase-00 workspace includes this in both `crates/envoy-bin/Cargo.toml` and `tests/differential/Cargo.toml`.
+  - A future toolchain-bump phase (per D-3.9) must verify edition-2024 behavior on the new toolchain before landing.
