@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 mod config;
+mod echo;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArgvError {
