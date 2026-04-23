@@ -60,3 +60,8 @@
 - Commit: 143bbf4
 - Change: `tests/differential/src/subject.rs` with `Subject` (port + optional Child; Drop aborts), async `shutdown(budget)`, `locate_envoy_bin` (honoring `CARGO_TARGET_DIR`, picking debug vs release by `cfg!(debug_assertions)`), `start(path, port)` (kill_on_drop, stdio inherited, `ENVOY_RUST_LOG=info`) + 2 tokio tests.
 - Verification: `cargo test --workspace subject::tests` → 2 passed; clippy + fmt --check → 0; cargo deny check → all ok.
+
+## Task 12 — fixture 0001-tcp-echo (2026-04-23)
+- Commit: a03857a
+- Change: `tests/fixtures/0001-tcp-echo/{envoy.yaml, envoy-rust.yaml, inputs/payload.bin, expectations.yaml, README.md}` — first differential fixture.
+- Verification: payload.bin = 18 bytes; envoy-rust.yaml + expectations.yaml both parse with basic YAML structure validation (grep key-value pairs).
