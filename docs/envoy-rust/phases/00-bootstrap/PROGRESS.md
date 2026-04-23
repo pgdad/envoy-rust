@@ -49,3 +49,9 @@
 - Commit: 6c909c0
 - Change: `tests/differential/src/lib.rs` with `Expectations`/`Equivalence`/`BodyRule`, `load_expectations`, `reserve_port` (TOCTOU-accepted), `render_yaml`, `write_temp`, `wait_accept_ready` (50ms→500ms exp. backoff) + 6 tests. Placeholders `subject.rs` and `upstream.rs` (filled in Tasks 11 and 10).
 - Verification: `cargo test -p differential --lib` → 6 passed; clippy + fmt --check → 0.
+
+## Task 10 — differential upstream launcher (2026-04-23)
+- Commit: df8a0d1
+- Change: `tests/differential/src/upstream.rs` with `IMAGE_NAME`/`IMAGE_TAG`/`CONTAINER_PORT` constants (matching ADR-0004), `UpstreamProxy` drop-to-stop guard, `start()` that bind-mounts the fixture's `envoy.yaml` and waits on the "starting main dispatch loop" stderr message + 500ms grace. One `#[ignore]`d tokio integration test. Added `tempfile = "3"` to dev-dependencies.
+- Verification: `cargo test -p differential --lib` → 0 failed, 1 ignored (the container-launching test); clippy + fmt --check → 0; `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (ADR-0005 exemptions hold).
+- Note: local Docker daemon has an IPv6 routing bug; the `#[ignore]`d test was NOT run locally and will be validated by CI per the phase-done gate.
