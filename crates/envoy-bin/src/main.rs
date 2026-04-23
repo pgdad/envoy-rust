@@ -171,6 +171,6 @@ mod argv_tests {
     #[test]
     fn rejects_duplicate_config_flag() {
         let err = parse_argv(argv(&["-c", "/a", "-c", "/b"])).unwrap_err();
-        matches!(err, ArgvError::Trailing(_));
+        assert!(matches!(err, ArgvError::Trailing(_)), "got {err:?}");
     }
 }
