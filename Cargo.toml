@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/envoy-bin",
+    "tests/differential",
+]
 
-# Workspace members are added as phases introduce crates under `crates/` and
-# `tests/`. Phase 00 seeds the workspace shell only; no crates exist yet.
+# Workspace members grow as later phases introduce crates. Phase 00 lands the
+# binary (`crates/envoy-bin`) and the differential harness (`tests/differential`).

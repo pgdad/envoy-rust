@@ -10,7 +10,22 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# Ignored advisories. Each entry must be narrowly justified; see ADR-0005 for
+# the discipline. Unscoped ignores are never allowed.
+ignore = [
+    # RUSTSEC-2025-0111 — tokio-tar 0.3.1 PAX extended header parsing allows
+    # file smuggling (CVE-2025-62518). Path: differential → testcontainers
+    # 0.23.3 → tokio-tar 0.3.1. Upstream tokio-tar is archived; "no safe
+    # upgrade is available"; the testcontainers project tracks a migration to
+    # `astral-tokio-tar`. Dev-only test harness; no production exposure.
+    # See ADR-0005.
+    { id = "RUSTSEC-2025-0111", reason = "dev-only testcontainers chain; no safe upgrade; tracked via ADR-0005" },
+    # RUSTSEC-2025-0134 — rustls-pemfile unmaintained. Path: differential →
+    # testcontainers → bollard → rustls-pemfile. Dev-only; upstream recommends
+    # migrating to rustls-pki-types' PemObject trait, tracked at testcontainers
+    # upstream. See ADR-0005.
+    { id = "RUSTSEC-2025-0134", reason = "dev-only testcontainers chain; no safe upgrade; tracked via ADR-0005" },
+]
 
 [licenses]
 version = 2
@@ -39,12 +54,18 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Doctrine D-3.2 forbidden-dependency list. These are hard-denied at the
 # workspace root; pulling them in as a direct dependency fails cargo-deny.
-# (Transitive pulls through permitted foundations — notably `hyper` and
-# `tower` via `tonic` — are allowed and must be enforced instead via
-# workspace-level import bans inside individual crates.)
+# Transitive pulls through permitted foundations are allowed via the
+# `wrappers` field on each entry — cargo-deny fires the ban only when the
+# crate's direct parent is NOT in the wrapper list. See ADR-0005 for why
+# `wrappers` is used here instead of `skip-tree` (skip-tree only affects
+# the multiple-versions check, not the denylist).
 deny = [
-    { name = "hyper" },
-    { name = "hyper-util" },
+    # hyper/hyper-util/tower-service leak in via bollard (a testcontainers
+    # transitive). The wrapper list enumerates every direct parent in that
+    # chain; non-wrapper parents still fire the ban. When later phases add
+    # `tonic`, extend the wrapper lists and land a new ADR.
+    { name = "hyper", wrappers = ["bollard", "hyper-named-pipe", "hyper-rustls", "hyper-util", "hyperlocal"] },
+    { name = "hyper-util", wrappers = ["bollard", "hyper-named-pipe", "hyper-rustls", "hyperlocal"] },
     { name = "axum" },
     { name = "actix-web" },
     { name = "warp" },
@@ -53,15 +74,16 @@ deny = [
     { name = "pingora" },
     { name = "sozu" },
     { name = "tower" },
-    { name = "tower-service" },
+    { name = "tower-service", wrappers = ["bollard", "hyper-named-pipe", "hyper-rustls", "hyper-util", "hyperlocal"] },
     { name = "tower-http" },
 ]
-# Exemptions for transitive dependencies of permitted foundations. When phase 00
-# or a later phase lands dependencies that legitimately pull these in
-# transitively (e.g. tonic → hyper/tower), add `skip` entries here and an ADR
-# documenting the transitive path.
+# `skip` / `skip-tree` govern the `multiple-versions` check ONLY; they do NOT
+# exempt banned crates (see ADR-0005). The testcontainers entry below keeps
+# multi-version noise out of the warning stream for that subtree.
 skip = []
-skip-tree = []
+skip-tree = [
+    { name = "testcontainers" },
+]
 
 [sources]
 unknown-registry = "deny"
