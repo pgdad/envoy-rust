@@ -225,3 +225,81 @@ envoy-rust/
 8. **Every workspace crate's root file** (`lib.rs` or `main.rs`) begins with `#![forbid(unsafe_code)]` unless an ADR grants an exemption. See D-3.8.
 
 ---
+
+## 5. Phase Lifecycle State Machine
+
+This state machine is the brain of the project. A session's entire job, after cold-start, is to match its state against this machine and invoke exactly the skill indicated.
+
+```
+0. Phase not yet in ROADMAP.md
+   → superpowers:brainstorming (adds/refines row in ROADMAP)
+
+1. Phase in ROADMAP, directory does not exist
+   → create docs/envoy-rust/phases/NN-slug/
+   → superpowers:brainstorming (scoped to THIS phase)
+   → output: SPEC.md
+
+2. SPEC.md exists, PLAN.md does not
+   → superpowers:writing-plans
+   → output: PLAN.md
+   → GATE: if PLAN.md > ~25 tasks OR > ~1500 LoC estimated
+           → split into NN.1, NN.2, …; update ROADMAP + STATE; stop
+
+3. PLAN.md exists, implementation incomplete
+   → superpowers:executing-plans (or subagent-driven-development for independent tasks)
+   → TDD per superpowers:test-driven-development on every task
+   → append to PROGRESS.md on each task completion
+
+4. Implementation complete, not verified
+   → superpowers:verification-before-completion
+   → run: cargo build --workspace --all-targets,
+          cargo clippy --workspace --all-targets --all-features -- -D warnings,
+          cargo fmt --all -- --check,
+          cargo test --workspace,
+          cargo deny check,
+          differential suite for phase's feature surface, conformance suites
+   → quote all command outputs into PROGRESS.md
+
+5. Verified, not reviewed
+   → superpowers:requesting-code-review
+   → output: REVIEW.md
+   → if issues → back to step 3 (NOT 4) until REVIEW.md approved
+
+6. Reviewed and approved
+   → commit (message format: "phase NN: <title> [ADR-xxxx,...]")
+   → ROADMAP.md status → done
+   → STATE.md advanced to next phase or "awaiting next planning"
+   → phase ends; session may exit
+
+Deviations:
+  * Ambiguity           → ADR + proceed
+  * Blocked by upstream → ROADMAP status=blocked, STATE note, exit clean
+  * Unexpected state    → superpowers:systematic-debugging FIRST
+```
+
+### 5.1 How to read this state machine
+
+- Each numbered state has an unambiguous detection rule from the contents of the active phase directory (presence/absence of `SPEC.md`, `PLAN.md`, `PROGRESS.md`, `REVIEW.md` — and for `REVIEW.md`, its approval status).
+- You move exactly one state forward per session. Do not chain through multiple states in a single session; the value of context isolation is that each transition starts fresh. (The sole exception is §10's first-session bootstrap, which traverses states 0 and 1 in one session because it creates the scaffolding preconditions for the state machine; this exception is unavailable to any subsequent session.)
+- If state detection is ambiguous (e.g., file exists but is empty, or contains conflicting signals), invoke `superpowers:systematic-debugging` before advancing.
+
+### 5.2 Review feedback re-entry point
+
+If step 5 produces `REVIEW.md` with issues, you re-enter at **step 3**, not step 4. You are resuming implementation (and TDD), not just re-verifying. This is a subtle but important asymmetry.
+
+### 5.3 Commit message format
+
+Final phase commits (step 6) use this format:
+
+```
+phase NN: <title> [ADR-NNNN, ADR-MMMM, ...]
+
+<summary — 1–3 sentences>
+
+Differential surface: <what new/existing fixtures are now green>
+Conformance: <what conformance suites were run and their pass rate>
+```
+
+If no ADRs were added or referenced during the phase, the bracketed list is omitted.
+
+---
