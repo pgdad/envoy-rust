@@ -10,17 +10,19 @@
 **id:** `00`
 **slug:** `00-bootstrap`
 **directory:** `docs/envoy-rust/phases/00-bootstrap/`
-**status:** `in-progress` (lifecycle state 2 — SPEC.md exists, PLAN.md pending)
+**status:** `in-progress` (lifecycle state 3 — PLAN.md landed, implementation pending)
 
 ## Next expected skill
 
-`superpowers:writing-plans` — scoped to phase 00. Consumes `docs/envoy-rust/phases/00-bootstrap/SPEC.md` and produces `docs/envoy-rust/phases/00-bootstrap/PLAN.md`.
+`superpowers:subagent-driven-development` — scoped to phase 00. Consumes `docs/envoy-rust/phases/00-bootstrap/PLAN.md` and produces the code + artifacts the plan specifies, with one fresh subagent per task and review between tasks.
 
-`PLAN.md` must be evaluated against the splitting thresholds in §6 of `BOOTSTRAP_PROMPT.md` (~25 tasks or ~1500 LoC). If either threshold is crossed, follow the split guidance in §5 of the SPEC (00.1 scaffolding / 00.2 echo fixture + harness) rather than inventing a new split.
+The plan was evaluated against the §6 splitting thresholds (~25 tasks, ~1500 LoC) at the end of state 2 and found to be under both (15 tasks, ~700 LoC of code + ~200 LoC of config/YAML/CI). **No split.** If mid-execution any single task's sub-step count blows past ~10, revisit per §6 mid-execution trigger.
+
+Each task ends with its own commit per the plan. The phase-done gate (§7.5) is evaluated in state 4, not here. PROGRESS.md is appended to after every task (executor creates it on task 1).
 
 ## Last commit
 
-`phase 00: spec brainstormed` (this commit — landed SPEC.md and flipped STATE to state 2).
+`phase 00: plan drafted` — this commit lands `docs/envoy-rust/phases/00-bootstrap/PLAN.md` and flips STATE to lifecycle state 3.
 
 ## Last updated
 
@@ -28,6 +30,8 @@
 
 ## Notes
 
-- The `docs/envoy-rust/` scaffold was committed by `bootstrap: envoy-rust project scaffold` on 2026-04-23; SPEC.md was landed in the follow-up commit named above.
+- SPEC.md landed in `phase 00: spec brainstormed` (2026-04-23). PLAN.md landed in `phase 00: plan drafted` (2026-04-23).
+- Per `BOOTSTRAP_PROMPT.md` §5.1, sessions move exactly one state forward. This session advanced state 2 → state 3 and now exits; the next session picks up at state 3 and begins execution.
+- The plan's final commit (state 6) carries the full phase title and ADR list per §5.3: `phase 00: Bootstrap [ADR-0002, ADR-0003, ADR-0004]`. Individual task commits use `phase 00: <task>` for traceability.
 - Consult `docs/envoy-rust/SKILL_ROUTING.md` for the full phase lifecycle state machine.
 - Any deviation from the state machine requires `superpowers:systematic-debugging` before proceeding — see §1 Step E of `BOOTSTRAP_PROMPT.md`.
