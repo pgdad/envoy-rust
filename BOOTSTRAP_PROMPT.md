@@ -391,3 +391,43 @@ Every phase that introduces a parser, codec, or filter ships a `cargo fuzz` targ
 These six gates are what `superpowers:verification-before-completion` verifies. They are the complete definition of "done."
 
 ---
+
+## 8. Seeded MVP Trunk — phases 00 through 08
+
+Phase 00 copies these rows verbatim into `docs/envoy-rust/ROADMAP.md`. Subsequent phases brainstorm their own `SPEC.md` when entered, but the titles, IDs, and ordering below are fixed.
+
+| # | Title | Differential surface at phase end |
+|---|---|---|
+| 00 | Bootstrap: Cargo workspace layout, `rust-toolchain.toml`, `deny.toml`, CI, Docker reference Envoy, differential harness skeleton, `ENVOY_TARGET.md` pin, trivial echo fixture | harness boots; one TCP echo fixture green |
+| 01 | Static bootstrap config loader (node, admin, static_resources skeleton) | config parses; admin `/ready` behaves like Envoy |
+| 02 | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext) | TCP proxy fixture green |
+| 03 | Downstream TLS termination + upstream TLS origination + SNI | TLS TCP fixture green |
+| 04 | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response | HTTP/1.1 routing fixture green |
+| 05 | HTTP/2 downstream + upstream (low-level framer, own conn mgr) | HTTP/2 fixture green; `h2spec` above threshold |
+| 06 | Access log (file sink, Envoy default format) + stats + Prometheus admin endpoint | access log + Prometheus fixtures green |
+| 07 | Filter chain framework: iteration protocol, per-route config, extension registry | framework fixtures green; trivial pluggable filter covers all iteration states |
+| 08 | Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain | admin + drain fixtures green |
+
+**Invariant:** Phases 00–08 ship *in order*. Each depends on the previous one having landed green, because each adds a primitive the next relies on. Splitting (§6) is still permitted within any of these phases.
+
+After phase 08 lands, envoy-rust is a minimal but real proxy. At that point you transition to feature-family expansion (§9).
+
+---
+
+## 9. Feature Families — phases 09 and onward (headings only)
+
+Phase 00 seeds these as headings in `docs/envoy-rust/ROADMAP.md`. Do **not** expand them into per-phase rows now. Each family is brainstormed as its own phase when it enters `in-progress`, and split (§6) as reality demands.
+
+- HTTP filters family (header manipulation, cors, compression, fault, local+global rate limit, jwt_authn, rbac, ext_authz, ext_proc, oauth2, csrf, buffer, lua, wasm, adaptive concurrency, admission control, bandwidth limit).
+- Network filters family (redis, mongo, kafka_broker, thrift, zookeeper [scope TBD], echo, direct_response, sni_cluster, rbac network).
+- Load balancing family (least_request, random, ring_hash, maglev, subset LB, locality-weighted LB, priority load balancing, panic thresholds).
+- Upstream robustness family (active health checks HTTP/TCP/gRPC/custom, outlier detection variants, circuit breakers, retries + hedging, per-protocol connection pooling).
+- HTTP/3 + QUIC family (quinn transport, downstream H3 listener, upstream H3 cluster, `h3spec` gate).
+- gRPC family (gRPC bridge, gRPC-Web, gRPC-JSON transcoding, interop conformance).
+- xDS / dynamic config family (ADS, delta xDS, LDS, CDS, RDS, EDS, SDS, RTDS, reconnection, initial-fetch timeout).
+- Observability family (gRPC ALS, OTLP access log, OTel/Zipkin/Jaeger/Datadog/XRay tracing, stats sinks, tap filter).
+- Runtime + hot restart family.
+- WASM host family (own multi-phase sub-project; ABI, engine binding, proxy-wasm conformance).
+- Deprecated / edge features (explicit out-of-scope ADRs unless later re-opened).
+
+---
