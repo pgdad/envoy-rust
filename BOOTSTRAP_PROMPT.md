@@ -168,3 +168,60 @@ Every workspace crate's root file (`lib.rs` or `main.rs`) must begin with `#![fo
 `rust-toolchain.toml` at the repo root pins the compiler channel and version. All phases build against the pinned toolchain. Upgrading the pin is its own phase, with its own ADR and its own differential re-baselining — you must not bump the toolchain ad-hoc. This parallels D-3.7's `ENVOY_TARGET.md` discipline for upstream Envoy.
 
 ---
+
+## 4. On-Disk Artifact Layout
+
+This is the only layout the project uses. Phase 00 creates it. Every subsequent phase adheres to it.
+
+```
+envoy-rust/
+├── README.md                        # short: what this is, how to resume a session
+├── Cargo.toml                       # workspace root (members list grows per phase)
+├── Cargo.lock
+├── rust-toolchain.toml              # pinned compiler (D-3.9)
+├── deny.toml                        # cargo-deny policy (license + advisory enforcement)
+├── crates/
+│   ├── envoy-bin/                   # the binary (src/main.rs)
+│   ├── envoy-protos/                # generated from upstream envoy .proto via prost-build + tonic-build
+│   ├── envoy-listener/
+│   ├── envoy-cluster/
+│   ├── envoy-filter/                # filter-chain engine (written from scratch)
+│   ├── envoy-http/   envoy-tcp/   envoy-tls/
+│   ├── envoy-xds/    envoy-admin/   envoy-stats/   envoy-accesslog/   envoy-runtime/   …
+├── tests/
+│   ├── differential/                # real-Envoy-vs-envoy-rust harness (testcontainers)
+│   ├── conformance/                 # h2spec, h3spec, grpc-conformance drivers
+│   ├── fixtures/                    # paired configs (envoy.yaml ↔ envoy-rust.yaml)
+│   └── helpers/
+└── docs/envoy-rust/
+    ├── MISSION.md                   # copy of the prompt's mission + doctrine (stable)
+    ├── ROADMAP.md                   # phase list with status column; append-only history
+    ├── STATE.md                     # pointer: active phase, last commit, next action
+    ├── DECISIONS.md                 # ADR log (numbered, append-only)
+    ├── ENVOY_TARGET.md              # pinned upstream version + how to refresh the image
+    ├── BEHAVIOR_CONTRACT.md         # what "behaviorally equivalent" means, per layer
+    ├── SKILL_ROUTING.md             # which superpowers skill runs at which phase boundary
+    └── phases/
+        ├── 00-bootstrap/
+        │   ├── SPEC.md              # brainstorming output
+        │   ├── PLAN.md              # writing-plans output
+        │   ├── PROGRESS.md          # running log, updated by executor
+        │   └── REVIEW.md            # requesting-code-review output
+        ├── 01-static-bootstrap-config/
+        ├── 02-tcp-proxy/
+        ├── …
+        └── 99-archive/              # completed phases' artifacts can be moved here if docs/ grows
+```
+
+### 4.1 Invariants
+
+1. **`STATE.md` is the single source of truth for "what next."** Cold-start reads it first. It names the active phase directory and the next expected skill invocation.
+2. **`ROADMAP.md` schema:** columns `id | title | depends-on | status | sub-phases | summary`. Status ∈ `planned | in-progress | blocked | done`. Append-only history; never delete rows, only update status and sub-phases columns.
+3. **Phase directory lifecycle:** a phase directory is created *only* when the phase enters `in-progress`. Creating `docs/envoy-rust/phases/NN-slug/` and its empty `SPEC.md` is the first concrete file-system act of starting a phase.
+4. **`DECISIONS.md` is ADR-numbered, append-only.** Entries are `ADR-0001`, `ADR-0002`, etc. Landed ADRs are never edited; they are superseded by later ADRs that explicitly name the superseded number.
+5. **`BEHAVIOR_CONTRACT.md` is the canonical reference** for differential equivalence rules (see §7). If a phase's observed behavior diverges from the contract, either the contract is updated (via ADR) or the implementation is fixed — never both silently.
+6. **`SKILL_ROUTING.md` is a verbatim copy** of the state machine in §5 of this prompt. It exists so an executing session does not need to re-parse the whole prompt to route its next action.
+7. **`phases/99-archive/`** is used only if `docs/envoy-rust/` grows large enough to hurt navigation. Completed phases may be moved there, wholesale, with an ADR documenting the move. Do not move phases there opportunistically.
+8. **Every workspace crate's root file** (`lib.rs` or `main.rs`) begins with `#![forbid(unsafe_code)]` unless an ADR grants an exemption. See D-3.8.
+
+---
