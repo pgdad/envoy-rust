@@ -289,3 +289,130 @@ State 5 complete. Next session loops back to state 3 via
 `superpowers:subagent-driven-development` to fix I1, I2, I3 (rustdoc
 portion), optionally M3, then re-enters state 4 (CI re-verify) and
 state 5 (re-review) for a final pass.
+
+## State 3 (loop-back) — REVIEW fixes (2026-04-23)
+
+Loop-back session per `SKILL_ROUTING.md` line 42 ("if issues → back to
+step 3 (NOT 4) until REVIEW.md approved"). Ran
+`superpowers:subagent-driven-development` scoped to the three Important
+items from REVIEW.md (plus M3 folded in per REVIEW's recommendation).
+Four commits, each with its own spec-compliance and code-quality review
+pass before moving to the next task.
+
+### I1 — `drive_tcp` trailing-byte check [ADR-0007] — commit `245a65f`
+
+- `tests/differential/src/lib.rs`: `drive_tcp` now polls the socket with
+  a 100ms deadline after `read_exact(payload.len())` and bails on any
+  trailing bytes. New regression test
+  `drive_tcp_rejects_trailing_bytes_after_echo` — a fake server that
+  echoes N bytes then writes `b"EXTRA"` now forces `drive_tcp` to return
+  `Err(...trailing bytes...)`, whereas pre-fix it would have returned
+  `Ok(echoed)` silently (verified under TDD).
+- `docs/envoy-rust/DECISIONS.md`: **ADR-0007** appended; ADR-0006 text
+  untouched (append-only doctrine, DECISIONS.md preamble line 7).
+  ADR-0007 enumerates the three REVIEW.md options (a/b/c), selects
+  option (a), names its per-connection ~100ms idle cost as acceptable
+  for phase 00, and cross-references ADR-0006 as the source of the
+  blind spot. Phase-00 final-commit bracketed ADR list extends to
+  `[ADR-0002, ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0007]`.
+- Reviews: spec ✅ (literal match of REVIEW.md option (a) shape), code
+  quality ✅ with 3 Minor nits (inline `100ms` magic number; 64-byte
+  tail buffer sizing; rustdoc cross-reference style) — all
+  future-proofing, none block.
+
+### I2 — `assert!` wrap on `rejects_duplicate_config_flag` — commit `ba17ee3`
+
+- `crates/envoy-bin/src/main.rs:174`:
+  `matches!(err, ArgvError::Trailing(_));` (discarded expression
+  statement) → `assert!(matches!(err, ArgvError::Trailing(_)), "got {err:?}");`.
+  Path-tightening (`Trailing(p) if p == "/b"`) deliberately skipped per
+  REVIEW.md "optional" labeling and YAGNI; rationale recorded in commit
+  body.
+- Reviews: spec ✅, code quality ✅ with 2 Minor observations (asymmetry
+  with sibling `assert_eq!`-style argv tests — non-blocking).
+
+### I3 — `Subject` rustdoc — SIGKILL, not SIGTERM — commit `18bbfde`
+
+- `tests/differential/src/subject.rs:8-9`: struct-level doc corrected
+  from "sends SIGTERM" to "sends SIGKILL (via tokio's `start_kill`) and
+  waits for the process to exit". Method-level rustdoc (lines 20-23)
+  and `Drop` impl comment were already accurate.
+- `tests/differential/src/subject.rs:24-32`: `TODO(phase-01)` block
+  added immediately above `Subject::shutdown` naming the planned
+  SIGTERM+drain+escalate switch, the `nix`-crate blocker (not on D-3.2
+  permitted-foundations list), and the phase-01 ADR gating.
+- **No behavior change.** `child.start_kill()` unchanged. No new deps.
+  Functional switch deferred to phase 01 per REVIEW.md recommendation.
+- Reviews: spec ✅, code quality ✅ (0 Critical/Important; Minor items
+  only stylistic).
+
+### M3 — `deny_unknown_fields` on YAML schemas — commit `fca3aba`
+
+- `#[serde(deny_unknown_fields)]` added to 9 YAML-parsed structs:
+  - 7 in `crates/envoy-bin/src/config.rs`: `Bootstrap`,
+    `StaticResources`, `Listener`, `Address`, `SocketAddress`,
+    `FilterChain`, `NetworkFilter`.
+  - 2 in `tests/differential/src/lib.rs`: `Expectations`, `Equivalence`.
+  - `BodyRule` correctly skipped (unit-variant enum; unknown
+    discriminants already covered by `expectations_reject_unknown_rule`).
+- Four new regression tests covering both root- and nested-level
+  unknown-field rejection (`expectations_reject_unknown_field`,
+  `equivalence_reject_unknown_field`, `rejects_unknown_bootstrap_field`,
+  `rejects_unknown_listener_field`); each asserts the stable
+  serde-canonical `"unknown field"` marker. TDD-verified failing against
+  pre-fix code.
+- Reviews: spec ✅, code quality ✅ with 1 Minor coverage gap (see
+  "Deferred follow-ups" below).
+
+### Minor items deliberately deferred
+
+- **REVIEW.md M1, M2, M4, M5, M6, M7, M8** — all REVIEW-classified
+  "nice to have; can defer"; none block phase completion. They remain
+  open items for future phases.
+- **Code-quality N1 on the M3 commit.** The four new regression tests
+  cover unknown-field rejection at 4 of the 9 attribute sites
+  (`Bootstrap`, `Listener`, `Expectations`, `Equivalence`). The 5 deeper
+  structs (`StaticResources`, `Address`, `SocketAddress`, `FilterChain`,
+  `NetworkFilter`) carry the attribute but are not individually
+  regression-tested. Reviewer demonstrated empirically that a future
+  removal of the attribute on any of those 5 would not be caught by the
+  current test matrix. Classified Minor ("judgment call") and recorded
+  here so it is not forgotten; a small follow-up commit or future
+  M-series cleanup pass can close the gap.
+- **I3 functional SIGKILL → SIGTERM+drain+escalate** — deferred to
+  phase 01 under its own ADR per REVIEW.md recommendation (D-3.2
+  blocker on the `nix` crate).
+
+### Verification gate (local, dev host)
+
+- `cargo build --workspace --all-targets` → exit `0`.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit `0`.
+- `cargo fmt --all -- --check` → exit `0`.
+- `cargo test --workspace` → exit `0`:
+  - `differential` lib: `test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out`
+    (the ignored is the docker-gated
+    `upstream::tests::starts_upstream_envoy_and_exposes_host_port`;
+    3 new tests from I1 and M3 all pass).
+  - `differential` integration `tests/echo.rs::echo_fixture`:
+    `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+    (Docker was available locally this run; CI on `ubuntu-latest`
+    remains the primary validator per the Task 3 Docker caveat).
+  - `envoy-bin` bin-unit: `test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+    (2 new M3 config tests; the newly-tight
+    `rejects_duplicate_config_flag` still passes).
+  - Doc-tests: `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`
+  (same informational unmatched-license/duplicate warnings as prior
+  passes; all permitted).
+
+### Outcome
+
+All three REVIEW.md Important items (I1, I2, I3 rustdoc) and the
+folded-in M3 are fixed across 4 atomic commits
+(`245a65f`, `ba17ee3`, `18bbfde`, `fca3aba`) and verified locally. State
+3 loop-back complete. Next session re-enters state 4
+(`superpowers:verification-before-completion`) to re-run the five
+phase-done gate commands on CI (`ubuntu-latest`) for HEAD `fca3aba`,
+quote outputs into a new "State 4 — Re-verification" section, then
+state 5 (`superpowers:requesting-code-review` re-pass) for the Approved
+verdict the REVIEW.md final recommendation anticipates.
