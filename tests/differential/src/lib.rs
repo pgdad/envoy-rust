@@ -93,8 +93,9 @@ pub async fn wait_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> 
 }
 
 /// Drive `payload` at `addr`: open TCP, write payload, read exactly
-/// `payload.len()` bytes of echoed response, then shut down the write side
-/// and drop the stream. Returns the echoed bytes.
+/// `payload.len()` bytes of echoed response, then confirm the peer writes
+/// no further bytes before shutting down the write side and dropping the
+/// stream. Returns the echoed bytes.
 ///
 /// Why `read_exact(payload.len())` instead of half-close + `read_to_end`: see
 /// `docs/envoy-rust/DECISIONS.md` ADR-0006. Upstream Envoy v1.33.0's default
@@ -106,6 +107,14 @@ pub async fn wait_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> 
 /// both sufficient and matches upstream Envoy's own echo integration test
 /// pattern. Graceful write-side shutdown still fires after the read so the
 /// envoy-rust subject's echo loop exits on FIN rather than a peer reset.
+///
+/// Why the trailing-byte poll: see ADR-0007. A bare `read_exact(payload.len())`
+/// silently ignores any bytes the peer writes after the echo, which would
+/// narrow BEHAVIOR_CONTRACT row 2's "byte-exact" assertion to "first N bytes
+/// match." After `read_exact`, we poll the socket with a short deadline
+/// (100ms) and bail if the peer delivers more data before EOF or the
+/// deadline — a peer that follows the echo-filter contract closes its
+/// write side cleanly and we observe `Ok(0)` or a timeout.
 pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -113,6 +122,17 @@ pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
     stream.write_all(payload).await?;
     let mut out = vec![0u8; payload.len()];
     stream.read_exact(&mut out).await?;
+
+    // ADR-0007: detect trailing bytes past the echoed payload. A compliant
+    // peer either closes (Ok(0)) or stays silent until the deadline (timeout
+    // Err). Any non-zero read is a contract violation.
+    let mut tail = [0u8; 64];
+    match tokio::time::timeout(Duration::from_millis(100), stream.read(&mut tail)).await {
+        Ok(Ok(0)) | Err(_) => {}
+        Ok(Ok(n)) => bail!("{addr} sent {n} trailing bytes after echo"),
+        Ok(Err(e)) => bail!("{addr} read error after echo: {e}"),
+    }
+
     stream.shutdown().await.ok();
     drop(stream);
     Ok(out)
@@ -257,6 +277,44 @@ mod tests {
 
         let echoed = drive_tcp(addr, payload).await.unwrap();
         assert_eq!(echoed, payload);
+        server.await.unwrap();
+    }
+
+    // Regression for REVIEW.md I1 (ADR-0007): a server that writes
+    // `payload.len()` bytes and then additional trailing bytes must cause
+    // `drive_tcp` to fail the fixture. Before ADR-0007's trailing-byte check,
+    // `drive_tcp` silently consumed only the first `payload.len()` bytes and
+    // returned Ok, narrowing BEHAVIOR_CONTRACT row 2's "byte-exact" contract
+    // to "first N bytes match."
+    #[tokio::test]
+    async fn drive_tcp_rejects_trailing_bytes_after_echo() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload: &'static [u8] = b"hello, envoy-rust\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; payload.len()];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+            // Write extra trailing bytes beyond the echoed payload. A pre-
+            // ADR-0007 `drive_tcp` would not notice these.
+            stream.write_all(b"EXTRA").await.unwrap();
+            // Hold the stream open long enough that the harness's trailing-
+            // byte poll deadline sees the bytes rather than an early EOF.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(stream);
+        });
+
+        let err = drive_tcp(addr, payload)
+            .await
+            .expect_err("drive_tcp must fail when the peer writes trailing bytes");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("trailing bytes"),
+            "unexpected error message: {msg}",
+        );
         server.await.unwrap();
     }
 }
