@@ -10,17 +10,17 @@
 **id:** `00`
 **slug:** `00-bootstrap`
 **directory:** `docs/envoy-rust/phases/00-bootstrap/`
-**status:** `in-progress` (lifecycle state 1 — phase directory being created, SPEC.md pending)
+**status:** `in-progress` (lifecycle state 2 — SPEC.md exists, PLAN.md pending)
 
 ## Next expected skill
 
-`superpowers:brainstorming` — scoped to phase 00. Produces `docs/envoy-rust/phases/00-bootstrap/SPEC.md`.
+`superpowers:writing-plans` — scoped to phase 00. Consumes `docs/envoy-rust/phases/00-bootstrap/SPEC.md` and produces `docs/envoy-rust/phases/00-bootstrap/PLAN.md`.
 
-After SPEC.md lands the next session enters lifecycle state 2, whose next expected skill is `superpowers:writing-plans`.
+`PLAN.md` must be evaluated against the splitting thresholds in §6 of `BOOTSTRAP_PROMPT.md` (~25 tasks or ~1500 LoC). If either threshold is crossed, follow the split guidance in §5 of the SPEC (00.1 scaffolding / 00.2 echo fixture + harness) rather than inventing a new split.
 
 ## Last commit
 
-`bootstrap: envoy-rust project scaffold` (scaffolds this file).
+`phase 00: spec brainstormed` (this commit — landed SPEC.md and flipped STATE to state 2).
 
 ## Last updated
 
@@ -28,6 +28,6 @@ After SPEC.md lands the next session enters lifecycle state 2, whose next expect
 
 ## Notes
 
-- This is the very first session after repo bootstrap; `docs/envoy-rust/` was empty before this commit.
+- The `docs/envoy-rust/` scaffold was committed by `bootstrap: envoy-rust project scaffold` on 2026-04-23; SPEC.md was landed in the follow-up commit named above.
 - Consult `docs/envoy-rust/SKILL_ROUTING.md` for the full phase lifecycle state machine.
 - Any deviation from the state machine requires `superpowers:systematic-debugging` before proceeding — see §1 Step E of `BOOTSTRAP_PROMPT.md`.
