@@ -1,11 +1,10 @@
 #![forbid(unsafe_code)]
-// Intermediate-task hygiene: items defined here (ArgvError, parse_argv, the
-// `config` module's types) are exercised by unit tests but not by `main()`
-// until Task 8 wires them in. Silencing crate-wide is narrower in scope than a
-// bunch of per-item `#[allow]`s and is removed in Task 8.
-#![allow(dead_code)]
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use tokio::net::TcpListener;
 
 mod config;
 mod echo;
@@ -43,7 +42,6 @@ where
     S: Into<String>,
 {
     let mut iter = args.into_iter().map(Into::into);
-    // Drop argv[0] (program name).
     let _ = iter.next();
     let mut path: Option<PathBuf> = None;
     while let Some(arg) = iter.next() {
@@ -61,8 +59,69 @@ where
     path.ok_or(ArgvError::NoConfigFlag)
 }
 
-fn main() {
-    // Replaced by Task 8 with the real wiring.
+fn main() -> std::process::ExitCode {
+    match parse_argv(std::env::args()) {
+        Ok(path) => {
+            install_tracing();
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime")
+            {
+                Ok(rt) => match rt.block_on(run(path)) {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(err) => {
+                        tracing::error!(error = ?err, "envoy-rust exited with error");
+                        std::process::ExitCode::from(1)
+                    }
+                },
+                Err(err) => {
+                    eprintln!("{err:#}");
+                    std::process::ExitCode::from(1)
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("envoy-bin: {err}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+fn install_tracing() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter =
+        EnvFilter::try_from_env("ENVOY_RUST_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).with_target(false).init();
+}
+
+async fn run(config_path: std::path::PathBuf) -> Result<()> {
+    let yaml = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("reading config at {}", config_path.display()))?;
+    let bootstrap = config::parse_bootstrap(&yaml)?;
+    let sock = &bootstrap.static_resources.listeners[0]
+        .address
+        .socket_address;
+    let addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
+        .parse()
+        .with_context(|| format!("parsing address {}:{}", sock.address, sock.port_value))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding to {addr}"))?;
+    tracing::info!(%addr, "envoy-rust listening");
+    echo::serve(listener, shutdown_signal()).await?;
+    tracing::info!("envoy-rust exited cleanly");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM");
+    let mut intr = signal(SignalKind::interrupt()).expect("install SIGINT");
+    tokio::select! {
+        _ = term.recv() => tracing::info!("SIGTERM received"),
+        _ = intr.recv() => tracing::info!("SIGINT received"),
+    }
 }
 
 #[cfg(test)]
