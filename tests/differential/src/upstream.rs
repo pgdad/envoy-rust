@@ -1,1 +1,107 @@
-// Populated by Task 10.
+use std::path::Path;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
+    core::{IntoContainerPort, Mount, WaitFor},
+    runners::AsyncRunner,
+};
+
+/// Matches ADR-0004 / `docs/envoy-rust/ENVOY_TARGET.md`.
+pub const IMAGE_NAME: &str = "envoyproxy/envoy";
+pub const IMAGE_TAG: &str = "v1.33.0";
+/// Container-internal listener port. Host-side port is assigned by
+/// testcontainers at runtime and reported via `host_port()`.
+pub const CONTAINER_PORT: u16 = 10000;
+
+/// Running upstream Envoy. Dropping this handle stops the container.
+pub struct UpstreamProxy {
+    _container: ContainerAsync<GenericImage>,
+    host_port: u16,
+}
+
+impl UpstreamProxy {
+    pub fn host_port(&self) -> u16 {
+        self.host_port
+    }
+}
+
+/// Start upstream Envoy with `envoy_yaml_path` bind-mounted to
+/// `/etc/envoy/envoy.yaml`. The caller must have already rendered any
+/// `{{PORT}}` token in the YAML to `CONTAINER_PORT`.
+pub async fn start(envoy_yaml_path: &Path) -> Result<UpstreamProxy> {
+    let absolute = envoy_yaml_path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", envoy_yaml_path.display()))?;
+    let image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
+        .with_exposed_port(CONTAINER_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("starting main dispatch loop"));
+    let container = image
+        .with_cmd(["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"])
+        .with_mount(Mount::bind_mount(
+            absolute.to_string_lossy().to_string(),
+            "/etc/envoy/envoy.yaml",
+        ))
+        .start()
+        .await
+        .context("starting upstream envoy container")?;
+    let host_port = container
+        .get_host_port_ipv4(CONTAINER_PORT.tcp())
+        .await
+        .context("reading host-mapped port from testcontainers")?;
+    // Testcontainers reports the port as soon as Docker maps it; Envoy itself
+    // may still be initializing. Give it a conservative extra second.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(UpstreamProxy {
+        _container: container,
+        host_port,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmp_envoy_yaml() -> tempfile::NamedTempFile {
+        // Smallest legal bootstrap that starts an echo listener. The container
+        // listens on CONTAINER_PORT internally.
+        let yaml = format!(
+            r#"
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: {port}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.echo
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.echo.v3.Echo
+"#,
+            port = CONTAINER_PORT,
+        );
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
+    async fn starts_upstream_envoy_and_exposes_host_port() {
+        let yaml = tmp_envoy_yaml();
+        let proxy = start(yaml.path()).await.unwrap();
+        assert!(proxy.host_port() > 0);
+        // Validate accept-readiness via the library's own helper.
+        let addr: std::net::SocketAddr =
+            format!("127.0.0.1:{}", proxy.host_port()).parse().unwrap();
+        crate::wait_accept_ready(addr, Duration::from_secs(15))
+            .await
+            .unwrap();
+        drop(proxy);
+    }
+}
