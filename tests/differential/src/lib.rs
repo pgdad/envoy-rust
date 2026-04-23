@@ -8,12 +8,13 @@
 //! responses are byte-exact equal per `expectations.yaml`.
 
 use std::io::Write;
-use std::net::TcpListener as StdTcpListener;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod subject;
 pub mod upstream;
@@ -91,10 +92,86 @@ pub async fn wait_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> 
     }
 }
 
+/// Drive `payload` at `addr`: open TCP, write payload, half-close the write
+/// side, read to EOF. Returns the echoed bytes.
+pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    stream.write_all(payload).await?;
+    stream.shutdown().await?;
+    let mut out = Vec::with_capacity(payload.len());
+    stream.read_to_end(&mut out).await?;
+    Ok(out)
+}
+
+/// End-to-end run of one fixture. Panics-on-failure paths unwind through Drop
+/// guards so the container and envoy-rust subprocess are cleaned up even on
+/// assertion failure.
+pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
+    let expectations = load_expectations(&fixture_dir.join("expectations.yaml"))?;
+    assert_eq!(
+        expectations.equivalence.response_body,
+        BodyRule::ByteExact,
+        "phase 00 only understands response_body: byte_exact",
+    );
+
+    // Shared port number — upstream Envoy uses it inside the container's
+    // namespace, envoy-rust binds it on the host.
+    let host_port = reserve_port()?;
+
+    // Render and materialize both configs in a temp directory.
+    let tmp = tempfile::tempdir().context("creating fixture temp dir")?;
+    let upstream_template = std::fs::read_to_string(fixture_dir.join("envoy.yaml"))
+        .context("reading upstream envoy.yaml")?;
+    let subject_template = std::fs::read_to_string(fixture_dir.join("envoy-rust.yaml"))
+        .context("reading envoy-rust.yaml")?;
+    let upstream_yaml = render_yaml(&upstream_template, upstream::CONTAINER_PORT);
+    let subject_yaml = render_yaml(&subject_template, host_port);
+    let upstream_path = write_temp(tmp.path(), "envoy.yaml", &upstream_yaml)?;
+    let subject_path = write_temp(tmp.path(), "envoy-rust.yaml", &subject_yaml)?;
+
+    // Start both proxies. Upstream first because it is slower to become ready.
+    let upstream = upstream::start(&upstream_path).await?;
+    let mut subject = subject::start(&subject_path, host_port).await?;
+
+    let upstream_addr: SocketAddr = format!("127.0.0.1:{}", upstream.host_port()).parse()?;
+    let subject_addr: SocketAddr = format!("127.0.0.1:{}", subject.port()).parse()?;
+
+    // 10s accept-ready budget per SPEC §D4 step 4.
+    let budget = Duration::from_secs(10);
+    wait_accept_ready(upstream_addr, budget)
+        .await
+        .context("upstream Envoy never became accept-ready")?;
+    wait_accept_ready(subject_addr, budget)
+        .await
+        .context("envoy-rust never became accept-ready")?;
+
+    // Drive identical bytes at both and compare.
+    let payload =
+        std::fs::read(fixture_dir.join("inputs/payload.bin")).context("reading payload.bin")?;
+    let upstream_out = drive_tcp(upstream_addr, &payload)
+        .await
+        .context("upstream envoy drive")?;
+    let subject_out = drive_tcp(subject_addr, &payload)
+        .await
+        .context("envoy-rust drive")?;
+
+    // Graceful subject shutdown so Drop doesn't SIGKILL unnecessarily.
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    if upstream_out != subject_out {
+        bail!(
+            "byte-exact body mismatch\n  upstream: {upstream_out:?}\n  subject:  {subject_out:?}",
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
 
     #[test]
     fn expectations_parse_byte_exact() {
