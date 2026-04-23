@@ -21,11 +21,13 @@ pub mod upstream;
 
 /// Contents of `<fixture>/expectations.yaml`.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Expectations {
     pub equivalence: Equivalence,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Equivalence {
     pub response_body: BodyRule,
 }
@@ -218,6 +220,33 @@ mod tests {
         let yaml = "equivalence:\n  response_body: sorta_equal\n";
         let r = serde_yaml::from_str::<Expectations>(yaml);
         assert!(r.is_err());
+    }
+
+    // Regression for REVIEW.md M3: `#[serde(deny_unknown_fields)]` must reject
+    // a typo'd or unexpected top-level key rather than silently dropping it.
+    #[test]
+    fn expectations_reject_unknown_field() {
+        let yaml = "equivalence:\n  response_body: byte_exact\nfoo: bar\n";
+        let err = serde_yaml::from_str::<Expectations>(yaml)
+            .expect_err("must reject unknown top-level field");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "unexpected error message: {msg}",
+        );
+    }
+
+    // Regression for REVIEW.md M3 at the nested `Equivalence` level.
+    #[test]
+    fn equivalence_reject_unknown_field() {
+        let yaml = "equivalence:\n  response_body: byte_exact\n  extra: true\n";
+        let err = serde_yaml::from_str::<Expectations>(yaml)
+            .expect_err("must reject unknown nested field");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field"),
+            "unexpected error message: {msg}",
+        );
     }
 
     #[test]
