@@ -55,3 +55,8 @@
 - Change: `tests/differential/src/upstream.rs` with `IMAGE_NAME`/`IMAGE_TAG`/`CONTAINER_PORT` constants (matching ADR-0004), `UpstreamProxy` drop-to-stop guard, `start()` that bind-mounts the fixture's `envoy.yaml` and waits on the "starting main dispatch loop" stderr message + 500ms grace. One `#[ignore]`d tokio integration test. Added `tempfile = "3"` to dev-dependencies.
 - Verification: `cargo test -p differential --lib` → 0 failed, 1 ignored (the container-launching test); clippy + fmt --check → 0; `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (ADR-0005 exemptions hold).
 - Note: local Docker daemon has an IPv6 routing bug; the `#[ignore]`d test was NOT run locally and will be validated by CI per the phase-done gate.
+
+## Task 11 — differential subject launcher (2026-04-23)
+- Commit: 143bbf4
+- Change: `tests/differential/src/subject.rs` with `Subject` (port + optional Child; Drop aborts), async `shutdown(budget)`, `locate_envoy_bin` (honoring `CARGO_TARGET_DIR`, picking debug vs release by `cfg!(debug_assertions)`), `start(path, port)` (kill_on_drop, stdio inherited, `ENVOY_RUST_LOG=info`) + 2 tokio tests.
+- Verification: `cargo test --workspace subject::tests` → 2 passed; clippy + fmt --check → 0; cargo deny check → all ok.
