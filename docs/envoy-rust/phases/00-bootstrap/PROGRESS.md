@@ -33,3 +33,9 @@
 - Change: hand-rolled argv parser (`-c`/`--config-path`) in main.rs with `ArgvError` + 6 unit tests; scoped `#![allow(dead_code)]` widened to the crate root to cover the argv items alongside config.
 - Verification: `cargo test -p envoy-bin --bin envoy-bin argv_tests` → 6 passed; clippy + fmt --check → 0.
 - Deviation: replaced the per-`mod config;` `#[allow(dead_code)]` with a single crate-root `#![allow(dead_code)]` on `main.rs` (carries forward Tasks 5–7 hygiene, all removed in Task 8).
+
+## Task 7 — envoy-bin TCP echo + drain (2026-04-23)
+- Commit: a41db88
+- Change: `crates/envoy-bin/src/echo.rs` with async `serve(listener, shutdown)`, per-connection `echo_once`, JoinSet-based 5s drain + timeout-abort; 2 `#[tokio::test]`s (single-payload + concurrent). `mod echo;` registered in main.rs.
+- Verification: `cargo test -p envoy-bin --bin envoy-bin echo::tests` → 2 passed; clippy + fmt --check → 0.
+- Deviation: the brief's echo module requires `tokio::time::timeout` and `tokio::sync::oneshot`, but the envoy-bin Cargo.toml from Task 4 did not enable those tokio features. Added `"time"` and `"sync"` to the tokio feature list to make the code (and its tests) compile. This also lands in the same commit.
