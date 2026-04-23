@@ -77,3 +77,8 @@
 - Change: `tests/differential/tests/echo.rs` — single `#[tokio::test] echo_fixture` that invokes `differential::run_fixture` against `tests/fixtures/0001-tcp-echo`.
 - Verification: `cargo build --workspace --all-targets` → 0; clippy + fmt --check → 0; `cargo test --workspace --lib --bins` → 21 passed (Tasks 1–13 regression intact).
 - Deviation: did NOT run `cargo test --workspace --test echo` locally — the local Docker daemon has an IPv6 routing bug (documented in Task 3 deviation); CI will validate the acceptance test per the phase-done gate (§7.5.a).
+
+## Task 15 — GitHub Actions CI workflow (2026-04-23)
+- Commit: 4058ab1
+- Change: `.github/workflows/ci.yml` — single `ubuntu-latest` job running fmt → clippy → build → test → cargo-deny on push/PR to main. Uses dtolnay/rust-toolchain (reads rust-toolchain.toml), Swatinem/rust-cache, taiki-e/install-action@cargo-deny.
+- Verification: `python3 -c 'yaml.safe_load(open(...))'` → exit 0.
