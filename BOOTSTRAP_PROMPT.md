@@ -431,3 +431,51 @@ Phase 00 seeds these as headings in `docs/envoy-rust/ROADMAP.md`. Do **not** exp
 - Deprecated / edge features (explicit out-of-scope ADRs unless later re-opened).
 
 ---
+
+## 10. First-Session Bootstrap — runs only once, on an empty repo
+
+You only reach this section if cold-start Step A detected `FRESH`. If you reached it any other way, stop and re-read §1. Do not run these steps twice.
+
+### Step 1: Sanity check
+
+```bash
+test ! -d docs/envoy-rust || { echo "NOT FRESH — stop"; exit 1; }
+git log --oneline -1 2>/dev/null | head -1
+```
+
+The repo may be empty (no commits) or contain only the prompt itself / a README. Anything more means something is already there — stop and invoke `superpowers:systematic-debugging` on that state before proceeding.
+
+### Step 2: Create the `docs/envoy-rust/` skeleton and workspace shell
+
+Create, in this order:
+
+1. `docs/envoy-rust/MISSION.md` — copy §§2 and 3 of this prompt verbatim (mission + doctrine). This makes the mission durable independently of this prompt file.
+2. `docs/envoy-rust/ROADMAP.md` — create with:
+   - A header explaining the schema (`id | title | depends-on | status | sub-phases | summary`).
+   - Rows for phases 00 through 08, copied from §8 of this prompt, all with `status = planned`.
+   - Family headings 09+ copied from §9, without rows under them yet.
+3. `docs/envoy-rust/STATE.md` — points at phase 00, with `next-skill = superpowers:brainstorming`, and an explicit "last-updated" timestamp.
+4. `docs/envoy-rust/DECISIONS.md` — seeded with `ADR-0001: bootstrap prompt version X committed at <git SHA>`. The SHA is the SHA of the BOOTSTRAP_PROMPT.md commit you are operating under; compute with `git log -1 --format=%H -- BOOTSTRAP_PROMPT.md`.
+5. `docs/envoy-rust/ENVOY_TARGET.md` — empty placeholder with a one-line note: "To be filled during phase 00. Must pin an upstream Envoy Docker image by tag and SHA256."
+6. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` — skeleton populated with the equivalence matrix from §7.2 of this prompt, plus explicit empty subsections (`Header allow-list`, `Stat-name mapping`, `Access log field mapping`, `xDS wire state machine`, `Timing tolerances`) each marked "to be filled per-phase as needed."
+7. `docs/envoy-rust/SKILL_ROUTING.md` — verbatim copy of §5's state machine (just the state machine block, not the surrounding prose).
+8. `Cargo.toml` — workspace root, with `[workspace]` and `members = []` (empty initially; phases add members as they introduce crates). Include `resolver = "2"`.
+9. `rust-toolchain.toml` — `[toolchain] channel = "stable"` pinned to the latest stable version available at bootstrap time, with `components = ["rustfmt", "clippy"]` and `profile = "minimal"`.
+10. `deny.toml` — `cargo-deny` config with a license allow-list that explicitly excludes GPL variants, and `[advisories]` enabled.
+
+### Step 3: Commit the scaffold as a single commit
+
+```bash
+git add docs/envoy-rust/ Cargo.toml rust-toolchain.toml deny.toml
+git commit -m "bootstrap: envoy-rust project scaffold"
+```
+
+### Step 4: Enter phase 00 lifecycle at state 1
+
+Create `docs/envoy-rust/phases/00-bootstrap/` (empty). Invoke `superpowers:brainstorming` scoped to phase 00. The brainstorm produces `phases/00-bootstrap/SPEC.md`. Do not go further in this session — the next session, per the state machine (§5), will write `PLAN.md`.
+
+### Step 5: Exit
+
+Update `docs/envoy-rust/STATE.md` to reflect: active phase = `00-bootstrap`, next-skill = `superpowers:writing-plans`. Exit cleanly.
+
+---
