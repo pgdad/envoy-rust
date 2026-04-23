@@ -69,3 +69,21 @@ Each ADR uses the structure:
 - Consequences:
   - Every new `Cargo.toml` this phase and later specifies `edition = "2024"`. The phase-00 workspace includes this in both `crates/envoy-bin/Cargo.toml` and `tests/differential/Cargo.toml`.
   - A future toolchain-bump phase (per D-3.9) must verify edition-2024 behavior on the new toolchain before landing.
+
+---
+
+## ADR-0004: Upstream Envoy pin — `envoyproxy/envoy:v1.33.0`
+
+- Date: 2026-04-23
+- Status: accepted
+- Context: D-3.7 requires a pinned upstream Envoy image. `docs/envoy-rust/ENVOY_TARGET.md` is the on-disk record of the pin; this ADR is its decision trail.
+- Options considered:
+  - **`envoyproxy/envoy:v1.33.0`** — the newest stable release at bootstrap time (resolved during execution; confirmed present on Docker Hub and on `refs/tags/v1.33.0` upstream).
+  - **`envoyproxy/envoy:v1.32.x`** — previous LTS line; more conservative; older xDS surface.
+  - **`envoyproxy/envoy:main`** — moving target; incompatible with the discipline that pins are deterministic per D-3.7.
+- Decision: `envoyproxy/envoy:v1.33.0`.
+- Rationale: starting on the newest GA release is cheaper than a refresh phase 3 months later. A future refresh ADR will supersede this one with the then-current LTS, which remains normal operation per D-3.7.
+- Consequences:
+  - The exact sha256 digest and proto-tree commit SHA are recorded in `docs/envoy-rust/ENVOY_TARGET.md`, landed in the same commit as this ADR.
+  - The differential harness (Task 11) hard-codes this image tag + digest when launching the upstream container via `testcontainers`.
+  - Every fixture's `envoy.yaml` is written against the `v1.33.0` bootstrap schema.

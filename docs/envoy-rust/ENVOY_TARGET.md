@@ -1,22 +1,22 @@
 # Upstream Envoy Target Pin
 
-> To be filled during phase 00. Must pin an upstream Envoy Docker image by tag
-> and SHA256.
+> Pinned during phase 00. Upgrading this pin is its own phase per doctrine rule
+> D-3.7 and supersedes ADR-0004 with a new ADR.
 
-## Required fields (all TBD until phase 00)
+## Pin
 
-- **Image:** `envoyproxy/envoy:<tag>` — TBD
-- **Digest:** `sha256:<hex>` — TBD
-- **Upstream release notes:** link to the Envoy release announcement for the pinned tag — TBD
-- **Proto tree commit:** the matching `envoyproxy/envoy` git SHA whose `api/` tree corresponds to this image — TBD
-- **xDS transport version:** v3 (fixed; v2 is retired upstream — confirm during phase 00)
+- **Image:** `envoyproxy/envoy:v1.33.0`
+- **Digest:** `sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`
+- **Upstream release notes:** https://github.com/envoyproxy/envoy/releases/tag/v1.33.0
+- **Proto tree commit:** `b0f43d67aa25c1b03c97186a200cc187f4c22db3`
+- **xDS transport version:** v3
 
 ## How to refresh the pin
 
 Upgrading the pin is its own phase per doctrine rule D-3.7. The refresh phase must:
 
 1. Open a new phase in `ROADMAP.md` titled "Refresh upstream Envoy pin to <new-tag>", depending on the most recent trunk/feature phase.
-2. Add an ADR that supersedes the previous pin ADR, naming the old SHA256, new SHA256, new tag, and any doctrine-surface changes in the release notes.
+2. Add an ADR that supersedes `ADR-0004`, naming the old digest, new digest, new tag, and any doctrine-surface changes in the release notes.
 3. Re-run every existing differential fixture against the new image. Any red fixture is either a product fix (update envoy-rust) or a contract fix (update `BEHAVIOR_CONTRACT.md`, documented in the same or a follow-up ADR), never both silently — per doctrine rule D-3.3.
 4. Update this file with the new fields and commit.
 
