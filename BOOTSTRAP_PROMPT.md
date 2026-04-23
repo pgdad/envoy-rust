@@ -303,3 +303,91 @@ Conformance: <what conformance suites were run and their pass rate>
 If no ADRs were added or referenced during the phase, the bracketed list is omitted.
 
 ---
+
+## 6. Phase Splitting Policy
+
+### 6.1 When to split
+
+Splitting is triggered at step 2 of the lifecycle (when `PLAN.md` is being written) if either threshold is crossed:
+
+- `PLAN.md` exceeds **~25 numbered tasks**, OR
+- `PLAN.md` estimates exceed **~1500 lines of code** of net change.
+
+Additionally, splitting is triggered *mid-execution* if any single task's sub-steps blow up past ~10 items once contact with reality reveals complexity.
+
+### 6.2 How to split
+
+1. Stop. Do not continue writing the oversize plan or implementing the oversize task.
+2. Create sibling phase directories `docs/envoy-rust/phases/NN.1-subtitle/`, `NN.2-subtitle/`, …
+3. Redistribute spec content — each sub-phase gets its own `SPEC.md` covering a coherent slice of the original.
+4. Update `docs/envoy-rust/ROADMAP.md`: the original row becomes a parent row with `status = in-progress` and its `sub-phases` column listing `NN.1, NN.2, …`. Each sub-phase gets its own row with `status = planned`.
+5. Update `docs/envoy-rust/STATE.md` to point at `NN.1`.
+6. Append an ADR explaining the split ("ADR-NNNN: split phase NN into NN.1–NN.k because plan exceeded …").
+7. Exit. The next fresh session starts at NN.1's lifecycle at step 1.
+
+### 6.3 Anti-pattern
+
+Do not "defer" work by cramming it into vague tasks like "TODO: extend later" or by introducing incomplete stubs that differential tests can't exercise. Either the work is in this phase and gets tested, or it is in a split sub-phase with its own row in the roadmap. There is no third option.
+
+---
+
+## 7. Differential Test Contract
+
+### 7.1 Harness architecture
+
+`tests/differential/` hosts a Rust test crate that orchestrates two proxies per fixture:
+
+- **Reference:** upstream Envoy, Docker image at the tag pinned in `docs/envoy-rust/ENVOY_TARGET.md`, managed via `testcontainers` (Rust).
+- **Subject:** envoy-rust built from the current tree (`cargo run -p envoy-bin --release -- -c <fixture>/envoy-rust.yaml`), run as a subprocess.
+
+Each test case lives under `tests/fixtures/NNNN-name/` and contains:
+
+- `envoy.yaml` — reference config for upstream Envoy.
+- `envoy-rust.yaml` — equivalent config for envoy-rust (initially identical; any divergence must be explained in an ADR referenced from the fixture's README).
+- `inputs/` — HTTP requests, raw TCP payloads, gRPC calls, or a small Rust driver that exercises the fixture.
+- `expectations.yaml` — allow-lists, ignore-lists, stats-name mappings, and timing tolerances, derived from `BEHAVIOR_CONTRACT.md`.
+
+Per run: start both proxies; drive identical inputs at both; capture responses, access logs, and stats snapshots; diff under the contract rules.
+
+### 7.2 Equivalence matrix
+
+The authoritative version lives in `docs/envoy-rust/BEHAVIOR_CONTRACT.md`. Summary:
+
+| Dimension | Required equivalence |
+|---|---|
+| Response status | Exact |
+| Response body | Byte-exact for deterministic handlers; semantically equal for filter-modified bodies |
+| Response headers | Set-equal modulo documented allow-list (`server`, `date`, timing/identity headers explicitly listed) |
+| Response trailers | Set-equal under the same allow-list discipline |
+| HTTP/2 & HTTP/3 framing | Structurally equivalent (same frame types/order on equivalent events); not byte-equal |
+| Access log records | Semantically equal after field-mapping |
+| Stats | Names match Envoy's documented stat tree; presence required; values exact on deterministic flows |
+| xDS wire behavior | ADS message sequences match the protocol state machine; effective-config diff on identical snapshots |
+| Timing | Not compared by default; a phase may opt in to latency bounds |
+
+### 7.3 Conformance suites (independent of real Envoy)
+
+Separate from the differential harness. These test absolute protocol correctness:
+
+- `tests/conformance/h2spec/` — runs once HTTP/2 lands; pass threshold is a phase gate.
+- `tests/conformance/h3spec/` — runs once HTTP/3 lands.
+- `tests/conformance/grpc/` — gRPC interop client.
+- `tests/conformance/proxy-wasm/` — proxy-wasm ABI conformance once the WASM host lands.
+
+### 7.4 Negative and fuzz testing
+
+Every phase that introduces a parser, codec, or filter ships a `cargo fuzz` target under the relevant crate's `fuzz/` subdirectory. Fuzzers run short-budget in CI and long-budget nightly. Malformed or adversarial inputs must produce the *same class* of response as upstream Envoy (matching status code and Envoy-style `x-envoy-local-reply` behavior) — identical error text is not required.
+
+### 7.5 Phase-done gate
+
+> A phase is not done until:
+> (a) all new/changed differential fixtures are green,
+> (b) all pre-existing differential fixtures are still green,
+> (c) the phase's conformance suites pass at the declared threshold,
+> (d) any new fuzzer has run clean for its short-budget CI run,
+> (e) `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `cargo test --workspace`, and `cargo deny check` are all clean,
+> (f) `REVIEW.md` is approved.
+
+These six gates are what `superpowers:verification-before-completion` verifies. They are the complete definition of "done."
+
+---
