@@ -82,3 +82,144 @@
 - Commit: 4058ab1
 - Change: `.github/workflows/ci.yml` — single `ubuntu-latest` job running fmt → clippy → build → test → cargo-deny on push/PR to main. Uses dtolnay/rust-toolchain (reads rust-toolchain.toml), Swatinem/rust-cache, taiki-e/install-action@cargo-deny.
 - Verification: `python3 -c 'yaml.safe_load(open(...))'` → exit 0.
+
+## State 4 — Phase-done gate verification (2026-04-23)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4 and `BOOTSTRAP_PROMPT.md` §7.5.
+Five gate commands run against `ubuntu-latest` CI; the acceptance test
+`tests/differential/tests/echo.rs::echo_fixture` is Docker-gated and only runs
+in CI per Task 14's deviation note.
+
+### Attempt 1 — commit `2d81b53`, workflow run `24855427288`
+
+Triggered by the first push of the phase-00 branch to `origin/main` after a
+`gh auth refresh -s workflow` to grant the `workflow` scope the existing
+token lacked.
+
+Local gate (dev host, post `cargo clean -p envoy-bin -p differential`):
+- `cargo build   --workspace --all-targets`                                   → exit `0` (`Finished dev profile target(s) in 0.38s`).
+- `cargo clippy  --workspace --all-targets --all-features -- -D warnings`     → exit `0` (`Checking envoy-bin`, `Checking differential`, `Finished`).
+- `cargo fmt     --all -- --check`                                            → exit `0` (no diffs).
+- `cargo test    --workspace`                                                 → exit `101` on `echo_fixture`. The failure reproduced the documented Docker daemon DNS bug from Task 3: `failed to pull the image 'envoyproxy/envoy:v1.33.0' ... dial tcp: lookup registry-1.docker.io: no such host`. `cargo test --workspace --lib --bins` (non-Docker portion) → exit `0`, 21 passed + 1 ignored.
+- `cargo deny    check`                                                       → exit `0` (`advisories ok, bans ok, licenses ok, sources ok`; unmatched-license warnings on 0BSD/BSD-2-Clause/CC0-1.0/MPL-2.0/Unicode-DFS-2016/Zlib; duplicate wit-bindgen 0.51.0 / 0.57.1 via `tempfile → getrandom`, both permitted by `[bans] multiple-versions = "allow"`).
+
+CI gate (`ubuntu-latest`, run 24855427288):
+- Steps `fmt` / `clippy` / `build` → `success`.
+- Step `test (includes differential harness → Docker)` → **`failure`**, exit `101`.
+- Steps `install cargo-deny` / `cargo deny check` → `skipped` (job failed earlier).
+
+The CI failure was *not* the dev-host Docker bug. The container launched, the
+image pulled, and `echo_fixture` ran end-to-end — but the differential
+assertion fired:
+
+    ---- echo_fixture stdout ----
+    Error: byte-exact body mismatch
+      upstream: []
+      subject:  [104, 101, 108, 108, 111, 44, 32, 101, 110, 118, 111, 121, 45, 114, 117, 115, 116, 10]
+
+Upstream Envoy returned zero bytes; the envoy-rust subject correctly echoed
+`hello, envoy-rust\n` (18 bytes). This is unexpected state and per doctrine
+D-3.1 was investigated under `superpowers:systematic-debugging` before any
+fix was proposed.
+
+### Root cause (evidence-backed)
+
+`envoyproxy/envoy@v1.33.0` — `source/common/network/connection_impl.cc`
+(fetched via `gh api 'repos/envoyproxy/envoy/contents/.../connection_impl.cc?ref=v1.33.0'`):
+
+- Line 83: `ConnectionImpl` constructor sets `enable_half_close_(false)` as the default.
+- Lines 698–701 in `onReadReady`:
+
+      if ((!enable_half_close_ && result.end_stream_read_)) {
+        result.end_stream_read_ = false;
+        result.action_ = PostIoAction::Close;
+      }
+
+- Lines 703–710: `onRead(new_buffer_size)` is dispatched to the filter
+  manager when `bytes_processed_ != 0` (so the echo filter's
+  `connection().write(data, end_stream)` queues the echo into the
+  connection's write buffer).
+- Lines 713–716:
+
+      if (result.action_ == PostIoAction::Close || bothSidesHalfClosed()) {
+        ENVOY_CONN_LOG(debug, "remote close", *this);
+        closeSocket(ConnectionEvent::RemoteClose);
+      }
+
+`closeSocket(RemoteClose)` runs in the same event-loop iteration as the
+filter's `connection().write(...)` — the write buffer has not yet been
+flushed, and the close drops it. Net effect: the echo response is dropped
+whenever the client half-closes the write side before reading.
+
+There is no listener-level YAML surface to enable half-close semantics in
+v1.33.0. The `Listener` proto (`api/envoy/config/listener/v3/listener.proto`
+at ref `v1.33.0`) contains no `enable_half_close` field; that switch is a
+C++ `Connection::enableHalfClose()` method only, and the only YAML
+surface is on `envoy.filters.network.tcp_proxy`, which phase 00 does not
+use.
+
+Envoy's own echo-filter integration test
+(`test/extensions/filters/network/echo/echo_integration_test.cc` at ref
+`v1.33.0`) confirms the intended client pattern: send data → wait for
+the data callback → `conn.close(ConnectionCloseType::FlushWrite)` —
+never half-close.
+
+The pre-fix `drive_tcp` used `write_all` → `shutdown()` → `read_to_end`,
+i.e. it half-closed before reading. This matched `SPEC.md` §D4 point 5's
+prescription but is fundamentally incompatible with Envoy v1.33.0's
+default echo-filter behavior.
+
+### Fix (ADR-0006 + 5355311)
+
+- **ADR-0006** landed in `docs/envoy-rust/DECISIONS.md`: documents the
+  four options considered (rewrite harness; replace fixture with tcp_proxy
+  + loopback cluster; read-with-idle-timeout; patch upstream Envoy) and
+  selects option A — rewrite `drive_tcp` to match Envoy's echo-filter
+  1:1 byte-count contract. Supersedes SPEC §D4 point 5's "half-close +
+  `read_to_end`" wording.
+- `tests/differential/src/lib.rs::drive_tcp` rewritten:
+  `write_all(payload)` → `read_exact(&mut vec![0u8; payload.len()])` →
+  `shutdown().await.ok()` (graceful FIN for the envoy-rust subject's
+  benefit — upstream Envoy will have already closed) → `drop(stream)`.
+- New unit test `drive_tcp_round_trips_without_half_close` added to the
+  `tests` module. Spawns an in-process server that mirrors Envoy's echo
+  semantics (read N, write N, close without honoring half-close) and
+  verifies `drive_tcp` round-trips against it. The pre-fix `drive_tcp`
+  would race this server identically to upstream Envoy and return an
+  empty body.
+- No fixture YAML changes. No `envoy-bin` changes.
+
+### Attempt 2 — commit `5355311`, workflow run `24856364702`
+
+Local gate (dev host, all five commands):
+- `cargo build   --workspace --all-targets` → exit `0` (`Finished dev profile target(s) in 1.10s`).
+- `cargo clippy  --workspace --all-targets --all-features -- -D warnings` → exit `0`.
+- `cargo fmt     --all -- --check` → exit `0`.
+- `cargo test    --workspace --lib --bins` → exit `0`, **22 passed, 0 failed, 1 ignored** (new `drive_tcp_round_trips_without_half_close` passes; all 21 Attempt-1 tests still pass). Full `cargo test --workspace` on the dev host still fails on `echo_fixture` with the Docker DNS bug from Task 3 — unchanged from Attempt 1 — so CI is still the validator for that single test.
+- `cargo deny    check` → exit `0`, `advisories ok, bans ok, licenses ok, sources ok`.
+
+CI gate (`ubuntu-latest`, run 24856364702):
+- Step `fmt` (`cargo fmt --all -- --check`) → `success`.
+- Step `clippy` (`cargo clippy --workspace --all-targets --all-features -- -D warnings`) → `success`; `Finished dev profile target(s) in 47.05s`.
+- Step `build` (`cargo build --workspace --all-targets`) → `success`; `Finished dev profile target(s) in 55.49s`.
+- Step `test (includes differential harness → Docker)` (`cargo test --workspace`) → `success`:
+    - `differential` lib: `test result: ok. 9 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.36s` (the ignored one is the Docker-gated `upstream::tests::starts_upstream_envoy_and_exposes_host_port`; the new `drive_tcp_round_trips_without_half_close` passes).
+    - `differential` integration (`tests/echo.rs`): `test echo_fixture ... ok`, `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.71s`.
+    - `envoy-bin` bin-unit: `test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s`.
+    - Doc-tests (`differential`): `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`.
+- Step `install cargo-deny` → `success`.
+- Step `cargo deny check` → `success`; `advisories ok, bans ok, licenses ok, sources ok` (same informational warnings as Attempt 1 — they are not failures).
+
+Run conclusion: `success`. URL: https://github.com/pgdad/envoy-rust/actions/runs/24856364702
+
+### Gate outcome per `BOOTSTRAP_PROMPT.md` §7.5
+
+- (a) `tests/fixtures/0001-tcp-echo/` → **green** (`echo_fixture ... ok`, 1/1 passed in 6.71s on CI).
+- (b) no pre-existing differential fixtures → nothing else to regress.
+- (c) no conformance suites this phase → n/a.
+- (d) no fuzz targets this phase → n/a.
+- (e) `cargo build / clippy / fmt --check / test --workspace / deny check` → all clean on CI.
+- (f) REVIEW.md → state 5 pending per `SKILL_ROUTING.md`.
+
+State 4 verification complete. Next session enters state 5 via
+`superpowers:requesting-code-review`.
