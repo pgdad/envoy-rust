@@ -157,7 +157,7 @@ No phase lands with failing unit tests, failing differential fixtures, failing c
 
 ### D-3.7 Version pinning
 
-The reference Envoy version (Docker image tag + SHA) lives in `docs/envoy-rust/ENVOY_TARGET.md`. All fixtures, proto versions, and behavior contracts reference that pin. Upgrading the pin is its own phase, with its own differential re-baselining; you may not change the pin ad-hoc.
+The reference Envoy version (Docker image tag + SHA) lives in `docs/envoy-rust/ENVOY_TARGET.md`. All fixtures, proto versions, and behavior contracts reference that pin. Upgrading the pin is its own phase, with its own differential re-baselining; you must not change the pin ad-hoc.
 
 ### D-3.8 `unsafe` is forbidden by default (Rust-only)
 
@@ -213,6 +213,8 @@ envoy-rust/
         └── 99-archive/              # completed phases' artifacts can be moved here if docs/ grows
 ```
 
+The `tests/differential/`, `tests/conformance/`, and `tests/helpers/` directories are themselves workspace crates (each has its own `Cargo.toml`) so they can depend on `crates/*` by path. `tests/fixtures/` is data only — no crate manifest.
+
 ### 4.1 Invariants
 
 1. **`STATE.md` is the single source of truth for "what next."** Cold-start reads it first. It names the active phase directory and the next expected skill invocation.
@@ -257,6 +259,7 @@ This state machine is the brain of the project. A session's entire job, after co
           cargo fmt --all -- --check,
           cargo test --workspace,
           cargo deny check,
+          cargo fuzz run <target> [for each new fuzz target, short-budget CI run],
           differential suite for phase's feature surface, conformance suites
    → quote all command outputs into PROGRESS.md
 
@@ -280,7 +283,7 @@ Deviations:
 ### 5.1 How to read this state machine
 
 - Each numbered state has an unambiguous detection rule from the contents of the active phase directory (presence/absence of `SPEC.md`, `PLAN.md`, `PROGRESS.md`, `REVIEW.md` — and for `REVIEW.md`, its approval status).
-- You move exactly one state forward per session. Do not chain through multiple states in a single session; the value of context isolation is that each transition starts fresh. (The sole exception is §10's first-session bootstrap, which traverses states 0 and 1 in one session because it creates the scaffolding preconditions for the state machine; this exception is unavailable to any subsequent session.)
+- You move exactly one state forward per session. Do not chain through multiple states in a single session; the value of context isolation is that each transition starts fresh. (The sole exception is §10's first-session bootstrap, which traverses state 1 in one session — ROADMAP.md is pre-seeded in Step 2, so state 0 is bypassed — because it creates the scaffolding preconditions for the state machine; this exception is unavailable to any subsequent session.)
 - If state detection is ambiguous (e.g., file exists but is empty, or contains conflicting signals), invoke `superpowers:systematic-debugging` before advancing.
 
 ### 5.2 Review feedback re-entry point
@@ -511,6 +514,7 @@ This is the same state machine as §5, duplicated here as a reference card for `
           cargo fmt --all -- --check,
           cargo test --workspace,
           cargo deny check,
+          cargo fuzz run <target> [for each new fuzz target, short-budget CI run],
           differential suite for phase's feature surface, conformance suites
    → quote all command outputs into PROGRESS.md
 
