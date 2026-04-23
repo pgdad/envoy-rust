@@ -460,3 +460,52 @@ State 4 re-verification complete. Next session enters state 5 via
 `superpowers:requesting-code-review` for the re-review pass expected to
 return **Approved** (all three Important items and the folded-in M3
 resolved per REVIEW.md's final recommendation).
+
+## State 5 (re-review) — Approved with fixes, new Minor only (2026-04-23)
+
+Ran `superpowers:requesting-code-review` against range `b42f18d..a1c8194`
+(code-relevant HEAD `fca3aba`; the two trailing commits `a1c8194` and
+`880efcd` are documentation-only STATE.md / PROGRESS.md updates). The
+code-reviewer subagent superseded the prior REVIEW.md in place with a
+re-review pass and returned verdict **Approved with fixes (new Minor
+only) — advance to state 6**.
+
+### Fix outcomes vs. prior REVIEW.md
+
+| ID | Prior severity | Fix commit | Re-review outcome |
+|---|---|---|---|
+| I1 — `drive_tcp` trailing-byte blind spot | Important | `245a65f` + ADR-0007 | **Fixed** — 100ms poll after `read_exact`, regression test `drive_tcp_rejects_trailing_bytes_after_echo` structurally reproduces silent-pass; ADR-0006 append-only-preserved (git-diff verified). |
+| I2 — `rejects_duplicate_config_flag` discarded assertion | Important | `ba17ee3` | **Fixed** — `assert!(matches!(...), ...)` wrapper asserts the `ArgvError::Trailing(_)` variant; test now fails on any other variant. |
+| I3 — `Subject::shutdown` rustdoc mismatch | Important (rustdoc portion) | `18bbfde` | **Fixed** — struct doc now accurately reads "sends SIGKILL …"; `TODO(phase-01)` block names the `nix`-crate D-3.2 blocker and phase-01 ADR gating. Functional SIGKILL→SIGTERM switch deferred per prior REVIEW's own recommendation. |
+| M3 — `deny_unknown_fields` on YAML schemas | Minor (folded in) | `fca3aba` | **Fixed** — attribute present on all 9 documented sites; four TDD-verified regression tests assert against serde-canonical `"unknown field"` marker. |
+
+### New issues surfaced in re-review (both Minor, non-blocking)
+
+- **N1** — `deny_unknown_fields` tightens SPEC §D3.2's "Any field not
+  covered here … is ignored by envoy-rust in phase 00" from
+  silent-ignore to hard-reject without a dedicated ADR or PROGRESS.md
+  SPEC-deviation note. REVIEW recommends closing with either a one-line
+  PROGRESS.md entry at state 6 or a brief ADR-0008. Strictly safer
+  (reject-on-typo) and REVIEW-recommended; does not block phase-done.
+- **N2** — the four M3 regression tests cover only 4 of the 9
+  `deny_unknown_fields` attribute sites (root `Bootstrap` + nested
+  `Listener` + both differential structs). The 5 deeper structs
+  (`StaticResources`, `Address`, `SocketAddress`, `FilterChain`,
+  `NetworkFilter`) carry the attribute but are not individually
+  regression-tested. Self-identified in the State 3 loop-back entry; a
+  small follow-up commit can close the gap. Non-blocking.
+
+### Pre-existing Minors (unchanged from prior REVIEW.md)
+
+M1, M2, M4, M5, M6, M7, M8 remain open with prior classification. All
+were labeled "nice to have; can defer" and none were in scope for the
+loop-back. Carried into future phases.
+
+### Outcome
+
+Phase 00 is ready for **state 6** (final phase commit + ROADMAP row →
+`done` + STATE advance). The final commit carries the full phase title
+and bracketed ADR list `[ADR-0002, ADR-0003, ADR-0004, ADR-0005,
+ADR-0006, ADR-0007]` per BOOTSTRAP_PROMPT §5.3. Per §5.1, this session
+advances exactly one state (5 → 6-prep) and exits; the next session
+enters state 6 via the BOOTSTRAP_PROMPT §5.3 final-commit procedure.
