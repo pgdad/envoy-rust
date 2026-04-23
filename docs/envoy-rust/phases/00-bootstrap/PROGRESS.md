@@ -27,3 +27,9 @@
 - Change: `crates/envoy-bin/src/config.rs` with `Bootstrap`/`StaticResources`/`Listener`/`Address`/`SocketAddress`/`FilterChain`/`NetworkFilter` types + `parse_bootstrap()` + `validate()` + `ECHO_FILTER` const + 5 unit tests. `mod config;` registered in `main.rs` with a scoped `#[allow(dead_code)]` (removed in Task 8 when `run()` consumes the module).
 - Verification: `cargo test -p envoy-bin --bin envoy-bin config` → `5 passed`; `cargo clippy -p envoy-bin --all-targets --all-features -- -D warnings` → 0; `cargo fmt -p envoy-bin -- --check` → 0 (rustfmt autofixed the plan's verbatim line-breaks on `parse_bootstrap` and the first test; behavior unchanged).
 - Deviation: PLAN Task 5 Step 3 uses `cargo test -p envoy-bin --lib config`, but `envoy-bin` is a binary-only crate (no `[lib]` target); the tests were run via `--bin envoy-bin` with the same selector. Also, PLAN's clippy step `-D warnings` fails on dead_code for items defined in Task 5 but not consumed until Task 8 — resolved with a single `#[allow(dead_code)]` on the `mod config;` declaration in `main.rs`, scoped and annotated for removal in Task 8. Same pattern will apply to Tasks 6 and 7 (argv + echo modules).
+
+## Task 6 — envoy-bin argv parser (2026-04-23)
+- Commit: 4c270b9
+- Change: hand-rolled argv parser (`-c`/`--config-path`) in main.rs with `ArgvError` + 6 unit tests; scoped `#![allow(dead_code)]` widened to the crate root to cover the argv items alongside config.
+- Verification: `cargo test -p envoy-bin --bin envoy-bin argv_tests` → 6 passed; clippy + fmt --check → 0.
+- Deviation: replaced the per-`mod config;` `#[allow(dead_code)]` with a single crate-root `#![allow(dead_code)]` on `main.rs` (carries forward Tasks 5–7 hygiene, all removed in Task 8).
