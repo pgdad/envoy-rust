@@ -10,24 +10,53 @@
 **id:** `00`
 **slug:** `00-bootstrap`
 **directory:** `docs/envoy-rust/phases/00-bootstrap/`
-**status:** `in-progress` (lifecycle state 5 — verified, code review pending)
+**status:** `in-progress` (lifecycle state 5 ran → looping back to state 3 per REVIEW.md)
 
 ## Next expected skill
 
-`superpowers:requesting-code-review` — scoped to phase 00. Produces
-`docs/envoy-rust/phases/00-bootstrap/REVIEW.md` per state 5 of the lifecycle
-(`docs/envoy-rust/SKILL_ROUTING.md`). If review surfaces issues the session
-loops back to state 3 per the state machine (NOT state 4).
+`superpowers:subagent-driven-development` — scoped to the three REVIEW.md
+Important items (plus the rustdoc portion of I3), looping back to
+lifecycle state 3 per `SKILL_ROUTING.md` line 42 ("if issues → back to
+step 3 (NOT 4) until REVIEW.md approved"). After state-3 fixes land and
+commit atomically per task, the session exits; the next session
+re-enters state 4 (CI re-verify) and then state 5 (re-review), which
+the REVIEW.md final verdict expects will approve on the next round.
 
-State 4 (verification) is complete: all five phase-done gate commands
-(`cargo build / clippy / fmt --check / test --workspace / deny check`)
-exited 0 on `ubuntu-latest` CI for commit `5355311` (workflow run
-`24856364702`, URL
+State 5 (code review) ran in this session. The `superpowers:code-reviewer`
+subagent reviewed `b42f18d..e1771c3` (32 commits) against SPEC.md,
+PLAN.md, PROGRESS.md, and BEHAVIOR_CONTRACT.md and wrote
+`docs/envoy-rust/phases/00-bootstrap/REVIEW.md` — verdict **Approved
+with fixes**:
+
+- **0 Critical.**
+- **3 Important:**
+  - **I1** — `drive_tcp` (`tests/differential/src/lib.rs:109–119`) reads
+    exactly `payload.len()` bytes per ADR-0006 and cannot detect a
+    server writing *extra* trailing bytes; narrows the byte-exact
+    assertion contract and is spec drift against BEHAVIOR_CONTRACT.md
+    row 2. Fix: post-`read_exact` idle-tail check + regression test;
+    amend ADR-0006 "Consequences" or land ADR-0007.
+  - **I2** — `rejects_duplicate_config_flag`
+    (`crates/envoy-bin/src/main.rs:171–175`) uses `matches!(err, …);`
+    as an expression statement, discarding the boolean and asserting
+    only that the parser returned `Err` at all. Fix: wrap in
+    `assert!(…)`.
+  - **I3** — `Subject::shutdown` rustdoc
+    (`tests/differential/src/subject.rs:20–34`) says SIGTERM but
+    implementation calls `child.start_kill()` (SIGKILL). Phase-00 minimum
+    per REVIEW: fix the rustdoc and drop a follow-up TODO. Functional
+    SIGKILL→SIGTERM switch needs `nix` (not on D-3.2) and is deferred to
+    phase 01 under its own ADR.
+- **8 Minor** (M1–M8). M3 (`deny_unknown_fields` on YAML structs) is
+  cheap and REVIEW recommends folding it into the loop-back.
+
+State 4 (verification) remains complete: all five phase-done gate
+commands exited 0 on `ubuntu-latest` CI for commit `5355311` (workflow
+run `24856364702`, URL
 https://github.com/pgdad/envoy-rust/actions/runs/24856364702),
-including the Docker-gated `echo_fixture` acceptance test which ran the
-full differential end-to-end against `envoyproxy/envoy:v1.33.0`. Quoted
-step outputs live in `phases/00-bootstrap/PROGRESS.md` under the
-"State 4 — Phase-done gate verification" section.
+including the Docker-gated `echo_fixture` acceptance test. Quoted step
+outputs live in `phases/00-bootstrap/PROGRESS.md` under "State 4 —
+Phase-done gate verification".
 
 ## Last commit
 
@@ -36,7 +65,9 @@ step outputs live in `phases/00-bootstrap/PROGRESS.md` under the
 v1.33.0's echo-filter contract (read exactly `payload.len()` bytes
 instead of half-close + `read_to_end`). Supersedes SPEC §D4 point 5's
 wording for the harness helper only; no fixture YAML or `envoy-bin`
-change. Unblocks `echo_fixture` on CI.
+change. Unblocks `echo_fixture` on CI. REVIEW.md I1 flags that this fix
+also needs a complementary trailing-byte check to preserve the
+byte-exact contract.
 
 ## Last updated
 
@@ -45,7 +76,7 @@ change. Unblocks `echo_fixture` on CI.
 ## Notes
 
 - SPEC.md landed 2026-04-23; PLAN.md landed 2026-04-23; implementation (state 3) completed 2026-04-23 via `superpowers:subagent-driven-development`; state 4 verification completed 2026-04-23 after one iteration (initial CI failure on `echo_fixture` → `superpowers:systematic-debugging` → ADR-0006 + harness fix → CI green).
-- Per `BOOTSTRAP_PROMPT.md` §5.1, sessions move exactly one state forward. This session advanced state 4 → state 5 (verified) and now exits; the next session picks up at state 5 and runs `superpowers:requesting-code-review`.
+- Per `BOOTSTRAP_PROMPT.md` §5.1, sessions move exactly one state forward. A previous session advanced state 4 → state 5 (verified); this session ran state 5 (code review → REVIEW.md) and now exits. Because REVIEW.md flagged 3 Important issues, the state machine routes the next session back to state 3 (per `SKILL_ROUTING.md` line 42) via `superpowers:subagent-driven-development`, not forward to state 6.
 - Deviations captured during state 3 (see `docs/envoy-rust/phases/00-bootstrap/PROGRESS.md` for full detail):
   - **ADR-0005 landed** — `skip-tree` in cargo-deny 0.19.4 only affects the `multiple-versions` check, not `[bans] deny`. Corrected the plan's Task 4 Step 6 by using `wrappers` on `hyper`/`hyper-util`/`tower-service` plus `[advisories].ignore` for RUSTSEC-2025-0111 (tokio-tar) and RUSTSEC-2025-0134 (rustls-pemfile).
   - Local Docker daemon DNS/IPv6 routing bug: Task 3 resolved the `envoyproxy/envoy:v1.33.0` digest via the Docker Hub public API; Task 10's `#[ignore]`d integration test and Task 14's acceptance test were NOT run locally and relied on CI for validation.

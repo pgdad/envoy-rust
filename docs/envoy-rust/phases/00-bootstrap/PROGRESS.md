@@ -223,3 +223,69 @@ Run conclusion: `success`. URL: https://github.com/pgdad/envoy-rust/actions/runs
 
 State 4 verification complete. Next session enters state 5 via
 `superpowers:requesting-code-review`.
+
+## State 5 — Code review (2026-04-23)
+
+Ran `superpowers:requesting-code-review` scoped to phase 00
+(`b42f18d..e1771c3`, 32 commits). Dispatched `superpowers:code-reviewer`
+subagent with SPEC.md, PLAN.md, PROGRESS.md, BEHAVIOR_CONTRACT.md,
+ENVOY_TARGET.md, and SKILL_ROUTING.md as context. Output:
+`docs/envoy-rust/phases/00-bootstrap/REVIEW.md`.
+
+### Verdict
+
+**Approved with fixes.** 0 Critical, 3 Important, 8 Minor. Loop back to
+lifecycle state 3 per `SKILL_ROUTING.md` line 42 ("if issues → back to
+step 3 (NOT 4) until REVIEW.md approved").
+
+### Important findings (must fix before state 6)
+
+- **I1 — `drive_tcp` cannot detect trailing bytes**
+  (`tests/differential/src/lib.rs:109–119`). ADR-0006's
+  `read_exact(payload.len())` rewrite narrows the byte-exact assertion to
+  "first N bytes match" — envoy-rust writing `payload.len() + 5` bytes
+  would pass silently. This is spec drift against BEHAVIOR_CONTRACT.md
+  row 2 ("byte-exact") and D-3.3. Fix (REVIEW recommends option (a)):
+  after `read_exact`, poll with a ~100ms deadline; any further bytes →
+  `bail!`. Add regression test (server that writes `payload.len()` bytes
+  then extra bytes, assert harness fails). Amend ADR-0006 "Consequences"
+  or land ADR-0007 alongside.
+- **I2 — `rejects_duplicate_config_flag` has no assertion**
+  (`crates/envoy-bin/src/main.rs:171–175`). `matches!(err,
+  ArgvError::Trailing(_));` is used as an expression statement; the
+  boolean is discarded. Fix: wrap in `assert!(…)`.
+- **I3 — `Subject::shutdown` rustdoc says SIGTERM, sends SIGKILL**
+  (`tests/differential/src/subject.rs:20–34`). The functional SIGKILL →
+  SIGTERM + escalate switch requires a new dep (`nix`, not on D-3.2) and
+  is a phase-01 follow-up per REVIEW's recommendation. **Phase 00
+  minimum:** fix the rustdoc; drop a TODO pointing at the follow-up.
+
+### Minor findings (defer-or-batch)
+
+M1–M8 in REVIEW.md §Issues/Minor. Notable: M3 (`deny_unknown_fields` on
+YAML structs) is cheap and prevents a real class of bugs once the
+`expectations.yaml` grammar grows per ADR-0006 "Consequences" — consider
+folding into the state-3 loop-back alongside the Importants.
+
+### Strengths called out
+
+- Narrative discipline in PROGRESS.md and ADRs 0005/0006 (REVIEW
+  "Strengths" §1–2); PROGRESS.md State 4 section is flagged as a
+  template for future verification entries.
+- `deny.toml` wrappers are mechanically correct against the actual
+  `Cargo.lock` transitive graph (REVIEW §Strengths point 3).
+- Spec conformance matrix: all D1–D6 deliverables landed; two (D4 step 3
+  artifact-dep fallback, D4 step 5 via ADR-0006) via documented
+  alternatives; none missing.
+
+### ADR assessment (from REVIEW)
+
+- ADR-0002, 0003, 0004, 0005: sound and properly reflected in code.
+- ADR-0006: rationale correct and evidence-backed; does not mitigate the
+  trailing-byte blindspot (→ I1). Amend "Consequences" or land ADR-0007
+  during the state-3 loop-back.
+
+State 5 complete. Next session loops back to state 3 via
+`superpowers:subagent-driven-development` to fix I1, I2, I3 (rustdoc
+portion), optionally M3, then re-enters state 4 (CI re-verify) and
+state 5 (re-review) for a final pass.
