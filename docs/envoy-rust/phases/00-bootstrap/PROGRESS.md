@@ -71,3 +71,9 @@
 - Change: appended `drive_tcp(addr, payload)` + `run_fixture(fixture_dir)` to `tests/differential/src/lib.rs` — orchestrates upstream Envoy via testcontainers + envoy-rust subprocess, renders both YAMLs against a shared port + `CONTAINER_PORT`, drives identical payloads, asserts byte-exact equivalence, cleans up on failure. Moved `tempfile` from `[dev-dependencies]` to `[dependencies]` (used at runtime now).
 - Verification: `cargo build --workspace --all-targets` → 0; clippy + fmt --check → 0; `cargo test --workspace` → 21 passed, 1 ignored; cargo deny check → all ok.
 - Deviation: brief appended new items after the `#[cfg(test)] mod tests` block; clippy's `items-after-test-module` lint rejects that at `-D warnings`. Hoisted the new `use` statements into the top import block and moved `drive_tcp` + `run_fixture` directly above the test module (semantically equivalent; matches the brief's own "let autofix hoist them" escape clause).
+
+## Task 14 — differential echo_fixture acceptance test (2026-04-23)
+- Commit: e5e24b2
+- Change: `tests/differential/tests/echo.rs` — single `#[tokio::test] echo_fixture` that invokes `differential::run_fixture` against `tests/fixtures/0001-tcp-echo`.
+- Verification: `cargo build --workspace --all-targets` → 0; clippy + fmt --check → 0; `cargo test --workspace --lib --bins` → 21 passed (Tasks 1–13 regression intact).
+- Deviation: did NOT run `cargo test --workspace --test echo` locally — the local Docker daemon has an IPv6 routing bug (documented in Task 3 deviation); CI will validate the acceptance test per the phase-done gate (§7.5.a).
