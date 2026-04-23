@@ -1,0 +1,69 @@
+# cargo-deny configuration for envoy-rust.
+#
+# Enforces doctrine rule D-3.2 ("Forbidden, without exception: GPL-licensed code")
+# and doctrine rule D-3.6 ("Every phase is a green build") by failing CI on
+# disallowed licenses or known security advisories in the dependency tree.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Confidence threshold for detecting a license from source text.
+confidence-threshold = 0.8
+# Allow-list. If a crate's license is not in this list, the build fails.
+# All GPL variants (GPL, LGPL, AGPL) are deliberately absent — see D-3.2.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "0BSD",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Doctrine D-3.2 forbidden-dependency list. These are hard-denied at the
+# workspace root; pulling them in as a direct dependency fails cargo-deny.
+# (Transitive pulls through permitted foundations — notably `hyper` and
+# `tower` via `tonic` — are allowed and must be enforced instead via
+# workspace-level import bans inside individual crates.)
+deny = [
+    { name = "hyper" },
+    { name = "hyper-util" },
+    { name = "axum" },
+    { name = "actix-web" },
+    { name = "warp" },
+    { name = "rocket" },
+    { name = "poem" },
+    { name = "pingora" },
+    { name = "sozu" },
+    { name = "tower" },
+    { name = "tower-service" },
+    { name = "tower-http" },
+]
+# Exemptions for transitive dependencies of permitted foundations. When phase 00
+# or a later phase lands dependencies that legitimately pull these in
+# transitively (e.g. tonic → hyper/tower), add `skip` entries here and an ADR
+# documenting the transitive path.
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

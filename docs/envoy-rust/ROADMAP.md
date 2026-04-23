@@ -1,0 +1,84 @@
+# envoy-rust Roadmap
+
+## Schema
+
+Each phase row has the columns:
+
+- **id** — stable numeric identifier (`00`, `01`, …; sub-phases `NN.1`, `NN.2`).
+- **title** — one-line human-readable name.
+- **depends-on** — space-separated phase ids that must be `done` before this one can enter `in-progress`.
+- **status** — one of `planned | in-progress | blocked | done`.
+- **sub-phases** — if the phase has been split (§6 of `BOOTSTRAP_PROMPT.md`), list the child ids here.
+- **summary** — the differential surface this phase is expected to light up when it lands.
+
+Rules:
+
+- This file is **append-only history** — rows are never deleted. Only the `status` and `sub-phases` columns are mutated.
+- `STATE.md` names the single active phase. A phase enters `in-progress` only when `STATE.md` points at it.
+- When a phase is split, its own `status` becomes `in-progress` while its sub-phases land. The parent flips to `done` only after all sub-phases are `done`.
+
+---
+
+## MVP Trunk — phases 00 through 08
+
+Phases 00–08 ship *in order*: each adds a primitive the next relies on. Splitting (§6) is still permitted inside any of them.
+
+| id | title | depends-on | status | sub-phases | summary |
+|---|---|---|---|---|---|
+| 00 | Bootstrap: Cargo workspace layout, `rust-toolchain.toml`, `deny.toml`, CI, Docker reference Envoy, differential harness skeleton, `ENVOY_TARGET.md` pin, trivial echo fixture | — | planned | — | harness boots; one TCP echo fixture green |
+| 01 | Static bootstrap config loader (node, admin, static_resources skeleton) | 00 | planned | — | config parses; admin `/ready` behaves like Envoy |
+| 02 | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext) | 01 | planned | — | TCP proxy fixture green |
+| 03 | Downstream TLS termination + upstream TLS origination + SNI | 02 | planned | — | TLS TCP fixture green |
+| 04 | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response | 03 | planned | — | HTTP/1.1 routing fixture green |
+| 05 | HTTP/2 downstream + upstream (low-level framer, own conn mgr) | 04 | planned | — | HTTP/2 fixture green; `h2spec` above threshold |
+| 06 | Access log (file sink, Envoy default format) + stats + Prometheus admin endpoint | 05 | planned | — | access log + Prometheus fixtures green |
+| 07 | Filter chain framework: iteration protocol, per-route config, extension registry | 06 | planned | — | framework fixtures green; trivial pluggable filter covers all iteration states |
+| 08 | Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain | 07 | planned | — | admin + drain fixtures green |
+
+---
+
+## Feature Families — phases 09 and onward (headings only)
+
+These are seeded as headings only. Each family becomes one or more concrete phase rows when it enters `in-progress`, at which point it is brainstormed and split (§6) as reality demands. Do **not** expand them into per-phase rows prematurely.
+
+### HTTP filters family
+
+Header manipulation, cors, compression, fault, local+global rate limit, jwt_authn, rbac, ext_authz, ext_proc, oauth2, csrf, buffer, lua, wasm, adaptive concurrency, admission control, bandwidth limit.
+
+### Network filters family
+
+Redis, mongo, kafka_broker, thrift, zookeeper [scope TBD], echo, direct_response, sni_cluster, rbac network.
+
+### Load balancing family
+
+least_request, random, ring_hash, maglev, subset LB, locality-weighted LB, priority load balancing, panic thresholds.
+
+### Upstream robustness family
+
+Active health checks HTTP/TCP/gRPC/custom, outlier detection variants, circuit breakers, retries + hedging, per-protocol connection pooling.
+
+### HTTP/3 + QUIC family
+
+quinn transport, downstream H3 listener, upstream H3 cluster, `h3spec` gate.
+
+### gRPC family
+
+gRPC bridge, gRPC-Web, gRPC-JSON transcoding, interop conformance.
+
+### xDS / dynamic config family
+
+ADS, delta xDS, LDS, CDS, RDS, EDS, SDS, RTDS, reconnection, initial-fetch timeout.
+
+### Observability family
+
+gRPC ALS, OTLP access log, OTel/Zipkin/Jaeger/Datadog/XRay tracing, stats sinks, tap filter.
+
+### Runtime + hot restart family
+
+### WASM host family
+
+Own multi-phase sub-project; ABI, engine binding, proxy-wasm conformance.
+
+### Deprecated / edge features
+
+Explicit out-of-scope ADRs unless later re-opened.

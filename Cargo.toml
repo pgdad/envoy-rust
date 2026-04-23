@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = []
+
+# Workspace members are added as phases introduce crates under `crates/` and
+# `tests/`. Phase 00 seeds the workspace shell only; no crates exist yet.
