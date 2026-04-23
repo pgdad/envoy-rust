@@ -92,16 +92,29 @@ pub async fn wait_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> 
     }
 }
 
-/// Drive `payload` at `addr`: open TCP, write payload, half-close the write
-/// side, read to EOF. Returns the echoed bytes.
+/// Drive `payload` at `addr`: open TCP, write payload, read exactly
+/// `payload.len()` bytes of echoed response, then shut down the write side
+/// and drop the stream. Returns the echoed bytes.
+///
+/// Why `read_exact(payload.len())` instead of half-close + `read_to_end`: see
+/// `docs/envoy-rust/DECISIONS.md` ADR-0006. Upstream Envoy v1.33.0's default
+/// `ConnectionImpl` (enable_half_close_=false) translates a client FIN into
+/// `PostIoAction::Close` and calls `closeSocket(RemoteClose)` before the echo
+/// filter's queued write is flushed, so a pre-read half-close causes the
+/// response bytes to be dropped. Phase 00's only fixture (echo filter) has a
+/// deterministic 1:1 byte-count contract, so `read_exact(payload.len())` is
+/// both sufficient and matches upstream Envoy's own echo integration test
+/// pattern. Graceful write-side shutdown still fires after the read so the
+/// envoy-rust subject's echo loop exits on FIN rather than a peer reset.
 pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .with_context(|| format!("connecting to {addr}"))?;
     stream.write_all(payload).await?;
-    stream.shutdown().await?;
-    let mut out = Vec::with_capacity(payload.len());
-    stream.read_to_end(&mut out).await?;
+    let mut out = vec![0u8; payload.len()];
+    stream.read_exact(&mut out).await?;
+    stream.shutdown().await.ok();
+    drop(stream);
     Ok(out)
 }
 
@@ -217,5 +230,33 @@ mod tests {
         drop(listener);
         let result = wait_accept_ready(addr, Duration::from_millis(200)).await;
         assert!(result.is_err());
+    }
+
+    // Mirrors upstream Envoy v1.33.0's echo filter semantics per ADR-0006: the
+    // server accepts one connection, reads `payload.len()` bytes, echoes them
+    // back, and closes WITHOUT ever honoring a client half-close. A harness
+    // that half-closed before reading (the pre-ADR-0006 `drive_tcp`) would
+    // race against this close and see an empty response.
+    #[tokio::test]
+    async fn drive_tcp_round_trips_without_half_close() {
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload: &'static [u8] = b"hello, envoy-rust\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; payload.len()];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+            // Drop without waiting for a client FIN — this is what upstream
+            // Envoy's echo path does once it has written the response.
+            drop(stream);
+        });
+
+        let echoed = drive_tcp(addr, payload).await.unwrap();
+        assert_eq!(echoed, payload);
+        server.await.unwrap();
     }
 }

@@ -108,3 +108,29 @@ Each ADR uses the structure:
   - `deny.toml`'s `[bans] deny = [...]` is the authoritative direct-dep ban list. Its `wrappers` arms are the machine-checked allow-list for transitive chains. Future phases that add `tonic` (bringing its own `hyper`/`tower` leak) must extend `wrappers` with `tonic`-chain parents and update this ADR or supersede it with a follow-up. Transitive exemptions are never silent.
   - A future phase must revisit the two `[advisories].ignore` entries if/when `testcontainers` ships a bollard-free or bollard-updated release. A scheduled dependency audit is a good trigger; see the refresh-pin discipline in ADR-0004 for precedent.
   - This ADR documents that PLAN.md Task 4 Step 6's prescription was mechanically wrong (skip-tree does not exempt bans); subsequent phases must treat the `deny.toml` shape in this ADR as authoritative over the plan text.
+
+---
+
+## ADR-0006: Harness `drive_tcp` uses `read_exact(payload.len())` instead of half-close + `read_to_end`
+
+- Date: 2026-04-23
+- Status: accepted
+- Context: Phase 00 SPEC §D4 point 5 prescribed that the differential harness's per-proxy TCP driver would `write_all(payload)` → `shutdown()` (half-close the write side) → `read_to_end()`. The first CI execution of the `echo_fixture` acceptance test on `ubuntu-latest` (workflow run `24855427288`, commit `2d81b53`) returned `upstream: []` (zero bytes) and `subject: "hello, envoy-rust\n"` (18 bytes). Root cause was traced to `envoyproxy/envoy@v1.33.0` in `source/common/network/connection_impl.cc`:
+  - `ConnectionImpl::enable_half_close_` defaults to `false` (line 83 of that file at tag `v1.33.0`).
+  - In `onReadReady` (lines 698–715), when `doRead` returns `end_stream_read_ = true` (client FIN) and `enable_half_close_` is false, the code path sets `result.action_ = PostIoAction::Close` and then calls `closeSocket(ConnectionEvent::RemoteClose)` immediately after dispatching `onRead` to the filter manager.
+  - The `envoy.filters.network.echo` filter (`source/extensions/filters/network/echo/echo.cc`) echoes by calling `read_callbacks_->connection().write(data, end_stream)`. That write is queued in the connection's write buffer and flushed on a later event-loop iteration — but the `closeSocket(RemoteClose)` above executes in the same iteration and drops the pending write buffer.
+  - There is no listener-level YAML surface to enable half-close semantics in v1.33.0. The `Listener` proto at that tag has no `enable_half_close` field (`enableHalfClose()` is a C++ `Connection` method only); the only network-filter with a YAML `enable_half_close` toggle is `envoy.filters.network.tcp_proxy`, which phase 00 does not use.
+  - Envoy's own integration test for the echo filter (`test/extensions/filters/network/echo/echo_integration_test.cc`) confirms the intended client pattern: send data → wait for the data callback → `conn.close(ConnectionCloseType::FlushWrite)`. It does not half-close.
+- Options considered:
+  - **(A) Change `drive_tcp` to `write_all` → `read_exact(payload.len())` → graceful close.** Matches the echo filter's deterministic 1:1 byte-count contract, which is what phase 00's only fixture asserts (`response_body: byte_exact`). Neither fixture YAML nor the `envoy-bin` subject changes.
+  - **(B) Replace the echo fixture with a `tcp_proxy`-based bootstrap that sets `enable_half_close: true` on both the TCP-proxy filter and a loopback upstream cluster.** Requires cluster-manager + upstream-cluster scaffolding that phase 00 explicitly defers to phase 02 per SPEC §4. Out of scope.
+  - **(C) Keep half-close and switch the harness to a read-with-idle-timeout loop** (read until no bytes for N ms). Works around the symptom but does not match the echo filter's contract, and produces a new flake surface on slow CI.
+  - **(D) Patch upstream Envoy to enable half-close on plain listeners.** Prohibited by doctrine D-3.2 (no FFI/patching of upstream) and by the differential mission (the contract is the contract — match Envoy, do not fork it).
+- Decision: option (A). `drive_tcp` now writes the payload, reads exactly `payload.len()` bytes, then shuts down the write side and drops the stream.
+- Rationale: the fix is mechanical, keeps the harness entrypoint reusable for future phases, touches only `tests/differential/src/lib.rs`, and restores the byte-exact differential equivalence without reaching for filters or clusters that phase 00 doesn't ship. The response-length assumption (`payload.len()`) is specific to the echo filter's 1:1 contract; when phase 02's TCP proxy fixture lands, it will either reuse the same 1:1 property (straight TCP proxy to an echoing upstream) or extend `expectations.yaml` with an explicit `response_length` declaration so `drive_tcp` can be re-used without another ADR.
+- Consequences:
+  - SPEC §D4 point 5's specific wording ("half-closes the write side, reads to EOF") is superseded by this ADR for the `drive_tcp` helper. The SPEC itself is an immutable historical artifact; the harness implementation follows this ADR.
+  - `envoy-bin`'s echo loop (D3 step 3) continues to honor client half-close — it is the correct long-run behavior for Envoy-parity proxies, and the new `drive_tcp` exercises it implicitly (graceful `shutdown()` still fires before drop). No change to `envoy-bin`.
+  - Neither fixture YAML changes. `tests/fixtures/0001-tcp-echo/envoy.yaml` remains the minimal echo-filter listener.
+  - Phase 00's final-commit message bracketed ADR list extends from `[ADR-0002, ADR-0003, ADR-0004, ADR-0005]` to `[ADR-0002, ADR-0003, ADR-0004, ADR-0005, ADR-0006]`.
+  - If a future phase needs genuine half-close semantics in the harness (e.g. to test a filter that expects client FIN as a trigger), that phase lands a new ADR — likely selecting option (B) since by then the cluster manager will exist.
