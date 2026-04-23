@@ -39,3 +39,8 @@
 - Change: `crates/envoy-bin/src/echo.rs` with async `serve(listener, shutdown)`, per-connection `echo_once`, JoinSet-based 5s drain + timeout-abort; 2 `#[tokio::test]`s (single-payload + concurrent). `mod echo;` registered in main.rs.
 - Verification: `cargo test -p envoy-bin --bin envoy-bin echo::tests` → 2 passed; clippy + fmt --check → 0.
 - Deviation: the brief's echo module requires `tokio::time::timeout` and `tokio::sync::oneshot`, but the envoy-bin Cargo.toml from Task 4 did not enable those tokio features. Added `"time"` and `"sync"` to the tokio feature list to make the code (and its tests) compile. This also lands in the same commit.
+
+## Task 8 — envoy-bin main wiring (2026-04-23)
+- Commit: 19afe3d
+- Change: removed crate-root `#![allow(dead_code)]` + comment; wired `main() -> ExitCode` with argv parse → explicit multi-thread tokio runtime → `run()` (config load + TcpListener::bind + `echo::serve`) → `shutdown_signal()` (SIGTERM/SIGINT via `tokio::signal::unix`); added `install_tracing()` reading `ENVOY_RUST_LOG`.
+- Verification: `cargo build -p envoy-bin --release` → 0; clippy + fmt --check → 0; `cargo test -p envoy-bin` → 13 passed (5 config + 6 argv + 2 echo); binary smoke test with no args → stderr matches `envoy-bin: expected exactly one of …`, exit 2.
