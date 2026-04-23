@@ -44,3 +44,8 @@
 - Commit: 19afe3d
 - Change: removed crate-root `#![allow(dead_code)]` + comment; wired `main() -> ExitCode` with argv parse → explicit multi-thread tokio runtime → `run()` (config load + TcpListener::bind + `echo::serve`) → `shutdown_signal()` (SIGTERM/SIGINT via `tokio::signal::unix`); added `install_tracing()` reading `ENVOY_RUST_LOG`.
 - Verification: `cargo build -p envoy-bin --release` → 0; clippy + fmt --check → 0; `cargo test -p envoy-bin` → 13 passed (5 config + 6 argv + 2 echo); binary smoke test with no args → stderr matches `envoy-bin: expected exactly one of …`, exit 2.
+
+## Task 9 — differential harness helpers (2026-04-23)
+- Commit: 6c909c0
+- Change: `tests/differential/src/lib.rs` with `Expectations`/`Equivalence`/`BodyRule`, `load_expectations`, `reserve_port` (TOCTOU-accepted), `render_yaml`, `write_temp`, `wait_accept_ready` (50ms→500ms exp. backoff) + 6 tests. Placeholders `subject.rs` and `upstream.rs` (filled in Tasks 11 and 10).
+- Verification: `cargo test -p differential --lib` → 6 passed; clippy + fmt --check → 0.
