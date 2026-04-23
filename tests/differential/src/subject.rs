@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use tokio::process::{Child, Command};
 
 /// A running envoy-rust subprocess. Dropping aborts it; calling `shutdown`
-/// sends SIGTERM and waits for clean exit.
+/// sends SIGKILL (via tokio's `start_kill`) and waits for the process to exit.
 pub struct Subject {
     child: Option<Child>,
     port: u16,
@@ -21,6 +21,15 @@ impl Subject {
     /// up to `budget` for it to exit. Graceful-drain on SIGTERM is covered by
     /// envoy-bin's own unit tests in Task 7; this harness path only needs the
     /// process to end deterministically between fixture runs.
+    //
+    // TODO(phase-01): switch to SIGTERM + drain-wait + SIGKILL-escalate so the
+    // harness exercises envoy-bin's graceful-drain path. That requires sending
+    // POSIX signals to a `tokio::process::Child` (stable tokio exposes only
+    // `start_kill` = SIGKILL on Unix), which means adopting the `nix` crate.
+    // `nix` is not on the D-3.2 permitted-foundations list for phase 00, so
+    // the switch is deferred to phase 01 under its own ADR. Until then this
+    // harness relies on SIGKILL for deterministic between-fixture teardown;
+    // SIGTERM drain behavior is validated by the envoy-bin unit tests.
     pub async fn shutdown(&mut self, budget: Duration) -> Result<()> {
         let Some(mut child) = self.child.take() else {
             return Ok(());
