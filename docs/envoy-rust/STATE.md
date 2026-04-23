@@ -10,73 +10,77 @@
 **id:** `00`
 **slug:** `00-bootstrap`
 **directory:** `docs/envoy-rust/phases/00-bootstrap/`
-**status:** `in-progress` (state 3 loop-back fixes landed; next session re-enters state 4)
+**status:** `in-progress` (state 4 re-verification green on CI; next session enters state 5 re-review)
 
 ## Next expected skill
 
-`superpowers:verification-before-completion` — re-run the five
-phase-done gate commands on CI (`ubuntu-latest`) for HEAD `fca3aba`,
-quote outputs into a new "State 4 — Re-verification" section of
-`phases/00-bootstrap/PROGRESS.md`, then advance STATE to state 5 for the
-re-review pass. REVIEW.md's final recommendation expects **Approved**
-on this round (all three Important items resolved, plus M3 folded in).
+`superpowers:requesting-code-review` — re-review pass (state 5) scoped
+to phase 00 against HEAD `a1c8194`, with the three Important items and
+the folded-in M3 from the prior REVIEW.md all resolved. Produce an
+updated REVIEW.md (supersede or append per the file's own conventions).
+If the verdict is **Approved**, the following session advances to
+state 6 (final commit per BOOTSTRAP_PROMPT §5.3 + ROADMAP row → done).
+If any new Important/Critical issues surface, route back to state 3 per
+`SKILL_ROUTING.md` line 42.
 
-State 3 loop-back completed in this session via
-`superpowers:subagent-driven-development` with four atomic commits,
-each paired with a spec-compliance review and a code-quality review
-pass before moving to the next task. Per-task detail lives in
-`phases/00-bootstrap/PROGRESS.md` under "State 3 (loop-back) — REVIEW
-fixes":
+State 4 re-verification closed in this session against CI run
+`24859537419` (HEAD `a1c81942292559246805029744083ff1605f1c2f`,
+`ubuntu-latest`, total job time **1m 3s**, conclusion **success**). All
+five phase-done gate commands exited 0 with zero regressions vs. the
+Attempt 2 baseline (`24856364702`, HEAD `5355311`):
+
+- `cargo fmt --all -- --check` → success (no diff).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → success; cache-warm Finished in 3.78s.
+- `cargo build --workspace --all-targets` → success; cache-warm Finished in 8.93s.
+- `cargo test --workspace` → success; **28 passed, 0 failed, 1 ignored** (the ignored is the docker-gated `upstream::tests::starts_upstream_envoy_and_exposes_host_port`). `echo_fixture` passed in 8.01s. All three new loop-back regression tests (`drive_tcp_rejects_trailing_bytes_after_echo`, the tightened `rejects_duplicate_config_flag`, and the four M3 `deny_unknown_fields` tests) all pass.
+- `cargo deny check` → success; tail `advisories ok, bans ok, licenses ok, sources ok`. Seven informational warnings carried forward unchanged from prior runs (1× duplicate `wit-bindgen`, 6× unmatched-license allowances) — not failures.
+
+Pushed commits `e1771c3..a1c8194` to `origin/main` to fire CI; the new
+tip `a1c8194` is documentation-only (`STATE.md` + `PROGRESS.md`) so the
+code under verification equals the review-target HEAD `fca3aba`. Full
+step-by-step CI evidence is quoted in the new "State 4 —
+Re-verification" section of `phases/00-bootstrap/PROGRESS.md`.
+
+State 3 loop-back detail (four atomic commits with per-task
+spec-compliance + code-quality reviews via
+`superpowers:subagent-driven-development`) remains in the earlier
+"State 3 (loop-back) — REVIEW fixes" section of PROGRESS.md:
 
 - **I1** → `245a65f` `phase 00: drive_tcp trailing-byte check [ADR-0007]`
-  — trailing-byte poll (100ms deadline) after `read_exact`, new
-  regression test `drive_tcp_rejects_trailing_bytes_after_echo`, and
-  **ADR-0007** landed append-only in `DECISIONS.md` cross-referencing
-  ADR-0006. Phase-00 final-commit bracketed ADR list now extends to
+  — trailing-byte poll (100ms deadline) after `read_exact`, regression
+  test `drive_tcp_rejects_trailing_bytes_after_echo`, **ADR-0007**
+  landed append-only in `DECISIONS.md` cross-referencing ADR-0006. The
+  phase-00 final-commit bracketed ADR list is
   `[ADR-0002, ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0007]`.
 - **I2** → `ba17ee3` `phase 00: assert! wrap on rejects_duplicate_config_flag`
   — `matches!(...)` wrapped in `assert!(...)` so the test actually
   asserts the `ArgvError::Trailing(_)` variant.
 - **I3** (rustdoc portion) → `18bbfde`
   `phase 00: Subject rustdoc — SIGKILL, not SIGTERM` — struct-level doc
-  corrected, `TODO(phase-01)` block added citing the `nix`-crate
-  blocker for the functional switch. No behavior change.
+  corrected, `TODO(phase-01)` block added citing the `nix`-crate blocker
+  for the functional switch. No behavior change.
 - **M3** (folded in) → `fca3aba`
   `phase 00: deny_unknown_fields on YAML schemas` — attribute on 9
   YAML-parsed structs plus four root/nested regression tests.
   `BodyRule` correctly skipped (unit-variant enum).
 
-Verification gate ran locally green before the loop-back closed
-(`cargo build / clippy -D warnings / fmt --check / test --workspace /
-deny check` all exit 0; 28 tests passed + 1 docker-gated ignored).
-The `echo_fixture` acceptance test passed locally this session (Docker
-was cooperative); CI on `ubuntu-latest` remains the authoritative
-validator per the Task 3 local-Docker caveat, which is the purpose of
-the next session's state 4 pass.
-
-State 4 (verification) on HEAD `5355311` remains complete from the
-prior iteration: all five phase-done gate commands exited 0 on
-`ubuntu-latest` CI (workflow run `24856364702`, URL
-https://github.com/pgdad/envoy-rust/actions/runs/24856364702). The next
-session's state 4 re-pass targets the new HEAD (`fca3aba`) to confirm
-no regressions from the four loop-back commits.
-
 ## Last commit
 
-`phase 00: deny_unknown_fields on YAML schemas` (`fca3aba`) — closes
-the state-3 loop-back. Four commits (`245a65f`, `ba17ee3`, `18bbfde`,
-`fca3aba`) land ADR-0007 plus fixes for REVIEW.md I1, I2, I3 (rustdoc),
-and M3. This commit itself adds `#[serde(deny_unknown_fields)]` to all
-9 YAML-parsed structs and four root/nested regression tests.
+`phase 00: state 3 loop-back close — PROGRESS entries + STATE advance`
+(`a1c8194`) — documentation-only: appended the "State 3 (loop-back) —
+REVIEW fixes" section to PROGRESS.md summarising the four loop-back fix
+commits and advanced STATE.md to route the next session into state 4.
+The code under state 4 re-verification is therefore identical to HEAD
+`fca3aba`.
 
 ## Last updated
 
-2026-04-23 (state 3 loop-back close)
+2026-04-23 (state 4 re-verification CI-green; routing advanced to state 5 re-review)
 
 ## Notes
 
-- SPEC.md landed 2026-04-23; PLAN.md landed 2026-04-23; implementation (state 3) completed 2026-04-23 via `superpowers:subagent-driven-development`; state 4 verification completed 2026-04-23 after one iteration (initial CI failure on `echo_fixture` → `superpowers:systematic-debugging` → ADR-0006 + harness fix → CI green).
-- Per `BOOTSTRAP_PROMPT.md` §5.1, sessions move exactly one state forward. Prior sessions ran state 4 (verified) → state 5 (REVIEW.md: Approved with fixes; 3 Important + 8 Minor). Per `SKILL_ROUTING.md` line 42, state 5 with issues routed the next session back to state 3. This session ran that state 3 loop-back (four atomic fix commits with spec + code-quality review per task) and now exits. The next session re-enters state 4 (`superpowers:verification-before-completion`) against the new HEAD `fca3aba`.
+- SPEC.md landed 2026-04-23; PLAN.md landed 2026-04-23; implementation (state 3) completed 2026-04-23 via `superpowers:subagent-driven-development`; state 4 verification completed 2026-04-23 after one iteration (initial CI failure on `echo_fixture` → `superpowers:systematic-debugging` → ADR-0006 + harness fix → CI green); state 5 review 2026-04-23 returned Approved-with-fixes (3 Important + 8 Minor); state 3 loop-back closed 2026-04-23 (four atomic fix commits with per-task spec + code-quality review); **state 4 re-verification 2026-04-23 green on CI run `24859537419` with zero regressions**.
+- Per `BOOTSTRAP_PROMPT.md` §5.1, sessions move exactly one state forward. This session ran state 4 re-verification and now exits; the next session enters state 5 (`superpowers:requesting-code-review`) for the re-review pass against HEAD `a1c8194`. If that review returns Approved, the following session advances to state 6 (final phase commit + ROADMAP row → done).
 - Deviations captured during state 3 (see `docs/envoy-rust/phases/00-bootstrap/PROGRESS.md` for full detail):
   - **ADR-0005 landed** — `skip-tree` in cargo-deny 0.19.4 only affects the `multiple-versions` check, not `[bans] deny`. Corrected the plan's Task 4 Step 6 by using `wrappers` on `hyper`/`hyper-util`/`tower-service` plus `[advisories].ignore` for RUSTSEC-2025-0111 (tokio-tar) and RUSTSEC-2025-0134 (rustls-pemfile).
   - Local Docker daemon DNS/IPv6 routing bug: Task 3 resolved the `envoyproxy/envoy:v1.33.0` digest via the Docker Hub public API; Task 10's `#[ignore]`d integration test and Task 14's acceptance test were NOT run locally and relied on CI for validation.

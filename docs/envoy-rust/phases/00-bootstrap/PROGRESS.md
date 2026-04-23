@@ -416,3 +416,47 @@ phase-done gate commands on CI (`ubuntu-latest`) for HEAD `fca3aba`,
 quote outputs into a new "State 4 — Re-verification" section, then
 state 5 (`superpowers:requesting-code-review` re-pass) for the Approved
 verdict the REVIEW.md final recommendation anticipates.
+
+## State 4 — Re-verification (2026-04-23)
+
+Ran `superpowers:verification-before-completion` against CI to confirm
+the four state-3 loop-back commits (`245a65f`, `ba17ee3`, `18bbfde`,
+`fca3aba`) did not regress the phase-done gate. Six unpushed commits
+were pushed `e1771c3..a1c8194`; the new tip `a1c8194` is a
+documentation-only commit (`STATE.md` + `PROGRESS.md`), so the code
+under verification is identical to the review-target HEAD `fca3aba`.
+
+### CI gate (`ubuntu-latest`, run `24859537419`, HEAD `a1c81942292559246805029744083ff1605f1c2f`)
+
+Run conclusion: `success`. Total job time: **1m 3s**. URL:
+https://github.com/pgdad/envoy-rust/actions/runs/24859537419
+
+- Step `fmt` (`cargo fmt --all -- --check`) → `success`; no diff emitted (step completed in <1s).
+- Step `clippy` (`cargo clippy --workspace --all-targets --all-features -- -D warnings`) → `success`; `Finished dev profile target(s) in 3.78s` (cache-warm run).
+- Step `build` (`cargo build --workspace --all-targets`) → `success`; `Finished dev profile target(s) in 8.93s` (cache-warm run).
+- Step `test (includes differential harness → Docker)` (`cargo test --workspace`) → `success`:
+    - `differential` lib (`target/debug/deps/differential-0dd6d9f7b2e1f8c5`): `test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.41s`.
+      - The ignored test is the Docker-gated `upstream::tests::starts_upstream_envoy_and_exposes_host_port` (annotated `ignored, requires Docker; runs under cargo test --workspace in CI`).
+      - The new I1 regression test `tests::drive_tcp_rejects_trailing_bytes_after_echo` is present and passes (line-quoted from run log: `test tests::drive_tcp_rejects_trailing_bytes_after_echo ... ok`).
+    - `differential` integration (`tests/echo.rs`): `test echo_fixture ... ok`, `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.01s`.
+    - `envoy-bin` bin-unit (`target/debug/deps/envoy_bin-4eca1f48f5f230a3`): `test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`.
+      - The I2-tightened `argv_tests::rejects_duplicate_config_flag` still passes.
+      - The four M3 `deny_unknown_fields` regression tests (`config::tests::rejects_unknown_bootstrap_field`, `rejects_unknown_listener_field`, plus the pre-existing `rejects_empty_listeners` / `rejects_multiple_listeners` / `rejects_non_echo_filter` / `rejects_malformed_yaml`) all pass.
+    - Doc-tests (`differential`): `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`.
+    - **Aggregate: 28 passed, 0 failed, 1 ignored** — matches the state 3 loop-back local gate exactly.
+- Step `install cargo-deny` → `success`.
+- Step `cargo deny check` → `success`; tail line quoted from run log: `advisories ok, bans ok, licenses ok, sources ok`. Seven informational warnings remain (1× `duplicate` on `wit-bindgen 0.51.0` vs `0.57.1`, both transitive through `tempfile` → `getrandom` → `wasip2`/`wasip3`; 6× `license-not-encountered` for permitted-but-unused licenses `0BSD`, `BSD-2-Clause`, `CC0-1.0`, `MPL-2.0`, `Unicode-DFS-2016`, `Zlib`) — identical set to the prior two CI passes; none are errors.
+
+### Gate outcome per `BOOTSTRAP_PROMPT.md` §7.5
+
+- (a) `tests/fixtures/0001-tcp-echo/` → **green** (`echo_fixture ... ok`, 1/1 passed in 8.01s on CI).
+- (b) no pre-existing differential fixtures → nothing else to regress.
+- (c) no conformance suites this phase → n/a.
+- (d) no fuzz targets this phase → n/a.
+- (e) `cargo build / clippy -D warnings / fmt --check / test --workspace / deny check` → all clean on CI with zero regressions vs. Attempt 2 (`24856364702`).
+- (f) REVIEW.md → state 5 re-review pass pending.
+
+State 4 re-verification complete. Next session enters state 5 via
+`superpowers:requesting-code-review` for the re-review pass expected to
+return **Approved** (all three Important items and the folded-in M3
+resolved per REVIEW.md's final recommendation).
