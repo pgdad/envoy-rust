@@ -65,3 +65,9 @@
 - Commit: a03857a
 - Change: `tests/fixtures/0001-tcp-echo/{envoy.yaml, envoy-rust.yaml, inputs/payload.bin, expectations.yaml, README.md}` — first differential fixture.
 - Verification: payload.bin = 18 bytes; envoy-rust.yaml + expectations.yaml both parse with basic YAML structure validation (grep key-value pairs).
+
+## Task 13 — differential run_fixture orchestrator (2026-04-23)
+- Commit: 521b62f
+- Change: appended `drive_tcp(addr, payload)` + `run_fixture(fixture_dir)` to `tests/differential/src/lib.rs` — orchestrates upstream Envoy via testcontainers + envoy-rust subprocess, renders both YAMLs against a shared port + `CONTAINER_PORT`, drives identical payloads, asserts byte-exact equivalence, cleans up on failure. Moved `tempfile` from `[dev-dependencies]` to `[dependencies]` (used at runtime now).
+- Verification: `cargo build --workspace --all-targets` → 0; clippy + fmt --check → 0; `cargo test --workspace` → 21 passed, 1 ignored; cargo deny check → all ok.
+- Deviation: brief appended new items after the `#[cfg(test)] mod tests` block; clippy's `items-after-test-module` lint rejects that at `-D warnings`. Hoisted the new `use` statements into the top import block and moved `drive_tcp` + `run_fixture` directly above the test module (semantically equivalent; matches the brief's own "let autofix hoist them" escape clause).
