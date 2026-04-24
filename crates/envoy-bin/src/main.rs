@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 
-mod config;
 mod echo;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,7 +97,7 @@ fn install_tracing() {
 async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("reading config at {}", config_path.display()))?;
-    let bootstrap = config::parse_bootstrap(&yaml)?;
+    let bootstrap = envoy_config::parse_bootstrap(&yaml)?;
     let sock = &bootstrap.static_resources.listeners[0]
         .address
         .socket_address;
