@@ -51,3 +51,9 @@
 - Change: rewrote .github/workflows/ci.yml to define two parallel jobs: 'build' (renamed from the pre-existing 'build-test-lint' job; unchanged cargo fmt/clippy/build/test/deny sequence) and 'fuzz' (new; nightly toolchain + rust-src component + cargo-fuzz install --locked + cargo fuzz run parse_bootstrap -- -max_total_time=30 under working-directory crates/envoy-config). Concurrency group 'ci-${{ github.ref }}' with cancel-in-progress: true; permissions: contents: read; timeout-minutes: 30 for build, 15 for fuzz.
 - Verification: `python3 -c 'import yaml,sys; yaml.safe_load(open(".github/workflows/ci.yml"))'` → ok; `cargo fmt --all -- --check` → 0; `cargo deny check` → advisories ok, bans ok, licenses ok, sources ok; `cargo test --workspace` → 42 passed + 1 ignored (unchanged).
 - CI push-and-watch deferred to Task 19 (state-4 phase-done gate), per PLAN Step 4.
+
+## Task 8 — ADR-0011 defer response-header equivalence (2026-04-24)
+
+- Commit: 31c7017
+- Change: appended ADR-0011 (phase 01 asserts status + body equivalence only; header-allow-list population deferred to phase 04 when the HCM response-header pipeline lands). Locks in `server: envoy-rust` divergence from upstream's `server: envoy` as tolerated until phase 04. BEHAVIOR_CONTRACT.md remains untouched (its "Header allow-list" subsection stays empty per the "populated starting phase 04" convention).
+- Verification: `grep -c '^## ADR-00' docs/envoy-rust/DECISIONS.md` → 11; `grep -n '^## ADR-00' docs/envoy-rust/DECISIONS.md | tail -3` shows ADR-0009/0010/0011 in ascending line order.
