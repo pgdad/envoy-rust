@@ -1,0 +1,4 @@
+corpus/parse_bootstrap/*
+!corpus/parse_bootstrap/minimal.yaml
+artifacts/
+target/

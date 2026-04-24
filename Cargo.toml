@@ -5,6 +5,9 @@ members = [
     "crates/envoy-config",
     "tests/differential",
 ]
+exclude = [
+    "crates/envoy-config/fuzz",
+]
 
 # Workspace members grow as later phases introduce crates. Phase 00 lands the
 # binary (`crates/envoy-bin`) and the differential harness (`tests/differential`).

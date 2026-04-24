@@ -1,0 +1,13 @@
+node:
+  id: envoy-rust-fuzz-seed
+  cluster: envoy-rust-fuzz-seed
+
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 10000
+
+static_resources:
+  listeners: []
+  clusters: []

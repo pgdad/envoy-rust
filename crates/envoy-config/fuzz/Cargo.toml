@@ -1,0 +1,20 @@
+[package]
+name = "envoy-config-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+envoy-config = { path = ".." }
+
+[[bin]]
+name = "parse_bootstrap"
+path = "fuzz_targets/parse_bootstrap.rs"
+test = false
+doc = false
+bench = false
