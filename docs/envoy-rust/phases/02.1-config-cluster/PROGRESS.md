@@ -81,3 +81,12 @@
 - Verification (lint): `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0 (fixed two `clippy::let_unit_value` hits in `drain_exits_within_budget` caused by the plan's `let result = ...` + `let _ = result;` pattern — inlined the chain since the return type is `()`); `cargo fmt --all -- --check` → exit 0 (reformatted `run_on` signature and `tracing::warn!` call to satisfy the 100-char column limit).
 - Verification (deny): `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (no new license surface from `tokio "time"` + `"sync"` features).
 - Self-review: `grep '#\[allow(dead_code)\]' tests/helpers/tcp-echo-server/src/main.rs` → 0 matches (confirmed).
+
+## Task 11 — decode_chunked unit tests / phase-01 I3 close-out (2026-04-24)
+
+- Commit: 535e6f9 ("phase 02.1: decode_chunked unit tests (phase-01 I3 close-out)")
+- Change: added 4 unit tests in `tests/differential/src/lib.rs` inside the existing `#[cfg(test)] mod tests` block, placed immediately before `fixture_0001_expectations_parses_as_tcp_echo` (after the `drive_http_get_*` test group, per adjacency intent in PLAN.md). Tests: `decode_chunked_empty_stream` (`b"0\r\n\r\n"` → `Ok(vec[])`), `decode_chunked_with_chunk_extension` (`b"5;name=value\r\nhello\r\n0\r\n\r\n"` → `Ok(b"hello")`), `decode_chunked_truncated_size_line` (`b"5hello"` → `Err` containing "CRLF"), `decode_chunked_ignores_trailer_bytes` (`b"3\r\nabc\r\n0\r\nTrailer-Name: value\r\n\r\n"` → `Ok(b"abc")`). No production code changed.
+- Verification (differential): `cargo test -p differential --lib` → `test result: ok. 26 passed; 0 failed; 1 ignored` (22 pre-existing + 4 new; 1 ignored = Docker-gated `wait_accept_ready_times_out_for_closed_socket`).
+- Verification (lint): `cargo clippy -p differential --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
+- Phase-01 REVIEW §9 item **I3** is now closed.
+- Deviation: PLAN.md Step 1 says "append after the final pre-existing test", but PLAN.md's test-inventory note says "placed after the `drive_http_get_*` tests for adjacency". Chose the adjacency placement (before `fixture_0001_*`, after `drive_http_get_rejects_malformed_response`) as directed by the PLAN.md scene-setting note and the explicit SPEC priority rule ("adjacency intent wins"). This deviation is explicitly flagged in the task description and does not affect test correctness.
