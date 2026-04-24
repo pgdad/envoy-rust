@@ -8,6 +8,9 @@ use tokio::net::TcpListener;
 
 mod echo;
 
+#[allow(dead_code)]
+mod admin;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArgvError {
     NoConfigFlag,

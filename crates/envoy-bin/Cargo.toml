@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 envoy-config = { path = "../envoy-config" }
+httparse = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
