@@ -50,3 +50,11 @@
 - envoy-config count held: `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed`.
 - Workspace lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
 - Pre-existing Docker-gated `differential::admin_ready_fixture` failure unchanged (no Docker socket; pre-dates this task).
+
+## Task 8 — scaffold tcp-echo-server helper crate (2026-04-24)
+
+- Commit: 81f5f5b
+- Change: created `tests/helpers/tcp-echo-server/` binary crate with minimum-viable scaffolding: `Cargo.toml` (dependencies: `anyhow = "1"`, `thiserror = "2"`, `tokio` with features `["rt-multi-thread", "net", "io-util", "macros", "signal"]`, `tracing = "0.1"`, `tracing-subscriber` with features `["env-filter", "fmt"]`), `src/main.rs` (placeholder with `unimplemented!()` macro; Tasks 9 and 10 provide substantive runtime). Added `tests/helpers/tcp-echo-server` to root `Cargo.toml` `[workspace] members`.
+- Verification (gates): `cargo build --workspace --all-targets` → `Finished dev profile […] in 0.39s` (compiles tcp-echo-server cleanly); `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
+- Verification (tests): `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed` (unchanged). `cargo test -p envoy-cluster` → `test result: ok. 8 passed; 0 failed` (unchanged). `tcp-echo-server` contributes 0 tests.
+- Verification (deny): `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (no new license surface; `tracing-subscriber` + `anyhow` + `thiserror` already reachable transitively via `envoy-bin`, per SPEC §D3.5).
