@@ -145,20 +145,62 @@ pub struct TcpProxyConfig {
 
 pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
     let listeners = &bootstrap.static_resources.listeners;
+    let clusters = &bootstrap.static_resources.clusters;
     if listeners.len() > 1 {
         return Err(crate::ConfigError::TooManyListeners(listeners.len()));
     }
     if bootstrap.admin.is_none() && listeners.is_empty() {
         return Err(crate::ConfigError::NoRuntime);
     }
+
+    // Per-cluster invariants.
+    for cluster in clusters {
+        if cluster.load_assignment.cluster_name != cluster.name {
+            return Err(crate::ConfigError::LoadAssignmentNameMismatch {
+                cluster: cluster.name.clone(),
+                assignment: cluster.load_assignment.cluster_name.clone(),
+            });
+        }
+        let total_endpoints: usize = cluster
+            .load_assignment
+            .endpoints
+            .iter()
+            .map(|le| le.lb_endpoints.len())
+            .sum();
+        if total_endpoints == 0 {
+            return Err(crate::ConfigError::EmptyClusterEndpoints(
+                cluster.name.clone(),
+            ));
+        }
+    }
+
+    // Per-listener invariants.
     for listener in listeners {
         for chain in &listener.filter_chains {
             for filter in &chain.filters {
-                if filter.name != crate::ECHO_FILTER {
-                    return Err(crate::ConfigError::UnsupportedFilter(
-                        filter.name.clone(),
-                        crate::ECHO_FILTER,
-                    ));
+                match filter.name.as_str() {
+                    crate::ECHO_FILTER => {
+                        if filter.typed_config.is_some() {
+                            return Err(crate::ConfigError::UnexpectedTypedConfig(
+                                crate::ECHO_FILTER,
+                            ));
+                        }
+                    }
+                    crate::TCP_PROXY_FILTER => {
+                        // 02.1: TypedConfig has one variant (TcpProxy). Phase 04+ extend; migrate to match.
+                        let TypedConfig::TcpProxy(tp) = filter.typed_config.as_ref().ok_or(
+                            crate::ConfigError::MissingTypedConfig(crate::TCP_PROXY_FILTER),
+                        )?;
+                        if !clusters.iter().any(|c| c.name == tp.cluster) {
+                            return Err(crate::ConfigError::UnknownCluster(tp.cluster.clone()));
+                        }
+                    }
+                    _ => {
+                        return Err(crate::ConfigError::UnsupportedFilter(
+                            filter.name.clone(),
+                            crate::ECHO_FILTER,
+                        ));
+                    }
                 }
             }
         }
@@ -326,11 +368,11 @@ admin:
     // --- Negative validation ---
 
     #[test]
-    fn rejects_non_echo_filter() {
-        let yaml = MINIMAL.replace(
-            "envoy.filters.network.echo",
-            "envoy.filters.network.tcp_proxy",
-        );
+    fn rejects_unknown_filter_name() {
+        // Phase 02.1 widens the validator allow-list from {echo} to
+        // {echo, tcp_proxy}. Pick a filter name that sits outside this
+        // allow-list (rbac lands in phase 09's network-filter family).
+        let yaml = MINIMAL.replace("envoy.filters.network.echo", "envoy.filters.network.rbac");
         let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
         assert!(
             matches!(err, crate::ConfigError::UnsupportedFilter(_, _)),
@@ -693,6 +735,40 @@ static_resources:
     }
 
     #[test]
+    fn rejects_tcp_proxy_without_typed_config() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::MissingTypedConfig(_)),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
     fn rejects_lb_policy_least_request() {
         let yaml = r#"
 static_resources:
@@ -716,5 +792,275 @@ static_resources:
             msg.contains("unknown variant") || msg.contains("LEAST_REQUEST"),
             "expected serde tagged-enum rejection; got {msg}",
         );
+    }
+
+    #[test]
+    fn rejects_echo_with_typed_config() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.echo
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::UnexpectedTypedConfig(_)),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_tcp_proxy_naming_missing_cluster() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress
+                cluster: nonexistent
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::UnknownCluster(ref s) if s == "nonexistent"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_load_assignment_cluster_name_mismatch() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: drift
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+  listeners: []
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::LoadAssignmentNameMismatch { ref cluster, ref assignment }
+                    if cluster == "backend" && assignment == "drift"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_empty_lb_endpoints() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints: []
+  listeners: []
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyClusterEndpoints(ref s) if s == "backend"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_endpoint_address() {
+        // Parse-layer *acceptance*: serde sees a valid Address/SocketAddress
+        // shape (address: String, port_value: u16). The SocketAddr parse
+        // failure surfaces in envoy-cluster::from_bootstrap at construction
+        // time (see envoy-cluster Task 7's ClusterError::EndpointParse test).
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: not-a-host
+                      port_value: 10001
+  listeners: []
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("serde accepts; SocketAddr parse defers");
+        assert_eq!(
+            b.static_resources.clusters[0].load_assignment.endpoints[0].lb_endpoints[0]
+                .endpoint
+                .address
+                .socket_address
+                .address,
+            "not-a-host",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_load_assignment_field() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+        bogus_la_field: 1
+  listeners: []
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_locality_lb_endpoints_field() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+            bogus_lle_field: 1
+  listeners: []
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_lb_endpoint_field() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+                bogus_lbe_field: 1
+  listeners: []
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_endpoint_field() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+                  bogus_ep_field: 1
+  listeners: []
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
     }
 }
