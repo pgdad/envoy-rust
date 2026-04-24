@@ -187,3 +187,47 @@ Run conclusion: `success`. URL: https://github.com/pgdad/envoy-rust/actions/runs
 
 State 4 verification complete. Next session enters state 5 via
 `superpowers:requesting-code-review`.
+
+## State 5 — Code review + I1/I2 close-out (2026-04-24)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 5 (verified → `superpowers:requesting-code-review` → `REVIEW.md`). State-5 work spanned two commits in one session.
+
+### Review dispatch
+
+- Range reviewed: `aef36ce..95a26a7` (20 files changed, +6628/-108; ~1500 LoC net code once doc-only sibling/parent SPEC files are factored out).
+- Reviewer: `superpowers:code-reviewer` subagent.
+- Initial verdict (HEAD `95a26a7`): **Approved with fixes** — no Critical, 3 Important (I1 Cargo.lock drift, I2 STATE.md stale, I3 positive `ClusterType::Static` test), 4 Minor (M1 `Cluster.name` accessor, M2 `echoes_round_trip` ordering awareness, M3 dead `|| msg.contains("CRLF")` disjunct, M4 style-only `Arc::clone` in `.map`).
+
+### I1 close-out — Cargo.lock sync (commit `dea4d16`)
+
+- Diff: `Cargo.lock` only, +19 lines, 2 new `[[package]]` stanzas (`envoy-cluster v0.0.0` + `tcp-echo-server v0.0.0`) matching the dependency sets declared in `crates/envoy-cluster/Cargo.toml` and `tests/helpers/tcp-echo-server/Cargo.toml`. No version bumps, no transitive additions.
+- `cargo check --workspace` re-runs clean without further drift.
+- Phase-01 precedent followed: `4955252` shape (single-file commit, narrative message enumerating the phase tasks that caused the drift).
+
+### I2 close-out — STATE.md advance (commit `379937b`)
+
+- Landed in the same commit as `REVIEW.md`. STATE.md `status:` advanced from "state 3 (PLAN.md exists, implementation incomplete)" to "state 5 (REVIEW.md approved; state-6 next)". "Next expected skill" rewritten for the state-6 phase-done gate.
+
+### Final state-5 verdict
+
+- **Approved** (REVIEW.md §7). I3 tracked forward to whichever phase extends `ClusterType` (likely phase 04+). M1 tracked to 02.2; M3 tracked to 02.2 harness touches; M2 and M4 flagged as awareness-only.
+- CI run `24912845960` (HEAD `379937b`) both jobs `success` (81s + 62s), matching the state-4 gate profile. State-5 REVIEW landing did not regress the build.
+
+Next session enters state 6 via the phase-done commit per `BOOTSTRAP_PROMPT.md` §5.3.
+
+## State 6 — Phase-done final commit (2026-04-24)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 6 (reviewed and approved → final commit + ROADMAP flip + STATE advance).
+
+- `docs/envoy-rust/ROADMAP.md` row 02.1 status flipped from `planned` to `done` (MVP Trunk table line 31). Row 02 (parent) stays `in-progress` per the ROADMAP schema; row 02.2 stays `planned`. Parent row 02 flips to `done` only in the same commit as 02.2's final phase-done commit.
+- `docs/envoy-rust/STATE.md` rewritten for phase 02.2: active id `02.2`, slug `02.2-listener-tcp-proxy`, lifecycle state 2 (SPEC.md already in-tree from the ADR-0013 split at `1c38ca9`; skipping state 1), next-skill `superpowers:writing-plans`. Phase-02.1 REVIEW rollovers (I3 forward to phase that extends `ClusterType`, M1/M3 to 02.2, M2/M4 awareness-only) carried forward in the Notes section alongside the pre-existing phase-01 rollovers (I4 + M1, both open for 02.2) and phase-00 deferrals.
+- This final PROGRESS entry lands in the same commit as the ROADMAP flip and STATE advance.
+
+Commit subject per `BOOTSTRAP_PROMPT.md` §5.3:
+`phase 02.1: Config schema + cluster manager + echo-server helper [ADR-0014]`.
+
+Phase 02.1 is now complete. The `envoy-config` crate extends the Bootstrap schema with the full `envoy.filters.network.tcp_proxy` + `STATIC` cluster + `ROUND_ROBIN` LB grammar (typed_config envelope per ADR-0014; six new topology types; five new `ConfigError` variants; 17 new validator tests including a fuzz-corpus regression backstop). The new `envoy-cluster` crate ships a lock-free round-robin endpoint picker and `ClusterManager::from_bootstrap` with structured error discipline (thorough test coverage including 1000-thread concurrent-call stability). The new `tcp-echo-server` helper binary provides the `run_on(listener, shutdown)` testability split that 02.2's fixture 0003 will dial. Phase-01 I3 rollover closed via four new `decode_chunked` unit tests. Fuzz corpus extended with two TCP-proxy-shaped seeds (`tcp_proxy_single_endpoint.yaml`, `tcp_proxy_round_robin_triple.yaml`), backstopped by the new `fuzz_corpus_tcp_proxy_seeds_parse` regression test.
+
+Differential surface: no new fixture this sub-phase; fixtures `0001-tcp-echo` and `0002-static-admin-ready` remain green unchanged. No conformance suites. CI runs `24909836488` (HEAD `cadeaa6`, state-4 gate) and `24912845960` (HEAD `379937b`, state-5 post-REVIEW gate) both jobs `success`.
+
+Phase-02.2 starter items (REVIEW.md §3–§4): add `Cluster::name()` accessor (M1), drop dead CRLF-disjunct in `lib.rs:788–791` (M3). Combined with the pre-existing phase-01 rollovers: tighten admin 8 KiB cap (I4), retarget stale `TODO(phase-01)` in `subject.rs:25–32` (phase-01 M1). All four are opportunistic cleanups, not state-2 / state-3 blockers for 02.2.
