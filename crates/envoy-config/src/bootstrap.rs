@@ -84,6 +84,29 @@ pub struct NetworkFilter {
     pub name: String,
 }
 
+pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
+    let listeners = &bootstrap.static_resources.listeners;
+    if listeners.len() > 1 {
+        return Err(crate::ConfigError::TooManyListeners(listeners.len()));
+    }
+    if bootstrap.admin.is_none() && listeners.is_empty() {
+        return Err(crate::ConfigError::NoRuntime);
+    }
+    for listener in listeners {
+        for chain in &listener.filter_chains {
+            for filter in &chain.filters {
+                if filter.name != crate::ECHO_FILTER {
+                    return Err(crate::ConfigError::UnsupportedFilter(
+                        filter.name.clone(),
+                        crate::ECHO_FILTER,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,5 +163,285 @@ static_resources:
         assert_eq!(admin.address.socket_address.port_value, 9901);
         assert_eq!(b.static_resources.listeners.len(), 0);
         assert_eq!(b.static_resources.clusters.len(), 0);
+    }
+
+    #[test]
+    fn parses_minimal_bootstrap() {
+        let b = crate::parse_bootstrap(MINIMAL).expect("valid");
+        assert_eq!(b.static_resources.listeners.len(), 1);
+        assert_eq!(
+            b.static_resources.listeners[0]
+                .address
+                .socket_address
+                .port_value,
+            10000
+        );
+    }
+
+    // --- Positive parses ---
+
+    #[test]
+    fn parses_bootstrap_with_node_admin_empty_resources() {
+        let yaml = r#"
+node:
+  id: id-1
+  cluster: cluster-1
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid");
+        assert_eq!(b.node.as_ref().unwrap().id, "id-1");
+        assert_eq!(
+            b.admin.as_ref().unwrap().address.socket_address.port_value,
+            9901
+        );
+        assert!(b.static_resources.listeners.is_empty());
+        assert!(b.static_resources.clusters.is_empty());
+    }
+
+    #[test]
+    fn parses_bootstrap_with_admin_only() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid");
+        assert!(b.node.is_none());
+        assert!(b.admin.is_some());
+        assert!(b.static_resources.listeners.is_empty());
+    }
+
+    #[test]
+    fn parses_bootstrap_with_clusters_stub() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: cluster_0
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid");
+        assert_eq!(b.static_resources.clusters.len(), 1);
+        assert_eq!(b.static_resources.clusters[0].name, "cluster_0");
+    }
+
+    #[test]
+    fn accepts_node_with_unmodeled_field() {
+        // Node deliberately omits deny_unknown_fields (SPEC §D1 inline comment).
+        // Upstream Envoy's Node also carries metadata + locality + etc.
+        let yaml = r#"
+node:
+  id: id-1
+  cluster: cluster-1
+  metadata: { labels: { tier: edge } }
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid");
+        assert_eq!(b.node.as_ref().unwrap().id, "id-1");
+    }
+
+    // --- Negative validation ---
+
+    #[test]
+    fn rejects_non_echo_filter() {
+        let yaml = MINIMAL.replace(
+            "envoy.filters.network.echo",
+            "envoy.filters.network.tcp_proxy",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedFilter(_, _)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_listeners_with_no_admin() {
+        let yaml = "static_resources:\n  listeners: []\n";
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(matches!(err, crate::ConfigError::NoRuntime), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_bootstrap_with_neither_admin_nor_listener() {
+        // Same as rejects_empty_listeners_with_no_admin but via an empty doc.
+        let err = crate::parse_bootstrap("{}").expect_err("must reject");
+        assert!(matches!(err, crate::ConfigError::NoRuntime), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_multiple_listeners() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: a
+      address: { socket_address: { address: 0.0.0.0, port_value: 1 } }
+      filter_chains: [{ filters: [{ name: envoy.filters.network.echo }] }]
+    - name: b
+      address: { socket_address: { address: 0.0.0.0, port_value: 2 } }
+      filter_chains: [{ filters: [{ name: envoy.filters.network.echo }] }]
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::TooManyListeners(2)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_yaml() {
+        let err = crate::parse_bootstrap("::: not yaml :::").expect_err("must fail");
+        assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
+    }
+
+    // --- deny_unknown_fields regressions (SPEC §D1 + phase-00 N2 closure) ---
+
+    fn assert_unknown_field(err: crate::ConfigError) {
+        let debug_str = format!("{err:?}");
+        let display_str = format!("{err}");
+        let debug_full = format!("{err:#?}");
+        let contains_unknown = debug_str.contains("unknown field")
+            || display_str.contains("unknown field")
+            || debug_full.contains("unknown field");
+        assert!(
+            contains_unknown,
+            "expected `unknown field` in error; got debug_str={}, display_str={}, debug_full={}",
+            debug_str, display_str, debug_full
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_bootstrap_field() {
+        let yaml = format!("{MINIMAL}\nbogus_field: true\n");
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_admin_field() {
+        let yaml = r#"
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+  bogus: 1
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_cluster_field() {
+        let yaml = r#"
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+static_resources:
+  clusters:
+    - name: cluster_0
+      bogus: 1
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_listener_field() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: listener_0
+      bogus_listener_field: true
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.echo
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    // --- N2 closure: 5 deeper structs (STATE.md lines 87–90) ---
+
+    #[test]
+    fn rejects_unknown_static_resources_field() {
+        let yaml = r#"
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+static_resources:
+  bogus_sr_field: 1
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_address_field() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+    bogus_addr_field: 1
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_socket_address_field() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+      bogus_sa_field: 1
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_filter_chain_field() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: listener_0
+      address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+      filter_chains:
+        - filters: [{ name: envoy.filters.network.echo }]
+          bogus_fc_field: 1
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
+    }
+
+    #[test]
+    fn rejects_unknown_network_filter_field() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: listener_0
+      address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.echo
+              bogus_nf_field: 1
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert_unknown_field(err);
     }
 }
