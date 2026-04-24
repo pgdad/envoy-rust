@@ -33,3 +33,11 @@
 - Commit: ed02a07
 - Change: created `crates/envoy-cluster/` library crate with minimum-viable scaffolding: `Cargo.toml` (dependencies: `envoy-config` path, `thiserror = "2"`), `src/lib.rs` (module-level doc comment + stable re-export names), `src/cluster.rs` (placeholder types: `Cluster`, `ClusterHandle`, `ClusterManager`, `ClusterError`, `from_bootstrap`). Added `crates/envoy-cluster` to root `Cargo.toml` `[workspace] members` (alphabetically between `envoy-bin` and `envoy-config`). Placeholder fields annotated with `#[allow(dead_code)]` to pass clippy.
 - Verification: `cargo check --workspace` → green; `cargo clippy -p envoy-cluster --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0; `cargo test --workspace` → `test result: ok. 22 passed; 0 failed; 1 ignored` (envoy-cluster contributes 0 tests; Docker-gated `admin_ready_fixture` fails as expected); `cargo deny check` → all ok.
+
+## Task 6 — envoy-cluster::cluster round-robin endpoint picker (2026-04-24)
+
+- Commit: 35eac2e
+- Change: replaced `Cluster` and `ClusterHandle` placeholder bodies with real implementations. `Cluster` derives `Debug` and owns `name: String`, `endpoints: Vec<SocketAddr>`, and `cursor: AtomicUsize`; provides private `pick() -> Option<SocketAddr>` using `fetch_add(1, Ordering::Relaxed)` + modulo. `ClusterHandle` derives `Clone, Debug`, wraps `Arc<Cluster>`, and exposes `pub fn pick_endpoint(&self) -> Option<SocketAddr>`. Removed struct-level `#[allow(dead_code)]` from both types (fields now used); added field-level `#[allow(dead_code)]` on `name` only (used in Task 7). `ClusterManager`, `ClusterError`, and `from_bootstrap` placeholders untouched.
+- Test verification: `cargo test -p envoy-cluster` → `test result: ok. 3 passed; 0 failed` (`pick_endpoint_cycles_over_three_endpoints`, `pick_endpoint_is_stable_under_concurrent_calls`, `handle_clone_shares_cursor`).
+- envoy-config count held: `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed`.
+- Workspace lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
