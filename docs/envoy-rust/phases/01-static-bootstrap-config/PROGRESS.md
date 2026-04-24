@@ -136,3 +136,11 @@
 - TDD evidence: fixture_0002_expectations_parses_as_http_get test passes, confirming the on-disk fixture expectations YAML parses correctly as the http_get driver shape with /ready path and envoy-rust-phase-01 host. Fixture is input to Task 18's admin_ready.rs acceptance test.
 - Fixture files: all YAML files have 2-space indentation and trailing newlines. No inputs/ directory (http_get driver payload lives in expectations.yaml). Matches phase-01 fixture structure established by Task 16's 0001-tcp-echo migration.
 - Scope: exactly five files committed (envoy.yaml, envoy-rust.yaml, expectations.yaml, README.md, src/lib.rs regression test). Cargo.lock not staged.
+
+## Task 18 — `tests/differential/tests/admin_ready.rs` acceptance test (2026-04-24)
+
+- Commit: 4024a8f (code)
+- Change: created `tests/differential/tests/admin_ready.rs` with module-level doc comment explaining the phase-01 differential acceptance test (GET /ready on admin endpoint should be identical between upstream Envoy v1.33.0 and envoy-rust), single `#[tokio::test]` async function `admin_ready_fixture` that constructs the fixture path via `PathBuf` + `env!("CARGO_MANIFEST_DIR")` + three `join("..")` calls to reach `tests/fixtures/0002-static-admin-ready`, then calls `differential::run_fixture(&dir).await.expect("fixture passes")`. Mirrors the structure of phase-00's `tests/differential/tests/echo.rs` modulo fixture path and function name.
+- Verification: `cargo build --workspace --all-targets` → exit 0; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0; `cargo test -p differential --test admin_ready` → Docker-socket failure (Socket not found: /var/run/docker.sock) as expected on hosts without Docker; same behavior as echo_fixture per phase-00 Task 14 convention.
+- Test outcome: Docker-gated failure. CI-only validation per phase-00 Task 14 convention. The test successfully compiles and exercises run_fixture dispatch on the http_get driver; authoritative pass/fail will occur in CI (Task 19) where Docker is available.
+- Scope: exactly one file committed (tests/differential/tests/admin_ready.rs). Cargo.lock not staged.
