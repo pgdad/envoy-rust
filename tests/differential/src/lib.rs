@@ -179,9 +179,10 @@ pub struct HttpResponse {
 }
 
 /// Open a TCP connection to `addr`, issue a minimal `GET` for `path` with
-/// `Host: host`, and parse the response. Supports `content-length`-framed and
-/// `connection: close`-framed responses only; that is enough for phase 01's
-/// admin surface (SPEC §6 signpost 9).
+/// `Host: host`, and parse the response. Supports `content-length`-framed,
+/// `transfer-encoding: chunked`-framed, and `connection: close`-framed
+/// responses. Chunked support was added in phase 01 when upstream Envoy v1.33.0
+/// was observed returning chunked responses for `/ready` (SPEC §6 signpost 9).
 pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<HttpResponse> {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -215,6 +216,7 @@ pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<
                 let mut captured_headers: Vec<(String, Vec<u8>)> = Vec::new();
                 let mut content_length: Option<usize> = None;
                 let mut connection_close = false;
+                let mut chunked = false;
                 for h in resp.headers.iter() {
                     captured_headers.push((h.name.to_ascii_lowercase(), h.value.to_vec()));
                     if h.name.eq_ignore_ascii_case("content-length") {
@@ -225,34 +227,52 @@ pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<
                         if s.eq_ignore_ascii_case("close") {
                             connection_close = true;
                         }
+                    } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                        let s = std::str::from_utf8(h.value)?.trim();
+                        if s.eq_ignore_ascii_case("chunked") {
+                            chunked = true;
+                        }
                     }
                 }
 
                 // Drain the body.
-                let body = match content_length {
-                    Some(cl) => {
-                        let mut body = Vec::with_capacity(cl);
-                        let already = &buf[head_end..];
-                        let take = already.len().min(cl);
-                        body.extend_from_slice(&already[..take]);
-                        if body.len() < cl {
-                            let remaining = cl - body.len();
-                            let mut rest = vec![0u8; remaining];
-                            stream.read_exact(&mut rest).await?;
-                            body.extend(rest);
+                let body = if chunked {
+                    // Decode HTTP/1.1 chunked transfer encoding. Read all
+                    // wire bytes (already-buffered tail + remaining from
+                    // stream), then parse chunk frames and concatenate the
+                    // chunk data. This handles upstream Envoy v1.33.0's
+                    // habit of sending `/ready` bodies as chunked.
+                    let mut wire = buf[head_end..].to_vec();
+                    stream.read_to_end(&mut wire).await?;
+                    decode_chunked(&wire)
+                        .with_context(|| format!("{addr} chunked decoding failed"))?
+                } else {
+                    match content_length {
+                        Some(cl) => {
+                            let mut body = Vec::with_capacity(cl);
+                            let already = &buf[head_end..];
+                            let take = already.len().min(cl);
+                            body.extend_from_slice(&already[..take]);
+                            if body.len() < cl {
+                                let remaining = cl - body.len();
+                                let mut rest = vec![0u8; remaining];
+                                stream.read_exact(&mut rest).await?;
+                                body.extend(rest);
+                            }
+                            body
                         }
-                        body
+                        None if connection_close => {
+                            let mut body = Vec::new();
+                            body.extend_from_slice(&buf[head_end..]);
+                            stream.read_to_end(&mut body).await?;
+                            body
+                        }
+                        None => bail!(
+                            "{addr} response has neither `content-length` nor \
+                             `connection: close` nor `transfer-encoding: chunked`; \
+                             drive_http_get does not support keep-alive in phase 01",
+                        ),
                     }
-                    None if connection_close => {
-                        let mut body = Vec::new();
-                        body.extend_from_slice(&buf[head_end..]);
-                        stream.read_to_end(&mut body).await?;
-                        body
-                    }
-                    None => bail!(
-                        "{addr} response has neither `content-length` nor `connection: close`; \
-                         drive_http_get does not support keep-alive in phase 01",
-                    ),
                 };
 
                 return Ok(HttpResponse {
@@ -265,6 +285,44 @@ pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<
             Err(e) => bail!("{addr} response parse error: {e}"),
         }
     }
+}
+
+/// Decode HTTP/1.1 chunked transfer-encoded body bytes into plain body bytes.
+/// Each chunk has the form `<hex-size>\r\n<data>\r\n`; the last chunk is
+/// `0\r\n\r\n`. Trailer headers (if any) are ignored. Returns an error if the
+/// wire bytes do not conform to the chunked framing grammar.
+fn decode_chunked(wire: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        // Find the CRLF that terminates the chunk-size line.
+        let crlf = wire[pos..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| anyhow::anyhow!("missing CRLF after chunk size at offset {pos}"))?;
+        let size_line = std::str::from_utf8(&wire[pos..pos + crlf])
+            .context("chunk size line is not UTF-8")?
+            .trim();
+        // Strip optional chunk extensions (`;ext=val`).
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_hex, 16)
+            .with_context(|| format!("invalid chunk size hex: {size_hex:?}"))?;
+        pos += crlf + 2; // advance past size line + CRLF
+        if chunk_size == 0 {
+            // Last chunk — ignore optional trailers.
+            break;
+        }
+        if pos + chunk_size + 2 > wire.len() {
+            bail!(
+                "chunk data truncated: need {} bytes at offset {pos}, have {}",
+                chunk_size + 2,
+                wire.len() - pos,
+            );
+        }
+        out.extend_from_slice(&wire[pos..pos + chunk_size]);
+        pos += chunk_size + 2; // advance past data + trailing CRLF
+    }
+    Ok(out)
 }
 
 /// End-to-end run of one fixture. Panics-on-failure paths unwind through Drop
