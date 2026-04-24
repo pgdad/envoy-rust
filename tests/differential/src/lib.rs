@@ -485,6 +485,38 @@ equivalence:
     // returned Ok, narrowing BEHAVIOR_CONTRACT row 2's "byte-exact" contract
     // to "first N bytes match."
     #[tokio::test]
+    async fn drive_tcp_rejects_trailing_bytes_after_echo() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload: &'static [u8] = b"hello, envoy-rust\n";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; payload.len()];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(&buf).await.unwrap();
+            // Write extra trailing bytes beyond the echoed payload. A pre-
+            // ADR-0007 `drive_tcp` would not notice these.
+            stream.write_all(b"EXTRA").await.unwrap();
+            // Hold the stream open long enough that the harness's trailing-
+            // byte poll deadline sees the bytes rather than an early EOF.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(stream);
+        });
+
+        let err = drive_tcp(addr, payload)
+            .await
+            .expect_err("drive_tcp must fail when the peer writes trailing bytes");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("trailing bytes"),
+            "unexpected error message: {msg}",
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn drive_http_get_round_trips() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -601,37 +633,5 @@ equivalence:
             msg.contains("parse") || msg.contains("invalid"),
             "got: {msg}"
         );
-    }
-
-    #[tokio::test]
-    async fn drive_tcp_rejects_trailing_bytes_after_echo() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let addr = listener.local_addr().unwrap();
-        let payload: &'static [u8] = b"hello, envoy-rust\n";
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; payload.len()];
-            stream.read_exact(&mut buf).await.unwrap();
-            stream.write_all(&buf).await.unwrap();
-            // Write extra trailing bytes beyond the echoed payload. A pre-
-            // ADR-0007 `drive_tcp` would not notice these.
-            stream.write_all(b"EXTRA").await.unwrap();
-            // Hold the stream open long enough that the harness's trailing-
-            // byte poll deadline sees the bytes rather than an early EOF.
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            drop(stream);
-        });
-
-        let err = drive_tcp(addr, payload)
-            .await
-            .expect_err("drive_tcp must fail when the peer writes trailing bytes");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("trailing bytes"),
-            "unexpected error message: {msg}",
-        );
-        server.await.unwrap();
     }
 }
