@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
-//! Differential test harness for envoy-rust. Phase 00 surface: TCP echo.
+//! Differential test harness for envoy-rust. Phase 01 surface: TCP echo + HTTP
+//! admin GET.
 //!
 //! Contract: `run_fixture(fixture_dir)` starts upstream Envoy (via
 //! testcontainers) and envoy-rust (via subprocess) against the fixture's paired
-//! configs, drives the fixture's `inputs/payload.bin` at both, and asserts the
-//! responses are byte-exact equal per `expectations.yaml`.
+//! configs, then dispatches on `expectations.yaml`'s tagged `driver:` —
+//! `tcp_echo` drives `inputs/payload.bin` via `drive_tcp`; `http_get` issues
+//! a minimal `GET` via `drive_http_get`. Equivalence rules from `expectations`
+//! are enforced by `assert_equivalence` (status-exact and/or byte-exact body).
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
