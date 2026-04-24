@@ -19,21 +19,39 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub mod subject;
 pub mod upstream;
 
-/// Contents of `<fixture>/expectations.yaml`.
+/// Contents of `<fixture>/expectations.yaml`. See SPEC §D5.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Expectations {
+    pub driver: Driver,
+    #[serde(default)]
     pub equivalence: Equivalence,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Driver {
+    TcpEcho,
+    HttpGet { path: String, host: String },
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Equivalence {
-    pub response_body: BodyRule,
+    #[serde(default)]
+    pub response_status: Option<StatusRule>,
+    #[serde(default)]
+    pub response_body: Option<BodyRule>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StatusRule {
+    Exact,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BodyRule {
     ByteExact,
 }
@@ -146,7 +164,10 @@ pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
 pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let expectations = load_expectations(&fixture_dir.join("expectations.yaml"))?;
     assert_eq!(
-        expectations.equivalence.response_body,
+        expectations
+            .equivalence
+            .response_body
+            .unwrap_or(BodyRule::ByteExact),
         BodyRule::ByteExact,
         "phase 00 only understands response_body: byte_exact",
     );
@@ -210,14 +231,15 @@ mod tests {
 
     #[test]
     fn expectations_parse_byte_exact() {
-        let yaml = "equivalence:\n  response_body: byte_exact\n";
+        let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: byte_exact\n";
         let e: Expectations = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(e.equivalence.response_body, BodyRule::ByteExact);
+        assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+        assert!(matches!(e.driver, Driver::TcpEcho));
     }
 
     #[test]
     fn expectations_reject_unknown_rule() {
-        let yaml = "equivalence:\n  response_body: sorta_equal\n";
+        let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: sorta_equal\n";
         let r = serde_yaml::from_str::<Expectations>(yaml);
         assert!(r.is_err());
     }
@@ -226,27 +248,23 @@ mod tests {
     // a typo'd or unexpected top-level key rather than silently dropping it.
     #[test]
     fn expectations_reject_unknown_field() {
-        let yaml = "equivalence:\n  response_body: byte_exact\nfoo: bar\n";
+        let yaml =
+            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: byte_exact\nfoo: bar\n";
         let err = serde_yaml::from_str::<Expectations>(yaml)
             .expect_err("must reject unknown top-level field");
         let msg = err.to_string();
-        assert!(
-            msg.contains("unknown field"),
-            "unexpected error message: {msg}",
-        );
+        assert!(msg.contains("unknown field"), "unexpected: {msg}");
     }
 
     // Regression for REVIEW.md M3 at the nested `Equivalence` level.
     #[test]
     fn equivalence_reject_unknown_field() {
-        let yaml = "equivalence:\n  response_body: byte_exact\n  extra: true\n";
+        let yaml =
+            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: byte_exact\n  extra: true\n";
         let err = serde_yaml::from_str::<Expectations>(yaml)
             .expect_err("must reject unknown nested field");
         let msg = err.to_string();
-        assert!(
-            msg.contains("unknown field"),
-            "unexpected error message: {msg}",
-        );
+        assert!(msg.contains("unknown field"), "unexpected: {msg}");
     }
 
     #[test]
@@ -307,6 +325,55 @@ mod tests {
         let echoed = drive_tcp(addr, payload).await.unwrap();
         assert_eq!(echoed, payload);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn expectations_parse_tcp_echo_driver() {
+        let yaml = r#"
+driver:
+  kind: tcp_echo
+equivalence:
+  response_body: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        assert!(matches!(e.driver, Driver::TcpEcho));
+        assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+        assert_eq!(e.equivalence.response_status, None);
+    }
+
+    #[test]
+    fn expectations_parse_http_get_driver() {
+        let yaml = r#"
+driver:
+  kind: http_get
+  path: /ready
+  host: envoy-rust-phase-01
+equivalence:
+  response_status: exact
+  response_body: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match e.driver {
+            Driver::HttpGet { path, host } => {
+                assert_eq!(path, "/ready");
+                assert_eq!(host, "envoy-rust-phase-01");
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
+        assert_eq!(e.equivalence.response_status, Some(StatusRule::Exact));
+        assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+    }
+
+    #[test]
+    fn expectations_reject_unknown_driver_kind() {
+        let yaml = r#"
+driver:
+  kind: quantum_bogon
+equivalence:
+  response_body: byte_exact
+"#;
+        let r: Result<Expectations, _> = serde_yaml::from_str(yaml);
+        assert!(r.is_err(), "quantum_bogon must not parse: {r:?}");
     }
 
     // Regression for REVIEW.md I1 (ADR-0007): a server that writes
