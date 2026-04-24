@@ -44,3 +44,10 @@
 - Verification: `cargo build --workspace --all-targets` → 0 (fuzz subcrate excluded from main workspace); `cargo test --workspace` → 41 passed + 1 ignored (unchanged since Task 5); `cargo deny check` → advisories ok, bans ok, licenses ok, sources ok.
 - Seed-file note: seed is the admin-only shape (not the phase-00 typed_config shape) because NetworkFilter's deny_unknown_fields (Task 3/4) rejects upstream Envoy's typed_config block. PLAN-minor deviation per PLAN lines 1083–1084; not ADR-worthy.
 - Fuzz smoke-run deferred to Task 7 CI fuzz job (PLAN Step 7 marked optional; developer toolchain has no nightly locally).
+
+## Task 7 — CI parallel fuzz job (2026-04-24)
+
+- Commit: 2a969a8
+- Change: rewrote .github/workflows/ci.yml to define two parallel jobs: 'build' (renamed from the pre-existing 'build-test-lint' job; unchanged cargo fmt/clippy/build/test/deny sequence) and 'fuzz' (new; nightly toolchain + rust-src component + cargo-fuzz install --locked + cargo fuzz run parse_bootstrap -- -max_total_time=30 under working-directory crates/envoy-config). Concurrency group 'ci-${{ github.ref }}' with cancel-in-progress: true; permissions: contents: read; timeout-minutes: 30 for build, 15 for fuzz.
+- Verification: `python3 -c 'import yaml,sys; yaml.safe_load(open(".github/workflows/ci.yml"))'` → ok; `cargo fmt --all -- --check` → 0; `cargo deny check` → advisories ok, bans ok, licenses ok, sources ok; `cargo test --workspace` → 42 passed + 1 ignored (unchanged).
+- CI push-and-watch deferred to Task 19 (state-4 phase-done gate), per PLAN Step 4.
