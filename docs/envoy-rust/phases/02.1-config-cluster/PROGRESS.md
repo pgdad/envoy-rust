@@ -20,3 +20,10 @@
 - Verification: `cargo test -p envoy-config` → `test result: ok. 27 passed; 0 failed` (24 phase-01/02 + 3 new in this task).
 - Pre-existing tests updated in-place (no count change): `parses_bootstrap_with_clusters_stub` renamed to `parses_bootstrap_with_single_endpoint_cluster` with full cluster shape YAML; `rejects_unknown_cluster_field` YAML expanded to full cluster shape with `bogus: 1` sibling to `name`.
 - Also re-expanded the `parses_bootstrap_with_tcp_proxy_filter` YAML cluster block to the full Task-3 topology (reversing Task 2's authorized YAML simplification, now that the schema supports it).
+
+## Task 4 — validator extensions + 5 ConfigError variants (2026-04-24)
+
+- Commit: 3dde2a6
+- Change: added 5 `ConfigError` variants (`MissingTypedConfig`, `UnexpectedTypedConfig`, `UnknownCluster`, `LoadAssignmentNameMismatch`, `EmptyClusterEndpoints`); extended `pub use` in `lib.rs` with 8 new public types (`TypedConfig`, `TcpProxyConfig`, `ClusterType`, `LbPolicy`, `LoadAssignment`, `LocalityLbEndpoints`, `LbEndpoint`, `Endpoint`); added `TCP_PROXY_FILTER` constant; extended `validate` with per-cluster invariants (cluster_name match, ≥1 lb_endpoint) and widened per-listener allow-list to `{echo, tcp_proxy}` with typed_config structural rules; renamed `rejects_non_echo_filter` → `rejects_unknown_filter_name` (YAML uses `rbac` instead of `tcp_proxy` so the test remains in the UnsupportedFilter path after the allow-list widening); added 10 new tests.
+- Verification (envoy-config): `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed` (27 prior + 10 new in this task).
+- Verification (workspace): `cargo test --workspace --exclude differential` → green; Docker-gated `admin_ready_fixture` fails as expected (no Docker socket in this environment); `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
