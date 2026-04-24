@@ -79,9 +79,16 @@ pub fn reserve_port() -> Result<u16> {
     Ok(port)
 }
 
-/// Template-render a fixture YAML by substituting the literal `{{PORT}}` token.
-pub fn render_yaml(template: &str, port: u16) -> String {
-    template.replace("{{PORT}}", &port.to_string())
+/// Template-render a fixture YAML by substituting literal `{{KEY}}` tokens.
+/// The `kvs` list is the set of tokens to replace; any `{{…}}` token not in
+/// `kvs` is left untouched so a typo surfaces as a parser error rather than
+/// silently rendering to the empty string.
+pub fn render_yaml(template: &str, kvs: &[(&str, &str)]) -> String {
+    let mut out = template.to_string();
+    for (k, v) in kvs {
+        out = out.replace(&format!("{{{{{k}}}}}"), v);
+    }
+    out
 }
 
 /// Write `content` to a new temp file in `dir` and return the path. The caller
@@ -262,41 +269,36 @@ pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<
 /// assertion failure.
 pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let expectations = load_expectations(&fixture_dir.join("expectations.yaml"))?;
-    // TODO(Task-15): run_fixture dispatches unconditionally on drive_tcp here.
-    // Minimum compile patch after Task 13's grammar change; Task 15 rewrites
-    // this function to branch on expectations.driver.
-    assert_eq!(
-        expectations
-            .equivalence
-            .response_body
-            .unwrap_or(BodyRule::ByteExact),
-        BodyRule::ByteExact,
-        "phase 00 only understands response_body: byte_exact",
-    );
 
-    // Shared port number — upstream Envoy uses it inside the container's
-    // namespace, envoy-rust binds it on the host.
+    // Reserve one port; use the driver-specific token to substitute into the
+    // rendered configs. Upstream Envoy runs inside the container namespace and
+    // listens on upstream::CONTAINER_PORT; envoy-rust listens on the host's
+    // reserved port.
     let host_port = reserve_port()?;
 
-    // Render and materialize both configs in a temp directory.
     let tmp = tempfile::tempdir().context("creating fixture temp dir")?;
     let upstream_template = std::fs::read_to_string(fixture_dir.join("envoy.yaml"))
         .context("reading upstream envoy.yaml")?;
     let subject_template = std::fs::read_to_string(fixture_dir.join("envoy-rust.yaml"))
         .context("reading envoy-rust.yaml")?;
-    let upstream_yaml = render_yaml(&upstream_template, upstream::CONTAINER_PORT);
-    let subject_yaml = render_yaml(&subject_template, host_port);
+
+    let upstream_port_str = upstream::CONTAINER_PORT.to_string();
+    let subject_port_str = host_port.to_string();
+    let port_key = match &expectations.driver {
+        Driver::TcpEcho => "PORT",
+        Driver::HttpGet { .. } => "ADMIN_PORT",
+    };
+    let upstream_yaml = render_yaml(&upstream_template, &[(port_key, &upstream_port_str)]);
+    let subject_yaml = render_yaml(&subject_template, &[(port_key, &subject_port_str)]);
     let upstream_path = write_temp(tmp.path(), "envoy.yaml", &upstream_yaml)?;
     let subject_path = write_temp(tmp.path(), "envoy-rust.yaml", &subject_yaml)?;
 
-    // Start both proxies. Upstream first because it is slower to become ready.
     let upstream = upstream::start(&upstream_path).await?;
     let mut subject = subject::start(&subject_path, host_port).await?;
 
     let upstream_addr: SocketAddr = format!("127.0.0.1:{}", upstream.host_port()).parse()?;
     let subject_addr: SocketAddr = format!("127.0.0.1:{}", subject.port()).parse()?;
 
-    // 10s accept-ready budget per SPEC §D4 step 4.
     let budget = Duration::from_secs(10);
     wait_accept_ready(upstream_addr, budget)
         .await
@@ -305,23 +307,82 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         .await
         .context("envoy-rust never became accept-ready")?;
 
-    // Drive identical bytes at both and compare.
-    let payload =
-        std::fs::read(fixture_dir.join("inputs/payload.bin")).context("reading payload.bin")?;
-    let upstream_out = drive_tcp(upstream_addr, &payload)
-        .await
-        .context("upstream envoy drive")?;
-    let subject_out = drive_tcp(subject_addr, &payload)
-        .await
-        .context("envoy-rust drive")?;
+    match &expectations.driver {
+        Driver::TcpEcho => {
+            let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
+                .context("reading payload.bin")?;
+            let upstream_out = drive_tcp(upstream_addr, &payload)
+                .await
+                .context("upstream envoy drive")?;
+            let subject_out = drive_tcp(subject_addr, &payload)
+                .await
+                .context("envoy-rust drive")?;
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+            assert_equivalence(
+                &expectations,
+                /* upstream status */ None,
+                /* subject status  */ None,
+                &upstream_out,
+                &subject_out,
+            )?;
+        }
+        Driver::HttpGet { path, host } => {
+            let upstream_resp = drive_http_get(upstream_addr, path, host)
+                .await
+                .context("upstream envoy http get")?;
+            let subject_resp = drive_http_get(subject_addr, path, host)
+                .await
+                .context("envoy-rust http get")?;
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+            assert_equivalence(
+                &expectations,
+                Some(upstream_resp.status),
+                Some(subject_resp.status),
+                &upstream_resp.body,
+                &subject_resp.body,
+            )?;
+        }
+    }
 
-    // Graceful subject shutdown so Drop doesn't SIGKILL unnecessarily.
-    subject.shutdown(Duration::from_secs(5)).await.ok();
-    drop(upstream);
+    Ok(())
+}
 
-    if upstream_out != subject_out {
+fn assert_equivalence(
+    expectations: &Expectations,
+    upstream_status: Option<u16>,
+    subject_status: Option<u16>,
+    upstream_body: &[u8],
+    subject_body: &[u8],
+) -> Result<()> {
+    if matches!(
+        expectations.equivalence.response_status,
+        Some(StatusRule::Exact)
+    ) {
+        match (upstream_status, subject_status) {
+            (Some(u), Some(s)) if u == s => {}
+            (u, s) => bail!(
+                "response status mismatch under `response_status: exact`\n  \
+                 upstream: {u:?}\n  subject:  {s:?}"
+            ),
+        }
+    }
+    if matches!(
+        expectations.equivalence.response_body,
+        Some(BodyRule::ByteExact)
+    ) && upstream_body != subject_body
+    {
         bail!(
-            "byte-exact body mismatch\n  upstream: {upstream_out:?}\n  subject:  {subject_out:?}",
+            "byte-exact body mismatch\n  upstream: {upstream_body:?}\n  subject:  {subject_body:?}",
+        );
+    }
+    // Neither rule configured → silently pass + log a warning (SPEC §D5).
+    if expectations.equivalence.response_status.is_none()
+        && expectations.equivalence.response_body.is_none()
+    {
+        tracing::warn!(
+            "fixture has neither response_status nor response_body equivalence rule — running as a smoke test"
         );
     }
     Ok(())
@@ -372,7 +433,16 @@ mod tests {
     #[test]
     fn render_yaml_substitutes_all_port_tokens() {
         let t = "a: {{PORT}}\nb: {{PORT}}\n";
-        assert_eq!(render_yaml(t, 9000), "a: 9000\nb: 9000\n");
+        assert_eq!(render_yaml(t, &[("PORT", "9000")]), "a: 9000\nb: 9000\n");
+    }
+
+    #[test]
+    fn render_yaml_substitutes_admin_port_key() {
+        let t = "address: 127.0.0.1\nport: {{ADMIN_PORT}}\n";
+        assert_eq!(
+            render_yaml(t, &[("ADMIN_PORT", "9901")]),
+            "address: 127.0.0.1\nport: 9901\n"
+        );
     }
 
     #[test]
