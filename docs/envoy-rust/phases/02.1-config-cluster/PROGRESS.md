@@ -58,3 +58,13 @@
 - Verification (gates): `cargo build --workspace --all-targets` → `Finished dev profile […] in 0.39s` (compiles tcp-echo-server cleanly); `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
 - Verification (tests): `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed` (unchanged). `cargo test -p envoy-cluster` → `test result: ok. 8 passed; 0 failed` (unchanged). `tcp-echo-server` contributes 0 tests.
 - Verification (deny): `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (no new license surface; `tracing-subscriber` + `anyhow` + `thiserror` already reachable transitively via `envoy-bin`, per SPEC §D3.5).
+
+## Task 9 — tcp-echo-server argv parser (2026-04-24)
+
+- Commit: d5b6afa
+- Change: replaced `src/main.rs` placeholder with full argv-parser module: `Args { port: u16 }`, `ArgvError` (6 variants: `MissingFlag(&'static str)`, `MissingValue`, `InvalidPort`, `Trailing`, `HelpRequested`, `VersionRequested`), `parse_argv(args: &[String]) -> Result<Args, ArgvError>` using hand-written index loop. `main()` remains `unimplemented!()` (Task 10 lands the tokio runtime). Added `#[allow(dead_code)]` to `Args`, `ArgvError`, and `parse_argv` (items are test-only until Task 10 wires them into `main`).
+- Verification (tcp-echo-server): `cargo test -p tcp-echo-server` → `test result: ok. 6 passed; 0 failed` (`argv_parses_port`, `argv_rejects_missing_port_flag`, `argv_rejects_missing_value`, `argv_rejects_non_numeric_port`, `argv_rejects_trailing_argument`, `argv_shows_help`).
+- Verification (envoy-config): `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed` (unchanged).
+- Verification (envoy-cluster): `cargo test -p envoy-cluster` → `test result: ok. 8 passed; 0 failed` (unchanged).
+- Verification (lint): `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
+- Deviation: plan's code blocks do not include `#[allow(dead_code)]` annotations, but clippy `-D warnings` with `dead_code` errors out on `Args`, `ArgvError`, and `parse_argv` when compiled as a binary target (they are only reachable from `#[cfg(test)]` until Task 10). Added field-granular `#[allow(dead_code)]` per the established pattern from Task 6's `Cluster.name` handling. Not a spec drift; the plan's intent is correct Rust — the annotations are a mechanical requirement of the clippy gate, not a design change.
