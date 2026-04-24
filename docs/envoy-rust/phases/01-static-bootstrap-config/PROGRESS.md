@@ -311,3 +311,31 @@ non-blocking and optionally folded into phase-02 work.
 Next action per SKILL_ROUTING state 6: phase-done commit per SPEC §8
 format, `ROADMAP.md` row 01 → `done`, `STATE.md` advanced to phase 02
 (slug `02-tcp-proxy`, next skill `superpowers:brainstorming`).
+
+## State 6 — Phase-done final commit (2026-04-24)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 6 (reviewed and approved →
+final commit + ROADMAP flip + STATE advance).
+
+- `docs/envoy-rust/ROADMAP.md` row 01 status flipped from `planned` to
+  `done` (MVP Trunk table line 29).
+- `docs/envoy-rust/STATE.md` rewritten for phase 02: active id `02`,
+  slug `02-tcp-proxy`, lifecycle state 1 (pending brainstorm), next
+  expected skill `superpowers:brainstorming`. Phase-02 starter items
+  (I3, I4, M1) carried forward in the Notes section.
+- This final PROGRESS entry lands in the same commit as the ROADMAP
+  flip and STATE advance.
+
+Commit subject per phase-01 SPEC §8 (extended with ADR-0012):
+`phase 01: Static bootstrap config loader + admin /ready [ADR-0008, ADR-0009, ADR-0010, ADR-0011, ADR-0012]`.
+
+Phase 01 is now complete. The envoy-config crate extracts and extends
+the Bootstrap schema (node, admin, static_resources skeleton); envoy-bin
+gains a hand-rolled admin HTTP endpoint serving `GET /ready`; the
+project's first cargo-fuzz target ships over `parse_bootstrap`, invoked
+nightly-only in a dedicated CI job per ADR-0010 and ADR-0012.
+Differential fixtures `0001-tcp-echo` (post driver-tag migration) and
+`0002-static-admin-ready` (admin /ready status + body equivalence) both
+green on CI run `24891070573` (HEAD `20ffb5b`, state-4 gate) and
+re-verified on CI run `24893585436` (HEAD `e32240c`, state-5 re-review
+gate). No conformance suites this phase.

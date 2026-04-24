@@ -7,75 +7,107 @@
 
 ## Active phase
 
-**id:** `01`
-**slug:** `01-static-bootstrap-config`
-**directory:** `docs/envoy-rust/phases/01-static-bootstrap-config/` (exists; contains `SPEC.md`, `PLAN.md`, `PROGRESS.md`, `REVIEW.md`)
-**status:** phase 01 lifecycle **state 6 (pending)** — reviewed and approved; final phase-done commit next (flips `ROADMAP.md` row 01 → `done` and advances this file to phase 02).
+**id:** `02`
+**slug:** `02-tcp-proxy`
+**directory:** `docs/envoy-rust/phases/02-tcp-proxy/` (does not yet exist — created by the next session per `SKILL_ROUTING.md` state 1).
+**status:** phase 02 lifecycle **state 1 (pending brainstorm)** — row exists in `ROADMAP.md` with `status: planned`; no SPEC / PLAN / PROGRESS yet.
 
-State-5 re-review verdict: **I1 Closed — no new issues.** ADR-0012 lands
-the nested nightly pin in `crates/envoy-config/fuzz/rust-toolchain.toml`
-on the record (narrowly supersedes ADR-0010). CI re-verification run
-24893585436 green on HEAD `e32240c`. `REVIEW.md` front-matter verdict
-now reads **Approved**; full close-out section at §9 with check table.
-
-Forward-tracked rollovers into phase 02: I3 (`decode_chunked` unit
-tests), I4 (admin 8 KiB cap tightening), M1 (retarget stale
-`TODO(phase-01)` in `tests/differential/src/subject.rs`).
+Phase 01 (`01-static-bootstrap-config`) is **done** as of the phase-done
+commit whose subject matches SPEC §8 and includes
+`[ADR-0008, ADR-0009, ADR-0010, ADR-0011, ADR-0012]`. `ROADMAP.md` row 01
+is now `done`. Phase-01 `REVIEW.md` verdict is **Approved** (state 5
+complete; I1 closed in-phase; I3/I4/M1 tracked forward).
 
 Phase 00 (`00-bootstrap`) is **done** as of commit `e5afc35`.
 
 ## Next expected skill
 
-**Final phase-done commit per SPEC §8** (message:
-`phase 01: Static bootstrap config loader + admin /ready [ADR-0008, ADR-0009, ADR-0010, ADR-0011, ADR-0012]`).
-That commit flips `docs/envoy-rust/ROADMAP.md` row 01 status to
-`done`, rewrites this file for phase 02 (slug `02-tcp-proxy`, next
-skill `superpowers:brainstorming`), and appends a final entry to
-`PROGRESS.md`. After that commit lands, phase 01 is complete and the
-next session enters phase 02 at lifecycle state 1.
+**`superpowers:brainstorming`** — the next session brainstorms phase 02
+scoped to the static TCP proxy filter surface: listener + TCP proxy
+network filter + static cluster + round-robin load balancer (plaintext).
+Per `ROADMAP.md` row 02 summary, the acceptance signal is "TCP proxy
+fixture green" against upstream Envoy v1.33.0. The brainstorm output is
+`docs/envoy-rust/phases/02-tcp-proxy/SPEC.md` per `SKILL_ROUTING.md`
+state 1.
+
+Inputs the brainstorm should read:
+
+- `BOOTSTRAP_PROMPT.md` §4 (phase naming / slug convention) and §8 row 02.
+- `docs/envoy-rust/MISSION.md`, `docs/envoy-rust/BEHAVIOR_CONTRACT.md`,
+  `docs/envoy-rust/DECISIONS.md` (ADR-0001..0012).
+- `docs/envoy-rust/phases/00-bootstrap/SPEC.md` and `REVIEW.md` (for
+  deferrals carried forward: `Minor` M1, M2, M4–M8; `Important` I3
+  SIGKILL→SIGTERM switch — still blocked by the `nix` crate unless
+  phase 02 takes it under an ADR).
+- `docs/envoy-rust/phases/01-static-bootstrap-config/SPEC.md`,
+  `PROGRESS.md`, and `REVIEW.md` (for the starter-items rollover
+  enumerated in the Notes section below).
 
 ## Last commit
 
-State-5 re-review approved:
-`phase 01: state 5 re-review Approved — REVIEW.md I1 close-out + STATE advance to state 6`.
+Phase-01 phase-done final commit:
+`phase 01: Static bootstrap config loader + admin /ready [ADR-0008, ADR-0009, ADR-0010, ADR-0011, ADR-0012]`.
+Flips `ROADMAP.md` row 01 → `done` and advances this file to phase 02.
 
 ## Last updated
 
-2026-04-24 (state 5 re-review approved; ADR-0012 closes I1; STATE
-advanced to state 6 pending the final phase-done commit).
+2026-04-24 (phase 01 complete; STATE advanced to phase 02 at lifecycle
+state 1).
 
 ## Notes
 
-- Pre-existing phase-00 deferred Minors M1, M2, M4, M5, M6, M7, M8
-  remain open; none blocked phase 01. See
-  `docs/envoy-rust/phases/00-bootstrap/REVIEW.md`.
-- N2 (phase-00 deferred Minor — `deny_unknown_fields` regression-test
-  gap on `StaticResources`, `Address`, `SocketAddress`, `FilterChain`,
-  `NetworkFilter`) was closed by `PLAN.md` Task 4 Step 4 via five new
-  regression tests (`rejects_unknown_static_resources_field`, etc.).
-  No remaining phase-00 carryover on this front.
-- The phase-00 I3 SIGKILL→SIGTERM functional switch remains deferred.
-  Phase-01 SPEC did not pick it up; the `nix` crate remains the stated
+### Phase-02 starter items (carry forward from phase-01 REVIEW.md §9)
+
+These three items are tracked forward from phase-01's state-5 REVIEW as
+explicit starter work for phase 02. The phase-02 brainstorm should decide
+whether to fold each into the phase-02 SPEC or leave them for an opportunistic
+cleanup commit alongside phase-02 work.
+
+- **I3** — add four unit tests for `decode_chunked` in
+  `tests/differential/src/lib.rs` (covering empty chunk, chunk-size
+  extension, truncated body, trailer headers). Helper landed in commit
+  `5b852ce` during phase-01 state-4 CI-fix work with only transitive
+  exercise via the Docker-gated `admin_ready_fixture` test.
+- **I4** — tighten the admin 8 KiB header cap in
+  `crates/envoy-bin/src/admin.rs:156–170` from "effectively ~9 KiB"
+  (the `buf.len() >= MAX_REQUEST_HEAD` check fires *before* each
+  1024-byte read) to an exact boundary. Not a correctness bug; ~2-line
+  fix (clamp the read slice to `MAX_REQUEST_HEAD - buf.len()`).
+- **M1** — retarget the stale `TODO(phase-01)` comment in
+  `tests/differential/src/subject.rs:25–32`. Phase 01 did not pick up
+  the phase-00 I3 SIGKILL→SIGTERM switch (the `nix` crate is still not
+  on the D-3.2 permitted-foundations list). The TODO target moves to
+  phase 04 or later — whichever phase genuinely takes the `nix` dep
+  under a new ADR.
+
+### Phase-00 deferrals still open
+
+- Minors M1, M2, M4, M5, M6, M7, M8 (see
+  `docs/envoy-rust/phases/00-bootstrap/REVIEW.md`). None blocked phase 01.
+- Important I3 (SIGKILL → SIGTERM graceful termination of the subject
+  subprocess): still deferred. The `nix` crate remains the stated
   blocker (not on the D-3.2 permitted-foundations list). Phase-01
-  review M1 (retarget stale `TODO(phase-01)` in
-  `tests/differential/src/subject.rs`) is tracked forward to phase 02
-  as part of clearing this breadcrumb.
-- ADR-0012 (nested nightly pin in fuzz subcrate; narrowly supersedes
-  ADR-0010) landed during state-5 remediation (commit `bda4e52`) to
-  close REVIEW.md §Issues/Important I1. This slot had been named
-  informally in a prior STATE.md note for a conditional
-  "`cargo deny` `libfuzzer-sys` license advisory" ADR that was never
-  needed; the actual ADR-0012 in `DECISIONS.md` is the nested-pin ADR.
-- Phase-01 state-4 CI-fix commits (`5b852ce`, `97c1576`, `20ffb5b`):
-  (1) `drive_http_get` chunked-encoding blind spot exposed by upstream
-  Envoy v1.33.0's `/ready` response; (2) cargo-fuzz toolchain-override
-  interaction with the workspace-root `rust-toolchain.toml`. Both root
-  causes are documented in `PROGRESS.md` State-4 section; ADR-0012
-  formally legitimates the nested-pin portion of fix (2).
-- Phase-02 starter items (carry forward from phase-01 REVIEW.md §9):
-  - I3 — add 4 unit tests for `decode_chunked` in `tests/differential/src/lib.rs` (empty, extension, truncated, trailer).
-  - I4 — tighten admin 8 KiB header cap in `crates/envoy-bin/src/admin.rs` to an exact boundary (currently effectively ~9 KiB; ~2-line fix).
-  - M1 — retarget stale `TODO(phase-01)` in `tests/differential/src/subject.rs:25–32` (phase-00 I3 deferral now targets phase 04 or later, since phase 01 did not pick it up).
+  SPEC explicitly did not pick it up. A future phase that genuinely
+  needs `nix` adds it under a new ADR and closes this item.
+- N2 (phase-00 deferred Minor — `deny_unknown_fields` regression-test
+  gap on deeper struct levels): **closed** by phase-01 Task 4 Step 4
+  via five new regression tests.
+
+### Phase-01 ADR ledger
+
+ADR-0008 (envoy-config extraction), ADR-0009 (cargo-fuzz + libfuzzer-sys
+as fuzz-only dev deps), ADR-0010 (nightly toolchain, explicit `+nightly`
+CI invocation; workspace-root pin stays stable), ADR-0011 (phase-01
+defers response-header equivalence to phase 04; `server: envoy-rust`
+tolerated until then), ADR-0012 (nested nightly pin in fuzz subcrate;
+narrowly supersedes ADR-0010 on that single sub-point while preserving
+its main decision). ADR-0010 is unedited per D-3.5 append-only doctrine;
+ADR-0012 is the retroactive ADR that legitimated the nested
+`crates/envoy-config/fuzz/rust-toolchain.toml` landed during the state-4
+CI-fix run.
+
+### Doctrine reminders
+
 - Any deviation from the state machine requires
   `superpowers:systematic-debugging` before proceeding — see §1 Step E
   of `BOOTSTRAP_PROMPT.md`.

@@ -26,7 +26,7 @@ Phases 00–08 ship *in order*: each adds a primitive the next relies on. Splitt
 | id | title | depends-on | status | sub-phases | summary |
 |---|---|---|---|---|---|
 | 00 | Bootstrap: Cargo workspace layout, `rust-toolchain.toml`, `deny.toml`, CI, Docker reference Envoy, differential harness skeleton, `ENVOY_TARGET.md` pin, trivial echo fixture | — | done | — | harness boots; one TCP echo fixture green |
-| 01 | Static bootstrap config loader (node, admin, static_resources skeleton) | 00 | planned | — | config parses; admin `/ready` behaves like Envoy |
+| 01 | Static bootstrap config loader (node, admin, static_resources skeleton) | 00 | done | — | config parses; admin `/ready` behaves like Envoy |
 | 02 | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext) | 01 | planned | — | TCP proxy fixture green |
 | 03 | Downstream TLS termination + upstream TLS origination + SNI | 02 | planned | — | TLS TCP fixture green |
 | 04 | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response | 03 | planned | — | HTTP/1.1 routing fixture green |
