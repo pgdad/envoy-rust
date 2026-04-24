@@ -43,11 +43,51 @@ pub struct StaticResources {
     pub clusters: Vec<Cluster>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Cluster {
     pub name: String,
-    // Phase 02 extends with type, lb_policy, load_assignment, etc.
+    #[serde(rename = "type")]
+    pub cluster_type: ClusterType,
+    pub lb_policy: LbPolicy,
+    pub load_assignment: LoadAssignment,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum ClusterType {
+    Static,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum LbPolicy {
+    RoundRobin,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LoadAssignment {
+    pub cluster_name: String,
+    pub endpoints: Vec<LocalityLbEndpoints>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalityLbEndpoints {
+    pub lb_endpoints: Vec<LbEndpoint>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LbEndpoint {
+    pub endpoint: Endpoint,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    pub address: Address,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,13 +99,13 @@ pub struct Listener {
     pub filter_chains: Vec<FilterChain>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Address {
     pub socket_address: SocketAddress,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SocketAddress {
     pub address: String,
@@ -237,7 +277,7 @@ admin:
     }
 
     #[test]
-    fn parses_bootstrap_with_clusters_stub() {
+    fn parses_bootstrap_with_single_endpoint_cluster() {
         let yaml = r#"
 admin:
   address:
@@ -246,11 +286,22 @@ admin:
       port_value: 9901
 static_resources:
   clusters:
-    - name: cluster_0
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
 "#;
         let b = crate::parse_bootstrap(yaml).expect("valid");
         assert_eq!(b.static_resources.clusters.len(), 1);
-        assert_eq!(b.static_resources.clusters[0].name, "cluster_0");
+        assert_eq!(b.static_resources.clusters[0].name, "backend");
     }
 
     #[test]
@@ -367,7 +418,18 @@ admin:
   address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
 static_resources:
   clusters:
-    - name: cluster_0
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
       bogus: 1
 "#;
         let err = crate::parse_bootstrap(yaml).expect_err("must reject");
@@ -483,6 +545,17 @@ static_resources:
                 cluster: backend
   clusters:
     - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
 "#;
         let b: Bootstrap = serde_yaml::from_str(yaml).expect("valid YAML");
         let filter = &b.static_resources.listeners[0].filter_chains[0].filters[0];
@@ -543,5 +616,105 @@ static_resources:
         let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
         let msg = format!("{err:?}");
         assert!(msg.contains("unknown field"), "got {msg}");
+    }
+
+    #[test]
+    fn parses_bootstrap_with_round_robin_multi_endpoint_cluster() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10002
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10003
+  listeners: []
+"#;
+        let b: Bootstrap = serde_yaml::from_str(yaml).expect("valid YAML");
+        assert_eq!(b.static_resources.clusters.len(), 1);
+        let c = &b.static_resources.clusters[0];
+        assert_eq!(c.name, "backend");
+        assert!(matches!(c.cluster_type, ClusterType::Static));
+        assert!(matches!(c.lb_policy, LbPolicy::RoundRobin));
+        assert_eq!(c.load_assignment.cluster_name, "backend");
+        assert_eq!(c.load_assignment.endpoints.len(), 1);
+        assert_eq!(c.load_assignment.endpoints[0].lb_endpoints.len(), 3);
+        assert_eq!(
+            c.load_assignment.endpoints[0].lb_endpoints[2]
+                .endpoint
+                .address
+                .socket_address
+                .port_value,
+            10003
+        );
+    }
+
+    #[test]
+    fn rejects_cluster_type_logical_dns() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: LOGICAL_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown variant") || msg.contains("LOGICAL_DNS"),
+            "expected serde tagged-enum rejection; got {msg}",
+        );
+    }
+
+    #[test]
+    fn rejects_lb_policy_least_request() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: LEAST_REQUEST
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown variant") || msg.contains("LEAST_REQUEST"),
+            "expected serde tagged-enum rejection; got {msg}",
+        );
     }
 }
