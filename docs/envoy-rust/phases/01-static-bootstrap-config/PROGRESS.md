@@ -117,3 +117,4 @@
 - Test count note: PLAN predicted 21 passed; actual is 20. Difference is a counting error in the plan (it double-counted `render_yaml_substitutes_all_port_tokens` which was already in the pre-Task-15 count of 19, making 19 + 1 new test = 20, not 21).
 - TODO(Task-15) resolved: both the comment and the `.unwrap_or` patch are gone. `assert_equivalence` is the canonical equivalence checker going forward.
 - `echo_fixture` integration test remains red (fixture `tests/fixtures/0001-tcp-echo/expectations.yaml` still uses pre-Task-13 shape). Task 16 migrates the fixture and is the last commit that leaves CI red.
+- Re-review fix: refreshed crate-level doc comment in lib.rs to reflect phase-01 two-driver surface (commit b0c06a1) — addresses Task 15 code-quality review I1.
