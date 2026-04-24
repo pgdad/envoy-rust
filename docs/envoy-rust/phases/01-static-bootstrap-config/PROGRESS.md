@@ -57,3 +57,10 @@
 - Commit: 31c7017
 - Change: appended ADR-0011 (phase 01 asserts status + body equivalence only; header-allow-list population deferred to phase 04 when the HCM response-header pipeline lands). Locks in `server: envoy-rust` divergence from upstream's `server: envoy` as tolerated until phase 04. BEHAVIOR_CONTRACT.md remains untouched (its "Header allow-list" subsection stays empty per the "populated starting phase 04" convention).
 - Verification: `grep -c '^## ADR-00' docs/envoy-rust/DECISIONS.md` → 11; `grep -n '^## ADR-00' docs/envoy-rust/DECISIONS.md | tail -3` shows ADR-0009/0010/0011 in ascending line order.
+
+## Task 9 — admin render_response + IMF-fixdate helper (2026-04-24)
+
+- Commit: 1d04796
+- Change: added crates/envoy-bin/src/admin.rs with render_response/render_response_at (hand-rolled HTTP/1.1 response framing; server: envoy-rust per ADR-0011), rfc7231_imf_fixdate (RFC 7231 IMF-fixdate formatter), and civil_from_days (Howard Hinnant's public-domain Gregorian civil date algo). 5 tests: 3 date + 2 response. Registered `mod admin;` with scoped `#[allow(dead_code)]` in main.rs (pattern carried from phase-00 Task 6; removed when Task 11 consumes admin). Added httparse = "1" to envoy-bin's [dependencies] (unused until Task 10).
+- Verification: `cargo test -p envoy-bin admin::tests` → 5 passed; `cargo test -p envoy-bin` → 13 passed (6 argv + 2 echo + 5 admin); `cargo test --workspace` → 47 passed + 1 ignored; `cargo clippy -p envoy-bin --all-targets --all-features -- -D warnings` → 0; `cargo fmt --all -- --check` → 0; `cargo deny check` → advisories ok, bans ok, licenses ok, sources ok.
+- PLAN-text minor: PLAN line 1519 says "11 tests passing (6 argv + 5 admin)" — undercounts by the 2 echo tests landed in phase-00 Task 7. Actual: 13. Code is correct; plan prose has a minor count error not worth a formal deviation or ADR.
