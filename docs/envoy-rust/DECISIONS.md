@@ -210,3 +210,21 @@ Each ADR uses the structure:
   - `.github/workflows/ci.yml` gains a second job `fuzz` running `dtolnay/rust-toolchain@nightly` with `rust-src` (SanitizerCoverage requires libstd recompiles), `cargo install cargo-fuzz --locked`, and `cargo fuzz run parse_bootstrap -- -max_total_time=30` from `crates/envoy-config/`. A 30 s budget matches SKILL_ROUTING.md state 4's "short-budget CI run."
   - Developer docs (future) may add a one-line "install nightly + cargo-fuzz" block; not required in phase 01.
   - A future "scheduled long-budget nightly fuzz" becomes its own phase with its own ADR.
+
+---
+
+## ADR-0011: Phase 01 defers response-header equivalence to phase 04
+
+- Date: 2026-04-24
+- Status: accepted
+- Context: `BEHAVIOR_CONTRACT.md`'s `Header allow-list` subsection is marked "populated starting phase 04" at bootstrap. Phase 01 is the first phase that returns an HTTP response (admin `/ready`). ROADMAP phase-01 summary — "config parses; admin `/ready` behaves like Envoy" — is silent on whether header equivalence is in scope. The fixture-0002 harness configuration therefore needs an explicit decision.
+- Options considered:
+  - Populate a phase-01 stub header allow-list (`server`, `date`) and assert header equivalence for everything else. Requires us to also allow-list `content-length` (identical values but still a comparison surface), `content-type`, `cache-control`, `x-content-type-options`, and `connection` — each with its own justification. Premature: phase 04 is where the HTTP/1.1 data-plane surfaces all the response-header questions worth answering.
+  - Assert full headers with a fresh allow-list. ADR-heavy; high review cost; diverges the two proxies on `server:` without a clean path forward before phase 04 lands the HCM response-header pipeline.
+  - Assert response status + body only for phase 01. The differential harness ignores headers. envoy-rust still emits a reasonable Envoy-shaped header block on every admin response for forward-compat (content-type, content-length, cache-control, x-content-type-options, server, date, connection) — the divergence on `server:` is tolerated until phase 04 populates the allow-list.
+- Decision: option 3 — status + body equivalence only for phase 01.
+- Rationale: the ROADMAP's "`/ready` behaves like Envoy" phrasing is behavioral, and status + body already pin the behavior (`200 OK` + `LIVE\n` vs. `404 Not Found` + the invalid-path message). Header equivalence is a framing concern that belongs in the phase that owns the framing (phase 04).
+- Consequences:
+  - `tests/fixtures/0002-static-admin-ready/expectations.yaml` only specifies `response_status: exact` + `response_body: byte_exact`. The harness's `drive_http_get` captures headers for debug tracing but they play no role in the equivalence diff.
+  - `envoy-rust`'s admin response uses `server: envoy-rust` (deliberately not `envoy`). When phase 04 populates the header allow-list, `server` lands on it.
+  - `BEHAVIOR_CONTRACT.md` is **not** edited in phase 01. All currently-empty subsections (`Header allow-list`, `Stat-name mapping`, `Access log field mapping`, `xDS wire state machine`, `Timing tolerances`) stay empty.
