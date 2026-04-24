@@ -136,9 +136,10 @@ test result: ok. 26 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fin
 
   The `differential` lib tally of 26 passed / 1 ignored matches PLAN.md's
   expectation (22 phase-01 + 4 I3 close-out tests from task 11; the 1 ignored
-  is the known TOCTOU-flaky `wait_accept_ready_times_out_for_closed_socket`
-  documented in ADR-0006 provenance). The Docker-gated integration tests
-  (`tests/differential/tests/echo.rs::echo_fixture`,
+  is the Docker-gated `upstream::tests::starts_upstream_envoy_and_exposes_host_port`,
+  marked `#[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]`
+  per ADR-0005 — Docker-dependent tests run only in CI). The Docker-gated
+  integration tests (`tests/differential/tests/echo.rs::echo_fixture`,
   `tests/differential/tests/admin_ready.rs::admin_ready_fixture`) are excluded
   by `--lib --bins` and validated only in CI.
 
@@ -172,6 +173,17 @@ Run conclusion: `success`. URL: https://github.com/pgdad/envoy-rust/actions/runs
   attempt, no fix-during-gate commits).
 - (e) the 5 `cargo` commands + `cargo deny check` clean on CI.
 - (f) REVIEW.md → deferred to state 5 (next session; `superpowers:requesting-code-review`).
+
+### Notes
+
+- `Cargo.lock` drift: the dev-host working tree carries uncommitted additions
+  to `Cargo.lock` for the two new workspace crates (`envoy-cluster` from task 5
+  and `tcp-echo-server` from task 8), consistent with the phase-01 and phase
+  02.1 tasks 1–12 convention of "Cargo.lock not staged". CI regenerates
+  `Cargo.lock` from scratch, so the state-4 gate is green regardless. A
+  dedicated lockfile-sync commit (mirroring phase-01 precedent `4955252`
+  "phase 01: sync Cargo.lock with phase-01 dep graph") is queued as a near-
+  future to-do, to land before the state-6 phase-done commit.
 
 State 4 verification complete. Next session enters state 5 via
 `superpowers:requesting-code-review`.
