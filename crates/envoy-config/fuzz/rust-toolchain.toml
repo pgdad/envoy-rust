@@ -1,0 +1,5 @@
+# cargo-fuzz requires nightly. This file overrides the workspace-root
+# rust-toolchain.toml (which pins a stable channel) so that rustup selects
+# nightly when cargo is invoked from inside the fuzz subcrate directory.
+[toolchain]
+channel = "nightly"
