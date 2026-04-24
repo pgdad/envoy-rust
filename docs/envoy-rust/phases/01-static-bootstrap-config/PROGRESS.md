@@ -118,3 +118,12 @@
 - TODO(Task-15) resolved: both the comment and the `.unwrap_or` patch are gone. `assert_equivalence` is the canonical equivalence checker going forward.
 - `echo_fixture` integration test remains red (fixture `tests/fixtures/0001-tcp-echo/expectations.yaml` still uses pre-Task-13 shape). Task 16 migrates the fixture and is the last commit that leaves CI red.
 - Re-review fix: refreshed crate-level doc comment in lib.rs to reflect phase-01 two-driver surface (commit b0c06a1) — addresses Task 15 code-quality review I1.
+
+## Task 16 — migrate fixture 0001-tcp-echo to tagged driver grammar (2026-04-24)
+
+- Commit: 8bb2310 (code); TBD (progress note)
+- Change: rewrote `tests/fixtures/0001-tcp-echo/expectations.yaml` from phase-00 shape (no `driver:` key) to phase-01 shape (added `driver: { kind: tcp_echo }` stanza). Pre-Task-16 YAML was `equivalence: { response_body: byte_exact }`; post-Task-16 YAML is `driver: { kind: tcp_echo }` + `equivalence: { response_body: byte_exact }`. Appended a migration note to `tests/fixtures/0001-tcp-echo/README.md` (after blank-line separator at EOF) explaining the `driver:` schema change and referencing ADR-0008 and ADR-0011. Added a new structural regression test to `tests/differential/src/lib.rs::tests` named `fixture_0001_expectations_parses_as_tcp_echo` that loads the fixture's expectations YAML on-disk and asserts it parses as `Driver::TcpEcho` with `response_body: Some(BodyRule::ByteExact)` and `response_status: None`.
+- Verification: `cargo test -p differential --lib tests::fixture_0001_expectations_parses_as_tcp_echo -- --exact` → 1 passed; `cargo test -p differential --lib` → 21 passed, 0 failed, 1 ignored; `cargo clippy --workspace` → 0; `cargo fmt --all -- --check` → 0.
+- TDD evidence: Pre-Step-1, fixture expectations.yaml lacked the `driver:` key, so `run_fixture` would fail on `load_expectations` (YAML parse error: missing required field `driver`). Post-Step-1 YAML rewrite, the fixture type-checks. Step 4's regression test confirms the fixture on-disk parses as the correct Driver variant.
+- `echo_fixture` integration test: remains Docker-gated (test at `tests/differential/tests/echo.rs::echo_fixture` requires Docker socket). This task restores YAML-parse green (fixture schema is now valid); actual integration success is contingent on Docker availability at test time. CI verification (Task 19) will run with Docker available.
+- Scope: exactly three files committed (expectations.yaml, README.md, src/lib.rs). Cargo.lock not staged.
