@@ -14,13 +14,10 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// write half until the client half-closes, mirroring Envoy's
 /// `envoy.filters.network.echo` filter.
 ///
-/// Returns `Ok(())` after a clean drain on `shutdown`. Individual connection
+/// Returns `Ok(())` after a clean drain on shutdown. Individual connection
 /// errors are logged via `tracing::warn!` and do not propagate; a connection
 /// failure never takes down the server.
-pub async fn serve<F>(listener: TcpListener, shutdown: F) -> Result<()>
-where
-    F: Future<Output = ()>,
-{
+pub async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) -> Result<()> {
     let mut set: JoinSet<()> = JoinSet::new();
     tokio::pin!(shutdown);
     loop {

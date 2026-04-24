@@ -110,12 +110,9 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
 /// Accept loop. Each accepted connection is passed to `handle_one` on a
-/// `JoinSet`. On `shutdown`, stop accepting and wait up to `DRAIN_TIMEOUT`
+/// `JoinSet`. On shutdown, stop accepting and wait up to `DRAIN_TIMEOUT`
 /// for in-flight handlers; then abort. Mirrors `echo::serve`.
-pub(crate) async fn serve<F>(listener: TcpListener, shutdown: F) -> Result<()>
-where
-    F: Future<Output = ()>,
-{
+pub(crate) async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) -> Result<()> {
     let mut set: JoinSet<()> = JoinSet::new();
     tokio::pin!(shutdown);
     loop {

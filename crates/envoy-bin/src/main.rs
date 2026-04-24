@@ -6,10 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 
-mod echo;
-
-#[allow(dead_code)]
 mod admin;
+mod echo;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ArgvError {
@@ -101,17 +99,57 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("reading config at {}", config_path.display()))?;
     let bootstrap = envoy_config::parse_bootstrap(&yaml)?;
-    let sock = &bootstrap.static_resources.listeners[0]
-        .address
-        .socket_address;
-    let addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
-        .parse()
-        .with_context(|| format!("parsing address {}:{}", sock.address, sock.port_value))?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding to {addr}"))?;
-    tracing::info!(%addr, "envoy-rust listening");
-    echo::serve(listener, shutdown_signal()).await?;
+
+    if let Some(node) = bootstrap.node.as_ref() {
+        tracing::info!(
+            node.id = %node.id,
+            node.cluster = %node.cluster,
+            "node registered",
+        );
+    }
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let signal_token = token.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_token.cancel();
+    });
+
+    let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
+
+    if let Some(listener_cfg) = bootstrap.static_resources.listeners.first() {
+        let sock = &listener_cfg.address.socket_address;
+        let addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
+            .parse()
+            .with_context(|| format!("parsing address {}:{}", sock.address, sock.port_value))?;
+        let lst = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding echo listener to {addr}"))?;
+        tracing::info!(%addr, "envoy-rust listening (echo)");
+        let shutdown = token.clone();
+        set.spawn(async move { echo::serve(lst, async move { shutdown.cancelled().await }).await });
+    }
+
+    if let Some(admin_cfg) = bootstrap.admin.as_ref() {
+        let sock = &admin_cfg.address.socket_address;
+        let addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
+            .parse()
+            .with_context(|| {
+                format!("parsing admin address {}:{}", sock.address, sock.port_value)
+            })?;
+        let lst = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding admin listener to {addr}"))?;
+        tracing::info!(%addr, "envoy-rust listening (admin)");
+        let shutdown = token.clone();
+        set.spawn(
+            async move { admin::serve(lst, async move { shutdown.cancelled().await }).await },
+        );
+    }
+
+    while let Some(res) = set.join_next().await {
+        res.context("task panicked")??;
+    }
     tracing::info!("envoy-rust exited cleanly");
     Ok(())
 }
