@@ -287,6 +287,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-cluster"
+version = "0.0.0"
+dependencies = [
+ "envoy-config",
+ "thiserror",
+]
+
+[[package]]
 name = "envoy-config"
 version = "0.0.0"
 dependencies = [
@@ -1466,6 +1474,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tcp-echo-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
