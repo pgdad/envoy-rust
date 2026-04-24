@@ -1,0 +1,7 @@
+driver:
+  kind: http_get
+  path: /ready
+  host: envoy-rust-phase-01
+equivalence:
+  response_status: exact
+  response_body: byte_exact

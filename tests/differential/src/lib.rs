@@ -719,4 +719,22 @@ equivalence:
         assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
         assert_eq!(e.equivalence.response_status, None);
     }
+
+    #[test]
+    fn fixture_0002_expectations_parses_as_http_get() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests/fixtures/0002-static-admin-ready/expectations.yaml");
+        let e = load_expectations(&path).expect("parses");
+        match e.driver {
+            Driver::HttpGet { ref path, ref host } => {
+                assert_eq!(path, "/ready");
+                assert_eq!(host, "envoy-rust-phase-01");
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
+        assert_eq!(e.equivalence.response_status, Some(StatusRule::Exact));
+        assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+    }
 }
