@@ -51,7 +51,10 @@ exceptions = []
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Wildcard version specs (like "*" or "1.*") are denied; path dependencies
+# (workspace members without version specs) are acceptable and common in
+# workspaces, so they are warned. See ADR-0008 for envoy-config introduction.
+wildcards = "warn"
 # Doctrine D-3.2 forbidden-dependency list. These are hard-denied at the
 # workspace root; pulling them in as a direct dependency fails cargo-deny.
 # Transitive pulls through permitted foundations are allowed via the
