@@ -90,3 +90,13 @@
 - Verification (lint): `cargo clippy -p differential --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
 - Phase-01 REVIEW §9 item **I3** is now closed.
 - Deviation: PLAN.md Step 1 says "append after the final pre-existing test", but PLAN.md's test-inventory note says "placed after the `drive_http_get_*` tests for adjacency". Chose the adjacency placement (before `fixture_0001_*`, after `drive_http_get_rejects_malformed_response`) as directed by the PLAN.md scene-setting note and the explicit SPEC priority rule ("adjacency intent wins"). This deviation is explicitly flagged in the task description and does not affect test correctness.
+
+## Task 12 — fuzz corpus TCP-proxy YAML seeds (2026-04-24)
+
+- Commit: ef90cf3 ("phase 02.1: fuzz corpus — TCP-proxy YAML seeds")
+- Change: created two TCP-proxy-shaped fuzz corpus seeds (`tcp_proxy_single_endpoint.yaml` — single backend endpoint; `tcp_proxy_round_robin_triple.yaml` — three backend endpoints for round-robin coverage); updated `crates/envoy-config/fuzz/.gitignore` to explicitly allow both new seed files alongside the pre-existing `minimal.yaml` exception; appended permanent `fuzz_corpus_tcp_proxy_seeds_parse` test to `crates/envoy-config/src/bootstrap.rs::tests` — reads both YAML files via `CARGO_MANIFEST_DIR` and drives `crate::parse_bootstrap`, acting as a regression gate on corpus-seed validity.
+- Verification (envoy-config): `cargo test -p envoy-config` → `test result: ok. 38 passed; 0 failed` (37 prior + 1 new: `fuzz_corpus_tcp_proxy_seeds_parse`).
+- Verification (workspace): `cargo test --workspace` → `test result: ok. 26 passed; 0 failed; 1 ignored` (integration suite) + `FAILED 0 passed; 1 failed` for `differential::admin_ready_fixture` (Docker-gated, pre-existing, no Docker socket in this environment).
+- Verification (lint): `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0 (reformatted the two `unwrap_or_else` closures from block to inline form per rustfmt's 100-char line limit rule).
+- The 30-second `cargo fuzz run parse_bootstrap -- -max_total_time=30` CI invocation (ADR-0010) now covers the extended grammar via the two new seeds. Full fuzz gate runs in Task 13.
+- Deviation: `crates/envoy-config/fuzz/.gitignore` needed updating — not mentioned in the PLAN.md step list (which only lists the two YAML files and `bootstrap.rs`). Added the two `!corpus/parse_bootstrap/<filename>` exception lines following the existing `minimal.yaml` exception pattern. Without this, `git add` of the corpus files would silently be ignored.
