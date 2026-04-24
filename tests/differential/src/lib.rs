@@ -767,6 +767,38 @@ equivalence:
     }
 
     #[test]
+    fn decode_chunked_empty_stream() {
+        let decoded = super::decode_chunked(b"0\r\n\r\n").expect("empty stream decodes");
+        assert!(decoded.is_empty(), "got {decoded:?}");
+    }
+
+    #[test]
+    fn decode_chunked_with_chunk_extension() {
+        let wire = b"5;name=value\r\nhello\r\n0\r\n\r\n";
+        let decoded = super::decode_chunked(wire).expect("chunk extensions tolerated");
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[test]
+    fn decode_chunked_truncated_size_line() {
+        // No CRLF anywhere — the first `windows(2).position(== \r\n)` miss
+        // must surface as Err, not silent Ok(partial).
+        let err = super::decode_chunked(b"5hello").expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("missing CRLF") || msg.contains("CRLF"),
+            "expected CRLF-missing error; got {msg}",
+        );
+    }
+
+    #[test]
+    fn decode_chunked_ignores_trailer_bytes() {
+        let wire = b"3\r\nabc\r\n0\r\nTrailer-Name: value\r\n\r\n";
+        let decoded = super::decode_chunked(wire).expect("trailer tolerated");
+        assert_eq!(decoded, b"abc");
+    }
+
+    #[test]
     fn fixture_0001_expectations_parses_as_tcp_echo() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
