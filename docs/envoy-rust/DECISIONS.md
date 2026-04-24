@@ -272,3 +272,19 @@ Each ADR uses the structure:
   - `docs/envoy-rust/STATE.md` now points at `02.1-config-cluster` at lifecycle state 2 (SPEC.md exists, PLAN.md does not). The next session runs `superpowers:writing-plans` scoped to sub-phase 02.1.
   - `docs/envoy-rust/STATE.md` line 76's projection ("adds an ADR documenting the split (next sequential, likely ADR-0016)") was a hypothetical anticipating a mid-execution split; the split is landed pre-execution at state 2 instead, so the split ADR takes the actual next-sequential number (0013), not 0016. The parenthetical is now obsolete and the refreshed STATE.md reflects the actual numbering.
   - No doctrine delta. This ADR is the mechanical application of `BOOTSTRAP_PROMPT.md` §6.2 by the plan-writer upon inspecting SPEC §5's LoC estimate against the §6.1 gate. No existing ADR is superseded.
+
+---
+
+## ADR-0014: YAML-native `typed_config` deserialization until the xDS/protos family lands
+
+- Date: 2026-04-24
+- Status: accepted
+- Context: Sub-phase 02.1 is the first phase to surface Envoy's `typed_config` envelope (`envoy.filters.network.tcp_proxy`). The `envoy-protos` crate + `prost` / `prost-build` + upstream proto-tree vendoring were deferred at phase-00 bootstrap to the xDS family (ROADMAP §9). 02.1 must choose: bring the protos stack forward now, or ship a narrower shim.
+- Options considered:
+  - **(i) YAML-native — one Rust enum discriminated on the `@type` URL string literal, fields deserialized by serde.** Minimal surface, scoped to this sub-phase's needs. Grows one enum variant per filter across phases 04/05/06 until the xDS family ships.
+  - **(ii) Bring `prost` + `envoy-protos` in as part of 02.1.** Pulls forward multi-phase proto-tree vendoring. Out of ROADMAP row-02 scope; would trigger a further split by itself.
+  - **(iii) Non-Envoy `raw_config` YAML key.** Diverges `envoy.yaml` and `envoy-rust.yaml` on filter shape, breaking the fixture principle that configs are initially identical.
+- Decision: (i). `TypedConfig` enum in `envoy-config::bootstrap` with a `#[serde(tag = "@type")]` discriminator; one variant for TCP proxy in 02.1; extended per filter across future phases.
+- Rationale: keeps 02.1 within row-02 scope; defers the `envoy-protos` multi-phase work until it pays for itself. Reviewable by shape — a stranger reading the YAML can see which filters are supported.
+- Consequences: unknown `@type` URLs reject at parse time via serde's tagged-enum default behavior. Every new filter in phase 04 / 05 / 06 extends the enum by one variant. An `envoy-protos` supersession ADR in the xDS family re-routes the `@type` URL to prost-generated message types in one sweep and retires this shim.
+- Provenance: this ADR was projected as "ADR-0013" in parent-phase SPEC §7 (`docs/envoy-rust/phases/02-tcp-proxy/SPEC.md`, committed at SHA `50349da`) and renumbered to ADR-0014 by the phase-02 split decision (ADR-0013). The projected ADR-0014 (host-docker + host-gateway) and ADR-0015 (`enable_half_close: false` default) from the parent SPEC are renumbered to ADR-0015 and ADR-0016 respectively and land with sub-phase 02.2.
