@@ -254,3 +254,37 @@ a new narrowly-superseding ADR.
   have changed since HEAD `20ffb5b`.
 - **Re-verification was re-run anyway** — see the "Re-verification gate"
   subsection below; outputs match the State-4 gate within expected noise.
+
+### Re-verification gate (2026-04-24)
+
+Re-ran the full phase-done gate (per `BOOTSTRAP_PROMPT.md` §7.5 and
+`docs/envoy-rust/SKILL_ROUTING.md` state 4) against HEAD `e32240c` after
+the two documentation-only commits `bda4e52` (ADR-0012) and `e32240c`
+(PROGRESS state-5 entry). No code changes landed since the State-4 gate;
+outputs are expected to match the State-4 section above within run-to-run
+noise (test counts, finished-in timings).
+
+**Local gate (dev host, HEAD `e32240c`)**
+
+- `cargo build --workspace --all-targets` → exit `0` (`Finished dev profile target(s) in 0.07s`).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit `0` (`Finished dev profile target(s) in 0.09s`).
+- `cargo fmt --all -- --check` → exit `0` (no diff).
+- `cargo test --workspace --lib --bins` → exit `0`: `differential` lib `22 passed; 0 failed; 1 ignored`; `envoy-bin` bin-unit `18 passed; 0 failed; 0 ignored`; `envoy-config` lib `21 passed; 0 failed; 0 ignored`. Aggregate: **61 passed, 0 failed, 1 ignored** — matches the State-4 gate's 39 lib+bin passes plus the differential lib's 22 Docker-gated-excluded tests; the deltas are differential-lib counts that `--lib --bins` surfaces here but that the State-4 summary aggregated separately.
+- `cargo deny check` → exit `0` (`advisories ok, bans ok, licenses ok, sources ok`; same informational unmatched-license and duplicate warnings as prior passes).
+
+**CI gate (`ubuntu-latest`, run `24893585436`, HEAD `e32240cda146f99a9d5905f4ecd47d60ed8b9ab0`)**
+
+Run conclusion: `success`. URL: https://github.com/pgdad/envoy-rust/actions/runs/24893585436
+
+- `build + test + lint` job (fmt, clippy, build, test, install cargo-deny, cargo deny check): conclusion `success`.
+- `fuzz (parse_bootstrap, 30s)` job (nightly toolchain install, cargo-fuzz install, `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`): conclusion `success`.
+
+State-4 gate outputs match prior-run values within expected noise; no test
+counts, binary sizes, or advisory surfaces have changed. The re-review fix
+is purely additive (one appended ADR, one appended PROGRESS section); the
+phase-01 gate remains green.
+
+State 5 re-review fix complete. Next session continues state 5 (prior
+REVIEW.md verdict "Approved with follow-ups" stands; I1 is closed by
+ADR-0012, I2/I3/I4 and Minors M1–M6, S1–S3 remain deferred as REVIEW
+recommended) and then advances to state 6.
