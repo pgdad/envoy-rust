@@ -154,3 +154,59 @@ Each ADR uses the structure:
   - A new regression test `drive_tcp_rejects_trailing_bytes_after_echo` in `tests/differential/src/lib.rs::tests` proves the silent-pass is closed: a server that echoes `payload.len()` bytes and then writes `b"EXTRA"` now causes `drive_tcp` to return `Err` carrying `"trailing bytes"`. The companion `drive_tcp_round_trips_without_half_close` test still passes, proving the happy path is unchanged.
   - ADR-0006 remains in force for its original contribution (the `read_exact` strategy and the Envoy v1.33.0 analysis). This ADR does not supersede ADR-0006; it lands on top of it as the mitigation for the blind spot ADR-0006's "Consequences" acknowledged but did not close. Per the append-only doctrine (DECISIONS.md preamble, MISSION.md D-3.5) ADR-0006 is not edited.
   - Phase 00's final-commit bracketed ADR list extends from `[ADR-0002, ADR-0003, ADR-0004, ADR-0005, ADR-0006]` to `[ADR-0002, ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0007]`.
+
+---
+
+## ADR-0008: Extract `envoy-config` as a library crate
+
+- Date: 2026-04-24
+- Status: accepted
+- Context: Phase 00's parser lives inline at `crates/envoy-bin/src/config.rs`. Phase 01 lands the first coverage-guided fuzz target (SPEC §D2, scheduled by phase-00 SPEC §6.2). `cargo-fuzz` requires its target crate to be a *library* — `envoy-bin` is a binary-only crate, so the parser must move. The parser is also the long-horizon seam every phase 02–08 plus the xDS family (§9) extends; isolating it behind a crate boundary now avoids a mass reshuffle later.
+- Options considered:
+  - Keep the parser inline in `envoy-bin` and fuzz a bin-sibling trampoline crate that `pub use`s `envoy_bin::config::parse_bootstrap`. Technically works; pollutes `envoy-bin` with a `[lib]` target carried only for fuzzing.
+  - Extract `envoy-config` only; defer a future `envoy-admin` extraction to phase 08 when a real router exists.
+  - Extract `envoy-config` + `envoy-admin` simultaneously. Over-scoped: there is no phase-01 admin router worth a crate boundary yet.
+- Decision: extract `envoy-config` now. `envoy-admin` extraction stays deferred to phase 08.
+- Rationale: the fuzz target drives the requirement today; the cross-phase parser seam is a standing concern either way. A single clean move now is cheaper than inline + trampoline now + rework in phase 02.
+- Consequences:
+  - `crates/envoy-config/` joins `[workspace] members`. `crates/envoy-bin/src/config.rs` is deleted; `envoy-bin` gains `envoy-config = { path = "../envoy-config" }` and drops its direct `serde`/`serde_yaml` deps.
+  - The struct relocation lands verbatim aside from one SPEC-mandated relaxation: `listeners.len() ∈ {0, 1}` (admin-only configs are now valid) and a new `NoRuntime` error fires when both `admin` and `listeners` are empty.
+  - Future parser surface (typed_config envelopes in phase 02, HCM in phase 04, xDS in §9) lands inside `envoy-config` rather than accreting in `envoy-bin`.
+
+---
+
+## ADR-0009: Permit `cargo-fuzz` and `libfuzzer-sys` as fuzz-only dev tooling
+
+- Date: 2026-04-24
+- Status: accepted
+- Context: Doctrine D-3.2's permitted-foundations list enumerates runtime crates; it does not cover fuzzing tooling. Phase 00 SPEC §6.2 scheduled the first fuzz target for phase 01 (`parse_bootstrap`), and the project will add more targets phase-over-phase (HTTP/1.1 tokenizer phase 04, HTTP/2 codec phase 05, protobuf family, etc.). A single authoritative choice of fuzzer avoids per-phase re-litigation.
+- Options considered:
+  - `cargo-fuzz` + `libfuzzer-sys`. Most ergonomic Rust integration; ships as a cargo subcommand; uses libFuzzer under the hood; SanitizerCoverage-instrumented builds via `-Z` flags on nightly rustc.
+  - `afl.rs`. Solid, but requires an out-of-tree setup flow and weaker integration with cargo workspaces.
+  - `honggfuzz-rs`. Smaller community; fewer batteries-included examples for our use case.
+  - `proptest` only. Property-based, not coverage-guided; valuable but a different tool (belongs in unit tests, not in the fuzz pipeline).
+- Decision: `cargo-fuzz` + `libfuzzer-sys` as fuzz-only dev tooling; never a transitive dep of `envoy-bin` or `tests/differential`.
+- Rationale: the one tool that reduces "new fuzz target" to "new `fuzz_target!(...)` file + one CI line" in a cargo-native workflow. The alternatives ask for per-fuzzer scaffolding we'd rebuild every phase.
+- Consequences:
+  - The fuzz subcrate (`crates/envoy-config/fuzz/`) is workspace-excluded per ADR-0010 to keep `libfuzzer-sys` out of the main build's dependency graph.
+  - Future fuzz targets (HTTP/1.1, H2, protobuf, xDS) reuse this decision; no new ADR per target.
+  - If `cargo deny check` flags a transitive license on `libfuzzer-sys` (historically Apache-2.0 + MIT + NCSA on LLVM runtime) that is not on the allow-list, the mitigation lands as a new ADR (likely ADR-0012) during execution — this ADR establishes the tooling choice, not the license surface.
+
+---
+
+## ADR-0010: Nightly Rust toolchain for fuzz-only invocation; stable pin untouched
+
+- Date: 2026-04-24
+- Status: accepted
+- Context: `cargo-fuzz` requires nightly rustc for `-Zsanitizer=address` / `-Zcoverage-options` flags needed by libFuzzer's SanitizerCoverage instrumentation. D-3.9 pins `rust-toolchain.toml` at the repo root to stable `1.95.0`, and "upgrading the pin is its own phase." The fuzz job must not flip every `cargo build` and `cargo test` in the repo onto nightly.
+- Options considered:
+  - Bump `rust-toolchain.toml` to nightly. Rejected — breaks D-3.9 for the mainline build and every phase's stable CI gate.
+  - Add a nested `rust-toolchain.toml` under `crates/envoy-config/fuzz/`. Rejected — that crate is workspace-excluded (ADR-0008 consequence); cargo toolchain-override semantics across workspace boundaries are surprising and brittle.
+  - Use `cargo-bolero` or similar stable-wrappers. Rejected — libFuzzer-backed runs still require nightly for sanitizer coverage.
+  - Invoke `cargo +nightly fuzz run ...` explicitly in a dedicated CI job; stable pin untouched.
+- Decision: explicit `+nightly` invocation in a dedicated `fuzz` CI job (SPEC §D8). Developers running fuzz locally install nightly with `rustup toolchain install nightly` and run `cargo +nightly fuzz run parse_bootstrap` from `crates/envoy-config/`.
+- Rationale: the cost is one `+nightly` prefix in CI and one README line; the benefit is that D-3.9 remains mechanically enforced for every mainline path and every developer-facing build stays on the pinned stable.
+- Consequences:
+  - `.github/workflows/ci.yml` gains a second job `fuzz` running `dtolnay/rust-toolchain@nightly` with `rust-src` (SanitizerCoverage requires libstd recompiles), `cargo install cargo-fuzz --locked`, and `cargo fuzz run parse_bootstrap -- -max_total_time=30` from `crates/envoy-config/`. A 30 s budget matches SKILL_ROUTING.md state 4's "short-budget CI run."
+  - Developer docs (future) may add a one-line "install nightly + cargo-fuzz" block; not required in phase 01.
+  - A future "scheduled long-budget nightly fuzz" becomes its own phase with its own ADR.
