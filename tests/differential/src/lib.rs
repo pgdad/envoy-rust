@@ -158,6 +158,105 @@ pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Decoded HTTP/1.1 response. Headers are captured for debug tracing but play
+/// no part in the phase-01 equivalence diff (ADR-0011).
+#[derive(Debug)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    #[allow(dead_code)]
+    pub headers: Vec<(String, Vec<u8>)>,
+}
+
+/// Open a TCP connection to `addr`, issue a minimal `GET` for `path` with
+/// `Host: host`, and parse the response. Supports `content-length`-framed and
+/// `connection: close`-framed responses only; that is enough for phase 01's
+/// admin surface (SPEC §6 signpost 9).
+pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<HttpResponse> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await?;
+    stream.flush().await.ok();
+
+    let mut buf = Vec::with_capacity(2048);
+    let mut scratch = [0u8; 2048];
+    let head_end;
+    loop {
+        let n = stream.read(&mut scratch).await?;
+        if n == 0 {
+            bail!("{addr} closed before a response head was received");
+        }
+        buf.extend_from_slice(&scratch[..n]);
+
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut resp = httparse::Response::new(&mut headers);
+        match resp.parse(&buf) {
+            Ok(httparse::Status::Complete(n)) => {
+                head_end = n;
+                let status = resp
+                    .code
+                    .ok_or_else(|| anyhow::anyhow!("missing response status code"))?;
+                let mut captured_headers: Vec<(String, Vec<u8>)> = Vec::new();
+                let mut content_length: Option<usize> = None;
+                let mut connection_close = false;
+                for h in resp.headers.iter() {
+                    captured_headers.push((h.name.to_ascii_lowercase(), h.value.to_vec()));
+                    if h.name.eq_ignore_ascii_case("content-length") {
+                        let s = std::str::from_utf8(h.value)?.trim();
+                        content_length = Some(s.parse()?);
+                    } else if h.name.eq_ignore_ascii_case("connection") {
+                        let s = std::str::from_utf8(h.value)?.trim();
+                        if s.eq_ignore_ascii_case("close") {
+                            connection_close = true;
+                        }
+                    }
+                }
+
+                // Drain the body.
+                let body = match content_length {
+                    Some(cl) => {
+                        let mut body = Vec::with_capacity(cl);
+                        let already = &buf[head_end..];
+                        let take = already.len().min(cl);
+                        body.extend_from_slice(&already[..take]);
+                        if body.len() < cl {
+                            let remaining = cl - body.len();
+                            let mut rest = vec![0u8; remaining];
+                            stream.read_exact(&mut rest).await?;
+                            body.extend(rest);
+                        }
+                        body
+                    }
+                    None if connection_close => {
+                        let mut body = Vec::new();
+                        body.extend_from_slice(&buf[head_end..]);
+                        stream.read_to_end(&mut body).await?;
+                        body
+                    }
+                    None => bail!(
+                        "{addr} response has neither `content-length` nor `connection: close`; \
+                         drive_http_get does not support keep-alive in phase 01",
+                    ),
+                };
+
+                return Ok(HttpResponse {
+                    status,
+                    body,
+                    headers: captured_headers,
+                });
+            }
+            Ok(httparse::Status::Partial) => continue,
+            Err(e) => bail!("{addr} response parse error: {e}"),
+        }
+    }
+}
+
 /// End-to-end run of one fixture. Panics-on-failure paths unwind through Drop
 /// guards so the container and envoy-rust subprocess are cleaned up even on
 /// assertion failure.
@@ -385,6 +484,125 @@ equivalence:
     // `drive_tcp` silently consumed only the first `payload.len()` bytes and
     // returned Ok, narrowing BEHAVIOR_CONTRACT row 2's "byte-exact" contract
     // to "first N bytes match."
+    #[tokio::test]
+    async fn drive_http_get_round_trips() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read the request (we don't parse — just drain until CRLFCRLF).
+            let mut buf = [0u8; 512];
+            let mut read = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                read.extend_from_slice(&buf[..n]);
+                if read.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nLIVE\n",
+                )
+                .await
+                .unwrap();
+            drop(stream);
+        });
+
+        let resp = drive_http_get(addr, "/ready", "x").await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"LIVE\n");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_http_get_handles_explicit_content_length() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = tokio::io::copy(
+                &mut tokio::io::empty(),
+                &mut tokio::io::BufWriter::new(&mut s),
+            )
+            .await;
+            s.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 4\r\n\r\nNOPE")
+                .await
+                .unwrap();
+            // Hold open long enough for the client to read_exact the 4 bytes.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(s);
+        });
+
+        let resp = drive_http_get(addr, "/x", "h").await.unwrap();
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.body, b"NOPE");
+    }
+
+    #[tokio::test]
+    async fn drive_http_get_handles_connection_close_without_length() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Drain the incoming request so the receive buffer is empty before
+            // we write and close. Without this, macOS sends RST instead of FIN
+            // when dropping a TcpStream with unread data.
+            let mut drain = [0u8; 512];
+            loop {
+                let n = s.read(&mut drain).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                if drain[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            s.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nhello-close")
+                .await
+                .unwrap();
+            s.shutdown().await.ok();
+            drop(s);
+        });
+
+        let resp = drive_http_get(addr, "/x", "h").await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello-close");
+    }
+
+    #[tokio::test]
+    async fn drive_http_get_rejects_malformed_response() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            s.write_all(b"this is not a valid http response\r\n\r\n")
+                .await
+                .unwrap();
+            drop(s);
+        });
+
+        let err = drive_http_get(addr, "/x", "h")
+            .await
+            .expect_err("malformed must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse") || msg.contains("invalid"),
+            "got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn drive_tcp_rejects_trailing_bytes_after_echo() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
