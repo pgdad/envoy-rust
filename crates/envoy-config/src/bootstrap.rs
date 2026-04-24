@@ -78,10 +78,29 @@ pub struct FilterChain {
     pub filters: Vec<NetworkFilter>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkFilter {
     pub name: String,
+    #[serde(default)]
+    pub typed_config: Option<TypedConfig>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "@type", deny_unknown_fields)]
+pub enum TypedConfig {
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy")]
+    TcpProxy(TcpProxyConfig),
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TcpProxyConfig {
+    /// Required by Envoy for access-log attribution; accepted by envoy-rust and
+    /// unused until phase 06 (access logs). Carrying it through the parser now
+    /// keeps fixture YAMLs identical across upstream-Envoy and envoy-rust.
+    pub stat_prefix: String,
+    pub cluster: String,
 }
 
 pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
@@ -443,5 +462,86 @@ static_resources:
 "#;
         let err = crate::parse_bootstrap(yaml).expect_err("must reject");
         assert_unknown_field(err);
+    }
+
+    #[test]
+    fn parses_bootstrap_with_tcp_proxy_filter() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+"#;
+        let b: Bootstrap = serde_yaml::from_str(yaml).expect("valid YAML");
+        let filter = &b.static_resources.listeners[0].filter_chains[0].filters[0];
+        assert_eq!(filter.name, "envoy.filters.network.tcp_proxy");
+        match filter.typed_config.as_ref().expect("typed_config present") {
+            TypedConfig::TcpProxy(tp) => {
+                assert_eq!(tp.stat_prefix, "ingress_tcp");
+                assert_eq!(tp.cluster, "backend");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_typed_config_unknown_type_url() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.not_tcp_proxy.v3.NotTcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+"#;
+        let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown variant") || msg.contains("@type"),
+            "expected serde tagged-enum rejection; got {msg}",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_tcp_proxy_config_field() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+                idle_timeout: 0s
+"#;
+        let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown field"), "got {msg}");
     }
 }
