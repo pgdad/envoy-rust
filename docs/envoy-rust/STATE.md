@@ -9,49 +9,51 @@
 
 **id:** `02.1`
 **slug:** `02.1-config-cluster`
-**directory:** `docs/envoy-rust/phases/02.1-config-cluster/` (exists; contains `SPEC.md` and `PLAN.md`).
-**status:** phase 02.1 lifecycle **state 3 (PLAN.md exists, implementation incomplete)** — `SPEC.md` landed at commit `1c38ca9` (alongside the ADR-0013 split decision); `PLAN.md` landed at commit `0779308` (this session). ROADMAP row `02.1` remains `status: planned` until the phase-done commit per `PLAN.md` Task 13.
+**directory:** `docs/envoy-rust/phases/02.1-config-cluster/` (exists; contains `SPEC.md`, `PLAN.md`, `PROGRESS.md`, and `REVIEW.md`).
+**status:** phase 02.1 lifecycle **state 5 (REVIEW.md approved; state-6 phase-done commit next)** — `SPEC.md` landed at `1c38ca9`; `PLAN.md` landed at `0779308`; all 13 PLAN.md tasks implemented (`6d1f8d6..cadeaa6`); state-4 phase-done gate cleared on CI run `24909836488` (PROGRESS.md §"State 4") with state-4 follow-up at `95a26a7`; `Cargo.lock` sync at `dea4d16` (REVIEW §3 I1 close-out); REVIEW.md landed with verdict **Approved** in the same commit that flips this STATE.md from state 3 to state 5. ROADMAP row `02.1` remains `status: planned` until the phase-done commit.
 
 Phase 02 (`02-tcp-proxy`) was split during state 2 via **ADR-0013** (landed at commit `1c38ca9`). The parent row's `status` is `in-progress` with `sub-phases = 02.1, 02.2`. Parent `SPEC.md` remains in-tree unedited at `docs/envoy-rust/phases/02-tcp-proxy/SPEC.md` as the committed design artifact from SHA `50349da`; sub-phase SPECs supersede it for execution purposes.
 
-Sub-phase 02.2 (`02.2-listener-tcp-proxy`) has its SPEC.md landed at `1c38ca9` but is `planned` — it depends on 02.1 being `done`, and STATE.md will advance from 02.1 to 02.2 only after 02.1's phase-done commit (`PLAN.md` Task 13, Step 7 of the future state-6 session).
+Sub-phase 02.2 (`02.2-listener-tcp-proxy`) has its SPEC.md landed at `1c38ca9` but is `planned` — it depends on 02.1 being `done`, and STATE.md will advance from 02.1 to 02.2 in the state-6 phase-done commit per `BOOTSTRAP_PROMPT.md` §5.3 / SKILL_ROUTING.md state 6.
 
 Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phase 00 (`00-bootstrap`) is **done** as of commit `e5afc35`.
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 23–27, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 3): the next session — operating as the state-3 session of phase 02.1 — invokes **`superpowers:subagent-driven-development`** scoped to this phase, executing `PLAN.md` task-by-task with a fresh subagent per task plus the two-stage (spec-compliance + code-quality) review cadence the skill mandates, appending a section to `PROGRESS.md` on each task completion.
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 44–48, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 6): the next session — operating as the state-6 session of phase 02.1 — lands the **phase-done commit** with message format per `BOOTSTRAP_PROMPT.md` §5.3:
 
-Every implementation task inside `PLAN.md` enforces `superpowers:test-driven-development` per doctrine D-3.1.
+```
+phase 02.1: <title> [ADR-0014]
 
-Per the user's standing preference (auto-memory `feedback_execution_style`), execution uses `superpowers:subagent-driven-development` over inline `executing-plans` — do not present the two-option fork.
+<3–6 paragraph narrative covering landed surface, differential/conformance
+status, gate evidence (CI runs 24909836488 state-4 and any state-5/6 CI
+runs), rollovers carried forward to 02.2 or later phases.>
+```
 
-**Plan splitting gate already evaluated** (BOOTSTRAP_PROMPT.md §5 state 2 / §6.1; SPEC §5; PLAN self-review §4):
+The commit flips `ROADMAP.md` row `02.1` status from `planned` to `done`, and advances this STATE.md from phase 02.1 to phase 02.2 (slug `02.2-listener-tcp-proxy`, lifecycle state 1, next skill `superpowers:brainstorming` scoped to the sub-phase SPEC). Parent row `02` remains `in-progress` — it flips to `done` in the same commit as 02.2's final phase-done commit per `ROADMAP.md` schema ("parent flips to `done` only after all sub-phases are `done`").
 
-- Task count: 13 (bound: ~25).
-- Estimated net LoC change: ~980 (bound: ~1500).
-- Decision: **kept unified**. Both gates hold comfortably. Per the sub-phase discussion in `STATE.md`'s splitting guidance (landed at `1c38ca9`), **do not split 02.1 further**. If a single task during execution blows past its own bite-sized budget, the executor invokes `superpowers:systematic-debugging` before attempting a nested split — nested splits of a split sub-phase were not anticipated at the parent brainstorm and deserve a fresh root-cause analysis.
+State 6 is a docs-only commit (no code changes). No further review is required — REVIEW.md's §7 final verdict stands.
 
-Inputs the state-3 session should read, in order, before launching the first subagent:
+Inputs the state-6 session should read, in order:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
 2. `docs/envoy-rust/STATE.md` (this file — to confirm routing).
-3. `docs/envoy-rust/ROADMAP.md` (phase 02 row: `in-progress` with sub-phases `02.1, 02.2`; phase 02.1 row: "Config schema + cluster manager + echo-server helper"; depends-on `01`).
-4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0013`; `ADR-0014` lands during this phase per `PLAN.md` Task 1 — see the renumbering note in §Notes below).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence rules — phase 02.1 does not ship a new differential fixture; existing fixtures `0001-tcp-echo` and `0002-static-admin-ready` remain green unchanged).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (routing reference).
-7. `docs/envoy-rust/phases/02.1-config-cluster/SPEC.md` (the authoritative sub-phase design contract — referenced at every task under the phrase "Source of truth: SPEC.md" at the top of `PLAN.md`).
-8. `docs/envoy-rust/phases/02.1-config-cluster/PLAN.md` (the operational plan; 13 tasks; task boundaries are the natural subagent-dispatch boundaries).
-9. `docs/envoy-rust/phases/02-tcp-proxy/SPEC.md` (parent SPEC — for context on the full phase-02 design; execution follows the 02.1 sub-phase SPEC, not the parent).
-10. `docs/envoy-rust/phases/01-static-bootstrap-config/PLAN.md` + `PROGRESS.md` (shape reference — phase 01's plan + progress file is the precedent for task granularity, TDD framing, and PROGRESS-formatting conventions `PLAN.md` Task 1 adopts).
+3. `docs/envoy-rust/ROADMAP.md` (phase 02 row; phase 02.1 row still `planned` at session entry).
+4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0014`).
+5. `docs/envoy-rust/SKILL_ROUTING.md` state 6 block.
+6. `docs/envoy-rust/phases/02.1-config-cluster/SPEC.md` §8 ("Commit discipline" / "Phase-done commit" — whichever section captures the commit-message conventions).
+7. `docs/envoy-rust/phases/02.1-config-cluster/REVIEW.md` (Approved verdict — §7 close-out).
+8. `docs/envoy-rust/phases/02.1-config-cluster/PROGRESS.md` (state-4 gate evidence, for the commit narrative).
+9. `docs/envoy-rust/phases/01-static-bootstrap-config/` (shape precedent — commit `aef36ce` is the state-6 phase-done commit; `f436c29` is the state-5 REVIEW-landing precedent).
+10. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/SPEC.md` (destination phase — state 6 advances STATE.md here; lifecycle state 1, next-skill `superpowers:brainstorming`).
 
 ## Last commit
 
-Plan commit (this session): lands `docs/envoy-rust/phases/02.1-config-cluster/PLAN.md` (2992 lines, 13 tasks). No code changes; no other documents touched by this commit. The state-advance commit following this one touches only `docs/envoy-rust/STATE.md`.
+REVIEW.md landing commit (this session): lands `docs/envoy-rust/phases/02.1-config-cluster/REVIEW.md` with state-5 verdict **Approved** and advances this STATE.md from state 3 to state 5. Preceded in the same session by `dea4d16` (Cargo.lock sync — REVIEW §3 I1 close-out; phase-01 precedent `4955252`).
 
 ## Last updated
 
-2026-04-24 (phase 02.1 lifecycle state advanced from 2 to 3; PLAN.md committed at `0779308`; next-skill flips from `superpowers:writing-plans` to `superpowers:subagent-driven-development`).
+2026-04-24 (phase 02.1 lifecycle state advanced from 3 to 5; REVIEW.md committed with verdict Approved; next-skill flips from `superpowers:subagent-driven-development` to the state-6 phase-done commit per `BOOTSTRAP_PROMPT.md` §5 state 6).
 
 ## Notes
 
