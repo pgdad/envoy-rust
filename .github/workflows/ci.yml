@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-test-lint:
+  build:
     name: build + test + lint
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -50,3 +50,27 @@ jobs:
 
       - name: cargo deny check
         run: cargo deny check
+
+  fuzz:
+    name: fuzz (parse_bootstrap, 30s)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install nightly Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: cargo cache (fuzz subcrate)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "crates/envoy-config/fuzz -> target"
+
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: fuzz parse_bootstrap
+        working-directory: crates/envoy-config
+        run: cargo fuzz run parse_bootstrap -- -max_total_time=30
