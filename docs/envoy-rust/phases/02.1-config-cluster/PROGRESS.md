@@ -41,3 +41,12 @@
 - Test verification: `cargo test -p envoy-cluster` → `test result: ok. 3 passed; 0 failed` (`pick_endpoint_cycles_over_three_endpoints`, `pick_endpoint_is_stable_under_concurrent_calls`, `handle_clone_shares_cursor`).
 - envoy-config count held: `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed`.
 - Workspace lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
+
+## Task 7 — ClusterManager + from_bootstrap (2026-04-24)
+
+- Commit: 72d9dcb
+- Change: replaced `ClusterManager`, `ClusterError`, and `from_bootstrap` placeholders with real implementations. `ClusterManager` derives `Debug`, holds `clusters: HashMap<String, Arc<Cluster>>`, and exposes `pub fn get(&self, name: &str) -> Option<ClusterHandle>` (returns a fresh `ClusterHandle` wrapping an `Arc::clone`). `ClusterError` is a `thiserror` enum with three variants: `EmptyCluster { name }`, `DuplicateClusterName { name }`, `EndpointParse { cluster, addr, #[source] source: AddrParseError }`. `from_bootstrap` iterates `bootstrap.static_resources.clusters`, parses each `"address:port"` string via `.parse::<SocketAddr>()` (wrapping failure in `EndpointParse`), rejects empty endpoint lists (`EmptyCluster`), inserts into a `HashMap`, and rejects collisions via `HashMap::insert` returning `Some(_)` (`DuplicateClusterName`). Removed `#[allow(dead_code)]` from `ClusterManager` (now used); `Cluster.name` retains its field-level `#[allow(dead_code)]` because it is written at construction time but never read back from a `Cluster` instance — the HashMap key carries the lookup identity. Added `#[derive(Debug)]` to `ClusterManager` (required by test `expect_err` bounds; not specified in plan but necessary for compilation).
+- Test verification: `cargo test -p envoy-cluster` → `test result: ok. 8 passed; 0 failed` (3 Task-6 + 5 new: `from_bootstrap_builds_single_endpoint_cluster`, `from_bootstrap_builds_three_endpoint_cluster`, `from_bootstrap_rejects_empty_cluster`, `from_bootstrap_rejects_duplicate_cluster_name`, `from_bootstrap_rejects_malformed_endpoint_address`).
+- envoy-config count held: `cargo test -p envoy-config` → `test result: ok. 37 passed; 0 failed`.
+- Workspace lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0.
+- Pre-existing Docker-gated `differential::admin_ready_fixture` failure unchanged (no Docker socket; pre-dates this task).
