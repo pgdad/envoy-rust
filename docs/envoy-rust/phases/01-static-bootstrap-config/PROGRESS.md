@@ -288,3 +288,26 @@ State 5 re-review fix complete. Next session continues state 5 (prior
 REVIEW.md verdict "Approved with follow-ups" stands; I1 is closed by
 ADR-0012, I2/I3/I4 and Minors M1–M6, S1–S3 remain deferred as REVIEW
 recommended) and then advances to state 6.
+
+## State 5 — Re-review Approved (2026-04-24)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 5 (close-out leg).
+
+Narrow re-review by `superpowers:code-reviewer` of commits
+`33665f0..c528872` (range: ADR-0012 + two PROGRESS commits; docs-only).
+Verdict: **I1 Closed — no new issues.** Full close-out section appended
+to `REVIEW.md` §9 with check table and re-reviewer evidence (scope-creep
+PASS, append-only D-3.5 PASS, ADR-0012 quality PASS, gate-evidence
+confirmed via `gh run view 24893585436`).
+
+Front-matter verdict in `REVIEW.md` updated to **Approved** (state 5
+complete). Forward-tracked items into phase 02: I3 (decode_chunked unit
+tests), I4 (admin header-cap tightening), M1 (retarget stale
+TODO(phase-01) in `tests/differential/src/subject.rs`). Other Minors
+(M2–M6) remain as REVIEW references, not tracked forward as starter
+items. One trivial polish (rustup-book URL citation in ADR-0012) is
+non-blocking and optionally folded into phase-02 work.
+
+Next action per SKILL_ROUTING state 6: phase-done commit per SPEC §8
+format, `ROADMAP.md` row 01 → `done`, `STATE.md` advanced to phase 02
+(slug `02-tcp-proxy`, next skill `superpowers:brainstorming`).

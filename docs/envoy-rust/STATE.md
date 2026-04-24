@@ -9,35 +9,40 @@
 
 **id:** `01`
 **slug:** `01-static-bootstrap-config`
-**directory:** `docs/envoy-rust/phases/01-static-bootstrap-config/` (exists; contains `SPEC.md`, `PLAN.md`, `PROGRESS.md`)
-**status:** phase 01 lifecycle **state 4** — implementation complete and verified; REVIEW pending.
+**directory:** `docs/envoy-rust/phases/01-static-bootstrap-config/` (exists; contains `SPEC.md`, `PLAN.md`, `PROGRESS.md`, `REVIEW.md`)
+**status:** phase 01 lifecycle **state 6 (pending)** — reviewed and approved; final phase-done commit next (flips `ROADMAP.md` row 01 → `done` and advances this file to phase 02).
 
-All 19 PLAN tasks committed. State-4 phase-done gate passed (CI run
-24891070573, HEAD `20ffb5bf52a59bcc3f00e636281fbfcfd321b307`, both `build`
-and `fuzz` jobs green; all 5 local stable-toolchain commands exit 0). See
-`PROGRESS.md` State-4 section for full details.
+State-5 re-review verdict: **I1 Closed — no new issues.** ADR-0012 lands
+the nested nightly pin in `crates/envoy-config/fuzz/rust-toolchain.toml`
+on the record (narrowly supersedes ADR-0010). CI re-verification run
+24893585436 green on HEAD `e32240c`. `REVIEW.md` front-matter verdict
+now reads **Approved**; full close-out section at §9 with check table.
+
+Forward-tracked rollovers into phase 02: I3 (`decode_chunked` unit
+tests), I4 (admin 8 KiB cap tightening), M1 (retarget stale
+`TODO(phase-01)` in `tests/differential/src/subject.rs`).
 
 Phase 00 (`00-bootstrap`) is **done** as of commit `e5afc35`.
 
 ## Next expected skill
 
-**`superpowers:requesting-code-review`** — the next session opens a code
-review for phase 01 per `SKILL_ROUTING.md` state 5. The reviewer should
-read `docs/envoy-rust/phases/01-static-bootstrap-config/SPEC.md` and
-`PROGRESS.md` (especially the State-4 section) as context.
+**Final phase-done commit per SPEC §8** (message:
+`phase 01: Static bootstrap config loader + admin /ready [ADR-0008, ADR-0009, ADR-0010, ADR-0011, ADR-0012]`).
+That commit flips `docs/envoy-rust/ROADMAP.md` row 01 status to
+`done`, rewrites this file for phase 02 (slug `02-tcp-proxy`, next
+skill `superpowers:brainstorming`), and appends a final entry to
+`PROGRESS.md`. After that commit lands, phase 01 is complete and the
+next session enters phase 02 at lifecycle state 1.
 
 ## Last commit
 
-State-4 phase-done gate:
-`phase 01: state 4 — phase-done gate verified` (commit `7768d01`).
-Appends State-4 section to `PROGRESS.md`. HEAD after STATE advance will
-be the STATE.md commit.
+State-5 re-review approved:
+`phase 01: state 5 re-review Approved — REVIEW.md I1 close-out + STATE advance to state 6`.
 
 ## Last updated
 
-2026-04-24 (state 4 complete — phase-done gate verified; STATE advanced
-to state 4; next session enters state 5 via
-`superpowers:requesting-code-review`).
+2026-04-24 (state 5 re-review approved; ADR-0012 closes I1; STATE
+advanced to state 6 pending the final phase-done commit).
 
 ## Notes
 
@@ -51,15 +56,26 @@ to state 4; next session enters state 5 via
   No remaining phase-00 carryover on this front.
 - The phase-00 I3 SIGKILL→SIGTERM functional switch remains deferred.
   Phase-01 SPEC did not pick it up; the `nix` crate remains the stated
-  blocker (not on the D-3.2 permitted-foundations list).
-- ADR-0012 (conditional — `cargo deny` `libfuzzer-sys` license advisory)
-  was not needed; `cargo deny check` passed throughout all phase-01 tasks.
-- Three CI-fix commits (`5b852ce`, `97c1576`, `20ffb5b`) landed during
-  the state-4 gate to resolve: (1) `drive_http_get` chunked-encoding
-  blind spot exposed by upstream Envoy v1.33.0's `/ready` response, and
-  (2) cargo-fuzz toolchain-override interaction with the workspace-root
-  `rust-toolchain.toml`. Both root causes are documented in `PROGRESS.md`
-  State-4 section.
+  blocker (not on the D-3.2 permitted-foundations list). Phase-01
+  review M1 (retarget stale `TODO(phase-01)` in
+  `tests/differential/src/subject.rs`) is tracked forward to phase 02
+  as part of clearing this breadcrumb.
+- ADR-0012 (nested nightly pin in fuzz subcrate; narrowly supersedes
+  ADR-0010) landed during state-5 remediation (commit `bda4e52`) to
+  close REVIEW.md §Issues/Important I1. This slot had been named
+  informally in a prior STATE.md note for a conditional
+  "`cargo deny` `libfuzzer-sys` license advisory" ADR that was never
+  needed; the actual ADR-0012 in `DECISIONS.md` is the nested-pin ADR.
+- Phase-01 state-4 CI-fix commits (`5b852ce`, `97c1576`, `20ffb5b`):
+  (1) `drive_http_get` chunked-encoding blind spot exposed by upstream
+  Envoy v1.33.0's `/ready` response; (2) cargo-fuzz toolchain-override
+  interaction with the workspace-root `rust-toolchain.toml`. Both root
+  causes are documented in `PROGRESS.md` State-4 section; ADR-0012
+  formally legitimates the nested-pin portion of fix (2).
+- Phase-02 starter items (carry forward from phase-01 REVIEW.md §9):
+  - I3 — add 4 unit tests for `decode_chunked` in `tests/differential/src/lib.rs` (empty, extension, truncated, trailer).
+  - I4 — tighten admin 8 KiB header cap in `crates/envoy-bin/src/admin.rs` to an exact boundary (currently effectively ~9 KiB; ~2-line fix).
+  - M1 — retarget stale `TODO(phase-01)` in `tests/differential/src/subject.rs:25–32` (phase-00 I3 deferral now targets phase 04 or later, since phase 01 did not pick it up).
 - Any deviation from the state machine requires
   `superpowers:systematic-debugging` before proceeding — see §1 Step E
   of `BOOTSTRAP_PROMPT.md`.
