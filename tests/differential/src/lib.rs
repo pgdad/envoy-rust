@@ -163,6 +163,9 @@ pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
 /// assertion failure.
 pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let expectations = load_expectations(&fixture_dir.join("expectations.yaml"))?;
+    // TODO(Task-15): run_fixture dispatches unconditionally on drive_tcp here.
+    // Minimum compile patch after Task 13's grammar change; Task 15 rewrites
+    // this function to branch on expectations.driver.
     assert_eq!(
         expectations
             .equivalence
