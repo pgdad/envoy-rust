@@ -1,4 +1,6 @@
 corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/minimal.yaml
+!corpus/parse_bootstrap/tcp_proxy_single_endpoint.yaml
+!corpus/parse_bootstrap/tcp_proxy_round_robin_triple.yaml
 artifacts/
 target/

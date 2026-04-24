@@ -1063,4 +1063,18 @@ admin:
         let err = crate::parse_bootstrap(yaml).expect_err("must reject");
         assert_unknown_field(err);
     }
+
+    #[test]
+    fn fuzz_corpus_tcp_proxy_seeds_parse() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        for fname in &[
+            "fuzz/corpus/parse_bootstrap/tcp_proxy_single_endpoint.yaml",
+            "fuzz/corpus/parse_bootstrap/tcp_proxy_round_robin_triple.yaml",
+        ] {
+            let path = format!("{root}/{fname}");
+            let yaml =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            crate::parse_bootstrap(&yaml).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+        }
+    }
 }
