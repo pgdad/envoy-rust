@@ -19,3 +19,11 @@
 - Change: populated crates/envoy-config/src/bootstrap.rs with the 10-struct Bootstrap type tree (SPEC §D1) + 2 serde shape tests (parses_phase00_minimal_into_bootstrap, parses_admin_only_bootstrap). No parse_bootstrap/ConfigError yet (Task 4).
 - Verification: cargo test -p envoy-config → 2 passed, 0 failed; cargo clippy -p envoy-config --all-targets --all-features -- -D warnings → 0; cargo fmt --all -- --check → 0.
 - TDD evidence: Step-2 red run failed with: `error[E0425]: cannot find type 'Bootstrap' in this scope` at crates/envoy-config/src/bootstrap.rs:22:16; Step-4 post-implement → 1 passed; Step-6 full gate → 2 passed, 0 failed.
+
+## Task 4 — parse_bootstrap + ConfigError + validate + N2 closure (2026-04-24)
+
+- Commit: 569ec07
+- Change: lib.rs rewritten with pub re-exports (Address, Admin, Bootstrap, Cluster, FilterChain, Listener, NetworkFilter, Node, SocketAddress, StaticResources), ECHO_FILTER const, ConfigError enum (4 variants: Yaml, NoRuntime, TooManyListeners, UnsupportedFilter), and parse_bootstrap entrypoint; bootstrap.rs gained pub(crate) fn validate (implementing SPEC §D1's three relaxations) + 19 new tests (14 SPEC §D1 + 5 N2 closure for deny_unknown_fields regression on StaticResources, Address, SocketAddress, FilterChain, NetworkFilter).
+- Verification: cargo test -p envoy-config → 21 passed, 0 failed; cargo clippy -p envoy-config --all-targets --all-features -- -D warnings → 0; cargo fmt --all -- --check → 0; cargo test --workspace → all green.
+- TDD evidence: Step-1 red run failed with `error[E0425]: cannot find function 'parse_bootstrap' in the crate root` at crates/envoy-config/src/bootstrap.rs:147:24; Step-3 post-implement (single test) → 1 passed; Step-5 full-suite (all 21 tests) → 21 passed, 0 failed.
+- N2 closure: the five rejects_unknown_{static_resources,address,socket_address,filter_chain,network_filter}_field tests close phase-00 N2 (STATE.md lines 87–90).
