@@ -73,4 +73,7 @@ jobs:
 
       - name: fuzz parse_bootstrap
         working-directory: crates/envoy-config
-        run: cargo fuzz run parse_bootstrap -- -max_total_time=30
+        # Use `+nightly` to override the workspace-root rust-toolchain.toml
+        # (which pins stable 1.95.0); cargo-fuzz requires nightly for
+        # -Zsanitizer and sancov flags.
+        run: cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30
