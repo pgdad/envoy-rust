@@ -100,3 +100,78 @@
 - Verification (lint): `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0; `cargo fmt --all -- --check` → exit 0 (reformatted the two `unwrap_or_else` closures from block to inline form per rustfmt's 100-char line limit rule).
 - The 30-second `cargo fuzz run parse_bootstrap -- -max_total_time=30` CI invocation (ADR-0010) now covers the extended grammar via the two new seeds. Full fuzz gate runs in Task 13.
 - Deviation: `crates/envoy-config/fuzz/.gitignore` needed updating — not mentioned in the PLAN.md step list (which only lists the two YAML files and `bootstrap.rs`). Added the two `!corpus/parse_bootstrap/<filename>` exception lines following the existing `minimal.yaml` exception pattern. Without this, `git add` of the corpus files would silently be ignored.
+
+## State 4 — Phase-done gate verification (2026-04-24)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4. All five local stable-toolchain
+gate commands and both CI jobs (`build`, `fuzz`) cleared on first attempt — no
+fix-during-gate commits were needed (contrast phase 01's state-4 which required
+two fixes before the final green CI run).
+
+### Local gate (dev host, HEAD `cadeaa6`)
+
+- `cargo build --workspace --all-targets` → exit 0.
+
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+```
+
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → exit 0.
+
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+```
+
+- `cargo fmt --all -- --check` → exit 0 (no diff).
+
+- `cargo test --workspace --lib --bins` → exit 0. Per-crate tails:
+
+```
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s  [envoy-config]
+test result: ok.  8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s  [envoy-cluster]
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s  [envoy-bin]
+test result: ok.  8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.01s  [tcp-echo-server]
+test result: ok. 26 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.36s  [differential lib]
+```
+
+  The `differential` lib tally of 26 passed / 1 ignored matches PLAN.md's
+  expectation (22 phase-01 + 4 I3 close-out tests from task 11; the 1 ignored
+  is the known TOCTOU-flaky `wait_accept_ready_times_out_for_closed_socket`
+  documented in ADR-0006 provenance). The Docker-gated integration tests
+  (`tests/differential/tests/echo.rs::echo_fixture`,
+  `tests/differential/tests/admin_ready.rs::admin_ready_fixture`) are excluded
+  by `--lib --bins` and validated only in CI.
+
+- `cargo deny check` → exit 0.
+
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+### CI gate (`ubuntu-latest`, run 24909836488, HEAD `cadeaa6bfdb9e9f2b9cd305a48aeaa48e32ded23`)
+
+Run conclusion: `success`. URL: https://github.com/pgdad/envoy-rust/actions/runs/24909836488
+
+- `build + test + lint` job (ID 72948398463, 1m20s) steps: install Rust
+  toolchain, cargo cache, fmt, clippy, build, test (includes differential
+  harness → Docker), install cargo-deny, `cargo deny check` → all `success`.
+- `fuzz (parse_bootstrap, 30s)` job (ID 72948398502, 1m02s) steps: install
+  nightly Rust toolchain, cargo cache (fuzz subcrate), install cargo-fuzz,
+  `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` → `success`.
+
+### Gate outcome per `BOOTSTRAP_PROMPT.md` §7.5
+
+- (a) no new differential fixture this sub-phase; fixtures `0001-tcp-echo` and
+  `0002-static-admin-ready` remain green on CI (covered by the `test` step of
+  the `build + test + lint` job).
+- (b) no conformance suites this sub-phase → n/a.
+- (c) fuzz target `parse_bootstrap` → 30 s clean run, no crashes, on extended
+  corpus (`minimal.yaml` + `tcp_proxy_single_endpoint.yaml` +
+  `tcp_proxy_round_robin_triple.yaml` per task 12).
+- (d) local stable-toolchain gate → all clean (all 5 commands exit 0 on first
+  attempt, no fix-during-gate commits).
+- (e) the 5 `cargo` commands + `cargo deny check` clean on CI.
+- (f) REVIEW.md → deferred to state 5 (next session; `superpowers:requesting-code-review`).
+
+State 4 verification complete. Next session enters state 5 via
+`superpowers:requesting-code-review`.
