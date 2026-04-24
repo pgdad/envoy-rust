@@ -1,2 +1,4 @@
+driver:
+  kind: tcp_echo
 equivalence:
   response_body: byte_exact

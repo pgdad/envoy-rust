@@ -707,4 +707,16 @@ equivalence:
             "got: {msg}"
         );
     }
+
+    #[test]
+    fn fixture_0001_expectations_parses_as_tcp_echo() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests/fixtures/0001-tcp-echo/expectations.yaml");
+        let e = load_expectations(&path).expect("parses");
+        assert!(matches!(e.driver, Driver::TcpEcho));
+        assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+        assert_eq!(e.equivalence.response_status, None);
+    }
 }
