@@ -225,3 +225,32 @@ Run conclusion: `success`. URL: https://github.com/pgdad/envoy-rust/actions/runs
 
 State 4 verification complete. Next session enters state 5 via
 `superpowers:requesting-code-review`.
+
+## State 5 — Re-review fix (2026-04-24)
+
+Phase-01 state-5 REVIEW (`docs/envoy-rust/phases/01-static-bootstrap-config/REVIEW.md`)
+returned verdict "Approved with follow-ups" with one Important finding (I1)
+and no Critical. I1 flagged an ADR-vs-implementation drift: ADR-0010 had
+explicitly rejected adding a nested `rust-toolchain.toml` under
+`crates/envoy-config/fuzz/`, but the state-4 phase-done gate landed exactly
+that file under time pressure (State-4 bullet 2 of the "Fixes Applied"
+subsection above; commit `97c1576`) to restore local-dev ergonomics for
+`cargo fuzz run`. Per doctrine D-3.5 (ADRs are append-only; drift is
+corrected by superseding ADRs, not by editing the original), the fix is
+a new narrowly-superseding ADR.
+
+- **ADR-0012 lands** — commit `bda4e52` ("phase 01: ADR-0012 — nested
+  nightly pin in fuzz subcrate narrowly supersedes ADR-0010"). ADR-0012
+  documents the two-source-of-truth arrangement (CI uses
+  `cargo +nightly fuzz run` per ADR-0010; the workspace-excluded fuzz
+  subcrate carries a directory-scoped nested pin for local-dev) and
+  names CI as authoritative for the phase-done gate.
+- **ADR-0010 is untouched** — append-only doctrine preserved; verified
+  by `git diff` on `docs/envoy-rust/DECISIONS.md` showing pure append.
+- **No code changes** — the nested file `crates/envoy-config/fuzz/rust-toolchain.toml`
+  already exists from commit `97c1576`; ADR-0012 retroactively legitimates
+  it rather than altering it. The state-4 phase-done gate from the previous
+  section (CI run `24891070573`) remains valid; no binary or test outputs
+  have changed since HEAD `20ffb5b`.
+- **Re-verification was re-run anyway** — see the "Re-verification gate"
+  subsection below; outputs match the State-4 gate within expected noise.
