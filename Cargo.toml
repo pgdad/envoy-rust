@@ -5,6 +5,7 @@ members = [
     "crates/envoy-cluster",
     "crates/envoy-config",
     "tests/differential",
+    "tests/helpers/tcp-echo-server",
 ]
 exclude = [
     "crates/envoy-config/fuzz",
