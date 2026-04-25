@@ -35,3 +35,9 @@
 - Commit: f601961
 - Change: replaced `Listener::serve` stub with real `tokio::select!` accept loop over `JoinSet`, shutdown via pinned future, 5s `DRAIN_BUDGET`, abort-stragglers returning `ListenerError::DrainTimeout`. Four tests: `serves_accepts_and_dispatches_to_handler`, `serves_honors_shutdown_signal`, `serves_drains_in_flight_connection_within_budget`, `serves_aborts_stragglers_past_drain_budget`. envoy-listener test count: 2 → 6.
 - Verification: `cargo test -p envoy-listener` → 6 passed. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
+
+## Task 7 — scaffold envoy-tcp crate (2026-04-25)
+
+- Commit: 2683476
+- Change: created `crates/envoy-tcp/{Cargo.toml,src/lib.rs}` (compiling stub — `#![forbid(unsafe_code)]` + module-level docstring only, no public items yet); added `crates/envoy-tcp` to root `Cargo.toml [workspace] members`. Task 8 lands `TcpProxy` + `ConnectionHandler` impl + 4 tests.
+- Verification: `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `cargo test -p envoy-tcp` (0 tests) — all clean.
