@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub mod backend;
 pub mod subject;
 pub mod upstream;
 
