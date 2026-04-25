@@ -332,10 +332,6 @@ fn decode_chunked(wire: &[u8]) -> Result<Vec<u8>> {
 pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let expectations = load_expectations(&fixture_dir.join("expectations.yaml"))?;
 
-    // Reserve one port; use the driver-specific token to substitute into the
-    // rendered configs. Upstream Envoy runs inside the container namespace and
-    // listens on upstream::CONTAINER_PORT; envoy-rust listens on the host's
-    // reserved port.
     let host_port = reserve_port()?;
 
     let tmp = tempfile::tempdir().context("creating fixture temp dir")?;
@@ -350,12 +346,55 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         Driver::TcpEcho => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
     };
-    let upstream_yaml = render_yaml(&upstream_template, &[(port_key, &upstream_port_str)]);
-    let subject_yaml = render_yaml(&subject_template, &[(port_key, &subject_port_str)]);
+
+    // Spawn a host-local backend if either template needs one. Holding the
+    // backend in a binding outside the proxies' lifetime ensures the child
+    // process outlives the fixture run; Drop fires after `run_fixture`'s
+    // returns paths.
+    let needs_backend = upstream_template.contains("{{BACKEND_PORT}}")
+        || subject_template.contains("{{BACKEND_PORT}}");
+    let _backend = if needs_backend {
+        Some(
+            backend::TcpProxyBackend::spawn()
+                .await
+                .context("spawning backend")?,
+        )
+    } else {
+        None
+    };
+    let backend_port_str = _backend.as_ref().map(|b| b.port().to_string());
+
+    let upstream_kvs: Vec<(&str, &str)> = {
+        let mut v: Vec<(&str, &str)> = vec![(port_key, &upstream_port_str)];
+        if let Some(bp) = backend_port_str.as_deref() {
+            v.push(("BACKEND_PORT", bp));
+            // Per ADR-0015: container-side reaches the host backend via
+            // host.docker.internal (with the harness's with_host call below).
+            v.push(("BACKEND_HOST", "host.docker.internal"));
+        }
+        v
+    };
+    let subject_kvs: Vec<(&str, &str)> = {
+        let mut v: Vec<(&str, &str)> = vec![(port_key, &subject_port_str)];
+        if let Some(bp) = backend_port_str.as_deref() {
+            v.push(("BACKEND_PORT", bp));
+            v.push(("BACKEND_HOST", "127.0.0.1"));
+        }
+        v
+    };
+
+    let upstream_yaml = render_yaml(&upstream_template, &upstream_kvs);
+    let subject_yaml = render_yaml(&subject_template, &subject_kvs);
     let upstream_path = write_temp(tmp.path(), "envoy.yaml", &upstream_yaml)?;
     let subject_path = write_temp(tmp.path(), "envoy-rust.yaml", &subject_yaml)?;
 
-    let upstream = upstream::start(&upstream_path).await?;
+    // The `host_uses_host_gateway` flag drives upstream::start to attach
+    // `with_host("host.docker.internal", Host::HostGateway)` on the
+    // testcontainers image (per ADR-0015). The flag is true exactly when the
+    // upstream YAML actually references the hostname — silent when it
+    // doesn't, so fixtures 0001 and 0002 stay unchanged.
+    let host_uses_host_gateway = upstream_yaml.contains("host.docker.internal");
+    let upstream = upstream::start(&upstream_path, host_uses_host_gateway).await?;
     let mut subject = subject::start(&subject_path, host_port).await?;
 
     let upstream_addr: SocketAddr = format!("127.0.0.1:{}", upstream.host_port()).parse()?;
@@ -381,13 +420,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 .context("envoy-rust drive")?;
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
-            assert_equivalence(
-                &expectations,
-                /* upstream status */ None,
-                /* subject status  */ None,
-                &upstream_out,
-                &subject_out,
-            )?;
+            assert_equivalence(&expectations, None, None, &upstream_out, &subject_out)?;
         }
         Driver::HttpGet { path, host } => {
             let upstream_resp = drive_http_get(upstream_addr, path, host)
@@ -408,6 +441,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         }
     }
 
+    // _backend Drop fires here.
     Ok(())
 }
 
@@ -787,7 +821,7 @@ equivalence:
         let err = super::decode_chunked(b"5hello").expect_err("must reject");
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("missing CRLF") || msg.contains("CRLF"),
+            msg.contains("missing CRLF"),
             "expected CRLF-missing error; got {msg}",
         );
     }
@@ -827,5 +861,74 @@ equivalence:
         }
         assert_eq!(e.equivalence.response_status, Some(StatusRule::Exact));
         assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+    }
+
+    #[test]
+    fn render_yaml_substitutes_backend_keys_for_envoy_side() {
+        // Upstream-Envoy rendering: {{BACKEND_HOST}} → host.docker.internal,
+        // {{BACKEND_PORT}} → harness-reserved port. {{PORT}} → the listener port.
+        let template = r#"
+listeners: [{{PORT}}]
+endpoint: {{BACKEND_HOST}}:{{BACKEND_PORT}}
+"#;
+        let got = render_yaml(
+            template,
+            &[
+                ("PORT", "10000"),
+                ("BACKEND_HOST", "host.docker.internal"),
+                ("BACKEND_PORT", "31415"),
+            ],
+        );
+        assert!(
+            got.contains("listeners: [10000]"),
+            "PORT not substituted: {got}"
+        );
+        assert!(
+            got.contains("endpoint: host.docker.internal:31415"),
+            "BACKEND_{{HOST,PORT}} not substituted: {got}",
+        );
+    }
+
+    #[test]
+    fn render_yaml_substitutes_backend_keys_for_envoy_rust_side() {
+        // envoy-rust-side rendering: {{BACKEND_HOST}} → 127.0.0.1.
+        let template = r#"
+listeners: [{{PORT}}]
+endpoint: {{BACKEND_HOST}}:{{BACKEND_PORT}}
+"#;
+        let got = render_yaml(
+            template,
+            &[
+                ("PORT", "20000"),
+                ("BACKEND_HOST", "127.0.0.1"),
+                ("BACKEND_PORT", "31415"),
+            ],
+        );
+        assert!(
+            got.contains("listeners: [20000]"),
+            "PORT not substituted: {got}"
+        );
+        assert!(
+            got.contains("endpoint: 127.0.0.1:31415"),
+            "BACKEND_HOST not substituted to 127.0.0.1: {got}",
+        );
+    }
+
+    #[test]
+    fn fixture_0003_expectations_parses_as_tcp_echo() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests/fixtures/0003-tcp-proxy/expectations.yaml");
+        if !path.exists() {
+            eprintln!(
+                "skipping: fixture 0003-tcp-proxy/expectations.yaml not yet landed (Task 12)"
+            );
+            return;
+        }
+        let e = load_expectations(&path).expect("parses");
+        assert!(matches!(e.driver, Driver::TcpEcho));
+        assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+        assert_eq!(e.equivalence.response_status, None);
     }
 }

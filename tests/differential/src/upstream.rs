@@ -30,19 +30,32 @@ impl UpstreamProxy {
 /// Start upstream Envoy with `envoy_yaml_path` bind-mounted to
 /// `/etc/envoy/envoy.yaml`. The caller must have already rendered any
 /// `{{PORT}}` token in the YAML to `CONTAINER_PORT`.
-pub async fn start(envoy_yaml_path: &Path) -> Result<UpstreamProxy> {
+///
+/// `host_gateway = true` adds `with_host("host.docker.internal", Host::HostGateway)`
+/// to the container image (per ADR-0015) — required when the fixture YAML
+/// references `host.docker.internal` to reach a host-running backend.
+/// `false` keeps the pre-02.2 behavior for fixtures that don't need
+/// container-to-host reachability.
+pub async fn start(envoy_yaml_path: &Path, host_gateway: bool) -> Result<UpstreamProxy> {
     let absolute = envoy_yaml_path
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", envoy_yaml_path.display()))?;
     let image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
         .with_exposed_port(CONTAINER_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr("starting main dispatch loop"));
-    let container = image
+    let mut request = image
         .with_cmd(["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"])
         .with_mount(Mount::bind_mount(
             absolute.to_string_lossy().to_string(),
             "/etc/envoy/envoy.yaml",
-        ))
+        ));
+    if host_gateway {
+        request = request.with_host(
+            "host.docker.internal",
+            testcontainers::core::Host::HostGateway,
+        );
+    }
+    let container = request
         .start()
         .await
         .context("starting upstream envoy container")?;
@@ -50,8 +63,6 @@ pub async fn start(envoy_yaml_path: &Path) -> Result<UpstreamProxy> {
         .get_host_port_ipv4(CONTAINER_PORT.tcp())
         .await
         .context("reading host-mapped port from testcontainers")?;
-    // Testcontainers reports the port as soon as Docker maps it; Envoy itself
-    // may still be initializing. Give it a conservative extra second.
     tokio::time::sleep(Duration::from_millis(500)).await;
     Ok(UpstreamProxy {
         _container: container,
@@ -94,7 +105,7 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path()).await.unwrap();
+        let proxy = start(yaml.path(), false).await.unwrap();
         assert!(proxy.host_port() > 0);
         // Validate accept-readiness via the library's own helper.
         let addr: std::net::SocketAddr =
