@@ -29,3 +29,9 @@
 - Commit: 1ccc5a3
 - Change: implemented `BoxFuture` alias, `ConnectionHandler` object-safe trait, `ListenerError` enum, `Listener` struct with `bind` + `local_addr`. `serve` stubbed `unimplemented!()` (Task 6). Added 2 tests: `bind_returns_socket_address`, `bind_fails_cleanly_on_address_in_use`. Plan-time deviation: `ListenerError::AddressParse(String, u16)` added (4th variant) for malformed `cfg.address.socket_address.address` strings — `envoy-config` keeps these as `String` until bind time. Mirrors phase-02.1 `envoy-cluster::ClusterError::EndpointParse`. Also added manual `Debug` impl for `Listener` (required by `expect_err` in test; `TcpListener` doesn't derive `Debug` automatically in this context) and formatted to pass `cargo fmt --check`.
 - Verification: `cargo test -p envoy-listener` → 2 passed. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
+
+## Task 6 — envoy-listener::Listener::serve + drain + 4 tests (2026-04-25)
+
+- Commit: f601961
+- Change: replaced `Listener::serve` stub with real `tokio::select!` accept loop over `JoinSet`, shutdown via pinned future, 5s `DRAIN_BUDGET`, abort-stragglers returning `ListenerError::DrainTimeout`. Four tests: `serves_accepts_and_dispatches_to_handler`, `serves_honors_shutdown_signal`, `serves_drains_in_flight_connection_within_budget`, `serves_aborts_stragglers_past_drain_budget`. envoy-listener test count: 2 → 6.
+- Verification: `cargo test -p envoy-listener` → 6 passed. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
