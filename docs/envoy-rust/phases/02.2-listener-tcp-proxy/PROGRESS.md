@@ -47,3 +47,10 @@
 - Commit: c9950f2
 - Change: implemented `TcpProxy` struct, `TcpProxyError` enum (`NoHealthyEndpoint`, `UpstreamConnect`, `CopyFailed`), and `ConnectionHandler` impl. Bidirectional copy uses `tokio::select!` over the two `tokio::io::copy` futures (plan-time deviation from SPEC §D2 step 4's `try_join!`), so EOF on either side drops the other copy future and propagates FIN — matches ADR-0016's `enable_half_close: false` posture. Four tests: `proxies_payload_end_to_end`, `proxies_closes_downstream_on_upstream_close`, `proxies_closes_upstream_on_downstream_close`, `proxies_returns_err_on_upstream_connect_refused`.
 - Verification: `cargo test -p envoy-tcp` → 4 passed. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
+
+## Task 9 — envoy-bin wiring + tcp_proxy integration test (2026-04-25)
+
+- Commit: e1efc82
+- Change: added `envoy-cluster`, `envoy-listener`, `envoy-tcp` path deps to `crates/envoy-bin/Cargo.toml`. Modified `main::run` to construct `ClusterManager` once and dispatch the listener's single filter on `envoy.filters.network.echo` (existing `echo::serve` path) vs. `envoy.filters.network.tcp_proxy` (new: build `TcpProxy`, pass to `Listener::serve`). Added Rust-native integration test `crates/envoy-bin/tests/tcp_proxy.rs` (no Docker): spawns envoy-bin subprocess against an in-process echo backend, drives a 17-byte payload, asserts byte-exact round-trip.
+- Verification: `cargo test -p envoy-bin` → all tests pass (admin + echo + integration tests). Workspace gates (`build`, `clippy -D warnings`, `fmt --check`, `deny check`) clean.
+- Note: Step 2 (pre-modification test) — the test passed against the unmodified `envoy-bin` because `echo::serve` echoes bytes locally without needing the upstream backend round-trip. The test still serves as a regression gate: post-wiring, the byte-exact round-trip now goes through the tcp_proxy path via the backend.
