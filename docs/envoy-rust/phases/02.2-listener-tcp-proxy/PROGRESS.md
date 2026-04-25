@@ -60,3 +60,9 @@
 - Commit: 8624c41
 - Change: created `tests/differential/src/backend.rs` with `TcpProxyBackend` (spawns the workspace `tcp-echo-server` binary as a host subprocess on a reserved port; SIGKILL on Drop with 2s exit polling; `container_host()` returns `host.docker.internal` per ADR-0015). `locate_tcp_echo_server` walks two parents up from `CARGO_MANIFEST_DIR` to the workspace root and joins `target/<profile>/tcp-echo-server` (cross-package `CARGO_BIN_EXE_*` is unavailable per SPEC §6 signpost 8). Two tests: `tcp_proxy_backend_spawns_and_echoes`, `tcp_proxy_backend_drop_terminates_child` (both skip if the helper binary isn't built).
 - Verification: `cargo test -p differential backend::tests` → 2 passed. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
+
+## Task 11 — differential: backend keys + run_fixture dispatch + with_host (2026-04-25)
+
+- Commit: aa4187f
+- Change: dropped dead `|| msg.contains("CRLF")` disjunct in `decode_chunked_truncated_size_line` (phase-02.1 REVIEW M3 close-out). Extended `run_fixture` to spawn `backend::TcpProxyBackend` when either template references `{{BACKEND_PORT}}`; build per-side substitution maps with `{{BACKEND_HOST}}` → `host.docker.internal` (envoy side) vs. `127.0.0.1` (envoy-rust side); flag `host_uses_host_gateway` on rendered upstream YAML containing `host.docker.internal`. Extended `upstream::start(yaml, host_gateway: bool)` to apply `with_host("host.docker.internal", Host::HostGateway)` per ADR-0015 when the flag is true. Updated `starts_upstream_envoy_and_exposes_host_port` to pass `false`. Added 3 unit tests: `render_yaml_substitutes_backend_keys_for_envoy_side`, `render_yaml_substitutes_backend_keys_for_envoy_rust_side`, `fixture_0003_expectations_parses_as_tcp_echo` (skip-if-not-yet-landed wrapper).
+- Verification: `cargo test -p differential --lib` → all pass. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
