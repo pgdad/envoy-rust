@@ -67,17 +67,76 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
 
+    // Build the cluster manager once. Empty `clusters` is permitted at the
+    // envoy-config validator (admin-only configs); the manager is empty in
+    // that case and `tcp_proxy` filters reference clusters by name, which
+    // the validator already verified exist (`ConfigError::UnknownCluster`).
+    let cluster_mgr = std::sync::Arc::new(
+        envoy_cluster::from_bootstrap(&bootstrap).context("building cluster manager")?,
+    );
+
     if let Some(listener_cfg) = bootstrap.static_resources.listeners.first() {
+        // The validator guarantees `filter_chains.len() ≥ 1` and at least one
+        // filter; we read the single first filter (phase 02.2 supports one
+        // filter per chain). Phase 07's filter chain framework will iterate.
+        let filter = listener_cfg
+            .filter_chains
+            .first()
+            .and_then(|c| c.filters.first())
+            .expect("validator guarantees ≥1 filter");
+
         let sock = &listener_cfg.address.socket_address;
-        let addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
+        let bind_addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
             .parse()
-            .with_context(|| format!("parsing address {}:{}", sock.address, sock.port_value))?;
-        let lst = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("binding echo listener to {addr}"))?;
-        tracing::info!(%addr, "envoy-rust listening (echo)");
-        let shutdown = token.clone();
-        set.spawn(async move { echo::serve(lst, async move { shutdown.cancelled().await }).await });
+            .with_context(|| {
+                format!(
+                    "parsing listener address {}:{}",
+                    sock.address, sock.port_value
+                )
+            })?;
+
+        match filter.name.as_str() {
+            envoy_config::ECHO_FILTER => {
+                let lst = TcpListener::bind(bind_addr)
+                    .await
+                    .with_context(|| format!("binding echo listener to {bind_addr}"))?;
+                tracing::info!(addr = %bind_addr, "envoy-rust listening (echo)");
+                let shutdown = token.clone();
+                set.spawn(async move {
+                    echo::serve(lst, async move { shutdown.cancelled().await }).await
+                });
+            }
+            envoy_config::TCP_PROXY_FILTER => {
+                let Some(envoy_config::TypedConfig::TcpProxy(tp_cfg)) =
+                    filter.typed_config.as_ref()
+                else {
+                    anyhow::bail!(
+                        "filter '{}' missing typed_config; envoy-config validator should have rejected at parse time",
+                        envoy_config::TCP_PROXY_FILTER,
+                    );
+                };
+                let cluster = cluster_mgr
+                    .get(&tp_cfg.cluster)
+                    .expect("validator guarantees cluster present");
+                let proxy = std::sync::Arc::new(envoy_tcp::TcpProxy::new(cluster, tp_cfg));
+                let listener = envoy_listener::Listener::bind(listener_cfg, proxy)
+                    .await
+                    .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
+                tracing::info!(addr = %bind_addr, cluster = %tp_cfg.cluster, "envoy-rust listening (tcp_proxy)");
+                let shutdown = token.clone();
+                set.spawn(async move {
+                    listener
+                        .serve(async move { shutdown.cancelled().await })
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                });
+            }
+            other => {
+                anyhow::bail!(
+                    "filter '{other}' is not dispatchable; envoy-config should have rejected at parse time"
+                );
+            }
+        }
     }
 
     if let Some(admin_cfg) = bootstrap.admin.as_ref() {

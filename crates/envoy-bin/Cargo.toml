@@ -11,7 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+envoy-cluster = { path = "../envoy-cluster" }
 envoy-config = { path = "../envoy-config" }
+envoy-listener = { path = "../envoy-listener" }
+envoy-tcp = { path = "../envoy-tcp" }
 httparse = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync", "process"] }
 tokio-util = { version = "0.7", features = ["default"] }
