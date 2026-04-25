@@ -8,11 +8,11 @@
 ## Active phase
 
 **id:** `03`
-**slug:** to be determined during state-1 brainstorming (ROADMAP row 03 title: "Downstream TLS termination + upstream TLS origination + SNI"; conventional slug `03-tls-tcp` or similar).
-**directory:** `docs/envoy-rust/phases/03-<slug>/` (does **not** yet exist; created at the start of state 1 per `BOOTSTRAP_PROMPT.md` §5 state 1).
-**status:** phase 03 lifecycle **state 1 (phase in ROADMAP, directory does not exist)** — next skill is `superpowers:brainstorming` scoped to phase 03, producing `SPEC.md`. ROADMAP row `03` is `status: planned`; it flips to `in-progress` at the same time the phase directory is created (per ROADMAP schema invariant 3).
+**slug:** `03-tls-tcp` (chosen during state-1 brainstorming; SPEC.md committed at `a3f3474`).
+**directory:** `docs/envoy-rust/phases/03-tls-tcp/` (exists; contains `SPEC.md`).
+**status:** phase 03 lifecycle **state 2 (SPEC.md exists, PLAN.md does not)** — next skill is `superpowers:writing-plans` scoped to phase 03, producing `PLAN.md`. ROADMAP row `03` is `status: in-progress` (flipped to `in-progress` in this same commit per ROADMAP schema invariant 3; a phase enters `in-progress` once `STATE.md` points at it as the active phase with the directory created).
 
-Parent phase 02 (`02-tcp-proxy`) is **done** as of this commit. Both sub-phases are done: `02.1-config-cluster` (commit `d447f53`) and `02.2-listener-tcp-proxy` (this commit). ROADMAP rows `02`, `02.1`, and `02.2` are all `status: done`. Parent SPEC at `docs/envoy-rust/phases/02-tcp-proxy/SPEC.md` remains in-tree unedited as the committed historical artifact (last touched at SHA `50349da`).
+Parent phase 02 (`02-tcp-proxy`) is **done** as of commit `f04e21a`. Both sub-phases are done: `02.1-config-cluster` (commit `d447f53`) and `02.2-listener-tcp-proxy` (commit `f04e21a`). ROADMAP rows `02`, `02.1`, and `02.2` are all `status: done`. Parent SPEC at `docs/envoy-rust/phases/02-tcp-proxy/SPEC.md` remains in-tree unedited as the committed historical artifact (last touched at SHA `50349da`).
 
 Phase 02.2 `REVIEW.md` verdict is **Approved** (state 5 complete; I1 closed in-phase via the §7 close-out commit `fc87505`; M1–M4 tracked forward — see Notes below). Phase 02.1 `REVIEW.md` verdict is **Approved** (I1 + I2 closed in-phase; I3 + M1–M4 tracked forward — see Notes below).
 
@@ -20,40 +20,43 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-**`superpowers:brainstorming`** — the next session enters phase 03 at lifecycle state 1: it picks the slug, creates `docs/envoy-rust/phases/03-<slug>/`, runs the brainstorm scoped to phase 03, and produces `SPEC.md`. Per `SKILL_ROUTING.md` state 1:
+**`superpowers:writing-plans`** — the next session enters phase 03 at lifecycle state 2: it consumes phase 03's `SPEC.md` and produces `PLAN.md`. Per `SKILL_ROUTING.md` state 2:
 
 ```
-1. Phase in ROADMAP, directory does not exist
-   → create docs/envoy-rust/phases/NN-slug/
-   → superpowers:brainstorming (scoped to THIS phase)
-   → output: SPEC.md
+2. SPEC.md exists, PLAN.md does not
+   → superpowers:writing-plans
+   → output: PLAN.md
+   → GATE: if PLAN.md > ~25 tasks OR > ~1500 LoC estimated
+           → split into NN.1, NN.2, …; update ROADMAP + STATE; stop
 ```
 
-Per `BOOTSTRAP_PROMPT.md` §8, ROADMAP row `03` covers "Downstream TLS termination + upstream TLS origination + SNI" with the differential surface "TLS TCP fixture green." The state-1 brainstorm decides slug, scope cuts, fixture shape (likely `0004-tls-tcp` building on fixture 0003's tcp_proxy backbone), the TLS stack approach (`rustls` + `aws-lc-rs` per D-3.2), and SNI semantics. Per `SKILL_ROUTING.md` state 2's gate, if the resulting PLAN.md exceeds ~25 tasks or ~1500 LoC, the phase is split (§6.2) before plan execution begins.
+`SPEC.md` §5 ("Splitting guidance for the planner") explicitly anticipates that the plan-writer will trip `BOOTSTRAP_PROMPT.md` §6.1's LoC gate (estimated ~2845 LoC across phase 03; ~90% over) and formally split phase 03 into sibling sub-phases `03.1-tls-foundation-downstream` (envoy-tls foundation + downstream TLS termination single-cert + fixture 0004; ~1400 LoC / ~13 tasks) and `03.2-tls-upstream-sni` (upstream TLS origination + multi-cert SNI cert selection + tls-echo-server helper + fixtures 0005 + 0006; ~1445 LoC / ~14 tasks). Both sub-phases comfortably under §6.1's ~1500 LoC / ~25 tasks gates. Pattern mirrors parent phase 02's ADR-0013 split.
 
-State 1 ends by writing `SPEC.md` and updating this STATE.md (active = phase 03 with the actual slug; lifecycle state 2; next-skill `superpowers:writing-plans`). Per `BOOTSTRAP_PROMPT.md` §5.1 "one state per session," state 1 does not chain into state 2.
+The state-2 plan-writer lands ADR-0019 (split decision) in the same shape as ADR-0013, redistributes SPEC content into fresh sub-phase SPECs (per `BOOTSTRAP_PROMPT.md` §6.2), updates ROADMAP (row 03 keeps `in-progress` with `sub-phases: 03.1, 03.2`; new rows 03.1 + 03.2 land as `planned`), and updates STATE.md to point at `03.1` at lifecycle state 1. Per `BOOTSTRAP_PROMPT.md` §5.1 "one state per session," state 2 does not chain into 03.1's state 1; a separate next session executes 03.1 state 1 (writing `phases/03.1-tls-foundation-downstream/SPEC.md`).
 
-Inputs the state-1 session for phase 03 should read, in order:
+If the plan-writer somehow finds the actual LoC accounting fits within §6.1's gates without splitting, it lands a single PLAN.md for phase 03 and updates STATE.md to lifecycle state 3 with next-skill `superpowers:executing-plans` (or `superpowers:subagent-driven-development`) — but SPEC §5's accounting strongly anticipates the split path. ADR-0017 (rcgen + tempfile dev-test-harness-only foundations) and ADR-0018 (tokio-rustls + rustls-pemfile covered by the rustls grant) are projected in SPEC §7 to land as task 1 of the post-split sub-phase plans; ADR numbering remains provisional per ADR-0013's renumbering precedent (Notes below).
+
+Inputs the state-2 session for phase 03 should read, in order:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
 2. `docs/envoy-rust/STATE.md` (this file — to confirm routing).
-3. `docs/envoy-rust/ROADMAP.md` (row 03 + summary; rows 02/02.1/02.2 now `done`).
-4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0016`; phase 03 picks ADR-0017 onward — treat the projection as provisional per the renumbering precedent established by ADR-0013 and discussed in the Notes section below).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence rules — phase 03 is the first phase to add TLS framing, so the brainstorm should consider whether `Header allow-list` or `Timing tolerances` need their first phase-03 entries).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (routing reference; state 1 → state 2 transition).
-7. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/SPEC.md` (consumed dependencies: `envoy-listener::Listener`, `envoy-tcp::TcpProxy`, the `ConnectionHandler` trait that phase 03 likely wraps with TLS termination — exact shape decided during the brainstorm).
-8. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/REVIEW.md` (§4 recommendations — especially #2 ("`Cluster::name()` accessor when phase 03's TLS work or phase 06's stats first need it") and #3 ("ADR-0017 projection should be provisional"); the M1–M4 forwards are in §3 and may inform phase 03's harness scope).
-9. `docs/envoy-rust/phases/02.1-config-cluster/SPEC.md` and `REVIEW.md` (further upstream context: `envoy-config` typed_config envelope grammar, `envoy-cluster` API, the cluster-manager surface phase 03 may extend with upstream-TLS metadata).
-10. `docs/envoy-rust/phases/02-tcp-proxy/SPEC.md` (parent SPEC of the just-completed row; useful for the "configs are initially identical" fixture principle and the ADR-0006/0007/0016 half-close precedent that any TLS-over-TCP fixture inherits).
-11. `docs/envoy-rust/phases/01-static-bootstrap-config/PLAN.md` + `PROGRESS.md` (shape reference for plan-writing cadence, TDD framing, and PROGRESS-formatting conventions; phase 02.1 / 02.2 also serve as more recent precedents).
+3. `docs/envoy-rust/ROADMAP.md` (row 03 now `in-progress`; rows 02/02.1/02.2 `done`).
+4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0016`; phase 03 SPEC §7 projects ADR-0017, ADR-0018, and ADR-0019 — treat numbering as provisional per the renumbering precedent established by ADR-0013 and discussed in the Notes section below).
+5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (no edits expected this phase per SPEC §1 baked-in defaults; the state-2 plan-writer confirms — the currently-empty `Header allow-list`, `Stat-name mapping`, `Access log field mapping`, `xDS wire state machine`, `Timing tolerances` subsections remain empty).
+6. `docs/envoy-rust/SKILL_ROUTING.md` (routing reference; state 2 → state 3 transition + §6.1 LoC gate + §6.2 split protocol).
+7. `docs/envoy-rust/phases/03-tls-tcp/SPEC.md` (the contract this PLAN must execute — read in full, especially §3 deliverables, §5 splitting guidance + LoC accounting, §6 implementation signposts, §7 ADRs, §8 artifacts list, §9 final-commit format).
+8. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/PLAN.md` + `PROGRESS.md` (most recent plan + progress precedent — task cadence, TDD framing, PROGRESS-formatting conventions).
+9. `docs/envoy-rust/phases/02.1-config-cluster/PLAN.md` (also recent precedent; especially the schema-additions task shape relevant to phase 03's envoy-config `DownstreamTlsContext` / `UpstreamTlsContext` / `FilterChainMatch` additions).
+10. `docs/envoy-rust/phases/02-tcp-proxy/SPEC.md` (parent SPEC of the just-completed row; precedent for the parent-SPEC-anticipates-split posture and the in-tree-historical-artifact stance the phase-03 SPEC will inherit once 03.1 + 03.2 land).
+11. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/REVIEW.md` §3–§4 (M1–M4 carryforwards and §4 recommendations relevant to phase 03 — especially recommendation 1 (`Cluster::name()` accessor opportunistic close) and recommendation 2 (ADR-0017 numbering provisional)).
 
 ## Last commit
 
-Phase 02.2 phase-done final commit: `phase 02.2: Listener + TCP proxy filter + fixture 0003 [ADR-0015,ADR-0016]`. Flips `ROADMAP.md` rows `02.2` and parent `02` → `done` in the same commit (per ROADMAP schema "parent flips to `done` only after all sub-phases are `done`"), and advances this STATE.md to phase 03 at lifecycle state 1. Preceded by `fc87505` (state-5 REVIEW.md landing + I1 close-out) and `02a9add` (state-4 phase-done gate verification).
+Phase 03 state-1 close-out commit: `phase 03: state-1 close-out — STATE advance to state 2 + ROADMAP row 03 in-progress` (this commit). Advances STATE.md to phase 03 lifecycle state 2 and flips `ROADMAP.md` row 03 from `planned` to `in-progress`. The state-1 SPEC artifact landed at `a3f3474` (`phase 03: SPEC — Downstream TLS termination + upstream TLS origination + SNI`), which committed `SPEC.md` only; the doctrinal STATE.md / ROADMAP.md update that should have bundled with that commit per the phase-02 precedent (e.g. `fc87505` for phase 02.2 state 5) was missed and is being closed out here as a separate commit. No SPEC content changes; no ADR; no code.
 
 ## Last updated
 
-2026-04-25 (phase 02.2 complete; parent phase 02 closed; STATE advanced to phase 03 at lifecycle state 1; next-skill flips to `superpowers:brainstorming`).
+2026-04-25 (phase 03 state-1 close-out — STATE advanced to phase 03 lifecycle state 2; ROADMAP row 03 flipped `planned` → `in-progress`; next-skill flips from `superpowers:brainstorming` to `superpowers:writing-plans`).
 
 ## Notes
 
@@ -128,4 +131,4 @@ ADR-0015 (cross-container host reachability via `host.docker.internal` + `host-g
 
 - Any deviation from the state machine requires `superpowers:systematic-debugging` before proceeding — see §1 Step E of `BOOTSTRAP_PROMPT.md`.
 - Consult `docs/envoy-rust/SKILL_ROUTING.md` for the full phase lifecycle state machine.
-- `BOOTSTRAP_PROMPT.md` §5.1: one state per session; do not chain states. The next session (state-1 of phase 03) ends by writing `SPEC.md` and advancing this STATE.md to phase 03 lifecycle state 2; the session after that (state-2 of phase 03) writes `PLAN.md`.
+- `BOOTSTRAP_PROMPT.md` §5.1: one state per session; do not chain states. State-1 of phase 03 already landed (`SPEC.md` at commit `a3f3474`; STATE.md / ROADMAP advance in this commit). The next session (state-2 of phase 03) consumes `SPEC.md` and writes `PLAN.md` — and per SPEC §5's LoC accounting will almost certainly trip §6.1's gate and land ADR-0019 splitting phase 03 into 03.1 + 03.2. State 2 does not chain into 03.1's state 1; a separate next session executes that.
