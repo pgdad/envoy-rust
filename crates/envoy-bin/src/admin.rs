@@ -162,7 +162,8 @@ async fn handle_one(mut stream: TcpStream) -> Result<()> {
             stream.write_all(&resp).await.ok();
             return Ok(());
         }
-        let n = stream.read(&mut scratch).await?;
+        let remaining = (MAX_REQUEST_HEAD - buf.len()).min(scratch.len());
+        let n = stream.read(&mut scratch[..remaining]).await?;
         if n == 0 {
             // EOF mid-request — silent close per SPEC §D3 point 2.1.
             return Ok(());
@@ -312,10 +313,18 @@ mod tests {
             .unwrap();
         });
 
-        // Build a request-head larger than MAX_REQUEST_HEAD (8 KiB) with no CRLF
-        // terminator, so the handler keeps reading until the cap fires.
-        let mut req: Vec<u8> = b"GET /ready HTTP/1.1\r\nHost: x\r\nX-Big: ".to_vec();
-        req.extend(std::iter::repeat_n(b'A', 9000));
+        // Build a request-head of exactly MAX_REQUEST_HEAD + 1 bytes with no
+        // terminating CRLF-CRLF, so the handler keeps reading until the cap
+        // fires. The pre-fix code allowed `buf` to grow up to
+        // `MAX_REQUEST_HEAD + scratch.len() - 1` bytes before the bound check
+        // tripped; the post-fix bounded read pins the cap at exactly
+        // MAX_REQUEST_HEAD.
+        let prefix = b"GET /ready HTTP/1.1\r\nHost: x\r\nX-Big: ";
+        let pad_len = MAX_REQUEST_HEAD + 1 - prefix.len();
+        let mut req: Vec<u8> = Vec::with_capacity(MAX_REQUEST_HEAD + 1);
+        req.extend_from_slice(prefix);
+        req.extend(std::iter::repeat_n(b'A', pad_len));
+        assert_eq!(req.len(), MAX_REQUEST_HEAD + 1);
 
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         stream.write_all(&req).await.expect("write");
@@ -428,5 +437,51 @@ mod tests {
         assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"));
         assert!(s.contains(&format!("content-length: {}\r\n", body.len())));
         assert!(s.ends_with(std::str::from_utf8(body).unwrap()));
+    }
+
+    /// Phase 02.2 I4: a request whose total request-head length is exactly
+    /// `MAX_REQUEST_HEAD` and which terminates with CRLF-CRLF must parse and
+    /// produce a normal HTTP response (here, 404 because the path is unknown).
+    /// Pre-tightening, the read could grow `buf` past `MAX_REQUEST_HEAD` by up
+    /// to `scratch.len()` bytes before the loop's bound check fired, masking
+    /// the real cap-boundary behavior. With the bounded read
+    /// `stream.read(&mut scratch[..MAX_REQUEST_HEAD - buf.len()])`, the
+    /// boundary is exact: 8192 bytes parse cleanly; 8193 bytes return 431.
+    #[tokio::test]
+    async fn accepts_requests_exactly_at_cap() {
+        let listener = bind_random_local().await;
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            serve(listener, async move {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+        });
+
+        // Build a complete HTTP/1.1 request whose total wire length is
+        // exactly MAX_REQUEST_HEAD = 8192 bytes, ending in CRLF-CRLF.
+        let prefix = b"GET /unknown HTTP/1.1\r\nHost: x\r\nX-Pad: ";
+        let suffix = b"\r\n\r\n";
+        let pad_len = MAX_REQUEST_HEAD - prefix.len() - suffix.len();
+        let mut req: Vec<u8> = Vec::with_capacity(MAX_REQUEST_HEAD);
+        req.extend_from_slice(prefix);
+        req.extend(std::iter::repeat_n(b'A', pad_len));
+        req.extend_from_slice(suffix);
+        assert_eq!(req.len(), MAX_REQUEST_HEAD);
+
+        let resp = drive(addr, &req).await;
+        let s = std::str::from_utf8(&resp).unwrap_or("<non-utf8>");
+        assert!(
+            s.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "expected 404 at exact cap, got: {s:?}",
+        );
+
+        tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
