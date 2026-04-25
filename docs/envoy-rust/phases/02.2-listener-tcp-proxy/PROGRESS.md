@@ -54,3 +54,9 @@
 - Change: added `envoy-cluster`, `envoy-listener`, `envoy-tcp` path deps to `crates/envoy-bin/Cargo.toml`. Modified `main::run` to construct `ClusterManager` once and dispatch the listener's single filter on `envoy.filters.network.echo` (existing `echo::serve` path) vs. `envoy.filters.network.tcp_proxy` (new: build `TcpProxy`, pass to `Listener::serve`). Added Rust-native integration test `crates/envoy-bin/tests/tcp_proxy.rs` (no Docker): spawns envoy-bin subprocess against an in-process echo backend, drives a 17-byte payload, asserts byte-exact round-trip.
 - Verification: `cargo test -p envoy-bin` → all tests pass (admin + echo + integration tests). Workspace gates (`build`, `clippy -D warnings`, `fmt --check`, `deny check`) clean.
 - Note: Step 2 (pre-modification test) — the test passed against the unmodified `envoy-bin` because `echo::serve` echoes bytes locally without needing the upstream backend round-trip. The test still serves as a regression gate: post-wiring, the byte-exact round-trip now goes through the tcp_proxy path via the backend.
+
+## Task 10 — TcpProxyBackend helper + 2 tests (2026-04-25)
+
+- Commit: 8624c41
+- Change: created `tests/differential/src/backend.rs` with `TcpProxyBackend` (spawns the workspace `tcp-echo-server` binary as a host subprocess on a reserved port; SIGKILL on Drop with 2s exit polling; `container_host()` returns `host.docker.internal` per ADR-0015). `locate_tcp_echo_server` walks two parents up from `CARGO_MANIFEST_DIR` to the workspace root and joins `target/<profile>/tcp-echo-server` (cross-package `CARGO_BIN_EXE_*` is unavailable per SPEC §6 signpost 8). Two tests: `tcp_proxy_backend_spawns_and_echoes`, `tcp_proxy_backend_drop_terminates_child` (both skip if the helper binary isn't built).
+- Verification: `cargo test -p differential backend::tests` → 2 passed. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
