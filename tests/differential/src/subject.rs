@@ -22,13 +22,14 @@ impl Subject {
     /// envoy-bin's own unit tests in Task 7; this harness path only needs the
     /// process to end deterministically between fixture runs.
     //
-    // TODO(phase-01): switch to SIGTERM + drain-wait + SIGKILL-escalate so the
-    // harness exercises envoy-bin's graceful-drain path. That requires sending
-    // POSIX signals to a `tokio::process::Child` (stable tokio exposes only
-    // `start_kill` = SIGKILL on Unix), which means adopting the `nix` crate.
-    // `nix` is not on the D-3.2 permitted-foundations list for phase 00, so
-    // the switch is deferred to phase 01 under its own ADR. Until then this
-    // harness relies on SIGKILL for deterministic between-fixture teardown;
+    // TODO: switch to SIGTERM + drain-wait + SIGKILL-escalate so the harness
+    // exercises envoy-bin's graceful-drain path. Sending POSIX signals to a
+    // `tokio::process::Child` requires the `nix` crate (or equivalent
+    // POSIX-signal surface), which is not on the D-3.2 permitted-foundations
+    // list. Phase 00 deferred this to phase 01; phase 01 (and phase 02 across
+    // 02.1 and 02.2) chose not to take `nix` either, so the deferral is
+    // open-ended — no specific target phase. A future phase that genuinely
+    // needs `nix` lands it under a new ADR and closes this TODO. Until then,
     // SIGTERM drain behavior is validated by the envoy-bin unit tests.
     pub async fn shutdown(&mut self, budget: Duration) -> Result<()> {
         let Some(mut child) = self.child.take() else {
