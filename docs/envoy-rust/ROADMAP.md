@@ -27,9 +27,9 @@ Phases 00–08 ship *in order*: each adds a primitive the next relies on. Splitt
 |---|---|---|---|---|---|
 | 00 | Bootstrap: Cargo workspace layout, `rust-toolchain.toml`, `deny.toml`, CI, Docker reference Envoy, differential harness skeleton, `ENVOY_TARGET.md` pin, trivial echo fixture | — | done | — | harness boots; one TCP echo fixture green |
 | 01 | Static bootstrap config loader (node, admin, static_resources skeleton) | 00 | done | — | config parses; admin `/ready` behaves like Envoy |
-| 02 | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext) | 01 | in-progress | 02.1, 02.2 | TCP proxy fixture green |
+| 02 | Listener + TCP proxy filter + static cluster + round-robin LB (plaintext) | 01 | done | 02.1, 02.2 | TCP proxy fixture green |
 | 02.1 | Config schema + cluster manager + echo-server helper | 01 | done | — | no new fixture; config parser + envoy-cluster + tcp-echo-server helper + fuzz corpus extended |
-| 02.2 | Listener + TCP proxy filter + fixture 0003 + phase-01 rollovers I4/M1 | 02.1 | planned | — | fixture 0003-tcp-proxy green; parent phase 02 flips done |
+| 02.2 | Listener + TCP proxy filter + fixture 0003 + phase-01 rollovers I4/M1 | 02.1 | done | — | fixture 0003-tcp-proxy green; parent phase 02 flips done |
 | 03 | Downstream TLS termination + upstream TLS origination + SNI | 02 | planned | — | TLS TCP fixture green |
 | 04 | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response | 03 | planned | — | HTTP/1.1 routing fixture green |
 | 05 | HTTP/2 downstream + upstream (low-level framer, own conn mgr) | 04 | planned | — | HTTP/2 fixture green; `h2spec` above threshold |
