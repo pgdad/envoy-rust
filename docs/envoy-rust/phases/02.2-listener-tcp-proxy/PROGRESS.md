@@ -17,3 +17,9 @@
 - Commit: 4bd0e22
 - Change: in `crates/envoy-bin/src/admin.rs::handle_one`, bounded `stream.read(&mut scratch)` to `stream.read(&mut scratch[..remaining])` where `remaining = (MAX_REQUEST_HEAD - buf.len()).min(scratch.len())`. Updated `rejects_oversized_request_headers` to send exactly `MAX_REQUEST_HEAD + 1` bytes; added new test `accepts_requests_exactly_at_cap` proving 8192-byte requests parse cleanly to a normal 404.
 - Verification: `cargo test -p envoy-bin admin::` — all admin tests pass (11 total, up from 10). Workspace gate (`build`, `clippy -D warnings`, `fmt --check`) clean.
+
+## Task 4 — scaffold envoy-listener crate (2026-04-25)
+
+- Commit: 787049a
+- Change: created `crates/envoy-listener/{Cargo.toml,src/lib.rs}` (compiling stub — `#![forbid(unsafe_code)]` + module-level docstring only, no public items yet); added `crates/envoy-listener` to root `Cargo.toml [workspace] members`. Tasks 5 and 6 land the real surface.
+- Verification: `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `cargo test -p envoy-listener` (0 tests) — all clean.
