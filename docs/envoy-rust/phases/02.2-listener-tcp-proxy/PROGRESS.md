@@ -41,3 +41,9 @@
 - Commit: 2683476
 - Change: created `crates/envoy-tcp/{Cargo.toml,src/lib.rs}` (compiling stub — `#![forbid(unsafe_code)]` + module-level docstring only, no public items yet); added `crates/envoy-tcp` to root `Cargo.toml [workspace] members`. Task 8 lands `TcpProxy` + `ConnectionHandler` impl + 4 tests.
 - Verification: `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `cargo test -p envoy-tcp` (0 tests) — all clean.
+
+## Task 8 — envoy-tcp::TcpProxy + ConnectionHandler impl + 4 tests (2026-04-25)
+
+- Commit: c9950f2
+- Change: implemented `TcpProxy` struct, `TcpProxyError` enum (`NoHealthyEndpoint`, `UpstreamConnect`, `CopyFailed`), and `ConnectionHandler` impl. Bidirectional copy uses `tokio::select!` over the two `tokio::io::copy` futures (plan-time deviation from SPEC §D2 step 4's `try_join!`), so EOF on either side drops the other copy future and propagates FIN — matches ADR-0016's `enable_half_close: false` posture. Four tests: `proxies_payload_end_to_end`, `proxies_closes_downstream_on_upstream_close`, `proxies_closes_upstream_on_downstream_close`, `proxies_returns_err_on_upstream_connect_refused`.
+- Verification: `cargo test -p envoy-tcp` → 4 passed. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean.
