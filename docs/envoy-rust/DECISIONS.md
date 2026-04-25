@@ -288,3 +288,41 @@ Each ADR uses the structure:
 - Rationale: keeps 02.1 within row-02 scope; defers the `envoy-protos` multi-phase work until it pays for itself. Reviewable by shape — a stranger reading the YAML can see which filters are supported.
 - Consequences: unknown `@type` URLs reject at parse time via serde's tagged-enum default behavior. Every new filter in phase 04 / 05 / 06 extends the enum by one variant. An `envoy-protos` supersession ADR in the xDS family re-routes the `@type` URL to prost-generated message types in one sweep and retires this shim.
 - Provenance: this ADR was projected as "ADR-0013" in parent-phase SPEC §7 (`docs/envoy-rust/phases/02-tcp-proxy/SPEC.md`, committed at SHA `50349da`) and renumbered to ADR-0014 by the phase-02 split decision (ADR-0013). The projected ADR-0014 (host-docker + host-gateway) and ADR-0015 (`enable_half_close: false` default) from the parent SPEC are renumbered to ADR-0015 and ADR-0016 respectively and land with sub-phase 02.2.
+
+---
+
+## ADR-0015: Cross-container host reachability via `host.docker.internal` + `host-gateway`
+
+- Date: 2026-04-25
+- Status: accepted
+- Context: Sub-phase 02.2's fixture `0003-tcp-proxy` exercises a TCP proxy whose upstream backend is the in-tree `tcp-echo-server` binary (landed in 02.1) running as a host process. The upstream Envoy container (started via `testcontainers` per ADR-0004/0005) and the envoy-rust host subprocess must both reach this single backend. Container-to-host networking is platform-dependent: Docker Desktop (macOS, Windows, Linux) resolves `host.docker.internal` natively; Linux bridge networks require `--add-host=host.docker.internal:host-gateway` to teach the container the hostname. `testcontainers = "0.23.3"` exposes this via `ImageExt::with_host(name: impl Into<String>, value: impl Into<Host>)` with `Host::HostGateway` (verified at `testcontainers::core::Host::HostGateway`).
+- Options considered:
+  - **(i) Always-on `host.docker.internal` injected via `with_host(..., Host::HostGateway)` on the upstream container.** Standardizes on one hostname across macOS dev, Linux dev, and `ubuntu-latest` CI. testcontainers handles the Docker-side plumbing.
+  - **(ii) Runtime platform detection (`/.dockerenv`, `uname -r`, `docker info`) with `172.17.0.1` as a Linux-bridge fallback.** Two code paths; brittle against Docker config drift (rootless Docker reassigns the bridge IP).
+  - **(iii) Run the backend inside a Docker container on a shared network.** Loses the "backend is a host process" property and pulls container-network management into every fixture's setup — premature complexity for a 1:1 echo backend.
+- Decision: (i). The upstream-Envoy container gains `with_host("host.docker.internal", Host::HostGateway)` whenever the rendered upstream YAML references `host.docker.internal`. Fixture 0003's `envoy.yaml` references `host.docker.internal:{{BACKEND_PORT}}`; `envoy-rust.yaml` references `127.0.0.1:{{BACKEND_PORT}}`. The harness substitutes both keys per side via `render_yaml` (Task 11).
+- Rationale: one code path across macOS dev, Linux dev, and `ubuntu-latest` CI; testcontainers already supports the API natively under the existing exemption from ADR-0005. The "configs are initially identical" fixture principle (phase-01 §3 fixture-grammar) is preserved because the `{{BACKEND_HOST}}` substitution map is per-side mechanics, not a YAML-level divergence.
+- Consequences:
+  - Every future fixture with a host-local backend follows the same pattern. Fixtures without a backend (0001, 0002) skip the `with_host` call (the harness gates it on whether the rendered YAML references `host.docker.internal`).
+  - If a later phase needs a backend inside a Docker network (e.g., a multi-proxy topology), that phase lands a separate testcontainers-networking ADR. ADR-0015 covers single-backend host-process reachability only.
+  - If `ubuntu-latest`'s Docker daemon ever refuses `host-gateway` (very unlikely; the feature has been GA since Docker CE 20.10 — see SPEC §6 signpost 4), the fallback is `172.17.0.1` (default Linux-bridge gateway) under a follow-up ADR. The `with_host` call would error at container start, surfacing the platform deficiency loudly rather than silently.
+
+---
+
+## ADR-0016: Phase 02 TCP proxy runs with Envoy's default `enable_half_close: false`
+
+- Date: 2026-04-25
+- Status: accepted
+- Context: ADR-0006/0007 documented the upstream-Envoy half-close-drops-pending-writes subtlety for the echo filter and the subsequent `drive_tcp` `read_exact(payload.len())` + 100ms trailing-byte poll pattern. Sub-phase 02.2 introduces `envoy.filters.network.tcp_proxy`, which exposes a YAML-visible `enable_half_close: true` toggle (unlike the echo filter, which has none). Fixture 0003's client pattern (`drive_tcp`: write payload → `read_exact(payload.len())` → 100ms trailing poll → graceful `shutdown()` + drop) does not depend on FIN propagation between downstream and upstream, only on the deterministic 1:1 byte-count contract.
+- Options considered:
+  - **(i) Leave the default `false` on both `envoy.yaml` and the envoy-rust config.** Matches Envoy v1.33.0's tcp_proxy default; minimal fixture YAML; envoy-rust's `TcpProxy::handle` mirrors the posture by running plain `tokio::io::copy` in both directions and propagating EOF via drop.
+  - **(ii) Set `true` on both sides.** Pre-positions for FIN-sensitive use cases at the cost of YAML and Rust code that doesn't yet matter.
+  - **(iii) Set `true` on one side only.** Divergent behavior under identical inputs; violates the "configs are initially identical" fixture principle (modulo bind address and harness substitutions).
+- Decision: (i). `enable_half_close` is absent from both `tests/fixtures/0003-tcp-proxy/envoy.yaml` and `envoy-rust.yaml`. envoy-rust's `TcpProxy::handle` (Task 8) is implemented to match: `tokio::io::copy` on both directions, EOF on either side propagates via drop of the write half.
+- Rationale: matches Envoy v1.33.0's default tcp_proxy posture; `drive_tcp`'s 1:1 echo client pattern doesn't need half-close propagation; minimal fixture keeps reviewer diffing tight. The ADR-0006/0007 precedent — "narrow fix, leave the grammar for when it pays for itself" — applies to the YAML toggle here too.
+- Consequences:
+  - Phase 02.2's TCP proxy is explicitly *not* a drop-in for every Envoy `tcp_proxy` deployment; use cases depending on half-close propagation belong to a phase-later. A future fixture with an asymmetric-close requirement (one side writes, then expects the other side's FIN to trigger a response) lands its own ADR flipping the toggle and extending `TcpProxy` with a half-close-propagation mode. Until then, `enable_half_close` is a known non-surface.
+  - SPEC §6 signpost 6 cautions against "defensively" including `enable_half_close: false` in the YAML — review should flag any future fixture or PR that adds a redundant `enable_half_close: false` key.
+  - The `tokio::io::copy` propagation property (SPEC §6 signpost 5) is preserved: if downstream→upstream succeeds while upstream→downstream errors, `try_join!` returns the error and drops the surviving future; `Drop` on the write halves closes the sockets, which RSTs the open direction. That aligns with Envoy's behavior of closing both sides on an asymmetric error.
+
+---
