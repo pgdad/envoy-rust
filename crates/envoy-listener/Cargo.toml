@@ -1,0 +1,19 @@
+[package]
+name = "envoy-listener"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+name = "envoy_listener"
+path = "src/lib.rs"
+
+[dependencies]
+envoy-config = { path = "../envoy-config" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "time", "sync", "io-util"] }

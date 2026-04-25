@@ -4,6 +4,7 @@ members = [
     "crates/envoy-bin",
     "crates/envoy-cluster",
     "crates/envoy-config",
+    "crates/envoy-listener",
     "tests/differential",
     "tests/helpers/tcp-echo-server",
 ]
