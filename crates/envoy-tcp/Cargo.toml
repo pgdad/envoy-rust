@@ -1,0 +1,21 @@
+[package]
+name = "envoy-tcp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+name = "envoy_tcp"
+path = "src/lib.rs"
+
+[dependencies]
+envoy-cluster = { path = "../envoy-cluster" }
+envoy-config = { path = "../envoy-config" }
+envoy-listener = { path = "../envoy-listener" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
