@@ -72,3 +72,57 @@
 - Commit: 8e343b7
 - Change: created `tests/fixtures/0003-tcp-proxy/{envoy.yaml,envoy-rust.yaml,inputs/payload.bin,expectations.yaml,README.md}`. payload.bin is byte-copy of fixture 0001's 18-byte payload `b"hello, envoy-rust\n"` (SPEC §6 signpost 10). envoy.yaml uses `{{BACKEND_HOST}}` (templates to `host.docker.internal` per ADR-0015); envoy-rust.yaml uses literal `127.0.0.1`. `enable_half_close` is absent from both per ADR-0016. Created `tests/differential/tests/tcp_proxy.rs` (Docker-gated acceptance test calling `differential::run_fixture("0003-tcp-proxy")`). The forward-regression test `fixture_0003_expectations_parses_as_tcp_echo` (landed in Task 11) now exercises the file rather than skipping.
 - Verification: `cargo test -p differential fixture_0003_expectations_parses_as_tcp_echo` → 1 passed (no longer skipping). `cargo test --workspace --lib --bins` → all pass. Workspace gates (`build`, `clippy -D warnings`, `fmt --check`) clean. Docker-gated `tcp_proxy_fixture` runs in CI; local pass-through depends on Docker availability.
+
+## Task 13 / State 4 — phase-done gate verification (2026-04-25)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4: the local stable-toolchain gate ran clean on first attempt. ROADMAP.md and STATE.md are NOT advanced here per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session); those flip in state 6 (the phase-done commit) after state 5's `REVIEW.md` is approved.
+
+### Local stable-toolchain gate
+
+`cargo build --workspace --all-targets`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output — clean)
+```
+
+`cargo test --workspace --lib --bins`:
+```
+     Running unittests src/lib.rs (target/debug/deps/differential-afd81a0c192eca80)
+test result: ok. 31 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.36s
+     Running unittests src/main.rs (target/debug/deps/envoy_bin-f92376a68c219b57)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+     Running unittests src/lib.rs (target/debug/deps/envoy_cluster-35a9c2517d0a0583)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running unittests src/lib.rs (target/debug/deps/envoy_config-6932b003571c8776)
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (target/debug/deps/envoy_listener-f112b806464276a3)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+     Running unittests src/lib.rs (target/debug/deps/envoy_tcp-d37d60167dc5fb26)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/main.rs (target/debug/deps/tcp_echo_server-06b6791653d77c50)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.01s
+```
+
+Total: 114 tests (31 differential + 19 envoy-bin + 8 envoy-cluster + 38 envoy-config + 6 envoy-listener + 4 envoy-tcp + 8 tcp-echo-server), 0 failed, 1 ignored.
+
+`cargo deny check`:
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+### Cargo.lock sync
+
+`Cargo.lock` was dirty from Tasks 4 and 7's new workspace members (`envoy-listener`, `envoy-tcp`). Landed as a dedicated `phase 02.2: sync Cargo.lock with phase 02.2 dep graph` commit (commit `2146014`), per the phase-01 / phase-02.1 precedent (commits `4955252`, `dea4d16`).
+
+### Outstanding for state 5/6
+
+State 5 (`superpowers:requesting-code-review`) writes `REVIEW.md` for this phase. State 6 (the phase-done commit) flips ROADMAP rows `02.2` and `02` (parent) to `done` in the same commit and advances STATE.md to phase `03-tls-tcp` (lifecycle state 1, directory does not yet exist, next-skill `superpowers:brainstorming`).
