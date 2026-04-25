@@ -92,15 +92,83 @@ impl Listener {
         self.listener.local_addr()
     }
 
-    /// Accept loop with shutdown-gated graceful drain. Lands in Task 6.
+    /// Accept loop with shutdown-gated graceful drain. On `shutdown`, stop
+    /// accepting and wait up to `DRAIN_BUDGET = 5s` for in-flight connections
+    /// to complete. If the drain budget expires, abort stragglers and return
+    /// `ListenerError::DrainTimeout`.
+    ///
+    /// SPEC §6 signpost 5: errors from individual `handle` calls are logged
+    /// at `warn!` and dropped; the listener stays up. Asymmetric errors in
+    /// `tokio::io::copy` (downstream → upstream succeeds while the other
+    /// direction errors) propagate via `try_join!` inside the handler, not
+    /// through the listener's accept loop.
     pub async fn serve(
         self,
-        _shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), ListenerError> {
-        // PLAN Task 6: replace this stub with the JoinSet-based accept loop.
-        let _ = self.listener;
-        let _ = self.handler;
-        unimplemented!("envoy_listener::Listener::serve lands in PLAN Task 6")
+        const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+        let listener = self.listener;
+        let handler = self.handler;
+        let mut join_set: tokio::task::JoinSet<
+            Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        > = tokio::task::JoinSet::new();
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    tracing::info!("listener shutdown signal received; draining");
+                    drop(listener);
+                    break;
+                }
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, peer)) => {
+                            tracing::debug!(%peer, "listener accepted connection");
+                            let h = handler.clone();
+                            join_set.spawn(async move { h.handle(stream).await });
+                        }
+                        Err(err) => {
+                            // Accept errors are not fatal — log and continue,
+                            // matching `envoy-bin::admin::serve` and
+                            // `envoy-bin::echo::serve` from phases 00–01.
+                            tracing::warn!(error = %err, "accept failed; continuing");
+                        }
+                    }
+                }
+                Some(done) = join_set.join_next(), if !join_set.is_empty() => {
+                    match done {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => tracing::warn!(error = %err, "connection task failed"),
+                        Err(join_err) => tracing::warn!(error = %join_err, "connection task panicked"),
+                    }
+                }
+            }
+        }
+
+        // Drain.
+        let drain = async {
+            while let Some(res) = join_set.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "connection task failed during drain")
+                    }
+                    Err(join_err) => {
+                        tracing::warn!(error = %join_err, "connection task panicked during drain")
+                    }
+                }
+            }
+        };
+        if tokio::time::timeout(DRAIN_BUDGET, drain).await.is_err() {
+            tracing::warn!(?DRAIN_BUDGET, "drain budget exceeded; aborting stragglers");
+            join_set.abort_all();
+            // Let aborted tasks unwind; ignore their results.
+            while join_set.join_next().await.is_some() {}
+            return Err(ListenerError::DrainTimeout(DRAIN_BUDGET));
+        }
+        Ok(())
     }
 }
 
@@ -108,6 +176,183 @@ impl Listener {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    /// In-process `EchoHandler` that echoes whatever bytes the downstream
+    /// writes back to it. Used in serve-side tests as a stand-in for the real
+    /// `envoy-tcp::TcpProxy` that lands in Task 8.
+    struct EchoHandler;
+    impl ConnectionHandler for EchoHandler {
+        fn handle(
+            &self,
+            mut downstream: tokio::net::TcpStream,
+        ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+            Box::pin(async move {
+                let (mut r, mut w) = downstream.split();
+                tokio::io::copy(&mut r, &mut w).await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serves_accepts_and_dispatches_to_handler() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
+        let listener = Listener::bind(&cfg, h).await.expect("bind ok");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            listener
+                .serve(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve ok")
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let payload = b"hello, listener\n";
+        client.write_all(payload).await.expect("write");
+        let mut buf = vec![0u8; payload.len()];
+        client.read_exact(&mut buf).await.expect("read_exact");
+        assert_eq!(buf, payload);
+        drop(client);
+
+        tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("serve resolves within 6s")
+            .expect("join");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serves_honors_shutdown_signal() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
+        let listener = Listener::bind(&cfg, h).await.expect("bind");
+        let (tx, rx) = oneshot::channel::<()>();
+        let start = std::time::Instant::now();
+        let server = tokio::spawn(async move {
+            listener
+                .serve(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve")
+        });
+
+        // Fire shutdown immediately (no in-flight connections); serve must
+        // return promptly.
+        tx.send(()).expect("signal");
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("serve resolves within 2s of empty shutdown")
+            .expect("join");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "serve took too long: {:?}",
+            start.elapsed(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serves_drains_in_flight_connection_within_budget() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
+        let listener = Listener::bind(&cfg, h).await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            listener
+                .serve(async move {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve")
+        });
+
+        // Open a connection that's actively echoing (not stalled).
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"in-flight").await.expect("write");
+        let mut buf = [0u8; 9];
+        client.read_exact(&mut buf).await.expect("read");
+        // FIN to let the EchoHandler's tokio::io::copy return cleanly.
+        client.shutdown().await.ok();
+
+        let start = std::time::Instant::now();
+        tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(7), server)
+            .await
+            .expect("serve drains within budget + ε")
+            .expect("join");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(6),
+            "drain too slow: {:?}",
+            start.elapsed(),
+        );
+    }
+
+    /// A handler that never returns. Used to exercise the abort-stragglers
+    /// path: the `handle` future stays parked past `DRAIN_BUDGET`, forcing
+    /// `Listener::serve` to call `JoinSet::abort_all`.
+    struct StalledHandler;
+    impl ConnectionHandler for StalledHandler {
+        fn handle(
+            &self,
+            _downstream: tokio::net::TcpStream,
+        ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serves_aborts_stragglers_past_drain_budget() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(StalledHandler);
+        let listener = Listener::bind(&cfg, h).await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            listener
+                .serve(async move {
+                    let _ = rx.await;
+                })
+                .await
+        });
+
+        // Open one stalled connection.
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        // Give the listener a moment to spawn the handler task.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let start = std::time::Instant::now();
+        tx.send(()).expect("signal shutdown");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), server)
+            .await
+            .expect("serve resolves within DRAIN_BUDGET + ε")
+            .expect("join");
+        assert!(
+            matches!(result, Err(ListenerError::DrainTimeout(_))),
+            "expected DrainTimeout, got {result:?}",
+        );
+        // Drain budget is 5s; the timeout should fire within 5s + ε.
+        assert!(
+            start.elapsed() >= std::time::Duration::from_secs(4),
+            "abort fired too early: {:?}",
+            start.elapsed(),
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(7),
+            "abort fired too late: {:?}",
+            start.elapsed(),
+        );
+    }
 
     /// Phase-02.1 `envoy_config::Listener` accepts the raw `address:
     /// socket_address: { address: String, port_value: u16 }` shape. Build one
