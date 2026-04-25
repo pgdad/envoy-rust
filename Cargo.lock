@@ -277,7 +277,10 @@ name = "envoy-bin"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "envoy-cluster",
  "envoy-config",
+ "envoy-listener",
+ "envoy-tcp",
  "httparse",
  "tempfile",
  "tokio",
@@ -301,6 +304,29 @@ dependencies = [
  "serde",
  "serde_yaml",
  "thiserror",
+]
+
+[[package]]
+name = "envoy-listener"
+version = "0.0.0"
+dependencies = [
+ "envoy-config",
+ "serde_yaml",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "envoy-tcp"
+version = "0.0.0"
+dependencies = [
+ "envoy-cluster",
+ "envoy-config",
+ "envoy-listener",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
