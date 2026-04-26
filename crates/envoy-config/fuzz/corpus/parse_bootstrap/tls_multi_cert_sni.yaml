@@ -1,0 +1,47 @@
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 10010 } }
+      filter_chains:
+        - filter_chain_match: { server_names: ["a.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-a.pem }
+                    private_key:       { filename: /tmp/leaf-a.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+        - filter_chain_match: { server_names: ["b.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-b.pem }
+                    private_key:       { filename: /tmp/leaf-b.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }

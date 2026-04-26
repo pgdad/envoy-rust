@@ -70,6 +70,26 @@ pub enum ConfigError {
     MissingValidationContext,
     #[error("UpstreamTlsContext.sni must be a non-empty DNS name")]
     EmptyUpstreamSni,
+    /// Within one listener, two filter chains declared the same SNI value
+    /// (case-insensitive) in their `filter_chain_match.server_names`. Note: the
+    /// variant name follows the parent-phase-03 SPEC §7's projection
+    /// (`MultipleListenersWithOverlappingSni`) — the rule is intra-listener (per
+    /// listener, not across listeners), but the name is preserved verbatim. The
+    /// `listener` field names the offending listener; the `sni` field names the
+    /// duplicated SNI in lowercased canonical form.
+    #[error("listener {listener:?} has two filter chains with overlapping SNI {sni:?}")]
+    MultipleListenersWithOverlappingSni { listener: String, sni: String },
+    /// Within one listener, more than one filter chain has empty
+    /// `filter_chain_match.server_names` (or no `filter_chain_match`). At most one
+    /// catch-all chain is allowed per listener.
+    #[error("listener {listener:?} has more than one catch-all filter chain (empty server_names)")]
+    MultipleCatchAllFilterChains { listener: String },
+    /// Within one listener with multiple filter chains, at least one chain
+    /// carries `transport_socket: TLS` while another does not. Phase-03 does not
+    /// support mixing TLS and plaintext chains on the same listener (would
+    /// require `tls_inspector` listener filter, deferred to a later phase).
+    #[error("listener {listener:?} mixes TLS and plaintext filter chains")]
+    MixedTlsAndPlaintextFilterChainsOnListener { listener: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

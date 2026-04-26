@@ -340,6 +340,62 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                 }
             }
         }
+
+        // 03.2: cross-chain rules within each listener. Task 4's
+        // envoy-tls::DownstreamTls::from_listener trusts these guarantees per
+        // SPEC §3 D1 — it does not re-check them.
+
+        // Rule 1: overlapping SNI. Walk each chain's server_names; build a
+        // HashSet<String> of lowercased SNIs; reject on duplicate.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for chain in &listener.filter_chains {
+            if let Some(m) = chain.filter_chain_match.as_ref() {
+                for sni in &m.server_names {
+                    let lower = sni.to_lowercase();
+                    if !seen.insert(lower.clone()) {
+                        return Err(crate::ConfigError::MultipleListenersWithOverlappingSni {
+                            listener: listener.name.clone(),
+                            sni: lower,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Rule 2: at most one catch-all (empty server_names) chain per listener.
+        // A missing filter_chain_match counts as catch-all (matches every connection).
+        let catch_all_count = listener
+            .filter_chains
+            .iter()
+            .filter(|c| {
+                c.filter_chain_match
+                    .as_ref()
+                    .map(|m| m.server_names.is_empty())
+                    .unwrap_or(true)
+            })
+            .count();
+        if catch_all_count > 1 {
+            return Err(crate::ConfigError::MultipleCatchAllFilterChains {
+                listener: listener.name.clone(),
+            });
+        }
+
+        // Rule 3: don't mix TLS and plaintext chains. Only fires when ≥ 2
+        // chains exist; mixing requires `tls_inspector` (deferred).
+        if listener.filter_chains.len() >= 2 {
+            let tls_count = listener
+                .filter_chains
+                .iter()
+                .filter(|c| c.transport_socket.is_some())
+                .count();
+            if tls_count > 0 && tls_count < listener.filter_chains.len() {
+                return Err(
+                    crate::ConfigError::MixedTlsAndPlaintextFilterChainsOnListener {
+                        listener: listener.name.clone(),
+                    },
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1209,6 +1265,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/tcp_proxy_round_robin_triple.yaml",
             "fuzz/corpus/parse_bootstrap/tls_downstream_single_cert.yaml",
             "fuzz/corpus/parse_bootstrap/tls_upstream_validation_context.yaml",
+            "fuzz/corpus/parse_bootstrap/tls_multi_cert_sni.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
@@ -1216,8 +1273,10 @@ admin:
             crate::parse_bootstrap(&yaml).unwrap_or_else(|e| panic!("parse {path}: {e}"));
         }
         // Seeds expected to reject cleanly (parse_bootstrap returns Err, not panic).
-        #[allow(clippy::single_element_loop)]
-        for fname in &["fuzz/corpus/parse_bootstrap/tls_malformed_at_type.yaml"] {
+        for fname in &[
+            "fuzz/corpus/parse_bootstrap/tls_malformed_at_type.yaml",
+            "fuzz/corpus/parse_bootstrap/tls_overlapping_sni_reject.yaml",
+        ] {
             let path = format!("{root}/{fname}");
             let yaml =
                 std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -1822,6 +1881,331 @@ filters:
         assert!(
             msg.contains("destination_port") || msg.contains("unknown field"),
             "expected unknown-field error, got {msg}"
+        );
+    }
+
+    // --- Phase 03.2 Task 2: cross-chain validator rules ---
+    //
+    // These tests use the existing `crate::parse_bootstrap` boundary (which
+    // performs parse + validate together) instead of the PLAN's bare
+    // `bootstrap.validate()` call: phase 03 keeps `validate` crate-private,
+    // and every existing validator test in this file already routes through
+    // `parse_bootstrap`. Documented as a "test API adaptation" deviation in
+    // the Task 2 PROGRESS.md entry.
+
+    #[test]
+    fn parses_listener_with_multi_chain_sni_routing() {
+        // Happy path: two filter chains, each carrying its own DownstreamTlsContext
+        // and disjoint server_names. Validator accepts.
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 10010 } }
+      filter_chains:
+        - filter_chain_match: { server_names: ["a.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-a.pem }
+                    private_key:       { filename: /tmp/leaf-a.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+        - filter_chain_match: { server_names: ["b.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-b.pem }
+                    private_key:       { filename: /tmp/leaf-b.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+"#;
+        crate::parse_bootstrap(yaml).expect("parses + validates");
+    }
+
+    #[test]
+    fn parses_filter_chain_with_empty_server_names_validator() {
+        // Single catch-all chain with empty server_names. Accepted by validator.
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 10010 } }
+      filter_chains:
+        - filter_chain_match: { server_names: [] }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+"#;
+        crate::parse_bootstrap(yaml).expect("parses + validates");
+    }
+
+    #[test]
+    fn rejects_filter_chains_with_overlapping_sni() {
+        // Two chains both declare server_names: ["a.example.com"].
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 10010 } }
+      filter_chains:
+        - filter_chain_match: { server_names: ["a.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-a.pem }
+                    private_key:       { filename: /tmp/leaf-a.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+        - filter_chain_match: { server_names: ["a.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-b.pem }
+                    private_key:       { filename: /tmp/leaf-b.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject overlapping SNI");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MultipleListenersWithOverlappingSni { ref listener, ref sni }
+                    if listener == "tcp_listener" && sni == "a.example.com"
+            ),
+            "expected MultipleListenersWithOverlappingSni, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_filter_chains_with_overlapping_sni_case_insensitive() {
+        // Chain A "a.example.com"; chain B "A.Example.com". Match is case-insensitive.
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 10010 } }
+      filter_chains:
+        - filter_chain_match: { server_names: ["a.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-a.pem }
+                    private_key:       { filename: /tmp/leaf-a.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+        - filter_chain_match: { server_names: ["A.Example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-b.pem }
+                    private_key:       { filename: /tmp/leaf-b.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject case-insensitive overlap");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MultipleListenersWithOverlappingSni { ref listener, .. }
+                    if listener == "tcp_listener"
+            ),
+            "expected MultipleListenersWithOverlappingSni, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_catch_all_filter_chains() {
+        // Two chains both have empty server_names.
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 10010 } }
+      filter_chains:
+        - filter_chain_match: { server_names: [] }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+        - filter_chain_match: {}
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject multiple catch-all chains");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MultipleCatchAllFilterChains { ref listener }
+                    if listener == "tcp_listener"
+            ),
+            "expected MultipleCatchAllFilterChains, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_tls_and_plaintext_filter_chains() {
+        // One TLS chain, one plaintext chain on the same listener.
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 10010 } }
+      filter_chains:
+        - filter_chain_match: { server_names: ["a.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/leaf-a.pem }
+                    private_key:       { filename: /tmp/leaf-a.key }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+        - filter_chain_match: { server_names: ["b.example.com"] }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject mixed TLS and plaintext");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MixedTlsAndPlaintextFilterChainsOnListener { ref listener }
+                    if listener == "tcp_listener"
+            ),
+            "expected MixedTlsAndPlaintextFilterChainsOnListener, got {err:?}"
         );
     }
 }

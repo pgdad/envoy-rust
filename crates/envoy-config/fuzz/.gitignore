@@ -5,5 +5,7 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/tls_downstream_single_cert.yaml
 !corpus/parse_bootstrap/tls_malformed_at_type.yaml
 !corpus/parse_bootstrap/tls_upstream_validation_context.yaml
+!corpus/parse_bootstrap/tls_multi_cert_sni.yaml
+!corpus/parse_bootstrap/tls_overlapping_sni_reject.yaml
 artifacts/
 target/
