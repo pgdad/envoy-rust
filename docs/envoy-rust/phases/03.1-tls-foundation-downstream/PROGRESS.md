@@ -110,3 +110,57 @@
 - Step 7 (Docker run): **Skipped — Docker not available in local environment** (`docker info` exit code 1). CI (`ubuntu-latest`) will provide Docker and run `cargo test -p differential --test tls_downstream`. Same behavior as `echo_fixture` / `admin_ready_fixture` / `tcp_proxy_fixture` in dev environments without Docker.
 - Verification (workspace gate): `cargo build --workspace --all-targets` exit 0; `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0; `cargo fmt --all -- --check` exit 0; `cargo test --workspace --lib --bins` → all crates pass (unchanged counts from Task 11: differential 37 + 1 ignored, envoy-bin 19, tcp-echo-server 8, envoy-config 50, envoy-listener 6, envoy-tcp 8, envoy-cluster 8, envoy-tls 10; total 146). The Docker-gated `tls_downstream_fixture` is excluded by `--lib --bins` as intended. Cargo.lock unchanged (no new deps — all deps already present from Tasks 10-11).
 - Deviations from PLAN: None. YAML files verbatim from PLAN lines 4253-4301 (envoy.yaml) and 4309-4351 (envoy-rust.yaml). Test file verbatim from PLAN lines 4413-4432. Expectations verbatim from PLAN lines 4357-4363. README verbatim from PLAN lines 4369-4409.
+
+## Task 13 / State 4 — phase-done gate verification (2026-04-26)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4: the local stable-toolchain gate ran clean on first attempt. ROADMAP.md and STATE.md are NOT advanced here per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session); those flip in state 6 (the phase-done commit) after state 5's `REVIEW.md` is approved.
+
+### Local stable-toolchain gate
+
+`cargo build --workspace --all-targets`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output — clean; exit 0)
+```
+
+`cargo test --workspace --lib --bins`:
+```
+differential       — test result: ok. 37 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+envoy-bin (main)   — test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+envoy-cluster      — test result: ok.  8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+envoy-config       — test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+envoy-listener     — test result: ok.  6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+envoy-tcp          — test result: ok.  8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+envoy-tls          — test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+tcp-echo-server    — test result: ok.  8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Total: 146 tests passed, 0 failed, 1 ignored (Docker-gated `starts_upstream_envoy_and_exposes_host_port` in `differential::upstream::tests`). Per-crate growth from phase 02.2 close: envoy-config +12 (Task 2 +5 + Task 3 +7); envoy-tcp +4 (Task 8); envoy-tls +10 (new crate, Tasks 6 + 7); differential +6 (Task 10). All other counts unchanged.
+
+`cargo deny check`:
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(With three pre-existing `license-not-encountered` warnings for unused allow-list entries — `MPL-2.0`, `Unicode-DFS-2016`, `Zlib`. These are non-failing warnings preserved across phases.)
+
+### Docker-gated acceptance test
+
+`cargo test -p differential --test tls_downstream` (Docker-gated): **not run locally** — Docker daemon not available in this dev environment. CI (`ubuntu-latest`) will provide Docker and run this test alongside the existing `echo_fixture`, `admin_ready_fixture`, `tcp_proxy_fixture` in the `build + test + lint` job. CI also runs the `fuzz (parse_bootstrap, 30s)` job against the extended corpus (3 new TLS seeds from Task 4).
+
+### Cargo.lock sync
+
+`Cargo.lock` is dirty after Task 5's envoy-tls scaffold + the rustls / aws-lc-rs / rcgen / rustls-pemfile / rustls-pki-types / tokio-rustls / aws-lc-sys / cmake / etc. transitive additions across Tasks 5-12. Will be landed as a dedicated `phase 03.1: sync Cargo.lock with phase 03.1 dep graph` commit immediately following this PROGRESS commit, per phase-01 precedent (`4955252`), phase-02.1 precedent (`dea4d16`), phase-02.2 precedent (`2146014`).
+
+### Outstanding for state 5/6
+
+State 5 (`superpowers:requesting-code-review`) writes `REVIEW.md` for this phase. State 6 (the phase-done commit) flips ROADMAP row `03.1` `status` → `done` (parent row `03` stays `in-progress` until 03.2 lands per the schema invariant) and advances STATE.md to phase `03.2-tls-upstream-sni` (lifecycle state 2; SPEC.md exists from the ADR-0017 split commit, PLAN.md does not; next-skill `superpowers:writing-plans`).
