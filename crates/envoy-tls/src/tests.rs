@@ -13,14 +13,20 @@ mod pki {
     use rcgen::{DnType, IsCa, KeyUsagePurpose};
     use std::path::Path;
 
-    /// In-test PKI: a self-signed CA + one leaf with SAN `a.example.com`,
-    /// written into a per-test `TempDir`. Drop the `Pki` to clean up.
+    /// In-test PKI: a self-signed CA + leaf-A (SAN `a.example.com`) + leaf-B
+    /// (SAN `b.example.com`), all written into a per-test `TempDir`. Drop the
+    /// `Pki` to clean up. Leaf-B was added in 03.2 Task 3 to support the
+    /// SNI-keyed multi-cert resolver tests; leaf-A's fields keep their pre-03.2
+    /// names (`leaf_cert_pem` / `leaf_key_pem`) so existing 03.1 tests are
+    /// unchanged.
     #[allow(dead_code)]
     pub struct Pki {
         pub _dir: TempDir,
         pub ca_cert_pem: PathBuf,
         pub leaf_cert_pem: PathBuf,
         pub leaf_key_pem: PathBuf,
+        pub leaf_b_cert_pem: PathBuf,
+        pub leaf_b_key_pem: PathBuf,
         pub ca_der_for_root_store: rustls::pki_types::CertificateDer<'static>,
     }
 
@@ -40,7 +46,7 @@ mod pki {
         let ca_kp = KeyPair::generate().expect("ca kp");
         let ca_cert = ca_params.self_signed(&ca_kp).expect("ca self-sign");
 
-        // Leaf signed by CA.
+        // Leaf A signed by CA.
         let mut leaf_params =
             CertificateParams::new(vec!["a.example.com".into()]).expect("leaf params");
         leaf_params
@@ -51,16 +57,33 @@ mod pki {
             .signed_by(&leaf_kp, &ca_cert, &ca_kp)
             .expect("leaf signed");
 
+        // Leaf B signed by the same CA, distinct keypair, distinct SAN.
+        let mut leaf_b_params =
+            CertificateParams::new(vec!["b.example.com".into()]).expect("leaf-b params");
+        leaf_b_params
+            .distinguished_name
+            .push(DnType::CommonName, "b.example.com");
+        let leaf_b_kp = KeyPair::generate().expect("leaf-b kp");
+        let leaf_b_cert = leaf_b_params
+            .signed_by(&leaf_b_kp, &ca_cert, &ca_kp)
+            .expect("leaf-b signed");
+
         let ca_pem = ca_cert.pem();
         let leaf_pem = leaf_cert.pem();
         let leaf_key_pem = leaf_kp.serialize_pem();
+        let leaf_b_pem = leaf_b_cert.pem();
+        let leaf_b_key_pem = leaf_b_kp.serialize_pem();
 
         let ca_path = dir.path().join("ca.pem");
         let leaf_path = dir.path().join("leaf-a.pem");
         let leaf_key_path = dir.path().join("leaf-a.key");
+        let leaf_b_path = dir.path().join("leaf-b.pem");
+        let leaf_b_key_path = dir.path().join("leaf-b.key");
         std::fs::write(&ca_path, &ca_pem).expect("write ca");
         std::fs::write(&leaf_path, &leaf_pem).expect("write leaf");
         std::fs::write(&leaf_key_path, &leaf_key_pem).expect("write leaf key");
+        std::fs::write(&leaf_b_path, &leaf_b_pem).expect("write leaf-b");
+        std::fs::write(&leaf_b_key_path, &leaf_b_key_pem).expect("write leaf-b key");
 
         let ca_der_for_root_store: rustls::pki_types::CertificateDer<'static> =
             ca_cert.der().clone().into_owned();
@@ -70,8 +93,41 @@ mod pki {
             ca_cert_pem: ca_path,
             leaf_cert_pem: leaf_path,
             leaf_key_pem: leaf_key_path,
+            leaf_b_cert_pem: leaf_b_path,
+            leaf_b_key_pem: leaf_b_key_path,
             ca_der_for_root_store,
         }
+    }
+
+    /// Load a `CertifiedKey` from cert + key PEM files. Mirrors `lib.rs`'s
+    /// crate-private `load_certified_key` but lives in the test module to
+    /// avoid widening crate visibility for a test-only consumer. Used by the
+    /// 03.2 Task 3 SNI resolver tests to build `Arc<CertifiedKey>` map values.
+    pub fn certified_key_from_pem(cert_path: &Path, key_path: &Path) -> rustls::sign::CertifiedKey {
+        let cert_bytes = std::fs::read(cert_path).expect("read cert");
+        let mut cert_slice = cert_bytes.as_slice();
+        let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_slice)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse cert chain");
+        let key_bytes = std::fs::read(key_path).expect("read key");
+        let mut key_slice = key_bytes.as_slice();
+        let key = rustls_pemfile::private_key(&mut key_slice)
+            .expect("parse private key")
+            .expect("at least one key");
+        let signing_key =
+            rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).expect("signing key");
+        rustls::sign::CertifiedKey::new(cert_chain, signing_key)
+    }
+
+    /// Read the first PEM-encoded certificate at `path` and return its DER.
+    /// Used to drive byte-exact peer-cert assertions in the SNI resolver
+    /// tests (avoids x509-parsing or SAN-substring scans).
+    pub fn cert_der_at(path: &Path) -> rustls::pki_types::CertificateDer<'static> {
+        let bytes = std::fs::read(path).expect("read cert");
+        let mut slice = bytes.as_slice();
+        let mut iter = rustls_pemfile::certs(&mut slice);
+        iter.next().expect("at least one cert").expect("parse cert")
     }
 
     pub fn ds_context_with(
@@ -521,4 +577,347 @@ async fn upstream_rejects_untrusted_cert() {
         .await
         .expect_err("must reject untrusted");
     assert!(matches!(err, TlsError::Handshake { .. }), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 03.2 Task 3: SniResolver + ResolvesServerCert tests.
+//
+// Tests 1 + 4 use byte-exact peer-cert DER comparison after a successful
+// client handshake (SNI matches a real SAN; standard root-store path).
+//
+// Test 2 (default fallback on miss) needs to drive an UNKNOWN SNI — the
+// presented cert's SAN won't match, so the default rustls SAN check would
+// abort the handshake before we can inspect what the server returned.
+// We therefore install a custom `ServerCertVerifier` that captures the
+// presented end-entity DER without enforcing SAN, then assert byte-exact that
+// the server returned key_a (the configured default). Pattern modelled on
+// `mod upstream_pki`'s in-test `ServerCertVerifier` shape.
+//
+// Test 3 (no default, miss) asserts the server-side `acceptor.accept` returns
+// Err — when `resolve()` returns None, rustls aborts with `unrecognized_name`.
+
+mod sni_capture {
+    use super::*;
+    use rustls::DigitallySignedStruct;
+    use rustls::SignatureScheme;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use std::sync::Mutex;
+
+    /// `ServerCertVerifier` that records the end-entity cert the server
+    /// presented (DER), then unconditionally accepts. Test-only — never
+    /// behaves like this in production. Lives in `mod sni_capture` to keep
+    /// the dangerous bypass scoped to the tests that need it.
+    #[derive(Debug)]
+    pub struct CapturingVerifier {
+        pub captured: Arc<Mutex<Option<CertificateDer<'static>>>>,
+    }
+
+    impl CapturingVerifier {
+        pub fn new() -> Self {
+            Self {
+                captured: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    impl ServerCertVerifier for CapturingVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            *self.captured.lock().expect("lock") = Some(end_entity.clone().into_owned());
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sni_resolver_routes_known_sni() {
+    install_provider_once();
+    let pki = pki::build();
+    let key_a = Arc::new(pki::certified_key_from_pem(
+        &pki.leaf_cert_pem,
+        &pki.leaf_key_pem,
+    ));
+    let key_b = Arc::new(pki::certified_key_from_pem(
+        &pki.leaf_b_cert_pem,
+        &pki.leaf_b_key_pem,
+    ));
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("a.example.com".to_string(), key_a.clone());
+    map.insert("b.example.com".to_string(), key_b.clone());
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        Arc::new(SniResolver { map, default: None });
+
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let _ = acceptor.accept(stream).await.expect("server accept");
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(pki.ca_der_for_root_store.clone())
+        .expect("add ca");
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let server_name =
+        rustls::pki_types::ServerName::try_from("a.example.com").expect("server name");
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("client handshake");
+
+    let (_io, conn) = tls.get_ref();
+    let presented = conn
+        .peer_certificates()
+        .expect("peer certs")
+        .first()
+        .expect("at least one cert")
+        .clone()
+        .into_owned();
+    let leaf_a_der = pki::cert_der_at(&pki.leaf_cert_pem);
+    assert_eq!(
+        presented.as_ref(),
+        leaf_a_der.as_ref(),
+        "SNI a.example.com must select leaf-A"
+    );
+
+    server_task.await.expect("server task joins");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sni_resolver_falls_back_to_default_on_miss() {
+    install_provider_once();
+    let pki = pki::build();
+    let key_a = Arc::new(pki::certified_key_from_pem(
+        &pki.leaf_cert_pem,
+        &pki.leaf_key_pem,
+    ));
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("a.example.com".to_string(), key_a.clone());
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> = Arc::new(SniResolver {
+        map,
+        default: Some(key_a.clone()),
+    });
+
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        // Must succeed: resolver returned the default cert; client uses a
+        // capturing verifier that bypasses SAN checks, so handshake completes.
+        acceptor.accept(stream).await.expect("server accept");
+    });
+
+    // Client side: dangerous capturing verifier so we can inspect what the
+    // server returned for an SNI it doesn't have an explicit map entry for.
+    let capture = sni_capture::CapturingVerifier::new();
+    let captured = capture.captured.clone();
+    let client_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(capture))
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let server_name =
+        rustls::pki_types::ServerName::try_from("unknown.example.com").expect("server name");
+    let _tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("client handshake (capturing verifier accepts any cert)");
+
+    server_task.await.expect("server task joins");
+
+    let presented = captured
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("verifier captured a cert");
+    let leaf_a_der = pki::cert_der_at(&pki.leaf_cert_pem);
+    assert_eq!(
+        presented.as_ref(),
+        leaf_a_der.as_ref(),
+        "unknown SNI must fall back to the default cert (leaf-A)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sni_resolver_returns_none_on_miss_without_default() {
+    install_provider_once();
+    let pki = pki::build();
+    let key_a = Arc::new(pki::certified_key_from_pem(
+        &pki.leaf_cert_pem,
+        &pki.leaf_key_pem,
+    ));
+
+    let mut map = std::collections::HashMap::new();
+    map.insert("a.example.com".to_string(), key_a.clone());
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        Arc::new(SniResolver { map, default: None });
+
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        // Resolver returns None for unknown SNI; rustls aborts the handshake
+        // with `unrecognized_name`. Server-side accept must Err.
+        acceptor.accept(stream).await
+    });
+
+    // Client uses the capturing verifier so its end of the handshake doesn't
+    // fail FIRST on SAN/cert-validation; we want the server-side rejection
+    // to be the failure under test.
+    let capture = sni_capture::CapturingVerifier::new();
+    let client_cfg = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(capture))
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let server_name =
+        rustls::pki_types::ServerName::try_from("unknown.example.com").expect("server name");
+    let _ = connector.connect(server_name, stream).await;
+
+    let server_result = server_task.await.expect("server task joins");
+    assert!(
+        server_result.is_err(),
+        "server-side accept must fail when resolver returns None for unknown SNI; got {server_result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sni_resolver_is_case_insensitive() {
+    install_provider_once();
+    let pki = pki::build();
+    let key_a = Arc::new(pki::certified_key_from_pem(
+        &pki.leaf_cert_pem,
+        &pki.leaf_key_pem,
+    ));
+
+    // Map keyed lowercase per the SniResolver contract; rustls 0.23's
+    // ClientHello::server_name() lowercases the SNI before the resolver sees it.
+    let mut map = std::collections::HashMap::new();
+    map.insert("a.example.com".to_string(), key_a.clone());
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        Arc::new(SniResolver { map, default: None });
+
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let _ = acceptor.accept(stream).await.expect("server accept");
+    });
+
+    // Client handshakes with mixed-case SNI; rustls lowercases on the wire,
+    // and (separately) lowercases the SAN-vs-name comparison too, so this is
+    // an end-to-end happy-path handshake.
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(pki.ca_der_for_root_store.clone())
+        .expect("add ca");
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let server_name =
+        rustls::pki_types::ServerName::try_from("A.Example.com").expect("server name");
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("mixed-case SNI must handshake (rustls lowercases before resolver lookup)");
+
+    let (_io, conn) = tls.get_ref();
+    let presented = conn
+        .peer_certificates()
+        .expect("peer certs")
+        .first()
+        .expect("at least one cert")
+        .clone()
+        .into_owned();
+    let leaf_a_der = pki::cert_der_at(&pki.leaf_cert_pem);
+    assert_eq!(
+        presented.as_ref(),
+        leaf_a_der.as_ref(),
+        "mixed-case SNI A.Example.com must lowercase to a.example.com and pick leaf-A"
+    );
+
+    server_task.await.expect("server task joins");
 }

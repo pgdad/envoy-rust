@@ -124,6 +124,39 @@ impl ResolvesServerCert for SingleCertResolver {
     }
 }
 
+/// SNI-keyed `ResolvesServerCert`. Map keys are lowercase per parent-SPEC §6
+/// signpost 21 (rustls 0.23's `ClientHello::server_name()` returns lowercase).
+/// The validator (`envoy_config::ConfigError::MultipleListenersWithOverlappingSni`)
+/// rejects overlapping SNIs at config-load time, so this resolver assumes
+/// well-formed input.
+pub struct SniResolver {
+    pub map: std::collections::HashMap<String, std::sync::Arc<rustls::sign::CertifiedKey>>,
+    /// Catch-all chain's certified key. None when the listener has no
+    /// catch-all chain — unknown SNIs then return None and rustls aborts the
+    /// handshake with `unrecognized_name`.
+    pub default: Option<std::sync::Arc<rustls::sign::CertifiedKey>>,
+}
+
+impl std::fmt::Debug for SniResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SniResolver")
+            .field("snis", &self.map.keys().collect::<Vec<_>>())
+            .field("has_default", &self.default.is_some())
+            .finish()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for SniResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        let sni = client_hello.server_name()?;
+        // rustls 0.23 returns lowercase already; we store lowercase; .get() is direct.
+        self.map.get(sni).cloned().or_else(|| self.default.clone())
+    }
+}
+
 /// Client-side TLS configuration. Build via `from_context`; drive a connected
 /// upstream `TcpStream` through the rustls client handshake via `connect`.
 ///
