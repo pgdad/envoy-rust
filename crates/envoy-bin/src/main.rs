@@ -53,9 +53,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     // Per SPEC §6 signpost 4: rustls's aws-lc-rs default provider must be
     // installed once per process before any TLS-touching code runs. The
-    // `install_default()` call returns `Err(_)` on second-or-later calls,
-    // which is the no-op behavior we want — discard with `let _ =`.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    // call returns `Err(_)` on second-or-later calls (no-op). Routed
+    // through envoy-tls per SPEC §3 D1 / ADR-0019 so envoy-bin does not
+    // hold a direct rustls dep.
+    let _ = envoy_tls::install_default_crypto_provider();
 
     if let Some(node) = bootstrap.node.as_ref() {
         tracing::info!(

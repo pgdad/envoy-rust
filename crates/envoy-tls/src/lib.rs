@@ -18,6 +18,20 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::net::TcpStream;
 
+/// Install the aws-lc-rs default crypto provider for this process.
+///
+/// rustls requires a single default crypto provider per process. This is
+/// idempotent: the second-or-later call returns `Err(_)`, which the caller
+/// should treat as a no-op (the provider is already installed). Tests use
+/// the same idiom (`let _ = envoy_tls::install_default_crypto_provider();`).
+///
+/// Architectural note: this lives in envoy-tls so envoy-bin and other
+/// consumers don't need a direct rustls dep. Per SPEC §3 D1 and ADR-0019,
+/// envoy-tls is the only crate with rustls in its dep tree.
+pub fn install_default_crypto_provider() -> Result<(), Arc<rustls::crypto::CryptoProvider>> {
+    rustls::crypto::aws_lc_rs::default_provider().install_default()
+}
+
 #[cfg(test)]
 mod tests;
 
