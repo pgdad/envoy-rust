@@ -9,8 +9,8 @@
 
 **id:** `03.2`
 **slug:** `03.2-tls-upstream-sni` (created during the state-2-of-parent-03 split commit `f256d2c`; SPEC.md committed alongside).
-**directory:** `docs/envoy-rust/phases/03.2-tls-upstream-sni/` (exists; contains `SPEC.md` and `PLAN.md`).
-**status:** phase 03.2 lifecycle **state 3 (PLAN.md exists, implementation incomplete)** — `SPEC.md` landed at `f256d2c` (alongside the ADR-0017 split decision and the 03.1 SPEC); `PLAN.md` landed at `df91b06` (the previous commit). ROADMAP row `03.2` remains `status: in-progress` as of this commit (set during phase 03.1's state-6 phase-done commit `64ea760`). Parent row `03` stays `in-progress` per the ROADMAP-schema invariant ("parent flips to `done` only after all sub-phases are `done`"); it will flip to `done` in 03.2's final commit.
+**directory:** `docs/envoy-rust/phases/03.2-tls-upstream-sni/` (exists; contains `SPEC.md`, `PLAN.md`, `PROGRESS.md`, `REVIEW.md`).
+**status:** phase 03.2 lifecycle **state 5 (REVIEW.md approved; state-6 next)** — `SPEC.md` landed at `f256d2c` (alongside the ADR-0017 split decision and the 03.1 SPEC); `PLAN.md` landed at `df91b06`; state-2→3 STATE advance at `b2c704e`; implementation complete (13 task commits + 13 progress notes + 1 mid-phase Task-5 cross-refs commit at commits `1e1ea64..4e3f892`); state-4 phase-done gate cleared at `4344f10`; Cargo.lock sync at `85685a3`; state-5 `REVIEW.md` landed at this commit (verdict: **Approved with fixes** — I1 closed in-phase via the §7 close-out; M1–M5 tracked forward — see Notes below). ROADMAP row `03.2` remains `status: in-progress` as of this commit (set during phase 03.1's state-6 phase-done commit `64ea760`); the state-6 phase-done commit (next session) flips row `03.2` to `done` AND parent row `03` to `done` (per the ROADMAP-schema invariant — both sub-phases will then be `done`).
 
 Phase 03.1 (`03.1-tls-foundation-downstream`) is **done** as of this commit. ROADMAP row `03.1` is `status: done`. Phase 03.1 `REVIEW.md` verdict is **Approved** (state 5 complete; I1 closed in-phase via the §7 close-out commit `1748cd2`; M1–M5 tracked forward — see Notes below).
 
@@ -24,43 +24,32 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 23–27, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 3): the next session — operating as the state-3 session of phase 03.2 — invokes **`superpowers:subagent-driven-development`** scoped to this phase, executing `PLAN.md` task-by-task with a fresh subagent per task plus the two-stage (spec-compliance + code-quality) review cadence the skill mandates, appending a section to `PROGRESS.md` on each task completion.
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` / `BOOTSTRAP_PROMPT.md` §5 state 6): the next session — operating as the state-6 phase-done session of phase 03.2 — does **not** invoke a skill; state 6 is the phase-done commit per BOOTSTRAP_PROMPT.md §5.3. The commit:
 
-Every implementation task inside `PLAN.md` enforces `superpowers:test-driven-development` per doctrine D-3.1.
+1. Flips ROADMAP row `03.2` `status` → `done` AND parent row `03` `status` → `done` in the same commit (per ROADMAP schema: "parent flips to `done` only after all sub-phases are `done`"; row `03.1` is already `done` from `64ea760`).
+2. Advances STATE.md to phase `04` (lifecycle state 1; SPEC.md does not yet exist; next-skill `superpowers:brainstorming`; phase 04 slug TBD per the next-session brainstorm — `BOOTSTRAP_PROMPT.md` §8 row 04 stub reads "HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response").
+3. Uses commit-message format **`phase 03.2: upstream TLS origination + multi-cert SNI cert selection + tls-echo-server + fixtures 0005 + 0006 [parent 03 done]`** per SPEC §9 / `BOOTSTRAP_PROMPT.md` §5.3. The SPEC §9 closing paragraph spells out the multi-line body verbatim.
 
-Per the user's standing preference (auto-memory `feedback_execution_style`), execution uses `superpowers:subagent-driven-development` over inline `executing-plans` — do not present the two-option fork.
-
-**Plan splitting gate already evaluated** (BOOTSTRAP_PROMPT.md §5 state 2 / §6.1; SPEC §5; PLAN self-review):
-
-- Task count: 13 (bound: ~25).
-- Estimated net LoC change: ~1445 (bound: ~1500).
-- Decision: **kept unified**. Both gates hold. Per SPEC §5 closing paragraph + PLAN's "Out-of-plan execution contingencies", **do not split 03.2 further**. 03.2 was already produced *by* a split (ADR-0017), so a nested split would be unusual and should trigger `superpowers:systematic-debugging` first.
-
-Inputs the state-3 session should read, in order, before launching the first subagent:
+Inputs the state-6 session should read, in order, before crafting the phase-done commit:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
 2. `docs/envoy-rust/STATE.md` (this file — to confirm routing).
-3. `docs/envoy-rust/ROADMAP.md` (row 03 `in-progress` with `sub-phases: 03.1, 03.2`; row 03.2 `in-progress`; row 03.1 `done`; rows 02/02.1/02.2 `done`).
-4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0019`; phase 03.2 picks ADR-0020 onward only if execution surfaces a need — see SPEC §7).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence rules — 03.2 ships fixtures `0005-tls-upstream` + `0006-tls-sni`, both exercising row 2 of §7.2 only; no contract edits expected per parent-SPEC §1's baked-in defaults and 03.2 SPEC §2).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (routing reference; state 3 sub-phase machinery).
-7. `docs/envoy-rust/phases/03.2-tls-upstream-sni/SPEC.md` (the authoritative sub-phase design contract — referenced at every task under "Source of truth: SPEC.md" at the top of `PLAN.md`).
-8. `docs/envoy-rust/phases/03.2-tls-upstream-sni/PLAN.md` (the operational plan; 13 tasks; task boundaries are the natural subagent-dispatch boundaries).
-9. `docs/envoy-rust/phases/03-tls-tcp/SPEC.md` (parent SPEC — context for the full phase-03 design; execution follows the 03.2 sub-phase SPEC, not the parent).
-10. `docs/envoy-rust/phases/03.1-tls-foundation-downstream/PLAN.md` + `PROGRESS.md` + `REVIEW.md` (most recent plan + progress + review precedent — task cadence, TDD framing, PROGRESS-formatting conventions; phase-03.1 REVIEW §3 M1–M5 + §4 recommendations may inform 03.2's execution).
-11. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/PLAN.md` + `PROGRESS.md` (TCP-proxy + harness `TcpProxyBackend` + integration-test shapes that 03.2's `TlsEchoBackend` and per-listener wiring mirror).
+3. `docs/envoy-rust/ROADMAP.md` (rows 03 + 03.2 both flip to `done`).
+4. `docs/envoy-rust/phases/03.2-tls-upstream-sni/REVIEW.md` (the state-5 verdict — Approved with fixes; I1 closed in-phase via §7).
+5. `docs/envoy-rust/phases/03.2-tls-upstream-sni/SPEC.md` §9 (the prescribed commit-message template).
+6. `docs/envoy-rust/phases/03.1-tls-foundation-downstream/REVIEW.md` (precedent for the state-5/state-6 split).
 
 ## Last commit
 
-Phase 03.2 STATE-advance commit (this commit): touches `docs/envoy-rust/STATE.md` only (lifecycle state 2 → 3; next-skill `superpowers:writing-plans` → `superpowers:subagent-driven-development`). No code changes; no ROADMAP changes (row 03.2 was flipped to `in-progress` at the 03.1 state-6 phase-done commit `64ea760` per ROADMAP-schema invariant 3).
+Phase 03.2 state-5 close-out commit (this commit): lands `docs/envoy-rust/phases/03.2-tls-upstream-sni/REVIEW.md` (verdict **Approved with fixes**) and advances `docs/envoy-rust/STATE.md` lifecycle text from state 3 to state 5 in one atomic move (per the phase-03.1 `1748cd2` / phase-02.2 `fc87505` / phase-02.1 `379937b` precedent). I1 (STATE.md staleness) is closed by this very commit. No code changes; no ROADMAP changes (those land in the state-6 phase-done commit next session).
 
 Predecessor commit:
 
-- `df91b06` — `phase 03.2: PLAN.md — upstream TLS origination + multi-cert SNI + fixtures 0005 + 0006` — landed the 4339-line PLAN.md (the previous commit; lands the state-2 artifact retroactively on the state-2 session per the phase-03.1 `19e14af` + `61a6e93` precedent of separating the PLAN commit from the state-advance commit).
+- `85685a3` — `phase 03.2: sync Cargo.lock with phase 03.2 dep graph` — single-file Cargo.lock sync immediately following the state-4 phase-done gate verification commit `4344f10`. Mirrors the phase-01 `4955252` / phase-02.1 `dea4d16` / phase-02.2 `2146014` / phase-03.1 `eb039e6` precedent.
 
 ## Last updated
 
-2026-04-26 (phase 03.2 lifecycle state advanced from 2 to 3; PLAN.md committed at `df91b06`; next-skill flips from `superpowers:writing-plans` to `superpowers:subagent-driven-development`).
+2026-04-26 (phase 03.2 lifecycle state advanced from 3 to 5; REVIEW.md landed alongside this STATE.md edit; next session executes state 6 as the phase-done commit per `BOOTSTRAP_PROMPT.md` §5.3 — no skill invocation).
 
 ## Notes
 
@@ -140,6 +129,33 @@ Phase 03.1 REVIEW §4 recommendations forward to phase 03.2 / later:
 5. `enable_half_close: true` flip-fixture deferral (carries over unchanged from phase-02.2 §4 recommendation 6).
 6. Round-robin distribution-equivalence assertion remains unit-test-only (carries over unchanged from phase-02.2 §4 recommendation 4).
 7. If parallel fixture execution arrives, revisit `TcpProxyBackend::Drop` and `TlsEchoBackend::Drop` (carries over unchanged from phase-02.2 §4 recommendation 5).
+
+### Phase-03.2 rollovers (from REVIEW.md §3–§4)
+
+The 03.2 REVIEW landed with one Important item and five Minor items. I1 (STATE.md stale) closed in-phase by the §7 close-out commit (this commit) — STATE.md advanced from state 3 to state 5 alongside REVIEW.md. The remaining items:
+
+- **M1** — `needs_tls_pki` token check in `tests/differential/src/lib.rs:572-578` is asymmetric across upstream and subject templates: 5 token substrings on the upstream side, only 2 on the subject side: awareness-only, no action required for 03.2 (every fixture's subject YAML references at least one of the two checked tokens). **Tracked forward to phase 04** if a future fixture's subject template references only `{{LEAF_B_*}}` or `{{SERVER_*}}` without `{{LEAF_A_CERT_PATH}}` or `{{CA_PATH}}`. The defensive form would extract a `template_needs_tls_pki(template: &str) -> bool` helper.
+- **M2** — vestigial `_server_cert` / `_server_key` alive-keeper fields on `TlsEchoBackend` (`tests/differential/src/backend.rs:102-103`): awareness-only, no action required. The fields cost two `PathBuf` allocations per backend and document the alive-keeper discipline at the type level.
+- **M3** — `drive_tls` and `drive_tls_probes` share ~80% body (`tests/differential/src/lib.rs:213-266` and `:288-357`): awareness-only for 03.2. **Tracked forward to phase 04 / 05** when a third `drive_*` helper would benefit from a shared `drive_one_tls_probe` factoring.
+- **M4** — fixture 0006's `expectations.yaml` carries `equivalence.response_body: byte_exact` even though the `Driver::TlsTcpProbeList` dispatch arm in `run_fixture` does not call `assert_equivalence` (byte-equality is enforced inside `drive_tls_probes` per probe): awareness-only, no action required. Decorative-but-consistent with fixtures 0001-0005's expectations YAML shape; `Driver::TlsTcpProbeList`'s rustdoc explains the implicit-conjunction discipline.
+- **M5** — `tls-echo-server` argv tests (4 + 1 round-trip = 5 total) miss three negative cases that `tcp-echo-server` covers (`argv_rejects_missing_port_flag`, `argv_rejects_non_numeric_port`, `argv_rejects_trailing_argument`): awareness-only, no action required. **Tracked forward as an optional polish pass** to bring `tls-echo-server` to coverage parity with `tcp-echo-server`.
+
+Phase 03.2 REVIEW §4 recommendations forward to phase 04 / later:
+
+1. `Cluster::name()` accessor (phase-02.1 REVIEW M1 cross-reference; phase-02.2 §4 rec 1; phase-03.1 §4 rec 2): unchanged from prior carryforwards. Phase 04 (HCM) or phase 05 (HTTP/2) may surface the need; phase 06 (stats) is the natural close-out target. Phase 03.2 Task 5 explicitly evaluated and re-deferred per SPEC §3 D4.
+2. `x509-parser` is still deferred (phase-03.1 §4 rec 3 unchanged); phase 04 / 05 will likely need structured cert introspection if mTLS or peer-cert-attribution headers land. The 03.2 fixtures (only 2 leafs each; in-process `tls_sni.rs` uses byte-exact peer-cert DER comparison) sidestepped the need.
+3. `with_copy_to(target, source)` API quirk inline comment in `tests/differential/src/upstream.rs:73-77` remains intact; carry forward verbatim. Task 9 PROGRESS deviation 1 confirms `upstream.rs` was not touched in 03.2 because the 03.1 implementation pre-staged the iterator-driven mount loop walking `pki.container_mounts()`.
+4. `TypedConfig` enum will grow one variant per filter across phases 04/05/06 (carries over unchanged).
+5. Round-robin distribution-equivalence assertion remains unit-test-only (carries over unchanged from parent-brainstorm Q1 decision).
+6. If parallel fixture execution arrives, revisit `TcpProxyBackend::Drop` AND `TlsEchoBackend::Drop` per phase-02.2 M1 + phase-03.2 M2 (carries over unchanged; `TlsEchoBackend` inherits the same SIGKILL-Drop posture).
+7. `enable_half_close: true` flip-fixture deferral (carries over unchanged from phase-02.2 §4 rec 6 / phase-03.1 §4 rec 5); the 03.2 branched dial preserves the ADR-0016 `tokio::select!`-on-`tokio::io::copy` posture for both arms.
+8. `tls_params` floor (TLS 1.3 only) under a new ADR if rustls-vs-Envoy version negotiation drifts during the 03.2 Docker-gated CI runs (carries over unchanged from phase-03.1 §4 rec 9).
+9. Optional: factor out `drive_one_tls_probe` helper when phase 04 / 05 adds a third `drive_*` helper (M3 cross-reference).
+10. Optional: bring `tls-echo-server` argv-test coverage to parity with `tcp-echo-server` (M5 cross-reference).
+
+### Phase-03.2 ADR ledger (for reference)
+
+No new ADRs landed in phase 03.2 (per SPEC §7). The DECISIONS.md ledger remains at ADR-0019 (last landed in 03.1 Task 1 commit `f93a062`). If phase 04 or later phases surface the need for any of the deferred ADRs (TLS protocol-version pin, wildcard SNI semantics, `x509-parser`, `Cluster::name()`-attribution variant), they land at the next-sequential available number (ADR-0020+).
 
 ### Phase-00 deferrals still open
 
