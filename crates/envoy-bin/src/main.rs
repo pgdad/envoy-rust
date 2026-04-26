@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 mod admin;
 mod argv;
 mod echo;
+mod tls_handler;
 
 fn main() -> std::process::ExitCode {
     match argv::parse_argv(std::env::args()) {
@@ -49,6 +50,12 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("reading config at {}", config_path.display()))?;
     let bootstrap = envoy_config::parse_bootstrap(&yaml)?;
+
+    // Per SPEC §6 signpost 4: rustls's aws-lc-rs default provider must be
+    // installed once per process before any TLS-touching code runs. The
+    // `install_default()` call returns `Err(_)` on second-or-later calls,
+    // which is the no-op behavior we want — discard with `let _ =`.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     if let Some(node) = bootstrap.node.as_ref() {
         tracing::info!(
@@ -119,7 +126,44 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     .get(&tp_cfg.cluster)
                     .expect("validator guarantees cluster present");
                 let proxy = std::sync::Arc::new(envoy_tcp::TcpProxy::new(cluster, tp_cfg));
-                let listener = envoy_listener::Listener::bind(listener_cfg, proxy)
+
+                // Per SPEC §3 D5: pre-pass the listener's first filter chain
+                // for a downstream `transport_socket`. If present, wrap the
+                // inner `Arc<TcpProxy>` in a `TlsAcceptingHandler`. The
+                // validator already rejected the wrong direction
+                // (UpstreamTlsContext on a listener) and the wrong name
+                // (anything not `envoy.transport_sockets.tls`), so the
+                // `Upstream(...)` arm and the `name != TLS_TRANSPORT_SOCKET`
+                // case are unreachable here.
+                let chain = listener_cfg
+                    .filter_chains
+                    .first()
+                    .expect("validator guarantees ≥1 filter chain");
+                let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = if let Some(
+                    ts,
+                ) =
+                    chain.transport_socket.as_ref()
+                {
+                    let envoy_config::TransportSocketTypedConfig::Downstream(ctx) =
+                        &ts.typed_config
+                    else {
+                        anyhow::bail!(
+                            "validator should have rejected upstream transport_socket on listener",
+                        );
+                    };
+                    let downstream_tls = std::sync::Arc::new(
+                        envoy_tls::DownstreamTls::from_context(ctx)
+                            .context("building DownstreamTls from listener transport_socket")?,
+                    );
+                    std::sync::Arc::new(tls_handler::TlsAcceptingHandler {
+                        tls: downstream_tls,
+                        inner: proxy,
+                    })
+                } else {
+                    proxy
+                };
+
+                let listener = envoy_listener::Listener::bind(listener_cfg, handler)
                     .await
                     .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
                 tracing::info!(addr = %bind_addr, cluster = %tp_cfg.cluster, "envoy-rust listening (tcp_proxy)");
