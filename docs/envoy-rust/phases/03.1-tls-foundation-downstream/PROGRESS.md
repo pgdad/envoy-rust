@@ -46,7 +46,7 @@
 
 ## Task 8 — envoy-tcp: generic-stream lift + 4 TLS-flavored tests (2026-04-26)
 
-- Commits: (first SHA) code + (second SHA) progress note (see below)
+- Commits: d038c4b (code) + ada727b (progress note)
 - Change: Generalized `TcpProxy::handle` from concrete `TcpStream` to `pub async fn handle<S>(&self, downstream: S) -> Result<...> where S: AsyncRead + AsyncWrite + Unpin + Send + 'static`. Rewrote `ConnectionHandler for TcpProxy` as a thin wrapper: clones `cluster` (ClusterHandle, Arc-internal) and `cluster_name` (String), constructs a fresh `TcpProxy` inside the `Box::pin(async move { ... })` block, and calls `proxy.handle::<tokio::net::TcpStream>(downstream)`. Swapped `downstream.into_split()` (TcpStream-specific) for `tokio::io::split(downstream)` (generic). Added 4 new tests: `proxies_payload_through_tls_downstream_stream`, `proxies_payload_with_plaintext_stream_unchanged`, `tls_downstream_proxy_closes_upstream_on_downstream_close`, `tls_downstream_proxy_returns_err_on_upstream_connect_refused`.
 - Dev-deps added to envoy-tcp Cargo.toml: `rcgen = "0.13"`, `rustls = "0.23"` (no-default-features, +std+tls12), `rustls-pemfile = "2"`, `rustls-pki-types = "1"`, `tokio-rustls = "0.26"` (no-default-features, +aws-lc-rs). `tempfile = "3"` omitted (PLAN listed it but none of the 4 tests use it — cleaner without).
 - **Plan correction (CRITICAL note 1):** PLAN's Task 8 dev-deps list did not include `rustls-pemfile`. All 4 tests call `rustls_pemfile::private_key(...)`. Added `rustls-pemfile = "2"` to dev-deps to fix the missing import.
