@@ -9,6 +9,7 @@ members = [
     "crates/envoy-tls",
     "tests/differential",
     "tests/helpers/tcp-echo-server",
+    "tests/helpers/tls-echo-server",
 ]
 exclude = [
     "crates/envoy-config/fuzz",
