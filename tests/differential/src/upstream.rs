@@ -36,7 +36,18 @@ impl UpstreamProxy {
 /// references `host.docker.internal` to reach a host-running backend.
 /// `false` keeps the pre-02.2 behavior for fixtures that don't need
 /// container-to-host reachability.
-pub async fn start(envoy_yaml_path: &Path, host_gateway: bool) -> Result<UpstreamProxy> {
+///
+/// `tls_pki = Some(&pki)` copies each PEM in `pki.container_mounts()` into the
+/// container at `/etc/envoy-rust-tls/<filename>.pem` via
+/// `with_copy_to` (per parent-SPEC §6 signpost 7 / SPEC §6 signpost 7).
+/// Note: testcontainers 0.23.x API uses `with_copy_to(target, source)` rather
+/// than the plan-anticipated `with_copy_to_container(host, container)` form —
+/// the CopyDataSource wraps a PathBuf directly.
+pub async fn start(
+    envoy_yaml_path: &Path,
+    host_gateway: bool,
+    tls_pki: Option<&crate::tls::TlsTestPki>,
+) -> Result<UpstreamProxy> {
     let absolute = envoy_yaml_path
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", envoy_yaml_path.display()))?;
@@ -54,6 +65,17 @@ pub async fn start(envoy_yaml_path: &Path, host_gateway: bool) -> Result<Upstrea
             "host.docker.internal",
             testcontainers::core::Host::HostGateway,
         );
+    }
+    if let Some(pki) = tls_pki {
+        // Copy each PEM into the container at /etc/envoy-rust-tls/<name>.pem.
+        // testcontainers 0.23.x: `with_copy_to(target, source)` where
+        // `source: impl Into<CopyDataSource>` and PathBuf implements
+        // `From<PathBuf> for CopyDataSource`. PLAN anticipated
+        // `with_copy_to_container(host, container)` — actual API differs;
+        // adapted without ADR per SPEC §6 signpost 7 (mechanical surface).
+        for (host_path, container_path) in pki.container_mounts() {
+            request = request.with_copy_to(container_path, host_path);
+        }
     }
     let container = request
         .start()
@@ -105,7 +127,7 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path(), false).await.unwrap();
+        let proxy = start(yaml.path(), false, None).await.unwrap();
         assert!(proxy.host_port() > 0);
         // Validate accept-readiness via the library's own helper.
         let addr: std::net::SocketAddr =
