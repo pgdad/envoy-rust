@@ -7,6 +7,7 @@
 //! depends on rustls / tokio-rustls / rustls-pki-types / rustls-pemfile /
 //! aws-lc-rs. envoy-listener and envoy-cluster stay rustls-free.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -87,6 +88,66 @@ impl DownstreamTls {
         let key_path = Path::new(&certs[0].private_key.filename);
         let key = load_certified_key(cert_path, key_path)?;
         let resolver: Arc<dyn ResolvesServerCert> = Arc::new(SingleCertResolver(Arc::new(key)));
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        Ok(Self {
+            config: Arc::new(config),
+        })
+    }
+
+    /// 03.2-only: build from a full `envoy_config::Listener` by walking all
+    /// filter chains. For each chain that carries a `transport_socket` with a
+    /// `DownstreamTlsContext`, load its cert+key into a `CertifiedKey`; for
+    /// each SNI in the chain's `filter_chain_match.server_names`, insert the
+    /// key into the `SniResolver`'s map (keyed lowercase). At most one chain
+    /// may have an empty `server_names` (the catch-all); its key becomes the
+    /// resolver's `default`.
+    ///
+    /// The validator already rejects overlapping `server_names`, multiple
+    /// catch-all chains, and mixed TLS+plaintext listeners — `from_listener`
+    /// trusts those guarantees.
+    ///
+    /// If any chain in the listener carries TLS, the entire listener is
+    /// treated as TLS (rustls multiplexes by SNI inside a single
+    /// `ServerConfig`).
+    pub fn from_listener(listener: &envoy_config::Listener) -> Result<Self, TlsError> {
+        let mut map: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
+        let mut default: Option<Arc<CertifiedKey>> = None;
+
+        for chain in &listener.filter_chains {
+            let Some(socket) = &chain.transport_socket else {
+                continue;
+            };
+            let envoy_config::TransportSocketTypedConfig::Downstream(ctx) = &socket.typed_config
+            else {
+                // Validator rejects mismatched direction on listeners; defensive.
+                continue;
+            };
+
+            let certs = &ctx.common_tls_context.tls_certificates;
+            let cert = certs.first().ok_or(TlsError::DownstreamRequiresCert)?;
+            let cert_path = Path::new(&cert.certificate_chain.filename);
+            let key_path = Path::new(&cert.private_key.filename);
+            let certified_key = Arc::new(load_certified_key(cert_path, key_path)?);
+
+            let server_names = chain
+                .filter_chain_match
+                .as_ref()
+                .map(|m| m.server_names.as_slice())
+                .unwrap_or(&[]);
+
+            if server_names.is_empty() {
+                // Catch-all chain. Validator ensured at most one.
+                default = Some(certified_key);
+            } else {
+                for sni in server_names {
+                    map.insert(sni.to_lowercase(), certified_key.clone());
+                }
+            }
+        }
+
+        let resolver: Arc<dyn ResolvesServerCert> = Arc::new(SniResolver { map, default });
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(resolver);

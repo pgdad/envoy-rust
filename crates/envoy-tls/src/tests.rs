@@ -854,6 +854,148 @@ async fn sni_resolver_returns_none_on_miss_without_default() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 03.2 Task 4: DownstreamTls::from_listener integration test.
+//
+// Synthesizes an envoy_config::Listener with two TLS filter chains (each with
+// a distinct SNI + leaf cert), feeds it through from_listener, drives two
+// in-process handshakes (one per SNI), and asserts byte-exact peer-cert DER
+// per SNI. Proves that from_listener correctly populates the SniResolver's
+// map and that the resulting ServerConfig dispatches by SNI.
+//
+// The Listener is constructed directly via the public envoy_config struct
+// constructors (not parsed from YAML) to avoid adding a serde_yaml dev-dep
+// and to match the convention established by `pki::ds_context_with`.
+
+fn synth_listener_two_tls_chains(pki: &pki::Pki) -> envoy_config::Listener {
+    let chain_a = envoy_config::FilterChain {
+        filter_chain_match: Some(envoy_config::FilterChainMatch {
+            server_names: vec!["a.example.com".to_string()],
+        }),
+        transport_socket: Some(envoy_config::TransportSocket {
+            name: envoy_config::TLS_TRANSPORT_SOCKET.to_string(),
+            typed_config: envoy_config::TransportSocketTypedConfig::Downstream(
+                pki::ds_context_with(&pki.leaf_cert_pem, &pki.leaf_key_pem),
+            ),
+        }),
+        filters: vec![envoy_config::NetworkFilter {
+            name: envoy_config::TCP_PROXY_FILTER.to_string(),
+            typed_config: Some(envoy_config::TypedConfig::TcpProxy(
+                envoy_config::TcpProxyConfig {
+                    stat_prefix: "ingress_tcp".to_string(),
+                    cluster: "backend".to_string(),
+                },
+            )),
+        }],
+    };
+    let chain_b = envoy_config::FilterChain {
+        filter_chain_match: Some(envoy_config::FilterChainMatch {
+            server_names: vec!["b.example.com".to_string()],
+        }),
+        transport_socket: Some(envoy_config::TransportSocket {
+            name: envoy_config::TLS_TRANSPORT_SOCKET.to_string(),
+            typed_config: envoy_config::TransportSocketTypedConfig::Downstream(
+                pki::ds_context_with(&pki.leaf_b_cert_pem, &pki.leaf_b_key_pem),
+            ),
+        }),
+        filters: vec![envoy_config::NetworkFilter {
+            name: envoy_config::TCP_PROXY_FILTER.to_string(),
+            typed_config: Some(envoy_config::TypedConfig::TcpProxy(
+                envoy_config::TcpProxyConfig {
+                    stat_prefix: "ingress_tcp".to_string(),
+                    cluster: "backend".to_string(),
+                },
+            )),
+        }],
+    };
+    envoy_config::Listener {
+        name: "tcp_listener".to_string(),
+        address: envoy_config::Address {
+            socket_address: envoy_config::SocketAddress {
+                address: "0.0.0.0".to_string(),
+                port_value: 10010,
+            },
+        },
+        filter_chains: vec![chain_a, chain_b],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn from_listener_builds_multi_cert_config() {
+    install_provider_once();
+    let pki = pki::build();
+    let listener = synth_listener_two_tls_chains(&pki);
+    let downstream = DownstreamTls::from_listener(&listener).expect("from_listener");
+
+    // Probe each SNI in turn. Helper closure to keep the test compact —
+    // mirrors the Task-3 inlined-handshake style.
+    async fn probe(
+        config: Arc<rustls::ServerConfig>,
+        ca_der: &rustls::pki_types::CertificateDer<'static>,
+        sni: &'static str,
+    ) -> rustls::pki_types::CertificateDer<'static> {
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = acceptor.accept(stream).await.expect("server accept");
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_der.clone()).expect("add ca");
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+
+        let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let server_name = rustls::pki_types::ServerName::try_from(sni).expect("server name");
+        let tls = connector
+            .connect(server_name, stream)
+            .await
+            .expect("client connect");
+        let (_io, conn) = tls.get_ref();
+        let presented = conn
+            .peer_certificates()
+            .expect("peer certs")
+            .first()
+            .expect("at least one cert")
+            .clone()
+            .into_owned();
+        server_task.await.expect("server task joins");
+        presented
+    }
+
+    let cert_for_a = probe(
+        downstream.config.clone(),
+        &pki.ca_der_for_root_store,
+        "a.example.com",
+    )
+    .await;
+    let cert_for_b = probe(
+        downstream.config.clone(),
+        &pki.ca_der_for_root_store,
+        "b.example.com",
+    )
+    .await;
+
+    let leaf_a_der = pki::cert_der_at(&pki.leaf_cert_pem);
+    let leaf_b_der = pki::cert_der_at(&pki.leaf_b_cert_pem);
+    assert_eq!(
+        cert_for_a.as_ref(),
+        leaf_a_der.as_ref(),
+        "SNI a.example.com must select leaf-A"
+    );
+    assert_eq!(
+        cert_for_b.as_ref(),
+        leaf_b_der.as_ref(),
+        "SNI b.example.com must select leaf-B"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sni_resolver_is_case_insensitive() {
     install_provider_once();
