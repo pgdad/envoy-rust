@@ -1,0 +1,23 @@
+node:
+  id: fuzz-seed-tls-malformed-attype
+  cluster: fuzz
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UnknownContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/cert.pem
+                    private_key:
+                      filename: /tmp/key.pem
+          filters: []
+  clusters: []

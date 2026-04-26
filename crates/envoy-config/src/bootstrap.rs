@@ -1185,17 +1185,38 @@ admin:
     }
 
     #[test]
-    fn fuzz_corpus_tcp_proxy_seeds_parse() {
+    fn fuzz_corpus_seeds_parse_or_reject_cleanly() {
         let root = env!("CARGO_MANIFEST_DIR");
+        // Seeds expected to parse + validate successfully.
         for fname in &[
             "fuzz/corpus/parse_bootstrap/tcp_proxy_single_endpoint.yaml",
             "fuzz/corpus/parse_bootstrap/tcp_proxy_round_robin_triple.yaml",
+            "fuzz/corpus/parse_bootstrap/tls_downstream_single_cert.yaml",
+            "fuzz/corpus/parse_bootstrap/tls_upstream_validation_context.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
                 std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
             crate::parse_bootstrap(&yaml).unwrap_or_else(|e| panic!("parse {path}: {e}"));
         }
+        // Seeds expected to reject cleanly (parse_bootstrap returns Err, not panic).
+        #[allow(clippy::single_element_loop)]
+        for fname in &["fuzz/corpus/parse_bootstrap/tls_malformed_at_type.yaml"] {
+            let path = format!("{root}/{fname}");
+            let yaml =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            assert!(
+                crate::parse_bootstrap(&yaml).is_err(),
+                "{path} was expected to reject, but parsed",
+            );
+        }
+        // The minimal.yaml seed is the phase-00 admin-only baseline; assert
+        // it still parses (regression gate against schema additions breaking
+        // baseline acceptance).
+        let minimal = format!("{root}/fuzz/corpus/parse_bootstrap/minimal.yaml");
+        let yaml =
+            std::fs::read_to_string(&minimal).unwrap_or_else(|e| panic!("read {minimal}: {e}"));
+        crate::parse_bootstrap(&yaml).unwrap_or_else(|e| panic!("parse {minimal}: {e}"));
     }
 
     #[test]

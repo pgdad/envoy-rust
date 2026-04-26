@@ -2,5 +2,8 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/minimal.yaml
 !corpus/parse_bootstrap/tcp_proxy_single_endpoint.yaml
 !corpus/parse_bootstrap/tcp_proxy_round_robin_triple.yaml
+!corpus/parse_bootstrap/tls_downstream_single_cert.yaml
+!corpus/parse_bootstrap/tls_malformed_at_type.yaml
+!corpus/parse_bootstrap/tls_upstream_validation_context.yaml
 artifacts/
 target/

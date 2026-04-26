@@ -1,0 +1,32 @@
+node:
+  id: fuzz-seed-tls-upstream
+  cluster: fuzz
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: envoy-rust.test
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /tmp/ca.pem
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
