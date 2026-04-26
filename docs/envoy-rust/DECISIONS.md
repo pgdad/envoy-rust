@@ -349,3 +349,29 @@ Each ADR uses the structure:
   - No doctrine delta. This ADR is the mechanical application of `BOOTSTRAP_PROMPT.md` §6.2 by the plan-writer upon inspecting parent-SPEC §5's LoC estimate against the §6.1 gate. No existing ADR is superseded.
 
 ---
+
+## ADR-0018: `rcgen` and `tempfile` permitted as dev-test-harness-only foundations
+
+- Date: 2026-04-25
+- Status: accepted
+- Context: Phase 03 is the first phase to need test certificates. TLS test infrastructure recurs across phases 03–08+ (HTTP/1.1 over TLS, H2 over TLS, mTLS, etc.). Static in-tree PEMs were considered and rejected per the parent-phase brainstorm Q2 decision (poor refresh ergonomics, expiry concerns, multi-leaf cert generation gets unwieldy). `rcgen` is the maintained Rust-native cert generator; `tempfile` is the canonical per-test-run tmpdir manager. Neither is on the D-3.2 permitted-foundations list at phase-02.2 close.
+- Options considered: (i) static in-tree PEMs (rejected, parent-brainstorm Q2); (ii) `rcgen` + `tempfile` on the permitted list as **dev-test-harness-only** (decision); (iii) script-generated PEMs committed to the repo (rejected, parent-brainstorm Q2: worst-of-both-worlds — refresh friction *and* in-tree drift).
+- Decision: add `rcgen = "0.13"` and `tempfile = "3"` to the permitted-foundations list with the **dev-test-harness-only** annotation. Mirrors ADR-0009's posture for `cargo-fuzz` + `libfuzzer-sys`. Never a transitive of `envoy-bin` or any non-test workspace crate. Restricted to: `tests/differential/` dev-deps; `tests/helpers/tls-echo-server/` dev-deps (lands in 03.2); `crates/envoy-tls/` dev-deps (for unit-test PKI); `crates/envoy-bin/` dev-deps (for the in-process integration test); `crates/envoy-tcp/` dev-deps (for the TLS-flavored unit tests).
+- Rationale: one-time foundations grant beats per-phase ADR churn; rcgen is the Rust-ecosystem default; tempfile is ubiquitous test-infra. Test-only restriction preserves D-3.2's spirit for runtime code.
+- Consequences: future TLS-cert-using phases (04 HCM-over-TLS, 05 H2-over-TLS, mTLS phases, etc.) reuse this decision without per-phase ADRs. `cargo deny check` may flag the rcgen license (Apache-2.0 OR MIT — both on the deny.toml allow-list) or its transitive deps; if so, the deny.toml is updated alongside ADR-0018's landing. If a future phase needs cert generation in *runtime* code (e.g., hot-restart cert rotation), that phase lands a new ADR superseding the dev-test-harness-only restriction.
+- Provenance: this ADR was projected as "ADR-0017" in parent-phase-03 SPEC §7 (`docs/envoy-rust/phases/03-tls-tcp/SPEC.md`, committed at SHA `a3f3474`) and renumbered to ADR-0018 by the phase-03 split decision (ADR-0017). The projected ADR-0018 (tokio-rustls + rustls-pemfile) is renumbered to ADR-0019 and lands alongside this ADR in the same Task-1 commit.
+
+---
+
+## ADR-0019: `tokio-rustls` and `rustls-pemfile` covered by the rustls foundations grant
+
+- Date: 2026-04-25
+- Status: accepted
+- Context: D-3.2 lists `rustls`, `webpki`, `rustls-pki-types`, and "`aws-lc-rs` permitted as the crypto provider," but does not name `tokio-rustls` or `rustls-pemfile` explicitly. Both are mechanically necessary to use rustls inside a tokio runtime / load PEMs from disk; both ship from the rustls org.
+- Options considered: (i) treat both as covered implicitly by the rustls grant — risks ambiguity for downstream phases; (ii) land an ADR formalizing the extension (decision); (iii) hand-roll the async glue and PEM parser — reinvents wheels D-3.2 explicitly tells us not to.
+- Decision: extend D-3.2's "rustls + aws-lc-rs permitted as the crypto provider" grant to cover `tokio-rustls = "0.26"` and `rustls-pemfile = "2"`. Both are runtime-permitted (not dev-only); rcgen + tempfile from ADR-0018 stay dev-only.
+- Rationale: removes ambiguity for downstream phases. Both crates are first-party in the rustls ecosystem; treating them as part of the same foundation is the cheapest, most honest formalization.
+- Consequences: envoy-tls's `Cargo.toml` lists both as direct deps. `tls-echo-server`'s `Cargo.toml` (lands in 03.2) lists both. Neither is allowed in `envoy-listener` or `envoy-cluster` — those crates remain rustls-free per D1's "envoy-tls is the only crate with rustls deps" architectural rule.
+- Provenance: this ADR was projected as "ADR-0018" in parent-phase-03 SPEC §7 (`docs/envoy-rust/phases/03-tls-tcp/SPEC.md`, committed at SHA `a3f3474`) and renumbered to ADR-0019 by the phase-03 split decision (ADR-0017). Lands alongside ADR-0018 in the same Task-1 commit.
+
+---
