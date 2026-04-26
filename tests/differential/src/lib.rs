@@ -599,15 +599,26 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let backend_port_str = _backend.as_ref().map(|b| b.port().to_string());
 
-    // 03.2 Task 8: detect TLS-backend-shaped fixtures. Task 9 will wire up
-    // `TlsEchoBackend`; until then, bail with a clear message so fixture 0005
-    // authors get a deterministic error rather than a confusing template-
-    // substitution failure downstream.
+    // 03.2 Task 9: spawn a TlsEchoBackend if either template needs one.
+    // Same alive-keeper binding-order discipline as `_backend` above — the
+    // `Option<TlsEchoBackend>` outlives both proxies, and Drop fires after
+    // `run_fixture` returns. Requires `tls_pki` to also be present (the
+    // backend reads cert + key from the same PKI the upstream consults).
     let needs_tls_backend = upstream_template.contains("{{TLS_BACKEND_PORT}}")
         || subject_template.contains("{{TLS_BACKEND_PORT}}");
-    if needs_tls_backend {
-        anyhow::bail!("TlsEchoBackend not yet wired up — pending Task 9");
-    }
+    let _tls_backend: Option<crate::backend::TlsEchoBackend> = if needs_tls_backend {
+        let pki = tls_pki
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TLS backend implies TLS pki shape"))?;
+        Some(
+            crate::backend::TlsEchoBackend::spawn(&pki.server_cert, &pki.server_key)
+                .await
+                .context("spawning TlsEchoBackend")?,
+        )
+    } else {
+        None
+    };
+    let tls_backend_port_str = _tls_backend.as_ref().map(|b| b.port().to_string());
 
     // (c) Build per-side substitution maps with TLS path keys.
     // Type is Vec<(&str, String)> to accommodate owned strings from TLS paths.
@@ -618,8 +629,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         let mut v: Vec<(&str, String)> = vec![(port_key, upstream_port_str.clone())];
         if let Some(bp) = backend_port_str.as_deref() {
             v.push(("BACKEND_PORT", bp.to_string()));
+        }
+        if let Some(tp) = tls_backend_port_str.as_deref() {
+            v.push(("TLS_BACKEND_PORT", tp.to_string()));
+        }
+        if backend_port_str.is_some() || tls_backend_port_str.is_some() {
             // Per ADR-0015: container-side reaches the host backend via
             // host.docker.internal (with the harness's with_host call below).
+            // Generalized in Task 9 to fire for either backend variant; was
+            // previously gated only on BACKEND_PORT (Task 8 cadence).
             v.push(("BACKEND_HOST", "host.docker.internal".to_string()));
         }
         if let Some(map) = upstream_tls_paths.as_ref() {
@@ -633,6 +651,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         let mut v: Vec<(&str, String)> = vec![(port_key, subject_port_str.clone())];
         if let Some(bp) = backend_port_str.as_deref() {
             v.push(("BACKEND_PORT", bp.to_string()));
+        }
+        if let Some(tp) = tls_backend_port_str.as_deref() {
+            v.push(("TLS_BACKEND_PORT", tp.to_string()));
+        }
+        if backend_port_str.is_some() || tls_backend_port_str.is_some() {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
         }
         if let Some(map) = subject_tls_paths.as_ref() {
