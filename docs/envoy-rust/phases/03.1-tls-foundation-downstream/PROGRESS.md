@@ -43,3 +43,15 @@
   3. **Clippy `ptr_arg` on `ds_context_with` params (PLAN line 1629):** PLAN signature used `&PathBuf`; clippy -D warnings requires `&Path`. Changed to `&Path` — call sites pass `&PathBuf` which auto-derefs.
   4. **rcgen 0.13.2 `KeyPair::generate()` (no-arg):** Confirmed available at rcgen 0.13.2 — PLAN form used verbatim, no adjustment needed.
   5. **`CertificateDer::into_owned()`:** Confirmed in `rustls-pki-types 1.14.0` — PLAN form used verbatim.
+
+## Task 7 — envoy-tls::UpstreamTls + CA loader + 3 tests (2026-04-26)
+
+- Commit: 6bd308d
+- Change: Extended `crates/envoy-tls/src/lib.rs` with: new imports (`ClientConfig`, `RootCertStore`, `ServerName`), `UpstreamTls` struct (`#[derive(Debug)]`, fields `config: Arc<ClientConfig>` + `server_name: ServerName<'static>`) with `from_context(cfg: &UpstreamTlsContext) -> Result<Self, TlsError>` (loads CA PEM into `RootCertStore`, builds `ClientConfig`, rejects IP-literal SNI via `parse_dns_server_name`) and `async fn connect(upstream: TcpStream) -> Result<TlsStream<TcpStream>, TlsError>` (drives `TlsConnector::connect`). Added private `load_root_store(ca_path: &Path)` (reads CA PEM via `rustls-pemfile::certs`, populates `RootCertStore`, rejects empty/malformed input with `TlsError::CaParse`) and private `parse_dns_server_name(sni: &str)` (parses via `ServerName::try_from`, accepts `DnsName` only, rejects `IpAddress` + catch-all with `TlsError::InvalidServerName`). Extended `crates/envoy-tls/src/tests.rs` with `mod upstream_pki` helper (CA + server cert with SAN `envoy-rust.test`, writes to TempDir, builds `CertifiedKey` via rustls-pemfile) and 3 tests: `loads_upstream_client_config` (loopback handshake, version assertion), `upstream_rejects_invalid_sni` (IP literal `127.0.0.1` → `TlsError::InvalidServerName`), `upstream_rejects_untrusted_cert` (different CA's server cert → `TlsError::Handshake`).
+- Verification: `cargo test -p envoy-tls` → `test result: ok. 10 passed; 0 failed` (7 from Task 6 + 3 from Task 7). Workspace gate: `cargo build --workspace --all-targets` exit 0; `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0; `cargo fmt --all -- --check` exit 0. Cargo.lock modified but not staged.
+- API-drift adjustments:
+  1. **`ProtocolVersion` no `PartialOrd` (PLAN line 2221):** Same as Task 6 — adjusted `>=` comparison to `matches!(v, TLSv1_2 | TLSv1_3)`.
+  2. **`UpstreamTls` needs `#[derive(Debug)]` (not in PLAN):** `expect_err` requires `T: Debug`; added `#[derive(Debug)]` (wraps `Arc<ClientConfig>` + `ServerName<'static>`, both are `Debug`).
+  3. **Clippy `ptr_arg` on `us_context_with` (PLAN line 2156):** PLAN used `&PathBuf`; clippy -D warnings requires `&Path`. Changed to `&std::path::Path` — call sites pass `&pki.ca_pem` (`PathBuf`) which auto-derefs.
+  4. **`load_root_store` simplified per CRITICAL note 1:** Dropped the dead-code `.or_else(|e| Err(e))?` from the PLAN; used the cleaner single `.map_err(|_| TlsError::CaParse {...})?` form.
+  5. **`DnsName::to_owned()` confirmed:** `rustls-pki-types 1.14.0` `DnsName<'a>` has `to_owned() -> DnsName<'static>`; PLAN form used verbatim.
