@@ -10,8 +10,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustls::ClientConfig;
+use rustls::RootCertStore;
 use rustls::ServerConfig;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::net::TcpStream;
@@ -105,6 +107,110 @@ struct SingleCertResolver(Arc<CertifiedKey>);
 impl ResolvesServerCert for SingleCertResolver {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.0.clone())
+    }
+}
+
+/// Client-side TLS configuration. Build via `from_context`; drive a connected
+/// upstream `TcpStream` through the rustls client handshake via `connect`.
+///
+/// 03.1 ships the implementation + unit tests; 03.2 wires consumers
+/// (envoy-tcp's `TcpProxy::handle` gains an `Option<Arc<UpstreamTls>>` field;
+/// envoy-bin builds the `Arc<UpstreamTls>` per cluster with
+/// `transport_socket: Upstream(...)`).
+#[derive(Debug)]
+pub struct UpstreamTls {
+    config: Arc<ClientConfig>,
+    server_name: ServerName<'static>,
+}
+
+impl UpstreamTls {
+    /// Build from a parsed `envoy_config::UpstreamTlsContext`. Loads the CA
+    /// PEM from `validation_context.trusted_ca.filename` into a `RootCertStore`;
+    /// builds a `ClientConfig` with that root store, no client auth (mTLS
+    /// deferred), default cipher suites/protocols. Parses `cfg.sni` into a
+    /// `ServerName::DnsName` via `rustls-pki-types`; rejects IP literals
+    /// (Envoy's `UpstreamTlsContext.sni` is documented DNS-name-only).
+    pub fn from_context(cfg: &envoy_config::UpstreamTlsContext) -> Result<Self, TlsError> {
+        let ca_path_str = cfg
+            .common_tls_context
+            .validation_context
+            .as_ref()
+            .map(|vc| vc.trusted_ca.filename.as_str())
+            .ok_or_else(|| {
+                TlsError::RustlsConfig(
+                    "UpstreamTls::from_context: validation_context required".to_string(),
+                )
+            })?;
+        let ca_path = Path::new(ca_path_str);
+        let roots = load_root_store(ca_path)?;
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let server_name = parse_dns_server_name(&cfg.sni)?;
+        Ok(Self {
+            config: Arc::new(config),
+            server_name,
+        })
+    }
+
+    /// Hands a connected upstream `TcpStream` through the rustls client
+    /// handshake; returns the post-handshake stream.
+    pub async fn connect(
+        &self,
+        upstream: TcpStream,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, TlsError> {
+        let connector = tokio_rustls::TlsConnector::from(self.config.clone());
+        connector
+            .connect(self.server_name.clone(), upstream)
+            .await
+            .map_err(|source| TlsError::Handshake { source })
+    }
+}
+
+fn load_root_store(ca_path: &Path) -> Result<RootCertStore, TlsError> {
+    let bytes = std::fs::read(ca_path).map_err(|source| TlsError::FileRead {
+        path: ca_path.to_path_buf(),
+        source,
+    })?;
+    let mut slice = bytes.as_slice();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut slice)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| TlsError::CaParse {
+            path: ca_path.to_path_buf(),
+        })?;
+    if certs.is_empty() {
+        return Err(TlsError::CaParse {
+            path: ca_path.to_path_buf(),
+        });
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| TlsError::RustlsConfig(format!("RootCertStore::add: {e}")))?;
+    }
+    Ok(roots)
+}
+
+fn parse_dns_server_name(sni: &str) -> Result<ServerName<'static>, TlsError> {
+    use std::convert::TryFrom;
+    let parsed = ServerName::try_from(sni).map_err(|e| TlsError::InvalidServerName {
+        sni: sni.to_string(),
+        reason: format!("parse: {e}"),
+    })?;
+    match parsed {
+        ServerName::DnsName(name) => Ok(ServerName::DnsName(name.to_owned())),
+        ServerName::IpAddress(_) => Err(TlsError::InvalidServerName {
+            sni: sni.to_string(),
+            reason: "IP literals not accepted in upstream sni; Envoy requires a DNS name".into(),
+        }),
+        // ServerName is non-exhaustive in some pki-types versions; default
+        // any future variant to rejection.
+        _ => Err(TlsError::InvalidServerName {
+            sni: sni.to_string(),
+            reason: "unsupported ServerName variant".into(),
+        }),
     }
 }
 
