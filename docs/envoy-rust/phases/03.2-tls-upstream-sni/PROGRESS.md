@@ -86,3 +86,123 @@
 - Verification: Workspace gate clean — `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check` all exit 0. `cargo test --workspace --lib --bins` reported all crates green: envoy-config 61, envoy-listener 6, envoy-tcp 11, envoy-tls 15, envoy-cluster 19, envoy-bin lib 37 + 1 ignored, envoy-tls-server-test 8, tcp-echo-server bin 8, tls-echo-server bin 5, differential 43 + 1 ignored. The Docker-gated `tls_sni_fixture` is excluded by `--lib --bins` (it lives under `tests/differential/tests/`, an integration test). `payload.bin` byte-identity verified via `diff tests/fixtures/0001-tcp-echo/inputs/payload.bin tests/fixtures/0006-tls-sni/inputs/payload.bin` exit 0.
 - Docker-run status: **SKIPPED locally** — `docker info` reports `Cannot connect to the Docker daemon` (Docker Desktop not running on dev host). Per PLAN Step 7 fallback, CI (`ubuntu-latest`) provides Docker and runs `tls_sni_fixture` alongside `tls_upstream_fixture` and the four 03.1 / earlier fixtures. Matches the precedent established in phase-03.1 fixture 0004 (commit `64ea760`) and Task 11's fixture 0005.
 - Deviation from PLAN: (1) **`#![forbid(unsafe_code)]` NOT added to `tls_sni.rs`** — PLAN line 4060 sketches it, but the established `tls_downstream.rs` (03.1) + `tls_upstream.rs` (Task 11 commit `017c512`) precedent omits it; the `tests/differential/src/lib.rs` carries crate-level `#![forbid(unsafe_code)]` (D-3.8 satisfied). Mirrored the precedent for parity, exactly as Task 11 did. (2) **`Cargo.lock` not staged** — deferred to Task 13 per phase-precedent (matches Tasks 5, 7, 8, 9, 10, 11 cadence).
+
+## Task 13 / State 4 — phase-done gate verification (2026-04-26)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4: **gate verdict — clean on first attempt** (no fix-during-gate commits). ROADMAP.md and STATE.md are NOT advanced here per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session); those flip in state 6 (the phase-done commit) after state 5's `REVIEW.md` is approved.
+
+### Local stable-toolchain gate
+
+`cargo build --workspace --all-targets`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+```
+(exit 0)
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+```
+(exit 0; no warnings)
+
+`cargo fmt --all -- --check`:
+```
+(no output — clean; exit 0)
+```
+
+`cargo test --workspace --lib --bins` — per-crate result lines:
+```
+     Running unittests src/lib.rs (target/debug/deps/differential-ebfdb9f33703b843)
+running 44 tests
+test result: ok. 43 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.52s
+
+     Running unittests src/main.rs (target/debug/deps/envoy_bin-9c6a711428cebe2f)
+running 19 tests
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+
+     Running unittests src/lib.rs (target/debug/deps/envoy_cluster-35a9c2517d0a0583)
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/envoy_config-6932b003571c8776)
+running 61 tests
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/envoy_listener-f112b806464276a3)
+running 6 tests
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+
+     Running unittests src/lib.rs (target/debug/deps/envoy_tcp-4af3d9e28f428a49)
+running 11 tests
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src/lib.rs (target/debug/deps/envoy_tls-922a07d4cc212a57)
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src/main.rs (target/debug/deps/tcp_echo_server-06b6791653d77c50)
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+
+     Running unittests src/main.rs (target/debug/deps/tls_echo_server-1709570091d270cd)
+running 5 tests
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+```
+
+Total: **176 tests passed, 0 failed, 1 ignored** (43 + 19 + 8 + 61 + 6 + 11 + 15 + 8 + 5). The single ignored test is `differential`'s Docker-gated unit test (TcpProxyBackend smoke, carried forward unchanged from 02.2). Note: `--lib --bins` deliberately excludes the integration tests under `crates/envoy-bin/tests/` (`tls_downstream`, `tls_upstream`, `tls_sni`) and under `tests/differential/tests/` (`echo_fixture`, `admin_ready_fixture`, `tcp_proxy_fixture`, `tls_downstream`, `tls_upstream`, `tls_sni`); those are exercised by `--tests` and by CI per ADR-0010. The PLAN line 4174 prediction of "envoy-bin (main) — 19 passed" matches exactly; envoy-bin has no `lib.rs` (bin-only crate) so the "37 + 1 ignored" figure quoted in earlier task PROGRESS notes is from a different invocation surface (test target enumeration) and is not what `--lib --bins` reports.
+
+`cargo deny check`:
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:48:6
+   │
+48 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+(exit 0; the 5 `license-not-encountered` warnings are the carryforward set from 03.1 — `0BSD`, `BSD-2-Clause`, `MPL-2.0`, `Unicode-DFS-2016`, `Zlib` are explicitly allowed in `deny.toml` but no current dep claims them; these are intentional headroom for future deps and are non-blocking per PLAN line 4188 expectation.)
+
+### Docker-gated acceptance tests
+
+**SKIPPED locally** — `docker info` reports `Server: ERROR: Cannot connect to the Docker daemon at unix:///Users/esa/.docker/run/docker.sock. Is the docker daemon running?` (Docker Desktop client is installed at v28.0.4 but the daemon is not running on dev host). CI (`ubuntu-latest`) provides Docker and runs all 6 fixture tests per ADR-0010: `echo_fixture`, `admin_ready_fixture`, `tcp_proxy_fixture`, `tls_downstream` (03.1), `tls_upstream` (Task 11), `tls_sni` (Task 12). Matches the precedent established in phase-03.1 fixture 0004 (commit `64ea760`) and phase-03.2 Tasks 11 + 12 (commits `017c512` + `e478e35`).
+
+### Fuzz job
+
+**SKIPPED locally** — `cargo +nightly fuzz` reports `error: no such command: 'fuzz'` (the `cargo-fuzz` cargo-subcommand binary is not installed on this dev host; the nightly toolchain itself was installed during this gate run via `rustup`'s on-demand provisioning, but `cargo install cargo-fuzz` has not been run). CI runs the parse_bootstrap fuzz target on `ubuntu-latest` per ADR-0010. Matches the precedent established in phase-03.1 PROGRESS Task 4 (commit `0273f0e`).
+
+### Cargo.lock sync
+
+**Dirty** — `git diff Cargo.lock` shows the carryforward churn from Tasks 5 + 10:
+- `envoy-bin`'s package stanza gained `envoy-tls` and `tempfile` entries (Task 5 added them as runtime + dev-deps to envoy-tcp; envoy-bin's lock entry indirectly reflects the workspace dep graph).
+- New `tls-echo-server` package stanza (Task 10's new workspace member).
+
+Will be landed as a dedicated `phase 03.2: sync Cargo.lock with phase 03.2 dep graph` commit immediately following this PROGRESS commit, mirroring the precedent shape from phase-01 `4955252`, phase-02.1 `dea4d16`, phase-02.2 `2146014`, phase-03.1 `eb039e6`.
+
+### Outstanding for state 5/6
+
+State 5 (`superpowers:requesting-code-review`) writes `REVIEW.md` for this phase. State 6 (the phase-done commit) flips ROADMAP row `03.2` `status` → `done` AND parent row `03` `status` → `done` (per the schema: parent flips when all sub-phases are `done`; row `03.1` is already `done`), and advances STATE.md to phase `04` (slug TBD; lifecycle state 1; next-skill `superpowers:brainstorming`). The state-6 commit message follows SPEC §9.
