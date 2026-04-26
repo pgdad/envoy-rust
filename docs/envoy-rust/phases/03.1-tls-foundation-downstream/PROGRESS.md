@@ -44,6 +44,16 @@
   4. **rcgen 0.13.2 `KeyPair::generate()` (no-arg):** Confirmed available at rcgen 0.13.2 — PLAN form used verbatim, no adjustment needed.
   5. **`CertificateDer::into_owned()`:** Confirmed in `rustls-pki-types 1.14.0` — PLAN form used verbatim.
 
+## Task 8 — envoy-tcp: generic-stream lift + 4 TLS-flavored tests (2026-04-26)
+
+- Commits: (first SHA) code + (second SHA) progress note (see below)
+- Change: Generalized `TcpProxy::handle` from concrete `TcpStream` to `pub async fn handle<S>(&self, downstream: S) -> Result<...> where S: AsyncRead + AsyncWrite + Unpin + Send + 'static`. Rewrote `ConnectionHandler for TcpProxy` as a thin wrapper: clones `cluster` (ClusterHandle, Arc-internal) and `cluster_name` (String), constructs a fresh `TcpProxy` inside the `Box::pin(async move { ... })` block, and calls `proxy.handle::<tokio::net::TcpStream>(downstream)`. Swapped `downstream.into_split()` (TcpStream-specific) for `tokio::io::split(downstream)` (generic). Added 4 new tests: `proxies_payload_through_tls_downstream_stream`, `proxies_payload_with_plaintext_stream_unchanged`, `tls_downstream_proxy_closes_upstream_on_downstream_close`, `tls_downstream_proxy_returns_err_on_upstream_connect_refused`.
+- Dev-deps added to envoy-tcp Cargo.toml: `rcgen = "0.13"`, `rustls = "0.23"` (no-default-features, +std+tls12), `rustls-pemfile = "2"`, `rustls-pki-types = "1"`, `tokio-rustls = "0.26"` (no-default-features, +aws-lc-rs). `tempfile = "3"` omitted (PLAN listed it but none of the 4 tests use it — cleaner without).
+- **Plan correction (CRITICAL note 1):** PLAN's Task 8 dev-deps list did not include `rustls-pemfile`. All 4 tests call `rustls_pemfile::private_key(...)`. Added `rustls-pemfile = "2"` to dev-deps to fix the missing import.
+- **Trait-impl-clones-fields pattern (PLAN line 2664 / SPEC §6 signpost 3, option α):** The `ConnectionHandler::handle` trait method takes `&self` but the `BoxFuture` must be `'static`. We cannot capture `self` directly. Option α (clone the two Arc-bearing fields and reconstruct a `TcpProxy` in the async block) was chosen to preserve the trait shape verbatim (zero diff to `envoy-listener`). `ClusterHandle` is `Arc<Cluster>` internally (`#[derive(Clone, Debug)]`), so the clone is O(1) reference-count increment.
+- **`tokio::io::split` vs `into_split`:** `into_split()` is `TcpStream`-only. `tokio::io::split(downstream)` works for any `AsyncRead + AsyncWrite + Unpin`. Upstream side retains `into_split()` since upstream is always `TcpStream` in phase 03.1.
+- Verification: `cargo test -p envoy-tcp` → 8 passed (4 phase-02.2 base + 4 new); workspace gate: `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `cargo test --workspace --lib --bins` all exit 0. Per-crate counts: differential 31, envoy-bin 19, tcp-echo-server 8, envoy-config 50, envoy-listener 6, envoy-tcp 8, envoy-cluster 8, envoy-tls 10 (total 140). Cargo.lock modified but not staged.
+
 ## Task 7 — envoy-tls::UpstreamTls + CA loader + 3 tests (2026-04-26)
 
 - Commit: 6bd308d
