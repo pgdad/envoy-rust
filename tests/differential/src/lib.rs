@@ -21,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod backend;
 pub mod subject;
+pub mod tls;
 pub mod upstream;
 
 /// Contents of `<fixture>/expectations.yaml`. See SPEC §D5.
@@ -36,7 +37,16 @@ pub struct Expectations {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Driver {
     TcpEcho,
-    HttpGet { path: String, host: String },
+    HttpGet {
+        path: String,
+        host: String,
+    },
+    /// 03.1 NEW: TLS round-trip with explicit SNI + optional CN/SAN check.
+    TlsTcp {
+        sni: String,
+        #[serde(default)]
+        expected_cn: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -345,6 +355,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let port_key = match &expectations.driver {
         Driver::TcpEcho => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
+        Driver::TlsTcp { .. } => "PORT",
     };
 
     // Spawn a host-local backend if either template needs one. Holding the
@@ -438,6 +449,12 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 &upstream_resp.body,
                 &subject_resp.body,
             )?;
+        }
+        Driver::TlsTcp { .. } => {
+            // drive_tls dispatch lands in Task 11.
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+            anyhow::bail!("Driver::TlsTcp dispatch not yet implemented (Task 11)");
         }
     }
 
@@ -912,6 +929,52 @@ endpoint: {{BACKEND_HOST}}:{{BACKEND_PORT}}
             got.contains("endpoint: 127.0.0.1:31415"),
             "BACKEND_HOST not substituted to 127.0.0.1: {got}",
         );
+    }
+
+    #[test]
+    fn render_yaml_substitutes_tls_paths_for_envoy_side() {
+        let template = r#"
+trusted_ca:
+  filename: {{CA_PATH}}
+leaf_cert:
+  filename: {{LEAF_A_CERT_PATH}}
+leaf_key:
+  filename: {{LEAF_A_KEY_PATH}}
+"#;
+        let got = render_yaml(
+            template,
+            &[
+                ("CA_PATH", "/etc/envoy-rust-tls/ca.pem"),
+                ("LEAF_A_CERT_PATH", "/etc/envoy-rust-tls/leaf-a-cert.pem"),
+                ("LEAF_A_KEY_PATH", "/etc/envoy-rust-tls/leaf-a-key.pem"),
+            ],
+        );
+        assert!(got.contains("filename: /etc/envoy-rust-tls/ca.pem"));
+        assert!(got.contains("filename: /etc/envoy-rust-tls/leaf-a-cert.pem"));
+        assert!(got.contains("filename: /etc/envoy-rust-tls/leaf-a-key.pem"));
+    }
+
+    #[test]
+    fn render_yaml_substitutes_tls_paths_for_subject_side() {
+        let template = r#"
+trusted_ca:
+  filename: {{CA_PATH}}
+leaf_cert:
+  filename: {{LEAF_A_CERT_PATH}}
+leaf_key:
+  filename: {{LEAF_A_KEY_PATH}}
+"#;
+        let got = render_yaml(
+            template,
+            &[
+                ("CA_PATH", "/tmp/abc/ca.pem"),
+                ("LEAF_A_CERT_PATH", "/tmp/abc/leaf-a-cert.pem"),
+                ("LEAF_A_KEY_PATH", "/tmp/abc/leaf-a-key.pem"),
+            ],
+        );
+        assert!(got.contains("filename: /tmp/abc/ca.pem"));
+        assert!(got.contains("filename: /tmp/abc/leaf-a-cert.pem"));
+        assert!(got.contains("filename: /tmp/abc/leaf-a-key.pem"));
     }
 
     #[test]
