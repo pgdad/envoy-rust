@@ -114,12 +114,28 @@ pub struct SocketAddress {
     pub port_value: u16,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FilterChain {
     #[serde(default)]
+    pub filter_chain_match: Option<FilterChainMatch>,
+    #[serde(default)]
     pub transport_socket: Option<TransportSocket>,
     pub filters: Vec<NetworkFilter>,
+}
+
+/// Filter-chain matcher (phase 03.2 portion). Selects which filter chain a
+/// connection routes to; for phase 03.2, only `server_names` (TLS SNI) is
+/// supported. Empty / missing `server_names` is the catch-all (validator
+/// enforces "at most one catch-all per listener").
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FilterChainMatch {
+    /// SNI values this filter chain matches. Empty Vec = catch-all. The
+    /// validator (Task 2) rejects two filter chains declaring the same SNI
+    /// (case-insensitive) and rejects multiple catch-all chains per listener.
+    #[serde(default)]
+    pub server_names: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -1716,6 +1732,96 @@ admin:
         assert!(
             matches!(err, crate::ConfigError::EmptyUpstreamSni),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_filter_chain_with_server_names() {
+        let yaml = r#"
+filter_chain_match:
+  server_names: ["a.example.com", "b.example.com"]
+filters:
+  - name: envoy.filters.network.tcp_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+      stat_prefix: ingress_tcp
+      cluster: backend
+"#;
+        let chain: FilterChain = serde_yaml::from_str(yaml).expect("parse");
+        let m = chain.filter_chain_match.expect("has filter_chain_match");
+        assert_eq!(
+            m.server_names,
+            vec!["a.example.com".to_string(), "b.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_filter_chain_without_filter_chain_match() {
+        // Existing 03.1 / 02.2 shape — no filter_chain_match key.
+        let yaml = r#"
+filters:
+  - name: envoy.filters.network.tcp_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+      stat_prefix: ingress_tcp
+      cluster: backend
+"#;
+        let chain: FilterChain = serde_yaml::from_str(yaml).expect("parse");
+        assert!(chain.filter_chain_match.is_none());
+    }
+
+    #[test]
+    fn parses_filter_chain_match_with_empty_server_names() {
+        // `filter_chain_match: {}` is the catch-all shape.
+        let yaml = r#"
+filter_chain_match: {}
+filters:
+  - name: envoy.filters.network.tcp_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+      stat_prefix: ingress_tcp
+      cluster: backend
+"#;
+        let chain: FilterChain = serde_yaml::from_str(yaml).expect("parse");
+        let m = chain.filter_chain_match.expect("has filter_chain_match");
+        assert!(m.server_names.is_empty());
+    }
+
+    #[test]
+    fn parses_filter_chain_match_with_explicit_empty_server_names_list() {
+        let yaml = r#"
+filter_chain_match:
+  server_names: []
+filters:
+  - name: envoy.filters.network.tcp_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+      stat_prefix: ingress_tcp
+      cluster: backend
+"#;
+        let chain: FilterChain = serde_yaml::from_str(yaml).expect("parse");
+        let m = chain.filter_chain_match.expect("has filter_chain_match");
+        assert!(m.server_names.is_empty());
+    }
+
+    #[test]
+    fn rejects_filter_chain_match_unknown_field() {
+        // deny_unknown_fields discipline: an unrecognized key under filter_chain_match fails.
+        let yaml = r#"
+filter_chain_match:
+  destination_port: 443
+filters:
+  - name: envoy.filters.network.tcp_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+      stat_prefix: ingress_tcp
+      cluster: backend
+"#;
+        let err = serde_yaml::from_str::<FilterChain>(yaml).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("destination_port") || msg.contains("unknown field"),
+            "expected unknown-field error, got {msg}"
         );
     }
 }
