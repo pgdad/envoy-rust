@@ -7,23 +7,58 @@
 //! propagates via drop of the write half.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use envoy_listener::{BoxFuture, ConnectionHandler};
+
+/// Local trait alias unifying tokio's `AsyncRead` + `AsyncWrite`. Auto-impl'd
+/// for any `T: AsyncRead + AsyncWrite`. Used internally to box the upstream
+/// stream in the 03.2 branched-dial path; both `TcpStream` (plaintext) and
+/// `tokio_rustls::client::TlsStream<TcpStream>` (TLS-upstream) impl this.
+trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite> AsyncReadWrite for T {}
 
 /// Per-connection TCP proxy. Holds a cloneable `ClusterHandle` to the
 /// upstream cluster and the cluster's name (carried separately for
 /// diagnostics — `envoy-cluster` does not expose `Cluster::name()` in 02.1
-/// per the REVIEW M1 deferral).
+/// per the REVIEW M1 deferral; M1 re-evaluated and re-deferred in 03.2 Task 5).
+///
+/// 03.2: gained `upstream_tls: Option<Arc<envoy_tls::UpstreamTls>>`. The
+/// existing `new()` constructor leaves it `None` (plaintext upstream); the
+/// new `with_upstream_tls()` constructor sets it to `Some(...)`.
 pub struct TcpProxy {
     cluster: envoy_cluster::ClusterHandle,
     cluster_name: String,
+    /// 03.2 NEW: when `Some`, the proxy performs an upstream rustls client
+    /// handshake immediately after the TCP connect. Shared `Arc` because
+    /// rustls's `ClientConfig` is `Send + Sync` and a single `UpstreamTls`
+    /// is reused across every connection routed through this proxy.
+    upstream_tls: Option<Arc<envoy_tls::UpstreamTls>>,
 }
 
 impl TcpProxy {
+    /// Plaintext-upstream constructor. Unchanged surface from 03.1; the new
+    /// 03.2 `upstream_tls` field defaults to `None`.
     pub fn new(cluster: envoy_cluster::ClusterHandle, cfg: &envoy_config::TcpProxyConfig) -> Self {
         Self {
             cluster,
             cluster_name: cfg.cluster.clone(),
+            upstream_tls: None,
+        }
+    }
+
+    /// 03.2 NEW: TLS-upstream constructor. The provided `Arc<UpstreamTls>` is
+    /// shared across every per-connection invocation of `handle`; rustls's
+    /// `ClientConfig` is `Send + Sync` and re-used.
+    pub fn with_upstream_tls(
+        cluster: envoy_cluster::ClusterHandle,
+        cfg: &envoy_config::TcpProxyConfig,
+        upstream_tls: Arc<envoy_tls::UpstreamTls>,
+    ) -> Self {
+        Self {
+            cluster,
+            cluster_name: cfg.cluster.clone(),
+            upstream_tls: Some(upstream_tls),
         }
     }
 
@@ -52,12 +87,26 @@ impl TcpProxy {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
-        let upstream = tokio::net::TcpStream::connect(addr)
+        let stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|source| {
                 Box::new(TcpProxyError::UpstreamConnect { addr, source })
                     as Box<dyn std::error::Error + Send + Sync>
             })?;
+
+        // 03.2 branched dial: TLS or plaintext upstream. Both arms unify into
+        // `Box<dyn AsyncReadWrite + Send + Unpin>` so the bidirectional copy
+        // body below stays a single code path.
+        let upstream: Box<dyn AsyncReadWrite + Send + Unpin> = match &self.upstream_tls {
+            None => Box::new(stream),
+            Some(tls) => {
+                let tls_stream = tls.connect(stream).await.map_err(|source| {
+                    Box::new(TcpProxyError::UpstreamTlsHandshake { source })
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?;
+                Box::new(tls_stream)
+            }
+        };
 
         // ADR-0016: half-close posture. `tokio::select!` over the two copy
         // futures so EOF on either side drops the other future and propagates
@@ -65,10 +114,11 @@ impl TcpProxy {
         //
         // Note: `tokio::io::split(downstream)` accepts any
         // `AsyncRead + AsyncWrite + Unpin` — works for both `TcpStream` and
-        // `TlsStream<TcpStream>`. The previous `downstream.into_split()` was
-        // `TcpStream`-specific; replaced with the generic `tokio::io::split`.
+        // `TlsStream<TcpStream>`. The previous `upstream.into_split()` was
+        // `TcpStream`-specific; the boxed `dyn AsyncReadWrite + Send + Unpin`
+        // upstream now goes through the generic `tokio::io::split` instead.
         let (mut dr, mut dw) = tokio::io::split(downstream);
-        let (mut ur, mut uw) = upstream.into_split();
+        let (mut ur, mut uw) = tokio::io::split(upstream);
         let result: Result<(), std::io::Error> = tokio::select! {
             res = tokio::io::copy(&mut dr, &mut uw) => res.map(|_| ()),
             res = tokio::io::copy(&mut ur, &mut dw) => res.map(|_| ()),
@@ -99,6 +149,14 @@ pub enum TcpProxyError {
         #[source]
         source: std::io::Error,
     },
+    /// 03.2 NEW: upstream TLS handshake failed. Wraps `envoy_tls::TlsError`.
+    /// Per-connection failure: the listener's accept loop logs at `warn!` and
+    /// drops the connection (phase 02.2 posture); the listener stays up.
+    #[error("upstream TLS handshake failed: {source}")]
+    UpstreamTlsHandshake {
+        #[source]
+        source: envoy_tls::TlsError,
+    },
 }
 
 impl ConnectionHandler for TcpProxy {
@@ -117,10 +175,12 @@ impl ConnectionHandler for TcpProxy {
         // the rationale (SPEC §6 signpost 3, option α).
         let cluster = self.cluster.clone();
         let cluster_name = self.cluster_name.clone();
+        let upstream_tls = self.upstream_tls.clone(); // 03.2 NEW: cheap Option<Arc<...>> clone
         Box::pin(async move {
             let proxy = TcpProxy {
                 cluster,
                 cluster_name,
+                upstream_tls,
             };
             proxy.handle::<tokio::net::TcpStream>(downstream).await
         })
@@ -635,6 +695,309 @@ admin:
         assert!(
             formatted.contains("connecting to upstream 127.0.0.1:1"),
             "expected UpstreamConnect, got: {formatted}",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 03.2 Task 5: upstream-TLS dial tests.
+    //
+    // The 3 tests below exercise `TcpProxy::with_upstream_tls` + the
+    // branched dial body. PKI is set up inline per existing 03.1 cadence
+    // (no shared `test_pki` module). The CA PEM is materialized to a
+    // `TempDir`-owned file so `UpstreamTlsContext.validation_context.trusted_ca`
+    // (which holds a filesystem path) can resolve it.
+    // ---------------------------------------------------------------------
+
+    /// Helper struct: rcgen-built single-leaf PKI with the CA written to a
+    /// TempDir-owned file at `ca_pem_path`. The `TempDir` is held in `_tmpdir`
+    /// to keep the directory alive for the test's lifetime.
+    struct UpstreamPki {
+        leaf_der: rustls::pki_types::CertificateDer<'static>,
+        leaf_key: rustls::pki_types::PrivateKeyDer<'static>,
+        ca_pem_path: std::path::PathBuf,
+        _tmpdir: tempfile::TempDir,
+    }
+
+    fn build_upstream_pki(leaf_san: &str) -> UpstreamPki {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_kp = KeyPair::generate().expect("ca kp");
+        let ca_cert = ca_params.self_signed(&ca_kp).expect("ca");
+
+        let leaf_params = CertificateParams::new(vec![leaf_san.into()]).expect("leaf params");
+        let leaf_kp = KeyPair::generate().expect("leaf kp");
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_kp, &ca_cert, &ca_kp)
+            .expect("leaf");
+        let leaf_der: rustls::pki_types::CertificateDer<'static> =
+            leaf_cert.der().clone().into_owned();
+
+        let leaf_key_pem = leaf_kp.serialize_pem();
+        let mut key_slice = leaf_key_pem.as_bytes();
+        let leaf_key = rustls_pemfile::private_key(&mut key_slice)
+            .expect("priv key parse")
+            .expect("priv key present");
+
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let ca_pem_path = tmpdir.path().join("ca.pem");
+        std::fs::write(&ca_pem_path, ca_cert.pem()).expect("write ca pem");
+
+        UpstreamPki {
+            leaf_der,
+            leaf_key,
+            ca_pem_path,
+            _tmpdir: tmpdir,
+        }
+    }
+
+    fn upstream_ctx_for(pki: &UpstreamPki, sni: &str) -> envoy_config::UpstreamTlsContext {
+        envoy_config::UpstreamTlsContext {
+            common_tls_context: envoy_config::CommonTlsContext {
+                tls_certificates: vec![],
+                validation_context: Some(envoy_config::CertificateValidationContext {
+                    trusted_ca: envoy_config::DataSource {
+                        filename: pki.ca_pem_path.to_string_lossy().into_owned(),
+                    },
+                }),
+            },
+            sni: sni.to_string(),
+        }
+    }
+
+    /// Build a `tokio_rustls::TlsAcceptor` for the leaf in `pki`, with an
+    /// optional `ResolvesServerCert` override (used by the SNI-capture test).
+    fn acceptor_from_pki(pki: &UpstreamPki) -> tokio_rustls::TlsAcceptor {
+        let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&pki.leaf_key)
+            .expect("any_supported_type");
+        let certified = Arc::new(rustls::sign::CertifiedKey::new(
+            vec![pki.leaf_der.clone()],
+            signing,
+        ));
+
+        #[derive(Debug)]
+        struct R(Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for R {
+            fn resolve(
+                &self,
+                _: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(R(certified)) as Arc<_>);
+        tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg))
+    }
+
+    /// 03.2 Task 5 (test 1): byte-exact round-trip via a TLS upstream when
+    /// the client's trust bundle accepts the upstream's leaf cert.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxies_to_tls_upstream_with_valid_cert() {
+        let _ = envoy_tls::install_default_crypto_provider();
+
+        let pki = build_upstream_pki("envoy-rust.test");
+        let acceptor = acceptor_from_pki(&pki);
+
+        // In-process TLS echo backend (inline — `spawn_tls_echo` is unused
+        // because we drive split/reunite directly here for clarity).
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let upstream_addr = upstream_listener.local_addr().expect("local_addr");
+        let acceptor_clone = acceptor.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = upstream_listener.accept().await
+                && let Ok(tls) = acceptor_clone.accept(stream).await
+            {
+                let (mut r, mut w) = tokio::io::split(tls);
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            }
+        });
+
+        let upstream_ctx = upstream_ctx_for(&pki, "envoy-rust.test");
+        let upstream_tls =
+            Arc::new(envoy_tls::UpstreamTls::from_context(&upstream_ctx).expect("upstream tls"));
+
+        let cluster = mk_handle("backend", upstream_addr);
+        let proxy = TcpProxy::with_upstream_tls(cluster, &mk_cfg("backend"), upstream_tls);
+        let proxy_arc: Arc<TcpProxy> = Arc::new(proxy);
+
+        let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let downstream_addr = downstream_listener.local_addr().expect("local_addr");
+        let proxy_arc_clone = proxy_arc.clone();
+        let proxy_task = tokio::spawn(async move {
+            let (stream, _) = downstream_listener.accept().await.expect("accept");
+            envoy_listener::ConnectionHandler::handle(&*proxy_arc_clone, stream)
+                .await
+                .expect("handle ok")
+        });
+
+        let mut client = TcpStream::connect(downstream_addr).await.expect("connect");
+        let payload = b"hello, tls upstream\n";
+        client.write_all(payload).await.expect("write");
+        let mut buf = vec![0u8; payload.len()];
+        client.read_exact(&mut buf).await.expect("read_exact");
+        assert_eq!(buf, payload);
+        client.shutdown().await.ok();
+        drop(client);
+
+        proxy_task.await.expect("proxy task joins");
+    }
+
+    /// 03.2 Task 5 (test 2): the proxy's UpstreamTls trust bundle is built
+    /// from CA2; the upstream presents a leaf signed by CA1. The handshake
+    /// must fail and the proxy must surface a `TcpProxyError::UpstreamTlsHandshake`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxies_returns_err_on_upstream_tls_handshake_fail() {
+        let _ = envoy_tls::install_default_crypto_provider();
+
+        let pki1 = build_upstream_pki("envoy-rust.test");
+        let pki2 = build_upstream_pki("envoy-rust.test"); // independent CA
+        let acceptor = acceptor_from_pki(&pki1);
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let upstream_addr = upstream_listener.local_addr().expect("local_addr");
+        let acceptor_clone = acceptor.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = upstream_listener.accept().await {
+                // Server-side handshake will fail because the client aborts
+                // on cert-verification failure; ignore the error here.
+                let _ = acceptor_clone.accept(stream).await;
+            }
+        });
+
+        // Trust bundle = pki2's CA — independent of pki1's CA that signed
+        // the upstream's leaf.
+        let upstream_ctx = upstream_ctx_for(&pki2, "envoy-rust.test");
+        let upstream_tls =
+            Arc::new(envoy_tls::UpstreamTls::from_context(&upstream_ctx).expect("upstream tls"));
+
+        let cluster = mk_handle("backend", upstream_addr);
+        let proxy = TcpProxy::with_upstream_tls(cluster, &mk_cfg("backend"), upstream_tls);
+        let proxy_arc: Arc<TcpProxy> = Arc::new(proxy);
+
+        let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let downstream_addr = downstream_listener.local_addr().expect("local_addr");
+        let proxy_arc_clone = proxy_arc.clone();
+        let proxy_task = tokio::spawn(async move {
+            let (stream, _) = downstream_listener.accept().await.expect("accept");
+            envoy_listener::ConnectionHandler::handle(&*proxy_arc_clone, stream).await
+        });
+
+        let _client = TcpStream::connect(downstream_addr).await.expect("connect");
+        let result = proxy_task.await.expect("proxy task joins");
+        let err = result.expect_err("upstream tls handshake must fail");
+        let formatted = format!("{err}");
+        assert!(
+            formatted.contains("upstream TLS handshake")
+                || formatted.contains("UpstreamTlsHandshake")
+                || formatted.to_lowercase().contains("certificate"),
+            "expected UpstreamTlsHandshake-shaped error, got: {formatted}",
+        );
+
+        // Also assert the underlying error variant matches the new
+        // TcpProxyError::UpstreamTlsHandshake constructor.
+        let downcast = err
+            .downcast_ref::<TcpProxyError>()
+            .expect("err must downcast to TcpProxyError");
+        assert!(
+            matches!(downcast, TcpProxyError::UpstreamTlsHandshake { .. }),
+            "expected TcpProxyError::UpstreamTlsHandshake, got: {downcast:?}",
+        );
+    }
+
+    /// 03.2 Task 5 (test 3): the SNI sent in the ClientHello matches
+    /// `UpstreamTlsContext.sni`. Uses a custom `ResolvesServerCert` impl that
+    /// captures `client_hello.server_name()` into a Mutex before delegating
+    /// to a normal CertifiedKey resolver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxies_to_tls_upstream_sends_sni_in_client_hello() {
+        use std::sync::Mutex;
+
+        let _ = envoy_tls::install_default_crypto_provider();
+
+        let pki = build_upstream_pki("envoy-rust.test");
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&pki.leaf_key)
+            .expect("any_supported_type");
+        let certified = Arc::new(rustls::sign::CertifiedKey::new(
+            vec![pki.leaf_der.clone()],
+            signing,
+        ));
+
+        #[derive(Debug)]
+        struct CapturingResolver {
+            inner: Arc<rustls::sign::CertifiedKey>,
+            captured: Arc<Mutex<Option<String>>>,
+        }
+        impl rustls::server::ResolvesServerCert for CapturingResolver {
+            fn resolve(
+                &self,
+                hello: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                let sni = hello.server_name().map(|s| s.to_string());
+                if let Ok(mut guard) = self.captured.lock() {
+                    *guard = sni;
+                }
+                Some(self.inner.clone())
+            }
+        }
+
+        let resolver = Arc::new(CapturingResolver {
+            inner: certified,
+            captured: captured.clone(),
+        });
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver as Arc<_>);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let upstream_addr = upstream_listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = upstream_listener.accept().await
+                && let Ok(tls) = acceptor.accept(stream).await
+            {
+                let (mut r, mut w) = tokio::io::split(tls);
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            }
+        });
+
+        let upstream_ctx = upstream_ctx_for(&pki, "envoy-rust.test");
+        let upstream_tls =
+            Arc::new(envoy_tls::UpstreamTls::from_context(&upstream_ctx).expect("upstream tls"));
+
+        let cluster = mk_handle("backend", upstream_addr);
+        let proxy = TcpProxy::with_upstream_tls(cluster, &mk_cfg("backend"), upstream_tls);
+        let proxy_arc: Arc<TcpProxy> = Arc::new(proxy);
+
+        let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let downstream_addr = downstream_listener.local_addr().expect("local_addr");
+        let proxy_arc_clone = proxy_arc.clone();
+        let proxy_task = tokio::spawn(async move {
+            let (stream, _) = downstream_listener.accept().await.expect("accept");
+            envoy_listener::ConnectionHandler::handle(&*proxy_arc_clone, stream)
+                .await
+                .expect("handle ok")
+        });
+
+        let mut client = TcpStream::connect(downstream_addr).await.expect("connect");
+        client.write_all(b"sni-probe").await.expect("write");
+        let mut buf = [0u8; 9];
+        client.read_exact(&mut buf).await.expect("read_exact");
+        client.shutdown().await.ok();
+        drop(client);
+
+        proxy_task.await.expect("proxy task joins");
+
+        let captured_sni = captured.lock().expect("captured lock").clone();
+        assert_eq!(
+            captured_sni.as_deref(),
+            Some("envoy-rust.test"),
+            "expected SNI 'envoy-rust.test' in ClientHello, got {captured_sni:?}",
         );
     }
 }
