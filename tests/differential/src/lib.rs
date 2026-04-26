@@ -47,6 +47,27 @@ pub enum Driver {
         #[serde(default)]
         expected_cn: Option<String>,
     },
+    /// 03.2 NEW: drive a sequence of per-SNI TLS probes against a single
+    /// listener address. Each probe runs a fresh TLS handshake (varying SNI),
+    /// optionally asserts the presented leaf cert's CN/SAN matches
+    /// `expected_cn` (DER-substring scan via `check_cn_or_san`), then writes
+    /// `payload.bin` and reads-exact + ADR-0007 trailing-byte poll.
+    /// Equivalence is enforced *inside* `drive_tls_probes` per probe (each
+    /// side asserts byte-equality against the input payload + per-probe
+    /// `expected_cn`); both sides succeeding ⇒ equivalent cert selection
+    /// per SNI without a final `assert_equivalence` call.
+    TlsTcpProbeList {
+        probes: Vec<TlsTcpProbe>,
+    },
+}
+
+/// One TLS-SNI probe entry inside `Driver::TlsTcpProbeList`. SPEC §D6.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsTcpProbe {
+    pub sni: String,
+    #[serde(default)]
+    pub expected_cn: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -242,6 +263,97 @@ pub async fn drive_tls(
     tls.shutdown().await.ok();
     drop(tls);
     Ok(out)
+}
+
+/// Drive a sequence of per-SNI TLS probes against a single listener address.
+/// Each probe gets a fresh TCP connection + TLS handshake; the SNI varies per
+/// probe; if the probe declares `expected_cn`, the post-handshake leaf cert is
+/// matched (DER-substring scan via `check_cn_or_san`) before any payload write.
+/// Each probe runs the same ADR-0006 read-exact + ADR-0007 trailing-byte poll
+/// discipline as `drive_tls`.
+///
+/// Returns `Ok(probe_outputs)` where `probe_outputs[i]` is the bytes echoed
+/// back for `probes[i]` (typically equal to `payload`). On any per-probe
+/// failure (handshake, expected_cn mismatch, byte mismatch, trailing-byte
+/// detection) returns `Err` naming the probe's SNI for diagnostics.
+///
+/// Equivalence note: byte-equality is enforced *inside* this helper (each
+/// probe writes `payload`, reads-exact `payload.len()` bytes, and the read
+/// would not have succeeded as a different byte sequence under
+/// `read_exact`-then-bail-on-trailing semantics). Per-probe `expected_cn`
+/// matches enforce the cert-selection invariant on each side independently;
+/// the conjunction across upstream + subject is the "both proxies select the
+/// same cert for the same SNI" property — implicit, no final
+/// `assert_equivalence` needed.
+pub async fn drive_tls_probes(
+    addr: SocketAddr,
+    payload: &[u8],
+    probes: &[TlsTcpProbe],
+    root_store: rustls::RootCertStore,
+) -> Result<Vec<Vec<u8>>> {
+    use rustls::pki_types::ServerName;
+    use std::convert::TryFrom;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_cfg));
+
+    let mut outputs = Vec::with_capacity(probes.len());
+    for probe in probes {
+        let server_name = ServerName::try_from(probe.sni.as_str())
+            .map_err(|e| anyhow::anyhow!("parsing sni {:?}: {e}", probe.sni))?
+            .to_owned();
+
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connecting to {addr} for probe sni={:?}", probe.sni))?;
+        let mut tls = connector.connect(server_name, tcp).await.with_context(|| {
+            format!("TLS handshake against {addr} for probe sni={:?}", probe.sni)
+        })?;
+
+        if let Some(cn) = &probe.expected_cn {
+            let peer_certs = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .ok_or_else(|| anyhow::anyhow!("no peer cert for probe sni={:?}", probe.sni))?;
+            let leaf = peer_certs.first().ok_or_else(|| {
+                anyhow::anyhow!("peer cert chain empty for probe sni={:?}", probe.sni)
+            })?;
+            check_cn_or_san(leaf, cn)
+                .with_context(|| format!("expected_cn match for probe sni={:?}", probe.sni))?;
+        }
+
+        tls.write_all(payload)
+            .await
+            .with_context(|| format!("write for probe sni={:?}", probe.sni))?;
+        let mut out = vec![0u8; payload.len()];
+        tls.read_exact(&mut out)
+            .await
+            .with_context(|| format!("read_exact for probe sni={:?}", probe.sni))?;
+
+        // ADR-0007 trailing-byte poll, mirroring drive_tls.
+        let mut tail = [0u8; 64];
+        match tokio::time::timeout(Duration::from_millis(100), tls.read(&mut tail)).await {
+            Ok(Ok(0)) | Err(_) => {}
+            Ok(Ok(n)) => bail!(
+                "{addr} sent {n} trailing bytes after echo for probe sni={:?}",
+                probe.sni
+            ),
+            Ok(Err(e)) => bail!(
+                "{addr} read error after echo for probe sni={:?}: {e}",
+                probe.sni
+            ),
+        }
+
+        tls.shutdown().await.ok();
+        drop(tls);
+
+        outputs.push(out);
+    }
+    Ok(outputs)
 }
 
 /// Walk a leaf cert's SAN DNS entries + CommonName for a case-insensitive
@@ -451,7 +563,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let upstream_port_str = upstream::CONTAINER_PORT.to_string();
     let subject_port_str = host_port.to_string();
     let port_key = match &expectations.driver {
-        Driver::TcpEcho | Driver::TlsTcp { .. } => "PORT",
+        Driver::TcpEcho | Driver::TlsTcp { .. } | Driver::TlsTcpProbeList { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
     };
 
@@ -486,6 +598,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         None
     };
     let backend_port_str = _backend.as_ref().map(|b| b.port().to_string());
+
+    // 03.2 Task 8: detect TLS-backend-shaped fixtures. Task 9 will wire up
+    // `TlsEchoBackend`; until then, bail with a clear message so fixture 0005
+    // authors get a deterministic error rather than a confusing template-
+    // substitution failure downstream.
+    let needs_tls_backend = upstream_template.contains("{{TLS_BACKEND_PORT}}")
+        || subject_template.contains("{{TLS_BACKEND_PORT}}");
+    if needs_tls_backend {
+        anyhow::bail!("TlsEchoBackend not yet wired up — pending Task 9");
+    }
 
     // (c) Build per-side substitution maps with TLS path keys.
     // Type is Vec<(&str, String)> to accommodate owned strings from TLS paths.
@@ -623,6 +745,38 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
             assert_equivalence(&expectations, None, None, &upstream_out, &subject_out)?;
+        }
+        // 03.2 Task 8: per-SNI probe list. Equivalence is enforced inside
+        // `drive_tls_probes` per probe (byte-equality + per-probe expected_cn);
+        // both sides succeeding ⇒ equivalent cert selection per SNI without a
+        // final `assert_equivalence` call.
+        Driver::TlsTcpProbeList { probes } => {
+            let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
+                .context("reading payload.bin")?;
+            let pki = tls_pki
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Driver::TlsTcpProbeList requires a TLS-shaped fixture (template did not reference any *_PATH key)"
+                ))?;
+            let ca_bytes = std::fs::read(&pki.ca_pem_path).context("read ca.pem")?;
+            let mut ca_slice = ca_bytes.as_slice();
+            let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut ca_slice)
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("parse ca.pem certs")?;
+            let mut roots = rustls::RootCertStore::empty();
+            for c in ca_certs {
+                roots.add(c).context("RootCertStore::add")?;
+            }
+
+            drive_tls_probes(upstream_addr, &payload, probes, roots.clone())
+                .await
+                .context("upstream envoy tls probes")?;
+            drive_tls_probes(subject_addr, &payload, probes, roots)
+                .await
+                .context("envoy-rust tls probes")?;
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
         }
     }
 
@@ -815,6 +969,52 @@ equivalence:
         }
         assert_eq!(e.equivalence.response_status, Some(StatusRule::Exact));
         assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
+    }
+
+    // RED for Task 8: parses `kind: tls_tcp_probe_list` with a `probes:`
+    // sequence whose entries are `{sni, expected_cn?}` maps.
+    #[test]
+    fn expectations_parse_tls_tcp_probe_list_driver() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp_probe_list
+  probes:
+    - sni: a.example.com
+      expected_cn: a.example.com
+    - sni: b.example.com
+      expected_cn: b.example.com
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match e.driver {
+            Driver::TlsTcpProbeList { ref probes } => {
+                assert_eq!(probes.len(), 2);
+                assert_eq!(probes[0].sni, "a.example.com");
+                assert_eq!(probes[0].expected_cn.as_deref(), Some("a.example.com"));
+                assert_eq!(probes[1].sni, "b.example.com");
+                assert_eq!(probes[1].expected_cn.as_deref(), Some("b.example.com"));
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
+    }
+
+    // RED for Task 8: `expected_cn` is `#[serde(default)]` so it may be absent.
+    #[test]
+    fn expectations_parse_tls_tcp_probe_list_without_expected_cn() {
+        let yaml = r#"
+driver:
+  kind: tls_tcp_probe_list
+  probes:
+    - sni: a.example.com
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        match e.driver {
+            Driver::TlsTcpProbeList { ref probes } => {
+                assert_eq!(probes.len(), 1);
+                assert_eq!(probes[0].sni, "a.example.com");
+                assert!(probes[0].expected_cn.is_none());
+            }
+            _ => panic!("unexpected driver: {:?}", e.driver),
+        }
     }
 
     #[test]
@@ -1143,6 +1343,49 @@ leaf_key:
         assert!(got.contains("filename: /tmp/abc/ca.pem"));
         assert!(got.contains("filename: /tmp/abc/leaf-a-cert.pem"));
         assert!(got.contains("filename: /tmp/abc/leaf-a-key.pem"));
+    }
+
+    // 03.2 Task 8: render_yaml must substitute LEAF_B_* keys (used by
+    // fixture 0006-tls-sni's second filter chain).
+    #[test]
+    fn render_yaml_substitutes_leaf_b_paths() {
+        let template = r#"
+chain_b_cert: {{LEAF_B_CERT_PATH}}
+chain_b_key: {{LEAF_B_KEY_PATH}}
+ca: {{CA_PATH}}
+"#;
+        let got = render_yaml(
+            template,
+            &[
+                ("CA_PATH", "/etc/envoy-rust-tls/ca.pem"),
+                ("LEAF_B_CERT_PATH", "/etc/envoy-rust-tls/leaf-b-cert.pem"),
+                ("LEAF_B_KEY_PATH", "/etc/envoy-rust-tls/leaf-b-key.pem"),
+            ],
+        );
+        assert!(got.contains("chain_b_cert: /etc/envoy-rust-tls/leaf-b-cert.pem"));
+        assert!(got.contains("chain_b_key: /etc/envoy-rust-tls/leaf-b-key.pem"));
+        assert!(got.contains("ca: /etc/envoy-rust-tls/ca.pem"));
+        assert!(!got.contains("{{"));
+    }
+
+    // 03.2 Task 8: render_yaml must substitute SERVER_* keys (used by
+    // fixture 0005-tls-upstream's TlsEchoBackend on the upstream cluster).
+    #[test]
+    fn render_yaml_substitutes_server_paths() {
+        let template = r#"
+server_cert: {{SERVER_CERT_PATH}}
+server_key: {{SERVER_KEY_PATH}}
+"#;
+        let got = render_yaml(
+            template,
+            &[
+                ("SERVER_CERT_PATH", "/etc/envoy-rust-tls/server-cert.pem"),
+                ("SERVER_KEY_PATH", "/etc/envoy-rust-tls/server-key.pem"),
+            ],
+        );
+        assert!(got.contains("server_cert: /etc/envoy-rust-tls/server-cert.pem"));
+        assert!(got.contains("server_key: /etc/envoy-rust-tls/server-key.pem"));
+        assert!(!got.contains("{{"));
     }
 
     #[test]
