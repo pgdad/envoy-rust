@@ -7,10 +7,17 @@
 
 ## Active phase
 
-**id:** `04`
-**slug:** `04-http1`
-**directory:** `docs/envoy-rust/phases/04-http1/` exists; contains `SPEC.md` (parent SPEC; landed at this commit via state-1 brainstorm).
-**status:** phase 04 lifecycle **state 2 (parent SPEC.md exists; sub-phase SPECs do not)** — parent SPEC landed at this commit per the state-1 brainstorm output. The brainstorm decided a 3-way split into sub-phases `04.1`, `04.2`, `04.3` (rationale codified in parent SPEC §5; will be formalized as **ADR-0020** at parent-04 state-2). ROADMAP row `04` is `status: in-progress` as of this commit (flipped from `planned` per ROADMAP-schema invariant 3); `sub-phases` column populated as `04.1, 04.2, 04.3`. Sub-phase rows themselves are not yet appended — those land at parent-04 state-2 alongside ADR-0020 and the sub-phase SPECs.
+**id:** `04.1`
+**slug:** `04.1-hcm-direct-response` (created during the parent-04 state-2 commit; SPEC.md committed alongside ADR-0020 + sibling sub-phase SPECs).
+**directory:** `docs/envoy-rust/phases/04.1-hcm-direct-response/` exists; contains `SPEC.md` (1074 lines).
+**status:** phase 04.1 lifecycle **state 2 (SPEC.md exists, PLAN.md does not)** — SPEC.md landed at this commit (parent-04 state-2 close-out) alongside ADR-0020 (split decision), the sibling 04.2 + 04.3 SPECs, and ROADMAP row appends. ROADMAP row `04.1` is `status: planned` as of this commit (will flip to `in-progress` at the next STATE-advance commit when 04.1 lifecycle state advances from 2 to 3 per ROADMAP-schema invariant 3 — same shape as phase-03.2's `b2c704e` STATE-advance commit). Parent row `04` stays `in-progress` per the ROADMAP-schema invariant ("parent flips to `done` only after all sub-phases are `done`"); it will flip to `done` in 04.3's final commit (mirrors phase 03's `ca81226`-shape close-out where 03.2's phase-done commit also closed parent 03).
+
+Phase 04 (`04-http1`) parent is **in-progress** with `sub-phases: 04.1, 04.2, 04.3` per **ADR-0020**'s split (landed at this commit). Parent SPEC at `docs/envoy-rust/phases/04-http1/SPEC.md` remains in-tree unedited as the committed historical artifact (last touched at SHA `805433e`, the parent-04 state-1 brainstorm output); for execution purposes it is superseded by the three sub-phase SPECs (`phases/04.1-hcm-direct-response/SPEC.md`, `phases/04.2-route-matchers/SPEC.md`, `phases/04.3-router-upstream/SPEC.md`).
+
+Sibling sub-phases:
+
+- **04.2 (`04.2-route-matchers`)** — `status: planned`. SPEC.md exists (698 lines; landed at this commit). Will enter active when 04.1 closes; depends-on `04.1` per the strict 04.1 → 04.2 → 04.3 ordering (04.2 amends 04.1's fixture 0007 to add a header-matcher route; cannot be parallelized).
+- **04.3 (`04.3-router-upstream`)** — `status: planned`. SPEC.md exists (769 lines; landed at this commit). Will enter active when 04.2 closes; depends-on `04.2` per the strict ordering (04.3 extends both 04.1's HCM and 04.2's matcher schema).
 
 Phase 03 (`03-tls-tcp`) is **done** as of commit `ca81226`. Both sub-phases are done: `03.1-tls-foundation-downstream` (commit `64ea760`) and `03.2-tls-upstream-sni` (commit `ca81226`). ROADMAP rows `03`, `03.1`, and `03.2` are all `status: done`. Parent SPEC at `docs/envoy-rust/phases/03-tls-tcp/SPEC.md` remains in-tree unedited as the committed historical artifact (last touched at SHA `a3f3474`); for execution purposes it was superseded by the two sub-phase SPECs (`phases/03.1-tls-foundation-downstream/SPEC.md` and `phases/03.2-tls-upstream-sni/SPEC.md`).
 
@@ -24,40 +31,49 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 16–22, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 2): the next session — operating as the parent-04 state-2 session — invokes **`superpowers:writing-plans`** adapted for the split-output shape. Per the phase-03 precedent (parent-03 state-2 commit `f256d2c` landed ADR-0017 + both sub-phase SPECs), parent-04 state-2 lands:
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 16–22, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 2): the next session — operating as the state-2 session of phase 04.1 — invokes **`superpowers:writing-plans`** scoped to phase 04.1, producing `docs/envoy-rust/phases/04.1-hcm-direct-response/PLAN.md`. The PLAN converts 04.1 SPEC §3's deliverables D1–D6 into a per-task checklist (~17 tasks, ~1500 LoC estimated per parent SPEC §5 / sub-phase SPEC §5). Each task respects `superpowers:test-driven-development` per doctrine D-3.1.
 
-1. **ADR-0020** — formalizes the 3-way split decision projected in parent SPEC §5. Provenance footer cites the parent-04 brainstorm scope choices (all 7 `HeaderMatcher` modes; `prefix` + `path` + `headers` on `RouteMatch`) that pushed a 2-way 04.α over the §6.1 gate.
-2. **`docs/envoy-rust/phases/04.1-<slug>/SPEC.md`** — sub-phase 04.1's design contract (codec + HCM + minimal routing + direct_response + fixture 0007). Slug picked at SPEC writeup; working sketch `04.1-codec-hcm`.
-3. **`docs/envoy-rust/phases/04.2-<slug>/SPEC.md`** — sub-phase 04.2's design contract (header matcher fan-out + ADR-0021 (`regex`) + fixture 0007 amendment). Slug working sketch `04.2-matchers`.
-4. **`docs/envoy-rust/phases/04.3-<slug>/SPEC.md`** — sub-phase 04.3's design contract (upstream HTTP/1.1 + router proxy arm + fixture 0008 + http1-echo-server helper). Slug working sketch `04.3-router-upstream`.
-5. **ROADMAP edits:** append rows `04.1`, `04.2`, `04.3` (each `status: planned`; will flip to `in-progress` as STATE.md points at each per ROADMAP-schema invariant 3).
+Per the user's standing preference (auto-memory `feedback_execution_style`), state-3 execution will use `superpowers:subagent-driven-development` over inline `executing-plans` — do not present the two-option fork at state-3 entry.
 
-NO sub-phase PLAN.md is written at parent-04 state-2 — that's each sub-phase's own state-2 (after its SPEC.md exists). Each sub-phase then enters its own state 3 with its own subagent-driven implementation cadence.
+**Plan splitting gate evaluation** (BOOTSTRAP_PROMPT.md §5 state 2 / §6.1; 04.1 SPEC §5; parent SPEC §5):
 
-Inputs the parent-04 state-2 session should read, in order, before drafting the sub-phase SPECs:
+- Estimated 04.1 surface: 17 tasks, ~1500 LoC. Both gates hold (~25 tasks / ~1500 LoC bounds).
+- **Decision: 04.1 stays unified.** No nested split. Per parent SPEC §5 closing paragraph + 04.1 SPEC §5 + the parent-04 brainstorm's express avoidance of nested splits, if either gate fires mid-PLAN-write invoke `superpowers:systematic-debugging` first — nested splits of an already-split sub-phase deserve a fresh root-cause analysis (scope creep vs. planner overdecomposition; phase 04 was already produced by a 3-way split per ADR-0020).
+
+Inputs the 04.1 state-2 session should read, in order, before drafting `PLAN.md`:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
 2. `docs/envoy-rust/STATE.md` (this file — to confirm routing).
-3. `docs/envoy-rust/ROADMAP.md` (row 04 `in-progress` with `sub-phases: 04.1, 04.2, 04.3`).
-4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0019`; ADR-0020 lands at parent-04 state-2; ADR-0021 lands at 04.2 Task 1).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (the `Header allow-list` section gets populated in 04.1 per parent SPEC §2; 04.2 adds none; 04.3 adds `x-envoy-upstream-service-time`).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine).
-7. **`docs/envoy-rust/phases/04-http1/SPEC.md`** (the parent SPEC just landed — the authoritative design contract for sub-phase splits; deliverables D1.1–D12.3 mapped to sub-phases).
-8. `docs/envoy-rust/phases/03-tls-tcp/SPEC.md` + the renumbering note in DECISIONS.md (phase 03 split-precedent — same parent-SPEC-projects-split pattern).
-9. `docs/envoy-rust/phases/03.2-tls-upstream-sni/SPEC.md` + `REVIEW.md` (most recent sub-phase SPEC precedent; format / sectioning / signpost cadence to mirror).
-10. `BOOTSTRAP_PROMPT.md` §5 state 2 + §6.1 (split gate; sub-phase SPECs each must hold the gate at SPEC writeup time) + §3 (D-3.1–D-3.9 doctrine).
+3. `docs/envoy-rust/ROADMAP.md` (rows 04 `in-progress` with `sub-phases: 04.1, 04.2, 04.3`; row 04.1 `planned`; row 04.2 `planned` (depends-on 04.1); row 04.3 `planned` (depends-on 04.2)).
+4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0020`; ADR-0021 (`regex`) lands at 04.2 Task 1, NOT in 04.1).
+5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (the `Header allow-list` section is empty pre-04.1; 04.1 populates it with `server` + `date` entries per parent SPEC §2 / 04.1 SPEC §2).
+6. `docs/envoy-rust/SKILL_ROUTING.md` (state-2 routing).
+7. **`docs/envoy-rust/phases/04.1-hcm-direct-response/SPEC.md`** (the authoritative sub-phase design contract — referenced at every task under "Source of truth: SPEC.md" at the top of the resulting PLAN.md).
+8. `docs/envoy-rust/phases/04-http1/SPEC.md` (parent SPEC — context for the full phase-04 design + cross-sub-phase architectural rules at §3 closing; execution follows the 04.1 sub-phase SPEC, not the parent).
+9. `docs/envoy-rust/phases/03.2-tls-upstream-sni/PLAN.md` + `PROGRESS.md` + `REVIEW.md` (most recent plan + progress + review precedent — task cadence, TDD framing, PROGRESS-formatting conventions; phase-03.2 REVIEW §3 M1–M5 + §4 recommendations may inform 04.1's execution).
+10. `docs/envoy-rust/phases/03.1-tls-foundation-downstream/PLAN.md` (phase-03.1 was the foundation sub-phase of phase 03's 2-way split; 04.1 plays the analogous role in phase 04's 3-way split — task shape + envoy-tls/envoy-http1 crate-scaffolding cadence is mirrored).
+11. `docs/envoy-rust/phases/02.1-config-cluster/PLAN.md` (phase-02.1 introduced the schema/validator cadence + `tcp-echo-server` helper crate scaffold that 04.1's HCM/RouteConfig schema work mirrors for shape).
 
 ## Last commit
 
-Phase 04 state-1 brainstorm close-out commit (this commit): lands `docs/envoy-rust/phases/04-http1/SPEC.md` (parent SPEC; ~700 lines projecting the 3-way split into 04.1 / 04.2 / 04.3 + ADR-0020 + ADR-0021 + the Header allow-list edits 04.x will land in BEHAVIOR_CONTRACT.md), flips ROADMAP row `04` from `planned` to `in-progress` with `sub-phases: 04.1, 04.2, 04.3` populated, and advances STATE.md from lifecycle state 1 to state 2. No code changes; no sub-phase SPECs (those land at parent-04 state-2 per the phase-03 `f256d2c` precedent). Mirrors phase-03 state-1 commit `a3f3474` shape.
+Parent-04 state-2 close-out commit (this commit): lands the split formalization in one atomic commit per the phase-03 `f256d2c` precedent. Touches:
+
+- **`docs/envoy-rust/DECISIONS.md`** — appends **ADR-0020** (split phase 04 into sub-phases 04.1, 04.2, 04.3) per parent SPEC §7 D2's projection.
+- **`docs/envoy-rust/phases/04.1-hcm-direct-response/SPEC.md`** (new; 1074 lines) — sub-phase 04.1's design contract (codec + HCM scaffold + minimal routing + direct_response + fixture 0007).
+- **`docs/envoy-rust/phases/04.2-route-matchers/SPEC.md`** (new; 698 lines) — sub-phase 04.2's design contract (header matcher fan-out + ADR-0021 (`regex`) projection + fixture 0007 amendment).
+- **`docs/envoy-rust/phases/04.3-router-upstream/SPEC.md`** (new; 769 lines) — sub-phase 04.3's design contract (upstream HTTP/1.1 + router proxy arm + fixture 0008 + http1-echo-server helper + Cluster::name() opportunistic close-out).
+- **`docs/envoy-rust/ROADMAP.md`** — appends rows `04.1`, `04.2`, `04.3` (each `status: planned`; depends-on chain reflects the strict 04.1 → 04.2 → 04.3 ordering since 04.2 amends 04.1's fixture and 04.3 extends both 04.1's HCM and 04.2's matchers).
+- **`docs/envoy-rust/STATE.md`** (this file) — advances active phase from `04` lifecycle state 2 to `04.1` lifecycle state 2 (sub-phase SPEC.md exists, PLAN.md does not).
+
+No code changes. Mirrors phase-03 state-2 commit `f256d2c` shape (which landed ADR-0017 + 03.1 SPEC + 03.2 SPEC + ROADMAP rows + STATE advance in one atomic move).
 
 Predecessor commit:
 
-- `ca81226` — `phase 03.2: TLS upstream origination + multi-cert SNI [parent 03 done]` — phase 03.2 phase-done commit; closed parent 03; advanced STATE to phase 04 state 1.
+- `805433e` — `phase 04: state-1 brainstorm — parent SPEC.md projecting 3-way split (04.1/04.2/04.3)` — landed parent SPEC + ROADMAP row 04 flip + STATE.md state-1→state-2 advance. Mirrored phase-03 state-1 commit `a3f3474` shape.
 
 ## Last updated
 
-2026-04-26 (phase 04 lifecycle state advanced from 1 to 2; parent SPEC landed at this commit; ROADMAP row 04 flipped to `in-progress` with `sub-phases: 04.1, 04.2, 04.3`; next-skill `superpowers:writing-plans` adapted for the parent-04 state-2 split-output — ADR-0020 + 3 sub-phase SPECs).
+2026-04-26 (parent-04 state-2 close-out; ADR-0020 landed; three sub-phase SPECs landed; ROADMAP rows 04.1+04.2+04.3 appended; STATE.md advanced active phase from 04 to 04.1 lifecycle state 2; next-skill `superpowers:writing-plans` scoped to phase 04.1).
 
 ## Notes
 
@@ -186,6 +202,12 @@ ADR-0015 (cross-container host reachability via `host.docker.internal` + `host-g
 ### Phase-03.1 ADR ledger (for reference)
 
 ADR-0017 (split phase 03 into 03.1 + 03.2; landed at `f256d2c` during parent-phase 03 state 2), ADR-0018 (`rcgen` + `tempfile` permitted as dev-test-harness-only foundations; landed at `f93a062` during 03.1 Task 1), ADR-0019 (`tokio-rustls` + `rustls-pemfile` covered by the rustls foundations grant; landed at `f93a062` during 03.1 Task 1).
+
+### Phase-04 ADR ledger (for reference)
+
+ADR-0020 (split phase 04 into 04.1 + 04.2 + 04.3; landed at this commit during parent-phase 04 state 2). ADR-0021 (`regex` permitted as a foundation for header / route matching; projected by parent-04 SPEC §7 / 04.2 SPEC §7) projected to land at 04.2 Task 1 — mirrors phase 03.1's inline-Task-1 ADR-landing pattern (ADR-0018 + ADR-0019 landed inline at 03.1 Task 1).
+
+Unlike phase 03's split decision (ADR-0017), which renumbered three projected ADRs because the split decision took the next-sequential number at split time, phase 04's split lands cleanly at ADR-0020 with no renumbering needed (ADR-0019 was the latest landed ADR before this commit; no inter-ADR landings have occurred between phase-03's close at `ca81226` and this commit). The parent-04 SPEC's projected ADR-0020 + ADR-0021 numbers match the actual landed numbers.
 
 ### Doctrine reminders
 
