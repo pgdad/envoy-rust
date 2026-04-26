@@ -7,9 +7,11 @@
 pub mod bootstrap;
 
 pub use bootstrap::{
-    Address, Admin, Bootstrap, Cluster, ClusterType, Endpoint, FilterChain, LbEndpoint, LbPolicy,
-    Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node, SocketAddress,
-    StaticResources, TcpProxyConfig, TypedConfig,
+    Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType,
+    CommonTlsContext, DataSource, DownstreamTlsContext, Endpoint, FilterChain, LbEndpoint,
+    LbPolicy, Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node, SocketAddress,
+    StaticResources, TcpProxyConfig, TlsCertificate, TransportSocket, TransportSocketTypedConfig,
+    TypedConfig, UpstreamTlsContext,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
@@ -19,9 +21,13 @@ pub const ECHO_FILTER: &str = "envoy.filters.network.echo";
 /// runtime dispatch lands in phase 02.2. See ADR-0014.
 pub const TCP_PROXY_FILTER: &str = "envoy.filters.network.tcp_proxy";
 
+/// The only transport-socket name envoy-rust accepts in phase 03. Future phases
+/// may add `envoy.transport_sockets.raw_buffer` / `envoy.transport_sockets.quic`.
+pub const TLS_TRANSPORT_SOCKET: &str = "envoy.transport_sockets.tls";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("parsing bootstrap YAML")]
+    #[error("parsing bootstrap YAML: {0}")]
     Yaml(#[from] serde_yaml::Error),
     #[error(
         "bootstrap configures neither an admin endpoint nor a listener; envoy-rust has nothing to do"

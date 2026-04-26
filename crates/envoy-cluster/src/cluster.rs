@@ -347,6 +347,7 @@ admin:
                         cluster_name: "backend".into(),
                         endpoints: vec![],
                     },
+                    transport_socket: None,
                 }],
             },
         };
@@ -385,6 +386,7 @@ admin:
                     }],
                 }],
             },
+            transport_socket: None,
         };
         let bootstrap = Bootstrap {
             node: None,

@@ -51,6 +51,8 @@ pub struct Cluster {
     pub cluster_type: ClusterType,
     pub lb_policy: LbPolicy,
     pub load_assignment: LoadAssignment,
+    #[serde(default)]
+    pub transport_socket: Option<TransportSocket>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -115,6 +117,8 @@ pub struct SocketAddress {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilterChain {
+    #[serde(default)]
+    pub transport_socket: Option<TransportSocket>,
     pub filters: Vec<NetworkFilter>,
 }
 
@@ -141,6 +145,74 @@ pub struct TcpProxyConfig {
     /// keeps fixture YAMLs identical across upstream-Envoy and envoy-rust.
     pub stat_prefix: String,
     pub cluster: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TransportSocket {
+    /// Phase 03 accepts only `"envoy.transport_sockets.tls"`; the validator
+    /// rejects any other name. Future phases may add raw_buffer / quic / etc.
+    pub name: String,
+    pub typed_config: TransportSocketTypedConfig,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "@type", deny_unknown_fields)]
+pub enum TransportSocketTypedConfig {
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext"
+    )]
+    Downstream(DownstreamTlsContext),
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext"
+    )]
+    Upstream(UpstreamTlsContext),
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DownstreamTlsContext {
+    pub common_tls_context: CommonTlsContext,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTlsContext {
+    pub common_tls_context: CommonTlsContext,
+    /// Server Name sent in the ClientHello server_name extension. Phase 03
+    /// requires this on every UpstreamTlsContext (no auto_sni). The validator
+    /// rejects an empty string.
+    pub sni: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CommonTlsContext {
+    #[serde(default)]
+    pub tls_certificates: Vec<TlsCertificate>,
+    #[serde(default)]
+    pub validation_context: Option<CertificateValidationContext>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsCertificate {
+    pub certificate_chain: DataSource,
+    pub private_key: DataSource,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CertificateValidationContext {
+    pub trusted_ca: DataSource,
+}
+
+/// Phase 03 supports `filename` only. inline_string / inline_bytes /
+/// environment_variable / `secret_ref` are deferred to later phases.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DataSource {
+    pub filename: String,
 }
 
 pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
@@ -1076,5 +1148,226 @@ admin:
                 std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
             crate::parse_bootstrap(&yaml).unwrap_or_else(|e| panic!("parse {path}: {e}"));
         }
+    }
+
+    #[test]
+    fn parses_listener_with_downstream_tls_context() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/leaf.pem
+                    private_key:
+                      filename: /tmp/leaf.key
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses + validates");
+        let chain = &bootstrap.static_resources.listeners[0].filter_chains[0];
+        let ts = chain
+            .transport_socket
+            .as_ref()
+            .expect("transport_socket present");
+        assert_eq!(ts.name, "envoy.transport_sockets.tls");
+        match &ts.typed_config {
+            crate::TransportSocketTypedConfig::Downstream(ctx) => {
+                let certs = &ctx.common_tls_context.tls_certificates;
+                assert_eq!(certs.len(), 1);
+                assert_eq!(certs[0].certificate_chain.filename, "/tmp/leaf.pem");
+                assert_eq!(certs[0].private_key.filename, "/tmp/leaf.key");
+            }
+            other => panic!("unexpected typed_config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_cluster_with_upstream_tls_context() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: envoy-rust.test
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /tmp/ca.pem
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses + validates");
+        let cluster = &bootstrap.static_resources.clusters[0];
+        let ts = cluster
+            .transport_socket
+            .as_ref()
+            .expect("transport_socket present");
+        assert_eq!(ts.name, "envoy.transport_sockets.tls");
+        match &ts.typed_config {
+            crate::TransportSocketTypedConfig::Upstream(ctx) => {
+                assert_eq!(ctx.sni, "envoy-rust.test");
+                let vc = ctx
+                    .common_tls_context
+                    .validation_context
+                    .as_ref()
+                    .expect("validation_context present");
+                assert_eq!(vc.trusted_ca.filename, "/tmp/ca.pem");
+                assert!(ctx.common_tls_context.tls_certificates.is_empty());
+            }
+            other => panic!("unexpected typed_config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_downstream_tls_context() {
+        // require_client_certificate is mTLS-shaped and out of phase 03 per
+        // SPEC §4. deny_unknown_fields on DownstreamTlsContext rejects it at
+        // parse time.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: false
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/leaf.pem
+                    private_key:
+                      filename: /tmp/leaf.key
+          filters: []
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject unknown field");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("require_client_certificate") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_common_tls_context() {
+        // alpn_protocols is a phase-04 surface; phase 03 fixtures do not
+        // include it (SPEC §6 signpost 14). deny_unknown_fields on
+        // CommonTlsContext rejects it.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols: ["h2"]
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/leaf.pem
+                    private_key:
+                      filename: /tmp/leaf.key
+          filters: []
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject unknown field");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("alpn_protocols") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_data_source() {
+        // inline_string is a phase-later surface; phase 03 supports `filename`
+        // only (SPEC §3 D2). deny_unknown_fields on DataSource rejects it.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/leaf.pem
+                      inline_string: "extra"
+                    private_key:
+                      filename: /tmp/leaf.key
+          filters: []
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject unknown field");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("inline_string") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}",
+        );
     }
 }
