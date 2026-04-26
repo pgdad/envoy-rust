@@ -1,0 +1,41 @@
+node:
+  id: envoy-rust-phase-03-1-subject
+  cluster: envoy-rust-phase-03-1
+
+static_resources:
+  listeners:
+    - name: tls_listener
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: {{PORT}}
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: {{LEAF_A_CERT_PATH}}
+                    private_key:
+                      filename: {{LEAF_A_KEY_PATH}}
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: {{BACKEND_PORT}}
