@@ -83,6 +83,37 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         envoy_cluster::from_bootstrap(&bootstrap).context("building cluster manager")?,
     );
 
+    // 03.2: per-cluster Arc<UpstreamTls> construction. Build once at startup
+    // and reuse across all per-connection invocations of `handle`. The
+    // validator already rejected DownstreamTlsContext on a cluster's
+    // transport_socket (MismatchedTransportSocketDirection { side: "cluster" }),
+    // so the Downstream(_) match arm below is unreachable in practice but
+    // kept defensively (parity with the listener-side fallthrough).
+    let mut upstream_tls_by_cluster: std::collections::HashMap<
+        String,
+        std::sync::Arc<envoy_tls::UpstreamTls>,
+    > = std::collections::HashMap::new();
+    for cluster in &bootstrap.static_resources.clusters {
+        let Some(socket) = cluster.transport_socket.as_ref() else {
+            continue;
+        };
+        match &socket.typed_config {
+            envoy_config::TransportSocketTypedConfig::Upstream(ctx) => {
+                let upstream_tls =
+                    std::sync::Arc::new(envoy_tls::UpstreamTls::from_context(ctx).with_context(
+                        || format!("building UpstreamTls for cluster {:?}", cluster.name),
+                    )?);
+                upstream_tls_by_cluster.insert(cluster.name.clone(), upstream_tls);
+            }
+            envoy_config::TransportSocketTypedConfig::Downstream(_) => {
+                anyhow::bail!(
+                    "cluster {:?} has DownstreamTlsContext (validator should have rejected)",
+                    cluster.name
+                );
+            }
+        }
+    }
+
     if let Some(listener_cfg) = bootstrap.static_resources.listeners.first() {
         // The validator guarantees `filter_chains.len() ≥ 1` and at least one
         // filter; we read the single first filter (phase 02.2 supports one
@@ -126,43 +157,77 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 let cluster = cluster_mgr
                     .get(&tp_cfg.cluster)
                     .expect("validator guarantees cluster present");
-                let proxy = std::sync::Arc::new(envoy_tcp::TcpProxy::new(cluster, tp_cfg));
+                // 03.2: per-cluster upstream-TLS dispatch per SPEC §D5 step 2.
+                // If this cluster carried `transport_socket: UpstreamTlsContext`
+                // we built an `Arc<UpstreamTls>` at startup and select the
+                // TLS-upstream constructor; otherwise the plaintext-upstream
+                // constructor (03.1 path).
+                let proxy: std::sync::Arc<envoy_tcp::TcpProxy> =
+                    match upstream_tls_by_cluster.get(&tp_cfg.cluster) {
+                        Some(upstream_tls) => {
+                            std::sync::Arc::new(envoy_tcp::TcpProxy::with_upstream_tls(
+                                cluster,
+                                tp_cfg,
+                                upstream_tls.clone(),
+                            ))
+                        }
+                        None => std::sync::Arc::new(envoy_tcp::TcpProxy::new(cluster, tp_cfg)),
+                    };
 
-                // Per SPEC §3 D5: pre-pass the listener's first filter chain
-                // for a downstream `transport_socket`. If present, wrap the
-                // inner `Arc<TcpProxy>` in a `TlsAcceptingHandler`. The
-                // validator already rejected the wrong direction
+                // 03.2: three-way TLS dispatch per SPEC §D5 step 1.
+                //   plaintext   -> no DownstreamTls; bare proxy.
+                //   single-cert -> from_context (03.1 path; fixtures 0001-0004).
+                //   multi-cert  -> from_listener (03.2 path; fixture 0006).
+                // The validator already rejected the wrong direction
                 // (UpstreamTlsContext on a listener) and the wrong name
                 // (anything not `envoy.transport_sockets.tls`), so the
-                // `Upstream(...)` arm and the `name != TLS_TRANSPORT_SOCKET`
-                // case are unreachable here.
-                let chain = listener_cfg
+                // `Upstream(...)` arm below is unreachable in practice.
+                let any_chain_has_tls = listener_cfg
                     .filter_chains
-                    .first()
-                    .expect("validator guarantees ≥1 filter chain");
-                let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = if let Some(
-                    ts,
-                ) =
-                    chain.transport_socket.as_ref()
-                {
-                    let envoy_config::TransportSocketTypedConfig::Downstream(ctx) =
-                        &ts.typed_config
-                    else {
-                        anyhow::bail!(
-                            "validator should have rejected upstream transport_socket on listener",
-                        );
+                    .iter()
+                    .any(|c| c.transport_socket.is_some());
+                let any_chain_has_server_names = listener_cfg.filter_chains.iter().any(|c| {
+                    c.filter_chain_match
+                        .as_ref()
+                        .map(|m| !m.server_names.is_empty())
+                        .unwrap_or(false)
+                });
+
+                let downstream_tls: Option<std::sync::Arc<envoy_tls::DownstreamTls>> =
+                    if !any_chain_has_tls {
+                        None
+                    } else if listener_cfg.filter_chains.len() == 1 && !any_chain_has_server_names {
+                        let chain = &listener_cfg.filter_chains[0];
+                        let socket = chain
+                            .transport_socket
+                            .as_ref()
+                            .expect("any_chain_has_tls implies Some on the single chain");
+                        let envoy_config::TransportSocketTypedConfig::Downstream(ctx) =
+                            &socket.typed_config
+                        else {
+                            anyhow::bail!(
+                                "validator should have rejected upstream transport_socket on listener",
+                            );
+                        };
+                        Some(std::sync::Arc::new(
+                            envoy_tls::DownstreamTls::from_context(ctx)
+                                .context("building DownstreamTls from single-chain context")?,
+                        ))
+                    } else {
+                        Some(std::sync::Arc::new(
+                            envoy_tls::DownstreamTls::from_listener(listener_cfg)
+                                .context("building DownstreamTls from multi-chain listener")?,
+                        ))
                     };
-                    let downstream_tls = std::sync::Arc::new(
-                        envoy_tls::DownstreamTls::from_context(ctx)
-                            .context("building DownstreamTls from listener transport_socket")?,
-                    );
-                    std::sync::Arc::new(tls_handler::TlsAcceptingHandler {
-                        tls: downstream_tls,
-                        inner: proxy,
-                    })
-                } else {
-                    proxy
-                };
+
+                let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
+                    match downstream_tls {
+                        Some(tls) => std::sync::Arc::new(tls_handler::TlsAcceptingHandler {
+                            tls,
+                            inner: proxy,
+                        }),
+                        None => proxy,
+                    };
 
                 let listener = envoy_listener::Listener::bind(listener_cfg, handler)
                     .await
