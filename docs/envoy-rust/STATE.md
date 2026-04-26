@@ -7,10 +7,12 @@
 
 ## Active phase
 
-**id:** `03.1`
-**slug:** `03.1-tls-foundation-downstream` (created during the state-2-of-parent-03 split commit `f256d2c`; SPEC.md committed alongside).
-**directory:** `docs/envoy-rust/phases/03.1-tls-foundation-downstream/` (exists; contains `SPEC.md`, `PLAN.md`, `PROGRESS.md`, and `REVIEW.md`).
-**status:** phase 03.1 lifecycle **state 5 (REVIEW.md approved; state-6 phase-done commit next)** — `SPEC.md` landed at `f256d2c` (alongside the ADR-0017 split decision); `PLAN.md` landed at `19e14af`; all 13 PLAN.md tasks implemented across `f93a062..5897d94`; state-4 phase-done gate cleared at task 13 with the local stable-toolchain gate clean on first attempt (PROGRESS.md §"Task 13 / State 4" — 146 tests passing, 1 ignored Docker-gated, `cargo deny check` clean) at `beefd8e`; `Cargo.lock` sync at `eb039e6` (phase-01/02.1/02.2 precedent shape); REVIEW.md landed with verdict **Approved with fixes → Approved** (REVIEW.md §6/§7) in the same commit that flips this STATE.md from state 3 to state 5. ROADMAP row `03.1` remains `status: in-progress` until the phase-done commit (which flips it to `done`); parent row `03` stays `in-progress` per the ROADMAP-schema invariant ("parent flips to `done` only after all sub-phases are `done`") — 03.2 has not landed yet, so the parent flip waits.
+**id:** `03.2`
+**slug:** `03.2-tls-upstream-sni` (created during the state-2-of-parent-03 split commit `f256d2c`; SPEC.md committed alongside).
+**directory:** `docs/envoy-rust/phases/03.2-tls-upstream-sni/` (exists; contains `SPEC.md` only).
+**status:** phase 03.2 lifecycle **state 2 (SPEC.md exists, PLAN.md does not)** — `SPEC.md` landed at `f256d2c` (alongside the ADR-0017 split decision and the 03.1 SPEC). ROADMAP row `03.2` is **`status: in-progress`** as of this commit — flipped per ROADMAP-schema invariant 3 ("a phase enters `in-progress` only when STATE.md points at it as the active phase with the directory created"; both conditions are satisfied here since the 03.2 directory has existed since `f256d2c`). This is the same small deviation from the 02.1 / 02.2 state-advance precedent the 03.1 state-3-entry session (`61a6e93`) established — applying the schema directly. Parent row `03` stays `in-progress` per the ROADMAP-schema invariant ("parent flips to `done` only after all sub-phases are `done`"); it will flip to `done` in 03.2's final commit.
+
+Phase 03.1 (`03.1-tls-foundation-downstream`) is **done** as of this commit. ROADMAP row `03.1` is `status: done`. Phase 03.1 `REVIEW.md` verdict is **Approved** (state 5 complete; I1 closed in-phase via the §7 close-out commit `1748cd2`; M1–M5 tracked forward — see Notes below).
 
 Parent phase `03-tls-tcp` is **in-progress** with `sub-phases: 03.1, 03.2` per ADR-0017's split (landed at `f256d2c`). Parent SPEC at `docs/envoy-rust/phases/03-tls-tcp/SPEC.md` remains in-tree unedited as the committed historical artifact (last touched at SHA `a3f3474`); for execution purposes it is superseded by the two sub-phase SPECs (`phases/03.1-tls-foundation-downstream/SPEC.md` and `phases/03.2-tls-upstream-sni/SPEC.md`).
 
@@ -22,65 +24,43 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 44–48, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 6): the next session — operating as the state-6 session of phase 03.1 — lands the **phase-done commit** with message format per `BOOTSTRAP_PROMPT.md` §5.3:
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 17–21, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 2): the next session — operating as the state-2 session of phase 03.2 — invokes **`superpowers:writing-plans`** scoped to phase 03.2, producing `docs/envoy-rust/phases/03.2-tls-upstream-sni/PLAN.md` from the SPEC. Per the gate at state 2: if PLAN.md exceeds ~25 tasks OR ~1500 LoC estimated, the planner must split (§6 of `BOOTSTRAP_PROMPT.md`) — but 03.2 was already produced *by* a split (ADR-0017), so a nested split would be unusual and should trigger `superpowers:systematic-debugging` first.
 
-```
-phase 03.1: envoy-tls foundation + downstream TLS termination + fixture 0004 [ADR-0017,ADR-0018,ADR-0019]
+Per `BOOTSTRAP_PROMPT.md` §5.1 "one state per session," state 2 ends by writing `PLAN.md` and updating this STATE.md (lifecycle state 3; next-skill `superpowers:subagent-driven-development` per the user's standing preference auto-memory `feedback_execution_style`). State 2 does not chain into state 3.
 
-<3–6 paragraph narrative covering landed surface (envoy-config TransportSocket
-envelope + DownstreamTlsContext + UpstreamTlsContext + 12 new validator tests +
-5 new ConfigError variants + 3 fuzz-corpus seeds; envoy-tls new crate with
-DownstreamTls + UpstreamTls + SingleCertResolver + install_default_crypto_provider
-helper + 10 tests; envoy-tcp generic-stream lift + 4 TLS-flavored unit tests;
-envoy-bin TlsAcceptingHandler in tls_handler.rs + filter-chain TLS dispatch +
-crypto-provider install routed through envoy-tls + Rust-native integration test
-in tests/tls_downstream.rs; differential harness TlsTestPki rcgen-driven +
-Driver::TlsTcp + drive_tls + with_copy_to PEM mounts + 6 new harness tests;
-fixture 0004-tls-downstream Docker-gated acceptance test); equivalence/
-conformance status (146 tests green + 1 ignored Docker-gated; CI runs
-tls_downstream_fixture against real Envoy); gate evidence (PROGRESS.md
-§"Task 13 / State 4" first-attempt clean — build/clippy/fmt/test/deny;
-REVIEW §6 Approved with fixes → §7 close-out → Approved); rollovers carried
-forward to phase 03.2 / later (REVIEW.md §3 M1–M5 + §4 recommendations).>
-```
-
-The commit flips `ROADMAP.md` row `03.1` `status` from `in-progress` to `done`. **Parent row `03` stays `in-progress`** per the ROADMAP schema invariant ("parent flips to `done` only after all sub-phases are `done`") — phase `03.2-tls-upstream-sni` has not yet landed, so parent-03 waits for the 03.2 phase-done commit. This is a deviation from the phase-02.2 state-6 shape (which atomically flipped both the sub-phase row and the parent row), and is the correct interpretation of the schema for the 03.1-first-of-two-sub-phases case.
-
-The commit also advances this STATE.md from phase `03.1-tls-foundation-downstream` to phase `03.2-tls-upstream-sni` (lifecycle state 2 — `SPEC.md` already exists from the ADR-0017 split commit `f256d2c`; `PLAN.md` does not; next-skill `superpowers:writing-plans` scoped to phase 03.2). State 6 is a docs-only commit (no code changes); no further review is required — REVIEW.md's §7 final verdict stands.
-
-Inputs the state-6 session should read, in order:
+Inputs the state-2 session for phase 03.2 should read, in order:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
 2. `docs/envoy-rust/STATE.md` (this file — to confirm routing).
-3. `docs/envoy-rust/ROADMAP.md` (rows 03, 03.1, 03.2; ensure the flip touches row 03.1 only — parent row 03 stays `in-progress`).
-4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0019`).
-5. `docs/envoy-rust/SKILL_ROUTING.md` state 6 block.
-6. `docs/envoy-rust/phases/03.1-tls-foundation-downstream/SPEC.md` §9 (commit discipline / phase-done commit conventions).
-7. `docs/envoy-rust/phases/03.1-tls-foundation-downstream/REVIEW.md` (Approved verdict — §7 close-out; mine the §1–2 narrative for the commit message body).
-8. `docs/envoy-rust/phases/03.1-tls-foundation-downstream/PROGRESS.md` (state-4 gate evidence and per-task narrative for the commit message body).
-9. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/` (shape precedent — `f04e21a` is the state-6 phase-done commit; `fc87505` is the state-5 REVIEW-landing precedent for the atomic "REVIEW.md + STATE.md advance" commit shape this session lands; note however that 02.2's state-6 atomically flipped both 02.2 and parent 02, whereas 03.1's state-6 flips only 03.1).
-10. `docs/envoy-rust/phases/03.2-tls-upstream-sni/SPEC.md` (sibling sub-phase SPEC — the state-6 successor activates phase 03.2 at lifecycle state 2; this SPEC is the design contract the next state-2 session will operationalize into a PLAN.md).
-11. `docs/envoy-rust/phases/03-tls-tcp/SPEC.md` (parent SPEC — last touched at SHA `a3f3474`; remains in-tree unedited as the committed historical artifact, but referenced for the commit narrative's "parent phase mid-flight" framing).
+3. `docs/envoy-rust/ROADMAP.md` (row 03 `in-progress` with `sub-phases: 03.1, 03.2`; row 03.2 now `in-progress`; row 03.1 `done`; rows 02/02.1/02.2 `done`).
+4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0019`; phase 03.2 picks ADR-0020 onward — treat the projection as provisional per the ADR-0013 / ADR-0017 renumbering precedents).
+5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence rules — 03.2 ships fixtures `0005-tls-upstream` + `0006-tls-sni`, both exercising row 2 of §7.2 only; no contract edits expected per parent-SPEC §1's baked-in defaults and 03.2 SPEC §2).
+6. `docs/envoy-rust/SKILL_ROUTING.md` (routing reference; state 2 → state 3 transition).
+7. `docs/envoy-rust/phases/03.2-tls-upstream-sni/SPEC.md` (the authoritative sub-phase design contract — referenced at every task under "Source of truth: SPEC.md" at the top of the planner's PLAN.md).
+8. `docs/envoy-rust/phases/03.1-tls-foundation-downstream/PLAN.md` + `PROGRESS.md` + `REVIEW.md` (most recent plan + progress + review precedent — task cadence, TDD framing, PROGRESS-formatting conventions; especially the per-task TDD ordering and the SPEC §6 signpost cross-references that 03.2's plan should mirror; phase-03.1 REVIEW §3 M1–M5 + §4 recommendations may inform 03.2's plan scope).
+9. `docs/envoy-rust/phases/03-tls-tcp/SPEC.md` (parent SPEC — context for the full phase-03 design; execution follows the 03.2 sub-phase SPEC, not the parent).
+10. `docs/envoy-rust/phases/02.2-listener-tcp-proxy/PLAN.md` (TCP-proxy task shape relevant to phase 03.2's `envoy-tcp::TcpProxy` upstream-TLS extension).
+11. `docs/envoy-rust/phases/02.1-config-cluster/PLAN.md` (schema-additions task shape relevant to phase 03.2's `envoy-config` `Cluster.transport_socket` consumer wiring + `filter_chain_match.server_names` SNI selection).
 
 ## Last commit
 
-REVIEW.md landing commit (this session): lands `docs/envoy-rust/phases/03.1-tls-foundation-downstream/REVIEW.md` with state-5 verdict **Approved** (per §7 I1 close-out) and advances this STATE.md from state 3 to state 5. Preceded in this lifecycle by `beefd8e` (Task 13 state-4 phase-done gate verification — workspace test/clippy/fmt/deny all clean) and `eb039e6` (Cargo.lock sync — phase-01/02.1/02.2 precedent shape).
+Phase 03.1 phase-done final commit: `phase 03.1: envoy-tls foundation + downstream TLS termination + fixture 0004 [ADR-0018, ADR-0019]`. Flips `ROADMAP.md` row `03.1` `status` from `in-progress` to `done`; flips row `03.2` from `planned` to `in-progress` per ROADMAP-schema invariant 3 (same precedent the 03.1 state-3-entry session `61a6e93` established); parent row `03` stays `in-progress` until 03.2 lands. Advances this STATE.md from phase 03.1 lifecycle state 5 to phase 03.2 lifecycle state 2. Preceded by `1748cd2` (state-5 REVIEW.md landing + I1 close-out — STATE.md advance from state 3 to state 5), `eb039e6` (Cargo.lock sync — phase-01/02.1/02.2 precedent shape), and `beefd8e` (Task 13 state-4 phase-done gate verification — 146 tests + 1 ignored Docker-gated, `cargo deny check` clean).
 
 ## Last updated
 
-2026-04-26 (phase 03.1 lifecycle state advanced from 3 to 5; REVIEW.md committed with verdict Approved; next-skill flips from `superpowers:subagent-driven-development` to the state-6 phase-done commit per `BOOTSTRAP_PROMPT.md` §5 state 6).
+2026-04-26 (phase 03.1 complete; STATE advanced to phase 03.2 at lifecycle state 2; next-skill flips to `superpowers:writing-plans`).
 
 ## Notes
 
 ### ADR numbering after the phase-03 split
 
-ADR-0017 (this commit's split decision) renumbered parent-SPEC §7's three projected ADRs upward by following the phase-02 / ADR-0013 precedent: the split ADR takes the next-sequential number at split time (here, ADR-0017), and the in-execution ADRs get the next-available numbers at landing time. The actual landed sequence:
+The parent-phase-03 SPEC (`03-tls-tcp/SPEC.md`, committed at SHA `a3f3474`) projected three phase-03 ADRs numbered 0017 (`rcgen` + `tempfile`), 0018 (`tokio-rustls` + `rustls-pemfile`), 0019 (split phase 03). The ADR-0017 split decision (landed at `f256d2c`) took the actual next-sequential number at split time, so each projected ADR shifted in-tree:
 
-- **ADR-0017** — split phase 03 into 03.1 + 03.2 (this commit; was parent-SPEC §7's projected ADR-0019).
-- **ADR-0018** — `rcgen` + `tempfile` permitted as dev-test-harness-only foundations (will land in 03.1 task 1; was parent-SPEC §7's projected ADR-0017).
-- **ADR-0019** — `tokio-rustls` + `rustls-pemfile` covered by the rustls foundations grant (will land in 03.1 task 1; was parent-SPEC §7's projected ADR-0018).
+- **ADR-0017** — split phase 03 into 03.1 + 03.2 (landed at `f256d2c`; was parent-SPEC §7's projected ADR-0019).
+- **ADR-0018** — `rcgen` + `tempfile` permitted as dev-test-harness-only foundations (landed at `f93a062` during 03.1 Task 1; was parent-SPEC §7's projected ADR-0017).
+- **ADR-0019** — `tokio-rustls` + `rustls-pemfile` covered by the rustls foundations grant (landed at `f93a062` during 03.1 Task 1; was parent-SPEC §7's projected ADR-0018).
 
-The sub-phase SPECs (03.1 + 03.2) cite ADR-0017 for the renumbering and rewrite each expected ADR with its actual landed number. The parent SPEC (`docs/envoy-rust/phases/03-tls-tcp/SPEC.md`) is preserved unedited per D-3.4 / D-3.5 (it's a committed historical artifact; the projected ADR numbers in its §7 remain literally as written — readers cross-reference this Notes section + ADR-0017 for the renumbered actuals). Any interim ADR (e.g., a `cargo-deny` exemption) landing during 03.1 execution between 03.1 task 1 and 03.2 start would shift ADR-0019's number (since it lands second at task 1) — same provisional posture phase-02.2 REVIEW recommendation #2 established.
+The sub-phase SPECs (03.1 + 03.2) cite ADR-0017 for the renumbering and rewrite each expected ADR with its actual landed number. The parent SPEC (`docs/envoy-rust/phases/03-tls-tcp/SPEC.md`) is preserved unedited per D-3.4 / D-3.5 (it's a committed historical artifact; the projected ADR numbers in its §7 remain literally as written — readers cross-reference this Notes section + ADR-0017 for the renumbered actuals). Phase 03.2's projected ADRs (currently slated for 0020+) follow the same provisional-numbering posture per phase-02.2 REVIEW recommendation #2 + phase-03.1 REVIEW §4 recommendation 1.
 
 ### ADR numbering after the phase-02 split (for reference)
 
@@ -129,6 +109,26 @@ Phase 02.2 REVIEW §4 recommendations forward to phase 03.1 / 03.2 / later:
 5. If parallel fixture execution arrives, revisit `TcpProxyBackend::Drop` per M1 above (and now `TlsEchoBackend::Drop` too).
 6. `enable_half_close: true` flip-fixture is the obvious follow-on per ADR-0016 — whichever phase first needs an asymmetric-close use case lands its own ADR + extends `TcpProxy` with an explicit half-close-propagation mode.
 
+### Phase-03.1 rollovers (from REVIEW.md §3–§4)
+
+The 03.1 REVIEW landed with one Important item and five Minor items. I1 (STATE.md stale at state 3) closed in-phase by the §7 close-out commit `1748cd2` (advanced STATE.md from state 3 to state 5 alongside REVIEW.md). The remaining items:
+
+- **M1** — `tls_upstream_returns_err_on_connect_refused` exercises a plaintext upstream-connect path, not a TLS handshake (`crates/envoy-tls/src/tests.rs`): awareness-only, no action required. The kernel-refused 127.0.0.1:1 dial fails before any TLS handshake bytes are sent, so the test still proves `UpstreamTls::connect` propagates the connect error correctly even though the variant isn't `TlsError::Handshake`.
+- **M2** — `single_cert_resolver_returns_same_cert_regardless_of_sni` accepts both `Ok` and `Err` on non-matching SNIs (`crates/envoy-tls/src/tests.rs`): awareness-only, no action required. The single-cert resolver shape is intentionally permissive on the rustls side — phase 03.2's `SniResolver` will tighten this to strict-`None`-on-miss.
+- **M3** — `check_cn_or_san` uses a DER-substring scan rather than `x509-parser`-style structured introspection (`tests/differential/src/lib.rs`): awareness-only, no action required for 03.1; **tracked forward to phase 03.2** if `x509-parser` is needed for the 0006-tls-sni fixture's per-probe SAN/CN assertion (would land under a follow-up ADR per PLAN line 4054).
+- **M4** — in-process integration test `crates/envoy-bin/tests/tls_downstream.rs` does not assert `expected_cn` (only proves the round-trip succeeds): awareness-only. The Docker-gated differential fixture `0004-tls-downstream` exercises the same path with the harness driver's `check_cn_or_san` assertion via `expected_cn`; the in-process test is a non-Docker regression gate, not a duplicate of the differential gate.
+- **M5** — differential's TLS deps (`rcgen`, `rustls`, `rustls-pemfile`, `rustls-pki-types`, `tokio-rustls`) live under `[dependencies]` rather than `[dev-dependencies]` (`tests/differential/Cargo.toml`): awareness-only, no action required. The `tests/differential/` crate is itself a `[lib]` consumed by Docker-gated `tests/` integration tests; the deps are runtime-needed by the lib's `tls.rs` module that those tests link against. Moving them to `[dev-dependencies]` would break the `tests/differential/tests/tls_downstream.rs` link.
+
+Phase 03.1 REVIEW §4 recommendations forward to phase 03.2 / later:
+
+1. Phase 03.2 ADR projection numbering (ADR-0020 onward) is provisional per the ADR-0013 / ADR-0017 renumbering precedents.
+2. `Cluster::name()` accessor (phase-02.1 REVIEW M1 cross-reference): unchanged from phase-02.2 §4 recommendation 1; phase 03.2 D4 is the next opportunistic close site.
+3. If `x509-parser` is added in phase 03.2 for the 0006-tls-sni fixture's SAN assertion, it lands under a follow-up ADR (per phase-03.1 REVIEW §3 M3).
+4. The `aws-lc-rs` crypto provider is now wired via `envoy-tls::install_default_crypto_provider`; phase 03.2's upstream-TLS consumer wiring inherits this — no duplicate crypto-provider install in `envoy-bin`.
+5. `enable_half_close: true` flip-fixture deferral (carries over unchanged from phase-02.2 §4 recommendation 6).
+6. Round-robin distribution-equivalence assertion remains unit-test-only (carries over unchanged from phase-02.2 §4 recommendation 4).
+7. If parallel fixture execution arrives, revisit `TcpProxyBackend::Drop` and `TlsEchoBackend::Drop` (carries over unchanged from phase-02.2 §4 recommendation 5).
+
 ### Phase-00 deferrals still open
 
 - Minors M1, M2, M4, M5, M6, M7, M8 (see `docs/envoy-rust/phases/00-bootstrap/REVIEW.md`). None block phase 03.1 or 03.2.
@@ -147,8 +147,12 @@ ADR-0013 (split phase 02 into 02.1 + 02.2; landed at `1c38ca9` during parent-pha
 
 ADR-0015 (cross-container host reachability via `host.docker.internal` + `host-gateway`; landed at `435c6fa` during 02.2 Task 1), ADR-0016 (phase 02 TCP proxy runs with Envoy's default `enable_half_close: false`; landed at `435c6fa` during 02.2 Task 1).
 
+### Phase-03.1 ADR ledger (for reference)
+
+ADR-0017 (split phase 03 into 03.1 + 03.2; landed at `f256d2c` during parent-phase 03 state 2), ADR-0018 (`rcgen` + `tempfile` permitted as dev-test-harness-only foundations; landed at `f93a062` during 03.1 Task 1), ADR-0019 (`tokio-rustls` + `rustls-pemfile` covered by the rustls foundations grant; landed at `f93a062` during 03.1 Task 1).
+
 ### Doctrine reminders
 
 - Any deviation from the state machine requires `superpowers:systematic-debugging` before proceeding — see §1 Step E of `BOOTSTRAP_PROMPT.md`.
 - Consult `docs/envoy-rust/SKILL_ROUTING.md` for the full phase lifecycle state machine.
-- `BOOTSTRAP_PROMPT.md` §5.1: one state per session; do not chain states. The state-5 close (landing this STATE.md edit alongside REVIEW.md) advances phase 03.1 to lifecycle state 5. The next session enters phase 03.1 state 6 — the phase-done commit per `BOOTSTRAP_PROMPT.md` §5.3 / `SKILL_ROUTING.md` state 6.
+- `BOOTSTRAP_PROMPT.md` §5.1: one state per session; do not chain states. The state-6 close (this commit) lands phase 03.1's phase-done commit and advances STATE.md to phase 03.2 at lifecycle state 2. The next session enters phase 03.2 state 2 via `superpowers:writing-plans`, producing PLAN.md from the SPEC.md committed at `f256d2c`.

@@ -31,8 +31,8 @@ Phases 00–08 ship *in order*: each adds a primitive the next relies on. Splitt
 | 02.1 | Config schema + cluster manager + echo-server helper | 01 | done | — | no new fixture; config parser + envoy-cluster + tcp-echo-server helper + fuzz corpus extended |
 | 02.2 | Listener + TCP proxy filter + fixture 0003 + phase-01 rollovers I4/M1 | 02.1 | done | — | fixture 0003-tcp-proxy green; parent phase 02 flips done |
 | 03 | Downstream TLS termination + upstream TLS origination + SNI | 02 | in-progress | 03.1, 03.2 | TLS TCP fixture green |
-| 03.1 | envoy-tls foundation + downstream TLS termination (single cert) + fixture 0004 | 02 | in-progress | — | fixture 0004-tls-downstream green; envoy-tls scaffold + transport_socket schema + downstream TLS dispatch + harness PKI land |
-| 03.2 | Upstream TLS origination + multi-cert SNI cert selection + tls-echo-server helper + fixtures 0005 + 0006 | 03.1 | planned | — | fixtures 0005-tls-upstream + 0006-tls-sni green; parent phase 03 flips done |
+| 03.1 | envoy-tls foundation + downstream TLS termination (single cert) + fixture 0004 | 02 | done | — | fixture 0004-tls-downstream green; envoy-tls scaffold + transport_socket schema + downstream TLS dispatch + harness PKI land |
+| 03.2 | Upstream TLS origination + multi-cert SNI cert selection + tls-echo-server helper + fixtures 0005 + 0006 | 03.1 | in-progress | — | fixtures 0005-tls-upstream + 0006-tls-sni green; parent phase 03 flips done |
 | 04 | HTTP connection manager (HTTP/1.1) + route match + router filter + direct_response | 03 | planned | — | HTTP/1.1 routing fixture green |
 | 05 | HTTP/2 downstream + upstream (low-level framer, own conn mgr) | 04 | planned | — | HTTP/2 fixture green; `h2spec` above threshold |
 | 06 | Access log (file sink, Envoy default format) + stats + Prometheus admin endpoint | 05 | planned | — | access log + Prometheus fixtures green |
