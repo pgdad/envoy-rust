@@ -49,6 +49,27 @@ pub enum ConfigError {
     LoadAssignmentNameMismatch { cluster: String, assignment: String },
     #[error("cluster '{0}' has zero lb_endpoints; ≥1 required")]
     EmptyClusterEndpoints(String),
+    #[error(
+        "unsupported transport_socket name '{0}'; envoy-rust accepts only 'envoy.transport_sockets.tls'"
+    )]
+    UnknownTransportSocketName(String),
+    #[error(
+        "transport_socket on the {side} side is the wrong direction (got '{got}'); listener requires DownstreamTlsContext, cluster requires UpstreamTlsContext"
+    )]
+    MismatchedTransportSocketDirection {
+        side: &'static str,
+        got: &'static str,
+    },
+    #[error(
+        "tls_certificates on the {side} side has the wrong cardinality; listener requires ≥1, cluster requires 0 (mTLS deferred)"
+    )]
+    EmptyTlsCertificates { side: &'static str },
+    #[error(
+        "UpstreamTlsContext requires validation_context.trusted_ca; phase 03 has no insecure-skip surface"
+    )]
+    MissingValidationContext,
+    #[error("UpstreamTlsContext.sni must be a non-empty DNS name")]
+    EmptyUpstreamSni,
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

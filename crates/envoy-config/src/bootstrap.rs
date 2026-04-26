@@ -244,11 +244,59 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                 cluster.name.clone(),
             ));
         }
+        if let Some(ts) = cluster.transport_socket.as_ref() {
+            if ts.name != crate::TLS_TRANSPORT_SOCKET {
+                return Err(crate::ConfigError::UnknownTransportSocketName(
+                    ts.name.clone(),
+                ));
+            }
+            match &ts.typed_config {
+                TransportSocketTypedConfig::Upstream(ctx) => {
+                    if !ctx.common_tls_context.tls_certificates.is_empty() {
+                        return Err(crate::ConfigError::EmptyTlsCertificates { side: "cluster" });
+                    }
+                    if ctx.common_tls_context.validation_context.is_none() {
+                        return Err(crate::ConfigError::MissingValidationContext);
+                    }
+                    if ctx.sni.is_empty() {
+                        return Err(crate::ConfigError::EmptyUpstreamSni);
+                    }
+                }
+                TransportSocketTypedConfig::Downstream(_) => {
+                    return Err(crate::ConfigError::MismatchedTransportSocketDirection {
+                        side: "cluster",
+                        got: "DownstreamTlsContext",
+                    });
+                }
+            }
+        }
     }
 
     // Per-listener invariants.
     for listener in listeners {
         for chain in &listener.filter_chains {
+            if let Some(ts) = chain.transport_socket.as_ref() {
+                if ts.name != crate::TLS_TRANSPORT_SOCKET {
+                    return Err(crate::ConfigError::UnknownTransportSocketName(
+                        ts.name.clone(),
+                    ));
+                }
+                match &ts.typed_config {
+                    TransportSocketTypedConfig::Downstream(ctx) => {
+                        if ctx.common_tls_context.tls_certificates.is_empty() {
+                            return Err(crate::ConfigError::EmptyTlsCertificates {
+                                side: "listener",
+                            });
+                        }
+                    }
+                    TransportSocketTypedConfig::Upstream(_) => {
+                        return Err(crate::ConfigError::MismatchedTransportSocketDirection {
+                            side: "listener",
+                            got: "UpstreamTlsContext",
+                        });
+                    }
+                }
+            }
             for filter in &chain.filters {
                 match filter.name.as_str() {
                     crate::ECHO_FILTER => {
@@ -1368,6 +1416,285 @@ static_resources:
         assert!(
             msg.contains("inline_string") || msg.contains("unknown field"),
             "expected unknown-field error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_transport_socket_name() {
+        // Phase 03 only accepts "envoy.transport_sockets.tls".
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.raw_buffer
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /tmp/leaf.pem
+                    private_key:
+                      filename: /tmp/leaf.key
+          filters: []
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::UnknownTransportSocketName(ref n) if n == "envoy.transport_sockets.raw_buffer"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_downstream_tls_context_on_cluster() {
+        // DownstreamTlsContext on a cluster's transport_socket → MismatchedTransportSocketDirection.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+              - certificate_chain:
+                  filename: /tmp/leaf.pem
+                private_key:
+                  filename: /tmp/leaf.key
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MismatchedTransportSocketDirection {
+                    side: "cluster",
+                    got: "DownstreamTlsContext",
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_upstream_tls_context_on_listener() {
+        // UpstreamTlsContext on a listener's filter_chain.transport_socket →
+        // MismatchedTransportSocketDirection.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+              sni: envoy-rust.test
+              common_tls_context:
+                validation_context:
+                  trusted_ca:
+                    filename: /tmp/ca.pem
+          filters: []
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MismatchedTransportSocketDirection {
+                    side: "listener",
+                    got: "UpstreamTlsContext",
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_downstream_with_empty_tls_certificates() {
+        // Downstream side requires ≥1 cert; empty → EmptyTlsCertificates { side: "listener" }.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates: []
+          filters: []
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::EmptyTlsCertificates { side: "listener" }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_upstream_with_tls_certificates() {
+        // Upstream side requires 0 certs (mTLS deferred); non-empty →
+        // EmptyTlsCertificates { side: "cluster" } (variant naming is asymmetric:
+        // "Empty" on listener means too-few, on cluster means too-many; the
+        // side discriminator carries the meaning).
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: envoy-rust.test
+          common_tls_context:
+            tls_certificates:
+              - certificate_chain:
+                  filename: /tmp/client.pem
+                private_key:
+                  filename: /tmp/client.key
+            validation_context:
+              trusted_ca:
+                filename: /tmp/ca.pem
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::EmptyTlsCertificates { side: "cluster" }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_upstream_without_validation_context() {
+        // No insecure-skip in phase 03 (SPEC §4) — validation_context required.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: envoy-rust.test
+          common_tls_context: {}
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::MissingValidationContext),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_upstream_with_empty_sni() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9443
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: ""
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /tmp/ca.pem
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyUpstreamSni),
+            "got {err:?}"
         );
     }
 }
