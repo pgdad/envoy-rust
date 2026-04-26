@@ -373,10 +373,12 @@ dependencies = [
  "envoy-cluster",
  "envoy-config",
  "envoy-listener",
+ "envoy-tls",
  "rcgen",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -1752,6 +1754,23 @@ checksum = "c8323304221c2a851516f22236c5722a72eaa19749016521d6dff0824447d96d"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "tls-echo-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
