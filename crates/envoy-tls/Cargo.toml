@@ -1,0 +1,25 @@
+[package]
+name = "envoy-tls"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+name = "envoy_tls"
+path = "src/lib.rs"
+
+[dependencies]
+envoy-config = { path = "../envoy-config" }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+tokio = { version = "1", features = ["net", "io-util", "macros", "sync"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+rcgen = "0.13"
+tempfile = "3"

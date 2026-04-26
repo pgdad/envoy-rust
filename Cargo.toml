@@ -6,6 +6,7 @@ members = [
     "crates/envoy-config",
     "crates/envoy-listener",
     "crates/envoy-tcp",
+    "crates/envoy-tls",
     "tests/differential",
     "tests/helpers/tcp-echo-server",
 ]
