@@ -120,3 +120,17 @@
 - Change: amended tests/fixtures/0007-http1-direct-response/{envoy.yaml,envoy-rust.yaml} to add a 04.2 NEW route at the head of routes: with `match: { prefix: "/api/", headers: [{ name: "x-foo", exact_match: "bar" }] }` returning direct_response 418 "teapot\n"; existing `prefix: "/"` catch-all stays second per first-match-wins discipline. Created tests/fixtures/0007-http1-direct-response/inputs/payload-matcher.bin (empty file; placeholder per 04.1 payload.bin convention). Restructured expectations.yaml from single-Driver::Http1 to Driver::Http1ProbeList with two probes (default-route, matcher-route). Appended a "04.2 amendment — header-matcher route" section to README.md and added ADR-0021 to the ADR references list.
 - Verification: `cargo test -p envoy-bin --test http1_direct_response` → PASS (in-process backstop: GET /healthz still falls through to default route 200 OK); `cargo test -p differential --test http1_direct_response` → Docker not available (Socket not found: /var/run/docker.sock) — environment issue, not a fixture problem; workspace gate (build/clippy/fmt/test --lib --bins) clean.
 - Deviations: none.
+
+## Task 11 — 04.1 REVIEW M-track carryforward check (2026-04-27)
+
+Per SPEC §3 D4 + the standing posture from STATE.md "Phase-04.1 rollovers": none of M1–M7 are critical-path for 04.2; all defer per their established annotations.
+
+- M1 (`diff_headers` duplicate-header semantics): A. No action in 04.2 — fixture 0007 amendment introduces no duplicate response headers; track forward.
+- M2 (body-drain idle timeout silent close): A. No action — matcher route returns direct_response (no body-drain); track forward to 04.3 or hardening.
+- M3 (envoy-cluster path-dep with no 04.1 consumer): A. No action — 04.2 adds no cluster consumer; track forward to 04.3.
+- M4 (strip_port IPv6 correctness): A. No action — 04.2 fixture uses `Host: envoy-rust.test` (not IPv6); track forward.
+- M5 (Cargo.lock sync cadence): partially addressed via Task 1 review-fix's PROGRESS disclosure. PLAN Step 11 of Task 1 stages Cargo.lock inline at the ADR-0021-bearing commit, deviating from the M5-recommended dedicated-tail-commit cadence; ADR-0021's Consequences section's "dedicated state-4 commit" prose is now contradicted but per D-3.5 the ADR text is append-only and remains untouched. The Task 1 review-fix's PROGRESS note is the audit trail. Task 12 (state-4 gate) will likely show Cargo.lock clean (already synced); if dirty, that's a fresh sync at state-4 per the established phase-precedent.
+- M6 (drive_http1 per-function unit test): A. No action in 04.2 for M6 specifically — Task 9's tests cover Http1Probe parsing + extra_headers default but not drive_http1 itself; track forward to 04.3.
+- M7 (TlsAcceptingHandler generalization for HCM+TLS): A. No action — 04.2 introduces no TLS-bearing HCM fixtures; track forward to phase 05+.
+
+No code changes in this task. All 7 M-track items (other than M5's partial address above) remain on the carryforward ledger for 04.3 / phase 05 / hardening pass.
