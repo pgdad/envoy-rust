@@ -634,6 +634,104 @@ pub async fn drive_http_get(addr: SocketAddr, path: &str, host: &str) -> Result<
     }
 }
 
+/// Drive an HTTP/1.1 request (no body) at `addr` for the 04.1 differential
+/// suite: open TCP, write a request line + `Host:` + `Connection: close`,
+/// then read until httparse signals headers `Complete`, capture every header
+/// in order, parse `Content-Length`, and read the declared body bytes (zero if
+/// no `Content-Length`). Returns status + headers + body.
+///
+/// Framing scope: this helper only handles `Content-Length`-framed responses
+/// (the only shape produced by 04.1's `direct_response` filter). `chunked` /
+/// `connection: close` framing is the existing `drive_http_get` helper's
+/// responsibility — when 04.x grows fixtures that need those, the dispatch
+/// arm will pick the right helper rather than overloading this one.
+///
+/// Reads run under a 5s per-poll timeout; a peer EOF before headers complete
+/// or before the declared body is consumed surfaces as `Err`. The connection
+/// is dropped after the body bytes have been read (peer closes via
+/// `Connection: close`).
+pub async fn drive_http1(
+    addr: SocketAddr,
+    method: &Http1Method,
+    path: &str,
+    host: &str,
+) -> Result<DriveHttp1Result> {
+    use tokio::net::TcpStream;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    let req_line = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        method.as_str(),
+        path,
+        host,
+    );
+    stream.write_all(req_line.as_bytes()).await?;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let read_timeout = Duration::from_secs(5);
+
+    // Read headers until httparse signals Complete; then read Content-Length body.
+    let (status, headers, headers_end, content_length) = loop {
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await??;
+        if n == 0 {
+            anyhow::bail!("unexpected EOF before headers complete");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+
+        let mut hp_headers = [httparse::EMPTY_HEADER; 64];
+        let mut resp = httparse::Response::new(&mut hp_headers);
+        match resp.parse(&buf)? {
+            httparse::Status::Complete(headers_end) => {
+                let status = resp.code.ok_or_else(|| anyhow::anyhow!("no status code"))?;
+                let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers.len());
+                for h in resp.headers.iter() {
+                    if h.name.is_empty() {
+                        continue;
+                    }
+                    let value = std::str::from_utf8(h.value)
+                        .map_err(|e| anyhow::anyhow!("invalid utf8 header value: {e}"))?
+                        .to_string();
+                    headers.push((h.name.to_string(), value));
+                }
+                let content_length = headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                break (status, headers, headers_end, content_length);
+            }
+            httparse::Status::Partial => continue,
+        }
+    };
+
+    // Read remaining body bytes.
+    while buf.len() < headers_end + content_length {
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await??;
+        if n == 0 {
+            if buf.len() < headers_end + content_length {
+                anyhow::bail!(
+                    "unexpected EOF before body complete: have {}, expected {}",
+                    buf.len() - headers_end,
+                    content_length,
+                );
+            }
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    let body = buf[headers_end..headers_end + content_length].to_vec();
+
+    Ok(DriveHttp1Result {
+        status,
+        headers,
+        body,
+    })
+}
+
 /// Decode HTTP/1.1 chunked transfer-encoded body bytes into plain body bytes.
 /// Each chunk has the form `<hex-size>\r\n<data>\r\n`; the last chunk is
 /// `0\r\n\r\n`. Trailer headers (if any) are ignored. Returns an error if the
@@ -930,14 +1028,99 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
         }
-        // 04.1 Task 13: grammar lands here; the async `drive_http1` helper
-        // and full equivalence dispatch arrive in Task 14. Bail with a clear
-        // message so a fixture rendered with `kind: http1` against a
-        // pre-Task-14 build doesn't silently pass.
-        Driver::Http1 { .. } => {
+        // 04.1 Task 14: real dispatch. Drive both proxies, then apply
+        // equivalence rules (envoy ↔ envoy-rust) plus per-driver `expected_*`
+        // anchors (each side independently). The header allow-list path is
+        // a per-driver `Http1HeaderRule::SetEqualModuloAllowList` (the
+        // `Equivalence` struct has no `response_headers` field today —
+        // documenting the asymmetry against status/body for the eventual
+        // 04.x cleanup).
+        Driver::Http1 {
+            method,
+            path,
+            host,
+            expected_status,
+            expected_body,
+            expected_headers,
+        } => {
+            let upstream_resp = drive_http1(upstream_addr, method, path, host)
+                .await
+                .context("upstream envoy http1 drive")?;
+            let subject_resp = drive_http1(subject_addr, method, path, host)
+                .await
+                .context("envoy-rust http1 drive")?;
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
-            bail!("Driver::Http1 dispatch is not implemented yet (lands in phase 04.1 Task 14)");
+
+            // Status: envoy ↔ envoy-rust under `response_status: exact`.
+            if matches!(
+                expectations.equivalence.response_status,
+                Some(StatusRule::Exact)
+            ) && upstream_resp.status != subject_resp.status
+            {
+                bail!(
+                    "response status mismatch under `response_status: exact`\n  \
+                     upstream: {}\n  subject:  {}",
+                    upstream_resp.status,
+                    subject_resp.status,
+                );
+            }
+            // Per-driver `expected_status`: each side independently equals it.
+            if let Some(es) = expected_status {
+                if upstream_resp.status != *es {
+                    bail!(
+                        "upstream status {} != expected {}",
+                        upstream_resp.status,
+                        es,
+                    );
+                }
+                if subject_resp.status != *es {
+                    bail!("subject status {} != expected {}", subject_resp.status, es,);
+                }
+            }
+
+            // Body: envoy ↔ envoy-rust under `response_body: byte_exact`.
+            if matches!(
+                expectations.equivalence.response_body,
+                Some(BodyRule::ByteExact)
+            ) && upstream_resp.body != subject_resp.body
+            {
+                bail!(
+                    "byte-exact body mismatch\n  upstream: {:?}\n  subject:  {:?}",
+                    upstream_resp.body,
+                    subject_resp.body,
+                );
+            }
+            // Per-driver `expected_body`: each side independently equals bytes.
+            if let Some(Http1BodyRule::ByteExact { bytes }) = expected_body {
+                if &upstream_resp.body != bytes {
+                    bail!(
+                        "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                        upstream_resp.body,
+                        bytes,
+                    );
+                }
+                if &subject_resp.body != bytes {
+                    bail!(
+                        "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                        subject_resp.body,
+                        bytes,
+                    );
+                }
+            }
+
+            // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
+            if matches!(
+                expected_headers,
+                Some(Http1HeaderRule::SetEqualModuloAllowList)
+            ) {
+                diff_headers(
+                    &upstream_resp.headers,
+                    &subject_resp.headers,
+                    HEADER_ALLOW_LIST,
+                )
+                .context("diff_headers (set_equal_modulo_allow_list)")?;
+            }
         }
     }
 
