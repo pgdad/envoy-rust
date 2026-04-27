@@ -17,3 +17,10 @@
 - Verification: `cargo test -p envoy-config --lib` -> 139 passed (was 136, +3 new); `cargo test -p envoy-http1 --lib` -> 24 passed (unchanged); `cargo build --workspace --all-targets` -> clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` -> clean; `cargo fmt --all -- --check` -> clean; `cargo test --workspace --lib` -> all green (envoy-cluster 48, envoy-listener 8, envoy-config 139, envoy-http1 24, envoy-bin 6, envoy-tcp 11, envoy-tls 15).
 - ADRs: none in 04.3 Task 2 (per SPEC §7). ADR ledger head: 21.
 - Deviations from PLAN: none — used the default `&[Cluster]` shape; no fallback to `&[String]` needed.
+
+### Task 2 review fix — generalize `ConfigError::UnknownCluster` Display string
+
+- Commit: d31e1a8
+- Change: in `crates/envoy-config/src/lib.rs:52` the `UnknownCluster` variant's `#[error(...)]` string was `"tcp_proxy filter references unknown cluster '{0}'"` (02.1-landed). After Task 2 widened the throw sites to include the HCM `RouteAction::Route` arm, that prefix became a half-truth on HCM-only configs. Generalized to `"unknown cluster '{0}'"` — lossy on the referrer, but no longer misleading. The PLAN explicitly disclaimed the schema-breaking alternative (carrying a referrer field on the variant); the tracing-warn alternative (PLAN §Architecture) was a forward-looking framing not carried into the Task 2 step body. This is the minimum-scope fix — 1-line change.
+- Verification: `cargo test -p envoy-config --lib` -> 139 passed (unchanged); `cargo clippy --workspace --all-targets --all-features -- -D warnings` -> clean; `cargo fmt --all -- --check` -> clean. No tests assert on the literal Display string (all use `matches!` on the variant), so no test ripples.
+- ADRs: none. ADR ledger head: 21.
