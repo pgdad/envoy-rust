@@ -67,3 +67,11 @@
 - Commit: 48e615c
 - Change: added a 3-line comment block to the TCP_PROXY_FILTER arm in `validate` clarifying that the `as_ref()` borrow is intentional (TCP_PROXY validation is read-only) — closes the asymmetry-readability gap with the HCM_FILTER arm's `as_mut()` (introduced in this Task 5). Comment-only change.
 - Verification: gate commands clean; 101 tests still passing.
+
+## Task 6 — envoy-config::matcher runtime + 28 matcher tests (2026-04-27)
+
+- Commit: dfac122
+- Change: created crates/envoy-config/src/matcher.rs with `impl HeaderMatcher::matches(&self, headers: &[(String, String)]) -> bool` and `impl StringMatcher::matches(&self, value: &str) -> bool`. Header name lookup uses eq_ignore_ascii_case (HTTP/1.1 §3.2). XOR with invert_match. SafeRegex variants take `safe_regex.compiled.as_ref().expect("validator ensured compiled")`. StringMatcher.ignore_case affects Exact/Prefix/Suffix/Contains (case-folded comparison) but not SafeRegex (Envoy proto: regex callers use `(?i)`). Half-open i64 range. Non-parseable RangeMatch values fail the match (not an error). present_match: false is "no presence requirement" (always true) per SPEC §6 signpost 7. Added pub mod matcher; to lib.rs.
+- Tests added (28): per-mode boolean truth tables (3 each for ExactMatch / PrefixMatch / SuffixMatch / SafeRegexMatch; 5 for RangeMatch boundary; 4 for PresentMatch; 3 for StringMatch); cross-cuts (header name case-insensitivity; header value case-sensitivity by default; invert_match for ExactMatch + PresentMatch).
+- Verification: `cargo test -p envoy-config --lib` → 129 passed; clippy + fmt + build clean.
+- Deviations: `cargo fmt` reformatted several lines in matcher.rs (SuffixMatch arm collapsed to single line; Prefix ignore_case joined to one line; Contains ignore_case chain split differently; 8 test `hm(...)` calls split to multi-line). Semantically identical; `cargo fmt --all` applied before committing to satisfy the fmt gate.
