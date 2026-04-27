@@ -75,3 +75,12 @@
 - Tests added (28): per-mode boolean truth tables (3 each for ExactMatch / PrefixMatch / SuffixMatch / SafeRegexMatch; 5 for RangeMatch boundary; 4 for PresentMatch; 3 for StringMatch); cross-cuts (header name case-insensitivity; header value case-sensitivity by default; invert_match for ExactMatch + PresentMatch).
 - Verification: `cargo test -p envoy-config --lib` → 129 passed; clippy + fmt + build clean.
 - Deviations: `cargo fmt` reformatted several lines in matcher.rs (SuffixMatch arm collapsed to single line; Prefix ignore_case joined to one line; Contains ignore_case chain split differently; 8 test `hm(...)` calls split to multi-line). Semantically identical; `cargo fmt --all` applied before committing to satisfy the fmt gate.
+
+### Task 6 follow-up — review fix (2026-04-27)
+
+- Commit: 81c6dde
+- Change: addressed 3 findings from code quality review of the matcher runtime:
+  1. **I1 (panic safety):** replaced bare `str` byte-slice indexing in `StringMatcher::matches` Prefix/Suffix `ignore_case: true` branches with `str::get(..)` + `.is_some_and(...)` — would have panicked on multi-byte UTF-8 input where `lit.len()` falls mid-codepoint. Defensive fix; prevents trivial panics from non-ASCII header values once Task 7 wires this into the HCM hot path.
+  2. **I2 (panic message disambiguation):** the two `expect("validator ensured compiled")` sites now read "validator ensured HeaderMatcher SafeRegex compiled" and "validator ensured StringMatcher SafeRegex compiled" so a future regression panic localizes to the correct call site without symbol information.
+  3. **M2 (test coverage gap):** added `string_match_prefix_with_ignore_case_matches` and `string_match_suffix_with_ignore_case_matches` tests — these exercise the Prefix/Suffix branches in `StringMatcher::matches` (only reachable through `HeaderMatcherMode::StringMatch`), which previously had no direct coverage and now serve as regression tests for the I1 fix.
+- Verification: `cargo test -p envoy-config --lib` → 131 passed (was 129; +2); all 5 gate commands clean.
