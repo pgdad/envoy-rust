@@ -5,6 +5,7 @@
 //! ADR-0008 for the extraction rationale.
 
 pub mod bootstrap;
+pub mod matcher;
 
 pub use bootstrap::{
     Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType, CodecType,
