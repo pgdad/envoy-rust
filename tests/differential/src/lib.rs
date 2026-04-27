@@ -59,6 +59,20 @@ pub enum Driver {
     TlsTcpProbeList {
         probes: Vec<TlsTcpProbe>,
     },
+    /// 04.1 NEW: drive an HTTP/1.1 request and assert the response shape.
+    /// Async I/O lives in Task 14's `drive_http1`; this variant only carries
+    /// grammar. Per SPEC §3 D5.
+    Http1 {
+        method: Http1Method,
+        path: String,
+        host: String,
+        #[serde(default)]
+        expected_status: Option<u16>,
+        #[serde(default)]
+        expected_body: Option<Http1BodyRule>,
+        #[serde(default)]
+        expected_headers: Option<Http1HeaderRule>,
+    },
 }
 
 /// One TLS-SNI probe entry inside `Driver::TlsTcpProbeList`. SPEC §D6.
@@ -89,6 +103,118 @@ pub enum StatusRule {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BodyRule {
     ByteExact,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Http1Method {
+    Get,
+    // 04.3 may add Post for upstream-proxy fixture; otherwise 04.x is GET-only.
+}
+
+impl Http1Method {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Http1Method::Get => "GET",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Http1BodyRule {
+    /// Body must equal these bytes exactly (the expected value comes from
+    /// the fixture's expectations.yaml). Distinct from the harness-level
+    /// `BodyRule::ByteExact` which compares envoy ↔ envoy-rust outputs.
+    ByteExact { bytes: Vec<u8> },
+    // 04.3 may add ByteExactWithRequestEcho — for the http1-echo-server's
+    // deterministic echo response shape.
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Http1HeaderRule {
+    SetEqualModuloAllowList,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowMode {
+    NameRequired,
+    // future: NameOptional, ValueRegex, ValueOneOf, ...
+}
+
+/// Header allow-list per BEHAVIOR_CONTRACT.md `Header allow-list` table.
+/// Sourced from the contract; updates to the contract update this constant
+/// in lockstep. 04.1 adds `server` and `date`.
+pub const HEADER_ALLOW_LIST: &[(&str, AllowMode)] = &[
+    ("server", AllowMode::NameRequired),
+    ("date", AllowMode::NameRequired),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveHttp1Result {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Set-equal modulo allow-list: case-insensitive name set equality, plus
+/// value-exact match for any name not on the allow-list.
+pub fn diff_headers(
+    envoy: &[(String, String)],
+    envoy_rust: &[(String, String)],
+    allow_list: &[(&str, AllowMode)],
+) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+
+    fn names_lc(headers: &[(String, String)]) -> BTreeSet<String> {
+        headers
+            .iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect()
+    }
+
+    let envoy_names = names_lc(envoy);
+    let envoy_rust_names = names_lc(envoy_rust);
+
+    if envoy_names != envoy_rust_names {
+        let only_envoy: Vec<_> = envoy_names.difference(&envoy_rust_names).collect();
+        let only_rust: Vec<_> = envoy_rust_names.difference(&envoy_names).collect();
+        anyhow::bail!(
+            "header name sets differ: only-in-envoy={only_envoy:?}, only-in-envoy-rust={only_rust:?}"
+        );
+    }
+
+    for name in envoy_names.iter() {
+        let allow_entry = allow_list
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name));
+        let envoy_value = envoy
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let rust_value = envoy_rust
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+
+        match allow_entry {
+            Some((_, AllowMode::NameRequired)) => {
+                // Skip value comparison.
+            }
+            None => {
+                if envoy_value != rust_value {
+                    anyhow::bail!(
+                        "header `{name}`: envoy=`{envoy_value}` envoy-rust=`{rust_value}`"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn load_expectations(path: &Path) -> Result<Expectations> {
@@ -563,7 +689,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let upstream_port_str = upstream::CONTAINER_PORT.to_string();
     let subject_port_str = host_port.to_string();
     let port_key = match &expectations.driver {
-        Driver::TcpEcho | Driver::TlsTcp { .. } | Driver::TlsTcpProbeList { .. } => "PORT",
+        Driver::TcpEcho
+        | Driver::TlsTcp { .. }
+        | Driver::TlsTcpProbeList { .. }
+        | Driver::Http1 { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
     };
 
@@ -800,6 +929,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 .context("envoy-rust tls probes")?;
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
+        }
+        // 04.1 Task 13: grammar lands here; the async `drive_http1` helper
+        // and full equivalence dispatch arrive in Task 14. Bail with a clear
+        // message so a fixture rendered with `kind: http1` against a
+        // pre-Task-14 build doesn't silently pass.
+        Driver::Http1 { .. } => {
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+            bail!("Driver::Http1 dispatch is not implemented yet (lands in phase 04.1 Task 14)");
         }
     }
 
@@ -1427,5 +1565,51 @@ server_key: {{SERVER_KEY_PATH}}
         assert!(matches!(e.driver, Driver::TcpEcho));
         assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
         assert_eq!(e.equivalence.response_status, None);
+    }
+
+    #[test]
+    fn diff_headers_passes_set_equal_modulo_allow_list() {
+        let envoy = vec![
+            ("server".to_string(), "envoy".to_string()),
+            (
+                "date".to_string(),
+                "Sun, 06 Nov 1994 08:49:37 GMT".to_string(),
+            ),
+            ("content-length".to_string(), "3".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("connection".to_string(), "keep-alive".to_string()),
+        ];
+        let envoy_rust = vec![
+            ("server".to_string(), "envoy-rust".to_string()),
+            (
+                "date".to_string(),
+                "Mon, 07 Nov 1994 12:00:00 GMT".to_string(),
+            ),
+            ("content-length".to_string(), "3".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("connection".to_string(), "keep-alive".to_string()),
+        ];
+        diff_headers(&envoy, &envoy_rust, HEADER_ALLOW_LIST).expect("server+date allow-listed");
+    }
+
+    #[test]
+    fn diff_headers_fails_on_value_diff_outside_allow_list() {
+        let envoy = vec![("content-length".to_string(), "3".to_string())];
+        let envoy_rust = vec![("content-length".to_string(), "4".to_string())];
+        let err = diff_headers(&envoy, &envoy_rust, HEADER_ALLOW_LIST)
+            .expect_err("content-length value mismatch");
+        assert!(err.to_string().contains("content-length"), "msg: {err}");
+    }
+
+    #[test]
+    fn diff_headers_fails_on_name_set_diff() {
+        let envoy = vec![
+            ("x-foo".to_string(), "1".to_string()),
+            ("date".to_string(), "...".to_string()),
+        ];
+        let envoy_rust = vec![("date".to_string(), "...".to_string())];
+        let err = diff_headers(&envoy, &envoy_rust, HEADER_ALLOW_LIST)
+            .expect_err("envoy emits x-foo, envoy-rust does not");
+        assert!(err.to_string().contains("x-foo"), "msg: {err}");
     }
 }
