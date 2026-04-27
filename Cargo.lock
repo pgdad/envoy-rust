@@ -323,6 +323,7 @@ dependencies = [
  "anyhow",
  "envoy-cluster",
  "envoy-config",
+ "envoy-http1",
  "envoy-listener",
  "envoy-tcp",
  "envoy-tls",

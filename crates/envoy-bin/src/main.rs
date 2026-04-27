@@ -174,51 +174,12 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         None => std::sync::Arc::new(envoy_tcp::TcpProxy::new(cluster, tp_cfg)),
                     };
 
-                // 03.2: three-way TLS dispatch per SPEC §D5 step 1.
-                //   plaintext   -> no DownstreamTls; bare proxy.
-                //   single-cert -> from_context (03.1 path; fixtures 0001-0004).
-                //   multi-cert  -> from_listener (03.2 path; fixture 0006).
-                // The validator already rejected the wrong direction
-                // (UpstreamTlsContext on a listener) and the wrong name
-                // (anything not `envoy.transport_sockets.tls`), so the
-                // `Upstream(...)` arm below is unreachable in practice.
-                let any_chain_has_tls = listener_cfg
-                    .filter_chains
-                    .iter()
-                    .any(|c| c.transport_socket.is_some());
-                let any_chain_has_server_names = listener_cfg.filter_chains.iter().any(|c| {
-                    c.filter_chain_match
-                        .as_ref()
-                        .map(|m| !m.server_names.is_empty())
-                        .unwrap_or(false)
-                });
-
-                let downstream_tls: Option<std::sync::Arc<envoy_tls::DownstreamTls>> =
-                    if !any_chain_has_tls {
-                        None
-                    } else if listener_cfg.filter_chains.len() == 1 && !any_chain_has_server_names {
-                        let chain = &listener_cfg.filter_chains[0];
-                        let socket = chain
-                            .transport_socket
-                            .as_ref()
-                            .expect("any_chain_has_tls implies Some on the single chain");
-                        let envoy_config::TransportSocketTypedConfig::Downstream(ctx) =
-                            &socket.typed_config
-                        else {
-                            anyhow::bail!(
-                                "validator should have rejected upstream transport_socket on listener",
-                            );
-                        };
-                        Some(std::sync::Arc::new(
-                            envoy_tls::DownstreamTls::from_context(ctx)
-                                .context("building DownstreamTls from single-chain context")?,
-                        ))
-                    } else {
-                        Some(std::sync::Arc::new(
-                            envoy_tls::DownstreamTls::from_listener(listener_cfg)
-                                .context("building DownstreamTls from multi-chain listener")?,
-                        ))
-                    };
+                // 03.2: three-way TLS dispatch per SPEC §D5 step 1, factored
+                // through `build_downstream_tls_for_listener` (04.1 task 11)
+                // so the new HCM arm below shares the same per-listener
+                // logic. See the helper for the plaintext / single-cert /
+                // multi-cert branching.
+                let downstream_tls = build_downstream_tls_for_listener(listener_cfg)?;
 
                 let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
                     match downstream_tls {
@@ -233,6 +194,56 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     .await
                     .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
                 tracing::info!(addr = %bind_addr, cluster = %tp_cfg.cluster, "envoy-rust listening (tcp_proxy)");
+                let shutdown = token.clone();
+                set.spawn(async move {
+                    listener
+                        .serve(async move { shutdown.cancelled().await })
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                });
+            }
+            envoy_config::HCM_FILTER => {
+                let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm_cfg)) =
+                    filter.typed_config.as_ref()
+                else {
+                    anyhow::bail!(
+                        "filter '{}' missing typed_config; envoy-config validator should have rejected at parse time",
+                        envoy_config::HCM_FILTER,
+                    );
+                };
+
+                let hcm_config = std::sync::Arc::new(envoy_http1::HCMConfig::from_config(hcm_cfg)?);
+                let hcm: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
+                    std::sync::Arc::new(envoy_http1::HCM { config: hcm_config });
+
+                // Per-listener TLS detection (factored to
+                // `build_downstream_tls_for_listener` at task 11). The
+                // TLS-wrap path is unreachable in 04.x fixtures (no 04.x
+                // fixture combines HTTP/1.1 + TLS) — the existing
+                // `TlsAcceptingHandler` is hard-coded to `Arc<TcpProxy>`
+                // (per the inherent-generic `handle::<S>` design in
+                // `tls_handler.rs`), so wrapping HCM in TLS requires
+                // generalizing the adapter, which is deliberately deferred
+                // to phase 05+ per SPEC §3 D4. We still detect-and-bail
+                // here so a misconfigured HCM+TLS listener fails loudly
+                // rather than silently serving plaintext on a TLS port.
+                if build_downstream_tls_for_listener(listener_cfg)?.is_some() {
+                    anyhow::bail!(
+                        "HCM listener with downstream TLS is not supported in phase 04.x; \
+                         TlsAcceptingHandler is currently TcpProxy-only and will be \
+                         generalized in phase 05+ (SPEC §3 D4)",
+                    );
+                }
+                let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = hcm;
+
+                let listener = envoy_listener::Listener::bind(listener_cfg, handler)
+                    .await
+                    .with_context(|| format!("binding HCM listener to {bind_addr}"))?;
+                tracing::info!(
+                    addr = %bind_addr,
+                    stat_prefix = %hcm_cfg.stat_prefix,
+                    "envoy-rust listening (http_connection_manager)",
+                );
                 let shutdown = token.clone();
                 set.spawn(async move {
                     listener
@@ -271,6 +282,54 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     }
     tracing::info!("envoy-rust exited cleanly");
     Ok(())
+}
+
+/// 03.2 three-way downstream-TLS construction, factored at 04.1 task 11 so
+/// both the TcpProxy and HCM dispatch arms share one implementation.
+///
+///   plaintext   -> `Ok(None)` (no chain has `transport_socket`).
+///   single-cert -> `DownstreamTls::from_context` (03.1 path; fixtures 0001-0004).
+///   multi-cert  -> `DownstreamTls::from_listener` (03.2 path; fixture 0006).
+///
+/// The validator already rejects the wrong direction (`UpstreamTlsContext`
+/// on a listener) and the wrong name (anything not
+/// `envoy.transport_sockets.tls`), so the `Upstream(...)` arm below is
+/// unreachable in practice but kept defensively.
+fn build_downstream_tls_for_listener(
+    listener_cfg: &envoy_config::Listener,
+) -> Result<Option<std::sync::Arc<envoy_tls::DownstreamTls>>> {
+    let any_chain_has_tls = listener_cfg
+        .filter_chains
+        .iter()
+        .any(|c| c.transport_socket.is_some());
+    let any_chain_has_server_names = listener_cfg.filter_chains.iter().any(|c| {
+        c.filter_chain_match
+            .as_ref()
+            .map(|m| !m.server_names.is_empty())
+            .unwrap_or(false)
+    });
+
+    if !any_chain_has_tls {
+        Ok(None)
+    } else if listener_cfg.filter_chains.len() == 1 && !any_chain_has_server_names {
+        let chain = &listener_cfg.filter_chains[0];
+        let socket = chain
+            .transport_socket
+            .as_ref()
+            .expect("any_chain_has_tls implies Some on the single chain");
+        let envoy_config::TransportSocketTypedConfig::Downstream(ctx) = &socket.typed_config else {
+            anyhow::bail!("validator should have rejected upstream transport_socket on listener",);
+        };
+        Ok(Some(std::sync::Arc::new(
+            envoy_tls::DownstreamTls::from_context(ctx)
+                .context("building DownstreamTls from single-chain context")?,
+        )))
+    } else {
+        Ok(Some(std::sync::Arc::new(
+            envoy_tls::DownstreamTls::from_listener(listener_cfg)
+                .context("building DownstreamTls from multi-chain listener")?,
+        )))
+    }
 }
 
 async fn shutdown_signal() {

@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow = "1"
 envoy-cluster = { path = "../envoy-cluster" }
 envoy-config = { path = "../envoy-config" }
+envoy-http1 = { path = "../envoy-http1" }
 envoy-listener = { path = "../envoy-listener" }
 envoy-tcp = { path = "../envoy-tcp" }
 envoy-tls = { path = "../envoy-tls" }
