@@ -98,3 +98,10 @@
 - Commit: 8330a86
 - Change: appended `Connection: close\r\n` to each of the 5 new HCM test request literals (route_with_no_headers_matches_unchanged, single_header_matcher_route_selected_when_match, single_header_matcher_route_skipped_when_no_match, multi_header_matcher_and_combination_all_match, multi_header_matcher_and_combination_one_fails). Without it, the server-side serve_connection loop kept the connection open until the 5s idle timeout fired before the test's `read_to_end()` returned, costing 5s per test in isolation. Aligns the 04.2 tests with the established 04.1 cadence (every 04.1 test in hcm.rs sends Connection: close).
 - Verification: all 5 new tests pass in <1s each (was ~5s); 24 envoy-http1 tests passing; gate clean.
+
+## Task 8 — fuzz corpus extension (route_with_header_matchers seed) (2026-04-27)
+
+- Commit: 132d55f
+- Change: created crates/envoy-config/fuzz/corpus/parse_bootstrap/route_with_header_matchers.yaml exercising 5 of the 7 HeaderMatcher modes simultaneously (exact_match, safe_regex_match, range_match, present_match, string_match-with-contains-and-ignore_case) inside a single Route's headers Vec. Added the corresponding allow-list entry to crates/envoy-config/fuzz/.gitignore. Extended bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly's parse-Ok list with the new seed.
+- Verification: `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → PASS; `cargo test -p envoy-config --lib` → 131 passed (unchanged — corpus-walk test was already counted; only its enumeration grew); clippy + fmt + build clean.
+- Deviations: none.
