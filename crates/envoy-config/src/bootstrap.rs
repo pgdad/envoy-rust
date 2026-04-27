@@ -845,6 +845,9 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                         // reject it as MissingTypedConfig (preserving the
                         // pre-04.1 error surface — the typed_config under the
                         // tcp_proxy name is not a TcpProxyConfig).
+                        // Read-only: TCP_PROXY validation does not mutate typed_config
+                        // (unlike HCM_FILTER's `as_mut()` arm below — `as_ref()` reborrows
+                        // a `&mut filter` as `&filter` which Rust permits).
                         let typed = filter.typed_config.as_ref().ok_or(
                             crate::ConfigError::MissingTypedConfig(crate::TCP_PROXY_FILTER),
                         )?;
