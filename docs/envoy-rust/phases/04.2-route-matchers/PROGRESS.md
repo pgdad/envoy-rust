@@ -17,3 +17,9 @@
 - Tests added (4): parses_int64_range, rejects_unknown_field_in_int64_range, parses_safe_regex, safe_regex_partial_eq_compares_only_regex_string.
 - Verification: `cargo test -p envoy-config --lib` → 79 passed; clippy + fmt + build clean.
 - Deviations: none.
+
+### Task 2 follow-up — review fix (2026-04-27)
+
+- Commit: 5a6b950db5da2191e220e20ac4f7422b506313b0
+- Change: amended the `SafeRegex` Deserialize doc-comment in bootstrap.rs to replace the misleading "`#[serde(skip)]` would leave the field absent" justification with the accurate template-setting rationale (Tasks 3+4 reuse the visitor pattern for field-name oneof discrimination on StringMatcher / HeaderMatcher, where `#[serde(untagged)]` + `#[serde(tag)]` are both wrong; the two-phase init contract is named explicitly). Comment-only change; no semantic impact on Task 2 code.
+- Verification: gate commands clean (build / clippy / fmt / test / deny all exit 0; 79 tests passing — unchanged from Task 2).
