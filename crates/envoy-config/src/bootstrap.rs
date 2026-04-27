@@ -729,18 +729,18 @@ impl<'de> serde::Deserialize<'de> for HeaderMatcher {
     }
 }
 
-pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
-    let listeners = &bootstrap.static_resources.listeners;
-    let clusters = &bootstrap.static_resources.clusters;
-    if listeners.len() > 1 {
-        return Err(crate::ConfigError::TooManyListeners(listeners.len()));
+pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigError> {
+    if bootstrap.static_resources.listeners.len() > 1 {
+        return Err(crate::ConfigError::TooManyListeners(
+            bootstrap.static_resources.listeners.len(),
+        ));
     }
-    if bootstrap.admin.is_none() && listeners.is_empty() {
+    if bootstrap.admin.is_none() && bootstrap.static_resources.listeners.is_empty() {
         return Err(crate::ConfigError::NoRuntime);
     }
 
     // Per-cluster invariants.
-    for cluster in clusters {
+    for cluster in &bootstrap.static_resources.clusters {
         if cluster.load_assignment.cluster_name != cluster.name {
             return Err(crate::ConfigError::LoadAssignmentNameMismatch {
                 cluster: cluster.name.clone(),
@@ -794,8 +794,8 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
     }
 
     // Per-listener invariants.
-    for listener in listeners {
-        for chain in &listener.filter_chains {
+    for listener in &mut bootstrap.static_resources.listeners {
+        for chain in &mut listener.filter_chains {
             if let Some(ts) = chain.transport_socket.as_ref() {
                 if ts.name != crate::TLS_TRANSPORT_SOCKET {
                     return Err(crate::ConfigError::UnknownTransportSocketName(
@@ -830,7 +830,7 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                     }
                 }
             }
-            for filter in &chain.filters {
+            for filter in &mut chain.filters {
                 match filter.name.as_str() {
                     crate::ECHO_FILTER => {
                         if filter.typed_config.is_some() {
@@ -853,14 +853,20 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                                 crate::TCP_PROXY_FILTER,
                             ));
                         };
-                        if !clusters.iter().any(|c| c.name == tp.cluster) {
-                            return Err(crate::ConfigError::UnknownCluster(tp.cluster.clone()));
+                        let cluster_name = tp.cluster.clone();
+                        if !bootstrap
+                            .static_resources
+                            .clusters
+                            .iter()
+                            .any(|c| c.name == cluster_name)
+                        {
+                            return Err(crate::ConfigError::UnknownCluster(cluster_name));
                         }
                     }
                     crate::HCM_FILTER => {
                         let typed = filter
                             .typed_config
-                            .as_ref()
+                            .as_mut()
                             .ok_or(crate::ConfigError::MissingTypedConfig(crate::HCM_FILTER))?;
                         let TypedConfig::HttpConnectionManager(hcm) = typed else {
                             return Err(crate::ConfigError::MissingTypedConfig(crate::HCM_FILTER));
@@ -938,7 +944,7 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
 
 /// Validate a fully-parsed `HttpConnectionManagerConfig` against the phase-04.1
 /// surface. SPEC §3 D2 enumerates the rejections this function fires.
-fn validate_hcm(hcm: &HttpConnectionManagerConfig) -> Result<(), crate::ConfigError> {
+fn validate_hcm(hcm: &mut HttpConnectionManagerConfig) -> Result<(), crate::ConfigError> {
     // codec_type: only AUTO and HTTP1 are runtime-supported in phase 04.
     match hcm.codec_type {
         CodecType::AUTO | CodecType::HTTP1 => {}
@@ -969,7 +975,7 @@ fn validate_hcm(hcm: &HttpConnectionManagerConfig) -> Result<(), crate::ConfigEr
             route_config: hcm.route_config.name.clone(),
         });
     }
-    for vh in &hcm.route_config.virtual_hosts {
+    for vh in &mut hcm.route_config.virtual_hosts {
         if vh.domains.is_empty() {
             return Err(crate::ConfigError::EmptyDomains {
                 virtual_host: vh.name.clone(),
@@ -985,7 +991,7 @@ fn validate_hcm(hcm: &HttpConnectionManagerConfig) -> Result<(), crate::ConfigEr
                 virtual_host: vh.name.clone(),
             });
         }
-        for r in &vh.routes {
+        for r in &mut vh.routes {
             // RouteMatch: exactly one of {prefix, path} is Some.
             match (&r.r#match.prefix, &r.r#match.path) {
                 (Some(_), None) | (None, Some(_)) => {}
@@ -1012,6 +1018,11 @@ fn validate_hcm(hcm: &HttpConnectionManagerConfig) -> Result<(), crate::ConfigEr
                 "direct_response.body",
                 Required::InlineString,
             )?;
+
+            // 04.2 NEW: walk the headers Vec.
+            for hm in &mut r.r#match.headers {
+                validate_header_matcher(hm)?;
+            }
         }
     }
     Ok(())
@@ -1086,6 +1097,54 @@ fn is_valid_dns_name(name: &str) -> bool {
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
+}
+
+/// Validate a single [`HeaderMatcher`] and, for SafeRegex modes (top-level or
+/// nested via [`StringMatcher`]), compile the regex pattern into
+/// `Arc<regex::Regex>` stored back on [`SafeRegex::compiled`]. Phase 04.2
+/// (under ADR-0021).
+fn validate_header_matcher(hm: &mut HeaderMatcher) -> Result<(), crate::ConfigError> {
+    if hm.name.is_empty() {
+        return Err(crate::ConfigError::EmptyHeaderName);
+    }
+    match &mut hm.mode {
+        HeaderMatcherMode::ExactMatch(_)
+        | HeaderMatcherMode::PrefixMatch(_)
+        | HeaderMatcherMode::SuffixMatch(_)
+        | HeaderMatcherMode::PresentMatch(_) => {}
+        HeaderMatcherMode::SafeRegexMatch(sr) => compile_safe_regex(sr)?,
+        HeaderMatcherMode::RangeMatch(r) => {
+            if r.start >= r.end {
+                return Err(crate::ConfigError::InvalidInt64Range {
+                    start: r.start,
+                    end: r.end,
+                });
+            }
+        }
+        HeaderMatcherMode::StringMatch(sm) => match &mut sm.mode {
+            StringMatcherMode::Exact(_)
+            | StringMatcherMode::Prefix(_)
+            | StringMatcherMode::Suffix(_)
+            | StringMatcherMode::Contains(_) => {}
+            StringMatcherMode::SafeRegex(sr) => compile_safe_regex(sr)?,
+        },
+    }
+    Ok(())
+}
+
+/// Compile `sr.regex` into a [`regex::Regex`] and store it on
+/// `sr.compiled`. Returns [`crate::ConfigError::InvalidRegex`] on failure.
+fn compile_safe_regex(sr: &mut SafeRegex) -> Result<(), crate::ConfigError> {
+    match regex::Regex::new(&sr.regex) {
+        Ok(re) => {
+            sr.compiled = Some(std::sync::Arc::new(re));
+            Ok(())
+        }
+        Err(e) => Err(crate::ConfigError::InvalidRegex {
+            regex: sr.regex.clone(),
+            source: e,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -3005,8 +3064,8 @@ case_sensitive: true
     // --- phase 04.1 Task 2: HCM validator tests ---
 
     fn parse_then_validate(yaml: &str) -> Result<Bootstrap, crate::ConfigError> {
-        let bs: Bootstrap = serde_yaml::from_str(yaml)?;
-        validate(&bs)?;
+        let mut bs: Bootstrap = serde_yaml::from_str(yaml)?;
+        validate(&mut bs)?;
         Ok(bs)
     }
 
@@ -3499,6 +3558,370 @@ prefix_match: "b"
             err.contains("multiple mode keys") || err.contains("mutually exclusive"),
             "error should mention mutual exclusivity: {err}"
         );
+    }
+
+    // --- phase 04.2 Task 5: HeaderMatcher validator tests ---
+
+    #[test]
+    fn rejects_empty_header_name() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: ""
+                                exact_match: "bar"
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let err = parse_then_validate(&yaml).expect_err("validator rejects");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyHeaderName),
+            "expected EmptyHeaderName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_regex_in_safe_regex_match() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-foo"
+                                safe_regex_match:
+                                  regex: "[unclosed"
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let err = parse_then_validate(&yaml).expect_err("validator rejects");
+        assert!(
+            matches!(err, crate::ConfigError::InvalidRegex { .. }),
+            "expected InvalidRegex, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_regex_in_string_match_safe_regex() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-foo"
+                                string_match:
+                                  safe_regex:
+                                    regex: "(?P<oops"
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let err = parse_then_validate(&yaml).expect_err("validator rejects");
+        assert!(matches!(err, crate::ConfigError::InvalidRegex { .. }));
+    }
+
+    #[test]
+    fn rejects_invalid_int64_range_start_eq_end() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-version"
+                                range_match: { start: 100, end: 100 }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let err = parse_then_validate(&yaml).expect_err("validator rejects");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidInt64Range {
+                    start: 100,
+                    end: 100
+                }
+            ),
+            "expected InvalidInt64Range {{100,100}}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_int64_range_start_gt_end() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-version"
+                                range_match: { start: 200, end: 100 }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let err = parse_then_validate(&yaml).expect_err("validator rejects");
+        assert!(matches!(err, crate::ConfigError::InvalidInt64Range { .. }));
+    }
+
+    #[test]
+    fn validator_compiles_safe_regex_match_into_arc() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-version"
+                                safe_regex_match:
+                                  regex: "^v[0-9]+$"
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("parses + validates");
+        let listener = &bs.static_resources.listeners[0];
+        let TypedConfig::HttpConnectionManager(hcm) = listener.filter_chains[0].filters[0]
+            .typed_config
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("not HCM");
+        };
+        let header_matcher = &hcm.route_config.virtual_hosts[0].routes[0].r#match.headers[0];
+        let HeaderMatcherMode::SafeRegexMatch(sr) = &header_matcher.mode else {
+            panic!("not SafeRegexMatch");
+        };
+        assert!(sr.compiled.is_some(), "validator should have compiled");
+    }
+
+    #[test]
+    fn validator_accepts_all_seven_modes() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - { name: "h1", exact_match: "x" }
+                              - { name: "h2", prefix_match: "p" }
+                              - { name: "h3", suffix_match: "s" }
+                              - { name: "h4", safe_regex_match: { regex: "^v[0-9]+$" } }
+                              - { name: "h5", range_match: { start: 1, end: 100 } }
+                              - { name: "h6", present_match: true }
+                              - { name: "h7", string_match: { contains: "c", ignore_case: true } }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("parses + validates");
+        let listener = &bs.static_resources.listeners[0];
+        let TypedConfig::HttpConnectionManager(hcm) = listener.filter_chains[0].filters[0]
+            .typed_config
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("not HCM");
+        };
+        assert_eq!(
+            hcm.route_config.virtual_hosts[0].routes[0]
+                .r#match
+                .headers
+                .len(),
+            7
+        );
+    }
+
+    #[test]
+    fn validator_accepts_empty_headers_vec() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        crate::parse_bootstrap(&yaml).expect("parses + validates");
+    }
+
+    #[test]
+    fn validator_accepts_invert_match_true() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-foo"
+                                exact_match: "bar"
+                                invert_match: true
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        crate::parse_bootstrap(&yaml).expect("parses + validates");
+    }
+
+    #[test]
+    fn validator_compiles_string_match_safe_regex_into_arc() {
+        let yaml = make_hcm_listener_yaml(
+            r#"
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-tag"
+                                string_match:
+                                  safe_regex:
+                                    regex: "^beta$"
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#,
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("parses + validates");
+        let listener = &bs.static_resources.listeners[0];
+        let TypedConfig::HttpConnectionManager(hcm) = listener.filter_chains[0].filters[0]
+            .typed_config
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("not HCM");
+        };
+        let header_matcher = &hcm.route_config.virtual_hosts[0].routes[0].r#match.headers[0];
+        let HeaderMatcherMode::StringMatch(sm) = &header_matcher.mode else {
+            panic!("not StringMatch");
+        };
+        let StringMatcherMode::SafeRegex(sr) = &sm.mode else {
+            panic!("not SafeRegex");
+        };
+        assert!(sr.compiled.is_some(), "nested regex should be compiled");
     }
 
     #[test]

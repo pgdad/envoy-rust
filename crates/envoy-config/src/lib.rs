@@ -164,7 +164,7 @@ pub enum ConfigError {
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
-    let bootstrap: Bootstrap = serde_yaml::from_str(yaml)?;
-    bootstrap::validate(&bootstrap)?;
+    let mut bootstrap: Bootstrap = serde_yaml::from_str(yaml)?;
+    bootstrap::validate(&mut bootstrap)?;
     Ok(bootstrap)
 }
