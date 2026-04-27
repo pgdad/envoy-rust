@@ -224,8 +224,12 @@ fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
         }
     };
 
-    // Walk routes first-match-wins on path.
-    let route = match vh.routes.iter().find(|r| route_matches(r, &req.path)) {
+    // Walk routes first-match-wins on path + headers.
+    let route = match vh
+        .routes
+        .iter()
+        .find(|r| route_matches(r, &req.path, &req.headers))
+    {
         Some(r) => r,
         None => {
             tracing::warn!(
@@ -261,12 +265,17 @@ fn vh_matches(vh: &VirtualHost, host: &str) -> bool {
     })
 }
 
-fn route_matches(r: &Route, path: &str) -> bool {
-    match (&r.r#match.prefix, &r.r#match.path) {
+fn route_matches(r: &Route, path: &str, headers: &[(String, String)]) -> bool {
+    let path_match = match (&r.r#match.prefix, &r.r#match.path) {
         (Some(p), None) => path.starts_with(p),
         (None, Some(p)) => path == p,
         _ => false, // validator rejects (Some, Some) and (None, None).
+    };
+    if !path_match {
+        return false;
     }
+    // 04.2: AND-combine HeaderMatchers per Envoy default headers_match_options: ALL.
+    r.r#match.headers.iter().all(|m| m.matches(headers))
 }
 
 fn now_imf_fixdate() -> String {
@@ -592,6 +601,213 @@ mod tests {
         // Two responses concatenated. Each starts with "HTTP/1.1 200 OK".
         let count_200 = s.matches("HTTP/1.1 200 OK\r\n").count();
         assert_eq!(count_200, 2, "expected 2 responses, got: {s}");
+    }
+
+    /// Build a minimal HCMConfig with a single VH `domains: ["*"]` and the
+    /// given routes. Used by 04.2 header-matcher tests.
+    fn build_test_config(routes: Vec<Route>) -> Arc<HCMConfig> {
+        Arc::new(HCMConfig {
+            stat_prefix: "test".into(),
+            route_config: Arc::new(RouteConfiguration {
+                name: "test_rc".into(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "test_vh".into(),
+                    domains: vec!["*".into()],
+                    routes,
+                }],
+            }),
+        })
+    }
+
+    // ── 04.2 header-matcher HCM integration tests ────────────────────────────
+
+    #[tokio::test]
+    async fn route_with_no_headers_matches_unchanged() {
+        // Regression: a route with empty headers Vec still matches on path only.
+        let cfg = build_test_config(vec![Route {
+            r#match: RouteMatch {
+                prefix: Some("/".into()),
+                path: None,
+                headers: vec![],
+            },
+            direct_response: DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("ok\n".into()),
+                },
+            },
+        }]);
+        let req = b"GET /healthz HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        assert!(std::str::from_utf8(&resp).unwrap().contains("200 OK"));
+    }
+
+    #[tokio::test]
+    async fn single_header_matcher_route_selected_when_match() {
+        let matcher_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/api/".into()),
+                path: None,
+                headers: vec![envoy_config::HeaderMatcher {
+                    name: "x-foo".into(),
+                    mode: envoy_config::HeaderMatcherMode::ExactMatch("bar".into()),
+                    invert_match: false,
+                }],
+            },
+            direct_response: DirectResponse {
+                status: 418,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("teapot\n".into()),
+                },
+            },
+        };
+        let default_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/".into()),
+                path: None,
+                headers: vec![],
+            },
+            direct_response: DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("ok\n".into()),
+                },
+            },
+        };
+        let cfg = build_test_config(vec![matcher_route, default_route]);
+        let req =
+            b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-Foo: bar\r\nContent-Length: 0\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("418"), "expected 418 teapot, got: {s}");
+        assert!(s.contains("teapot\n"));
+    }
+
+    #[tokio::test]
+    async fn single_header_matcher_route_skipped_when_no_match() {
+        let matcher_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/api/".into()),
+                path: None,
+                headers: vec![envoy_config::HeaderMatcher {
+                    name: "x-foo".into(),
+                    mode: envoy_config::HeaderMatcherMode::ExactMatch("bar".into()),
+                    invert_match: false,
+                }],
+            },
+            direct_response: DirectResponse {
+                status: 418,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("teapot\n".into()),
+                },
+            },
+        };
+        let default_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/".into()),
+                path: None,
+                headers: vec![],
+            },
+            direct_response: DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("ok\n".into()),
+                },
+            },
+        };
+        let cfg = build_test_config(vec![matcher_route, default_route]);
+        // /api/widgets but no X-Foo header → falls through to default 200.
+        let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("200 OK"), "expected 200, got: {s}");
+    }
+
+    #[tokio::test]
+    async fn multi_header_matcher_and_combination_all_match() {
+        let matcher_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/".into()),
+                path: None,
+                headers: vec![
+                    envoy_config::HeaderMatcher {
+                        name: "x-a".into(),
+                        mode: envoy_config::HeaderMatcherMode::ExactMatch("1".into()),
+                        invert_match: false,
+                    },
+                    envoy_config::HeaderMatcher {
+                        name: "x-b".into(),
+                        mode: envoy_config::HeaderMatcherMode::ExactMatch("2".into()),
+                        invert_match: false,
+                    },
+                ],
+            },
+            direct_response: DirectResponse {
+                status: 418,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("teapot\n".into()),
+                },
+            },
+        };
+        let cfg = build_test_config(vec![matcher_route]);
+        let req =
+            b"GET / HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: 2\r\nContent-Length: 0\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        assert!(std::str::from_utf8(&resp).unwrap().contains("418"));
+    }
+
+    #[tokio::test]
+    async fn multi_header_matcher_and_combination_one_fails() {
+        let matcher_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/api/".into()),
+                path: None,
+                headers: vec![
+                    envoy_config::HeaderMatcher {
+                        name: "x-a".into(),
+                        mode: envoy_config::HeaderMatcherMode::ExactMatch("1".into()),
+                        invert_match: false,
+                    },
+                    envoy_config::HeaderMatcher {
+                        name: "x-b".into(),
+                        mode: envoy_config::HeaderMatcherMode::ExactMatch("2".into()),
+                        invert_match: false,
+                    },
+                ],
+            },
+            direct_response: DirectResponse {
+                status: 418,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("teapot\n".into()),
+                },
+            },
+        };
+        let default_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/".into()),
+                path: None,
+                headers: vec![],
+            },
+            direct_response: DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("ok\n".into()),
+                },
+            },
+        };
+        let cfg = build_test_config(vec![matcher_route, default_route]);
+        // X-A matches, X-B does not → matcher route fails, fall through to default.
+        let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: WRONG\r\nContent-Length: 0\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        assert!(std::str::from_utf8(&resp).unwrap().contains("200 OK"));
     }
 
     #[tokio::test]
