@@ -119,3 +119,19 @@
   2. **rustfmt reformat — `tokio::time::timeout(...).await { … }`** — rustfmt collapsed the two-line `match … .await\n{` form back onto one line (`match … .await {`) at the inner read site of `serve_connection`. Applied the reformat. No semantic change.
   3. **rustfmt reformat — multi-line `assert!(resp_str.contains(...), "…: {resp_str}")` calls** — rustfmt re-collapsed several test assertions back onto a single line where they fit within the column limit. Applied. No semantic change.
 - ADRs: none in this task. ADR ledger head remains 20.
+
+### Task 10 follow-up — review fixes (2026-04-27)
+- Commit: a6f7b5e
+- Change: applied 4 review fixes to `crates/envoy-http1/src/hcm.rs`:
+  1. **`tracing::warn!` on 400/404/501 paths** — added structured-field warns at the four error call sites (missing/empty-Host, no-VH-match, no-route-match, chunked-501). Closes the PLAN.md line 1151 deviation ("04.1's HCM uses `tracing::warn!` only on the 400/404/501 error paths") — the dep was already in `Cargo.toml` but had zero call sites until this commit. Placed at call sites in `build_response`/`serve_connection` rather than inside the synth helpers so each warn carries request context (method/path; host where available).
+  2. **Empty Host header → 400** — combined the missing-Host and empty-Host (`Host: \r\n` → `Some("")`) cases into one `Some(h) if !h.is_empty() => h, _ => …` arm, sharing one `tracing::warn!` site. Same RFC §5.4 violation; differential gap (Task 16 would otherwise diverge against Envoy's behavior on empty Host).
+  3. **`keep_alive_serves_two_requests` test** — added a 7th HCM test that pipes two requests over one connection (req1 default keep-alive, req2 `Connection: close` to trigger EOF), asserts `"HTTP/1.1 200 OK\r\n"` appears twice in the response stream. Exercises the parse-then-read loop's already-buffered-pipelined-bytes path on the second iteration — previously untested by the 6 PLAN-named tests.
+  4. **`chunked_request_rejected_with_501` test** — added an 8th HCM test asserting `Transfer-Encoding: chunked` requests get `501 Not Implemented`. The 501 branch was in spec but untested.
+- Verification: `cargo test -p envoy-http1` → 19 passed, 0 failed (17 → 19, +2). `cargo build --workspace --all-targets` clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean. `cargo fmt --all -- --check` clean.
+- Known divergences from RFC / Envoy that 04.1 deliberately accepts (carried forward, surfaced here per review):
+  1. **HTTP/1.0 + explicit `Connection: keep-alive` → close** — matches PLAN reference; known divergence from RFC 7230 §6.3 + Envoy. 04.1's `close` decision in `serve_connection` is `Connection: close OR HTTP/1.0`, ignoring the explicit-keep-alive opt-in.
+  2. **Idle-timeout-during-body-drain returns `Ok(())` silent close** — matches PLAN reference; the 5s idle-read timeout in the body-drain loop returns `Ok(())` rather than surfacing an error, dropping the pending response. Flag for revisit in 04.2 or hardening pass.
+  3. **Non-chunked `Transfer-Encoding` values fall through to Content-Length framing** — known narrow scope; SPEC scopes only `chunked` for the 501 branch. Other `Transfer-Encoding` values (e.g. `identity`, `gzip`) are not detected and fall through to `Content-Length`-framed read.
+  4. **`clone_route_config` is a hand-walk rather than `Clone`-derive on envoy-config types** — chose the path that keeps Task 10's diff scoped to `envoy-http1`. The helper retires once envoy-config types derive `Clone`.
+- Deviations from review prescription: none — all four code fixes applied as suggested; both new tests written verbatim from the prompt's sketches.
+- ADRs: none in this follow-up. ADR ledger head remains 20.
