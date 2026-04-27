@@ -23,6 +23,10 @@ pub const ECHO_FILTER: &str = "envoy.filters.network.echo";
 /// runtime dispatch lands in phase 02.2. See ADR-0014.
 pub const TCP_PROXY_FILTER: &str = "envoy.filters.network.tcp_proxy";
 
+/// The HTTP connection manager network filter name. envoy-rust accepts it as
+/// of phase 04.1; runtime dispatch lands in tasks 10–11. See ADR-0020.
+pub const HCM_FILTER: &str = "envoy.filters.network.http_connection_manager";
+
 /// The only transport-socket name envoy-rust accepts in phase 03. Future phases
 /// may add `envoy.transport_sockets.raw_buffer` / `envoy.transport_sockets.quic`.
 pub const TLS_TRANSPORT_SOCKET: &str = "envoy.transport_sockets.tls";
@@ -92,6 +96,35 @@ pub enum ConfigError {
     /// require `tls_inspector` listener filter, deferred to a later phase).
     #[error("listener {listener:?} mixes TLS and plaintext filter chains")]
     MixedTlsAndPlaintextFilterChainsOnListener { listener: String },
+    #[error("unsupported codec_type: {got:?}; only AUTO and HTTP1 are supported in phase 04")]
+    UnsupportedCodecType { got: bootstrap::CodecType },
+    #[error(
+        "unsupported HTTP filter: {name}; only envoy.filters.http.router is supported in phase 04.x"
+    )]
+    UnsupportedHttpFilter { name: String },
+    #[error("unsupported route matcher: {matcher}; exactly one of `prefix` or `path` must be set")]
+    UnsupportedRouteMatcher { matcher: &'static str },
+    #[error(
+        "unsupported virtual_host domain: {domain}; only \"*\" or syntactically-valid DNS names are supported in phase 04"
+    )]
+    UnsupportedDomainMatcher { domain: String },
+    #[error("RouteConfiguration `{route_config}` has no virtual_hosts")]
+    EmptyVirtualHosts { route_config: String },
+    #[error("VirtualHost `{virtual_host}` has no routes")]
+    EmptyRoutes { virtual_host: String },
+    #[error("VirtualHost `{virtual_host}` has no domains")]
+    EmptyDomains { virtual_host: String },
+    #[error("invalid status code: {status}; must be in 100..=599")]
+    InvalidStatusCode { status: u16 },
+    #[error("unsupported DataSource at field `{field}`: requires `{requires}`")]
+    UnsupportedDataSource {
+        field: &'static str,
+        requires: &'static str,
+    },
+    #[error(
+        "unsupported HTTP filter count: {count}; phase 04.x's HCM accepts exactly one filter (the router)"
+    )]
+    MultipleHttpFilters { count: usize },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

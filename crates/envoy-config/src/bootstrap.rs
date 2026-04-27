@@ -369,9 +369,16 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                     if !ctx.common_tls_context.tls_certificates.is_empty() {
                         return Err(crate::ConfigError::EmptyTlsCertificates { side: "cluster" });
                     }
-                    if ctx.common_tls_context.validation_context.is_none() {
-                        return Err(crate::ConfigError::MissingValidationContext);
-                    }
+                    let vc = ctx
+                        .common_tls_context
+                        .validation_context
+                        .as_ref()
+                        .ok_or(crate::ConfigError::MissingValidationContext)?;
+                    validate_data_source(
+                        &vc.trusted_ca,
+                        "validation_context.trusted_ca",
+                        "filename",
+                    )?;
                     if ctx.sni.is_empty() {
                         return Err(crate::ConfigError::EmptyUpstreamSni);
                     }
@@ -402,6 +409,18 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                                 side: "listener",
                             });
                         }
+                        for tls_cert in &ctx.common_tls_context.tls_certificates {
+                            validate_data_source(
+                                &tls_cert.certificate_chain,
+                                "tls_certificate.certificate_chain",
+                                "filename",
+                            )?;
+                            validate_data_source(
+                                &tls_cert.private_key,
+                                "tls_certificate.private_key",
+                                "filename",
+                            )?;
+                        }
                     }
                     TransportSocketTypedConfig::Upstream(_) => {
                         return Err(crate::ConfigError::MismatchedTransportSocketDirection {
@@ -421,15 +440,11 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                         }
                     }
                     crate::TCP_PROXY_FILTER => {
-                        // Phase 04.1: TypedConfig now has multiple variants
-                        // (TcpProxy, HttpConnectionManager). Match instead of
-                        // irrefutable destructuring; the HCM-on-tcp_proxy-name
-                        // case is rejected as a missing typed_config (the
-                        // tcp_proxy filter requires its own typed_config; an
-                        // HCM typed_config under the tcp_proxy name is
-                        // misconfiguration). Task 2 will tighten this with a
-                        // dedicated error variant; here we keep the same error
-                        // surface as before.
+                        // TypedConfig is multi-variant (TcpProxy, HCM). The
+                        // HCM-on-tcp_proxy-name shape is misconfiguration; we
+                        // reject it as MissingTypedConfig (preserving the
+                        // pre-04.1 error surface — the typed_config under the
+                        // tcp_proxy name is not a TcpProxyConfig).
                         let typed = filter.typed_config.as_ref().ok_or(
                             crate::ConfigError::MissingTypedConfig(crate::TCP_PROXY_FILTER),
                         )?;
@@ -441,6 +456,16 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                         if !clusters.iter().any(|c| c.name == tp.cluster) {
                             return Err(crate::ConfigError::UnknownCluster(tp.cluster.clone()));
                         }
+                    }
+                    crate::HCM_FILTER => {
+                        let typed = filter
+                            .typed_config
+                            .as_ref()
+                            .ok_or(crate::ConfigError::MissingTypedConfig(crate::HCM_FILTER))?;
+                        let TypedConfig::HttpConnectionManager(hcm) = typed else {
+                            return Err(crate::ConfigError::MissingTypedConfig(crate::HCM_FILTER));
+                        };
+                        validate_hcm(hcm)?;
                     }
                     _ => {
                         return Err(crate::ConfigError::UnsupportedFilter(
@@ -509,6 +534,139 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
         }
     }
     Ok(())
+}
+
+/// Validate a fully-parsed `HttpConnectionManagerConfig` against the phase-04.1
+/// surface. SPEC §3 D2 enumerates the rejections this function fires.
+fn validate_hcm(hcm: &HttpConnectionManagerConfig) -> Result<(), crate::ConfigError> {
+    // codec_type: only AUTO and HTTP1 are runtime-supported in phase 04.
+    match hcm.codec_type {
+        CodecType::AUTO | CodecType::HTTP1 => {}
+        CodecType::HTTP2 | CodecType::HTTP3 => {
+            return Err(crate::ConfigError::UnsupportedCodecType {
+                got: hcm.codec_type,
+            });
+        }
+    }
+
+    // http_filters: cardinality + name.
+    match hcm.http_filters.len() {
+        1 => {
+            let f = &hcm.http_filters[0];
+            if f.name != "envoy.filters.http.router" {
+                return Err(crate::ConfigError::UnsupportedHttpFilter {
+                    name: f.name.clone(),
+                });
+            }
+            // typed_config @type is constrained to Router by the schema.
+        }
+        n => return Err(crate::ConfigError::MultipleHttpFilters { count: n }),
+    }
+
+    // route_config: walk virtual_hosts → routes.
+    if hcm.route_config.virtual_hosts.is_empty() {
+        return Err(crate::ConfigError::EmptyVirtualHosts {
+            route_config: hcm.route_config.name.clone(),
+        });
+    }
+    for vh in &hcm.route_config.virtual_hosts {
+        if vh.domains.is_empty() {
+            return Err(crate::ConfigError::EmptyDomains {
+                virtual_host: vh.name.clone(),
+            });
+        }
+        for d in &vh.domains {
+            if d != "*" && !is_valid_dns_name(d) {
+                return Err(crate::ConfigError::UnsupportedDomainMatcher { domain: d.clone() });
+            }
+        }
+        if vh.routes.is_empty() {
+            return Err(crate::ConfigError::EmptyRoutes {
+                virtual_host: vh.name.clone(),
+            });
+        }
+        for r in &vh.routes {
+            // RouteMatch: exactly one of {prefix, path} is Some.
+            match (&r.r#match.prefix, &r.r#match.path) {
+                (Some(_), None) | (None, Some(_)) => {}
+                (Some(_), Some(_)) => {
+                    return Err(crate::ConfigError::UnsupportedRouteMatcher {
+                        matcher: "both prefix and path are set",
+                    });
+                }
+                (None, None) => {
+                    return Err(crate::ConfigError::UnsupportedRouteMatcher {
+                        matcher: "neither prefix nor path is set",
+                    });
+                }
+            }
+            // direct_response.status range.
+            if !(100..=599).contains(&r.direct_response.status) {
+                return Err(crate::ConfigError::InvalidStatusCode {
+                    status: r.direct_response.status,
+                });
+            }
+            // direct_response.body must be inline_string.
+            validate_data_source(
+                &r.direct_response.body,
+                "direct_response.body",
+                "inline_string",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate a `DataSource` against a per-callsite restriction.
+///
+/// Cardinality: exactly one of `{filename, inline_string}` is `Some`.
+/// `requires` is `"filename"` or `"inline_string"`; the field on the other
+/// side must not be set.
+fn validate_data_source(
+    ds: &DataSource,
+    field: &'static str,
+    requires: &'static str,
+) -> Result<(), crate::ConfigError> {
+    let has_file = ds.filename.is_some();
+    let has_inline = ds.inline_string.is_some();
+    if has_file == has_inline {
+        // both Some, or both None
+        return Err(crate::ConfigError::UnsupportedDataSource { field, requires });
+    }
+    match requires {
+        "inline_string" => {
+            if !has_inline {
+                return Err(crate::ConfigError::UnsupportedDataSource { field, requires });
+            }
+        }
+        "filename" => {
+            if !has_file {
+                return Err(crate::ConfigError::UnsupportedDataSource { field, requires });
+            }
+        }
+        _ => unreachable!("unknown requires marker: {}", requires),
+    }
+    Ok(())
+}
+
+/// Returns true if `name` is a syntactically valid DNS name per RFC 1123 LDH
+/// rule. Wildcard prefixes (`*.example.com`) return false in 04.1.
+fn is_valid_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    if name.starts_with('*') {
+        return false; // wildcard prefix deferred
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
 }
 
 #[cfg(test)]
@@ -2420,6 +2578,283 @@ case_sensitive: true
         assert!(
             res.is_err(),
             "deny_unknown_fields should reject case_sensitive"
+        );
+    }
+
+    // --- phase 04.1 Task 2: HCM validator tests ---
+
+    fn parse_then_validate(yaml: &str) -> Result<Bootstrap, crate::ConfigError> {
+        let bs: Bootstrap = serde_yaml::from_str(yaml)?;
+        validate(&bs)?;
+        Ok(bs)
+    }
+
+    fn make_hcm_listener_yaml(hcm_block: &str) -> String {
+        format!(
+            r#"
+node:
+  id: x
+  cluster: y
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+{}
+  clusters: []
+admin:
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 0 }}
+"#,
+            hcm_block
+        )
+    }
+
+    const VALID_ROUTER_FILTER: &str = r#"
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#;
+
+    #[test]
+    fn rejects_codec_type_http2() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP2
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok" }}
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject HTTP2");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedCodecType {
+                    got: CodecType::HTTP2
+                }
+            ),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_codec_type_http3() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP3
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok" }}
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject HTTP3");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedCodecType {
+                    got: CodecType::HTTP3
+                }
+            ),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_http_filter() {
+        let hcm = r#"
+                stat_prefix: x
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok" }
+                http_filters:
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#;
+        // The @type IS the router (the only schema arm), but `name` is "lua" — validator rejects.
+        let yaml = make_hcm_listener_yaml(hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject non-router name");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedHttpFilter { .. }),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_route_match_with_both_prefix_and_path() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/x", path: "/y" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok" }}
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject both prefix and path");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedRouteMatcher { .. }),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_route_match_with_neither_prefix_nor_path() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{}}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok" }}
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject empty match");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedRouteMatcher { .. }),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_direct_response_with_filename_body() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ filename: "/tmp/x" }}
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err =
+            parse_then_validate(&yaml).expect_err("should reject filename in direct_response");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedDataSource {
+                    field: "direct_response.body",
+                    requires: "inline_string"
+                }
+            ),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_direct_response_with_invalid_status() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 99
+                            body: {{ inline_string: "ok" }}
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject status < 100");
+        assert!(
+            matches!(err, crate::ConfigError::InvalidStatusCode { status: 99 }),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_empty_virtual_hosts() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts: []
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject empty virtual_hosts");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyVirtualHosts { .. }),
+            "got: {:?}",
+            err
         );
     }
 }
