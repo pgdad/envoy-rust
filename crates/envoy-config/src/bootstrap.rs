@@ -988,7 +988,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                         let TypedConfig::HttpConnectionManager(hcm) = typed else {
                             return Err(crate::ConfigError::MissingTypedConfig(crate::HCM_FILTER));
                         };
-                        validate_hcm(hcm)?;
+                        validate_hcm(hcm, &bootstrap.static_resources.clusters)?;
                     }
                     _ => {
                         return Err(crate::ConfigError::UnsupportedFilter(
@@ -1061,7 +1061,10 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
 
 /// Validate a fully-parsed `HttpConnectionManagerConfig` against the phase-04.1
 /// surface. SPEC §3 D2 enumerates the rejections this function fires.
-fn validate_hcm(hcm: &mut HttpConnectionManagerConfig) -> Result<(), crate::ConfigError> {
+fn validate_hcm(
+    hcm: &mut HttpConnectionManagerConfig,
+    clusters: &[Cluster],
+) -> Result<(), crate::ConfigError> {
     // codec_type: only AUTO and HTTP1 are runtime-supported in phase 04.
     match hcm.codec_type {
         CodecType::AUTO | CodecType::HTTP1 => {}
@@ -1133,8 +1136,13 @@ fn validate_hcm(hcm: &mut HttpConnectionManagerConfig) -> Result<(), crate::Conf
                     }
                     validate_data_source(&dr.body, "direct_response.body", Required::InlineString)?;
                 }
-                RouteAction::Route(_) => {
-                    // Task 2 lands the cluster-existence check.
+                RouteAction::Route(ar) => {
+                    // 04.3 NEW: check the cluster reference against declared clusters.
+                    // ConfigError::UnknownCluster is the 02.1-landed variant reused here
+                    // per SPEC §3 D2.
+                    if !clusters.iter().any(|c| c.name == ar.cluster) {
+                        return Err(crate::ConfigError::UnknownCluster(ar.cluster.clone()));
+                    }
                 }
             }
 
@@ -4223,6 +4231,44 @@ static_resources:
         assert!(
             msg.contains("unknown_route_field"),
             "msg should mention the offending key `unknown_route_field`; got: {msg}"
+        );
+    }
+
+    // --- 04.3 Task 2: validator UnknownCluster reuse for RouteAction::Route ---
+
+    #[test]
+    fn parses_route_with_cluster_action() {
+        // Happy path: route references the declared `backend` cluster.
+        let routes = r#"- match: { prefix: "/" }
+                          route: { cluster: backend }"#;
+        let yaml = route_action_yaml(routes, BACKEND_CLUSTER);
+        crate::parse_bootstrap(&yaml).expect("parses + validates");
+    }
+
+    #[test]
+    fn rejects_hcm_route_with_unknown_cluster() {
+        // The route references `nonexistent`; only `backend` is declared.
+        let routes = r#"- match: { prefix: "/" }
+                          route: { cluster: nonexistent }"#;
+        let yaml = route_action_yaml(routes, BACKEND_CLUSTER);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject unknown cluster");
+        assert!(
+            matches!(&err, crate::ConfigError::UnknownCluster(name) if name == "nonexistent"),
+            "expected UnknownCluster(\"nonexistent\"); got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_hcm_route_with_empty_cluster_name() {
+        // Empty cluster names are treated as just another unknown reference;
+        // no cluster declares an empty name.
+        let routes = r#"- match: { prefix: "/" }
+                          route: { cluster: "" }"#;
+        let yaml = route_action_yaml(routes, BACKEND_CLUSTER);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject empty cluster name");
+        assert!(
+            matches!(&err, crate::ConfigError::UnknownCluster(name) if name.is_empty()),
+            "expected UnknownCluster(\"\"); got: {err:?}"
         );
     }
 }
