@@ -368,12 +368,16 @@ impl PartialEq for SafeRegex {
 }
 
 /// Hand-rolled Deserialize: only reads `regex: String`; sets `compiled: None`.
-/// The validator extension (Task 5) fills the compiled form. The hand-rolled
-/// shape (rather than `#[derive(Deserialize)] + #[serde(skip)]`) is mandatory
-/// because the validator needs to *write* `compiled`, but `serde(skip)` would
-/// leave the field absent from any auto-generated value-construction path —
-/// and we additionally enforce `deny_unknown_fields` semantics here (reject
-/// any key other than `regex`).
+/// The validator extension (Task 5) fills the compiled form.
+///
+/// The hand-rolled form (rather than `#[derive(Deserialize)] +
+/// `#[serde(skip, default)]`) is chosen to establish the visitor pattern that
+/// Tasks 3 and 4 reuse for `StringMatcher` and `HeaderMatcher` field-name
+/// oneof discrimination — where `#[serde(untagged)]` would silently pick the
+/// first parsing variant and `#[serde(tag = "...")]` only models a fixed
+/// discriminator-key shape. Landing the visitor pattern here establishes the
+/// template + makes the two-phase init contract explicit: this visitor always
+/// produces `compiled: None`; the validator fills it.
 impl<'de> serde::Deserialize<'de> for SafeRegex {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
