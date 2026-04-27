@@ -135,6 +135,11 @@ async fn serve_connection(
 
         // 5. Build response (handles 400 / 404 / 501 / 200 internally).
         let resp = if chunked {
+            tracing::warn!(
+                method = %req.method,
+                path = %req.path,
+                "request rejected: Transfer-Encoding: chunked not supported (501)"
+            );
             synth_501(close)
         } else {
             build_response(&config, &req, close)
@@ -184,10 +189,18 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Erro
 }
 
 fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
-    // Validate Host header presence (HTTP/1.1 §5.4 — mandatory).
+    // Validate Host header presence and non-emptiness (HTTP/1.1 §5.4 — mandatory).
+    // Treat empty Host (`Host: \r\n`) as the same RFC violation as missing Host.
     let host_raw = match find_header(&req.headers, headers::HOST) {
-        Some(h) => h,
-        None => return synth_400(close),
+        Some(h) if !h.is_empty() => h,
+        _ => {
+            tracing::warn!(
+                method = %req.method,
+                path = %req.path,
+                "request rejected: missing or empty Host header"
+            );
+            return synth_400(close);
+        }
     };
     let host = strip_port(host_raw);
 
@@ -199,13 +212,29 @@ fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
         .find(|vh| vh_matches(vh, host))
     {
         Some(vh) => vh,
-        None => return synth_404(close),
+        None => {
+            tracing::warn!(
+                host = %host,
+                method = %req.method,
+                path = %req.path,
+                "request rejected: no matching virtual_host"
+            );
+            return synth_404(close);
+        }
     };
 
     // Walk routes first-match-wins on path.
     let route = match vh.routes.iter().find(|r| route_matches(r, &req.path)) {
         Some(r) => r,
-        None => return synth_404(close),
+        None => {
+            tracing::warn!(
+                host = %host,
+                method = %req.method,
+                path = %req.path,
+                "request rejected: no matching route"
+            );
+            return synth_404(close);
+        }
     };
 
     // Hardcoded router-filter call site:
@@ -527,5 +556,47 @@ mod tests {
         );
         // drive() called read_to_end which returns 0 once server closes — no
         // additional check needed beyond that drive returned at all.
+    }
+
+    #[tokio::test]
+    async fn keep_alive_serves_two_requests() {
+        let config = hcm_config_single_route("/", 200, "ok\n");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = serve_connection(config, sock).await;
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Request 1: keep-alive (HTTP/1.1 default).
+        client
+            .write_all(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // Request 2: explicit close so server returns Ok and client sees EOF.
+        client
+            .write_all(b"GET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        drop(client);
+        let _ = server.await;
+        let s = String::from_utf8_lossy(&buf);
+        // Two responses concatenated. Each starts with "HTTP/1.1 200 OK".
+        let count_200 = s.matches("HTTP/1.1 200 OK\r\n").count();
+        assert_eq!(count_200, 2, "expected 2 responses, got: {s}");
+    }
+
+    #[tokio::test]
+    async fn chunked_request_rejected_with_501() {
+        let config = hcm_config_single_route("/", 200, "ok\n");
+        let req = b"POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+            "got: {resp_str}"
+        );
     }
 }
