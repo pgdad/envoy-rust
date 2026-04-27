@@ -9,8 +9,8 @@ use crate::response::{Http1Response, Response};
 
 use bytes::{Buf, Bytes, BytesMut};
 use envoy_config::{
-    DataSource, DirectResponse, HttpConnectionManagerConfig, Route, RouteConfiguration, RouteMatch,
-    VirtualHost,
+    DataSource, DirectResponse, HttpConnectionManagerConfig, Route, RouteAction, RouteAction_Route,
+    RouteConfiguration, RouteMatch, VirtualHost,
 };
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::Arc;
@@ -63,17 +63,26 @@ fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
                             path: r.r#match.path.clone(),
                             headers: r.r#match.headers.clone(),
                         },
-                        direct_response: DirectResponse {
-                            status: r.direct_response.status,
-                            body: DataSource {
-                                filename: r.direct_response.body.filename.clone(),
-                                inline_string: r.direct_response.body.inline_string.clone(),
-                            },
-                        },
+                        action: clone_route_action(&r.action),
                     })
                     .collect(),
             })
             .collect(),
+    }
+}
+
+fn clone_route_action(a: &RouteAction) -> RouteAction {
+    match a {
+        RouteAction::DirectResponse(dr) => RouteAction::DirectResponse(DirectResponse {
+            status: dr.status,
+            body: DataSource {
+                filename: dr.body.filename.clone(),
+                inline_string: dr.body.inline_string.clone(),
+            },
+        }),
+        RouteAction::Route(ar) => RouteAction::Route(RouteAction_Route {
+            cluster: ar.cluster.clone(),
+        }),
     }
 }
 
@@ -242,10 +251,20 @@ fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
         }
     };
 
-    // Hardcoded router-filter call site:
-    //   match action { DirectResponse(dr) => synth_direct_response(req, dr) }
-    // 04.3 will extend this match with a Route(_) arm.
-    synth_direct_response(&route.direct_response, close)
+    // Hardcoded router-filter call site. 04.3 Task 1 names a placeholder
+    // Route(_) arm returning 501; Task 9 wires that arm to the upstream
+    // proxy path via the cluster manager.
+    match &route.action {
+        RouteAction::DirectResponse(dr) => synth_direct_response(dr, close),
+        RouteAction::Route(_ar) => {
+            tracing::warn!(
+                method = %req.method,
+                path = %req.path,
+                "RouteAction::Route reached HCM build_response — Task 9 wires the proxy arm",
+            );
+            synth_501(close)
+        }
+    }
 }
 
 fn strip_port(host: &str) -> &str {
@@ -364,13 +383,13 @@ mod tests {
                             path: None,
                             headers: vec![],
                         },
-                        direct_response: DirectResponse {
+                        action: RouteAction::DirectResponse(DirectResponse {
                             status,
                             body: DataSource {
                                 filename: None,
                                 inline_string: Some(body.to_string()),
                             },
-                        },
+                        }),
                     }],
                 }],
             }),
@@ -438,13 +457,13 @@ mod tests {
                             path: None,
                             headers: vec![],
                         },
-                        direct_response: DirectResponse {
+                        action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
                             body: DataSource {
                                 filename: None,
                                 inline_string: Some("hit\n".to_string()),
                             },
-                        },
+                        }),
                     }],
                 }],
             }),
@@ -475,13 +494,13 @@ mod tests {
                                 path: None,
                                 headers: vec![],
                             },
-                            direct_response: DirectResponse {
+                            action: RouteAction::DirectResponse(DirectResponse {
                                 status: 200,
                                 body: DataSource {
                                     filename: None,
                                     inline_string: Some("first\n".to_string()),
                                 },
-                            },
+                            }),
                         },
                         Route {
                             r#match: RouteMatch {
@@ -489,13 +508,13 @@ mod tests {
                                 path: None,
                                 headers: vec![],
                             },
-                            direct_response: DirectResponse {
+                            action: RouteAction::DirectResponse(DirectResponse {
                                 status: 500,
                                 body: DataSource {
                                     filename: None,
                                     inline_string: Some("never\n".to_string()),
                                 },
-                            },
+                            }),
                         },
                     ],
                 }],
@@ -538,13 +557,13 @@ mod tests {
                             path: None,
                             headers: vec![],
                         },
-                        direct_response: DirectResponse {
+                        action: RouteAction::DirectResponse(DirectResponse {
                             status: 200,
                             body: DataSource {
                                 filename: None,
                                 inline_string: Some("ok\n".to_string()),
                             },
-                        },
+                        }),
                     }],
                 }],
             }),
@@ -630,13 +649,13 @@ mod tests {
                 path: None,
                 headers: vec![],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 200,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("ok\n".into()),
                 },
-            },
+            }),
         }]);
         let req = b"GET /healthz HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
@@ -655,13 +674,13 @@ mod tests {
                     invert_match: false,
                 }],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 418,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("teapot\n".into()),
                 },
-            },
+            }),
         };
         let default_route = Route {
             r#match: RouteMatch {
@@ -669,13 +688,13 @@ mod tests {
                 path: None,
                 headers: vec![],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 200,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("ok\n".into()),
                 },
-            },
+            }),
         };
         let cfg = build_test_config(vec![matcher_route, default_route]);
         let req =
@@ -698,13 +717,13 @@ mod tests {
                     invert_match: false,
                 }],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 418,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("teapot\n".into()),
                 },
-            },
+            }),
         };
         let default_route = Route {
             r#match: RouteMatch {
@@ -712,13 +731,13 @@ mod tests {
                 path: None,
                 headers: vec![],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 200,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("ok\n".into()),
                 },
-            },
+            }),
         };
         let cfg = build_test_config(vec![matcher_route, default_route]);
         // /api/widgets but no X-Foo header → falls through to default 200.
@@ -747,13 +766,13 @@ mod tests {
                     },
                 ],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 418,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("teapot\n".into()),
                 },
-            },
+            }),
         };
         let cfg = build_test_config(vec![matcher_route]);
         let req =
@@ -781,13 +800,13 @@ mod tests {
                     },
                 ],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 418,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("teapot\n".into()),
                 },
-            },
+            }),
         };
         let default_route = Route {
             r#match: RouteMatch {
@@ -795,13 +814,13 @@ mod tests {
                 path: None,
                 headers: vec![],
             },
-            direct_response: DirectResponse {
+            action: RouteAction::DirectResponse(DirectResponse {
                 status: 200,
                 body: DataSource {
                     filename: None,
                     inline_string: Some("ok\n".into()),
                 },
-            },
+            }),
         };
         let cfg = build_test_config(vec![matcher_route, default_route]);
         // X-A matches, X-B does not → matcher route fails, fall through to default.

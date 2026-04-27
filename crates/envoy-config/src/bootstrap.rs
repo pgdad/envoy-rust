@@ -235,7 +235,7 @@ pub struct CertificateValidationContext {
 /// "exactly one of {filename, inline_string} is `Some`" invariant — and any
 /// per-callsite restriction (e.g. TLS still requires `filename`) — is enforced
 /// by the validator (Task 2 of phase 04.1), not by serde.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DataSource {
     #[serde(default)]
@@ -305,12 +305,126 @@ pub struct VirtualHost {
     pub routes: Vec<Route>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Route {
-    #[serde(rename = "match")]
+    /// The match predicate (path + headers; populated by 04.1 + 04.2).
     pub r#match: RouteMatch,
-    pub direct_response: DirectResponse,
+
+    /// 04.3 NEW: the action to dispatch on a matched request.
+    pub action: RouteAction,
+}
+
+/// 04.3 NEW (under SPEC §3 D2): the action variant a route's HCM router
+/// invocation dispatches into. Discrimination is by field-name oneof at the
+/// route map level — the route's peer keys are `direct_response: { ... }` OR
+/// `route: { ... }`, not nested under a single `action:` key. The hand-rolled
+/// `impl<'de> Deserialize` for `Route` (below) detects which peer key is
+/// present and constructs the matching variant; both-present and
+/// neither-present are errors.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteAction {
+    /// Direct-response action — write a static body downstream. Phase 04.1 carryover.
+    DirectResponse(DirectResponse),
+
+    /// Route-to-cluster action — proxy through to the named cluster. Phase 04.3 NEW.
+    Route(RouteAction_Route),
+}
+
+/// 04.3 NEW (under SPEC §3 D2). Names the cluster to forward the matched
+/// request to. Future route-action knobs (timeout, retries, weighted clusters,
+/// host-rewrite, header manipulations) are deferred (SPEC §4 non-goals).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[allow(non_camel_case_types)]
+pub struct RouteAction_Route {
+    pub cluster: String,
+}
+
+/// 04.3 NEW: hand-rolled because Envoy's `Route` schema uses a field-name
+/// oneof for the action variant — `direct_response: { ... }` and `route: { ... }`
+/// are peers of `match: { ... }` at the same map level, not nested under a
+/// shared discriminator key. `#[serde(tag = "...")]` doesn't model field-name
+/// discrimination, and `#[serde(untagged)]` would silently pick the first
+/// parsing variant. Mirrors the 04.2 HeaderMatcher visitor pattern.
+impl<'de> serde::Deserialize<'de> for Route {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Route;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a Route map with `match` and exactly one of `direct_response` or `route`",
+                )
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Route, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut r#match: Option<RouteMatch> = None;
+                let mut direct_response: Option<DirectResponse> = None;
+                let mut route_action: Option<RouteAction_Route> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "match" => {
+                            if r#match.is_some() {
+                                return Err(M::Error::duplicate_field("match"));
+                            }
+                            r#match = Some(map.next_value::<RouteMatch>()?);
+                        }
+                        "direct_response" => {
+                            if direct_response.is_some() {
+                                return Err(M::Error::duplicate_field("direct_response"));
+                            }
+                            direct_response = Some(map.next_value::<DirectResponse>()?);
+                        }
+                        "route" => {
+                            if route_action.is_some() {
+                                return Err(M::Error::duplicate_field("route"));
+                            }
+                            route_action = Some(map.next_value::<RouteAction_Route>()?);
+                        }
+                        other => {
+                            return Err(M::Error::unknown_field(
+                                other,
+                                &["match", "direct_response", "route"],
+                            ));
+                        }
+                    }
+                }
+
+                let r#match = r#match.ok_or_else(|| M::Error::missing_field("match"))?;
+                let action = match (direct_response, route_action) {
+                    (Some(_), Some(_)) => {
+                        return Err(M::Error::custom(
+                            "Route must carry exactly one of `direct_response` or `route`; \
+                             both are present",
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(M::Error::custom(
+                            "Route must carry exactly one of `direct_response` or `route`; \
+                             neither is present",
+                        ));
+                    }
+                    (Some(dr), None) => RouteAction::DirectResponse(dr),
+                    (None, Some(ar)) => RouteAction::Route(ar),
+                };
+
+                Ok(Route { r#match, action })
+            }
+        }
+
+        deserializer.deserialize_map(V)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -324,7 +438,7 @@ pub struct RouteMatch {
     pub headers: Vec<HeaderMatcher>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DirectResponse {
     pub status: u16,
@@ -1009,18 +1123,20 @@ fn validate_hcm(hcm: &mut HttpConnectionManagerConfig) -> Result<(), crate::Conf
                     });
                 }
             }
-            // direct_response.status range.
-            if !(100..=599).contains(&r.direct_response.status) {
-                return Err(crate::ConfigError::InvalidStatusCode {
-                    status: r.direct_response.status,
-                });
+            // 04.3: dispatch on the action variant. DirectResponse keeps its
+            // 04.1 status-range + body-shape checks. The Route(_) arm has no
+            // validator obligation in Task 1; Task 2 wires UnknownCluster.
+            match &r.action {
+                RouteAction::DirectResponse(dr) => {
+                    if !(100..=599).contains(&dr.status) {
+                        return Err(crate::ConfigError::InvalidStatusCode { status: dr.status });
+                    }
+                    validate_data_source(&dr.body, "direct_response.body", Required::InlineString)?;
+                }
+                RouteAction::Route(_) => {
+                    // Task 2 lands the cluster-existence check.
+                }
             }
-            // direct_response.body must be inline_string.
-            validate_data_source(
-                &r.direct_response.body,
-                "direct_response.body",
-                Required::InlineString,
-            )?;
 
             // 04.2 NEW: walk the headers Vec.
             for hm in &mut r.r#match.headers {
@@ -2992,11 +3108,12 @@ admin:
         assert_eq!(vh.domains, vec!["*".to_string()]);
         let route = &vh.routes[0];
         assert_eq!(route.r#match.prefix.as_deref(), Some("/"));
-        assert_eq!(route.direct_response.status, 200);
-        assert_eq!(
-            route.direct_response.body.inline_string.as_deref(),
-            Some("ok\n")
-        );
+        let dr = match &route.action {
+            RouteAction::DirectResponse(dr) => dr,
+            other => panic!("expected DirectResponse, got {other:?}"),
+        };
+        assert_eq!(dr.status, 200);
+        assert_eq!(dr.body.inline_string.as_deref(), Some("ok\n"));
         assert_eq!(hcm.http_filters.len(), 1);
         assert_eq!(hcm.http_filters[0].name, "envoy.filters.http.router");
     }
@@ -3951,6 +4068,161 @@ headers:
         assert_eq!(
             rm.headers[1].mode,
             HeaderMatcherMode::RangeMatch(Int64Range { start: 1, end: 100 })
+        );
+    }
+
+    // --- 04.3 Task 1: RouteAction parse-shape tests ---
+
+    /// Build the full bootstrap YAML scaffolding around the given routes block
+    /// and clusters block. The 5 RouteAction parse-shape tests vary only in
+    /// these two slots.
+    fn route_action_yaml(routes: &str, clusters: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: rc
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        {routes}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:{clusters}
+"#
+        )
+    }
+
+    const BACKEND_CLUSTER: &str = r#"
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 9001 } } }"#;
+
+    const NO_CLUSTERS: &str = " []";
+
+    /// Helper to drill into the parsed bootstrap and return the first route's
+    /// action. Panics on any structural mismatch (these tests are about
+    /// RouteAction shape; non-shape failures should fail loudly).
+    fn first_route_action(b: &Bootstrap) -> &RouteAction {
+        let listener = &b.static_resources.listeners[0];
+        let filter = &listener.filter_chains[0].filters[0];
+        let typed = filter.typed_config.as_ref().expect("typed_config present");
+        let hcm = match typed {
+            TypedConfig::HttpConnectionManager(hcm) => hcm,
+            other => panic!("expected HCM typed_config, got {other:?}"),
+        };
+        &hcm.route_config.virtual_hosts[0].routes[0].action
+    }
+
+    #[test]
+    fn parses_route_with_direct_response_action() {
+        let routes = r#"- match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }"#;
+        let yaml = route_action_yaml(routes, NO_CLUSTERS);
+        let b = crate::parse_bootstrap(&yaml).expect("parses + validates");
+        let action = first_route_action(&b);
+        match action {
+            RouteAction::DirectResponse(dr) => {
+                assert_eq!(dr.status, 200);
+                assert_eq!(dr.body.inline_string.as_deref(), Some("ok\n"));
+            }
+            other => panic!("expected DirectResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_route_with_route_action() {
+        let routes = r#"- match: { prefix: "/" }
+                          route: { cluster: backend }"#;
+        let yaml = route_action_yaml(routes, BACKEND_CLUSTER);
+        let b = crate::parse_bootstrap(&yaml).expect("parses + validates");
+        let action = first_route_action(&b);
+        match action {
+            RouteAction::Route(ar) => {
+                assert_eq!(ar.cluster, "backend");
+            }
+            other => panic!("expected Route(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_route_with_both_direct_response_and_route() {
+        let routes = r#"- match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                          route: { cluster: backend }"#;
+        let yaml = route_action_yaml(routes, BACKEND_CLUSTER);
+        let err = crate::parse_bootstrap(&yaml).expect_err("rejects both peers present");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("direct_response"),
+            "msg should mention direct_response; got: {msg}"
+        );
+        assert!(
+            msg.contains("route"),
+            "msg should mention route; got: {msg}"
+        );
+        assert!(
+            msg.contains("exactly one"),
+            "msg should mention `exactly one`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_route_with_neither_direct_response_nor_route() {
+        let routes = r#"- match: { prefix: "/" }"#;
+        let yaml = route_action_yaml(routes, NO_CLUSTERS);
+        let err = crate::parse_bootstrap(&yaml).expect_err("rejects neither peer present");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("direct_response"),
+            "msg should mention direct_response; got: {msg}"
+        );
+        assert!(
+            msg.contains("route"),
+            "msg should mention route; got: {msg}"
+        );
+        assert!(
+            msg.contains("exactly one"),
+            "msg should mention `exactly one`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_route_with_unknown_top_level_key() {
+        let routes = r#"- match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                          unknown_route_field: surprise"#;
+        let yaml = route_action_yaml(routes, NO_CLUSTERS);
+        let err = crate::parse_bootstrap(&yaml).expect_err("rejects unknown top-level Route key");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("unknown"),
+            "msg should mention `unknown` (case-insensitive); got: {msg}"
+        );
+        assert!(
+            msg.contains("unknown_route_field"),
+            "msg should mention the offending key `unknown_route_field`; got: {msg}"
         );
     }
 }
