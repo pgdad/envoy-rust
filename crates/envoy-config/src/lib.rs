@@ -7,11 +7,13 @@
 pub mod bootstrap;
 
 pub use bootstrap::{
-    Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType,
-    CommonTlsContext, DataSource, DownstreamTlsContext, Endpoint, FilterChain, FilterChainMatch,
-    LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node,
-    SocketAddress, StaticResources, TcpProxyConfig, TlsCertificate, TransportSocket,
-    TransportSocketTypedConfig, TypedConfig, UpstreamTlsContext,
+    Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType, CodecType,
+    CommonTlsContext, DataSource, DirectResponse, DownstreamTlsContext, Endpoint, FilterChain,
+    FilterChainMatch, HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, LbEndpoint,
+    LbPolicy, Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node, Route,
+    RouteConfiguration, RouteMatch, RouterConfig, SocketAddress, StaticResources, TcpProxyConfig,
+    TlsCertificate, TransportSocket, TransportSocketTypedConfig, TypedConfig, UpstreamTlsContext,
+    VirtualHost,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.

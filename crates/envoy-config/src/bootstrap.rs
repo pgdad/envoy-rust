@@ -151,6 +151,10 @@ pub struct NetworkFilter {
 pub enum TypedConfig {
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy")]
     TcpProxy(TcpProxyConfig),
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
+    )]
+    HttpConnectionManager(HttpConnectionManagerConfig),
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -223,12 +227,106 @@ pub struct CertificateValidationContext {
     pub trusted_ca: DataSource,
 }
 
-/// Phase 03 supports `filename` only. inline_string / inline_bytes /
-/// environment_variable / `secret_ref` are deferred to later phases.
+/// Phase 03 supports `filename` only. Phase 04.1 adds `inline_string` for the
+/// HCM `direct_response.body` use-case (small inline payloads). `inline_bytes`,
+/// `environment_variable`, and `secret_ref` are deferred to later phases.
+///
+/// Schema-level both fields are `Option<String>` with `#[serde(default)]`. The
+/// "exactly one of {filename, inline_string} is `Some`" invariant — and any
+/// per-callsite restriction (e.g. TLS still requires `filename`) — is enforced
+/// by the validator (Task 2 of phase 04.1), not by serde.
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DataSource {
-    pub filename: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub inline_string: Option<String>,
+}
+
+/// HCM (HTTP Connection Manager) typed-config. Phase 04.1 carries the minimal
+/// subset needed for the `direct_response` happy path: stat_prefix, codec_type,
+/// route_config, http_filters. Upstream Envoy's HCM has dozens more fields
+/// (access_log, tracing, http_protocol_options, idle_timeout, ...); all
+/// deferred per SPEC §4.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConnectionManagerConfig {
+    pub stat_prefix: String,
+    pub codec_type: CodecType,
+    pub route_config: RouteConfiguration,
+    pub http_filters: Vec<HttpFilter>,
+}
+
+/// HCM codec_type. Phase 04.1 wire-supports HTTP1 only (Task 10's HCM rejects
+/// the others at construction time); AUTO/HTTP2/HTTP3 parse but do not yet
+/// dispatch.
+#[derive(Debug, Deserialize, PartialEq, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub enum CodecType {
+    AUTO,
+    HTTP1,
+    HTTP2,
+    HTTP3,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpFilter {
+    pub name: String,
+    pub typed_config: HttpFilterTypedConfig,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "@type", deny_unknown_fields)]
+pub enum HttpFilterTypedConfig {
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router")]
+    Router(RouterConfig),
+}
+
+/// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
+/// dynamic_stats, start_child_span, ...); all deferred per SPEC §4.
+#[derive(Debug, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RouterConfig {}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteConfiguration {
+    pub name: String,
+    pub virtual_hosts: Vec<VirtualHost>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VirtualHost {
+    pub name: String,
+    pub domains: Vec<String>,
+    pub routes: Vec<Route>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    #[serde(rename = "match")]
+    pub r#match: RouteMatch,
+    pub direct_response: DirectResponse,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteMatch {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DirectResponse {
+    pub status: u16,
+    pub body: DataSource,
 }
 
 pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
@@ -323,10 +421,23 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                         }
                     }
                     crate::TCP_PROXY_FILTER => {
-                        // 02.1: TypedConfig has one variant (TcpProxy). Phase 04+ extend; migrate to match.
-                        let TypedConfig::TcpProxy(tp) = filter.typed_config.as_ref().ok_or(
+                        // Phase 04.1: TypedConfig now has multiple variants
+                        // (TcpProxy, HttpConnectionManager). Match instead of
+                        // irrefutable destructuring; the HCM-on-tcp_proxy-name
+                        // case is rejected as a missing typed_config (the
+                        // tcp_proxy filter requires its own typed_config; an
+                        // HCM typed_config under the tcp_proxy name is
+                        // misconfiguration). Task 2 will tighten this with a
+                        // dedicated error variant; here we keep the same error
+                        // surface as before.
+                        let typed = filter.typed_config.as_ref().ok_or(
                             crate::ConfigError::MissingTypedConfig(crate::TCP_PROXY_FILTER),
                         )?;
+                        let TypedConfig::TcpProxy(tp) = typed else {
+                            return Err(crate::ConfigError::MissingTypedConfig(
+                                crate::TCP_PROXY_FILTER,
+                            ));
+                        };
                         if !clusters.iter().any(|c| c.name == tp.cluster) {
                             return Err(crate::ConfigError::UnknownCluster(tp.cluster.clone()));
                         }
@@ -799,6 +910,7 @@ static_resources:
                 assert_eq!(tp.stat_prefix, "ingress_tcp");
                 assert_eq!(tp.cluster, "backend");
             }
+            other => panic!("unexpected typed_config variant: {other:?}"),
         }
     }
 
@@ -1346,8 +1458,14 @@ static_resources:
             crate::TransportSocketTypedConfig::Downstream(ctx) => {
                 let certs = &ctx.common_tls_context.tls_certificates;
                 assert_eq!(certs.len(), 1);
-                assert_eq!(certs[0].certificate_chain.filename, "/tmp/leaf.pem");
-                assert_eq!(certs[0].private_key.filename, "/tmp/leaf.key");
+                assert_eq!(
+                    certs[0].certificate_chain.filename.as_deref(),
+                    Some("/tmp/leaf.pem")
+                );
+                assert_eq!(
+                    certs[0].private_key.filename.as_deref(),
+                    Some("/tmp/leaf.key")
+                );
             }
             other => panic!("unexpected typed_config: {other:?}"),
         }
@@ -1401,7 +1519,7 @@ admin:
                     .validation_context
                     .as_ref()
                     .expect("validation_context present");
-                assert_eq!(vc.trusted_ca.filename, "/tmp/ca.pem");
+                assert_eq!(vc.trusted_ca.filename.as_deref(), Some("/tmp/ca.pem"));
                 assert!(ctx.common_tls_context.tls_certificates.is_empty());
             }
             other => panic!("unexpected typed_config: {other:?}"),
@@ -1480,40 +1598,13 @@ static_resources:
         );
     }
 
-    #[test]
-    fn rejects_unknown_field_in_data_source() {
-        // inline_string is a phase-later surface; phase 03 supports `filename`
-        // only (SPEC §3 D2). deny_unknown_fields on DataSource rejects it.
-        let yaml = r#"
-static_resources:
-  listeners:
-    - name: l
-      address:
-        socket_address:
-          address: 0.0.0.0
-          port_value: 10000
-      filter_chains:
-        - transport_socket:
-            name: envoy.transport_sockets.tls
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
-              common_tls_context:
-                tls_certificates:
-                  - certificate_chain:
-                      filename: /tmp/leaf.pem
-                      inline_string: "extra"
-                    private_key:
-                      filename: /tmp/leaf.key
-          filters: []
-  clusters: []
-"#;
-        let err = crate::parse_bootstrap(yaml).expect_err("must reject unknown field");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("inline_string") || msg.contains("unknown field"),
-            "expected unknown-field error, got: {msg}",
-        );
-    }
+    // The phase-03.1 test `rejects_unknown_field_in_data_source` was removed in
+    // phase 04.1 Task 1: `inline_string` is now a recognized DataSource field
+    // (used by `direct_response.body`), so the YAML it asserted-rejects now
+    // parses cleanly. The "exactly one of {filename, inline_string} set" rule
+    // — and the per-callsite restriction that TLS still requires `filename` —
+    // is the validator's responsibility (phase 04.1 Task 2), and Task 2's
+    // validator tests subsume the regression coverage.
 
     #[test]
     fn rejects_unknown_transport_socket_name() {
@@ -2206,6 +2297,129 @@ static_resources:
                     if listener == "tcp_listener"
             ),
             "expected MixedTlsAndPlaintextFilterChainsOnListener, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_listener_with_hcm_direct_response() {
+        let yaml = r#"
+node:
+  id: x
+  cluster: y
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: default
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 0 }
+"#;
+        let bs: Bootstrap = serde_yaml::from_str(yaml).expect("parses");
+        let listener = &bs.static_resources.listeners[0];
+        let filter = &listener.filter_chains[0].filters[0];
+        let TypedConfig::HttpConnectionManager(hcm) = filter.typed_config.as_ref().unwrap() else {
+            panic!("expected HCM variant");
+        };
+        assert_eq!(hcm.stat_prefix, "ingress_http");
+        assert!(matches!(hcm.codec_type, CodecType::HTTP1));
+        assert_eq!(hcm.route_config.virtual_hosts.len(), 1);
+        let vh = &hcm.route_config.virtual_hosts[0];
+        assert_eq!(vh.domains, vec!["*".to_string()]);
+        let route = &vh.routes[0];
+        assert_eq!(route.r#match.prefix.as_deref(), Some("/"));
+        assert_eq!(route.direct_response.status, 200);
+        assert_eq!(
+            route.direct_response.body.inline_string.as_deref(),
+            Some("ok\n")
+        );
+        assert_eq!(hcm.http_filters.len(), 1);
+        assert_eq!(hcm.http_filters[0].name, "envoy.filters.http.router");
+    }
+
+    #[test]
+    fn parses_route_with_path_matcher() {
+        let yaml = r#"
+prefix: ~
+path: "/exact"
+"#;
+        let m: RouteMatch = serde_yaml::from_str(yaml).expect("parses");
+        assert!(m.prefix.is_none());
+        assert_eq!(m.path.as_deref(), Some("/exact"));
+    }
+
+    #[test]
+    fn parses_data_source_with_inline_string() {
+        let yaml = r#"
+inline_string: "hello"
+"#;
+        let ds: DataSource = serde_yaml::from_str(yaml).expect("parses");
+        assert!(ds.filename.is_none());
+        assert_eq!(ds.inline_string.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parses_data_source_with_filename() {
+        let yaml = r#"
+filename: "/tmp/cert.pem"
+"#;
+        let ds: DataSource = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(ds.filename.as_deref(), Some("/tmp/cert.pem"));
+        assert!(ds.inline_string.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_hcm_config() {
+        let yaml = r#"
+stat_prefix: ingress_http
+codec_type: HTTP1
+access_log: []
+route_config:
+  name: r
+  virtual_hosts: []
+http_filters: []
+"#;
+        let res: Result<HttpConnectionManagerConfig, _> = serde_yaml::from_str(yaml);
+        assert!(res.is_err(), "deny_unknown_fields should reject access_log");
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("access_log") || err.contains("unknown field"),
+            "error mentions unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_route_match() {
+        let yaml = r#"
+prefix: "/"
+case_sensitive: true
+"#;
+        let res: Result<RouteMatch, _> = serde_yaml::from_str(yaml);
+        assert!(
+            res.is_err(),
+            "deny_unknown_fields should reject case_sensitive"
         );
     }
 }

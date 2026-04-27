@@ -138,10 +138,12 @@ mod pki {
             common_tls_context: envoy_config::CommonTlsContext {
                 tls_certificates: vec![envoy_config::TlsCertificate {
                     certificate_chain: envoy_config::DataSource {
-                        filename: cert_path.to_string_lossy().into_owned(),
+                        filename: Some(cert_path.to_string_lossy().into_owned()),
+                        inline_string: None,
                     },
                     private_key: envoy_config::DataSource {
-                        filename: key_path.to_string_lossy().into_owned(),
+                        filename: Some(key_path.to_string_lossy().into_owned()),
+                        inline_string: None,
                     },
                 }],
                 validation_context: None,
@@ -450,7 +452,8 @@ mod upstream_pki {
                 tls_certificates: vec![],
                 validation_context: Some(envoy_config::CertificateValidationContext {
                     trusted_ca: envoy_config::DataSource {
-                        filename: ca_path.to_string_lossy().into_owned(),
+                        filename: Some(ca_path.to_string_lossy().into_owned()),
+                        inline_string: None,
                     },
                 }),
             },

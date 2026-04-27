@@ -758,7 +758,8 @@ admin:
                 tls_certificates: vec![],
                 validation_context: Some(envoy_config::CertificateValidationContext {
                     trusted_ca: envoy_config::DataSource {
-                        filename: pki.ca_pem_path.to_string_lossy().into_owned(),
+                        filename: Some(pki.ca_pem_path.to_string_lossy().into_owned()),
+                        inline_string: None,
                     },
                 }),
             },

@@ -84,8 +84,20 @@ impl DownstreamTls {
         // 03.1 honors the first tls_certificate only. The validator rejects
         // the empty case; multi-cert SNI selection lands in 03.2 via
         // `from_listener`.
-        let cert_path = Path::new(&certs[0].certificate_chain.filename);
-        let key_path = Path::new(&certs[0].private_key.filename);
+        let cert_path = Path::new(
+            certs[0]
+                .certificate_chain
+                .filename
+                .as_deref()
+                .expect("validator ensures TLS DataSource carries filename"),
+        );
+        let key_path = Path::new(
+            certs[0]
+                .private_key
+                .filename
+                .as_deref()
+                .expect("validator ensures TLS DataSource carries filename"),
+        );
         let key = load_certified_key(cert_path, key_path)?;
         let resolver: Arc<dyn ResolvesServerCert> = Arc::new(SingleCertResolver(Arc::new(key)));
         let config = ServerConfig::builder()
@@ -127,8 +139,18 @@ impl DownstreamTls {
 
             let certs = &ctx.common_tls_context.tls_certificates;
             let cert = certs.first().ok_or(TlsError::DownstreamRequiresCert)?;
-            let cert_path = Path::new(&cert.certificate_chain.filename);
-            let key_path = Path::new(&cert.private_key.filename);
+            let cert_path = Path::new(
+                cert.certificate_chain
+                    .filename
+                    .as_deref()
+                    .expect("validator ensures TLS DataSource carries filename"),
+            );
+            let key_path = Path::new(
+                cert.private_key
+                    .filename
+                    .as_deref()
+                    .expect("validator ensures TLS DataSource carries filename"),
+            );
             let certified_key = Arc::new(load_certified_key(cert_path, key_path)?);
 
             let server_names = chain
@@ -243,7 +265,12 @@ impl UpstreamTls {
             .common_tls_context
             .validation_context
             .as_ref()
-            .map(|vc| vc.trusted_ca.filename.as_str())
+            .map(|vc| {
+                vc.trusted_ca
+                    .filename
+                    .as_deref()
+                    .expect("validator ensures TLS DataSource carries filename")
+            })
             .ok_or_else(|| {
                 TlsError::RustlsConfig(
                     "UpstreamTls::from_context: validation_context required".to_string(),
