@@ -105,3 +105,11 @@
 - Change: created crates/envoy-config/fuzz/corpus/parse_bootstrap/route_with_header_matchers.yaml exercising 5 of the 7 HeaderMatcher modes simultaneously (exact_match, safe_regex_match, range_match, present_match, string_match-with-contains-and-ignore_case) inside a single Route's headers Vec. Added the corresponding allow-list entry to crates/envoy-config/fuzz/.gitignore. Extended bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly's parse-Ok list with the new seed.
 - Verification: `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → PASS; `cargo test -p envoy-config --lib` → 131 passed (unchanged — corpus-walk test was already counted; only its enumeration grew); clippy + fmt + build clean.
 - Deviations: none.
+
+## Task 9 — differential harness: Driver::Http1ProbeList + Http1Probe + drive_http1 extra_headers (2026-04-27)
+
+- Commit: 42b96f3
+- Change: added Http1Probe struct (name, method, path, host, extra_headers, expected_*) and Driver::Http1ProbeList { probes: Vec<Http1Probe> } variant on the Driver enum (mirrors TlsTcpProbeList shape from 03.2). Extended drive_http1 signature with extra_headers: &[(String, String)] parameter; existing single-probe Driver::Http1 callsites pass &[]. Added Driver::Http1ProbeList dispatch arm in run_fixture iterating probes and applying per-probe equivalence cascade; subject.shutdown + drop(upstream) move to AFTER the probe loop. Extended the listener-port substitution arm to include Http1ProbeList.
+- Tests added (2): parses_expectations_with_http1_probe_list, http1_probe_extra_headers_default_empty.
+- Verification: `cargo test -p differential --lib` → 49 passed (was 47; +2); clippy + fmt + build clean.
+- Deviations: rustfmt required Http1ProbeList variant to be expanded to multi-line form (`{ probes: Vec<Http1Probe>, }` across 3 lines) rather than the single-line form in the PLAN — fmt gate caught and fixed before commit.
