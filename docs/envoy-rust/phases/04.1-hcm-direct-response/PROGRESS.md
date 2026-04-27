@@ -36,3 +36,13 @@
 - Commit: 4e7c050
 - Change: added rejects_empty_domains test (closes coverage gap on the EmptyDomains validator branch); converted validate_data_source's `requires` parameter from `&'static str` to a private `Required` enum, removing the runtime `unreachable!` fallback.
 - Verification: cargo test -p envoy-config → 75 passed; clippy clean; fmt clean.
+
+## Task 3 — fuzz corpus extension (2026-04-27)
+
+- Commit: fe65bb0
+- Change: added 2 HCM-shaped seeds to `crates/envoy-config/fuzz/corpus/parse_bootstrap/`: `hcm_direct_response_happy.yaml` (parse+validate Ok), `hcm_invalid_codec_type.yaml` (parse Ok / validate UnsupportedCodecType). The existing `parse_bootstrap` target picks them up automatically; `-max_total_time=30` budget unchanged per ADR-0010. Extended `crates/envoy-config/fuzz/.gitignore`'s allow-list with the two new filenames so they actually land under version control (the directory is `corpus/parse_bootstrap/*` ignored with per-seed `!`-overrides). Extended the hand-listed `fuzz_corpus_seeds_parse_or_reject_cleanly` corpus-walk test in `bootstrap.rs` to cover both seeds: `hcm_direct_response_happy.yaml` joined the parse-Ok group, `hcm_invalid_codec_type.yaml` joined the reject-cleanly group.
+- Verification: `cargo test -p envoy-config` → 75 passed (test count unchanged — the corpus-walk test was already counted; only its enumeration grew). `cargo build --workspace --all-targets` clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean. `cargo fmt --all -- --check` clean. Local cargo-fuzz smoke-run skipped: nightly toolchain present but `cargo-fuzz` not installed on this box; CI exercises the extended corpus on its `-max_total_time=30` budget.
+- Deviations from PLAN:
+  1. **`.gitignore` allow-list extension** — not enumerated in the PLAN's Step 1/2 list of files-to-create, but mandatory: `crates/envoy-config/fuzz/.gitignore` ignores `corpus/parse_bootstrap/*` with per-seed `!`-overrides, so without the two new `!corpus/parse_bootstrap/hcm_*.yaml` lines the seeds would be silently ignored by git and never reach CI. Added at the natural spot (end of the existing allow-list, before `artifacts/`).
+  2. **bootstrap.rs corpus-walk extension** — the PLAN's Constraints section says "Do NOT modify any source files," but Step 3 explicitly says "If the test exists and enumerates seeds explicitly (a hand-listed allow-list), extend it to include the two new seeds." The test is hand-listed (verified in `bootstrap.rs` lines 1549–1584), so Step 3 applies and is the more specific instruction. The change is purely additive: one new entry in the parse-Ok loop, one in the reject-cleanly loop.
+- ADRs: none in this task. ADR ledger head remains 20.
