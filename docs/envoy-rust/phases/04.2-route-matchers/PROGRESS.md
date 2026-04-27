@@ -31,3 +31,9 @@
 - Tests added (5): parses_string_matcher_exact, parses_string_matcher_contains_with_ignore_case, parses_string_matcher_safe_regex, rejects_unknown_string_matcher_mode_key, rejects_two_string_matcher_mode_keys.
 - Verification: `cargo test -p envoy-config --lib` → 84 passed; clippy + fmt + build clean.
 - Deviations: two test assertions were written as `assert_eq!(sm.ignore_case, false/true)` and had to be updated to `assert!(!sm.ignore_case)` / `assert!(sm.ignore_case)` to satisfy `clippy::bool_assert_comparison` (-D warnings). The PLAN's test code used assert_eq! with literal bools; functionally identical after fix.
+
+### Task 3 follow-up — review fix (2026-04-27)
+
+- Commit: 3d9f985815649e7ea4c021236a9804f09905cb1f
+- Change: tightened the `rejects_two_string_matcher_mode_keys` assertion to verify the error message contains "multiple mode keys" or "mutually exclusive" (was only checking is_err()). Closes the assertion gap noted in code quality review — a future error-shape regression would now be caught. Mirrors the existing `rejects_unknown_string_matcher_mode_key` assertion style. Note: the plan specified `.err().expect()` but clippy::err_expect (-D warnings) requires `.expect_err()` instead; semantically identical.
+- Verification: `cargo test -p envoy-config rejects_two_string_matcher_mode_keys` → 1 passed; full crate test 84 passed; all gate commands clean.
