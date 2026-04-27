@@ -92,3 +92,9 @@
 - Tests added (5): route_with_no_headers_matches_unchanged (regression baseline — empty headers Vec is a no-op, path matching unchanged), single_header_matcher_route_selected_when_match, single_header_matcher_route_skipped_when_no_match, multi_header_matcher_and_combination_all_match, multi_header_matcher_and_combination_one_fails. Added `build_test_config(routes: Vec<Route>) -> Arc<HCMConfig>` test helper alongside the existing `hcm_config_single_route` helper (not a duplicate — `build_test_config` accepts an arbitrary routes Vec, enabling the multi-route matcher tests).
 - Verification: `cargo test -p envoy-http1` → 24 passed (was 19; +5); `cargo test -p envoy-config` → 131 passed (unchanged); clippy + fmt + build clean.
 - Deviations: rustfmt required the call site in `build_response` to be expanded to method-chain style (`.routes / .iter() / .find(...)`) rather than the single-line form shown in the PLAN step — semantically identical, fmt gate enforced the reformat. Two byte-string literals in tests were also wrapped to two lines by rustfmt to satisfy line-length limits.
+
+### Task 7 follow-up — review fix (2026-04-27)
+
+- Commit: 8330a86
+- Change: appended `Connection: close\r\n` to each of the 5 new HCM test request literals (route_with_no_headers_matches_unchanged, single_header_matcher_route_selected_when_match, single_header_matcher_route_skipped_when_no_match, multi_header_matcher_and_combination_all_match, multi_header_matcher_and_combination_one_fails). Without it, the server-side serve_connection loop kept the connection open until the 5s idle timeout fired before the test's `read_to_end()` returned, costing 5s per test in isolation. Aligns the 04.2 tests with the established 04.1 cadence (every 04.1 test in hcm.rs sends Connection: close).
+- Verification: all 5 new tests pass in <1s each (was ~5s); 24 envoy-http1 tests passing; gate clean.
