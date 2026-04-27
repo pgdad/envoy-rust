@@ -38,7 +38,10 @@
 > access-log header filter, router header manipulations, etc.) updates this
 > section or produces an ADR explaining why the defaults suffice.
 
-_(empty; populated starting phase 04)_
+| Header | Equivalence | Rationale |
+|---|---|---|
+| `server` | name-required, value-may-differ | Implementation-identifying. Both proxies emit `server: <name>`; envoy-rust's HCM default is `server: envoy-rust`, Envoy's default is `server: envoy`. When HCM `server_name` config field is set (deferred to phase 05+ per parent SPEC §4), value tightens to exact-match on both sides. |
+| `date` | name-required, value-may-differ | Wall-clock non-determinism (RFC 7231 §7.1.1.2 IMF-fixdate format). Both proxies stamp the response with the wall-clock at response-write time; values diverge because the two proxies write at slightly different instants. |
 
 ---
 
