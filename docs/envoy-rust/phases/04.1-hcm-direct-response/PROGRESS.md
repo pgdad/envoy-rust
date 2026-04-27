@@ -31,3 +31,8 @@
   3. **Added `HCM_FILTER` constant** — not explicitly enumerated in the PLAN's lib.rs delta but mirrors `TCP_PROXY_FILTER` precedent and is needed for the dispatch arm.
   4. **`EmptyDomains` test absent** — the PLAN's tally is "8 new tests" and explicitly enumerates the 8 added; `EmptyDomains` is exercised by the `validate_hcm` walk but not directly by a 04.1 test. Coverage is implicit via `rejects_empty_virtual_hosts` exercising the same outer `route_config.virtual_hosts.is_empty()` short-circuit. No drift from the PLAN's named-test list.
 - ADRs: none in this task. ADR ledger head remains 20.
+
+### Task 2 follow-up — review fixes (2026-04-27)
+- Commit: 4e7c050
+- Change: added rejects_empty_domains test (closes coverage gap on the EmptyDomains validator branch); converted validate_data_source's `requires` parameter from `&'static str` to a private `Required` enum, removing the runtime `unreachable!` fallback.
+- Verification: cargo test -p envoy-config → 75 passed; clippy clean; fmt clean.
