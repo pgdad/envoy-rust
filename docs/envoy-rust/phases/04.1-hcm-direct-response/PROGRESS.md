@@ -212,3 +212,85 @@
   2. **Used `expected_headers: set_equal_modulo_allow_list` (snake_case scalar)** rather than the PLAN's drafted `expected_headers: { rule: set_equal_modulo_allow_list }` (struct form). The Task 13 type is `Http1HeaderRule::SetEqualModuloAllowList` (unit variant) with `#[serde(rename_all = "snake_case", deny_unknown_fields)]` and *no* `#[serde(tag)]`, so unit variants serialize as bare scalars (`set_equal_modulo_allow_list`) not struct maps. The PLAN's draft would have failed `deny_unknown_fields`.
   3. **Used `method: get` (lowercase)** rather than `method: GET`. Task 13's `Http1Method` has `#[serde(rename_all = "snake_case")]`, so the variant `Get` deserializes from the lowercase scalar.
   4. **Dropped the PLAN's drafted `equivalence.response_headers: { rule: set_equal_modulo_allow_list }`.** Task 14 confirmed `Equivalence` has only `response_status` + `response_body` fields; the per-driver `expected_headers` carries the header-rule contract. This asymmetry against status/body is documented in `lib.rs`'s `run_fixture` dispatch comment (lines 1031-1037) for an eventual 04.x cleanup; the fixture is fully sufficient as-is.
+
+## Task 17 / State 4 — phase-done gate verification (2026-04-27)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4: the local stable-toolchain gate ran clean on first attempt. ROADMAP.md and STATE.md are NOT advanced here per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session); those flip in state 6 after state 5's REVIEW.md is approved.
+
+### Local stable-toolchain gate
+
+`cargo build --workspace --all-targets`:
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output — clean)
+```
+
+`cargo test --workspace --lib --bins`:
+```
+running 47 tests (differential lib)
+test result: ok. 46 passed; 0 failed; 1 ignored
+
+running 19 tests (envoy-bin lib+bin)
+test result: ok. 19 passed; 0 failed; 0 ignored
+
+running 8 tests (envoy-cluster)
+test result: ok. 8 passed
+
+running 75 tests (envoy-config)
+test result: ok. 75 passed
+
+running 19 tests (envoy-http1) [NEW crate this phase: codec + headers + date + response + hcm]
+test result: ok. 19 passed
+
+running 6 tests (tcp-echo-server)
+test result: ok. 6 passed
+
+running 11 tests (envoy-listener)
+test result: ok. 11 passed
+
+running 15 tests (envoy-tcp)
+test result: ok. 15 passed
+
+running 8 tests (envoy-tls)
+test result: ok. 8 passed
+
+running 5 tests (tls-echo-server)
+test result: ok. 5 passed
+```
+
+Total across `--lib --bins`: **212 passed, 0 failed, 1 ignored** (the 1 ignored is the Docker-gated `differential::starts_upstream_envoy_and_exposes_host_port`). Phase deltas:
+- `envoy-config`: +14 tests this phase (Tasks 1+2+3 → +6 parse-shape +8 validator + 1 corpus-walk extension; net 61 → 75).
+- `envoy-http1` (new): +19 tests (Tasks 6/7/8/9/10+10-fixes = 2/2/5/2/8 = 19). Task 10's review-fix commit `a6f7b5e` added 2 extra tests beyond the plan's 6 (keep-alive + chunked-501).
+- `envoy-bin`: +1 integration test (Task 12's `http1_direct_response_round_trip`).
+- `differential` lib: +3 tests (Task 13's 3 diff_headers tests).
+
+`cargo deny check`:
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+(One warning about an unused `Zlib` license allowance in `deny.toml:45` — pre-existing; not a phase-04.1 regression.)
+
+### Cargo.lock sync
+
+Clean. Task 4's `phase 04.1: scaffold envoy-http1 crate` commit (`37e074c`) already synced Cargo.lock when adding the new workspace member. No dedicated sync commit needed (deviates from phase-01/02.1/02.2/03.1/03.2 precedent which had sync-as-final-commit; here the lock landed inline at scaffold-time which is also acceptable per BOOTSTRAP_PROMPT.md). The git index has only the pre-existing untracked `crates/envoy-config/fuzz/Cargo.lock` and `target/` — nothing in this phase's tracked surface is dirty.
+
+### Docker-gated tests (informational)
+
+`tests/differential/tests/http1_direct_response.rs` (Task 16) is Docker-gated. Not run on this machine (Docker socket not available — same posture as phases 02.2 / 03.1 / 03.2). CI's `build + test + lint` job exercises the full Docker-gated suite end-to-end including the new fixture 0007.
+
+### Outstanding for state 5/6
+
+State 5 (`superpowers:requesting-code-review`) writes `REVIEW.md` for this phase. State 6 (the phase-done commit) flips ROADMAP row `04.1` `status` → `done` (parent row `04` stays `in-progress` until 04.3 lands per the schema invariant) and advances STATE.md to phase `04.2-route-matchers` (lifecycle state 2; SPEC.md exists from parent-04 state-2 commit `1d9740d`, PLAN.md does not; next-skill `superpowers:writing-plans`).
+
+### Phase summary
+
+17 tasks, 33 commits on `main` (17 task commits + 13 progress-note follow-ups + 2 review-fix follow-ups for Tasks 2 and 10 + 1 inline Cargo.lock sync at Task 4). All landed without inline-debug detours. Commit chain: `c41ae7f` (Task 1) → `a72c987` (Task 15 progress note). Final HEAD before this State-4 commit: see `git log -1`.
