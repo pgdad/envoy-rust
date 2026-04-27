@@ -1555,6 +1555,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/tls_downstream_single_cert.yaml",
             "fuzz/corpus/parse_bootstrap/tls_upstream_validation_context.yaml",
             "fuzz/corpus/parse_bootstrap/tls_multi_cert_sni.yaml",
+            "fuzz/corpus/parse_bootstrap/hcm_direct_response_happy.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
@@ -1565,6 +1566,7 @@ admin:
         for fname in &[
             "fuzz/corpus/parse_bootstrap/tls_malformed_at_type.yaml",
             "fuzz/corpus/parse_bootstrap/tls_overlapping_sni_reject.yaml",
+            "fuzz/corpus/parse_bootstrap/hcm_invalid_codec_type.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
