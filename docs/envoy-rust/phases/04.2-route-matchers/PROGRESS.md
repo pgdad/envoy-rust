@@ -61,3 +61,9 @@
 - Tests added (10): rejects_empty_header_name, rejects_invalid_regex_in_safe_regex_match, rejects_invalid_regex_in_string_match_safe_regex, rejects_invalid_int64_range_start_eq_end, rejects_invalid_int64_range_start_gt_end, validator_compiles_safe_regex_match_into_arc, validator_accepts_all_seven_modes, validator_accepts_empty_headers_vec, validator_accepts_invert_match_true, validator_compiles_string_match_safe_regex_into_arc.
 - Verification: `cargo test -p envoy-config --lib` → 101 passed; `cargo build --workspace --all-targets` clean (envoy-bin absorbs the &mut transparently); clippy + fmt clean.
 - Deviations: The borrow checker required a small structural change in `validate`'s TCP_PROXY_FILTER arm: `tp.cluster.clone()` is extracted into `cluster_name` before the mutable listener borrow is active, and the cluster lookup uses `bootstrap.static_resources.clusters.iter()` directly (rather than the `clusters` alias that existed in the old code). This is semantically identical but necessary because the `&mut bootstrap.static_resources.listeners` loop borrow and a simultaneous `&bootstrap.static_resources.clusters` access would conflict under two-phase borrow rules. The PLAN did not anticipate this specific borrow conflict; the fix preserves the original check semantics exactly.
+
+### Task 5 follow-up — review fix (2026-04-27)
+
+- Commit: 48e615c
+- Change: added a 3-line comment block to the TCP_PROXY_FILTER arm in `validate` clarifying that the `as_ref()` borrow is intentional (TCP_PROXY validation is read-only) — closes the asymmetry-readability gap with the HCM_FILTER arm's `as_mut()` (introduced in this Task 5). Comment-only change.
+- Verification: gate commands clean; 101 tests still passing.
