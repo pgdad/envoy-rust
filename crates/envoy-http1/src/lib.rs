@@ -20,4 +20,5 @@ pub mod response;
 
 pub use codec::{Http1Codec, HttpVersion, Request};
 pub use error::Http1Error;
-// Tasks 9–10 will add re-exports for response/hcm public types.
+pub use response::{Http1Response, Response};
+// Task 10 will add re-exports for hcm public types.
