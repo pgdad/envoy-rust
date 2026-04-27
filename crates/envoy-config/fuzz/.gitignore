@@ -9,5 +9,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/tls_overlapping_sni_reject.yaml
 !corpus/parse_bootstrap/hcm_direct_response_happy.yaml
 !corpus/parse_bootstrap/hcm_invalid_codec_type.yaml
+!corpus/parse_bootstrap/route_with_header_matchers.yaml
 artifacts/
 target/
