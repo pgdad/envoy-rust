@@ -614,6 +614,15 @@ impl<'de> serde::Deserialize<'de> for HeaderMatcher {
         use serde::de::{Error, MapAccess, Visitor};
         use std::fmt;
 
+        const MODE_KEYS: &[&str] = &[
+            "exact_match",
+            "prefix_match",
+            "suffix_match",
+            "safe_regex_match",
+            "range_match",
+            "present_match",
+            "string_match",
+        ];
         const ALL_KEYS: &[&str] = &[
             "name",
             "exact_match",
@@ -705,9 +714,9 @@ impl<'de> serde::Deserialize<'de> for HeaderMatcher {
 
                 let name = name.ok_or_else(|| M::Error::missing_field("name"))?;
                 let mode = mode.ok_or_else(|| {
-                    M::Error::custom(
-                        "HeaderMatcher: missing mode key (expected one of exact_match, prefix_match, suffix_match, safe_regex_match, range_match, present_match, string_match)",
-                    )
+                    M::Error::custom(format!(
+                        "HeaderMatcher: missing mode key (expected one of {MODE_KEYS:?})"
+                    ))
                 })?;
                 Ok(HeaderMatcher {
                     name,
@@ -3472,6 +3481,23 @@ weird_match: "bar"
         assert!(
             err.contains("weird_match") || err.contains("unknown"),
             "error mentions unknown key: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_two_header_matcher_mode_keys() {
+        let yaml = r#"
+name: "x-foo"
+exact_match: "a"
+prefix_match: "b"
+"#;
+        let res: Result<HeaderMatcher, _> = serde_yaml::from_str(yaml);
+        let err = res
+            .expect_err("two mode keys should be rejected (each variant is mutually exclusive)")
+            .to_string();
+        assert!(
+            err.contains("multiple mode keys") || err.contains("mutually exclusive"),
+            "error should mention mutual exclusivity: {err}"
         );
     }
 
