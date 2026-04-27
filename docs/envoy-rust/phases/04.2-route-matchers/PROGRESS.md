@@ -134,3 +134,63 @@ Per SPEC §3 D4 + the standing posture from STATE.md "Phase-04.1 rollovers": non
 - M7 (TlsAcceptingHandler generalization for HCM+TLS): A. No action — 04.2 introduces no TLS-bearing HCM fixtures; track forward to phase 05+.
 
 No code changes in this task. All 7 M-track items (other than M5's partial address above) remain on the carryforward ledger for 04.3 / phase 05 / hardening pass.
+
+## Task 12 / State 4 — phase-done gate verification (2026-04-27)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4: the local stable-toolchain gate ran clean on first attempt. ROADMAP.md and STATE.md are NOT advanced here per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session); those flip in state 6 (the phase-done commit) after state 5's `REVIEW.md` is approved.
+
+### State-2 PLAN.md late-landing
+
+PLAN.md was committed at `160caf0` immediately before the state-4 gate as a dedicated commit `phase 04.2: state-2 PLAN.md (late-landing per 04.1 inline-at-Task-1 precedent)`. Mirrors the 04.1 pattern of PLAN.md landing inline rather than at a clean state-2 close-out (PROGRESS Task 1 of 04.1 documents the same well-disclosed deviation). Reviewer-of-state-5 may flag this as a process consistency concern.
+
+### Local stable-toolchain gate
+
+`cargo build --workspace --all-targets`:
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output — clean)
+```
+
+`cargo test --workspace --lib --bins`:
+```
+running 49 tests        (differential lib: 48 passed; 1 ignored — pre-existing 02.2 TcpProxyBackend smoke)
+running 19 tests        (envoy-bin: 19 passed)
+running 8 tests         (envoy-cluster: 8 passed)
+running 131 tests       (envoy-config: 131 passed)
+running 24 tests        (envoy-http1: 24 passed)
+running 6 tests         (envoy-listener: 6 passed)
+running 11 tests        (envoy-tcp: 11 passed)
+running 15 tests        (envoy-tls: 15 passed)
+running 8 tests         (tcp-echo-server: 8 passed)
+running 5 tests         (tls-echo-server: 5 passed)
+```
+
+Total: 275 passed, 0 failed, 1 ignored. Test count delta from 04.1 close (212 + 1 ignored): +63 (envoy-config 75→131 = +56, envoy-http1 19→24 = +5, differential 47→49 = +2).
+
+`cargo deny check`:
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing `license-not-encountered` warnings for `Unicode-DFS-2016` and `Zlib` preserved; not 04.2 regressions.)
+
+### Cargo.lock sync
+
+Clean — no diff at state-4. `Cargo.lock` was synced inline at Task 1 (commit `984aedde`) when ADR-0021's `regex = "1"` runtime dep landed (per PLAN Task 1 Step 11's explicit `git add ... Cargo.lock` instruction). Task 1's review-fix at `def3046` documented the discrepancy with ADR-0021's prose ("dedicated state-4 commit") for D-3.5 audit — ADR text is append-only and not editable. The 04.2 state-4 gate confirms the inline sync was sufficient: no additional Cargo.lock changes accumulated during Tasks 2-11. Mirrors 04.1's same inline-at-scaffold cadence (per 04.1 PROGRESS Task 4 / Task 17 + 04.1 REVIEW M5).
+
+### CI
+
+Local push + `gh run watch` deferred to commit-time; CI exercises the same gate plus the Docker-gated `http1_direct_response_fixture` (now exercising both probes per Task 10's amendment) and the fuzz job (now picks up `route_with_header_matchers.yaml` per Task 8). Reviewer-of-state-5 cross-checks the CI run results.
+
+### Outstanding for state 5/6
+
+State 5 (`superpowers:requesting-code-review`) writes `REVIEW.md` for this phase. State 6 (the phase-done commit) flips ROADMAP row `04.2` `status` → `done` (parent row `04` stays `in-progress` until 04.3 lands per the schema invariant) and advances STATE.md to phase `04.3-router-upstream` (lifecycle state 2; SPEC.md exists from the parent-04 state-2 split commit `1d9740d`, PLAN.md does not; next-skill `superpowers:writing-plans`).
