@@ -313,13 +313,15 @@ pub struct Route {
     pub direct_response: DirectResponse,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
     #[serde(default)]
     pub prefix: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(default)]
+    pub headers: Vec<HeaderMatcher>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -551,6 +553,166 @@ impl<'de> serde::Deserialize<'de> for StringMatcher {
                 Ok(StringMatcher {
                     mode,
                     ignore_case: ignore_case.unwrap_or(false),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+/// One header-matching predicate. AND-combined with sibling HeaderMatchers
+/// in `RouteMatch.headers` per Envoy v1.33.0 default `headers_match_options:
+/// ALL`. Phase 04.2.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeaderMatcher {
+    /// Header name. Matched case-insensitively against the request's header
+    /// names per HTTP/1.1 RFC 7230 §3.2. Empty string is rejected by the
+    /// validator with ConfigError::EmptyHeaderName.
+    pub name: String,
+    /// The mode discriminator. The Envoy proto uses field-name oneof shape
+    /// (the discriminator is *which* of the seven mode fields is present);
+    /// serde tagged-enum doesn't directly model this, so the parsed form goes
+    /// through a hand-rolled Deserialize impl that inspects the YAML mapping
+    /// keys and dispatches to the matching variant. SPEC §6 signpost 1.
+    pub mode: HeaderMatcherMode,
+    /// If true, the entire mode-specific match result is inverted (XOR after
+    /// the mode match runs, before AND-combination across sibling
+    /// HeaderMatchers). SPEC §6 signpost 5.
+    pub invert_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeaderMatcherMode {
+    /// `exact_match: <string>` — value equals literal (case-sensitive on the
+    /// value; the header name match is always case-insensitive per HTTP/1.1).
+    ExactMatch(String),
+    /// `prefix_match: <string>` — value starts with literal.
+    PrefixMatch(String),
+    /// `suffix_match: <string>` — value ends with literal.
+    SuffixMatch(String),
+    /// `safe_regex_match: { regex: "<pattern>" }` — value matches the regex.
+    /// Compiled at config-load time into Arc<regex::Regex>; the validator
+    /// rejects unparseable patterns with ConfigError::InvalidRegex.
+    SafeRegexMatch(SafeRegex),
+    /// `range_match: { start: <i64>, end: <i64> }` — value parses as i64
+    /// (decimal) and falls in [start, end). Non-parseable values fail the
+    /// match (NOT an error). SPEC §6 signpost 6.
+    RangeMatch(Int64Range),
+    /// `present_match: <bool>` — header presence (true) or "no presence
+    /// requirement" (false; SPEC §6 signpost 7 for the subtle false semantics).
+    PresentMatch(bool),
+    /// `string_match: <StringMatcher>` — Envoy's modern generic tagged-union
+    /// (the only path to Contains; SPEC §6 signpost 8).
+    StringMatch(StringMatcher),
+}
+
+impl<'de> serde::Deserialize<'de> for HeaderMatcher {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        const ALL_KEYS: &[&str] = &[
+            "name",
+            "exact_match",
+            "prefix_match",
+            "suffix_match",
+            "safe_regex_match",
+            "range_match",
+            "present_match",
+            "string_match",
+            "invert_match",
+        ];
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = HeaderMatcher;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a HeaderMatcher map with `name`, exactly one mode key, and optional invert_match",
+                )
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<HeaderMatcher, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut name: Option<String> = None;
+                let mut mode: Option<HeaderMatcherMode> = None;
+                let mut invert_match: Option<bool> = None;
+
+                fn set_mode<E: Error>(
+                    slot: &mut Option<HeaderMatcherMode>,
+                    new: HeaderMatcherMode,
+                ) -> Result<(), E> {
+                    if slot.is_some() {
+                        return Err(E::custom(
+                            "HeaderMatcher: multiple mode keys (each variant is mutually exclusive)",
+                        ));
+                    }
+                    *slot = Some(new);
+                    Ok(())
+                }
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "name" => {
+                            if name.is_some() {
+                                return Err(M::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value::<String>()?);
+                        }
+                        "exact_match" => set_mode(
+                            &mut mode,
+                            HeaderMatcherMode::ExactMatch(map.next_value::<String>()?),
+                        )?,
+                        "prefix_match" => set_mode(
+                            &mut mode,
+                            HeaderMatcherMode::PrefixMatch(map.next_value::<String>()?),
+                        )?,
+                        "suffix_match" => set_mode(
+                            &mut mode,
+                            HeaderMatcherMode::SuffixMatch(map.next_value::<String>()?),
+                        )?,
+                        "safe_regex_match" => set_mode(
+                            &mut mode,
+                            HeaderMatcherMode::SafeRegexMatch(map.next_value::<SafeRegex>()?),
+                        )?,
+                        "range_match" => set_mode(
+                            &mut mode,
+                            HeaderMatcherMode::RangeMatch(map.next_value::<Int64Range>()?),
+                        )?,
+                        "present_match" => set_mode(
+                            &mut mode,
+                            HeaderMatcherMode::PresentMatch(map.next_value::<bool>()?),
+                        )?,
+                        "string_match" => set_mode(
+                            &mut mode,
+                            HeaderMatcherMode::StringMatch(map.next_value::<StringMatcher>()?),
+                        )?,
+                        "invert_match" => {
+                            if invert_match.is_some() {
+                                return Err(M::Error::duplicate_field("invert_match"));
+                            }
+                            invert_match = Some(map.next_value::<bool>()?);
+                        }
+                        other => {
+                            return Err(M::Error::unknown_field(other, ALL_KEYS));
+                        }
+                    }
+                }
+
+                let name = name.ok_or_else(|| M::Error::missing_field("name"))?;
+                let mode = mode.ok_or_else(|| {
+                    M::Error::custom(
+                        "HeaderMatcher: missing mode key (expected one of exact_match, prefix_match, suffix_match, safe_regex_match, range_match, present_match, string_match)",
+                    )
+                })?;
+                Ok(HeaderMatcher {
+                    name,
+                    mode,
+                    invert_match: invert_match.unwrap_or(false),
                 })
             }
         }
@@ -3245,6 +3407,97 @@ prefix: "b"
         assert!(
             err.contains("multiple mode keys") || err.contains("mutually exclusive"),
             "error should mention mutual exclusivity: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_header_matcher_exact() {
+        let yaml = r#"
+name: "x-foo"
+exact_match: "bar"
+"#;
+        let m: HeaderMatcher = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(m.name, "x-foo");
+        assert_eq!(m.mode, HeaderMatcherMode::ExactMatch("bar".into()));
+        assert!(!m.invert_match);
+    }
+
+    #[test]
+    fn parses_header_matcher_with_invert_match_true() {
+        let yaml = r#"
+name: "x-foo"
+exact_match: "bar"
+invert_match: true
+"#;
+        let m: HeaderMatcher = serde_yaml::from_str(yaml).expect("parses");
+        assert!(m.invert_match);
+    }
+
+    #[test]
+    fn parses_header_matcher_present_match_true() {
+        let yaml = r#"
+name: "authorization"
+present_match: true
+"#;
+        let m: HeaderMatcher = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(m.mode, HeaderMatcherMode::PresentMatch(true));
+    }
+
+    #[test]
+    fn parses_header_matcher_string_match_contains() {
+        let yaml = r#"
+name: "x-tag"
+string_match:
+  contains: "beta"
+  ignore_case: true
+"#;
+        let m: HeaderMatcher = serde_yaml::from_str(yaml).expect("parses");
+        match m.mode {
+            HeaderMatcherMode::StringMatch(sm) => {
+                assert_eq!(sm.mode, StringMatcherMode::Contains("beta".into()));
+                assert!(sm.ignore_case);
+            }
+            other => panic!("expected StringMatch variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_header_matcher_mode_key() {
+        let yaml = r#"
+name: "x-foo"
+weird_match: "bar"
+"#;
+        let res: Result<HeaderMatcher, _> = serde_yaml::from_str(yaml);
+        let err = res.expect_err("unknown mode key should error").to_string();
+        assert!(
+            err.contains("weird_match") || err.contains("unknown"),
+            "error mentions unknown key: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_route_match_with_headers_vec_and_invert_match_default() {
+        let yaml = r#"
+prefix: "/api/"
+headers:
+  - name: "x-foo"
+    exact_match: "bar"
+  - name: "x-version"
+    range_match: { start: 1, end: 100 }
+"#;
+        let rm: RouteMatch = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(rm.prefix.as_deref(), Some("/api/"));
+        assert_eq!(rm.headers.len(), 2);
+        assert_eq!(rm.headers[0].name, "x-foo");
+        assert!(!rm.headers[0].invert_match);
+        assert_eq!(
+            rm.headers[0].mode,
+            HeaderMatcherMode::ExactMatch("bar".into())
+        );
+        assert_eq!(rm.headers[1].name, "x-version");
+        assert_eq!(
+            rm.headers[1].mode,
+            HeaderMatcherMode::RangeMatch(Int64Range { start: 1, end: 100 })
         );
     }
 }

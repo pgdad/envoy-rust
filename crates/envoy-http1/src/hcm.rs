@@ -61,6 +61,7 @@ fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
                         r#match: RouteMatch {
                             prefix: r.r#match.prefix.clone(),
                             path: r.r#match.path.clone(),
+                            headers: r.r#match.headers.clone(),
                         },
                         direct_response: DirectResponse {
                             status: r.direct_response.status,
@@ -352,6 +353,7 @@ mod tests {
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
                             path: None,
+                            headers: vec![],
                         },
                         direct_response: DirectResponse {
                             status,
@@ -425,6 +427,7 @@ mod tests {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
+                            headers: vec![],
                         },
                         direct_response: DirectResponse {
                             status: 200,
@@ -461,6 +464,7 @@ mod tests {
                             r#match: RouteMatch {
                                 prefix: Some("/healthz".to_string()),
                                 path: None,
+                                headers: vec![],
                             },
                             direct_response: DirectResponse {
                                 status: 200,
@@ -474,6 +478,7 @@ mod tests {
                             r#match: RouteMatch {
                                 prefix: Some("/".to_string()),
                                 path: None,
+                                headers: vec![],
                             },
                             direct_response: DirectResponse {
                                 status: 500,
@@ -522,6 +527,7 @@ mod tests {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
+                            headers: vec![],
                         },
                         direct_response: DirectResponse {
                             status: 200,
