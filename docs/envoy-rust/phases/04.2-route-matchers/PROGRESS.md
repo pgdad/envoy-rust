@@ -45,3 +45,11 @@
 - Tests added (6): parses_header_matcher_exact, parses_header_matcher_with_invert_match_true, parses_header_matcher_present_match_true, parses_header_matcher_string_match_contains, rejects_unknown_header_matcher_mode_key, parses_route_match_with_headers_vec_and_invert_match_default.
 - Verification: `cargo test -p envoy-config --lib` → 90 passed; `cargo build --workspace --all-targets` clean (envoy-http1 hcm.rs updated for all 6 RouteMatch literal sites — 1 in clone_route_config + 5 in tests); clippy + fmt clean.
 - Deviations: PLAN mentioned only the `clone_route_config` site in hcm.rs, but the compile cascade affected 5 additional RouteMatch literal sites in the test section of hcm.rs (lines 353, 427, 464, 478, 527). All 6 sites were patched with `headers: vec![]` / `.headers.clone()` as appropriate. Additionally, rustfmt reformatted one long `assert_eq!` line in the new test (`parses_route_match_with_headers_vec_and_invert_match_default`) into multi-line form; `cargo fmt --all` applied to satisfy the fmt gate.
+
+### Task 4 follow-up — review fix (2026-04-27)
+
+- Commit: 17f991ac1401328f1e551276412b0939e473ff7b
+- Change: addressed 2 Important findings from code quality review:
+  1. Added `rejects_two_header_matcher_mode_keys` test exercising `set_mode`'s guard branch (the schema-layer test for the multi-mode-key collision invariant; mirrors Task 3's `rejects_two_string_matcher_mode_keys`).
+  2. Introduced `MODE_KEYS` const inside HeaderMatcher's Deserialize impl (sibling to ALL_KEYS) and refactored the missing-mode error to use `format!("...{MODE_KEYS:?}")` — matches StringMatcher's pattern and prevents the error string from drifting if a future variant is added.
+- Verification: `cargo test -p envoy-config --lib` → 91 passed (was 90; +1); all gate commands clean.
