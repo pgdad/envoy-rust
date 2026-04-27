@@ -2,7 +2,7 @@
 
 ## Task 1 — envoy-config: HCM TypedConfig variant + RouteConfiguration schema + DirectResponse + DataSource extension + 6 parse-shape tests (2026-04-27)
 
-- Commit: <SHA>
+- Commit: c41ae7f
 - Change: Extended `crates/envoy-config/src/bootstrap.rs` with the HCM and route-config schema. Added a new `TypedConfig::HttpConnectionManager(HttpConnectionManagerConfig)` variant on the existing `TypedConfig` enum (sibling of `TcpProxy`). Appended ten new types after the existing `DataSource` struct: `HttpConnectionManagerConfig`, `CodecType` (enum: AUTO/HTTP1/HTTP2/HTTP3, `#[allow(non_camel_case_types)]`), `HttpFilter`, `HttpFilterTypedConfig` (enum tagged on `@type` with the `Router` variant), `RouterConfig` (empty in 04.1 per SPEC §4 deferrals), `RouteConfiguration`, `VirtualHost`, `Route` (with `#[serde(rename = "match")]` on `r#match`), `RouteMatch` (`prefix` + `path`, both `Option<String>` with `#[serde(default)]`), `DirectResponse` (`status: u16`, `body: DataSource`). All carry `#[derive(Debug, Deserialize, PartialEq)]` and `#[serde(deny_unknown_fields)]` per the established bootstrap.rs convention.
 - DataSource extension: `filename: String` → `filename: Option<String>` with `#[serde(default)]`; new `inline_string: Option<String>` field with `#[serde(default)]`. The "exactly one of {filename, inline_string} is `Some`" invariant — and the per-callsite restriction that TLS still requires `filename` — is the validator's responsibility (Task 2), not serde's.
 - Re-exports: extended the `pub use bootstrap::{...}` list in `crates/envoy-config/src/lib.rs` to include all 10 new public names (alphabetic / logical-cluster ordering preserved).
