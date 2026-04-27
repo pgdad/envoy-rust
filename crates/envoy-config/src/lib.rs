@@ -125,6 +125,32 @@ pub enum ConfigError {
         "unsupported HTTP filter count: {count}; phase 04.x's HCM accepts exactly one filter (the router)"
     )]
     MultipleHttpFilters { count: usize },
+
+    /// HeaderMatcher.name was empty. Phase 04.2.
+    #[error("HeaderMatcher.name must be non-empty")]
+    EmptyHeaderName,
+
+    /// SafeRegex.regex failed `regex::Regex::new`. Phase 04.2 (under ADR-0021).
+    #[error("invalid regex `{regex}`: {source}")]
+    InvalidRegex {
+        regex: String,
+        #[source]
+        source: regex::Error,
+    },
+
+    /// Int64Range.start >= Int64Range.end (the half-open interval would be
+    /// empty). Phase 04.2.
+    #[error("invalid Int64Range: start {start} must be < end {end}")]
+    InvalidInt64Range { start: i64, end: i64 },
+
+    /// HeaderMatcher's hand-rolled Deserialize encountered an unrecognized mode
+    /// key. Phase 04.2; the seven recognized keys are `exact_match`,
+    /// `prefix_match`, `suffix_match`, `safe_regex_match`, `range_match`,
+    /// `present_match`, `string_match`.
+    #[error(
+        "unknown HeaderMatcher mode key: {got:?}; expected one of exact_match, prefix_match, suffix_match, safe_regex_match, range_match, present_match, string_match"
+    )]
+    UnknownHeaderMatcherMode { got: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
