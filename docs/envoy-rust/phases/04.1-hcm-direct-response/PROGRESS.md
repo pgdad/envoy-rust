@@ -57,3 +57,11 @@
 - Deviations from PLAN:
   1. **`mod` declaration order in `lib.rs`** — the PLAN's Step 2 sketch listed `pub mod codec; pub mod headers; pub mod date; pub mod response; pub mod hcm; mod error;` (logical/grouped order). rustfmt enforces alphabetical sort of `mod` items, so the as-committed order is `pub mod codec; pub mod date; mod error; pub mod hcm; pub mod headers; pub mod response;` (alphabetic, with the private `mod error` interleaved at its alphabetic slot). Caught by `cargo fmt --all -- --check` failing initially; resorted to match rustfmt. No semantic change; the comment block referencing Task 5 / Tasks 8–10 re-exports is preserved verbatim below the module list.
 - ADRs: none in this task. ADR ledger head remains 20.
+
+## Task 5 — envoy-http1::error (2026-04-27)
+
+- Commit: 4f1814f
+- Change: replaced the `error.rs` stub with the `Http1Error` enum carrying 6 variants (`MalformedRequestLine`, `MalformedHeader`, `HeadersTooLarge { cap: usize }`, `BodyTooLarge { cap: usize }`, `UnexpectedEof`, `Io { source: std::io::Error }`) per SPEC §3 D1. Each variant has its `#[error(...)]` display string verbatim from the PLAN. Added an explicit `impl From<std::io::Error> for Http1Error` (mapping into the `Io` variant) for `?`-ergonomic propagation in Tasks 8–10. Added `pub use error::Http1Error;` to `lib.rs` (Task 4 deferred this re-export; the comment-block reminder for Tasks 8–10 codec/response/hcm re-exports is preserved verbatim on the line below).
+- Verification: `cargo build -p envoy-http1` → clean (0.20s, only envoy-http1 recompiled). `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean. `cargo fmt --all -- --check` → clean. No `dead_code` warnings fired despite the variants being unused at this point — `pub`-visible enum variants are not subject to dead-code lint, so no `#[allow(dead_code)]` attribute was needed (the PLAN's Step 4 contingency was not triggered).
+- Deviations from PLAN: chose the explicit `impl From<std::io::Error>` form over thiserror's `#[from]` shorthand. The PLAN allowed either; explicit-impl was kept because clippy did not flag the manual impl as redundant (the `#[from]` substitution clause was contingent on clippy complaining), and the explicit form makes the conversion site obvious to a reader. Behavior is identical either way.
+- ADRs: none in this task. ADR ledger head remains 20.
