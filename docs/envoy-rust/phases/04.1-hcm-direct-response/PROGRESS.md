@@ -194,3 +194,10 @@
   4. **rustfmt reformats — `bail!(...)` argument layout + multi-line `diff_headers(...)` call.** rustfmt collapsed several `bail!("..."\n  upstream: {}\n  subject:  {}", ...)` invocations onto compact multi-line forms, and re-broke the `diff_headers(&upstream_resp.headers, &subject_resp.headers, HEADER_ALLOW_LIST)` call across 5 lines. Applied; no semantic change.
 - ADRs: none in this task. ADR ledger head remains 20.
 - Open concern: drive_http1 has no per-function unit test in this task (PLAN-mandated). It is unreached by the existing 46 tests and only becomes covered by Task 16's Docker-gated fixture 0007 test. A regression in drive_http1 between Task 14 and Task 16 would not be caught by `cargo test -p differential --lib`. This is the PLAN's intentional cadence (the helper's behavior is a thin wrapper around well-tested deps — `tokio` I/O + `httparse`); the risk is bounded.
+
+## Task 15 — BEHAVIOR_CONTRACT.md Header allow-list (2026-04-27)
+
+- Commit: 43c4538
+- Change: replaced `_(empty; populated starting phase 04)_` placeholder in `docs/envoy-rust/BEHAVIOR_CONTRACT.md` with a 2-row Header allow-list table (`server` + `date`, both name-required / value-may-differ). ADR-0011's deferral closes here — the contract now has its first populated entries, and the harness `HEADER_ALLOW_LIST` constant (Task 13) is the in-code mirror.
+- Verification: harness constant + contract table are byte-identical in entry set (`server`, `date`) and ordering. ADR ledger unchanged at 20.
+- Deviations: none.
