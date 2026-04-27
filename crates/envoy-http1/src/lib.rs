@@ -11,6 +11,7 @@
 //! is that admin code routes through this crate's public types when admin
 //! is next touched; 04.1 does not perform an in-flight refactor of admin.
 
+pub mod client;
 pub mod codec;
 pub mod date;
 mod error;
@@ -18,6 +19,7 @@ pub mod hcm;
 pub mod headers;
 pub mod response;
 
+pub use client::{Client, ClientStream};
 pub use codec::{Http1Codec, HttpVersion, Request};
 pub use error::Http1Error;
 pub use hcm::{HCM, HCMConfig};
