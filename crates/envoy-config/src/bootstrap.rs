@@ -329,6 +329,94 @@ pub struct DirectResponse {
     pub body: DataSource,
 }
 
+/// Half-open i64 range. Validator rejects start >= end with
+/// ConfigError::InvalidInt64Range. Phase 04.2.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Int64Range {
+    pub start: i64,
+    pub end: i64,
+}
+
+/// Reference to a regex pattern. Held both as the original String (for
+/// re-serialization / equality / debugging) and the compiled Arc<regex::Regex>
+/// (for cheap clone + zero-cost matching). The compiled form is *not* a serde
+/// field; it's filled in by the envoy-config validator after deserialization.
+/// Phase 04.2 (under ADR-0021).
+///
+/// PartialEq compares only the `regex: String` field. The compiled regex has
+/// no stable equality (regex::Regex doesn't impl PartialEq), and PartialEq is
+/// useful for assert_eq! shape comparisons in tests where pre-validate values
+/// (compiled == None) and post-validate values (compiled == Some) should be
+/// considered equal if they came from the same pattern.
+#[derive(Debug, Clone)]
+pub struct SafeRegex {
+    pub regex: String,
+    /// Filled in by the validator (`crate::bootstrap::validate`). At
+    /// deserialization time this is None; after a successful validate() call
+    /// it's Some(Arc<regex::Regex>). Consumers (the route walker in HCM via
+    /// HeaderMatcher::matches) take the .as_ref().expect("validator ensured
+    /// compiled") shape, mirroring phase 02.1's "validator ensured cluster
+    /// present" precedent.
+    pub compiled: Option<std::sync::Arc<regex::Regex>>,
+}
+
+impl PartialEq for SafeRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.regex == other.regex
+    }
+}
+
+/// Hand-rolled Deserialize: only reads `regex: String`; sets `compiled: None`.
+/// The validator extension (Task 5) fills the compiled form. The hand-rolled
+/// shape (rather than `#[derive(Deserialize)] + #[serde(skip)]`) is mandatory
+/// because the validator needs to *write* `compiled`, but `serde(skip)` would
+/// leave the field absent from any auto-generated value-construction path —
+/// and we additionally enforce `deny_unknown_fields` semantics here (reject
+/// any key other than `regex`).
+impl<'de> serde::Deserialize<'de> for SafeRegex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = SafeRegex;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a SafeRegex map with a `regex: String` field")
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<SafeRegex, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut regex: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "regex" => {
+                            if regex.is_some() {
+                                return Err(M::Error::duplicate_field("regex"));
+                            }
+                            regex = Some(map.next_value::<String>()?);
+                        }
+                        other => {
+                            return Err(M::Error::unknown_field(other, &["regex"]));
+                        }
+                    }
+                }
+                let regex = regex.ok_or_else(|| M::Error::missing_field("regex"))?;
+                Ok(SafeRegex {
+                    regex,
+                    compiled: None,
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
     let listeners = &bootstrap.static_resources.listeners;
     let clusters = &bootstrap.static_resources.clusters;
@@ -2905,5 +2993,50 @@ admin:
             "got: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn parses_int64_range() {
+        let yaml = r#"
+start: 1
+end: 100
+"#;
+        let r: Int64Range = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(r.start, 1);
+        assert_eq!(r.end, 100);
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_int64_range() {
+        let yaml = r#"
+start: 1
+end: 100
+step: 5
+"#;
+        let res: Result<Int64Range, _> = serde_yaml::from_str(yaml);
+        assert!(res.is_err(), "deny_unknown_fields should reject `step`");
+    }
+
+    #[test]
+    fn parses_safe_regex() {
+        let yaml = r#"
+regex: "^v[0-9]+$"
+"#;
+        let sr: SafeRegex = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(sr.regex, "^v[0-9]+$");
+        assert!(sr.compiled.is_none(), "compiled set to None pre-validate");
+    }
+
+    #[test]
+    fn safe_regex_partial_eq_compares_only_regex_string() {
+        let a = SafeRegex {
+            regex: "x".into(),
+            compiled: None,
+        };
+        let b = SafeRegex {
+            regex: "x".into(),
+            compiled: Some(std::sync::Arc::new(regex::Regex::new("x").unwrap())),
+        };
+        assert_eq!(a, b, "compiled field is opaque to PartialEq");
     }
 }
