@@ -49,7 +49,7 @@ pub enum ConfigError {
     MissingTypedConfig(&'static str),
     #[error("filter '{0}' must not carry typed_config")]
     UnexpectedTypedConfig(&'static str),
-    #[error("tcp_proxy filter references unknown cluster '{0}'")]
+    #[error("unknown cluster '{0}'")]
     UnknownCluster(String),
     #[error(
         "cluster '{cluster}' declares load_assignment.cluster_name '{assignment}'; these must match"
