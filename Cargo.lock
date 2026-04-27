@@ -356,6 +356,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-http1"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "envoy-cluster",
+ "envoy-config",
+ "envoy-listener",
+ "httparse",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "envoy-listener"
 version = "0.0.0"
 dependencies = [

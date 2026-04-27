@@ -1,0 +1,19 @@
+[package]
+name = "envoy-http1"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+envoy-config = { path = "../envoy-config" }
+envoy-cluster = { path = "../envoy-cluster" }
+envoy-listener = { path = "../envoy-listener" }
+httparse = "1"
+bytes = "1"
+tokio = { version = "1", features = ["net", "io-util", "macros", "sync", "time"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
