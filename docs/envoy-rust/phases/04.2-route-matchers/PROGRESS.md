@@ -113,3 +113,10 @@
 - Tests added (2): parses_expectations_with_http1_probe_list, http1_probe_extra_headers_default_empty.
 - Verification: `cargo test -p differential --lib` → 49 passed (was 47; +2); clippy + fmt + build clean.
 - Deviations: rustfmt required Http1ProbeList variant to be expanded to multi-line form (`{ probes: Vec<Http1Probe>, }` across 3 lines) rather than the single-line form in the PLAN — fmt gate caught and fixed before commit.
+
+## Task 10 — fixture 0007 amendment (matcher route) (2026-04-27)
+
+- Commit: 64e269f
+- Change: amended tests/fixtures/0007-http1-direct-response/{envoy.yaml,envoy-rust.yaml} to add a 04.2 NEW route at the head of routes: with `match: { prefix: "/api/", headers: [{ name: "x-foo", exact_match: "bar" }] }` returning direct_response 418 "teapot\n"; existing `prefix: "/"` catch-all stays second per first-match-wins discipline. Created tests/fixtures/0007-http1-direct-response/inputs/payload-matcher.bin (empty file; placeholder per 04.1 payload.bin convention). Restructured expectations.yaml from single-Driver::Http1 to Driver::Http1ProbeList with two probes (default-route, matcher-route). Appended a "04.2 amendment — header-matcher route" section to README.md and added ADR-0021 to the ADR references list.
+- Verification: `cargo test -p envoy-bin --test http1_direct_response` → PASS (in-process backstop: GET /healthz still falls through to default route 200 OK); `cargo test -p differential --test http1_direct_response` → Docker not available (Socket not found: /var/run/docker.sock) — environment issue, not a fixture problem; workspace gate (build/clippy/fmt/test --lib --bins) clean.
+- Deviations: none.
