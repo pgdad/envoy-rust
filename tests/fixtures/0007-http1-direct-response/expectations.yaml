@@ -1,0 +1,13 @@
+driver:
+  kind: http1
+  method: get
+  path: "/healthz"
+  host: "envoy-rust.test"
+  expected_status: 200
+  expected_body:
+    kind: byte_exact
+    body: "ok\n"
+  expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: byte_exact

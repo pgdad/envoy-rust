@@ -123,10 +123,18 @@ impl Http1Method {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Http1BodyRule {
-    /// Body must equal these bytes exactly (the expected value comes from
-    /// the fixture's expectations.yaml). Distinct from the harness-level
-    /// `BodyRule::ByteExact` which compares envoy ↔ envoy-rust outputs.
-    ByteExact { bytes: Vec<u8> },
+    /// Body must equal this string's UTF-8 bytes exactly (the expected value
+    /// comes from the fixture's expectations.yaml). Distinct from the
+    /// harness-level `BodyRule::ByteExact` which compares envoy ↔ envoy-rust
+    /// outputs.
+    ///
+    /// Field is `String` rather than `Vec<u8>` because serde's default YAML
+    /// deserialization of `Vec<u8>` rejects YAML scalar strings (it expects a
+    /// sequence of integer bytes). 04.x bodies are always text — the string
+    /// form keeps fixture YAML readable (e.g. `body: "ok\n"`). If a future
+    /// fixture needs to assert on non-UTF-8 bytes, switch to `serde_bytes` or
+    /// add a string-to-bytes deserializer at that point.
+    ByteExact { body: String },
     // 04.3 may add ByteExactWithRequestEcho — for the http1-echo-server's
     // deterministic echo response shape.
 }
@@ -1092,19 +1100,20 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 );
             }
             // Per-driver `expected_body`: each side independently equals bytes.
-            if let Some(Http1BodyRule::ByteExact { bytes }) = expected_body {
-                if &upstream_resp.body != bytes {
+            if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
+                let expected = body.as_bytes();
+                if upstream_resp.body != expected {
                     bail!(
                         "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
                         upstream_resp.body,
-                        bytes,
+                        expected,
                     );
                 }
-                if &subject_resp.body != bytes {
+                if subject_resp.body != expected {
                     bail!(
                         "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
                         subject_resp.body,
-                        bytes,
+                        expected,
                     );
                 }
             }
