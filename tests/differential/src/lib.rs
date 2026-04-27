@@ -73,6 +73,13 @@ pub enum Driver {
         #[serde(default)]
         expected_headers: Option<Http1HeaderRule>,
     },
+    /// 04.2 NEW: drive a sequence of HTTP/1.1 probes against a single listener
+    /// address. Each probe runs an independent request/response cycle and
+    /// applies the per-probe equivalence cascade. Mirrors the established
+    /// `TlsTcpProbeList` shape (03.2). Per SPEC §3 D3.
+    Http1ProbeList {
+        probes: Vec<Http1Probe>,
+    },
 }
 
 /// One TLS-SNI probe entry inside `Driver::TlsTcpProbeList`. SPEC §D6.
@@ -143,6 +150,30 @@ pub enum Http1BodyRule {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Http1HeaderRule {
     SetEqualModuloAllowList,
+}
+
+/// 04.2 NEW: one probe entry inside `Driver::Http1ProbeList`. Each probe drives
+/// one HTTP/1.1 request through both upstream Envoy and envoy-rust, applying
+/// the same 5-axis equivalence cascade the single-probe `Driver::Http1` does.
+/// Extra request headers (e.g. `X-Foo: bar`) inject through `extra_headers`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Http1Probe {
+    /// Human-readable label for this probe (appears in failure messages).
+    pub name: String,
+    pub method: Http1Method,
+    pub path: String,
+    pub host: String,
+    /// Extra request headers beyond the harness-emitted defaults
+    /// (`Host`, `Connection: close`). Empty Vec means no extras.
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub expected_status: Option<u16>,
+    #[serde(default)]
+    pub expected_body: Option<Http1BodyRule>,
+    #[serde(default)]
+    pub expected_headers: Option<Http1HeaderRule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,18 +694,23 @@ pub async fn drive_http1(
     method: &Http1Method,
     path: &str,
     host: &str,
+    extra_headers: &[(String, String)],
 ) -> Result<DriveHttp1Result> {
     use tokio::net::TcpStream;
     let mut stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connecting to {addr}"))?;
-    let req_line = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\n",
         method.as_str(),
         path,
         host,
     );
-    stream.write_all(req_line.as_bytes()).await?;
+    for (n, v) in extra_headers {
+        req.push_str(&format!("{n}: {v}\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let read_timeout = Duration::from_secs(5);
@@ -798,7 +834,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         Driver::TcpEcho
         | Driver::TlsTcp { .. }
         | Driver::TlsTcpProbeList { .. }
-        | Driver::Http1 { .. } => "PORT",
+        | Driver::Http1 { .. }
+        | Driver::Http1ProbeList { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
     };
 
@@ -1051,10 +1088,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_body,
             expected_headers,
         } => {
-            let upstream_resp = drive_http1(upstream_addr, method, path, host)
+            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[])
                 .await
                 .context("upstream envoy http1 drive")?;
-            let subject_resp = drive_http1(subject_addr, method, path, host)
+            let subject_resp = drive_http1(subject_addr, method, path, host, &[])
                 .await
                 .context("envoy-rust http1 drive")?;
             subject.shutdown(Duration::from_secs(5)).await.ok();
@@ -1130,6 +1167,112 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 )
                 .context("diff_headers (set_equal_modulo_allow_list)")?;
             }
+        }
+        Driver::Http1ProbeList { probes } => {
+            // Iterate probes; per-probe equivalence cascade mirrors the
+            // single-probe Driver::Http1 arm. Subject + upstream tear down
+            // AFTER all probes have run.
+            for probe in probes {
+                let upstream_resp = drive_http1(
+                    upstream_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                )
+                .await
+                .with_context(|| format!("upstream envoy http1 drive (probe {})", probe.name))?;
+                let subject_resp = drive_http1(
+                    subject_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                )
+                .await
+                .with_context(|| format!("envoy-rust http1 drive (probe {})", probe.name))?;
+
+                // Status: envoy ↔ envoy-rust under `response_status: exact`.
+                if matches!(
+                    expectations.equivalence.response_status,
+                    Some(StatusRule::Exact)
+                ) && upstream_resp.status != subject_resp.status
+                {
+                    bail!(
+                        "probe {}: response status mismatch under `response_status: exact`\n  \
+                         upstream: {}\n  subject:  {}",
+                        probe.name,
+                        upstream_resp.status,
+                        subject_resp.status,
+                    );
+                }
+                if let Some(es) = probe.expected_status {
+                    if upstream_resp.status != es {
+                        bail!(
+                            "probe {}: upstream status {} != expected {}",
+                            probe.name,
+                            upstream_resp.status,
+                            es,
+                        );
+                    }
+                    if subject_resp.status != es {
+                        bail!(
+                            "probe {}: subject status {} != expected {}",
+                            probe.name,
+                            subject_resp.status,
+                            es,
+                        );
+                    }
+                }
+
+                // Body.
+                if matches!(
+                    expectations.equivalence.response_body,
+                    Some(BodyRule::ByteExact)
+                ) && upstream_resp.body != subject_resp.body
+                {
+                    bail!(
+                        "probe {}: byte-exact body mismatch\n  upstream: {:?}\n  subject:  {:?}",
+                        probe.name,
+                        upstream_resp.body,
+                        subject_resp.body,
+                    );
+                }
+                if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
+                    let expected = body.as_bytes();
+                    if upstream_resp.body != expected {
+                        bail!(
+                            "probe {}: upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                            probe.name,
+                            upstream_resp.body,
+                            expected,
+                        );
+                    }
+                    if subject_resp.body != expected {
+                        bail!(
+                            "probe {}: subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                            probe.name,
+                            subject_resp.body,
+                            expected,
+                        );
+                    }
+                }
+
+                // Headers.
+                if matches!(
+                    probe.expected_headers,
+                    Some(Http1HeaderRule::SetEqualModuloAllowList)
+                ) {
+                    diff_headers(
+                        &upstream_resp.headers,
+                        &subject_resp.headers,
+                        HEADER_ALLOW_LIST,
+                    )
+                    .with_context(|| format!("probe {}: diff_headers", probe.name))?;
+                }
+            }
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
         }
     }
 
@@ -1803,5 +1946,66 @@ server_key: {{SERVER_KEY_PATH}}
         let err = diff_headers(&envoy, &envoy_rust, HEADER_ALLOW_LIST)
             .expect_err("envoy emits x-foo, envoy-rust does not");
         assert!(err.to_string().contains("x-foo"), "msg: {err}");
+    }
+
+    #[test]
+    fn parses_expectations_with_http1_probe_list() {
+        // 04.2 NEW: Driver::Http1ProbeList shape parses round-trip from YAML.
+        let yaml = r#"
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: default-route
+      method: get
+      path: "/healthz"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body:
+        kind: byte_exact
+        body: "ok\n"
+      expected_headers: set_equal_modulo_allow_list
+    - name: matcher-route
+      method: get
+      path: "/api/widgets"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["X-Foo", "bar"]
+      expected_status: 418
+      expected_body:
+        kind: byte_exact
+        body: "teapot\n"
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::Http1ProbeList { probes } = e.driver else {
+            panic!("expected Http1ProbeList");
+        };
+        assert_eq!(probes.len(), 2);
+        assert_eq!(probes[0].name, "default-route");
+        assert_eq!(probes[0].extra_headers.len(), 0);
+        assert_eq!(probes[1].name, "matcher-route");
+        assert_eq!(probes[1].extra_headers.len(), 1);
+        assert_eq!(probes[1].extra_headers[0].0, "X-Foo");
+        assert_eq!(probes[1].extra_headers[0].1, "bar");
+    }
+
+    #[test]
+    fn http1_probe_extra_headers_default_empty() {
+        let yaml = r#"
+name: simple
+method: get
+path: "/"
+host: "x.test"
+expected_status: 200
+expected_body:
+  kind: byte_exact
+  body: ""
+expected_headers: set_equal_modulo_allow_list
+"#;
+        let p: Http1Probe = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(p.extra_headers.len(), 0);
     }
 }
