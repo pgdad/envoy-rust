@@ -1,13 +1,26 @@
 driver:
-  kind: http1
-  method: get
-  path: "/healthz"
-  host: "envoy-rust.test"
-  expected_status: 200
-  expected_body:
-    kind: byte_exact
-    body: "ok\n"
-  expected_headers: set_equal_modulo_allow_list
+  kind: http1_probe_list
+  probes:
+    - name: default-route
+      method: get
+      path: "/healthz"
+      host: "envoy-rust.test"
+      expected_status: 200
+      expected_body:
+        kind: byte_exact
+        body: "ok\n"
+      expected_headers: set_equal_modulo_allow_list
+    - name: matcher-route
+      method: get
+      path: "/api/widgets"
+      host: "envoy-rust.test"
+      extra_headers:
+        - ["X-Foo", "bar"]
+      expected_status: 418
+      expected_body:
+        kind: byte_exact
+        body: "teapot\n"
+      expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact
   response_body: byte_exact

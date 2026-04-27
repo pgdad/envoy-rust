@@ -44,7 +44,35 @@ What is *out* of this fixture (each pinned to a later sub-phase or phase):
   literal) — phase 05+; until then the BEHAVIOR_CONTRACT.md allow-list
   permits `server` to differ.
 
+## 04.2 amendment — header-matcher route
+
+Phase 04.2 added a second route at the head of `routes:` (so first-match-wins
+reaches it before the catch-all): `match: { prefix: "/api/", headers: [{ name:
+"x-foo", exact_match: "bar" }] }` returning `direct_response: { status: 418,
+body: { inline_string: "teapot\n" } }`. The original `prefix: "/"` catch-all
+stays second; both proxies must select the same route on each probe — the new
+differential property 04.2 exercises.
+
+The fixture now drives two probes via the harness's `Driver::Http1ProbeList`:
+
+- `default-route` — `GET /healthz Host: envoy-rust.test` (no `X-Foo`); falls
+  through to the catch-all 200 OK.
+- `matcher-route` — `GET /api/widgets Host: envoy-rust.test X-Foo: bar`; hits
+  the matcher route 418 teapot.
+
+Each probe applies the same 5-axis equivalence cascade as the 04.1 single-probe
+shape (status exact, body byte_exact, headers set_equal_modulo_allow_list).
+
+The matcher route demonstrates production matcher use across all 7 of Envoy's
+`HeaderMatcher` modes (which all 7 modes land in 04.2 — `exact_match`,
+`prefix_match`, `suffix_match`, `safe_regex_match`, `range_match`,
+`present_match`, `string_match`); this fixture exercises only `exact_match` for
+maximum minimum-viable coverage. Per-mode runtime behavior is exercised by
+the matcher-runtime unit tests in `crates/envoy-config/src/matcher.rs::tests`
+(28 tests covering all 7 modes + invert_match XOR + StringMatcher.ignore_case).
+
 ADR references: ADR-0011 (response-header equivalence deferral closes here
 via the BEHAVIOR_CONTRACT.md `Header allow-list` table populated at this
 phase), ADR-0014 (`typed_config` deserialization), ADR-0020 (split phase 04
-into 04.1 + 04.2 + 04.3).
+into 04.1 + 04.2 + 04.3), ADR-0021 (`regex` permitted as a foundation for
+header / route matching at config-load time).

@@ -19,6 +19,15 @@ static_resources:
                     - name: default
                       domains: ["*"]
                       routes:
+                        - match:
+                            prefix: "/api/"
+                            headers:
+                              - name: "x-foo"
+                                exact_match: "bar"
+                          direct_response:
+                            status: 418
+                            body:
+                              inline_string: "teapot\n"
                         - match: { prefix: "/" }
                           direct_response:
                             status: 200
