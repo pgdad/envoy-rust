@@ -23,3 +23,11 @@
 - Commit: 5a6b950db5da2191e220e20ac4f7422b506313b0
 - Change: amended the `SafeRegex` Deserialize doc-comment in bootstrap.rs to replace the misleading "`#[serde(skip)]` would leave the field absent" justification with the accurate template-setting rationale (Tasks 3+4 reuse the visitor pattern for field-name oneof discrimination on StringMatcher / HeaderMatcher, where `#[serde(untagged)]` + `#[serde(tag)]` are both wrong; the two-phase init contract is named explicitly). Comment-only change; no semantic impact on Task 2 code.
 - Verification: gate commands clean (build / clippy / fmt / test / deny all exit 0; 79 tests passing — unchanged from Task 2).
+
+## Task 3 — envoy-config schema: StringMatcher + StringMatcherMode (2026-04-27)
+
+- Commit: 90dcb47afdc076bcb1e4537a1fe80803fba50fd0
+- Change: appended StringMatcher (mode + ignore_case) and StringMatcherMode (5 variants: Exact, Prefix, Suffix, SafeRegex, Contains) types after SafeRegex in bootstrap.rs. StringMatcher carries a hand-rolled `impl<'de> Deserialize<'de>` for the field-name oneof: collects all keys; allows at most one mode key; accepts ignore_case as a peer (default false); rejects unknown keys via M::Error::unknown_field. Added the 5th ConfigError variant UnknownStringMatcherMode in lib.rs (sibling of the 4 added in Task 1).
+- Tests added (5): parses_string_matcher_exact, parses_string_matcher_contains_with_ignore_case, parses_string_matcher_safe_regex, rejects_unknown_string_matcher_mode_key, rejects_two_string_matcher_mode_keys.
+- Verification: `cargo test -p envoy-config --lib` → 84 passed; clippy + fmt + build clean.
+- Deviations: two test assertions were written as `assert_eq!(sm.ignore_case, false/true)` and had to be updated to `assert!(!sm.ignore_case)` / `assert!(sm.ignore_case)` to satisfy `clippy::bool_assert_comparison` (-D warnings). The PLAN's test code used assert_eq! with literal bools; functionally identical after fix.
