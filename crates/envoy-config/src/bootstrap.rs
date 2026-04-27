@@ -3239,9 +3239,12 @@ exact: "a"
 prefix: "b"
 "#;
         let res: Result<StringMatcher, _> = serde_yaml::from_str(yaml);
+        let err = res
+            .expect_err("two mode keys should be rejected (each variant is mutually exclusive)")
+            .to_string();
         assert!(
-            res.is_err(),
-            "two mode keys should be rejected (each variant is mutually exclusive)"
+            err.contains("multiple mode keys") || err.contains("mutually exclusive"),
+            "error should mention mutual exclusivity: {err}"
         );
     }
 }
