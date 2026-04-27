@@ -421,6 +421,143 @@ impl<'de> serde::Deserialize<'de> for SafeRegex {
     }
 }
 
+/// Envoy's modern generic StringMatcher (proto:
+/// `envoy.type.matcher.v3.StringMatcher`). Field-name oneof shape: the
+/// discriminator is *which* of `exact` / `prefix` / `suffix` / `safe_regex` /
+/// `contains` is the present key. `ignore_case` is a peer of the mode key
+/// (not a per-variant field) controlling case sensitivity of the value match.
+/// Defaults to false. Has no effect on the SafeRegex variant per Envoy proto
+/// (regex callers express case insensitivity via the `(?i)` inline flag).
+/// Phase 04.2.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringMatcher {
+    pub mode: StringMatcherMode,
+    pub ignore_case: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringMatcherMode {
+    /// `exact: <string>`.
+    Exact(String),
+    /// `prefix: <string>`.
+    Prefix(String),
+    /// `suffix: <string>`.
+    Suffix(String),
+    /// `safe_regex: { regex: "<pattern>" }`.
+    SafeRegex(SafeRegex),
+    /// `contains: <string>` — substring match. Only reachable through
+    /// HeaderMatcherMode::StringMatch(StringMatcher::Contains(...)); there is
+    /// no top-level HeaderMatcherMode::ContainsMatch (Envoy v1.33.0 only
+    /// supports Contains via the modern string_match field; SPEC §6 signpost 8).
+    Contains(String),
+}
+
+/// Hand-rolled Deserialize for the field-name oneof shape — same template
+/// Task 2 established for `SafeRegex`. Tasks 3 and 4 share this approach
+/// because `#[serde(untagged)]` would silently pick the first parsing variant
+/// and `#[serde(tag = "...")]` only models a fixed discriminator-key shape;
+/// neither fits Envoy's "exactly one of N mode keys" semantics.
+impl<'de> serde::Deserialize<'de> for StringMatcher {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        const MODE_KEYS: &[&str] = &["exact", "prefix", "suffix", "safe_regex", "contains"];
+        const ALL_KEYS: &[&str] = &[
+            "exact",
+            "prefix",
+            "suffix",
+            "safe_regex",
+            "contains",
+            "ignore_case",
+        ];
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = StringMatcher;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a StringMatcher map with exactly one mode key plus optional ignore_case",
+                )
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<StringMatcher, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut mode: Option<StringMatcherMode> = None;
+                let mut ignore_case: Option<bool> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "exact" => {
+                            if mode.is_some() {
+                                return Err(M::Error::custom(
+                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
+                                ));
+                            }
+                            mode = Some(StringMatcherMode::Exact(map.next_value::<String>()?));
+                        }
+                        "prefix" => {
+                            if mode.is_some() {
+                                return Err(M::Error::custom(
+                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
+                                ));
+                            }
+                            mode = Some(StringMatcherMode::Prefix(map.next_value::<String>()?));
+                        }
+                        "suffix" => {
+                            if mode.is_some() {
+                                return Err(M::Error::custom(
+                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
+                                ));
+                            }
+                            mode = Some(StringMatcherMode::Suffix(map.next_value::<String>()?));
+                        }
+                        "safe_regex" => {
+                            if mode.is_some() {
+                                return Err(M::Error::custom(
+                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
+                                ));
+                            }
+                            mode =
+                                Some(StringMatcherMode::SafeRegex(map.next_value::<SafeRegex>()?));
+                        }
+                        "contains" => {
+                            if mode.is_some() {
+                                return Err(M::Error::custom(
+                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
+                                ));
+                            }
+                            mode = Some(StringMatcherMode::Contains(map.next_value::<String>()?));
+                        }
+                        "ignore_case" => {
+                            if ignore_case.is_some() {
+                                return Err(M::Error::duplicate_field("ignore_case"));
+                            }
+                            ignore_case = Some(map.next_value::<bool>()?);
+                        }
+                        other => {
+                            return Err(M::Error::unknown_field(other, ALL_KEYS));
+                        }
+                    }
+                }
+                let mode = mode.ok_or_else(|| {
+                    M::Error::custom(format!(
+                        "StringMatcher: missing mode key (expected one of {MODE_KEYS:?})"
+                    ))
+                })?;
+                Ok(StringMatcher {
+                    mode,
+                    ignore_case: ignore_case.unwrap_or(false),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
     let listeners = &bootstrap.static_resources.listeners;
     let clusters = &bootstrap.static_resources.clusters;
@@ -3042,5 +3179,69 @@ regex: "^v[0-9]+$"
             compiled: Some(std::sync::Arc::new(regex::Regex::new("x").unwrap())),
         };
         assert_eq!(a, b, "compiled field is opaque to PartialEq");
+    }
+
+    #[test]
+    fn parses_string_matcher_exact() {
+        let yaml = r#"
+exact: "foo"
+"#;
+        let sm: StringMatcher = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(sm.mode, StringMatcherMode::Exact("foo".into()));
+        assert!(!sm.ignore_case);
+    }
+
+    #[test]
+    fn parses_string_matcher_contains_with_ignore_case() {
+        let yaml = r#"
+contains: "beta"
+ignore_case: true
+"#;
+        let sm: StringMatcher = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(sm.mode, StringMatcherMode::Contains("beta".into()));
+        assert!(sm.ignore_case);
+    }
+
+    #[test]
+    fn parses_string_matcher_safe_regex() {
+        let yaml = r#"
+safe_regex:
+  regex: "^v[0-9]+$"
+"#;
+        let sm: StringMatcher = serde_yaml::from_str(yaml).expect("parses");
+        match sm.mode {
+            StringMatcherMode::SafeRegex(sr) => {
+                assert_eq!(sr.regex, "^v[0-9]+$");
+                assert!(sr.compiled.is_none());
+            }
+            other => panic!("expected SafeRegex variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_string_matcher_mode_key() {
+        let yaml = r#"
+weird: "x"
+"#;
+        let res: Result<StringMatcher, _> = serde_yaml::from_str(yaml);
+        assert!(res.is_err(), "unknown mode key should error");
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("weird") || err.contains("unknown"),
+            "error mentions unknown key: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_two_string_matcher_mode_keys() {
+        let yaml = r#"
+exact: "a"
+prefix: "b"
+"#;
+        let res: Result<StringMatcher, _> = serde_yaml::from_str(yaml);
+        assert!(
+            res.is_err(),
+            "two mode keys should be rejected (each variant is mutually exclusive)"
+        );
     }
 }

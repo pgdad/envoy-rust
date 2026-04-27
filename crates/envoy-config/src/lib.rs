@@ -151,6 +151,15 @@ pub enum ConfigError {
         "unknown HeaderMatcher mode key: {got:?}; expected one of exact_match, prefix_match, suffix_match, safe_regex_match, range_match, present_match, string_match"
     )]
     UnknownHeaderMatcherMode { got: String },
+
+    /// StringMatcher's hand-rolled Deserialize encountered an unrecognized mode
+    /// key. Phase 04.2; the five recognized keys are `exact`, `prefix`, `suffix`,
+    /// `safe_regex`, `contains`. (`ignore_case` is a peer of the mode key, not a
+    /// mode key itself; it does not trip this error.)
+    #[error(
+        "unknown StringMatcher mode key: {got:?}; expected one of exact, prefix, suffix, safe_regex, contains"
+    )]
+    UnknownStringMatcherMode { got: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
