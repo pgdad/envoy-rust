@@ -377,7 +377,7 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                     validate_data_source(
                         &vc.trusted_ca,
                         "validation_context.trusted_ca",
-                        "filename",
+                        Required::Filename,
                     )?;
                     if ctx.sni.is_empty() {
                         return Err(crate::ConfigError::EmptyUpstreamSni);
@@ -413,12 +413,12 @@ pub(crate) fn validate(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> 
                             validate_data_source(
                                 &tls_cert.certificate_chain,
                                 "tls_certificate.certificate_chain",
-                                "filename",
+                                Required::Filename,
                             )?;
                             validate_data_source(
                                 &tls_cert.private_key,
                                 "tls_certificate.private_key",
-                                "filename",
+                                Required::Filename,
                             )?;
                         }
                     }
@@ -610,41 +610,60 @@ fn validate_hcm(hcm: &HttpConnectionManagerConfig) -> Result<(), crate::ConfigEr
             validate_data_source(
                 &r.direct_response.body,
                 "direct_response.body",
-                "inline_string",
+                Required::InlineString,
             )?;
         }
     }
     Ok(())
 }
 
+/// Per-callsite restriction marker for `validate_data_source`.
+///
+/// Private to this module; the `ConfigError::UnsupportedDataSource.requires`
+/// field stays `&'static str` (public-API-stable) and is populated via
+/// [`Required::as_str`].
+#[derive(Debug, Clone, Copy)]
+enum Required {
+    Filename,
+    InlineString,
+}
+
+impl Required {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Filename => "filename",
+            Self::InlineString => "inline_string",
+        }
+    }
+}
+
 /// Validate a `DataSource` against a per-callsite restriction.
 ///
 /// Cardinality: exactly one of `{filename, inline_string}` is `Some`.
-/// `requires` is `"filename"` or `"inline_string"`; the field on the other
-/// side must not be set.
+/// `requires` selects which side must be set; the other side must not be.
 fn validate_data_source(
     ds: &DataSource,
     field: &'static str,
-    requires: &'static str,
+    requires: Required,
 ) -> Result<(), crate::ConfigError> {
     let has_file = ds.filename.is_some();
     let has_inline = ds.inline_string.is_some();
     if has_file == has_inline {
         // both Some, or both None
-        return Err(crate::ConfigError::UnsupportedDataSource { field, requires });
+        return Err(crate::ConfigError::UnsupportedDataSource {
+            field,
+            requires: requires.as_str(),
+        });
     }
-    match requires {
-        "inline_string" => {
-            if !has_inline {
-                return Err(crate::ConfigError::UnsupportedDataSource { field, requires });
-            }
-        }
-        "filename" => {
-            if !has_file {
-                return Err(crate::ConfigError::UnsupportedDataSource { field, requires });
-            }
-        }
-        _ => unreachable!("unknown requires marker: {}", requires),
+    let ok = match requires {
+        Required::Filename => has_file,
+        Required::InlineString => has_inline,
+    };
+    if !ok {
+        return Err(crate::ConfigError::UnsupportedDataSource {
+            field,
+            requires: requires.as_str(),
+        });
     }
     Ok(())
 }
@@ -2853,6 +2872,34 @@ admin:
         let err = parse_then_validate(&yaml).expect_err("should reject empty virtual_hosts");
         assert!(
             matches!(err, crate::ConfigError::EmptyVirtualHosts { .. }),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_empty_domains() {
+        let hcm = format!(
+            r#"
+                stat_prefix: x
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: []
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok" }}
+{}"#,
+            VALID_ROUTER_FILTER
+        );
+        let yaml = make_hcm_listener_yaml(&hcm);
+        let err = parse_then_validate(&yaml).expect_err("should reject empty domains");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyDomains { .. }),
             "got: {:?}",
             err
         );
