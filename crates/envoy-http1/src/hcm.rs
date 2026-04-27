@@ -638,7 +638,7 @@ mod tests {
                 },
             },
         }]);
-        let req = b"GET /healthz HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\n\r\n";
+        let req = b"GET /healthz HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
         assert!(std::str::from_utf8(&resp).unwrap().contains("200 OK"));
     }
@@ -679,7 +679,7 @@ mod tests {
         };
         let cfg = build_test_config(vec![matcher_route, default_route]);
         let req =
-            b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-Foo: bar\r\nContent-Length: 0\r\n\r\n";
+            b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-Foo: bar\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("418"), "expected 418 teapot, got: {s}");
@@ -722,7 +722,7 @@ mod tests {
         };
         let cfg = build_test_config(vec![matcher_route, default_route]);
         // /api/widgets but no X-Foo header → falls through to default 200.
-        let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\n\r\n";
+        let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.contains("200 OK"), "expected 200, got: {s}");
@@ -757,7 +757,7 @@ mod tests {
         };
         let cfg = build_test_config(vec![matcher_route]);
         let req =
-            b"GET / HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: 2\r\nContent-Length: 0\r\n\r\n";
+            b"GET / HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
         assert!(std::str::from_utf8(&resp).unwrap().contains("418"));
     }
@@ -805,7 +805,7 @@ mod tests {
         };
         let cfg = build_test_config(vec![matcher_route, default_route]);
         // X-A matches, X-B does not → matcher route fails, fall through to default.
-        let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: WRONG\r\nContent-Length: 0\r\n\r\n";
+        let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: WRONG\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
         assert!(std::str::from_utf8(&resp).unwrap().contains("200 OK"));
     }
