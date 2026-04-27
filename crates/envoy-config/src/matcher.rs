@@ -31,7 +31,7 @@ impl HeaderMatcher {
             HeaderMatcherMode::SafeRegexMatch(sr) => value.is_some_and(|v| {
                 sr.compiled
                     .as_ref()
-                    .expect("validator ensured compiled")
+                    .expect("validator ensured HeaderMatcher SafeRegex compiled")
                     .is_match(v)
             }),
             HeaderMatcherMode::RangeMatch(r) => value
@@ -66,15 +66,18 @@ impl StringMatcher {
             }
             StringMatcherMode::Prefix(lit) => {
                 if self.ignore_case {
-                    value.len() >= lit.len() && value[..lit.len()].eq_ignore_ascii_case(lit)
+                    value
+                        .get(..lit.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(lit))
                 } else {
                     value.starts_with(lit.as_str())
                 }
             }
             StringMatcherMode::Suffix(lit) => {
                 if self.ignore_case {
-                    value.len() >= lit.len()
-                        && value[value.len() - lit.len()..].eq_ignore_ascii_case(lit)
+                    value
+                        .get(value.len().saturating_sub(lit.len())..)
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(lit))
                 } else {
                     value.ends_with(lit.as_str())
                 }
@@ -82,7 +85,7 @@ impl StringMatcher {
             StringMatcherMode::SafeRegex(sr) => sr
                 .compiled
                 .as_ref()
-                .expect("validator ensured compiled")
+                .expect("validator ensured StringMatcher SafeRegex compiled")
                 .is_match(value),
             StringMatcherMode::Contains(lit) => {
                 if self.ignore_case {
@@ -303,6 +306,28 @@ mod tests {
         // Pattern is case-sensitive; "BETA" should not match despite ignore_case.
         assert!(!m.matches(&[h("x-tag", "BETA")]));
         assert!(m.matches(&[h("x-tag", "beta")]));
+    }
+
+    #[test]
+    fn string_match_prefix_with_ignore_case_matches() {
+        let sm = StringMatcher {
+            mode: StringMatcherMode::Prefix("BA".into()),
+            ignore_case: true,
+        };
+        let m = hm("x-foo", HeaderMatcherMode::StringMatch(sm));
+        assert!(m.matches(&[h("x-foo", "bar")]));
+        assert!(!m.matches(&[h("x-foo", "qux")]));
+    }
+
+    #[test]
+    fn string_match_suffix_with_ignore_case_matches() {
+        let sm = StringMatcher {
+            mode: StringMatcherMode::Suffix("AR".into()),
+            ignore_case: true,
+        };
+        let m = hm("x-foo", HeaderMatcherMode::StringMatch(sm));
+        assert!(m.matches(&[h("x-foo", "bar")]));
+        assert!(!m.matches(&[h("x-foo", "baz")]));
     }
 
     // Cross-cutting tests.
