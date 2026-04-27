@@ -18,5 +18,5 @@ pub mod hcm;
 pub mod headers;
 pub mod response;
 
-// Task 5 will add: `pub use error::Http1Error;`
+pub use error::Http1Error;
 // Tasks 8–10 will add re-exports for codec/response/hcm public types.
