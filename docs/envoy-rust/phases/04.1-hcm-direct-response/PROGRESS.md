@@ -65,3 +65,11 @@
 - Verification: `cargo build -p envoy-http1` → clean (0.20s, only envoy-http1 recompiled). `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean. `cargo fmt --all -- --check` → clean. No `dead_code` warnings fired despite the variants being unused at this point — `pub`-visible enum variants are not subject to dead-code lint, so no `#[allow(dead_code)]` attribute was needed (the PLAN's Step 4 contingency was not triggered).
 - Deviations from PLAN: chose the explicit `impl From<std::io::Error>` form over thiserror's `#[from]` shorthand. The PLAN allowed either; explicit-impl was kept because clippy did not flag the manual impl as redundant (the `#[from]` substitution clause was contingent on clippy complaining), and the explicit form makes the conversion site obvious to a reader. Behavior is identical either way.
 - ADRs: none in this task. ADR ledger head remains 20.
+
+## Task 6 — envoy-http1::headers (2026-04-27)
+
+- Commit: 7f3af73
+- Change: populated `headers.rs` with 6 canonical-name constants (`HOST`, `CONTENT_LENGTH`, `CONNECTION`, `SERVER`, `DATE`, `CONTENT_TYPE`, all lowercase per HTTP/1.1 §3.2 case-insensitivity convention) + `find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str>` case-insensitive lookup helper using `eq_ignore_ascii_case` + 2 unit tests (`find_header_is_case_insensitive`, `find_header_returns_none_on_missing`). Per PLAN, did not add a `pub use headers::*` or any re-export to `lib.rs` — downstream code uses the `envoy_http1::headers::find_header` form, so the module stays accessible via its public path without surfacing names at crate root.
+- Verification: `cargo test -p envoy-http1 -- find_header_is_case_insensitive find_header_returns_none_on_missing` → 2 passed, 0 failed (delta +2 from Task 5's baseline of 0). `cargo build --workspace --all-targets` clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean. `cargo fmt --all -- --check` clean. No `dead_code` warnings fired on the 6 unused `pub const`s — `pub`-visible items are exempt from the lint at the workspace-internal level — so no `#[allow(dead_code)]` attribute was added (PLAN's Step 3 contingency was not triggered; Task 10 will consume the constants).
+- Deviations from PLAN: none.
+- ADRs: none in this task. ADR ledger head remains 20.
