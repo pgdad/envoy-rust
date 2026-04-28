@@ -62,7 +62,11 @@ pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 /// 1. Status line forwards verbatim from upstream.
 /// 2. For each upstream header: if the name is in HCM_EMITTED_HEADERS,
 ///    replace with envoy-rust's value (`server: envoy-rust`, `date: <fresh IMF-fixdate>`);
-///    otherwise pass verbatim.
+///    drop `connection` and `transfer-encoding` (envoy-rust authoritatively sets
+///    `connection` per posture below, and the body has been decoded into a
+///    known-length `Bytes` so chunked framing is not re-emitted); otherwise
+///    pass through with the name lowercased (case-insensitive per RFC 7230 §3.2;
+///    envoy-rust normalises egress to lowercase).
 /// 3. Append `x-envoy-upstream-service-time: <elapsed_ms>`.
 /// 4. Set `Connection:` per `close` flag (true → `close`, false → `keep-alive`).
 /// 5. Forward the body bytes preserving the upstream's framing (CL or chunked
@@ -97,12 +101,20 @@ where
             // Drop any upstream Connection: header — we authoritatively set it
             // below per the downstream posture.
             continue;
+        } else if lc == hdr::TRANSFER_ENCODING {
+            // Drop upstream Transfer-Encoding: the body has been fully decoded
+            // into a known-length Bytes by client.rs's chunked reader. Keeping
+            // this header while also emitting Content-Length violates RFC 7230
+            // §3.3.3 rule 3 and causes real clients to reject the response.
+            continue;
         } else if lc == hdr::CONTENT_LENGTH {
             saw_cl = true;
             headers.push((hdr::CONTENT_LENGTH.to_string(), value));
         } else {
-            // Pass through with lowercase name (HTTP header names are
-            // case-insensitive; envoy-rust normalises to lowercase on egress).
+            // Pass through with the name lowercased (RFC 7230 §3.2 — header names are
+            // case-insensitive; envoy-rust normalises egress to lowercase to match the
+            // rest of the response.write_to wire format). Includes content-type and
+            // any allow-listed headers that envoy-rust does not authoritatively set.
             headers.push((lc, value));
         }
     }
@@ -227,17 +239,7 @@ mod tests {
             vec![("Content-Length", "0"), ("Connection", "keep-alive")],
             b"",
         );
-        let buf_close = drive_proxy(
-            Response {
-                status: 200,
-                reason: None,
-                headers: up.headers.clone(),
-                body: up.body.clone(),
-            },
-            1,
-            true, // close = true
-        )
-        .await;
+        let buf_close = drive_proxy(up.clone(), 1, true).await;
         let s_close = String::from_utf8_lossy(&buf_close);
         assert!(
             s_close.contains("connection: close\r\n"),
@@ -248,11 +250,36 @@ mod tests {
             "must not pass upstream Connection: {s_close}"
         );
 
-        let buf_keep = drive_proxy(up, 1, false).await; // close = false
+        let buf_keep = drive_proxy(up, 1, false).await;
         let s_keep = String::from_utf8_lossy(&buf_keep);
         assert!(
             s_keep.contains("connection: keep-alive\r\n"),
             "keep-alive: {s_keep}"
         );
+    }
+
+    #[tokio::test]
+    async fn proxied_response_strips_upstream_transfer_encoding() {
+        // Upstream emitted Transfer-Encoding: chunked; client.rs's chunked reader
+        // decoded the body but left the header in upstream_response.headers.
+        // write_proxied_response MUST strip transfer-encoding (RFC 7230 §3.3.3
+        // forbids T-E + Content-Length combo). The synthesized response carries
+        // Content-Length: <body.len()> only.
+        let up = upstream(
+            200,
+            vec![
+                ("Transfer-Encoding", "chunked"),
+                ("Content-Type", "text/plain"),
+            ],
+            b"hello",
+        );
+        let buf = drive_proxy(up, 1, false).await;
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.to_ascii_lowercase().contains("transfer-encoding"),
+            "transfer-encoding must be stripped: {s}"
+        );
+        assert!(s.contains("content-length: 5\r\n"), "synthesized CL: {s}");
+        assert!(s.ends_with("\r\nhello"), "body: {s}");
     }
 }

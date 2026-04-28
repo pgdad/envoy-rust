@@ -5,6 +5,7 @@ pub const CONTENT_LENGTH: &str = "content-length";
 pub const CONNECTION: &str = "connection";
 pub const SERVER: &str = "server";
 pub const DATE: &str = "date";
+pub const TRANSFER_ENCODING: &str = "transfer-encoding";
 pub const CONTENT_TYPE: &str = "content-type";
 
 /// Find a header by name using case-insensitive comparison per HTTP/1.1 §3.2.
