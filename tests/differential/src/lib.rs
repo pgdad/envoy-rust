@@ -1429,8 +1429,9 @@ mod tests {
             ("HTTP1_BACKEND_PORT", port_str.as_str()),
         ];
         let rendered = render_yaml(template, kvs);
-        assert!(
-            rendered.contains("host.docker.internal:") && rendered.contains(&port_str),
+        assert_eq!(
+            rendered,
+            format!("endpoint: host.docker.internal:{port_str}"),
             "rendered: {rendered}"
         );
         drop(backend);

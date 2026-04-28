@@ -493,7 +493,7 @@ mod tests {
         s.read_to_end(&mut buf).await.expect("read");
         let response = String::from_utf8_lossy(&buf);
         assert!(
-            response.contains("HTTP/1.1 200 OK\r\n"),
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
             "status: {response}"
         );
         assert!(
