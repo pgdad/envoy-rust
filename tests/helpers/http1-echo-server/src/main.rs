@@ -35,6 +35,10 @@ struct Args {
     port: u16,
 }
 
+/// argv parse failure modes.
+///
+/// `HelpRequested` and `VersionRequested` are "successful" user intents that
+/// nevertheless short-circuit the parse — `main` translates them to exit 0.
 #[derive(Debug, Error, PartialEq)]
 enum ArgvError {
     #[error("required flag {0} missing")]
@@ -82,7 +86,7 @@ fn print_help() {
 }
 
 async fn run(_args: Args) -> Result<()> {
-    // Task 12 lands the accept loop.
+    // Task 12 lands the accept loop; the no-op DRAIN_BUDGET keeps the const live until then.
     let _ = DRAIN_BUDGET;
     Ok(())
 }
@@ -149,7 +153,6 @@ mod tests {
 
     #[test]
     fn argv_rejects_missing_port() {
-        // No --port arg → MissingFlag("--port").
         let result = parse_argv(&argv(&[]));
         assert_eq!(result, Err(ArgvError::MissingFlag("--port")));
     }
