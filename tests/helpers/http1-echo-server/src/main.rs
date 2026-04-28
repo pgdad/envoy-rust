@@ -85,10 +85,178 @@ fn print_help() {
     );
 }
 
-async fn run(_args: Args) -> Result<()> {
-    // Task 12 lands the accept loop; the no-op DRAIN_BUDGET keeps the const live until then.
-    let _ = DRAIN_BUDGET;
+async fn run(args: Args) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinSet;
+    use tokio::time::timeout;
+
+    let listener = TcpListener::bind(("127.0.0.1", args.port)).await?;
+    tracing::info!("http1-echo-server listening on 127.0.0.1:{}", args.port);
+
+    let mut join_set: JoinSet<()> = JoinSet::new();
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received");
+                break;
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((mut stream, _)) => {
+                        join_set.spawn(async move {
+                            // Read the request bytes (single request per connection;
+                            // no keep-alive — see SPEC §6 signpost 9).
+                            use tokio::io::AsyncReadExt;
+                            let mut buf = bytes::BytesMut::with_capacity(8192);
+                            // Read in a loop until httparse signals Complete.
+                            loop {
+                                let mut chunk = [0u8; 4096];
+                                let n = match tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    stream.read(&mut chunk),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(0)) => break,
+                                    Ok(Ok(n)) => n,
+                                    Ok(Err(_)) | Err(_) => return,
+                                };
+                                buf.extend_from_slice(&chunk[..n]);
+                                match envoy_http1::Http1Codec::parse_request(&buf) {
+                                    Ok(Some(req)) => {
+                                        // Read body (Content-Length only).
+                                        let body_len = req
+                                            .headers
+                                            .iter()
+                                            .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                                            .and_then(|(_, v)| v.parse::<usize>().ok())
+                                            .unwrap_or(0);
+                                        let headers_end = req.bytes_consumed;
+                                        let mut body: Vec<u8> = Vec::with_capacity(body_len);
+                                        if buf.len() > headers_end {
+                                            let take = (buf.len() - headers_end).min(body_len);
+                                            body.extend_from_slice(
+                                                &buf[headers_end..headers_end + take],
+                                            );
+                                        }
+                                        while body.len() < body_len {
+                                            let mut chunk = [0u8; 4096];
+                                            let n = match tokio::time::timeout(
+                                                Duration::from_secs(5),
+                                                stream.read(&mut chunk),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(0)) => return,
+                                                Ok(Ok(n)) => n,
+                                                Ok(Err(_)) | Err(_) => return,
+                                            };
+                                            let need = body_len - body.len();
+                                            body.extend_from_slice(&chunk[..n.min(need)]);
+                                        }
+
+                                        let echo = build_echo_body(&req, &body);
+                                        let resp = envoy_http1::Response {
+                                            status: 200,
+                                            reason: None,
+                                            headers: vec![
+                                                ("content-type".to_string(), "text/plain".to_string()),
+                                                (
+                                                    "content-length".to_string(),
+                                                    echo.len().to_string(),
+                                                ),
+                                                ("connection".to_string(), "close".to_string()),
+                                            ],
+                                            body: bytes::Bytes::from(echo),
+                                        };
+                                        let _ = envoy_http1::Http1Response::write_to(
+                                            &resp,
+                                            &mut stream,
+                                        )
+                                        .await;
+                                        let _ = stream.shutdown().await;
+                                        return;
+                                    }
+                                    Ok(None) => continue,
+                                    Err(_) => return,
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed; continuing");
+                    }
+                }
+            }
+        }
+    }
+
+    drop(listener);
+    let drain = timeout(DRAIN_BUDGET, async {
+        while join_set.join_next().await.is_some() {}
+    });
+    let _ = drain.await;
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
+
     Ok(())
+}
+
+/// Build the deterministic echo body per SPEC §3 D3:
+///
+/// ```text
+/// method: <METHOD>
+/// path: <PATH>
+/// headers:
+///   <name1>: <value1>     (alphabetically sorted by lowercase name)
+///   ...
+/// body: <BODY>
+/// ```
+///
+/// The alphabetic header sort is LOAD-BEARING: both proxies forward the
+/// request to the SAME helper, but Envoy may emit headers in a different
+/// order than envoy-rust. Sorting by lowercase name eliminates this
+/// source of divergence so byte-exact body equality holds across both
+/// proxies' downstream responses (which are then proxied back to the
+/// harness verbatim per the router proxy arm in Task 9).
+fn build_echo_body(req: &envoy_http1::Request, body: &[u8]) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("method: ");
+    out.push_str(&req.method);
+    out.push('\n');
+    out.push_str("path: ");
+    out.push_str(&req.path);
+    out.push('\n');
+    out.push_str("headers:\n");
+    let mut sorted_headers: Vec<(String, String)> = req
+        .headers
+        .iter()
+        .map(|(n, v)| (n.to_ascii_lowercase(), v.clone()))
+        .collect();
+    sorted_headers.sort_by(|a, b| a.0.cmp(&b.0));
+    for (n, v) in &sorted_headers {
+        out.push_str("  ");
+        out.push_str(n);
+        out.push_str(": ");
+        out.push_str(v);
+        out.push('\n');
+    }
+    out.push_str("body: ");
+    // UTF-8 if possible; else replace each byte with `?`.
+    match std::str::from_utf8(body) {
+        Ok(s) => out.push_str(s),
+        Err(_) => {
+            for _ in body {
+                out.push('?');
+            }
+        }
+    }
+    out.push('\n');
+    out.into_bytes()
 }
 
 fn main() -> ExitCode {
@@ -169,5 +337,65 @@ mod tests {
             parse_argv(&argv(&["--help"])),
             Err(ArgvError::HelpRequested)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_and_echoes_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Reserve a port (race-y but matches helper conventions).
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+
+        // Spawn the runtime in a background task.
+        let server_handle = tokio::spawn(async move {
+            let _ = run(Args { port }).await;
+        });
+
+        // Wait for the listener.
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Open a TCP connection and write an HTTP/1.1 GET. Use Connection: close
+        // so the server closes after the response (matches fixture 0008's wire).
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Read the full response.
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf);
+
+        // Assert the response shape. The body is deterministic per SPEC §3 D3.
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "status: {response}"
+        );
+        assert!(
+            response.contains("content-type: text/plain\r\n"),
+            "ct: {response}"
+        );
+        // The body has the SPEC §3 D3 shape:
+        //   method: GET\npath: /\nheaders:\n  content-length: 0\n  host: x.test\nbody: \n
+        let expected_body =
+            "method: GET\npath: /\nheaders:\n  content-length: 0\n  host: x.test\nbody: \n";
+        assert!(
+            response.ends_with(expected_body),
+            "body shape:\nactual:\n{response}\nexpected suffix:\n{expected_body}"
+        );
+
+        server_handle.abort();
     }
 }

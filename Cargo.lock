@@ -692,6 +692,7 @@ name = "http1-echo-server"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "envoy-http1",
  "thiserror",
  "tokio",
