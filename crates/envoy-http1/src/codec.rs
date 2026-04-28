@@ -37,6 +37,31 @@ pub struct Request {
     /// Number of bytes consumed from the input buffer to produce this
     /// request (= the offset to the start of the body, if any).
     pub bytes_consumed: usize,
+
+    /// 04.3 NEW: outgoing request body bytes (for the router-proxy arm in
+    /// Task 9 to populate before calling `Client::send_request`). The codec's
+    /// `parse_request` (incoming-side) sets this to `None`; only the outgoing-
+    /// side caller fills it. `None` is treated as `Bytes::new()` (Content-Length: 0).
+    pub body: Option<bytes::Bytes>,
+}
+
+impl Request {
+    /// 04.3 NEW: byte-length of the outgoing body, for `Content-Length:` and
+    /// for the request-wire byte budget pre-allocation. Treats `None` as 0.
+    #[allow(dead_code)] // wired up by Task 9's router-proxy arm; used here by send_request
+    pub fn body_len_estimate(&self) -> usize {
+        self.body.as_ref().map(|b| b.len()).unwrap_or(0)
+    }
+
+    #[allow(dead_code)] // wired up by Task 9's router-proxy arm; used here by send_request
+    pub(crate) fn body_len_string(&self) -> String {
+        self.body_len_estimate().to_string()
+    }
+
+    #[allow(dead_code)] // wired up by Task 9's router-proxy arm; used here by send_request
+    pub(crate) fn body_bytes(&self) -> Option<&[u8]> {
+        self.body.as_ref().map(|b| b.as_ref())
+    }
 }
 
 pub struct Http1Codec;
@@ -105,6 +130,7 @@ impl Http1Codec {
             version,
             headers,
             bytes_consumed,
+            body: None, // 04.3 NEW
         }))
     }
 }
