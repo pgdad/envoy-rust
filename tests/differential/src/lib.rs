@@ -184,10 +184,12 @@ pub enum AllowMode {
 
 /// Header allow-list per BEHAVIOR_CONTRACT.md `Header allow-list` table.
 /// Sourced from the contract; updates to the contract update this constant
-/// in lockstep. 04.1 adds `server` and `date`.
+/// in lockstep. 04.1 added `server` and `date`; 04.3 added
+/// `x-envoy-upstream-service-time`.
 pub const HEADER_ALLOW_LIST: &[(&str, AllowMode)] = &[
     ("server", AllowMode::NameRequired),
     ("date", AllowMode::NameRequired),
+    ("x-envoy-upstream-service-time", AllowMode::NameRequired), // 04.3 NEW
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
