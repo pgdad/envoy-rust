@@ -26,8 +26,17 @@ use std::time::Duration;
 
 use anyhow::Result;
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Per-read deadline for header + body reads. Bounds straggler clients without
+/// slowing the harness; same value as DRAIN_BUDGET because both are "stop
+/// waiting eventually" budgets, not load-bearing tuning.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Parsed argv surface. (`--port <u16>` only; no TLS keys.)
 #[derive(Debug, PartialEq)]
@@ -86,11 +95,6 @@ fn print_help() {
 }
 
 async fn run(args: Args) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-    use tokio::task::JoinSet;
-    use tokio::time::timeout;
-
     let listener = TcpListener::bind(("127.0.0.1", args.port)).await?;
     tracing::info!("http1-echo-server listening on 127.0.0.1:{}", args.port);
 
@@ -106,86 +110,8 @@ async fn run(args: Args) -> Result<()> {
             }
             accept_result = listener.accept() => {
                 match accept_result {
-                    Ok((mut stream, _)) => {
-                        join_set.spawn(async move {
-                            // Read the request bytes (single request per connection;
-                            // no keep-alive — see SPEC §6 signpost 9).
-                            use tokio::io::AsyncReadExt;
-                            let mut buf = bytes::BytesMut::with_capacity(8192);
-                            // Read in a loop until httparse signals Complete.
-                            loop {
-                                let mut chunk = [0u8; 4096];
-                                let n = match tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    stream.read(&mut chunk),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(0)) => break,
-                                    Ok(Ok(n)) => n,
-                                    Ok(Err(_)) | Err(_) => return,
-                                };
-                                buf.extend_from_slice(&chunk[..n]);
-                                match envoy_http1::Http1Codec::parse_request(&buf) {
-                                    Ok(Some(req)) => {
-                                        // Read body (Content-Length only).
-                                        let body_len = req
-                                            .headers
-                                            .iter()
-                                            .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-                                            .and_then(|(_, v)| v.parse::<usize>().ok())
-                                            .unwrap_or(0);
-                                        let headers_end = req.bytes_consumed;
-                                        let mut body: Vec<u8> = Vec::with_capacity(body_len);
-                                        if buf.len() > headers_end {
-                                            let take = (buf.len() - headers_end).min(body_len);
-                                            body.extend_from_slice(
-                                                &buf[headers_end..headers_end + take],
-                                            );
-                                        }
-                                        while body.len() < body_len {
-                                            let mut chunk = [0u8; 4096];
-                                            let n = match tokio::time::timeout(
-                                                Duration::from_secs(5),
-                                                stream.read(&mut chunk),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(0)) => return,
-                                                Ok(Ok(n)) => n,
-                                                Ok(Err(_)) | Err(_) => return,
-                                            };
-                                            let need = body_len - body.len();
-                                            body.extend_from_slice(&chunk[..n.min(need)]);
-                                        }
-
-                                        let echo = build_echo_body(&req, &body);
-                                        let resp = envoy_http1::Response {
-                                            status: 200,
-                                            reason: None,
-                                            headers: vec![
-                                                ("content-type".to_string(), "text/plain".to_string()),
-                                                (
-                                                    "content-length".to_string(),
-                                                    echo.len().to_string(),
-                                                ),
-                                                ("connection".to_string(), "close".to_string()),
-                                            ],
-                                            body: bytes::Bytes::from(echo),
-                                        };
-                                        let _ = envoy_http1::Http1Response::write_to(
-                                            &resp,
-                                            &mut stream,
-                                        )
-                                        .await;
-                                        let _ = stream.shutdown().await;
-                                        return;
-                                    }
-                                    Ok(None) => continue,
-                                    Err(_) => return,
-                                }
-                            }
-                        });
+                    Ok((stream, _)) => {
+                        join_set.spawn(handle_connection(stream));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "accept failed; continuing");
@@ -204,6 +130,64 @@ async fn run(args: Args) -> Result<()> {
     while join_set.join_next().await.is_some() {}
 
     Ok(())
+}
+
+async fn handle_connection(mut stream: tokio::net::TcpStream) {
+    // Read the request bytes (single request per connection;
+    // no keep-alive — see SPEC §6 signpost 9).
+    let mut buf = bytes::BytesMut::with_capacity(8192);
+    loop {
+        let mut chunk = [0u8; 4096];
+        let n = match timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) | Err(_) => return,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        match envoy_http1::Http1Codec::parse_request(&buf) {
+            Ok(Some(req)) => {
+                let body_len = req
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, v)| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let headers_end = req.bytes_consumed;
+                let mut body: Vec<u8> = Vec::with_capacity(body_len);
+                if buf.len() > headers_end {
+                    let take = (buf.len() - headers_end).min(body_len);
+                    body.extend_from_slice(&buf[headers_end..headers_end + take]);
+                }
+                while body.len() < body_len {
+                    let mut chunk = [0u8; 4096];
+                    let n = match timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
+                        Ok(Ok(0)) => return,
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) | Err(_) => return,
+                    };
+                    let need = body_len - body.len();
+                    body.extend_from_slice(&chunk[..n.min(need)]);
+                }
+
+                let echo = build_echo_body(&req, &body);
+                let resp = envoy_http1::Response {
+                    status: 200,
+                    reason: None,
+                    headers: vec![
+                        ("content-type".to_string(), "text/plain".to_string()),
+                        ("content-length".to_string(), echo.len().to_string()),
+                        ("connection".to_string(), "close".to_string()),
+                    ],
+                    body: bytes::Bytes::from(echo),
+                };
+                let _ = envoy_http1::Http1Response::write_to(&resp, &mut stream).await;
+                let _ = stream.shutdown().await;
+                return;
+            }
+            Ok(None) => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 /// Build the deterministic echo body per SPEC §3 D3:
