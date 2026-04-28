@@ -218,14 +218,18 @@ async fn serve_connection(
                 };
 
                 let host_header = find_header(&req.headers, headers::HOST)
-                    .unwrap_or("")
+                    .expect("build_response rejected missing/empty Host before BuildOutcome::Proxy")
                     .to_owned();
 
-                // Strip Connection: from upstream-bound headers — the upstream
-                // connection is one-shot per SPEC §3 D1; `send_request` sets
-                // connection: posture afresh internally if needed.
+                // Strip Connection: per SPEC §3 D1 (one-shot upstream connection)
+                // and Transfer-Encoding: per RFC 7230 §3.3.3 — the outgoing body
+                // is forced to CL: 0, mirroring the response-side strip in
+                // `router::write_proxied_response`.
                 let mut out_headers = req.headers.clone();
-                out_headers.retain(|(n, _)| !n.eq_ignore_ascii_case(headers::CONNECTION));
+                out_headers.retain(|(n, _)| {
+                    !n.eq_ignore_ascii_case(headers::CONNECTION)
+                        && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
+                });
                 let out_req = Request {
                     method: req.method.clone(),
                     path: req.path.clone(),
@@ -1158,6 +1162,60 @@ static_resources:
             .trim_start_matches("x-envoy-upstream-service-time: ")
             .trim();
         let _ms: u128 = value.parse().expect("integer ms");
+    }
+
+    /// In-process upstream that captures the wire bytes it received and
+    /// returns them via a JoinHandle. Mirrors `client::tests::capturing_acceptor`
+    /// (Task 6) — reproduced inline because that helper is `mod tests`-private
+    /// to client.rs, and one test doesn't justify hoisting to a shared
+    /// `pub(crate)` test helper.
+    async fn spawn_capturing_upstream(
+        response: &'static [u8],
+    ) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+            buf.truncate(n);
+            let _ = sock.write_all(response).await;
+            let _ = sock.shutdown().await;
+            buf
+        });
+        (port, h)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_strips_transfer_encoding_from_outgoing_request() {
+        // RFC 7230 §3.3.3: a request must not carry both Transfer-Encoding
+        // and Content-Length (CL: 0 is forced by the Proxy arm because
+        // chunked-request-body forwarding is a SPEC §4 non-goal). The
+        // chunked-request 501-reject at hcm.rs only matches T-E: chunked,
+        // so a downstream T-E: identity passes through to the Proxy arm
+        // and exercises the strip.
+        let upstream_response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let (upstream_port, capture) = spawn_capturing_upstream(upstream_response).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+            }),
+            cluster_mgr,
+        );
+        let req = b"GET /any HTTP/1.1\r\nHost: x.test\r\nTransfer-Encoding: identity\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _resp = drive(cfg, req).await;
+        let captured = capture.await.unwrap();
+        let s = String::from_utf8_lossy(&captured);
+        assert!(
+            !s.to_ascii_lowercase().contains("transfer-encoding:"),
+            "outgoing upstream request must not carry Transfer-Encoding (RFC 7230 §3.3.3): {s}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
