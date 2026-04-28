@@ -1,0 +1,18 @@
+[package]
+name = "http1-echo-server"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "http1-echo-server"
+path = "src/main.rs"
+
+[dependencies]
+envoy-http1 = { path = "../../../crates/envoy-http1" }
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
