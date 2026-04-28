@@ -121,3 +121,12 @@
 - Verification: `cargo test --workspace --lib` -> previous counts unchanged (differential 48 passed + 1 ignored, envoy-config 139, envoy-cluster 11, envoy-listener 6, envoy-http1 43, envoy-tcp 11, envoy-tls 15); `cargo build --workspace --all-targets` -> clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` -> clean; `cargo fmt --all -- --check` -> clean.
 - ADRs: none. ADR ledger head: 21.
 - Deviations from PLAN: none.
+
+## Task 11 — http1-echo-server scaffold + argv parser + 4 argv tests (2026-04-28)
+
+- Commit: 73e8514
+- Change: created tests/helpers/http1-echo-server/{Cargo.toml,src/main.rs}; registered the crate as a workspace member in root Cargo.toml (alphabetic position before tcp-echo-server). Argv parser handles `--port <u16>` + `--help` + `--version` + Trailing rejection (mirrors tls-echo-server's shape minus `--cert`/`--key`). Runtime accept loop is stubbed (`run` returns `Ok(())`) — Task 12 lands the accept loop. The `DRAIN_BUDGET` constant is held alive by `let _ = DRAIN_BUDGET;` in `run` to suppress `dead_code` until Task 12 consumes it. Cargo.lock updated to reflect the new workspace member; deps are envoy-http1 path-dep + anyhow + thiserror + tokio + tracing + tracing-subscriber per SPEC §3 D3 (no rustls / rcgen / tempfile — plaintext only).
+- Tests added (4): argv_parses_full_invocation, argv_rejects_missing_port, argv_rejects_invalid_port, argv_shows_help.
+- Verification: TDD bookkeeping observed (stub parser → 1/4 passed accidentally + 3/4 failed → real impl → 4/4 passed); `cargo test -p http1-echo-server` -> 4 passed; `cargo build --workspace --all-targets` -> clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` -> clean; `cargo fmt --all -- --check` -> clean.
+- ADRs: none. ADR ledger head: 21.
+- Deviations from PLAN: one minor. The PLAN's verbatim `src/main.rs` paste includes `use std::path::PathBuf;` carried over from the tls-echo-server skeleton, but `PathBuf` is never used in Task 11 (no `--cert`/`--key` paths). Clippy under `-D warnings` flags unused imports, so the line was dropped — explicitly authorized by the PLAN's NOTE block immediately after the paste.
