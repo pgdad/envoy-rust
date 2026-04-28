@@ -18,9 +18,11 @@ mod error;
 pub mod hcm;
 pub mod headers;
 pub mod response;
+pub mod router; // 04.3 NEW (Task 8)
 
 pub use client::{Client, ClientStream};
 pub use codec::{Http1Codec, HttpVersion, Request};
 pub use error::Http1Error;
 pub use hcm::{HCM, HCMConfig};
 pub use response::{Http1Response, Response};
+pub use router::RouterError; // 04.3 NEW (Task 8)
