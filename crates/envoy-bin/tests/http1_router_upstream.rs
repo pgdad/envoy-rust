@@ -41,8 +41,6 @@ async fn wait_ready(addr: SocketAddr, budget: Duration) {
     }
 }
 
-// Minimal in-process HTTP/1.1 upstream: single accept, drain request bytes
-// until \r\n\r\n (cap 8 KiB), respond with a fixed 200 + 5-byte body, close.
 // Deliberately NOT replicating http1-echo-server's deterministic-echo body
 // shape — that's the differential harness's job in Task 15.
 async fn spawn_http1_upstream() -> SocketAddr {
