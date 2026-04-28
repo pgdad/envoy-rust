@@ -143,12 +143,21 @@ impl ClientStream {
                             && v.eq_ignore_ascii_case("chunked")
                     });
                     if chunked {
-                        // Task 7 lands the reader; Task 6 stubs it to error.
-                        // Note: in production this branch never fires because
-                        // Task 7 lands before Task 9 (which is the first
-                        // production consumer); stub error is the test path.
-                        let _ = headers_end;
-                        return Err(Http1Error::MalformedChunkedFraming);
+                        // 04.3 Task 7: real chunked reader.
+                        let already = self.buf.len() - headers_end;
+                        let body = read_chunked_body(
+                            &mut self.stream,
+                            &mut self.buf,
+                            headers_end,
+                            already,
+                        )
+                        .await?;
+                        return Ok(Response {
+                            status,
+                            reason: None,
+                            headers,
+                            body: Bytes::from(body),
+                        });
                     }
 
                     let cl: usize = headers
@@ -209,6 +218,126 @@ impl ClientStream {
             }
         }
     }
+}
+
+/// Read a chunked-encoding response body from `stream`, having already read
+/// `already` bytes past the headers into `buf` starting at offset `headers_end`.
+/// Returns the decoded body bytes (chunks concatenated; trailers discarded).
+///
+/// Wire format per RFC 7230 §4.1:
+///   chunk        = chunk-size CRLF chunk-data CRLF
+///   last-chunk   = "0" CRLF [trailer-part] CRLF
+///   chunk-size   = 1*HEXDIG
+///
+/// 04.3 ignores trailers (per SPEC §4 non-goals — trailer forwarding deferred).
+/// On any framing violation returns `Http1Error::MalformedChunkedFraming`.
+async fn read_chunked_body(
+    stream: &mut tokio::net::TcpStream,
+    buf: &mut bytes::BytesMut,
+    headers_end: usize,
+    _already: usize,
+) -> Result<Vec<u8>, Http1Error> {
+    use tokio::io::AsyncReadExt;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = headers_end;
+
+    loop {
+        // Ensure at least one CRLF visible after `pos`.
+        let crlf_offset = loop {
+            if let Some(off) = find_crlf(&buf[pos..]) {
+                break off;
+            }
+            // Need more bytes.
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .map_err(|_| Http1Error::MalformedChunkedFraming)??;
+            if n == 0 {
+                return Err(Http1Error::MalformedChunkedFraming);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        };
+
+        // Parse chunk-size as hex (with optional ;ext extensions per RFC).
+        let size_line = std::str::from_utf8(&buf[pos..pos + crlf_offset])
+            .map_err(|_| Http1Error::MalformedChunkedFraming)?
+            .trim();
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let chunk_size =
+            usize::from_str_radix(size_hex, 16).map_err(|_| Http1Error::MalformedChunkedFraming)?;
+
+        pos += crlf_offset + 2; // skip size line + CRLF
+
+        if chunk_size == 0 {
+            // Last chunk. RFC 7230 allows trailer-part before the final CRLF;
+            // 04.3 reads (and discards) until the next CRLF (the empty-line
+            // sentinel). For simplicity, assume zero trailers — read one CRLF
+            // and we're done. If the response has trailers, the framing is
+            // technically valid but body content is intact (we've already
+            // read all chunk bytes); the `0\r\n\r\n` shape covers the no-trailer
+            // case which fixture 0008 + the test response use.
+            //
+            // Defensive read: if the next 2 bytes are CRLF, accept; else read
+            // until CRLF then require another CRLF (single-pass trailer skip).
+            while buf.len() < pos + 2 {
+                let mut chunk = [0u8; 64];
+                let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                    .await
+                    .map_err(|_| Http1Error::MalformedChunkedFraming)??;
+                if n == 0 {
+                    return Err(Http1Error::MalformedChunkedFraming);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            if &buf[pos..pos + 2] != b"\r\n" {
+                // Trailers present — skip until empty CRLF line.
+                loop {
+                    let crlf = match find_crlf(&buf[pos..]) {
+                        Some(off) => off,
+                        None => {
+                            let mut chunk = [0u8; 256];
+                            let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                                .await
+                                .map_err(|_| Http1Error::MalformedChunkedFraming)??;
+                            if n == 0 {
+                                return Err(Http1Error::MalformedChunkedFraming);
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            continue;
+                        }
+                    };
+                    pos += crlf + 2;
+                    if crlf == 0 {
+                        break; // empty line — end of trailers
+                    }
+                }
+            }
+            // `pos` is not used after this point; return immediately.
+            return Ok(out);
+        }
+
+        // Read exactly `chunk_size` body bytes + 2 trailing CRLF.
+        while buf.len() < pos + chunk_size + 2 {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .map_err(|_| Http1Error::MalformedChunkedFraming)??;
+            if n == 0 {
+                return Err(Http1Error::MalformedChunkedFraming);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        out.extend_from_slice(&buf[pos..pos + chunk_size]);
+        if &buf[pos + chunk_size..pos + chunk_size + 2] != b"\r\n" {
+            return Err(Http1Error::MalformedChunkedFraming);
+        }
+        pos += chunk_size + 2;
+    }
+}
+
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\r\n")
 }
 
 #[cfg(test)]
@@ -383,6 +512,39 @@ mod tests {
             .expect_err("garbage upstream must fail");
         assert!(
             matches!(err, Http1Error::MalformedResponseLine),
+            "got: {err:?}"
+        );
+    }
+
+    // ── 04.3 Task 7 chunked-encoding reader tests ─────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_request_reads_chunked_response_body() {
+        // Two chunks ("hello" 5 bytes + " world" 6 bytes) terminated by 0-size.
+        let response: &[u8] =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let (addr, _capture) = capturing_acceptor(response).await;
+        let mut client = Client::connect(addr, "envoy-rust.test").await.unwrap();
+        let request = req("GET", "/", &[]);
+        let resp = client.send_request(request).await.expect("send_request");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.as_ref(), b"hello world");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_request_returns_malformed_chunked_on_bad_size_line() {
+        // "XYZ" is not a valid hex chunk size.
+        let response: &[u8] =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nXYZ\r\nhello\r\n";
+        let (addr, _capture) = capturing_acceptor(response).await;
+        let mut client = Client::connect(addr, "envoy-rust.test").await.unwrap();
+        let request = req("GET", "/", &[]);
+        let err = client
+            .send_request(request)
+            .await
+            .expect_err("malformed chunk size must fail");
+        assert!(
+            matches!(err, Http1Error::MalformedChunkedFraming),
             "got: {err:?}"
         );
     }
