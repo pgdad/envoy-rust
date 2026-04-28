@@ -167,6 +167,107 @@ impl Drop for TlsEchoBackend {
     }
 }
 
+/// `Http1EchoBackend` — spawns the workspace's `http1-echo-server` binary as a
+/// host subprocess on a reserved 127.0.0.1 port. Sibling of `TcpProxyBackend`
+/// (phase 02.2) and `TlsEchoBackend` (phase 03.2). Used by fixture
+/// 0008-http1-router-upstream as the upstream HTTP/1.1 backend that both
+/// proxies dial.
+///
+/// Drop posture: SIGKILL via tokio's `start_kill` + 50ms-poll/2s-deadline
+/// fallback (mirrors TcpProxyBackend / TlsEchoBackend; phase-02.2 REVIEW M1
+/// inherited).
+pub struct Http1EchoBackend {
+    port: u16,
+    child: Option<tokio::process::Child>,
+}
+
+impl Http1EchoBackend {
+    /// Reserve an ephemeral 127.0.0.1 port, locate the workspace's
+    /// `http1-echo-server` binary, spawn it with `--port <port>`, and wait
+    /// until the listener accepts a TCP connection. Total readiness budget:
+    /// 1s (matches TcpProxyBackend's exponential backoff defaults).
+    pub async fn spawn() -> Result<Self> {
+        let port = reserve_port().context("reserving http1 backend port")?;
+        let bin = locate_http1_echo_server().context("locating http1-echo-server binary")?;
+        let child = tokio::process::Command::new(&bin)
+            .arg("--port")
+            .arg(port.to_string())
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning {} --port {port}", bin.display()))?;
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        wait_accept_ready(addr, Duration::from_secs(1))
+            .await
+            .with_context(|| format!("http1-echo-server never became accept-ready on {addr}"))?;
+
+        Ok(Self {
+            port,
+            child: Some(child),
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Hostname the upstream Envoy container uses to reach this backend.
+    /// See ADR-0015. Always `host.docker.internal`; envoy-rust on the host
+    /// reaches the same backend at `127.0.0.1`.
+    pub fn container_host(&self) -> &'static str {
+        "host.docker.internal"
+    }
+}
+
+impl Drop for Http1EchoBackend {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+}
+
+/// Locate the workspace's `http1-echo-server` binary. Mirrors
+/// `locate_tcp_echo_server` and `locate_tls_echo_server`. `pub(crate)` so the
+/// `lib.rs::tests` cross-module dispatch test can probe binary availability.
+pub(crate) fn locate_http1_echo_server() -> Result<PathBuf> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .context("walking up from CARGO_MANIFEST_DIR to workspace root")?;
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("target"));
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let mut bin = target_dir.join(profile).join("http1-echo-server");
+    if cfg!(windows) {
+        bin.set_extension("exe");
+    }
+    if !bin.exists() {
+        bail!(
+            "http1-echo-server not found at {}; run `cargo build -p http1-echo-server` or `cargo test --workspace`",
+            bin.display(),
+        );
+    }
+    Ok(bin)
+}
+
 /// Locate the workspace's `tls-echo-server` binary. Mirrors
 /// `locate_tcp_echo_server`. Returns `Err` if the binary is not at the
 /// expected path (e.g., not built yet, or workspace layout changed).
@@ -364,5 +465,87 @@ mod tests {
             result.is_err(),
             "expected port {port} to be released after Drop"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http1_echo_backend_spawns_and_echoes() {
+        // Skip if the helper binary isn't built (cargo test --workspace builds
+        // it; cargo test -p differential alone may not).
+        if locate_http1_echo_server().is_err() {
+            eprintln!(
+                "skipping http1_echo_backend_spawns_and_echoes — http1-echo-server not built; run `cargo test --workspace`"
+            );
+            return;
+        }
+
+        let backend = Http1EchoBackend::spawn().await.expect("spawn ok");
+        let port = backend.port();
+        assert!(port > 0);
+        assert_eq!(backend.container_host(), "host.docker.internal");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect("write");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("read");
+        let response = String::from_utf8_lossy(&buf);
+        assert!(
+            response.contains("HTTP/1.1 200 OK\r\n"),
+            "status: {response}"
+        );
+        assert!(
+            response.ends_with(
+                "method: GET\npath: /\nheaders:\n  content-length: 0\n  host: x.test\nbody: \n"
+            ),
+            "deterministic echo body: {response}"
+        );
+
+        drop(backend);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http1_echo_backend_drop_terminates_child() {
+        if locate_http1_echo_server().is_err() {
+            eprintln!(
+                "skipping http1_echo_backend_drop_terminates_child — http1-echo-server not built"
+            );
+            return;
+        }
+        let backend = Http1EchoBackend::spawn().await.expect("spawn ok");
+        let port = backend.port();
+
+        drop(backend);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let result = std::net::TcpStream::connect(("127.0.0.1", port));
+        assert!(
+            result.is_err(),
+            "expected port {port} to be released after Drop"
+        );
+    }
+
+    #[test]
+    fn locate_http1_echo_server_returns_existing_path() {
+        // Smoke test for the locator's path-construction logic, not a
+        // build-prereq check — skip silently if the binary isn't built.
+        match locate_http1_echo_server() {
+            Ok(path) => {
+                assert!(
+                    path.exists(),
+                    "locator returned {path:?} but file doesn't exist"
+                );
+                assert!(
+                    path.ends_with("http1-echo-server") || path.ends_with("http1-echo-server.exe")
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "skipping locate_http1_echo_server_returns_existing_path — binary not built"
+                );
+            }
+        }
     }
 }

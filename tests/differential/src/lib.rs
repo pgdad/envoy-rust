@@ -894,6 +894,22 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let tls_backend_port_str = _tls_backend.as_ref().map(|b| b.port().to_string());
 
+    // 04.3 Task 13: spawn an Http1EchoBackend if either template needs one.
+    // Same alive-keeper binding-order discipline as `_backend` and
+    // `_tls_backend` above — Drop fires after `run_fixture` returns.
+    let needs_http1_backend = upstream_template.contains("{{HTTP1_BACKEND_PORT}}")
+        || subject_template.contains("{{HTTP1_BACKEND_PORT}}");
+    let _http1_backend: Option<crate::backend::Http1EchoBackend> = if needs_http1_backend {
+        Some(
+            crate::backend::Http1EchoBackend::spawn()
+                .await
+                .context("spawning Http1EchoBackend")?,
+        )
+    } else {
+        None
+    };
+    let http1_backend_port_str = _http1_backend.as_ref().map(|b| b.port().to_string());
+
     // (c) Build per-side substitution maps with TLS path keys.
     // Type is Vec<(&str, String)> to accommodate owned strings from TLS paths.
     let upstream_tls_paths = tls_pki.as_ref().map(|p| p.envoy_side_paths());
@@ -907,11 +923,18 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(tp) = tls_backend_port_str.as_deref() {
             v.push(("TLS_BACKEND_PORT", tp.to_string()));
         }
-        if backend_port_str.is_some() || tls_backend_port_str.is_some() {
+        if let Some(hp) = http1_backend_port_str.as_deref() {
+            v.push(("HTTP1_BACKEND_PORT", hp.to_string()));
+        }
+        if backend_port_str.is_some()
+            || tls_backend_port_str.is_some()
+            || http1_backend_port_str.is_some()
+        {
             // Per ADR-0015: container-side reaches the host backend via
             // host.docker.internal (with the harness's with_host call below).
             // Generalized in Task 9 to fire for either backend variant; was
-            // previously gated only on BACKEND_PORT (Task 8 cadence).
+            // previously gated only on BACKEND_PORT (Task 8 cadence). Task 13
+            // extends the gate to HTTP1_BACKEND_PORT.
             v.push(("BACKEND_HOST", "host.docker.internal".to_string()));
         }
         if let Some(map) = upstream_tls_paths.as_ref() {
@@ -929,7 +952,13 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(tp) = tls_backend_port_str.as_deref() {
             v.push(("TLS_BACKEND_PORT", tp.to_string()));
         }
-        if backend_port_str.is_some() || tls_backend_port_str.is_some() {
+        if let Some(hp) = http1_backend_port_str.as_deref() {
+            v.push(("HTTP1_BACKEND_PORT", hp.to_string()));
+        }
+        if backend_port_str.is_some()
+            || tls_backend_port_str.is_some()
+            || http1_backend_port_str.is_some()
+        {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
         }
         if let Some(map) = subject_tls_paths.as_ref() {
@@ -1376,6 +1405,35 @@ mod tests {
             render_yaml(t, &[("ADMIN_PORT", "9901")]),
             "address: 127.0.0.1\nport: 9901\n"
         );
+    }
+
+    // Awareness-only: the full Docker-gated dispatch lands in Task 15's
+    // fixture 0008. This test exercises only the harness's spawn-and-render
+    // wiring per SPEC §6 signpost 11 (M11 carryforward shape surfaces).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_fixture_dispatches_http1_backend_on_template_marker() {
+        if crate::backend::locate_http1_echo_server().is_err() {
+            eprintln!(
+                "skipping run_fixture_dispatches_http1_backend_on_template_marker — http1-echo-server not built"
+            );
+            return;
+        }
+        let backend = crate::backend::Http1EchoBackend::spawn()
+            .await
+            .expect("spawn http1 backend");
+        let port = backend.port();
+        let port_str = port.to_string();
+        let template = "endpoint: {{BACKEND_HOST}}:{{HTTP1_BACKEND_PORT}}";
+        let kvs = &[
+            ("BACKEND_HOST", "host.docker.internal"),
+            ("HTTP1_BACKEND_PORT", port_str.as_str()),
+        ];
+        let rendered = render_yaml(template, kvs);
+        assert!(
+            rendered.contains("host.docker.internal:") && rendered.contains(&port_str),
+            "rendered: {rendered}"
+        );
+        drop(backend);
     }
 
     #[test]
