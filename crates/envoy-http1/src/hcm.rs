@@ -1,6 +1,7 @@
 //! HTTP connection manager: per-listener config, per-connection state machine,
 //! route walker, hardcoded router-filter call site.
 
+use crate::client::Client;
 use crate::codec::{Http1Codec, HttpVersion, Request};
 use crate::date::format_imf_fixdate;
 use crate::error::Http1Error;
@@ -27,17 +28,21 @@ const READ_BUFFER_INITIAL_CAPACITY: usize = 8192;
 pub struct HCMConfig {
     pub stat_prefix: String,
     pub route_config: Arc<RouteConfiguration>,
-    // 04.3: pub cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+    pub cluster_mgr: Arc<envoy_cluster::ClusterManager>,
 }
 
 impl HCMConfig {
-    pub fn from_config(cfg: &HttpConnectionManagerConfig) -> Result<Self, Http1Error> {
+    pub fn from_config(
+        cfg: &HttpConnectionManagerConfig,
+        cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+    ) -> Result<Self, Http1Error> {
         // The validator (envoy-config Task 2) has already enforced shape.
         // This constructor is `Result<>` for forward-compat with 04.3's
         // cluster lookup; in 04.1 it never returns Err.
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
             route_config: Arc::new(clone_route_config(&cfg.route_config)),
+            cluster_mgr,
         })
     }
 }
@@ -143,14 +148,15 @@ async fn serve_connection(
             n.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
         });
 
-        // 5. Build response (handles 400 / 404 / 501 / 200 internally).
-        let resp = if chunked {
+        // 5. Build response (handles 400 / 404 / 501 / 200 internally) or
+        //    decide to proxy upstream.
+        let outcome = if chunked {
             tracing::warn!(
                 method = %req.method,
                 path = %req.path,
                 "request rejected: Transfer-Encoding: chunked not supported (501)"
             );
-            synth_501(close)
+            BuildOutcome::Synth(synth_501(close))
         } else {
             build_response(&config, &req, close)
         };
@@ -179,8 +185,103 @@ async fn serve_connection(
             remaining -= n;
         }
 
-        // 8. Write response.
-        Http1Response::write_to(&resp, &mut downstream).await?;
+        // 8. Dispatch the outcome to the wire.
+        match outcome {
+            BuildOutcome::Synth(resp) => {
+                Http1Response::write_to(&resp, &mut downstream).await?;
+            }
+            BuildOutcome::Proxy {
+                cluster: cluster_name,
+            } => {
+                // The validator (envoy-config Task 2) ensures every cluster
+                // name referenced from a RouteAction::Route exists in the
+                // bootstrap; the .expect() is defense-in-depth.
+                let cluster = config
+                    .cluster_mgr
+                    .get(&cluster_name)
+                    .expect("validator ensures cluster present");
+
+                let endpoint = match cluster.pick_endpoint() {
+                    Some(ep) => ep,
+                    None => {
+                        tracing::warn!(
+                            cluster = %cluster.name(),
+                            "no healthy endpoint for cluster — returning 503",
+                        );
+                        let resp = synth_status(503, close);
+                        Http1Response::write_to(&resp, &mut downstream).await?;
+                        if close {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+
+                let host_header = find_header(&req.headers, headers::HOST)
+                    .unwrap_or("")
+                    .to_owned();
+
+                // Strip Connection: from upstream-bound headers — the upstream
+                // connection is one-shot per SPEC §3 D1; `send_request` sets
+                // connection: posture afresh internally if needed.
+                let mut out_headers = req.headers.clone();
+                out_headers.retain(|(n, _)| !n.eq_ignore_ascii_case(headers::CONNECTION));
+                let out_req = Request {
+                    method: req.method.clone(),
+                    path: req.path.clone(),
+                    version: HttpVersion::Http11,
+                    headers: out_headers,
+                    bytes_consumed: 0,
+                    // Chunked-request-body forwarding is a SPEC §4 non-goal.
+                    body: Some(Bytes::new()),
+                };
+
+                let start = std::time::Instant::now();
+                let mut client_stream = match Client::connect(endpoint, &host_header).await {
+                    Ok(s) => s,
+                    Err(source) => {
+                        tracing::warn!(
+                            cluster = %cluster.name(),
+                            addr = %endpoint,
+                            error = ?source,
+                            "upstream connect failed — returning 502",
+                        );
+                        let resp = synth_status(502, close);
+                        Http1Response::write_to(&resp, &mut downstream).await?;
+                        if close {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                let upstream_response = match client_stream.send_request(out_req).await {
+                    Ok(r) => r,
+                    Err(source) => {
+                        tracing::warn!(
+                            cluster = %cluster.name(),
+                            addr = %endpoint,
+                            error = ?source,
+                            "upstream request failed — returning 502",
+                        );
+                        let resp = synth_status(502, close);
+                        Http1Response::write_to(&resp, &mut downstream).await?;
+                        if close {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                let elapsed_ms = start.elapsed().as_millis();
+
+                crate::router::write_proxied_response(
+                    &mut downstream,
+                    upstream_response,
+                    elapsed_ms,
+                    close,
+                )
+                .await?;
+            }
+        }
 
         // 9. Connection lifecycle.
         if close {
@@ -198,7 +299,17 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Erro
     }
 }
 
-fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
+/// Outcome of the route walk: either a fully-synthesized downstream response
+/// (DirectResponse arm or any 4xx/5xx synth path), or a directive to proxy
+/// the request to the named cluster. The caller (serve_connection) writes
+/// Synth via `Http1Response::write_to` and dispatches Proxy via
+/// `cluster_mgr` → `pick_endpoint` → `Client::connect` → `send_request`.
+enum BuildOutcome {
+    Synth(Response),
+    Proxy { cluster: String },
+}
+
+fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
     // Validate Host header presence and non-emptiness (HTTP/1.1 §5.4 — mandatory).
     // Treat empty Host (`Host: \r\n`) as the same RFC violation as missing Host.
     let host_raw = match find_header(&req.headers, headers::HOST) {
@@ -209,7 +320,7 @@ fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
                 path = %req.path,
                 "request rejected: missing or empty Host header"
             );
-            return synth_400(close);
+            return BuildOutcome::Synth(synth_400(close));
         }
     };
     let host = strip_port(host_raw);
@@ -229,7 +340,7 @@ fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
                 path = %req.path,
                 "request rejected: no matching virtual_host"
             );
-            return synth_404(close);
+            return BuildOutcome::Synth(synth_404(close));
         }
     };
 
@@ -247,23 +358,16 @@ fn build_response(config: &HCMConfig, req: &Request, close: bool) -> Response {
                 path = %req.path,
                 "request rejected: no matching route"
             );
-            return synth_404(close);
+            return BuildOutcome::Synth(synth_404(close));
         }
     };
 
-    // Hardcoded router-filter call site. 04.3 Task 1 names a placeholder
-    // Route(_) arm returning 501; Task 9 wires that arm to the upstream
-    // proxy path via the cluster manager.
+    // Hardcoded router-filter call site.
     match &route.action {
-        RouteAction::DirectResponse(dr) => synth_direct_response(dr, close),
-        RouteAction::Route(_ar) => {
-            tracing::warn!(
-                method = %req.method,
-                path = %req.path,
-                "RouteAction::Route reached HCM build_response — Task 9 wires the proxy arm",
-            );
-            synth_501(close)
-        }
+        RouteAction::DirectResponse(dr) => BuildOutcome::Synth(synth_direct_response(dr, close)),
+        RouteAction::Route(ar) => BuildOutcome::Proxy {
+            cluster: ar.cluster.clone(),
+        },
     }
 }
 
@@ -367,11 +471,58 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    /// Build a ClusterManager with a single static cluster `name` whose only
+    /// endpoint is `127.0.0.1:<port>`. Reused by the 04.3 Task 9 router-proxy
+    /// arm tests.
+    fn cluster_mgr_with_endpoint(name: &str, port: u16) -> Arc<envoy_cluster::ClusterManager> {
+        let yaml = format!(
+            r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: {name}
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: {name}
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: {port} }} }} }}
+"#
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
+        Arc::new(envoy_cluster::from_bootstrap(&bootstrap).expect("cluster mgr"))
+    }
+
+    /// Build an empty ClusterManager (no clusters). Used by the existing
+    /// 04.1/04.2 tests whose RouteAction is always DirectResponse and never
+    /// reaches the cluster lookup.
+    fn cluster_mgr_empty() -> Arc<envoy_cluster::ClusterManager> {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters: []
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
+        Arc::new(envoy_cluster::from_bootstrap(&bootstrap).expect("cluster mgr"))
+    }
+
     /// Build a minimal HCMConfig with a single VH `domains: ["*"]`,
     /// configurable routes.
     fn hcm_config_single_route(prefix: &str, status: u16, body: &str) -> Arc<HCMConfig> {
         Arc::new(HCMConfig {
             stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty(),
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -446,6 +597,7 @@ mod tests {
     async fn host_match_strips_port() {
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
+            cluster_mgr: cluster_mgr_empty(),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -482,6 +634,7 @@ mod tests {
     async fn first_match_wins_on_routes() {
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
+            cluster_mgr: cluster_mgr_empty(),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -546,6 +699,7 @@ mod tests {
     async fn unknown_route_returns_404() {
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
+            cluster_mgr: cluster_mgr_empty(),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -627,6 +781,7 @@ mod tests {
     fn build_test_config(routes: Vec<Route>) -> Arc<HCMConfig> {
         Arc::new(HCMConfig {
             stat_prefix: "test".into(),
+            cluster_mgr: cluster_mgr_empty(),
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 virtual_hosts: vec![VirtualHost {
@@ -838,6 +993,196 @@ mod tests {
         assert!(
             resp_str.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
             "got: {resp_str}"
+        );
+    }
+
+    // ── 04.3 Task 9 router-proxy arm tests ────────────────────────────────────
+
+    /// Build a minimal HCMConfig with a single VH `domains: ["*"]`,
+    /// a configurable route prefix + action, and a caller-supplied
+    /// cluster_mgr. Used by the Task-9 Route-arm tests.
+    fn hcm_config_with_cluster(
+        prefix: &str,
+        action: RouteAction,
+        cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+    ) -> Arc<HCMConfig> {
+        Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            route_config: Arc::new(RouteConfiguration {
+                name: "rc".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some(prefix.to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action,
+                    }],
+                }],
+            }),
+        })
+    }
+
+    /// Spawn an in-process upstream HTTP/1.1 acceptor on an ephemeral port.
+    /// The acceptor reads (then ignores) the incoming request bytes and
+    /// writes the supplied response. Returns the bound port.
+    async fn spawn_in_process_upstream(response: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
+                let _ = sock.write_all(response).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        port
+    }
+
+    // NOTE: route_walk_returns_no_healthy_endpoint_when_cluster_empty is
+    // documented-only and intentionally not landed here. The Route arm uses
+    // .expect("validator ensures cluster present") on cluster_mgr.get(), so
+    // a missing cluster panics rather than surfacing as 503; constructing a
+    // present cluster with zero endpoints requires bypassing
+    // envoy-cluster::from_bootstrap's EmptyCluster rejection. The test
+    // moves into the upstream-robustness family alongside health checking.
+    // See PROGRESS Task 9 + PLAN Task 9 Step 2 NOTE.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_walk_dispatches_direct_response_unchanged() {
+        // Regression: the 04.1 + 04.2 DirectResponse path is unchanged after
+        // the Task-9 RouteAction restructure.
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::DirectResponse(DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("ok\n".into()),
+                },
+            }),
+            cluster_mgr_empty(),
+        );
+        let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
+        assert!(s.ends_with("\r\nok\n"), "body: {s}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_walk_dispatches_route_action_to_client_connect() {
+        let upstream_response: &'static [u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\nhello, world";
+        let upstream_port = spawn_in_process_upstream(upstream_response).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+            }),
+            cluster_mgr,
+        );
+        let req = b"GET /any HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {s}");
+        assert!(
+            s.contains("server: envoy-rust\r\n"),
+            "server overwrite: {s}"
+        );
+        assert!(
+            s.contains("x-envoy-upstream-service-time: "),
+            "x-envoy-upstream-service-time present: {s}"
+        );
+        assert!(
+            s.contains("content-type: text/plain\r\n"),
+            "ct passthrough: {s}"
+        );
+        assert!(s.contains("content-length: 12\r\n"), "cl passthrough: {s}");
+        assert!(s.ends_with("hello, world"), "body passthrough: {s}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn route_walk_returns_upstream_connect_on_refused_port() {
+        // Cluster's single endpoint is 127.0.0.1:1 (kernel-refused). HCM's
+        // Route arm should propagate the connect failure as a 502 Bad Gateway
+        // downstream response.
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", 1);
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+            }),
+            cluster_mgr,
+        );
+        let req = b"GET /any HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "expected 502 on UpstreamConnect, got: {s}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxied_response_carries_x_envoy_upstream_service_time() {
+        // Don't pin the exact value (timing-dependent); assert presence +
+        // parseability as integer ms.
+        let upstream_response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let upstream_port = spawn_in_process_upstream(upstream_response).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+            }),
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("x-envoy-upstream-service-time: "))
+            .expect("x-envoy-upstream-service-time present");
+        let value = line
+            .trim_start_matches("x-envoy-upstream-service-time: ")
+            .trim();
+        let _ms: u128 = value.parse().expect("integer ms");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxied_response_overwrites_upstream_server_header() {
+        let upstream_response: &'static [u8] =
+            b"HTTP/1.1 200 OK\r\nServer: nginx/1.x\r\nContent-Length: 0\r\n\r\n";
+        let upstream_port = spawn_in_process_upstream(upstream_response).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+            }),
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.contains("server: envoy-rust\r\n"),
+            "server overwrite: {s}"
+        );
+        assert!(
+            !s.contains("nginx/1.x"),
+            "upstream Server must not pass through: {s}"
         );
     }
 }

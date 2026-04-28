@@ -10,13 +10,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// external code works through `ClusterHandle`.
 #[derive(Debug)]
 pub struct Cluster {
-    #[allow(dead_code)]
     pub(crate) name: String,
     pub(crate) endpoints: Vec<SocketAddr>,
     pub(crate) cursor: AtomicUsize,
 }
 
 impl Cluster {
+    /// Cluster name as configured in `bootstrap.static_resources.clusters[].name`.
+    /// Surfaced for use in error variants and tracing log lines that name the
+    /// cluster a request was routed to (per phase-04.3 SPEC §3 D5; closes the
+    /// multi-phase Cluster::name() carryforward originating in phase-02.1
+    /// REVIEW M1).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Picks the next endpoint in round-robin order. `Relaxed` ordering is
     /// sufficient because no other observation depends on a happens-before
     /// relationship with the cursor update (SPEC §6 signpost 3).
@@ -45,6 +53,12 @@ impl ClusterHandle {
     /// phase 02. `Option<_>` is preserved for phase-06+ health checking.
     pub fn pick_endpoint(&self) -> Option<SocketAddr> {
         self.inner.pick()
+    }
+
+    /// Cluster name (delegates to `Cluster::name`). Mirrors `Cluster::name`'s
+    /// public posture per phase-04.3 SPEC §3 D5.
+    pub fn name(&self) -> &str {
+        self.inner.name()
     }
 }
 
@@ -408,6 +422,33 @@ admin:
             matches!(err, ClusterError::DuplicateClusterName { ref name } if name == "backend"),
             "got {err:?}",
         );
+    }
+
+    #[test]
+    fn cluster_name_returns_configured_name() {
+        let c = Cluster {
+            name: "backend".to_string(),
+            endpoints: mk_endpoints(1),
+            cursor: AtomicUsize::new(0),
+        };
+        assert_eq!(c.name(), "backend");
+    }
+
+    #[test]
+    fn cluster_handle_exposes_name() {
+        let h = mk_handle("primary", mk_endpoints(2));
+        assert_eq!(h.name(), "primary");
+    }
+
+    #[test]
+    fn cluster_name_outlives_borrow_correctly() {
+        // The accessor returns a borrow tied to the Cluster's lifetime.
+        // Borrow-check regression guard: holding the borrow while picking
+        // an endpoint compiles cleanly.
+        let h = mk_handle("primary", mk_endpoints(2));
+        let name = h.name();
+        let _ep = h.pick_endpoint();
+        assert_eq!(name, "primary");
     }
 
     #[test]

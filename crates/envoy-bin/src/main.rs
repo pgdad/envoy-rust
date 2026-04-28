@@ -212,7 +212,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     );
                 };
 
-                let hcm_config = std::sync::Arc::new(envoy_http1::HCMConfig::from_config(hcm_cfg)?);
+                let hcm_config = std::sync::Arc::new(envoy_http1::HCMConfig::from_config(
+                    hcm_cfg,
+                    std::sync::Arc::clone(&cluster_mgr),
+                )?);
                 let hcm: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
                     std::sync::Arc::new(envoy_http1::HCM { config: hcm_config });
 
