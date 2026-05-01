@@ -210,3 +210,38 @@
   3. **`generate_request_id: false` on Envoy HCM.** Envoy v1.33's HCM by default generates a UUID `x-request-id` per request, even before `request_headers_to_remove` runs. Setting `generate_request_id: false` on the HCM in `envoy.yaml` (only) suppresses generation entirely — belt-and-suspenders alongside the `x-request-id` entry in `request_headers_to_remove`. Same field-set divergence rationale as deviation (2): `HttpConnectionManagerConfig` (`bootstrap.rs:252-259`) does not list `generate_request_id` and `deny_unknown_fields` is in effect.
   4. **`payload.bin` is empty (0 bytes), not the literal request bytes.** SPEC §3 D4 lines 435-441 specifies `inputs/payload.bin` should contain `GET / HTTP/1.1\r\nHost: envoy-rust.test\r\nContent-Length: 0\r\n\r\n`. The actual `Driver::Http1` arm in `tests/differential/src/lib.rs:1114-1201` calls `drive_http1` which constructs the request from the driver fields (`method`, `path`, `host`) — it does not read `payload.bin`. Mirrored sibling fixture 0007's empty `payload.bin` to keep the directory structure uniform; the file content is moot for `Driver::Http1`.
 - Open questions: none. The Docker-gated test cannot run locally without `DOCKER=1`; CI will validate the byte-equivalence assertion. If CI surfaces additional Envoy-injected headers not stripped here, the fix is to extend `request_headers_to_remove` in `envoy.yaml`.
+
+## Task 16 — 04.1+04.2 REVIEW M-track carryforward check (2026-05-01)
+
+Per PLAN.md task index lines 93 + 113 and the 04.2 PLAN Task 11 precedent: small task slot for documenting that M-track items either closed in-line during 04.3 or carry forward to phase 05+ / hardening.
+
+M10 verification: `git log --oneline -- docs/envoy-rust/phases/04.3-router-upstream/PLAN.md` yields a single commit `c02eea7` ("phase 04.3: state-2 PLAN.md (inline-at-Task-1 precedent: pre-Task-1 standalone)") timestamped `2026-04-27 16:43:57 -0400`, which predates Task-1 commit `313707f` ("phase 04.3: envoy-config — RouteAction enum…") timestamped `2026-04-27 17:15:40 -0400`. PLAN.md's first commit genuinely predates Task 1 — M10 is **closed**.
+
+**04.1 M-track items (M1–M7):**
+
+- M1 (`diff_headers` duplicate-header value lookup): no action in 04.3. Fixture 0008 uses `Driver::Http1` (single probe), and the upstream echo response carries unique header rows (no `Set-Cookie` / `Vary` duplication). CARRY FORWARD to phase 05+ / hardening; coupled with M11.
+- M2 (body-drain idle timeout silent close, `crates/envoy-http1/src/hcm.rs:167`): no action in 04.3. Fixture 0008's deterministic-echo body is small (Content-Length–framed; fits well under the read budget); the latent silent-drop-on-timeout posture was not observable. CARRY FORWARD to hardening.
+- M3 (envoy-cluster path-dep with no prior consumer): **CLOSED in 04.3 Task 5** (commit `c033e20`) where `envoy-cluster` was confirmed pre-staged in `crates/envoy-http1/Cargo.toml` and first activated by `Client::connect`'s use site; consumed structurally by Task 9's `HCMConfig.cluster_mgr: Arc<ClusterManager>` field (commit `3fdf960`). No Cargo.toml edit was needed at Task 5 — the forward declaration landed in 04.1 as anticipated.
+- M4 (`strip_port` IPv6 correctness, `hcm.rs:246-251`): no action in 04.3. Fixture 0008 uses `Host: envoy-rust.test` (plain DNS name, no bracketed IPv6). Defense-in-depth fix deferred. CARRY FORWARD to hardening.
+- M5 (Cargo.lock sync cadence): same posture as 04.2. In 04.3, lock changes landed inline at Task 5 (envoy-cluster activation confirming the pre-existing lock entry) and Task 11 (http1-echo-server workspace-member addition — the first actual Cargo.lock mutation of this phase). Task 17 (state-4 gate) will confirm Cargo.lock clean; if dirty, a fresh sync per phase-precedent. CARRY FORWARD to whichever phase next adds a workspace member; coupled with M9.
+- M6 (`drive_http1` per-function unit test): **PRACTICALLY CLOSED in 04.3.** Task 6 / Task 9 added `client::tests::send_request_*` (4 tests) and `hcm::tests::route_walk_*` (5 tests) exercising `drive_http1`'s production-equivalent shape via in-process acceptors. The Task 13 lib unit test `run_fixture_dispatches_http1_backend_on_template_marker` covers the harness-side `drive_http1` invocation path. A strict per-function isolation unit test for `drive_http1` in `tests/differential/src/lib.rs::tests` was never added (fixture 0008's Docker-gated test is the end-to-end gate for the harness-side dispatch). Mark as closed with the awareness that the per-function in-isolation unit test remains absent.
+- M7 (TlsAcceptingHandler generalization for HCM+TLS): no action in 04.3. Phase 04.3 introduces no TLS-bearing HCM fixtures (parent SPEC §4 line 570 deferral remains in force). CARRY FORWARD to phase 05+ brainstorm.
+
+**04.2 M-track items (M8–M11):**
+
+- M8 (`safe_regex_partial_eq` opaque equality): no action in 04.3. No consumer compares `RouteConfiguration` values post-validate in 04.3 (the router-proxy arm dispatches on the route action, not on structural equality of the full config). CARRY FORWARD to the first phase that does config-diff (e.g. xDS).
+- M9 (ADR-0021 prose ↔ Cargo.lock cadence contradiction): no action in 04.3. Per D-3.5, ADR text is append-only; the contradiction between ADR-0021's "dedicated state-4 commit" prose and the actual inline-at-Task-1 cadence is a permanent artifact. CARRY FORWARD alongside M5. A future phase may supersede ADR-0021 with prose that matches the chosen cadence.
+- M10 (PLAN.md late-landing process consistency): **CLOSED in 04.3** — git log confirms `PLAN.md` first commit `c02eea7` (2026-04-27 16:43) predates Task-1 commit `313707f` (2026-04-27 17:15). The 04.3 planner committed PLAN.md as a dedicated single-file commit before any Task 1 commit, breaking the 04.1 → 04.2 inline-PLAN precedent. PLAN commit message even labels this explicitly: "inline-at-Task-1 precedent: pre-Task-1 standalone". The multi-phase process concern ends here.
+- M11 (`Http1Probe.extra_headers` duplicate semantics, coupled with M1): no action in 04.3. Same gate as M1 — fixture 0008 uses `Driver::Http1` (not `Driver::Http1ProbeList`), so `extra_headers` is not exercised; no duplicate-header row surface. CARRY FORWARD alongside M1.
+
+**Earlier-phase carryforwards (#12–#14 from Phase-04.2 rollovers):**
+
+- #12 (`Cluster::name()` accessor, originating in phase-02.1 REVIEW M1): **CLOSED in 04.3 Task 9** (commit `3fdf960`). `pub fn Cluster::name(&self) -> &str` and `ClusterHandle::name` accessors landed; the field-level `#[allow(dead_code)]` on `Cluster.name` was removed. The carryforward chain that ran through phase-02.1 → 02.2 → 03.1 → 03.2 → 04.1 → 04.2 → 04.3 ends at Task 9.
+- #13 (`x509-parser` deferred ADR): no action in 04.3. Phase 04.3 introduces no mTLS or peer-cert-attribution headers (parent SPEC §4 line 570 deferral). CARRY FORWARD to phase 05+ or whichever phase first needs structured cert introspection.
+- #14 (`enable_half_close: true` flip-fixture): no action in 04.3. Phase 04.3 introduces no asymmetric-close semantics (SPEC §4 deferral; ADR-0016 posture unchanged). CARRY FORWARD.
+
+**D5 close-out (inline with Task 9):** the `Cluster::name()` deliverable from 04.3 SPEC §3 D5 landed at commit `3fdf960` (Task 9) — same commit as #12 above. No separate tracking needed.
+
+**Closing summary:** items closed in 04.3: M3 (Task 5), M6 (practically, Task 6/9/13), M10 (process-wise, pre-Task-1 PLAN commit), D5 / #12 (Task 9). Items carrying forward to phase 05+ / hardening: M1, M2, M4, M5, M7, M8, M9, M11, #13, #14.
+
+No code changes in this task.
