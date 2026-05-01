@@ -252,3 +252,79 @@ No code changes in this task.
 - Important fix I2 (#14 carry-forward missing destination): The #14 bullet ended with bare `CARRY FORWARD.` — no destination phase, unlike every other carry-forward bullet in this section. Fixed to `CARRY FORWARD to phase 05+ or whichever phase first needs asymmetric-close semantics`, matching the phrasing used for #13 (cert introspection) and paralleling M7 (phase 05+ brainstorm) + M1/M2/M4 (hardening).
 - Issues NOT fixed (intentional): M5 forward reference to Task 17 (acceptable; Task 17 is the next task and the M5 audit is conditional on its outcome); M6 "practically closed" hedged phrasing (acceptable; the closing summary clarifies). Scope confined to the two Important flags.
 - Verification: `cargo build --workspace --all-targets` -> clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` -> clean; `cargo fmt --all -- --check` -> clean (doc-only task; no Rust changes).
+
+## Task 17 / State 4 — phase-done gate verification (2026-05-01)
+
+Per `docs/envoy-rust/SKILL_ROUTING.md` state 4: the local stable-toolchain gate ran clean on first attempt. ROADMAP.md and STATE.md are NOT advanced here per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session); those flip in state 6 (the phase-done commit) after state 5's `REVIEW.md` is approved.
+
+### Local stable-toolchain gate
+
+`cargo build --workspace --all-targets`:
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output — clean)
+```
+
+`cargo test --workspace --lib --bins`:
+```
+running 53 tests        (differential lib: 52 passed; 1 ignored — pre-existing 02.2 TcpProxyBackend smoke)
+running 19 tests        (envoy-bin: 19 passed)
+running 11 tests        (envoy-cluster: 11 passed)
+running 139 tests       (envoy-config: 139 passed)
+running 43 tests        (envoy-http1: 43 passed)
+running 6 tests         (envoy-listener: 6 passed)
+running 11 tests        (envoy-tcp: 11 passed)
+running 15 tests        (envoy-tls: 15 passed)
+running 5 tests         (http1-echo-server: 5 passed) — NEW workspace member this phase
+running 8 tests         (tcp-echo-server: 8 passed)
+running 5 tests         (tls-echo-server: 5 passed)
+```
+
+Total: 314 passed, 0 failed, 1 ignored. Test count delta from 04.2 close (275 + 1 ignored): +39 passed. Per-crate deltas:
+- `envoy-config` 131 → 139 = +8 (Task 1's 5 parse-shape tests for `RouteAction` + Task 2's 3 validator tests for cluster-name resolution).
+- `envoy-cluster` 8 → 11 = +3 (Task 9's `Cluster::name()` accessor close-out tests; #12 carryforward closed at commit `3fdf960`).
+- `envoy-http1` 24 → 43 = +19 (Tasks 4–9 cumulative: Task 4 +1 error variant, Task 5 +2 connect, Task 6 +4 send_request CL, Task 7 +2 chunked reader, Task 8 +3 router, Task 9 +8 HCM including review-fix additions; partly offsets the M6 "practically closed" claim from Task 16).
+- `differential` lib 48 → 52 (passed) = +4 (Task 13's 4 harness tests for `Http1EchoBackend` + dispatch).
+- `http1-echo-server` 0 → 5 = NEW (Task 11's 4 argv tests + Task 12's 1 round-trip test).
+
+`cargo deny check`:
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing `license-not-encountered` warnings for `0BSD`, `BSD-2-Clause`, `MPL-2.0`, `Unicode-DFS-2016`, `Zlib` preserved; not 04.3 regressions.)
+
+### Cargo.lock sync
+
+Clean — no diff at state-4. `Cargo.lock` was synced inline at Task 11 (commit `73e8514`, the http1-echo-server workspace-member scaffold — the first Cargo.lock mutation of this phase) and Task 12 (commit `48ad4e8`, the http1-echo-server runtime adding deps activation). Task 5 (commit `c033e20`) consumed envoy-cluster from the existing graph without lock change. The 04.3 gate confirms inline-sync was sufficient: no additional Cargo.lock changes accumulated through Tasks 13–16. M5 carryforward audit closes its conditional gate cleanly: the inline-at-scaffold cadence is consistent with 04.1 / 04.2 precedents — coupled with M9, the next phase that adds a workspace member should make a conscious cadence decision (or supersede ADR-0021 with prose matching the inline pattern).
+
+### Docker-gated tests (state-5 finding)
+
+The `cargo test --workspace --lib --bins` gate per phase-04.1 / 04.2 precedent confirms unit-test surface is green. **Reviewer-of-state-5 must cross-check CI** for the Docker-gated differential suite (`tests/differential/tests/{tcp_proxy,tls_downstream,tls_upstream,tls_sni,http1_direct_response,http1_router_upstream}.rs` + `crates/envoy-bin/tests/*.rs` integration tests). Local Docker is available on this machine, and a probe with `cargo test --workspace` surfaces a **pre-existing systemic regression** that affects every backend-using fixture (0003, 0004, 0005, 0006, 0008): upstream Envoy v1.33.0 rejects the rendered `address: host.docker.internal` under `type: STATIC` with the critical error:
+
+```
+[critical][main] [source/server/server.cc:416] error initializing config '/etc/envoy/envoy.yaml':
+malformed IP address: host.docker.internal. Consider setting resolver_name or setting cluster type
+to 'STRICT_DNS' or 'LOGICAL_DNS'
+```
+
+The latest CI run on `origin/main` HEAD (`25106213773`, commit `f7a10ad` — phase 04.3 task 14 review fix) failed for the same reason on `tcp_proxy_fixture` (fixture 0003). The regression originates at phase-02.2's ADR-0015 landing, where `host.docker.internal` was introduced as the BACKEND_HOST substitution for Linux + macOS host reachability via `host-gateway`; subsequent phases (02.2 / 03.1 / 03.2 / 04.1 / 04.2) did not push to CI between phase-02.1 close (`24913934580`) and 04.3 task 14 (`25106213773`), so the regression has been latent across five phases. Envoy v1.33's tightened `socket_address.address` parse semantics expect either a literal IP (under `STATIC`) or DNS resolution opt-in (under `STRICT_DNS` / `LOGICAL_DNS`).
+
+This is **NOT a 04.3 regression** but is **surfaced by 04.3** because (a) fixture 0008 is new in this phase and inherits the same broken pattern, and (b) the 04.3 push cadence reactivated CI exposure. Fixing requires a coordinated edit across `tests/fixtures/{0003,0004,0005,0006,0008}/envoy.yaml` to either flip to `type: STRICT_DNS` (plus matching schema-level support for STRICT_DNS in `crates/envoy-config/src/bootstrap.rs::ClusterType` if envoy-rust must parse the same YAML — currently `ClusterType` is a single-variant `Static` enum) or add `resolver_name: envoy.dns.cares` on the upstream-side socket_address. Both options carry envoy-config schema implications because `envoy-rust.yaml` mirrors the cluster-type field (per fixture 0003 / 0008 envoy-rust.yaml). **Tracked forward as a state-5 review finding** for 04.3 reviewer's verdict; likely outcome is one of: (a) state-5 verdict "Approved with fixes" with state-3 loop-back to flip cluster types + harness substitution; (b) state-5 verdict "Approved with M-track follow-ups" deferring to phase 05+ / hardening pass given the cross-phase scope; (c) a dedicated post-04.3 fixture-hardening sub-phase. The choice belongs to state 5; this state-4 gate quotes the finding in full so the reviewer has the complete trace.
+
+### CI
+
+Local push + `gh run watch` deferred to commit-time. CI on the new HEAD will re-run the unit-test suite (expected: green per the local gate above) plus the Docker-gated suite (expected: same regression on fixtures 0003/0004/0005/0006/0008 per the finding above) plus the fuzz job (which now picks up the `hcm_route_to_cluster.yaml` seed per Task 3). The fuzz target is unchanged from 04.2 (`parse_bootstrap`); no new fuzz target was added in 04.3 per SPEC §3 D2.
+
+### Outstanding for state 5/6
+
+State 5 (`superpowers:requesting-code-review`) writes `REVIEW.md` for this phase, with explicit attention to the Docker-gated regression finding above. State 6 (the phase-done commit) flips ROADMAP rows `04.3` and **`04` (parent)** `status` → `done` (closing parent phase 04 per the ROADMAP-schema invariant — 04.1 + 04.2 + 04.3 will all be `done`; mirrors phase-03's `ca81226`-shape close-out where 03.2's phase-done commit also closed parent 03), advances STATE.md to "awaiting next planning" (no successor phase active until phase 05 brainstorm lands), and lands the phase-done commit message format `phase 04.3: <title> [no new ADRs]` (no ADRs landed in 04.3 per SPEC §7; ADR ledger head remains at 21).
