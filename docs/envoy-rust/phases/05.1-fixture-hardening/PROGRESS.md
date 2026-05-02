@@ -30,7 +30,7 @@ Test count delta: 139 → 145 (6 new tests).
 
 ## Task 2 — envoy-cluster: tokio dep + async from_bootstrap + ClusterError::DnsResolutionFailed + STRICT_DNS branch + 3 new tests + I3 close-out (2026-05-02)
 
-**Commit:** `<SHA>`
+**Commit:** `f7a555d`
 
 **Change summary.** Promotes `crates/envoy-cluster/src/cluster.rs::from_bootstrap` from `pub fn` to `pub async fn`; adds a `STRICT_DNS` resolution branch via `tokio::net::lookup_host` (resolves once at cluster-build time per ADR-0023; results cached for cluster lifetime). Extends `ClusterError` with one new variant `DnsResolutionFailed { cluster: String, address: String, source: std::io::Error }`. Adds `tokio = { version = "1", features = ["net", "rt", "macros"] }` to envoy-cluster's `[dependencies]` (was previously absent — `tokio` is already a top-level dep on other workspace crates so no new transitive license surfaces). Adds `tokio = { version = "1", features = ["macros", "rt"] }` to `[dev-dependencies]` for `#[tokio::test]` flavor. Appends 3 new unit tests (`static_cluster_constructs_with_literal_ip` — closes phase-02.1 REVIEW I3; `strict_dns_cluster_resolves_localhost_at_build_time`; `strict_dns_cluster_returns_dns_resolution_failed_on_nxdomain`). Updates 5 existing tests (`from_bootstrap_builds_single_endpoint_cluster`, `from_bootstrap_builds_three_endpoint_cluster`, `from_bootstrap_rejects_empty_cluster`, `from_bootstrap_rejects_duplicate_cluster_name`, `from_bootstrap_rejects_malformed_endpoint_address`) to `#[tokio::test] async fn` + `.await` on the `from_bootstrap` call (mechanical; ~5 LoC churn). Updates the single envoy-bin call site at `crates/envoy-bin/src/main.rs:83` with one `.await` token. Total: ~120 LoC core + ~25 LoC of forced cross-crate test-helper churn (see Deviations below).
 
