@@ -2154,6 +2154,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/hcm_direct_response_happy.yaml",
             "fuzz/corpus/parse_bootstrap/hcm_route_to_cluster.yaml",
             "fuzz/corpus/parse_bootstrap/route_with_header_matchers.yaml",
+            "fuzz/corpus/parse_bootstrap/strict_dns_cluster.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
