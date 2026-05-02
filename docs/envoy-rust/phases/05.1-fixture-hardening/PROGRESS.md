@@ -65,3 +65,36 @@ Test count delta in envoy-cluster: 11 → 14 (+3 new tests). Workspace test coun
 - `crates/envoy-http1/src/hcm.rs::tests::cluster_mgr_empty` — promoted from `fn` to `async fn`; 6 call-site `.await` updates (5 direct + 1 inside helpers `hcm_config_single_route` and `build_test_config`, themselves promoted to `async fn` with their own callers updated).
 
 Without these the workspace will not compile (`E0728: 'await' is only allowed inside async functions`). All updates are mechanical — `fn` → `async fn`, append `.await` at each call site, no behavioural changes. Files touched beyond PLAN.md's enumeration: `crates/envoy-tcp/src/lib.rs`, `crates/envoy-http1/src/hcm.rs`. `Cargo.lock` updated as expected by adding `tokio` to envoy-cluster (dep graph is otherwise unchanged — `tokio` was already pulled by envoy-tls/envoy-tcp/envoy-http1/envoy-listener/envoy-bin).
+
+## Task 3 — 5-fixture coordinated YAML edit: type: STATIC → type: STRICT_DNS (2026-05-02)
+
+**Commit:** `0ce0aa2`
+
+**Change summary.** Coordinated 10-file YAML edit — flips `type: STATIC` to `type: STRICT_DNS` on the cluster whose endpoints reference `{{BACKEND_HOST}}` in 5 fixtures: 0003-tcp-proxy, 0004-tls-downstream, 0005-tls-upstream, 0006-tls-sni, 0008-http1-router-upstream. Both `envoy.yaml` and `envoy-rust.yaml` flip in lockstep (per fixture). Fixtures 0001/0002/0007 are NOT edited (they don't reference `host.docker.internal` at any cluster — verified at PLAN-write + Task 3 entry time). Edits are mechanically identical: 10 files × 1 line change each, no whitespace re-indent (the replacement string `STRICT_DNS` is the same indent level as `STATIC`). One bundled commit per PLAN.md signpost G + SPEC §6 signpost 8. Total: ~10 LoC of YAML diff.
+
+**Verification tail.**
+
+```
+$ grep -n "type: STRICT_DNS" tests/fixtures/0003-tcp-proxy/*.yaml tests/fixtures/0004-tls-downstream/*.yaml tests/fixtures/0005-tls-upstream/*.yaml tests/fixtures/0006-tls-sni/*.yaml tests/fixtures/0008-http1-router-upstream/*.yaml
+tests/fixtures/0003-tcp-proxy/envoy.yaml:27:      type: STRICT_DNS
+tests/fixtures/0004-tls-downstream/envoy-rust.yaml:31:      type: STRICT_DNS
+tests/fixtures/0003-tcp-proxy/envoy-rust.yaml:21:      type: STRICT_DNS
+tests/fixtures/0005-tls-upstream/envoy-rust.yaml:15:      type: STRICT_DNS
+tests/fixtures/0006-tls-sni/envoy-rust.yaml:39:      type: STRICT_DNS
+tests/fixtures/0004-tls-downstream/envoy.yaml:37:      type: STRICT_DNS
+tests/fixtures/0006-tls-sni/envoy.yaml:40:      type: STRICT_DNS
+tests/fixtures/0005-tls-upstream/envoy.yaml:16:      type: STRICT_DNS
+tests/fixtures/0008-http1-router-upstream/envoy.yaml:49:      type: STRICT_DNS
+tests/fixtures/0008-http1-router-upstream/envoy-rust.yaml:27:      type: STRICT_DNS
+
+$ grep -n "type: STATIC" tests/fixtures/0003-tcp-proxy/*.yaml tests/fixtures/0004-tls-downstream/*.yaml tests/fixtures/0005-tls-upstream/*.yaml tests/fixtures/0006-tls-sni/*.yaml tests/fixtures/0008-http1-router-upstream/*.yaml
+[empty]
+
+$ cargo test --package envoy-config 2>&1 | grep "^test result"
+test result: ok. 145 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+$ cargo test --package envoy-cluster 2>&1 | grep "^test result"
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+**Deviations from PLAN.** None.
