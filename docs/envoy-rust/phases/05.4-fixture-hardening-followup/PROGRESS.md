@@ -30,3 +30,24 @@ Source of truth: `SPEC.md` (D1–D7) + `PLAN.md` (Tasks 1–7).
   - **Step 10 fmt re-flow:** adding `DnsLookupFamily` to the alphabetic re-export list pushed `FilterChain` past the line width; `cargo fmt --all` re-flowed lines 12-14 of `lib.rs` (token-equivalent; no symbols added or dropped beyond the new re-export). Per PLAN Step 10 ("If fmt fails, run `cargo fmt --all` and re-stage"), this is the prescribed remediation.
 - **Carryforward note:** None — Task 1 is mechanically scoped per SPEC §3 D1.
 - **Fuzz seed:** Not added (per PLAN signpost H — optional, deferred to PLAN discretion; planner elected NOT to add).
+
+---
+
+## Task 2 — 5-fixture coordinated `dns_lookup_family: V4_ONLY` edit
+
+- **Commit:** _(pending — fill in post-hoc if needed)_
+- **Deliverables:** SPEC §3 D2.
+- **ADR landed:** None (D2 has no ADR; the ADR-0024 grant landed at Task 1).
+- **Files modified:**
+  - `tests/fixtures/0003-tcp-proxy/envoy.yaml` (line 28 inserted).
+  - `tests/fixtures/0004-tls-downstream/envoy.yaml` (line 38 inserted).
+  - `tests/fixtures/0005-tls-upstream/envoy.yaml` (line 17 inserted).
+  - `tests/fixtures/0006-tls-sni/envoy.yaml` (line 41 inserted; further edits at Task 3).
+  - `tests/fixtures/0008-http1-router-upstream/envoy.yaml` (line 50 inserted).
+- **LoC:** 5 (1 line per fixture).
+- **Cadence:** single bundled commit per SPEC §6 signpost 15 + PLAN signpost G.
+- **Verification:**
+  - `grep -A1 'type: STRICT_DNS' tests/fixtures/000{3,4,5,6,8}*/envoy.yaml` shows each `type:` line followed by `dns_lookup_family: V4_ONLY`.
+  - `grep -n 'dns_lookup_family' tests/fixtures/000*/envoy-rust.yaml` returns empty (the envoy-rust.yaml siblings are intentionally unchanged).
+  - The actual differential green re-baseline is at Task 7 — Tasks 2-6 land progressively; the gate fires once.
+- **Deviations from PLAN:** _(none expected)_
