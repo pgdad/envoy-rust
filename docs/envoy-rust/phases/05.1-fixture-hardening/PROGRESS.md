@@ -2,7 +2,7 @@
 
 ## Task 1 — envoy-config: ClusterType::StrictDns + ADR-0023 + 6 validator tests + fuzz seed (2026-05-02)
 
-**Commit:** `7a2cd6f`
+**Commit:** `bfabcb6`
 
 **Change summary.** Lands ADR-0023 (`ClusterType::StrictDns` accepted; `LOGICAL_DNS` deferred) inline at this Task 1 commit per SPEC §7. Extends `crates/envoy-config/src/bootstrap.rs::ClusterType` from single-variant `Static` (lines 60-62 at HEAD `e626862`) to two-variant `Static | StrictDns`. Appends 6 unit tests to `bootstrap::tests` covering: (1) `STRICT_DNS` parse + variant-match; (2) `STATIC` parse-path regression-guard (unchanged); (3) `LOGICAL_DNS` rejection with `"unknown variant"` error documenting the ADR-0023 deferral; (4) unknown-tag rejection (`WEIRD_TYPE`); (5) multi-endpoint `STRICT_DNS` load-assignment shape; (6) `STRICT_DNS` cluster with a DNS-name endpoint passes the validator stage cleanly. Adds 1 new fuzz corpus seed (`crates/envoy-config/fuzz/corpus/parse_bootstrap/strict_dns_cluster.yaml`; full bootstrap with one `STRICT_DNS` cluster whose endpoint resolves to `localhost`); appends one `.gitignore` allow-list entry. Total: ~145 LoC (15 schema + 80 unit tests + 25 fuzz seed YAML + 1 .gitignore + 25 ADR).
 
