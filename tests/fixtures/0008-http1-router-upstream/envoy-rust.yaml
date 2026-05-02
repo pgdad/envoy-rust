@@ -24,7 +24,7 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters:
     - name: backend
-      type: STATIC
+      type: STRICT_DNS
       lb_policy: ROUND_ROBIN
       load_assignment:
         cluster_name: backend

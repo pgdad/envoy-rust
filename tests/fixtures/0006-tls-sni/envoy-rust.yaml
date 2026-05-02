@@ -36,7 +36,7 @@ static_resources:
                 cluster: backend
   clusters:
     - name: backend
-      type: STATIC
+      type: STRICT_DNS
       lb_policy: ROUND_ROBIN
       load_assignment:
         cluster_name: backend
