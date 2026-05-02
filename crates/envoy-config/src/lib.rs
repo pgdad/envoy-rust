@@ -9,9 +9,9 @@ pub mod matcher;
 
 pub use bootstrap::{
     Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType, CodecType,
-    CommonTlsContext, DataSource, DirectResponse, DownstreamTlsContext, Endpoint, FilterChain,
-    FilterChainMatch, HeaderMatcher, HeaderMatcherMode, HttpConnectionManagerConfig, HttpFilter,
-    HttpFilterTypedConfig, Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment,
+    CommonTlsContext, DataSource, DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint,
+    FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode, HttpConnectionManagerConfig,
+    HttpFilter, HttpFilterTypedConfig, Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment,
     LocalityLbEndpoints, NetworkFilter, Node, Route, RouteAction, RouteAction_Route,
     RouteConfiguration, RouteMatch, RouterConfig, SafeRegex, SocketAddress, StaticResources,
     StringMatcher, StringMatcherMode, TcpProxyConfig, TlsCertificate, TransportSocket,

@@ -53,6 +53,14 @@ pub struct Cluster {
     pub load_assignment: LoadAssignment,
     #[serde(default)]
     pub transport_socket: Option<TransportSocket>,
+    /// 05.4 NEW per ADR-0024: optional DNS lookup family override for
+    /// STRICT_DNS / LOGICAL_DNS clusters. Defaults to None, which lets
+    /// the upstream Envoy honor its proto default (AUTO). envoy-rust does
+    /// NOT consume this field at runtime in 05.4; only the upstream Envoy
+    /// side observes the V4_ONLY knob via per-fixture envoy.yaml edits
+    /// (D2 of phase 05.4 — see SPEC §3 D2).
+    #[serde(default)]
+    pub dns_lookup_family: Option<DnsLookupFamily>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -69,6 +77,21 @@ pub enum ClusterType {
     /// semantics with default `dns_refresh_rate`). 05.1 NEW per ADR-0023;
     /// `LOGICAL_DNS` deferred to a later phase.
     StrictDns,
+}
+
+/// DNS lookup family for STRICT_DNS / LOGICAL_DNS clusters. Mirrors Envoy
+/// v1.33's `Cluster.DnsLookupFamily` proto enum (3 variants: V4_ONLY /
+/// V6_ONLY / AUTO; v1.33 does not have V4_PREFERRED or ALL — those land
+/// in later Envoy versions). 05.4 NEW per ADR-0024; parsed-and-stored
+/// only — envoy-rust's `tokio::net::lookup_host` resolution path returns
+/// the system-stack default and does NOT filter by family at runtime.
+/// Whichever later phase needs the runtime filter lands it then.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum DnsLookupFamily {
+    V4Only,
+    V6Only,
+    Auto,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -4525,5 +4548,37 @@ admin:
                 .address,
             "host.docker.internal",
         );
+    }
+
+    /// 05.4 NEW (D1, ADR-0024): Cluster gains `dns_lookup_family: Option<DnsLookupFamily>`.
+    /// The field is parsed-and-stored on envoy-rust's typed Cluster struct; runtime
+    /// non-consumption is deliberate per ADR-0024 (only the upstream Envoy side
+    /// observes the V4_ONLY knob via the D2 envoy.yaml edit).
+    #[test]
+    fn parses_cluster_with_dns_lookup_family_v4_only() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: "host.docker.internal", port_value: 9001 } }
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses");
+        assert_eq!(bootstrap.static_resources.clusters.len(), 1);
+        let c = &bootstrap.static_resources.clusters[0];
+        assert!(matches!(c.cluster_type, ClusterType::StrictDns));
+        assert_eq!(c.dns_lookup_family, Some(DnsLookupFamily::V4Only));
     }
 }

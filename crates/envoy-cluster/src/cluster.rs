@@ -432,6 +432,7 @@ admin:
                         endpoints: vec![],
                     },
                     transport_socket: None,
+                    dns_lookup_family: None,
                 }],
             },
         };
@@ -473,6 +474,7 @@ admin:
                 }],
             },
             transport_socket: None,
+            dns_lookup_family: None,
         };
         let bootstrap = Bootstrap {
             node: None,
