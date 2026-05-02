@@ -58,7 +58,17 @@ pub struct Cluster {
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ClusterType {
+    /// Static cluster type — endpoints' `address` fields are literal IPs
+    /// (parsed via `SocketAddr::from_str` at cluster-build time in
+    /// `envoy-cluster::from_bootstrap`).
     Static,
+    /// STRICT_DNS cluster type — endpoints' `address` fields are DNS names
+    /// (resolved via `tokio::net::lookup_host` at cluster-build time in
+    /// `envoy-cluster::from_bootstrap`; the resolved `SocketAddr`s are
+    /// cached for the cluster's lifetime, matching Envoy v1.33's STRICT_DNS
+    /// semantics with default `dns_refresh_rate`). 05.1 NEW per ADR-0023;
+    /// `LOGICAL_DNS` deferred to a later phase.
+    StrictDns,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -4270,6 +4280,249 @@ static_resources:
         assert!(
             matches!(&err, crate::ConfigError::UnknownCluster(name) if name.is_empty()),
             "expected UnknownCluster(\"\"); got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_cluster_with_type_strict_dns() {
+        // 05.1 NEW: ClusterType gains StrictDns variant. The serde tag STRICT_DNS
+        // maps mechanically via the existing #[serde(rename_all = "SCREAMING_SNAKE_CASE")].
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: localhost
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses + validates");
+        let c = &bootstrap.static_resources.clusters[0];
+        assert!(
+            matches!(c.cluster_type, ClusterType::StrictDns),
+            "expected ClusterType::StrictDns, got {:?}",
+            c.cluster_type,
+        );
+        assert_eq!(c.name, "backend");
+        assert_eq!(
+            c.load_assignment.endpoints[0].lb_endpoints[0]
+                .endpoint
+                .address
+                .socket_address
+                .address,
+            "localhost",
+        );
+    }
+
+    #[test]
+    fn parses_cluster_with_type_static_unchanged() {
+        // 05.1 NEW: regression guard — the existing STATIC parse path stays
+        // unchanged after StrictDns lands. (Phase-02.1 REVIEW I3 originally
+        // requested this discriminator test; the positive Static runtime test
+        // lands separately in envoy-cluster as static_cluster_constructs_with_literal_ip.)
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses + validates");
+        let c = &bootstrap.static_resources.clusters[0];
+        assert!(
+            matches!(c.cluster_type, ClusterType::Static),
+            "expected ClusterType::Static, got {:?}",
+            c.cluster_type,
+        );
+    }
+
+    #[test]
+    fn rejects_cluster_with_type_logical_dns() {
+        // 05.1 NEW: documents the ADR-0023 LOGICAL_DNS deferral at the parser surface.
+        // serde rejects with an "unknown variant" error naming LOGICAL_DNS. If a
+        // future phase lifts the deferral, this test gets renamed to
+        // parses_cluster_with_type_logical_dns and the assertion flips.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: LOGICAL_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: example.com
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject LOGICAL_DNS");
+        let s = err.to_string();
+        assert!(
+            s.contains("LOGICAL_DNS") || s.contains("unknown variant"),
+            "expected LOGICAL_DNS unknown-variant error, got: {s}",
+        );
+    }
+
+    #[test]
+    fn rejects_cluster_with_unknown_type_value() {
+        // 05.1 NEW: covers the deny_unknown_fields-equivalent posture on the
+        // variant tag — any tag that isn't STATIC or STRICT_DNS rejects.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: WEIRD_TYPE
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject WEIRD_TYPE");
+        let s = err.to_string();
+        assert!(
+            s.contains("WEIRD_TYPE") || s.contains("unknown variant"),
+            "expected WEIRD_TYPE unknown-variant error, got: {s}",
+        );
+    }
+
+    #[test]
+    fn parses_cluster_with_type_strict_dns_with_multi_endpoint_load_assignment() {
+        // 05.1 NEW: verifies that DNS-name endpoints are stored as raw strings at
+        // config-parse time (resolution lands at runtime in envoy-cluster's
+        // from_bootstrap, NOT at parse time). Two endpoints with the same DNS name
+        // but different ports parse cleanly into the Vec<LbEndpoint>.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: localhost
+                      port_value: 7000
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: localhost
+                      port_value: 7001
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses + validates");
+        let c = &bootstrap.static_resources.clusters[0];
+        assert!(matches!(c.cluster_type, ClusterType::StrictDns));
+        let lbe = &c.load_assignment.endpoints[0].lb_endpoints;
+        assert_eq!(lbe.len(), 2);
+        assert_eq!(lbe[0].endpoint.address.socket_address.address, "localhost");
+        assert_eq!(lbe[0].endpoint.address.socket_address.port_value, 7000);
+        assert_eq!(lbe[1].endpoint.address.socket_address.address, "localhost");
+        assert_eq!(lbe[1].endpoint.address.socket_address.port_value, 7001);
+    }
+
+    #[test]
+    fn validates_strict_dns_cluster_does_not_require_literal_ip_endpoints() {
+        // 05.1 NEW: explicit assertion that envoy-config's validator passes the
+        // parse stage for STRICT_DNS clusters even though the endpoint address is
+        // a DNS name (not a literal IP). The runtime-side endpoint parse via
+        // SocketAddr::from_str (which would fail on "host.docker.internal") lives
+        // in envoy-cluster's from_bootstrap, NOT in envoy-config's validator —
+        // and envoy-cluster's STRICT_DNS arm uses tokio::net::lookup_host instead
+        // of SocketAddr::from_str on the StrictDns path, so the DNS-name endpoint
+        // is fine end-to-end.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: host.docker.internal
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        // The validator passes the parse stage cleanly; runtime resolution is
+        // out of scope for this test (envoy-cluster's from_bootstrap is not
+        // invoked here).
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses + validates");
+        let c = &bootstrap.static_resources.clusters[0];
+        assert!(matches!(c.cluster_type, ClusterType::StrictDns));
+        assert_eq!(
+            c.load_assignment.endpoints[0].lb_endpoints[0]
+                .endpoint
+                .address
+                .socket_address
+                .address,
+            "host.docker.internal",
         );
     }
 }
