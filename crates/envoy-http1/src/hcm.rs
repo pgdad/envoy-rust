@@ -478,7 +478,10 @@ mod tests {
     /// Build a ClusterManager with a single static cluster `name` whose only
     /// endpoint is `127.0.0.1:<port>`. Reused by the 04.3 Task 9 router-proxy
     /// arm tests.
-    fn cluster_mgr_with_endpoint(name: &str, port: u16) -> Arc<envoy_cluster::ClusterManager> {
+    async fn cluster_mgr_with_endpoint(
+        name: &str,
+        port: u16,
+    ) -> Arc<envoy_cluster::ClusterManager> {
         let yaml = format!(
             r#"
 admin:
@@ -500,13 +503,17 @@ static_resources:
 "#
         );
         let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
-        Arc::new(envoy_cluster::from_bootstrap(&bootstrap).expect("cluster mgr"))
+        Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap)
+                .await
+                .expect("cluster mgr"),
+        )
     }
 
     /// Build an empty ClusterManager (no clusters). Used by the existing
     /// 04.1/04.2 tests whose RouteAction is always DirectResponse and never
     /// reaches the cluster lookup.
-    fn cluster_mgr_empty() -> Arc<envoy_cluster::ClusterManager> {
+    async fn cluster_mgr_empty() -> Arc<envoy_cluster::ClusterManager> {
         let yaml = r#"
 admin:
   address:
@@ -518,15 +525,19 @@ static_resources:
   clusters: []
 "#;
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
-        Arc::new(envoy_cluster::from_bootstrap(&bootstrap).expect("cluster mgr"))
+        Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap)
+                .await
+                .expect("cluster mgr"),
+        )
     }
 
     /// Build a minimal HCMConfig with a single VH `domains: ["*"]`,
     /// configurable routes.
-    fn hcm_config_single_route(prefix: &str, status: u16, body: &str) -> Arc<HCMConfig> {
+    async fn hcm_config_single_route(prefix: &str, status: u16, body: &str) -> Arc<HCMConfig> {
         Arc::new(HCMConfig {
             stat_prefix: "ingress_http".to_string(),
-            cluster_mgr: cluster_mgr_empty(),
+            cluster_mgr: cluster_mgr_empty().await,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -572,7 +583,7 @@ static_resources:
 
     #[tokio::test]
     async fn direct_response_returns_status_and_body() {
-        let config = hcm_config_single_route("/", 200, "ok\n");
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
         let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
         let resp_str = String::from_utf8_lossy(&resp);
@@ -601,7 +612,7 @@ static_resources:
     async fn host_match_strips_port() {
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
-            cluster_mgr: cluster_mgr_empty(),
+            cluster_mgr: cluster_mgr_empty().await,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -638,7 +649,7 @@ static_resources:
     async fn first_match_wins_on_routes() {
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
-            cluster_mgr: cluster_mgr_empty(),
+            cluster_mgr: cluster_mgr_empty().await,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -689,7 +700,7 @@ static_resources:
 
     #[tokio::test]
     async fn missing_host_returns_400() {
-        let config = hcm_config_single_route("/", 200, "ok\n");
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
         let req = b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
         let resp_str = String::from_utf8_lossy(&resp);
@@ -703,7 +714,7 @@ static_resources:
     async fn unknown_route_returns_404() {
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
-            cluster_mgr: cluster_mgr_empty(),
+            cluster_mgr: cluster_mgr_empty().await,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -738,7 +749,7 @@ static_resources:
 
     #[tokio::test]
     async fn connection_close_closes_socket() {
-        let config = hcm_config_single_route("/", 200, "ok\n");
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
         let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
         let resp_str = String::from_utf8_lossy(&resp);
@@ -752,7 +763,7 @@ static_resources:
 
     #[tokio::test]
     async fn keep_alive_serves_two_requests() {
-        let config = hcm_config_single_route("/", 200, "ok\n");
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -782,10 +793,10 @@ static_resources:
 
     /// Build a minimal HCMConfig with a single VH `domains: ["*"]` and the
     /// given routes. Used by 04.2 header-matcher tests.
-    fn build_test_config(routes: Vec<Route>) -> Arc<HCMConfig> {
+    async fn build_test_config(routes: Vec<Route>) -> Arc<HCMConfig> {
         Arc::new(HCMConfig {
             stat_prefix: "test".into(),
-            cluster_mgr: cluster_mgr_empty(),
+            cluster_mgr: cluster_mgr_empty().await,
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 virtual_hosts: vec![VirtualHost {
@@ -815,7 +826,8 @@ static_resources:
                     inline_string: Some("ok\n".into()),
                 },
             }),
-        }]);
+        }])
+        .await;
         let req = b"GET /healthz HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
         assert!(std::str::from_utf8(&resp).unwrap().contains("200 OK"));
@@ -855,7 +867,7 @@ static_resources:
                 },
             }),
         };
-        let cfg = build_test_config(vec![matcher_route, default_route]);
+        let cfg = build_test_config(vec![matcher_route, default_route]).await;
         let req =
             b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-Foo: bar\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
@@ -898,7 +910,7 @@ static_resources:
                 },
             }),
         };
-        let cfg = build_test_config(vec![matcher_route, default_route]);
+        let cfg = build_test_config(vec![matcher_route, default_route]).await;
         // /api/widgets but no X-Foo header → falls through to default 200.
         let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
@@ -933,7 +945,7 @@ static_resources:
                 },
             }),
         };
-        let cfg = build_test_config(vec![matcher_route]);
+        let cfg = build_test_config(vec![matcher_route]).await;
         let req =
             b"GET / HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
@@ -981,7 +993,7 @@ static_resources:
                 },
             }),
         };
-        let cfg = build_test_config(vec![matcher_route, default_route]);
+        let cfg = build_test_config(vec![matcher_route, default_route]).await;
         // X-A matches, X-B does not → matcher route fails, fall through to default.
         let req = b"GET /api/widgets HTTP/1.1\r\nHost: x.test\r\nX-A: 1\r\nX-B: WRONG\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
@@ -990,7 +1002,7 @@ static_resources:
 
     #[tokio::test]
     async fn chunked_request_rejected_with_501() {
-        let config = hcm_config_single_route("/", 200, "ok\n");
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
         let req = b"POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n";
         let resp = drive(config, req).await;
         let resp_str = String::from_utf8_lossy(&resp);
@@ -1073,7 +1085,7 @@ static_resources:
                     inline_string: Some("ok\n".into()),
                 },
             }),
-            cluster_mgr_empty(),
+            cluster_mgr_empty().await,
         );
         let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(cfg, req).await;
@@ -1087,7 +1099,7 @@ static_resources:
         let upstream_response: &'static [u8] =
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\nhello, world";
         let upstream_port = spawn_in_process_upstream(upstream_response).await;
-        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
         let cfg = hcm_config_with_cluster(
             "/",
             RouteAction::Route(RouteAction_Route {
@@ -1120,7 +1132,7 @@ static_resources:
         // Cluster's single endpoint is 127.0.0.1:1 (kernel-refused). HCM's
         // Route arm should propagate the connect failure as a 502 Bad Gateway
         // downstream response.
-        let cluster_mgr = cluster_mgr_with_endpoint("backend", 1);
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", 1).await;
         let cfg = hcm_config_with_cluster(
             "/",
             RouteAction::Route(RouteAction_Route {
@@ -1143,7 +1155,7 @@ static_resources:
         // parseability as integer ms.
         let upstream_response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         let upstream_port = spawn_in_process_upstream(upstream_response).await;
-        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
         let cfg = hcm_config_with_cluster(
             "/",
             RouteAction::Route(RouteAction_Route {
@@ -1200,7 +1212,7 @@ static_resources:
         // and exercises the strip.
         let upstream_response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         let (upstream_port, capture) = spawn_capturing_upstream(upstream_response).await;
-        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
         let cfg = hcm_config_with_cluster(
             "/",
             RouteAction::Route(RouteAction_Route {
@@ -1223,7 +1235,7 @@ static_resources:
         let upstream_response: &'static [u8] =
             b"HTTP/1.1 200 OK\r\nServer: nginx/1.x\r\nContent-Length: 0\r\n\r\n";
         let upstream_port = spawn_in_process_upstream(upstream_response).await;
-        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port);
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
         let cfg = hcm_config_with_cluster(
             "/",
             RouteAction::Route(RouteAction_Route {

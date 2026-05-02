@@ -213,7 +213,7 @@ mod tests {
     /// Build a single-endpoint `ClusterHandle` pointing at `addr`. Use the
     /// YAML path so we go through `parse_bootstrap` + `from_bootstrap`,
     /// mirroring how `envoy-bin` will build the manager in Task 9.
-    fn mk_handle(name: &str, addr: SocketAddr) -> envoy_cluster::ClusterHandle {
+    async fn mk_handle(name: &str, addr: SocketAddr) -> envoy_cluster::ClusterHandle {
         let yaml = format!(
             r#"
 static_resources:
@@ -241,7 +241,9 @@ admin:
             port = addr.port(),
         );
         let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("valid YAML");
-        let mgr = envoy_cluster::from_bootstrap(&bootstrap).expect("manager builds");
+        let mgr = envoy_cluster::from_bootstrap(&bootstrap)
+            .await
+            .expect("manager builds");
         mgr.get(name).expect("cluster present")
     }
 
@@ -255,7 +257,7 @@ admin:
     #[tokio::test(flavor = "multi_thread")]
     async fn proxies_payload_end_to_end() {
         let upstream_addr = spawn_echo().await;
-        let handle = mk_handle("backend", upstream_addr);
+        let handle = mk_handle("backend", upstream_addr).await;
         let proxy = TcpProxy::new(handle, &mk_cfg("backend"));
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -300,7 +302,7 @@ admin:
             drop(stream);
         });
 
-        let handle = mk_handle("backend", upstream_addr);
+        let handle = mk_handle("backend", upstream_addr).await;
         let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -347,7 +349,7 @@ admin:
             upstream_seen_fin_signal.notify_one();
         });
 
-        let handle = mk_handle("backend", upstream_addr);
+        let handle = mk_handle("backend", upstream_addr).await;
         let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -373,7 +375,7 @@ admin:
     async fn proxies_returns_err_on_upstream_connect_refused() {
         // 127.0.0.1:1 is reserved (kernel TCP RST) on every UNIX-like host.
         let refused: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let handle = mk_handle("backend", refused);
+        let handle = mk_handle("backend", refused).await;
         let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -460,7 +462,7 @@ admin:
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let downstream_addr = downstream_listener.local_addr().expect("local_addr");
 
-        let handle = mk_handle("backend", upstream_addr);
+        let handle = mk_handle("backend", upstream_addr).await;
         let proxy = TcpProxy::new(handle, &mk_cfg("backend"));
         let proxy_arc: Arc<TcpProxy> = Arc::new(proxy);
         let proxy_arc_clone = proxy_arc.clone();
@@ -495,7 +497,7 @@ admin:
     #[tokio::test(flavor = "multi_thread")]
     async fn proxies_payload_with_plaintext_stream_unchanged() {
         let upstream_addr = spawn_echo().await;
-        let handle = mk_handle("backend", upstream_addr);
+        let handle = mk_handle("backend", upstream_addr).await;
         let proxy = TcpProxy::new(handle, &mk_cfg("backend"));
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -589,7 +591,7 @@ admin:
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let downstream_addr = downstream_listener.local_addr().expect("local_addr");
 
-        let handle = mk_handle("backend", upstream_addr);
+        let handle = mk_handle("backend", upstream_addr).await;
         let proxy_arc: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
         let proxy_arc_clone = proxy_arc.clone();
         let acceptor_clone = acceptor.clone();
@@ -672,7 +674,7 @@ admin:
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let downstream_addr = downstream_listener.local_addr().expect("local_addr");
 
-        let handle = mk_handle("backend", refused);
+        let handle = mk_handle("backend", refused).await;
         let proxy_arc: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
         let proxy_arc_clone = proxy_arc.clone();
         let acceptor_clone = acceptor.clone();
@@ -820,7 +822,7 @@ admin:
         let upstream_tls =
             Arc::new(envoy_tls::UpstreamTls::from_context(&upstream_ctx).expect("upstream tls"));
 
-        let cluster = mk_handle("backend", upstream_addr);
+        let cluster = mk_handle("backend", upstream_addr).await;
         let proxy = TcpProxy::with_upstream_tls(cluster, &mk_cfg("backend"), upstream_tls);
         let proxy_arc: Arc<TcpProxy> = Arc::new(proxy);
 
@@ -874,7 +876,7 @@ admin:
         let upstream_tls =
             Arc::new(envoy_tls::UpstreamTls::from_context(&upstream_ctx).expect("upstream tls"));
 
-        let cluster = mk_handle("backend", upstream_addr);
+        let cluster = mk_handle("backend", upstream_addr).await;
         let proxy = TcpProxy::with_upstream_tls(cluster, &mk_cfg("backend"), upstream_tls);
         let proxy_arc: Arc<TcpProxy> = Arc::new(proxy);
 
@@ -971,7 +973,7 @@ admin:
         let upstream_tls =
             Arc::new(envoy_tls::UpstreamTls::from_context(&upstream_ctx).expect("upstream tls"));
 
-        let cluster = mk_handle("backend", upstream_addr);
+        let cluster = mk_handle("backend", upstream_addr).await;
         let proxy = TcpProxy::with_upstream_tls(cluster, &mk_cfg("backend"), upstream_tls);
         let proxy_arc: Arc<TcpProxy> = Arc::new(proxy);
 

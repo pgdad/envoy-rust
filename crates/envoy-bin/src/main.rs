@@ -80,7 +80,9 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // that case and `tcp_proxy` filters reference clusters by name, which
     // the validator already verified exist (`ConfigError::UnknownCluster`).
     let cluster_mgr = std::sync::Arc::new(
-        envoy_cluster::from_bootstrap(&bootstrap).context("building cluster manager")?,
+        envoy_cluster::from_bootstrap(&bootstrap)
+            .await
+            .context("building cluster manager")?,
     );
 
     // 03.2: per-cluster Arc<UpstreamTls> construction. Build once at startup

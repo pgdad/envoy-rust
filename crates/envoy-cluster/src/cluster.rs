@@ -90,7 +90,15 @@ impl ClusterManager {
 /// `EndpointParse` is *not* defense-in-depth: `envoy-config` accepts any
 /// serde-valid `SocketAddress { address: String, port_value: u16 }` shape
 /// (including `"not-a-host"`); the `SocketAddr` parse is the first place that
-/// rejects a malformed address.
+/// rejects a malformed address. Reached only on the `Static` cluster-type arm;
+/// the `StrictDns` arm uses `tokio::net::lookup_host` instead and surfaces
+/// resolution failure via `DnsResolutionFailed`.
+///
+/// `DnsResolutionFailed` is the runtime counterpart of `EndpointParse` for
+/// `STRICT_DNS` clusters: the configured `address` is a DNS name (not a
+/// literal IP), and `tokio::net::lookup_host` either errored or returned zero
+/// addresses. Per ADR-0023, `STRICT_DNS` resolves once at cluster-build time
+/// and caches the result; periodic re-resolution defers to a future phase.
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterError {
     #[error("cluster '{name}' has no lb_endpoints")]
@@ -104,33 +112,95 @@ pub enum ClusterError {
         #[source]
         source: std::net::AddrParseError,
     },
+    #[error("cluster '{cluster}' STRICT_DNS resolution of '{address}' failed: {source}")]
+    DnsResolutionFailed {
+        cluster: String,
+        address: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Constructs a `ClusterManager` from a validated `Bootstrap`. The caller
 /// should have already run `envoy_config::parse_bootstrap`, but this function
 /// validates its own preconditions for library robustness.
-pub fn from_bootstrap(bootstrap: &envoy_config::Bootstrap) -> Result<ClusterManager, ClusterError> {
+///
+/// Async since 05.1: `STRICT_DNS` clusters call `tokio::net::lookup_host`
+/// (which is async). `STATIC` clusters don't await any I/O — the parse path
+/// stays unchanged from phase 02.1 — but the function signature is uniformly
+/// async because Rust doesn't have a "conditionally async" mechanism. The
+/// single envoy-bin caller (`crates/envoy-bin/src/main.rs`) awaits this once
+/// at startup, before serving any traffic.
+pub async fn from_bootstrap(
+    bootstrap: &envoy_config::Bootstrap,
+) -> Result<ClusterManager, ClusterError> {
     let mut clusters: HashMap<String, Arc<Cluster>> = HashMap::new();
     for cfg in &bootstrap.static_resources.clusters {
-        // envoy-config enforces cluster_type == Static, lb_policy == RoundRobin,
-        // load_assignment.cluster_name == cfg.name, and total endpoints ≥ 1 at
-        // parse time. We don't re-check those here; we do re-check emptiness
-        // and duplicate names as defense-in-depth, and we parse each address
-        // (which envoy-config does NOT do).
+        // envoy-config enforces cluster_type ∈ {Static, StrictDns} (post-05.1),
+        // lb_policy == RoundRobin, load_assignment.cluster_name == cfg.name,
+        // and total endpoints ≥ 1 at parse time. We don't re-check those here;
+        // we do re-check emptiness and duplicate names as defense-in-depth,
+        // and we resolve each endpoint to a SocketAddr (which envoy-config
+        // does NOT do — neither the literal-IP parse for STATIC nor the DNS
+        // lookup for STRICT_DNS).
         let mut endpoints: Vec<SocketAddr> = Vec::new();
         for locality in &cfg.load_assignment.endpoints {
             for lbe in &locality.lb_endpoints {
                 let sa = &lbe.endpoint.address.socket_address;
-                let addr_str = format!("{}:{}", sa.address, sa.port_value);
-                let parsed: SocketAddr =
-                    addr_str
-                        .parse()
-                        .map_err(|source| ClusterError::EndpointParse {
-                            cluster: cfg.name.clone(),
-                            addr: addr_str.clone(),
-                            source,
-                        })?;
-                endpoints.push(parsed);
+                match cfg.cluster_type {
+                    envoy_config::ClusterType::Static => {
+                        // EXISTING path (phase 02.1): each endpoint's address
+                        // parses as a literal SocketAddr via SocketAddr::from_str.
+                        // Failure surfaces as ClusterError::EndpointParse —
+                        // regression-guarded by the I3-closing test
+                        // static_cluster_constructs_with_literal_ip.
+                        let addr_str = format!("{}:{}", sa.address, sa.port_value);
+                        let parsed: SocketAddr =
+                            addr_str
+                                .parse()
+                                .map_err(|source| ClusterError::EndpointParse {
+                                    cluster: cfg.name.clone(),
+                                    addr: addr_str.clone(),
+                                    source,
+                                })?;
+                        endpoints.push(parsed);
+                    }
+                    envoy_config::ClusterType::StrictDns => {
+                        // 05.1 NEW per ADR-0023: each endpoint's address is a
+                        // DNS name; resolve via tokio::net::lookup_host at
+                        // cluster-build time. The lookup runs once; results
+                        // cached for the cluster's lifetime, matching Envoy
+                        // v1.33 STRICT_DNS semantics with default
+                        // dns_refresh_rate (periodic re-resolution defers per
+                        // parent-05 SPEC §4 / 05.1 SPEC §4).
+                        let target = format!("{}:{}", sa.address, sa.port_value);
+                        let resolved: Vec<SocketAddr> = tokio::net::lookup_host(&target)
+                            .await
+                            .map_err(|source| ClusterError::DnsResolutionFailed {
+                                cluster: cfg.name.clone(),
+                                address: sa.address.clone(),
+                                source,
+                            })?
+                            .collect();
+                        if resolved.is_empty() {
+                            // Defensive zero-result guard: lookup_host can
+                            // return an empty iterator on success on some
+                            // platforms (e.g., NXDOMAIN may surface as empty
+                            // rather than as an io::Error). Synthesise an
+                            // io::Error so DnsResolutionFailed.source carries
+                            // diagnostic info uniformly.
+                            return Err(ClusterError::DnsResolutionFailed {
+                                cluster: cfg.name.clone(),
+                                address: sa.address.clone(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "DNS resolution returned zero addresses",
+                                ),
+                            });
+                        }
+                        endpoints.extend(resolved);
+                    }
+                }
             }
         }
         if endpoints.is_empty() {
@@ -275,10 +345,10 @@ admin:
       port_value: 9901
 "#;
 
-    #[test]
-    fn from_bootstrap_builds_single_endpoint_cluster() {
+    #[tokio::test]
+    async fn from_bootstrap_builds_single_endpoint_cluster() {
         let bootstrap = envoy_config::parse_bootstrap(SINGLE_ENDPOINT_YAML).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap).expect("construct");
+        let mgr = crate::from_bootstrap(&bootstrap).await.expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
         let picked = handle.pick_endpoint().expect("non-empty");
         assert_eq!(picked, "127.0.0.1:10042".parse::<SocketAddr>().unwrap());
@@ -317,10 +387,10 @@ admin:
       port_value: 9901
 "#;
 
-    #[test]
-    fn from_bootstrap_builds_three_endpoint_cluster() {
+    #[tokio::test]
+    async fn from_bootstrap_builds_three_endpoint_cluster() {
         let bootstrap = envoy_config::parse_bootstrap(THREE_ENDPOINT_YAML).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap).expect("construct");
+        let mgr = crate::from_bootstrap(&bootstrap).await.expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
         let picks: Vec<SocketAddr> = (0..3).map(|_| handle.pick_endpoint().unwrap()).collect();
         assert_eq!(
@@ -333,8 +403,8 @@ admin:
         );
     }
 
-    #[test]
-    fn from_bootstrap_rejects_empty_cluster() {
+    #[tokio::test]
+    async fn from_bootstrap_rejects_empty_cluster() {
         // envoy-config rejects zero-endpoint clusters before we get here, so
         // build the Bootstrap by-hand to exercise the cluster-crate edge.
         use envoy_config::{
@@ -365,15 +435,17 @@ admin:
                 }],
             },
         };
-        let err = crate::from_bootstrap(&bootstrap).expect_err("must reject");
+        let err = crate::from_bootstrap(&bootstrap)
+            .await
+            .expect_err("must reject");
         assert!(
             matches!(err, ClusterError::EmptyCluster { ref name } if name == "backend"),
             "got {err:?}",
         );
     }
 
-    #[test]
-    fn from_bootstrap_rejects_duplicate_cluster_name() {
+    #[tokio::test]
+    async fn from_bootstrap_rejects_duplicate_cluster_name() {
         // envoy-config doesn't reject duplicate cluster names (Vec<Cluster>
         // allows dupes at the serde layer); envoy-cluster is the first
         // enforcement. Build via by-hand Bootstrap to exercise this edge.
@@ -417,7 +489,9 @@ admin:
                 clusters: vec![mk_cluster(), mk_cluster()],
             },
         };
-        let err = crate::from_bootstrap(&bootstrap).expect_err("must reject");
+        let err = crate::from_bootstrap(&bootstrap)
+            .await
+            .expect_err("must reject");
         assert!(
             matches!(err, ClusterError::DuplicateClusterName { ref name } if name == "backend"),
             "got {err:?}",
@@ -451,8 +525,8 @@ admin:
         assert_eq!(name, "primary");
     }
 
-    #[test]
-    fn from_bootstrap_rejects_malformed_endpoint_address() {
+    #[tokio::test]
+    async fn from_bootstrap_rejects_malformed_endpoint_address() {
         // envoy-config accepts the YAML at parse time (address: String);
         // envoy-cluster is the first layer that parses it into SocketAddr.
         let yaml = r#"
@@ -478,7 +552,9 @@ admin:
       port_value: 9901
 "#;
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("serde accepts");
-        let err = crate::from_bootstrap(&bootstrap).expect_err("must reject");
+        let err = crate::from_bootstrap(&bootstrap)
+            .await
+            .expect_err("must reject");
         assert!(
             matches!(
                 err,
@@ -486,6 +562,134 @@ admin:
                     if cluster == "backend" && addr == "not-a-host:10001"
             ),
             "got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn static_cluster_constructs_with_literal_ip() {
+        // 05.1 NEW (closes phase-02.1 REVIEW I3): positive Static regression guard.
+        // Was un-writable before phase 05.1 because ClusterType had only one variant
+        // (`Static`); with `StrictDns` now landing in 05.1 the `match cluster_type`
+        // arm is structurally meaningful, so the Static path is exercised here as
+        // an explicit guard against accidental schema/runtime regressions.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
+        let mgr = crate::from_bootstrap(&bootstrap)
+            .await
+            .expect("Static cluster constructs cleanly");
+        let handle = mgr.get("backend").expect("cluster present");
+        let picked = handle.pick_endpoint().expect("non-empty");
+        assert_eq!(picked, "127.0.0.1:7000".parse::<SocketAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn strict_dns_cluster_resolves_localhost_at_build_time() {
+        // 05.1 NEW: STRICT_DNS resolves a DNS name at cluster-build time via
+        // tokio::net::lookup_host. `localhost` is universally resolvable across
+        // dev/CI (loopback-bound; no network dependency); see PLAN.md signpost D.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: localhost
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
+        let mgr = crate::from_bootstrap(&bootstrap)
+            .await
+            .expect("STRICT_DNS cluster resolves localhost cleanly");
+        let handle = mgr.get("backend").expect("cluster present");
+        let picked = handle.pick_endpoint().expect("non-empty");
+        assert_eq!(
+            picked.port(),
+            7000,
+            "resolved endpoint should preserve configured port",
+        );
+        assert!(
+            picked.ip().is_loopback(),
+            "localhost should resolve to loopback (127.0.0.1 or ::1), got {picked:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_dns_cluster_returns_dns_resolution_failed_on_nxdomain() {
+        // 05.1 NEW: NXDOMAIN-equivalent path returns ClusterError::DnsResolutionFailed
+        // with the diagnostic fields populated. `.invalid` TLD is RFC 6761 §6.4
+        // reserved as non-resolvable (PLAN.md signpost E). If CI flakes due to a
+        // misconfigured resolver synthesizing a positive answer, fall back to the
+        // empty-host case per signpost E's documented escape hatch.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: this-host-does-not-exist.invalid
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
+        let err = crate::from_bootstrap(&bootstrap)
+            .await
+            .expect_err("STRICT_DNS resolution of .invalid TLD must fail");
+        assert!(
+            matches!(
+                err,
+                ClusterError::DnsResolutionFailed {
+                    ref cluster,
+                    ref address,
+                    ..
+                } if cluster == "backend" && address == "this-host-does-not-exist.invalid"
+            ),
+            "expected DnsResolutionFailed{{cluster:'backend',address:'this-host-does-not-exist.invalid',..}}, got {err:?}",
         );
     }
 }

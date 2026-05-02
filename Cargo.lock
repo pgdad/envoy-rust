@@ -345,6 +345,7 @@ version = "0.0.0"
 dependencies = [
  "envoy-config",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
