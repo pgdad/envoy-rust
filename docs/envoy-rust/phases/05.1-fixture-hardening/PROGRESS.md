@@ -98,3 +98,62 @@ test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 ```
 
 **Deviations from PLAN.** None.
+
+## Task 4 — state-4 phase-done gate verification + Cargo.lock sync + CI re-push (2026-05-02)
+
+**Commit:** `006288a`
+
+**Change summary.** Runs the state-4 phase-done gate per `BOOTSTRAP_PROMPT.md` §7.5: the 5 stable-toolchain commands + the fuzz short-budget + the Docker-gated CI re-push. Aggregates results below. **§7.5 is NOT yet met at this commit** — CI run `25258722850` (the canonical run for the code state at HEAD parent `4768fcd`) is red on `http1_router_upstream_fixture` (fixture 0008), and the four remaining differential test binaries (0003/0004/0005/0006) did not execute because `cargo test` exits at the first failing binary. Phase-04.3 REVIEW C-1 is therefore NOT materially closed at this commit; closure is deferred to a follow-up sub-phase that will diagnose the underlying upstream-routing defect under proper SPEC + ADR discipline.
+
+**Local gate (stable toolchain):**
+
+```
+$ cargo build --workspace --all-targets 2>&1 | tail -3
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -3
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+
+$ cargo fmt --all -- --check
+(no output — clean)
+
+$ cargo test --workspace 2>&1 | tail -3
+FAILED — http1_router_upstream_fixture: upstream: 503, subject: 200 (macOS Docker networking; CI is authoritative)
+
+$ cargo deny check 2>&1 | tail -3
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+**Fuzz short-budget (nightly toolchain):**
+
+```
+$ cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30 2>&1 | tail -5
+Done 769302 runs in 31 second(s)
+```
+
+**Docker-gated CI run:**
+
+CI run URL: https://github.com/pgdad/envoy-rust/actions/runs/25258722850
+
+Per-fixture results (alphabetical by test-binary name, the order `cargo test` invokes them):
+
+```
+tests/differential/tests/admin_ready.rs            GREEN    (fixture 0002 — unaffected by C-1)
+tests/differential/tests/echo.rs                   GREEN    (fixture 0001 — unaffected by C-1)
+tests/differential/tests/http1_direct_response.rs  GREEN    (fixture 0007 — unaffected by C-1)
+tests/differential/tests/http1_router_upstream.rs  RED      (fixture 0008 — response status mismatch under `response_status: exact`: upstream 503, subject 200)
+tests/differential/tests/tcp_proxy.rs              NOT RUN  (fixture 0003 — cargo test exited at 0008's binary failure)
+tests/differential/tests/tls_downstream.rs         NOT RUN  (fixture 0004 — cargo test exited at 0008's binary failure)
+tests/differential/tests/tls_sni.rs                NOT RUN  (fixture 0006 — cargo test exited at 0008's binary failure)
+tests/differential/tests/tls_upstream.rs           NOT RUN  (fixture 0005 — cargo test exited at 0008's binary failure)
+```
+
+**Cargo.lock sync.** No-op — clean at state-4. Tokio's `net` feature was already active in the workspace's resolved feature set; no separate sync commit needed.
+
+**Phase-04.3 REVIEW C-1 status.** NOT closed at this commit. The 0008 fixture's red CI indicates that Task 1's `STRICT_DNS` schema variant + Task 2's `tokio::net::lookup_host` resolution branch + Task 3's fixture YAML flip are necessary but not sufficient for the upstream-routing path through `host.docker.internal`. The remaining 4 fixtures (0003/0004/0005/0006) are unverified at this commit because `cargo test` short-circuits on the 0008 failure. Diagnosis of the underlying defect(s) and closure of C-1 is deferred to a follow-up sub-phase under proper SPEC + ADR discipline (per PLAN.md's "If a fixture remains red → re-enter state 3" guidance).
+
+**Phase-04.1 REVIEW M-claim** stays deferred per the 04.3 disposition. Carryforward chain (02.2 → 03.1 → 03.2 → 04.1 → 04.2 → 04.3 → 05.1 → 05.x-followup) continues.
+
+**Deviations from PLAN.** PLAN.md projected this commit would materially close phase-04.3 REVIEW C-1 at a green CI run; reality is a red CI run. The PLAN template's "all 8 fixtures green / 5 RESTORED + 3 unchanged" rendering does not match the captured CI matrix and was not used. The verification commit lands regardless, to materialize the gate-evidence artifact in git history per BOOTSTRAP_PROMPT.md §7.5; C-1 closure itself moves to a future follow-up sub-phase whose SPEC will be brainstormed against the captured 0008 status-mismatch trace.
+
+A prior in-session attempt at Task 4 introduced 6 root-cause patches inline (commits `9279895` / `2d3d679` / `339b3c7`, since reset and force-pushed away). That work was preserved on local branch `backup/task4-scope-creep-2026-05-02` for re-adoption under a properly scoped follow-up SPEC. Discarding the inline expansion preserves the PLAN's "0 LoC of code changes" Task 4 contract and the SPEC §7 "no new ADRs at this task" invariant.
