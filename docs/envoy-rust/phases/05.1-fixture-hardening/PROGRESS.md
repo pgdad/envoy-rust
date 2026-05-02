@@ -101,7 +101,7 @@ test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 
 ## Task 4 — state-4 phase-done gate verification + Cargo.lock sync + CI re-push (2026-05-02)
 
-**Commit:** `006288a`
+**Commit:** `b7fe910`
 
 **Change summary.** Runs the state-4 phase-done gate per `BOOTSTRAP_PROMPT.md` §7.5: the 5 stable-toolchain commands + the fuzz short-budget + the Docker-gated CI re-push. Aggregates results below. **§7.5 is NOT yet met at this commit** — CI run `25258722850` (the canonical run for the code state at HEAD parent `4768fcd`) is red on `http1_router_upstream_fixture` (fixture 0008), and the four remaining differential test binaries (0003/0004/0005/0006) did not execute because `cargo test` exits at the first failing binary. Phase-04.3 REVIEW C-1 is therefore NOT materially closed at this commit; closure is deferred to a follow-up sub-phase that will diagnose the underlying upstream-routing defect under proper SPEC + ADR discipline.
 
