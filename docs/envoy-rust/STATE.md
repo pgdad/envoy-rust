@@ -7,10 +7,10 @@
 
 ## Active phase
 
-**id:** `05`
-**slug:** `05-http2`
-**directory:** `docs/envoy-rust/phases/05-http2/` exists; contains `SPEC.md` (committed at this state-1 commit; 490 lines).
-**status:** phase 05 lifecycle **state 2 (parent SPEC.md exists; sub-phase SPECs do not)** — ROADMAP row `05` is `status: in-progress` as of this state-1 commit (flipped from `planned`); `sub-phases: 05.1, 05.2, 05.3` projected (codified at parent-05 state-2 via ADR-0022). The parent-05 state-2 session lands ADR-0022, the three sub-phase SPECs (`docs/envoy-rust/phases/05.1-fixture-hardening/SPEC.md`, `docs/envoy-rust/phases/05.2-http2-downstream/SPEC.md`, `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md`), and three new ROADMAP rows for the sub-phases. Mirrors the phase-04 state-2 commit `1d9740d` shape (ADR-0020 + three sub-phase SPECs + ROADMAP rows in a single commit).
+**id:** `05.1`
+**slug:** `05.1-fixture-hardening`
+**directory:** `docs/envoy-rust/phases/05.1-fixture-hardening/` exists; contains `SPEC.md` (committed at this state-2 commit). Parent directory `docs/envoy-rust/phases/05-http2/` continues to hold the parent SPEC at `SPEC.md` (committed at parent-05 state-1 commit `cd1a70e`; 490 lines, unedited at this commit per D-3.4 / D-3.5 — the parent SPEC remains the historical artifact projecting the split, superseded for execution by the three sub-phase SPECs landed at this commit). Sibling directories `05.2-http2-downstream/` and `05.3-http2-upstream/` also exist with their own `SPEC.md` files committed at this same state-2 commit.
+**status:** sub-phase 05.1 lifecycle **state 2 (sub-phase SPEC.md exists; PLAN.md does not)** — ROADMAP row `05.1` is `status: planned` as of this state-2 commit (added at this commit); ROADMAP row `05` remains `status: in-progress`; ROADMAP rows `05.2` and `05.3` are also `status: planned` (added at this commit, awaiting sequential entry per the strict 05.1 → 05.2 → 05.3 ordering). The next session — operating as the sub-phase-05.1 state-2 planner — invokes `superpowers:writing-plans` scoped to sub-phase 05.1, producing `docs/envoy-rust/phases/05.1-fixture-hardening/PLAN.md`. PLAN.md commits as a standalone pre-Task-1 commit per the 04.3-established cadence (commit `c02eea7`; M10 closure precedent — see "Phase-04.2 rollovers" below).
 
 Phase 04 (`04-http1`) is **done** as of commit `e626862` (the phase-04.3 state-6 close-out, predecessor of this state-1 commit). All three sub-phases are done: `04.1-hcm-direct-response` (commit `c5c40ec`), `04.2-route-matchers` (commit `04163c5`), and `04.3-router-upstream` (commit `e626862`). ROADMAP rows `04`, `04.1`, `04.2`, and `04.3` are all `status: done`. Parent SPEC at `docs/envoy-rust/phases/04-http1/SPEC.md` remains in-tree unedited as the committed historical artifact (last touched at SHA `805433e`); for execution purposes it was superseded by the three sub-phase SPECs.
 
@@ -32,51 +32,65 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 17–22, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 2): the next session — operating as the parent-05 state-2 session — invokes **`superpowers:writing-plans`**. State-2 output for the parent-05 split: **ADR-0022** (split decision) lands in `docs/envoy-rust/DECISIONS.md`; three sub-phase SPECs land at `docs/envoy-rust/phases/{05.1-fixture-hardening,05.2-http2-downstream,05.3-http2-upstream}/SPEC.md`; three new ROADMAP rows for the sub-phases. The state-2 commit also advances STATE.md to point at sub-phase 05.1 as the next active phase (lifecycle state 2; sub-phase SPEC exists, sub-phase PLAN.md does not), with next-skill `superpowers:writing-plans` for sub-phase 05.1.
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 17–22, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 2): the next session — operating as the **sub-phase 05.1 state-2 planner** — invokes **`superpowers:writing-plans`** scoped to sub-phase 05.1. Output: `docs/envoy-rust/phases/05.1-fixture-hardening/PLAN.md`. PLAN.md commits as a standalone pre-Task-1 commit per the 04.3-established cadence (commit `c02eea7`; M10 closure precedent). Sub-phase 05.1 does NOT re-split (its scope of ~400 LoC / ~5 tasks sits well under the §6.1 gate); if the planner finds the actual PLAN crosses §6.1 thresholds, invoke `superpowers:systematic-debugging` first per `BOOTSTRAP_PROMPT.md` §6.1 (nested splits of an already-split sub-phase are flagged as suspicious).
 
-The split decision was projected at parent-05 state-1 (this commit) per parent SPEC §5 / §7. Three sub-phases by surface boundary:
+After 05.1 closes (its state-6 phase-done commit), STATE.md will advance to sub-phase 05.2 lifecycle state 2, then to 05.3 lifecycle state 2 in the same way; the **last** sub-phase commit (05.3's state-6) ALSO flips parent ROADMAP row `05` `in-progress` → `done` per the ROADMAP-schema invariant ("the parent flips to `done` only after all sub-phases are `done`"; mirrors phase 04's `e626862`-shape close-out).
 
-- **05.1 `fixture-hardening`** — `ClusterType::StrictDns` + validator + 5-fixture coordinated edit (`tests/fixtures/{0003,0004,0005,0006,0008}/{envoy.yaml,envoy-rust.yaml}`) + closes phase-02.1 REVIEW I3 (positive `Static` regression guard) + closes phase-04.3 REVIEW C-1 (Docker-gated regression). NO H2 work. ~400 LoC, ~5 tasks. Lands **ADR-0023** at 05.1 Task 1.
-- **05.2 `http2-downstream`** — `envoy-http2` foundation (sole workspace dep on `h2 = "0.4"`; mirrors `envoy-http1`'s sole-owner-of-`httparse` posture) + `CodecType::HTTP2` accept path + listener-side `Http2ProtocolOptions` + HCM-on-H2 dispatch (reuses 04.x `HCMConfig` end-to-end; only the codec layer changes) + fixture `0009-http2-direct-response` + `tests/conformance/h2spec/` runner crate at the **≥95% pass** gate with catalogued failures + `Driver::Http2` harness extensions. ~1300 LoC, ~14 tasks. May land **ADR-0024** (`http` crate scoping) and/or **ADR-0025** (`h2spec` integration posture) conditionally per parent SPEC §7.
-- **05.3 `http2-upstream`** — `envoy-http2::Client` (per-connection plaintext H2 client; no pooling) + cluster-side `Http2ProtocolOptions` via `typed_extension_protocol_options` + router H2-arm (extends 04.3's `RouteAction::Route` arm to dispatch H1-or-H2 based on cluster's protocol options) + new helper crate `tests/helpers/http2-echo-server` + fixture `0010-http2-router-upstream` + parent-05 close-out. ~1300 LoC, ~14 tasks.
+The split decision is now codified in **ADR-0022** (landed at this state-2 commit; see DECISIONS.md). Three sub-phases by surface boundary, each with its own SPEC.md committed at this same state-2 commit:
+
+- **05.1 `fixture-hardening`** — `ClusterType::StrictDns` schema variant + `Cluster::new` extension for DNS resolution at cluster-build time + 5-fixture coordinated edit (`tests/fixtures/{0003,0004,0005,0006,0008}/{envoy.yaml,envoy-rust.yaml}`) + closes phase-02.1 REVIEW I3 (positive `Static` regression guard) + closes phase-04.3 REVIEW C-1 (cross-phase Docker-gated regression). NO H2 work. ~400 LoC, ~5 tasks. Lands **ADR-0023** at 05.1 Task 1 inline. SPEC at `docs/envoy-rust/phases/05.1-fixture-hardening/SPEC.md`.
+- **05.2 `http2-downstream`** — `envoy-http2` foundation (sole workspace dep on `h2 = "0.4"`; mirrors `envoy-http1`'s sole-owner-of-`httparse` posture established in 04.1) + `CodecType::HTTP2` accept path + listener-side `Http2ProtocolOptions` + HCM-on-H2 dispatch (reuses 04.x `HCMConfig` + route-walk + router invocation site end-to-end; only the codec layer at the connection edge changes) + fixture `0009-http2-direct-response` + `tests/conformance/h2spec/` runner crate at the **≥95% pass** gate with catalogued failures in `known-failures.txt` + harness `Driver::Http2` + `drive_http2`. ~1300 LoC, ~14 tasks. May land **ADR-0024** (`http` crate scoping) and/or **ADR-0025** (`h2spec` integration posture) conditionally per parent SPEC §7. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/SPEC.md`.
+- **05.3 `http2-upstream`** — `envoy-http2::Client` (per-connection plaintext H2 client; one TCP connection per upstream call; no pooling — pooling defers to upstream-robustness family) + cluster-side `Http2ProtocolOptions` via `typed_extension_protocol_options` + new `Cluster.upstream_protocol: UpstreamProtocol { Http1, Http2 }` field + router H2-arm (extends 04.3-landed `RouteAction::Route` arm at `crates/envoy-http1/src/hcm.rs` to dispatch H1-or-H2 by cluster.upstream_protocol; reuses `write_proxied_response` unchanged) + new helper crate `tests/helpers/http2-echo-server` + fixture `0010-http2-router-upstream` + parent-05 close-out. ~1300 LoC, ~14 tasks. SPEC at `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md`.
 
 Strict ordering 05.1 → 05.2 → 05.3 (cannot be parallelized; 05.2 depends on 05.1's restored Docker-gated baseline; 05.3 extends 05.2's schema and runtime).
 
-The DECISIONS.md ledger head is **ADR-0021** (last landed in 04.2 Task 1 commit `984aedd`); phase 05's projected ADRs land at **ADR-0022, ADR-0023**, with **ADR-0024 / ADR-0025 conditional**.
+The DECISIONS.md ledger head is now **ADR-0022** (landed at this state-2 commit). Phase 05's projected ADRs: ADR-0023 (lands at 05.1 Task 1 inline); ADR-0024 / ADR-0025 conditional at 05.2 Task 1.
 
-**Standing context for the parent-05 state-2 session:**
+**Standing context for the sub-phase 05.1 state-2 planner:**
 
-- **The brainstorm scope decisions are codified in the parent-05 SPEC** at `docs/envoy-rust/phases/05-http2/SPEC.md`. The state-2 planner does NOT re-litigate these. Specifically: (i) C-1 fix is in-scope as 05.1; (ii) plaintext H2C prior-knowledge for both downstream and upstream (TLS+ALPN deferred per parent SPEC §4 — M7 carryforward continues); (iii) two H2 fixtures (0009 + 0010); (iv) `h2spec` ≥95% pass with catalogued failures targeting 100%; (v) `server_name` HCM field re-deferred; (vi) `codec_type: AUTO` stays HTTP/1.1-only; (vii) cross-protocol H2↔H1 translation deferred.
+- **The brainstorm scope decisions are codified in the parent-05 SPEC** at `docs/envoy-rust/phases/05-http2/SPEC.md` (490 lines, committed at parent-05 state-1 commit `cd1a70e`) AND in the sub-phase 05.1 SPEC at `docs/envoy-rust/phases/05.1-fixture-hardening/SPEC.md` (committed at this state-2 commit). The 05.1 PLAN.md planner does NOT re-litigate scope — the 05.1 SPEC is the design contract for what the planner expands into ~5 tasks.
 - **Per the user's standing preference** (auto-memory `feedback_execution_style`), state-3 execution will use `superpowers:subagent-driven-development` over inline `executing-plans` — do not present the two-option fork at state-3 entry.
-- **PLAN.md cadence** continues the 04.3 standardized posture: each sub-phase's planner commits PLAN.md cleanly at state-2 close-out, before any Task 1 commit (the 04.3 standalone pre-Task-1 PLAN.md commit `c02eea7` is the precedent). The 04.1/04.2 inline-PLAN deviation is no longer the model.
-- **`http` crate ADR (ADR-0024) and `h2spec` integration ADR (ADR-0025) are CONDITIONAL** per parent SPEC §7. The 05.2 planner decides at sub-phase Task 1 time whether either warrants landing. If neither lands, ADR-0024 / ADR-0025 numbers stay available for phase-06 ADRs.
+- **PLAN.md cadence** continues the 04.3 standardized posture: PLAN.md commits cleanly at state-2 close-out as a standalone pre-Task-1 commit (precedent: `c02eea7`). The 04.1/04.2 inline-PLAN deviation is no longer the model.
+- **ADR-0023 lands at 05.1 Task 1** per parent SPEC §7 / 05.1 SPEC §7 — extends the `ClusterType` enum with `StrictDns` variant; defers `LOGICAL_DNS` to a later phase. Provenance footer cites the C-1 cross-phase regression trace and the 04.3 REVIEW §3/§4 carryforward.
 
-Inputs the parent-05 state-2 session should read, in order:
+Inputs the sub-phase 05.1 state-2 planner should read, in order:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
 2. `docs/envoy-rust/STATE.md` (this file — to confirm routing).
-3. `docs/envoy-rust/ROADMAP.md` (row 05 `in-progress`; sub-phases column `05.1, 05.2, 05.3`; rows 04 + 04.x and earlier all `done`).
-4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0021`; phase-05's projected ADRs land at `ADR-0022+`).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (Header allow-list section has 3 phase-04 rows; phase 05 anticipates no edits per parent SPEC §2).
+3. `docs/envoy-rust/ROADMAP.md` (row 05 `in-progress`; row 05.1 `planned`; rows 05.2 + 05.3 `planned`; rows 04 + 04.x and earlier all `done`).
+4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0022`; ADR-0023 lands at 05.1 Task 1).
+5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (Header allow-list section has 3 phase-04 rows; sub-phase 05.1 anticipates no edits per its SPEC §2).
 6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine).
-7. **`docs/envoy-rust/phases/05-http2/SPEC.md` (parent-05 SPEC; 490 lines)** — the design contract for the split. §3 enumerates ~13 deliverables organized by sub-phase that the sub-phase SPECs decompose into per-task plans; §5 projects the 3-way split with LoC/tasks estimates; §6 lists 23 implementation signposts; §7 names ADR-0022, ADR-0023, and the conditional ADR-0024/0025; §8 lists artifacts created/amended; §9 names the parent-05 close-out commit format.
-8. `docs/envoy-rust/phases/04.3-router-upstream/{SPEC,PLAN,PROGRESS,REVIEW}.md` (most recent phase precedent — task cadence, TDD framing, in-phase review-fix discipline, REVIEW.md verdict shape).
-9. `docs/envoy-rust/phases/04.1-hcm-direct-response/SPEC.md` + `04.2-route-matchers/SPEC.md` (HCM scaffold + matcher schema phase 05 inherits unchanged; HCM-on-H2 reuses `HCMConfig` + route-walk + router invocation site wholesale).
-10. `BOOTSTRAP_PROMPT.md` §5 state 2 (writing-plans skill routing) + §6.1 / §6.2 (split gate + how-to-split — the parent-05 state-2 session lands the projected split decision following §6.2 steps).
+7. **`docs/envoy-rust/phases/05.1-fixture-hardening/SPEC.md`** — the design contract for the 5-task PLAN. §3 enumerates the deliverables (D1 schema variant, D2 cluster construction, D3 5-fixture edit, D4 verification, D5 I3 close); §7 names ADR-0023; §9 names the 05.1 close-out commit format.
+8. `docs/envoy-rust/phases/05-http2/SPEC.md` (parent-05 SPEC; 490 lines) — for cross-sub-phase architectural rules + non-goals 05.1 inherits.
+9. `docs/envoy-rust/phases/04.3-router-upstream/{SPEC,PLAN,PROGRESS,REVIEW}.md` (most recent phase precedent — task cadence, TDD framing, in-phase review-fix discipline, REVIEW.md verdict shape, the C-1 carryforward trace 05.1 closes).
+10. `docs/envoy-rust/phases/02.1-config-cluster/SPEC.md` (the `ClusterType::Static` originating phase — for the schema-growth precedent and the I3 audit-trail context).
+11. `BOOTSTRAP_PROMPT.md` §5 state 2 (writing-plans skill routing) + §6.1 / §6.2 (split gate — 05.1 must NOT re-split per the parent's flat-3-way constraint).
 
 ## Last commit
 
-Phase 05 state-1 close-out commit (this commit): touches `docs/envoy-rust/phases/05-http2/SPEC.md` (NEW; 490 lines), `docs/envoy-rust/ROADMAP.md` (row 05 `status` `planned` → `in-progress`; `sub-phases` column `—` → `05.1, 05.2, 05.3`), and `docs/envoy-rust/STATE.md` (this file; advance from phase 05 lifecycle state 1 → state 2; rewrite of active sections). No code changes. Mirrors the phase-04 state-1 commit `805433e`-shape (parent SPEC + ROADMAP flip + STATE advance, all atomic).
+Parent-05 state-2 close-out commit (this commit): lands the parent-05 split formalization in one atomic commit per the phase-04 state-2 commit `1d9740d` precedent. Touches:
+
+- `docs/envoy-rust/DECISIONS.md` — appends ADR-0022 (split phase 05 into sub-phases 05.1, 05.2, 05.3 by surface boundary). Provenance footer cites parent-05 SPEC §7 (commit `cd1a70e`).
+- `docs/envoy-rust/phases/05.1-fixture-hardening/SPEC.md` — NEW. Sub-phase SPEC for the fixture-hardening preamble. ~400 LoC scope, ~5 tasks. Lands ADR-0023 at Task 1.
+- `docs/envoy-rust/phases/05.2-http2-downstream/SPEC.md` — NEW. Sub-phase SPEC for the downstream H2C codec + HCM + h2spec attach. ~1300 LoC scope, ~14 tasks.
+- `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md` — NEW. Sub-phase SPEC for the upstream H2C client + router H2-arm + helper + parent-05 close. ~1300 LoC scope, ~14 tasks. Closes parent ROADMAP row 05 at its state-6 commit.
+- `docs/envoy-rust/ROADMAP.md` — appends rows `05.1`, `05.2`, `05.3` (each `status: planned`; depends-on chain reflects strict 05.1 → 05.2 → 05.3 ordering since 05.2 depends on 05.1's restored Docker-gated baseline and 05.3 extends both 05.2's schema and runtime). Parent row `05` stays `in-progress`; its `sub-phases` column was already populated as `05.1, 05.2, 05.3` at the state-1 commit.
+- `docs/envoy-rust/STATE.md` — advances active phase from phase 05 lifecycle state 2 (parent) to sub-phase 05.1 lifecycle state 2 (sub-phase SPEC.md exists, sub-phase PLAN.md does not). Next-skill `superpowers:writing-plans` scoped to sub-phase 05.1. Adds Phase-05 ADR ledger Notes entry.
+
+No code changes. `ENVOY_TARGET.md` and `rust-toolchain.toml` untouched (D-3.7 / D-3.9). DECISIONS.md ADR-0001 through ADR-0021 byte-identical (D-3.5 append-only). Mirrors the phase-04 state-2 commit `1d9740d` shape (ADR-0020 + three sub-phase SPECs + ROADMAP rows + STATE advance, all atomic).
 
 Predecessor commits:
 
-- `e626862` — `phase 04.3: HTTP/1.1 upstream origination + router proxy arm [parent 04 done]` (state-6 phase-done close-out for phase 04.3 AND parent phase 04; advanced STATE.md to phase 05 lifecycle state 1 with next-skill `superpowers:brainstorming`).
+- `cd1a70e` — `phase 05: state-1 brainstorm — parent SPEC.md projecting 3-way split (05.1/05.2/05.3)` (parent-05 state-1 close-out; lands the parent SPEC at `docs/envoy-rust/phases/05-http2/SPEC.md`; advances STATE.md to phase 05 lifecycle state 2; flips ROADMAP row 05 `planned` → `in-progress` with `sub-phases: 05.1, 05.2, 05.3`).
+- `e626862` — `phase 04.3: HTTP/1.1 upstream origination + router proxy arm [parent 04 done]` (state-6 phase-done close-out for phase 04.3 AND parent phase 04; immediate predecessor of the surface this state-2 commit operates on).
 - `eb030d1` — `phase 04.3: state 5 REVIEW.md Approved with M-track follow-ups` (the REVIEW.md that surfaced C-1 as the cross-phase carryforward 05.1 now resolves).
-- `c02eea7` — `phase 04.3: state-2 PLAN.md (inline-at-Task-1 precedent: pre-Task-1 standalone)` — the standalone-pre-Task-1 PLAN.md commit that established the standardized cadence inherited by phase 05's sub-phase planners.
+- `c02eea7` — `phase 04.3: state-2 PLAN.md (inline-at-Task-1 precedent: pre-Task-1 standalone)` — the standalone-pre-Task-1 PLAN.md commit that established the standardized cadence inherited by phase 05's sub-phase planners (the 05.1 PLAN.md commit follows this shape).
+- `1d9740d` — `phase 04: state-2 split formalization — ADR-0020 + 3 sub-phase SPECs (04.1/04.2/04.3)` — the immediate shape-precedent for this state-2 commit.
 
 ## Last updated
 
-2026-05-01 (phase 05 state-1 close-out; parent SPEC at `docs/envoy-rust/phases/05-http2/SPEC.md` projects 3-way split into 05.1/05.2/05.3 with C-1 fix folded into 05.1; ROADMAP row 05 flipped to `in-progress`; STATE advances to phase 05 lifecycle state 2; next-skill `superpowers:writing-plans` for parent-05 state-2 — lands ADR-0022 + 3 sub-phase SPECs + 3 new ROADMAP rows).
+2026-05-01 (parent-05 state-2 close-out; ADR-0022 landed; sub-phase SPECs at `docs/envoy-rust/phases/{05.1-fixture-hardening,05.2-http2-downstream,05.3-http2-upstream}/SPEC.md` committed; ROADMAP rows 05.1/05.2/05.3 added as `status: planned`; STATE advances to sub-phase 05.1 lifecycle state 2; next-skill `superpowers:writing-plans` for sub-phase 05.1's PLAN.md).
 
 ## Notes
 
@@ -225,12 +239,24 @@ ADR-0017 (split phase 03; landed at `f256d2c`), ADR-0018 (`rcgen` + `tempfile`; 
 
 ### Phase-04 ADR ledger (for reference)
 
-ADR-0020 (split phase 04 into 04.1 + 04.2 + 04.3; landed at parent-04 state-2 commit `1d9740d`). ADR-0021 (`regex` permitted as a foundation for header / route matching; landed at 04.2 Task 1 commit `984aedd`). No ADRs landed in phase 04.3 (per SPEC §7). The DECISIONS.md ledger head remains at **ADR-0021**; phase 05's projected ADRs land at **ADR-0022+**.
+ADR-0020 (split phase 04 into 04.1 + 04.2 + 04.3; landed at parent-04 state-2 commit `1d9740d`). ADR-0021 (`regex` permitted as a foundation for header / route matching; landed at 04.2 Task 1 commit `984aedd`). No ADRs landed in phase 04.3 (per SPEC §7).
 
 Unlike phase-03's split (ADR-0017) which renumbered three projected ADRs, phase-04's split landed cleanly at ADR-0020 with no renumbering needed (parent-04 SPEC's projected ADR-0020 + ADR-0021 numbers match the actual landed numbers).
+
+### Phase-05 ADR ledger (current)
+
+**ADR-0022** (split phase 05 into sub-phases 05.1, 05.2, 05.3 by surface boundary; landed at parent-05 state-2 commit — this commit). The DECISIONS.md ledger head is now **ADR-0022**.
+
+Phase 05's projected ADRs after this commit:
+
+- **ADR-0023** (`ClusterType::StrictDns` accepted; `LOGICAL_DNS` deferred) — lands at 05.1 Task 1 inline, mirrors ADR-0021's inline-at-Task-1 pattern. Closes phase-04.3 REVIEW C-1 (cross-phase Docker-gated regression). Closes phase-02.1 REVIEW I3 (positive `Static` regression guard, enabled by introducing the second `ClusterType` variant).
+- **ADR-0024** (CONDITIONAL — `http` crate typed-surface scoping) — lands at 05.2 Task 1 IF the planner determines `http` warrants policy-grade documentation as a permitted-foundation grant (parallel to ADR-0021's narrow scoping for `regex`). The `h2` crate exposes `http::*` types as part of its API; the question is whether `http` goes on the foundations list directly or stays transitive-only. Recommendation per parent SPEC §7: lands as a brief permitted-foundations grant.
+- **ADR-0025** (CONDITIONAL — `h2spec` integration posture) — lands at 05.2 Task 1 IF the gate-mechanics surface a non-trivial doctrine choice (binary provisioning, known-failures format, partial-pass gate semantics). Brainstorm anticipates this is mostly mechanical and may not warrant an ADR.
+
+If ADR-0024 / ADR-0025 do not land at 05.2 Task 1, those numbers stay available for phase-06+ ADRs. Like phase-04's split (ADR-0020), phase-05's split lands cleanly at ADR-0022 with no renumbering needed (parent-05 SPEC's projected ADR-0022 / ADR-0023 numbers match the actual landed numbers; conditional ADR-0024 / ADR-0025 may not land).
 
 ### Doctrine reminders
 
 - Any deviation from the state machine requires `superpowers:systematic-debugging` before proceeding — see §1 Step E of `BOOTSTRAP_PROMPT.md`.
 - Consult `docs/envoy-rust/SKILL_ROUTING.md` for the full phase lifecycle state machine.
-- `BOOTSTRAP_PROMPT.md` §5.1: one state per session; do not chain states. The phase 04.3 state-6 close-out (this commit) advances STATE.md to phase 05 lifecycle state 1. The next session enters phase 05 state 1 via `superpowers:brainstorming` scoped to phase 05, producing `docs/envoy-rust/phases/05-<slug>/SPEC.md`.
+- `BOOTSTRAP_PROMPT.md` §5.1: one state per session; do not chain states. The parent-05 state-2 close-out (this commit) advances STATE.md to sub-phase 05.1 lifecycle state 2. The next session enters sub-phase 05.1 state 2 via `superpowers:writing-plans` scoped to 05.1, producing `docs/envoy-rust/phases/05.1-fixture-hardening/PLAN.md` as a standalone pre-Task-1 commit.
