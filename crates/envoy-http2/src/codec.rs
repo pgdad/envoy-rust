@@ -17,6 +17,8 @@ pub fn build_h2_server(opts: Option<&Http2ProtocolOptions>) -> h2::server::Build
         if let Some(v) = o.max_concurrent_streams {
             builder.max_concurrent_streams(v);
         }
+        // h2's setter is named `initial_window_size` (no `_stream_` infix);
+        // envoy-config retains the proto-canonical `initial_stream_window_size`.
         if let Some(v) = o.initial_stream_window_size {
             builder.initial_window_size(v);
         }
