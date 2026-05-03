@@ -22,3 +22,4 @@ envoy-http1 = { path = "../envoy-http1" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+envoy-cluster = { path = "../envoy-cluster" }

@@ -29,6 +29,10 @@ pub struct HCMConfig {
     pub stat_prefix: String,
     pub route_config: Arc<RouteConfiguration>,
     pub cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+    /// 05.2 NEW: listener-side HTTP/2 protocol options. Ignored on the H1
+    /// dispatch path (envoy-http1's HCM doesn't read this); consumed on the
+    /// H2 dispatch path (envoy-http2's HCM reads it at handshake time).
+    pub http2_protocol_options: Option<envoy_config::Http2ProtocolOptions>,
 }
 
 impl HCMConfig {
@@ -43,6 +47,7 @@ impl HCMConfig {
             stat_prefix: cfg.stat_prefix.clone(),
             route_config: Arc::new(clone_route_config(&cfg.route_config)),
             cluster_mgr,
+            http2_protocol_options: cfg.http2_protocol_options.clone(),
         })
     }
 }
@@ -308,12 +313,12 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Erro
 /// the request to the named cluster. The caller (serve_connection) writes
 /// Synth via `Http1Response::write_to` and dispatches Proxy via
 /// `cluster_mgr` → `pick_endpoint` → `Client::connect` → `send_request`.
-enum BuildOutcome {
+pub enum BuildOutcome {
     Synth(Response),
     Proxy { cluster: String },
 }
 
-fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
+pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
     // Validate Host header presence and non-emptiness (HTTP/1.1 §5.4 — mandatory).
     // Treat empty Host (`Host: \r\n`) as the same RFC violation as missing Host.
     let host_raw = match find_header(&req.headers, headers::HOST) {
@@ -538,6 +543,7 @@ static_resources:
         Arc::new(HCMConfig {
             stat_prefix: "ingress_http".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -613,6 +619,7 @@ static_resources:
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -650,6 +657,7 @@ static_resources:
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -715,6 +723,7 @@ static_resources:
         let config = Arc::new(HCMConfig {
             stat_prefix: "x".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -797,6 +806,7 @@ static_resources:
         Arc::new(HCMConfig {
             stat_prefix: "test".into(),
             cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 virtual_hosts: vec![VirtualHost {
@@ -1025,6 +1035,7 @@ static_resources:
         Arc::new(HCMConfig {
             stat_prefix: "ingress_http".to_string(),
             cluster_mgr,
+            http2_protocol_options: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 virtual_hosts: vec![VirtualHost {

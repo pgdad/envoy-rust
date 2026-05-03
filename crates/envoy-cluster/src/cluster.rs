@@ -77,6 +77,19 @@ impl ClusterManager {
             inner: Arc::clone(arc),
         })
     }
+
+    /// Build an empty `ClusterManager` carrying zero clusters. Used by
+    /// downstream test fixtures (envoy-http2 Task 9) where the HCM under
+    /// test only takes `RouteAction::DirectResponse` paths and never invokes
+    /// `cluster_mgr.get`. The runtime path still goes through
+    /// `from_bootstrap`; this is a test-shaped constructor that bypasses the
+    /// validator-shaped `EmptyCluster`/`DuplicateClusterName` invariants
+    /// because by definition there are no clusters to violate them.
+    pub fn empty() -> Self {
+        Self {
+            clusters: HashMap::new(),
+        }
+    }
 }
 
 /// Errors returned by `from_bootstrap`.

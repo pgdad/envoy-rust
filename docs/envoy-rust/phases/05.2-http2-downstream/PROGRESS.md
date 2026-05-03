@@ -563,3 +563,88 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 - **Carryforward note:** `build_h2_server` is consumed by Task 9's HCM, which calls it on connection accept to obtain a configured `h2::server::Builder` and then drives `Builder::handshake(io)` to obtain a `h2::server::Connection`. The 05.2 SPEC §3 D3 contract is now in place: HCM does NOT touch `Http2ProtocolOptions` directly — it passes `listener.http2_protocol_options.as_ref()` straight to `build_h2_server`, keeping the option-to-setter mapping in one place. When 05.3 adds `client.rs`, a sibling `build_h2_client(Option<&Http2ProtocolOptions>) -> h2::client::Builder` will live in this same module, sharing the field-by-field mapping shape; the listener-side / client-side `Http2ProtocolOptions` type is intentionally a single struct (cf. SPEC §3 D2.b — Envoy's upstream + downstream H2 use the same `Http2ProtocolOptions` proto, just attached to different config nodes). The smoke test compiles-only; the wire-effect verification (a peer observing `SETTINGS_MAX_CONCURRENT_STREAMS = 50` after handshake) lands in Task 9's `hcm.rs` `h2_protocol_options_max_concurrent_streams_applied` integration test.
 - **Post-review fixup:** One Minor finding closed: (M2) added inline comment at `codec.rs:20-22` documenting the field rename `initial_stream_window_size` (envoy-config proto-canonical name) → `initial_window_size` (h2 setter, no `_stream_` infix). Closes code-quality reviewer M2 on Task 8.
 
+## Task 9 — `crates/envoy-http2/src/hcm.rs` (HCM ConnectionHandler impl + 8 unit tests)
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** D3 hcm.rs — new `hcm` submodule under `envoy-http2` housing the `HCM` struct + `ConnectionHandler` impl. The HCM consumes `envoy_http1::HCMConfig` (re-exported as a type alias `envoy_http2::HCMConfig` for ergonomic naming, per cross-sub-phase architectural rule 2) and dispatches per-stream through the existing 04.x route-walk + `envoy_http1::hcm::build_response` + `BuildOutcome` arms. Per-connection driver: `h2::server::handshake` (configured via `build_h2_server(config.http2_protocol_options.as_ref())`); per-stream: `tokio::spawn` direct (parent §6 signpost 6, fire-and-forget; per-stream errors logged, not propagated). The `BuildOutcome::Synth(Response)` arm goes through the existing `send_envoy_response` (Task 7); the `BuildOutcome::Proxy { .. }` arm STUBS a 502 with a doctrine-line body (no cluster names, defense-in-depth) per SPEC §6 local signpost 21 — the real upstream H2 dispatch lands in 05.3 D13.3. The trait shape (BoxFuture-returning, NOT async-trait) mirrors `envoy_listener::ConnectionHandler` per SPEC §6 local signpost 19. 8 unit tests; 7 pass, 1 `#[ignore]` (test 8 — see Deviations).
+- **ADR landed:** None (Task 9 directly applies parent-05 SPEC §3 D3 + cross-sub-phase architectural rule 2; no decisions needed beyond what SPEC settles).
+- **Files modified:**
+  - `crates/envoy-http2/src/hcm.rs` (created) — ~340 lines incl. doc-comments + impl + 8 tests.
+  - `crates/envoy-http2/src/lib.rs` — added `pub mod hcm;` and `pub use hcm::{HCM, HCMConfig};`. rustfmt re-sorted `mod`/`use` blocks alphabetically.
+  - `crates/envoy-http2/Cargo.toml` — added `envoy-cluster = { path = "../envoy-cluster" }` to `[dev-dependencies]` (test-only consumer of `ClusterManager::empty()`).
+  - `crates/envoy-http1/src/hcm.rs` — visibility lift: `BuildOutcome` (line 311) and `build_response` (line 316) lifted from `pub(crate)` to `pub` for cross-crate consumption by envoy-http2's HCM. `HCMConfig` extended with `pub http2_protocol_options: Option<envoy_config::Http2ProtocolOptions>` (4th field); `HCMConfig::from_config` populates it from `cfg.http2_protocol_options.clone()`. Six in-test `HCMConfig { ... }` literal constructions in the existing `tests` module updated to include `http2_protocol_options: None,` (none of the 04.x tests exercise this field).
+  - `crates/envoy-http1/src/lib.rs` — extended `pub use hcm::{HCM, HCMConfig};` to `pub use hcm::{BuildOutcome, HCM, HCMConfig, build_response};` (rustfmt-sorted).
+  - `crates/envoy-config/src/bootstrap.rs` — added `Clone` to `Http2ProtocolOptions`'s derive list (prerequisite for the `cfg.http2_protocol_options.clone()` call inside `HCMConfig::from_config`).
+  - `crates/envoy-cluster/src/cluster.rs` — added `pub fn empty() -> Self` to `impl ClusterManager` (test-shaped constructor consumed by envoy-http2's hcm.rs test fixtures; the runtime path still goes through `from_bootstrap`).
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~430 raw lines (hcm.rs ~340 incl. tests; envoy-http1 visibility lift + HCMConfig extension + 7 test-literal updates ~12; envoy-http1/lib.rs re-export ~1; envoy-cluster `empty()` ~13 incl. doc; envoy-config Clone derive ~1; envoy-http2/lib.rs +2 lines after rustfmt; Cargo.toml +1 line). PLAN estimated ~440; actual matches within margin.
+- **Verification:**
+
+  Step 9.5 — `cargo test -p envoy-http2 -- --nocapture`:
+  ```
+  running 20 tests
+  test hcm::tests::h2_protocol_options_max_concurrent_streams_applied ... ignored, h2-crate client-side observability of peer SETTINGS_MAX_CONCURRENT_STREAMS is not deterministically surfaced ...
+  test codec::tests::build_h2_server_applies_protocol_options ... ok
+  test error::tests::bad_status_code_displays_value ... ok
+  test error::tests::missing_authority_displays_descriptively ... ok
+  test error::tests::h2_handshake_displays_with_source ... ok
+  test request::tests::http_to_envoy_request_lowercases_headers ... ok
+  test request::tests::http_to_envoy_request_synthesizes_host_from_authority ... ok
+  test request::tests::http_to_envoy_request_missing_authority_returns_error ... ok
+  test request::tests::http_to_envoy_request_non_utf8_header_value_returns_error ... ok
+  test response::tests::envoy_response_to_http2_strips_h2_forbidden_headers ... ok
+  test response::tests::envoy_response_to_http2_preserves_status_and_body ... ok
+  test response::tests::build_http_response_rejects_invalid_status_code ... ok
+  test response::tests::build_http_response_rejects_invalid_header_name ... ok
+  test hcm::tests::h2_handshake_completes_against_in_process_listener ... ok
+  test hcm::tests::h2_get_resolves_to_direct_response_synth ... ok
+  test hcm::tests::h2_authority_header_synthesizes_host_for_route_walk ... ok
+  test hcm::tests::h2_two_requests_share_one_tcp_connection ... ok
+  test hcm::tests::h2_response_strips_hop_by_hop_headers_defensively ... ok
+  test hcm::tests::h2_proxy_outcome_returns_502_in_05_2 ... ok
+  test hcm::tests::h2_handshake_fails_on_garbage_preamble ... ok
+
+  test result: ok. 19 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  ```
+  Suite goes 12 → 20 (Task 8 left it at 12; Task 9 adds 8: 7 PASS + 1 `#[ignore]`). Matches PLAN's Step 9.5 expected count.
+
+  Per-test status:
+  1. `h2_handshake_completes_against_in_process_listener` — PASS.
+  2. `h2_get_resolves_to_direct_response_synth` — PASS.
+  3. `h2_authority_header_synthesizes_host_for_route_walk` — PASS (specific VH wins over `*` catch-all).
+  4. `h2_two_requests_share_one_tcp_connection` — PASS.
+  5. `h2_response_strips_hop_by_hop_headers_defensively` — PASS (synth_direct_response emits `connection: keep-alive`; build_http_response strips it; client observes none of `connection`/`transfer-encoding`/`upgrade`/`keep-alive`/`proxy-connection`).
+  6. `h2_proxy_outcome_returns_502_in_05_2` — PASS.
+  7. `h2_handshake_fails_on_garbage_preamble` — PASS (1s timeout; observed `Ok(0)` peer-side after h2 codec rejects the preamble).
+  8. `h2_protocol_options_max_concurrent_streams_applied` — `#[ignore]` per PLAN's escape clause (Step 9.5). The h2-0.4 client API does not expose peer SETTINGS_MAX_CONCURRENT_STREAMS in a deterministic way that lets a unit test assert the cap shape without racing the response loop. The codec-edge of the same setter is already covered in `codec.rs::build_h2_server_applies_protocol_options` (Task 8). The wire-effect verification will be picked up by the Docker-gated differential test in 05.2 Task 12 (`tests/differential/tests/http2_protocol_options.rs` — already in the PLAN at Task 12).
+
+  Workspace gates:
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.93s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.96s
+
+  $ cargo fmt --all -- --check
+  (empty — clean, after rustfmt's alpha-sort of the import + re-export lines was applied)
+
+  $ cargo test --workspace 2>&1 | grep -E 'test result' | awk ...
+  passed: 368 failed: 0 ignored: 2
+  ```
+  Workspace tests went from 339 (pre-Task-9 baseline carried in PLAN) + 12 (envoy-http2 pre-Task-9) = 351-ish to 368 passing across all crates: envoy-http1 stayed at 43 (no regression from the visibility lift / HCMConfig extension); envoy-http2 went 12 → 19 (passing) + 1 `#[ignore]`; no other crate's count moved.
+
+- **Verified shapes (greps run at task time):**
+  - `BuildOutcome` enum: 2 variants, `Synth(Response)` and `Proxy { cluster: String }` (PLAN's anticipatory 3-variant `Reject(Response)` reference is folded into `Synth` per PLAN's own settling note).
+  - `RouteAction::Route(RouteAction_Route)` is the variant name (NOT `Cluster`); the PLAN's pseudo-code referenced `RouteAction::Route { cluster: "backend" }` which is the struct-shorthand misread — actual variant is tuple-style `RouteAction::Route(RouteAction_Route { cluster: ... })`. Test 6 uses the tuple shape correctly.
+  - `Http2ProtocolOptions` was missing `Clone`; added per Step 9.1.6 instruction.
+  - `ClusterManager::empty()` did not exist; added per Step 9.1.5 instruction.
+  - `HCMConfig::from_config` body uses explicit field assignments (no `..Default::default()` shorthand); the new `http2_protocol_options` field needed an explicit `cfg.http2_protocol_options.clone()` line.
+
+- **Deviations from PLAN:**
+  1. **Test 8 (`h2_protocol_options_max_concurrent_streams_applied`) `#[ignore]`-marked** with a doctrine reason rather than failing the suite. PLAN explicitly permits this at Step 9.5 / the Step 9.3 elaboration guidance. The `#[ignore = "..."]` reason describes (a) the h2-crate observability gap and (b) the codec-side coverage already in place at codec.rs. Differential coverage of the same setter lands in Task 12.
+  2. **rustfmt re-sorted `use envoy_http1::{...}` and the lib.rs `pub use hcm::{...}` blocks alphabetically** (`build_response` migrated to lowercase-after-uppercase). Same kind of cosmetic rustfmt nudge as Tasks 2/4/5/6/7/8. Functionally identical to PLAN's intent.
+  3. **`envoy-cluster` added as `[dev-dependencies]` of `envoy-http2`** (not in the PLAN's file list). Required for the test fixture's `envoy_cluster::ClusterManager::empty()` call. Test-only; runtime dependency surface unchanged.
+
+- **Carryforward note:** The HCM-on-H2 dispatch contract is now in place. `envoy-bin` Task 10 wires the new `envoy_http2::HCM` into the listener-walk site at `crates/envoy-bin/src/main.rs:207` HCM arm with H1-vs-H2 branching on `hcm_cfg.codec_type`. The `BuildOutcome::Proxy` 502 stub is the only surface that 05.3 D13.3 must replace; everything else (handshake, stream accept, route-walk, synth, header strip, body emit, hop-by-hop strip) is final-shape. Future H2 trailers emission, body forwarding for chunked-request-body, and upstream H2 origination all extend this module without disturbing the 05.2 contract.
+

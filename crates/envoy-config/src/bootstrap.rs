@@ -347,7 +347,7 @@ pub struct RouterConfig {}
 /// default to RFC-conformant values via the `h2` crate and defer until a
 /// fixture or h2spec test forces them. Validator-checked range constraints
 /// per RFC 7540 §6.5.2 / §6.9.1 / §6.9.2 land in `validate_hcm`.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Http2ProtocolOptions {
     /// SETTINGS_MAX_CONCURRENT_STREAMS. h2-crate default: 100. No upper bound
