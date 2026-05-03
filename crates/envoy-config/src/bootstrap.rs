@@ -296,6 +296,13 @@ pub struct DataSource {
 pub struct HttpConnectionManagerConfig {
     pub stat_prefix: String,
     pub codec_type: CodecType,
+
+    /// 05.2 NEW: listener-side HTTP/2 protocol tuning (per SPEC §3 D2.b).
+    /// Optional; absent means "use h2-crate defaults". Validator runs the
+    /// RFC 7540 range checks at parse time only when `Some`.
+    #[serde(default)]
+    pub http2_protocol_options: Option<Http2ProtocolOptions>,
+
     pub route_config: RouteConfiguration,
     pub http_filters: Vec<HttpFilter>,
 }
@@ -331,6 +338,38 @@ pub enum HttpFilterTypedConfig {
 #[derive(Debug, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {}
+
+/// HTTP/2 protocol-level tuning knobs, listener-side. Subset of Envoy's
+/// `envoy.config.core.v3.Http2ProtocolOptions`. Phase 05.2 ships 4 optional
+/// `u32` fields per parent-05 SPEC §6 signpost 2; further fields
+/// (allow_connect, allow_metadata, hpack_table_size,
+/// override_stream_error_on_invalid_http_message, connection_keepalive, ...)
+/// default to RFC-conformant values via the `h2` crate and defer until a
+/// fixture or h2spec test forces them. Validator-checked range constraints
+/// per RFC 7540 §6.5.2 / §6.9.1 / §6.9.2 land in `validate_hcm`.
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Http2ProtocolOptions {
+    /// SETTINGS_MAX_CONCURRENT_STREAMS. h2-crate default: 100. No upper bound
+    /// per RFC 7540; zero is valid (peer would refuse all stream creation).
+    #[serde(default)]
+    pub max_concurrent_streams: Option<u32>,
+
+    /// SETTINGS_INITIAL_WINDOW_SIZE. h2-crate default: 65535. Range
+    /// [0, 2^31 - 1] per RFC 7540 §6.9.2.
+    #[serde(default)]
+    pub initial_stream_window_size: Option<u32>,
+
+    /// Connection-level initial window size. h2-crate default: 65535. Range
+    /// [0, 2^31 - 1] per RFC 7540 §6.9.1.
+    #[serde(default)]
+    pub initial_connection_window_size: Option<u32>,
+
+    /// SETTINGS_MAX_FRAME_SIZE. h2-crate default: 16384. Range
+    /// [16384, 16777215] per RFC 7540 §6.5.2.
+    #[serde(default)]
+    pub max_frame_size: Option<u32>,
+}
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1136,6 +1175,43 @@ fn validate_hcm(
     // 05.2 NEW — D2.a TLS+HTTP2 rejection.
     if matches!(hcm.codec_type, CodecType::HTTP2) && chain_has_tls {
         return Err(crate::ConfigError::Http2OverTlsNotSupported);
+    }
+
+    // 05.2 NEW — D2.b: validate Http2ProtocolOptions ranges per RFC 7540
+    // §6.5.2 / §6.9.1 / §6.9.2. Run only if Some; absent = h2-crate defaults.
+    if let Some(opts) = &hcm.http2_protocol_options {
+        const MAX_FRAME_SIZE_RANGE: (u32, u32) = (16384, 16_777_215);
+        const WINDOW_SIZE_RANGE: (u32, u32) = (0, (1u32 << 31) - 1);
+
+        if let Some(v) = opts.max_frame_size
+            && !(MAX_FRAME_SIZE_RANGE.0..=MAX_FRAME_SIZE_RANGE.1).contains(&v)
+        {
+            return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+                field: "max_frame_size",
+                value: v,
+                range: MAX_FRAME_SIZE_RANGE,
+            });
+        }
+        if let Some(v) = opts.initial_stream_window_size
+            && v > WINDOW_SIZE_RANGE.1
+        {
+            return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+                field: "initial_stream_window_size",
+                value: v,
+                range: WINDOW_SIZE_RANGE,
+            });
+        }
+        if let Some(v) = opts.initial_connection_window_size
+            && v > WINDOW_SIZE_RANGE.1
+        {
+            return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+                field: "initial_connection_window_size",
+                value: v,
+                range: WINDOW_SIZE_RANGE,
+            });
+        }
+        // max_concurrent_streams has no upper bound per RFC 7540 §6.5.2;
+        // zero is valid. No range check.
     }
 
     // http_filters: cardinality + name.
@@ -4727,5 +4803,256 @@ static_resources:
             matches!(err, crate::ConfigError::Http2OverTlsNotSupported),
             "expected Http2OverTlsNotSupported, got {err:?}"
         );
+    }
+
+    // --- phase 05.2 Task 3: Http2ProtocolOptions struct + RFC 7540 ranges ---
+
+    #[test]
+    fn parses_hcm_http2_protocol_options_default() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+static_resources:
+  listeners:
+    - name: h2
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#;
+        let bs = crate::parse_bootstrap(yaml).expect("parses");
+        let TypedConfig::HttpConnectionManager(hcm) =
+            bs.static_resources.listeners[0].filter_chains[0].filters[0]
+                .typed_config
+                .as_ref()
+                .unwrap()
+        else {
+            panic!();
+        };
+        assert!(hcm.http2_protocol_options.is_none());
+    }
+
+    #[test]
+    fn parses_hcm_http2_protocol_options_all_fields() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+static_resources:
+  listeners:
+    - name: h2
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                http2_protocol_options:
+                  max_concurrent_streams: 50
+                  initial_stream_window_size: 131072
+                  initial_connection_window_size: 262144
+                  max_frame_size: 32768
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#;
+        let bs = crate::parse_bootstrap(yaml).expect("parses");
+        let TypedConfig::HttpConnectionManager(hcm) =
+            bs.static_resources.listeners[0].filter_chains[0].filters[0]
+                .typed_config
+                .as_ref()
+                .unwrap()
+        else {
+            panic!();
+        };
+        let opts = hcm.http2_protocol_options.as_ref().expect("present");
+        assert_eq!(opts.max_concurrent_streams, Some(50));
+        assert_eq!(opts.initial_stream_window_size, Some(131072));
+        assert_eq!(opts.initial_connection_window_size, Some(262144));
+        assert_eq!(opts.max_frame_size, Some(32768));
+    }
+
+    #[test]
+    fn rejects_http2_protocol_options_max_frame_size_too_small() {
+        let yaml = http2_options_yaml(/* max_frame_size = */ Some(1024), None, None, None);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        match err {
+            crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+                field,
+                value,
+                range,
+            } => {
+                assert_eq!(field, "max_frame_size");
+                assert_eq!(value, 1024);
+                assert_eq!(range, (16384, 16777215));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_http2_protocol_options_max_frame_size_too_large() {
+        let yaml = http2_options_yaml(Some(17_000_000), None, None, None);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Http2ProtocolOptionsOutOfRange { field, .. }
+                    if field == "max_frame_size"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_http2_protocol_options_initial_stream_window_size_too_large() {
+        // 2^31 = 2147483648 is one above the max.
+        let yaml = http2_options_yaml(None, Some(2_147_483_648), None, None);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Http2ProtocolOptionsOutOfRange { field, .. }
+                    if field == "initial_stream_window_size"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_http2_protocol_options_initial_connection_window_size_too_large() {
+        let yaml = http2_options_yaml(None, None, Some(2_147_483_648), None);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Http2ProtocolOptionsOutOfRange { field, .. }
+                    if field == "initial_connection_window_size"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_http2_protocol_options_unknown_field() {
+        // hpack_table_size is a real Envoy field; envoy-rust 05.2 doesn't ship
+        // it. The struct's deny_unknown_fields rejects.
+        let yaml = r#"
+node: { id: x, cluster: y }
+static_resources:
+  listeners:
+    - name: h2
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                http2_protocol_options:
+                  hpack_table_size: 4096
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::Yaml(_)),
+            "expected serde Yaml error for unknown field, got {err:?}"
+        );
+    }
+
+    /// Builds a minimal HCM `codec_type: HTTP2` bootstrap with the given
+    /// http2_protocol_options field values. Helper for the 4 range-rejection
+    /// tests above. Each Option<u32> argument controls one field.
+    fn http2_options_yaml(
+        max_frame_size: Option<u32>,
+        initial_stream_window_size: Option<u32>,
+        initial_connection_window_size: Option<u32>,
+        max_concurrent_streams: Option<u32>,
+    ) -> String {
+        let mut opts_block = String::from("                http2_protocol_options:\n");
+        if let Some(v) = max_frame_size {
+            opts_block.push_str(&format!("                  max_frame_size: {v}\n"));
+        }
+        if let Some(v) = initial_stream_window_size {
+            opts_block.push_str(&format!(
+                "                  initial_stream_window_size: {v}\n"
+            ));
+        }
+        if let Some(v) = initial_connection_window_size {
+            opts_block.push_str(&format!(
+                "                  initial_connection_window_size: {v}\n"
+            ));
+        }
+        if let Some(v) = max_concurrent_streams {
+            opts_block.push_str(&format!("                  max_concurrent_streams: {v}\n"));
+        }
+        format!(
+            r#"
+node: {{ id: x, cluster: y }}
+static_resources:
+  listeners:
+    - name: h2
+      address: {{ socket_address: {{ address: 0.0.0.0, port_value: 9000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+{opts_block}                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: "ok\n" }} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#,
+        )
     }
 }

@@ -131,3 +131,94 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
   4. **`UnsupportedCodecType` `#[error(...)]` message updated to drop "phase 04" and include HTTP2.** Mentioned in pre-task instructions (the user's brief noted this would be needed). The message now reads `"unsupported codec_type: {got:?}; only AUTO, HTTP1, and HTTP2 are supported"` — phase-04 anchor removed because HTTP2 is post-Task-2 accepted; future HTTP3 work will revise again.
   5. **`validate_hcm` doc-comment extended with a `chain_has_tls` paragraph.** Two extra lines beyond PLAN's mechanical signature change, documenting the parameter's contract. Cost: +2 LoC; benefit: future readers don't have to grep the call site to learn what TLS-state the bool represents.
 - **Carryforward note:** D2.a's runtime half lands later in phase 05.2 (the schema accepts HTTP2; no codec is wired into the connection-handling path until Tasks 5–9 land the `envoy-http2` crate's modules and Task 10 wires HCM dispatch). The `Http2OverTlsNotSupported` variant covers per-listener filter-chain TLS detection only; per-listener-filter (`tls_inspector`) state is not consulted (TLS termination still happens entirely in transport_socket). When TLS+ALPN+H2 lands in a later phase the variant retires by deletion (or relaxes its predicate) — its doc-comment names that future work explicitly.
+
+---
+
+## Task 3 — `envoy-config` `Http2ProtocolOptions` struct + validator (RFC 7540 ranges)
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** D2.b (schema half) — new `Http2ProtocolOptions` struct in `envoy-config::bootstrap` with 4 optional `u32` fields (`max_concurrent_streams`, `initial_stream_window_size`, `initial_connection_window_size`, `max_frame_size`) per parent-05 SPEC §6 signpost 2. New `http2_protocol_options: Option<Http2ProtocolOptions>` field on `HttpConnectionManagerConfig`. New `ConfigError::Http2ProtocolOptionsOutOfRange { field: &'static str, value: u32, range: (u32, u32) }` variant. `validate_hcm` extended with RFC 7540 §6.5.2 / §6.9.1 / §6.9.2 range checks (only run when `Some`; absent = h2-crate defaults at HCM construction time). 7 new validator unit tests: 2 happy-path (default + all-fields parse round-trip), 4 range-rejection (too-small max_frame_size; too-large max_frame_size; window_size 2^31; both window-size variants), 1 unknown-field (`hpack_table_size` rejected by `deny_unknown_fields`).
+- **ADR landed:** None (Task 3 is a direct application of parent-05 SPEC §6 signpost 2 + RFC 7540 ranges; no decisions needed beyond what SPEC and the RFC settle).
+- **Files modified:**
+  - `crates/envoy-config/src/lib.rs` — appended `Http2ProtocolOptionsOutOfRange` variant immediately after `Http2OverTlsNotSupported`; added `Http2ProtocolOptions` to the `pub use bootstrap::{...}` re-export list (alphabetic position between `HeaderMatcherMode` and `HttpConnectionManagerConfig`).
+  - `crates/envoy-config/src/bootstrap.rs` — added `Http2ProtocolOptions` struct just before `RouteConfiguration`; added `http2_protocol_options: Option<Http2ProtocolOptions>` field on `HttpConnectionManagerConfig` between `codec_type` and `route_config`; extended `validate_hcm` with the 3 range checks (max_frame_size has both lower- and upper-bound; the two window sizes have only upper-bound since min is 0); appended 7 tests + the `http2_options_yaml` helper to `tests` mod.
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~210 raw lines. Breakdown: struct (35 lines incl. doc-comments); HCM field insertion (7 lines incl. doc-comment); re-export shuffle (1-line net); ConfigError variant (15 lines); validator extension (40 lines); 7 tests + helper (~110 lines, dominated by repeated YAML literals — happy-path tests at ~37 lines each with full bootstrap; helper at ~50 lines including the 4 conditional field push_strs and the format!). Matches PLAN's ~200 estimate (overshoot is the helper's flexibility scaffold).
+- **Verification:**
+
+  Step 3.2 — `cargo test -p envoy-config -- parses_hcm_http2_protocol_options` (failing-test confirmation, before struct exists):
+  ```
+  error[E0609]: no field `http2_protocol_options` on type `&bootstrap::HttpConnectionManagerConfig`
+      --> crates/envoy-config/src/bootstrap.rs:4772:21
+       |
+  4772 |         assert!(hcm.http2_protocol_options.is_none());
+       |                     ^^^^^^^^^^^^^^^^^^^^^^ unknown field
+       |
+       = note: available fields are: `stat_prefix`, `codec_type`, `route_config`, `http_filters`
+  ```
+  Failed exactly as PLAN predicted (no `http2_protocol_options` field; 2 errors, one per new test).
+
+  Step 3.6 — same command after Steps 3.3/3.4/3.5:
+  ```
+  running 2 tests
+  test bootstrap::tests::parses_hcm_http2_protocol_options_default ... ok
+  test bootstrap::tests::parses_hcm_http2_protocol_options_all_fields ... ok
+
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 148 filtered out; finished in 0.00s
+  ```
+
+  Step 3.7 — failing validator-range tests (after writing tests, before adding variant):
+  ```
+  error[E0599]: no variant named `Http2ProtocolOptionsOutOfRange` found for enum `ConfigError`
+  ...
+  error: could not compile `envoy-config` (lib test) due to 4 previous errors
+  ```
+  Compile-fails as PLAN predicted (4 errors, one per new test).
+
+  Step 3.10 — same command after Steps 3.8 + 3.9:
+  ```
+  running 4 tests
+  test bootstrap::tests::rejects_http2_protocol_options_max_frame_size_too_large ... ok
+  test bootstrap::tests::rejects_http2_protocol_options_initial_stream_window_size_too_large ... ok
+  test bootstrap::tests::rejects_http2_protocol_options_max_frame_size_too_small ... ok
+  test bootstrap::tests::rejects_http2_protocol_options_initial_connection_window_size_too_large ... ok
+
+  test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 150 filtered out; finished in 0.00s
+  ```
+
+  Step 3.11 — unknown-field rejection test:
+  ```
+  running 1 test
+  test bootstrap::tests::rejects_http2_protocol_options_unknown_field ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 154 filtered out; finished in 0.00s
+  ```
+
+  Step 3.12 — full crate test suite:
+  ```
+  $ cargo test -p envoy-config 2>&1 | grep '^test result'
+  test result: ok. 155 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+  Net delta: +7 (148 → 155). All 7 new tests land green.
+
+  Step 3.12 — workspace-wide gates:
+  ```
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.66s
+
+  $ cargo fmt --all -- --check
+  (empty — clean)
+  ```
+  Initial clippy run flagged `collapsible_if` on the 3 nested `if let Some(v) = ... { if <range-violation> { ... } }` blocks (the PLAN's note covered `manual_range_contains` but not `collapsible_if`; this clippy lint demands let-chain form on Rust 1.95). Applied let-chain rewrite (`if let Some(v) = ... && <pred> { ... }`) and used `(MIN..=MAX).contains(&v)` for the max_frame_size two-sided range to silence both lints in one stroke. Re-ran clippy → clean. Tests still pass after the rewrite (logic is identical).
+
+  Workspace-wide test sanity (Task 3 schema change is internal to `envoy-config` but verified non-breaking):
+  ```
+  $ cargo test --workspace 2>&1 | grep -E '^test result' | sort -u
+  (all "ok"; 155 in envoy-config matches above; no other crate test count changed)
+  ```
+
+- **Deviations from PLAN:**
+  1. **Validator block uses let-chain + `RangeInclusive::contains` instead of PLAN's mechanical `if v < MIN || v > MAX` form.** PLAN's note at Step 3.9 mentioned this possibility for the `manual_range_contains` lint; on Rust 1.95 with this toolchain's clippy config, `collapsible_if` also fires on the nested `if let Some(v) = ... { if <pred> { ... } }` shape, so a let-chain rewrite was needed regardless. Net effect: identical control-flow + same return values; just shorter/idiomatic Rust. The 4 range-rejection tests + the unknown-field test all still pass on the rewritten validator, so semantics are unchanged.
+  2. **Helper YAML body's `max_concurrent_streams` push_str collapsed to one line.** rustfmt preferred the single-line form (`opts_block.push_str(&format!("                  max_concurrent_streams: {v}\n"));`) over the multi-line form copied verbatim from PLAN line 853-857. Cosmetic only; helper still produces identical YAML.
+- **Carryforward note:** Runtime use of `Http2ProtocolOptions` (consuming the 4 fields when constructing the `h2::server::Builder` inside `envoy-http2`) lands in Tasks 8–9. The schema-level field-naming and range-validator obligations are settled here. Future Envoy `Http2ProtocolOptions` field additions (allow_connect, hpack_table_size, override_stream_error_on_invalid_http_message, connection_keepalive, ...) extend the struct under `deny_unknown_fields` and may add new `Http2ProtocolOptionsOutOfRange` callsites; the variant's `field: &'static str` parameterization is built for that growth.

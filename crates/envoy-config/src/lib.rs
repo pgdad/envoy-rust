@@ -10,12 +10,13 @@ pub mod matcher;
 pub use bootstrap::{
     Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType, CodecType,
     CommonTlsContext, DataSource, DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint,
-    FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode, HttpConnectionManagerConfig,
-    HttpFilter, HttpFilterTypedConfig, Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment,
-    LocalityLbEndpoints, NetworkFilter, Node, Route, RouteAction, RouteAction_Route,
-    RouteConfiguration, RouteMatch, RouterConfig, SafeRegex, SocketAddress, StaticResources,
-    StringMatcher, StringMatcherMode, TcpProxyConfig, TlsCertificate, TransportSocket,
-    TransportSocketTypedConfig, TypedConfig, UpstreamTlsContext, VirtualHost,
+    FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode, Http2ProtocolOptions,
+    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, Int64Range, LbEndpoint,
+    LbPolicy, Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node, Route,
+    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, SafeRegex,
+    SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
+    TlsCertificate, TransportSocket, TransportSocketTypedConfig, TypedConfig, UpstreamTlsContext,
+    VirtualHost,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
@@ -107,6 +108,18 @@ pub enum ConfigError {
         "HTTP/2 over TLS is not supported in phase 05; the listener must be plaintext or use codec_type: HTTP1/AUTO"
     )]
     Http2OverTlsNotSupported,
+    /// `http2_protocol_options.<field>` value violates RFC 7540's wire-format
+    /// range constraint. `field` names the offending field; `value` is the
+    /// configured value; `range` is the inclusive (min, max) interval.
+    #[error(
+        "Http2ProtocolOptions field {field} value {value} out of range; must be in [{}, {}]",
+        .range.0, .range.1
+    )]
+    Http2ProtocolOptionsOutOfRange {
+        field: &'static str,
+        value: u32,
+        range: (u32, u32),
+    },
     #[error("unsupported codec_type: {got:?}; only AUTO, HTTP1, and HTTP2 are supported")]
     UnsupportedCodecType { got: bootstrap::CodecType },
     #[error(
