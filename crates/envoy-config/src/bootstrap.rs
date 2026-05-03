@@ -4993,10 +4993,7 @@ static_resources:
   clusters: []
 "#;
         let err = crate::parse_bootstrap(yaml).expect_err("must reject");
-        assert!(
-            matches!(err, crate::ConfigError::Yaml(_)),
-            "expected serde Yaml error for unknown field, got {err:?}"
-        );
+        assert_unknown_field(err);
     }
 
     /// Builds a minimal HCM `codec_type: HTTP2` bootstrap with the given
