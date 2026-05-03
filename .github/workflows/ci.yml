@@ -40,6 +40,14 @@ jobs:
       - name: build
         run: cargo build --workspace --all-targets
 
+      - name: install h2spec
+        run: |
+          set -euo pipefail
+          H2SPEC_VERSION="2.6.0"  # pinned; revisit at phase 06+
+          curl -fsSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin
+          h2spec --version
+
       - name: test (includes differential harness → Docker)
         run: cargo test --workspace
 
