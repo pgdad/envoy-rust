@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `http1-echo-server` — minimal localhost-only HTTP/1.1 echo server for the
+//! `http1-echo-server` — minimal HTTP/1.1 echo server for the
 //! envoy-rust differential harness. Sibling of `tcp-echo-server` (phase 02.1)
 //! and `tls-echo-server` (phase 03.2). Plaintext only — no TLS.
 //!
@@ -95,8 +95,8 @@ fn print_help() {
 }
 
 async fn run(args: Args) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", args.port)).await?;
-    tracing::info!("http1-echo-server listening on 127.0.0.1:{}", args.port);
+    let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
+    tracing::info!("http1-echo-server listening on 0.0.0.0:{}", args.port);
 
     let mut join_set: JoinSet<()> = JoinSet::new();
     let shutdown = tokio::signal::ctrl_c();

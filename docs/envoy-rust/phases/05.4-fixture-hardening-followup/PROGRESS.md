@@ -77,3 +77,25 @@ Source of truth: `SPEC.md` (D1–D7) + `PLAN.md` (Tasks 1–7).
   - **Step 2 struct path correction:** as projected in the plan's "ALSO" note, the actual hierarchy is `bootstrap.static_resources.listeners`, not `bootstrap.listeners`. Adjusted to match the existing `parses_listener_with_downstream_tls_context` analogue.
   - **Step 2 `admin:` block omitted intentionally:** the plan's "ALSO" note flagged the prior Task 1 defect of YAML missing `admin:`. In this test the bootstrap has 1 listener so the validator's `admin.is_none() && listeners.is_empty()` rejection at bootstrap.rs:885 does NOT fire; no `admin:` block needed. (The same shape is used by the analogous `parses_listener_with_downstream_tls_context` test at line 2211 with no admin block.)
 - **Pattern note:** parse-and-ignore is now a documented envoy-config posture per ADR-0026. Future fields meeting the criteria may follow the same pattern without a new ADR.
+
+---
+
+## Task 4 — 3 echo-server helper bind flips (0.0.0.0)
+
+- **Commit:** _(pending)_
+- **Deliverables:** SPEC §3 D4.
+- **ADR landed:** None (D4 has no ADR; ADR-0015's host-gateway grant is the operative cross-reference).
+- **Files modified:**
+  - `tests/helpers/tcp-echo-server/src/main.rs` (line 118 bind; line 119 tracing log; line 3 doc comment).
+  - `tests/helpers/tls-echo-server/src/main.rs` (line 109 bind; line 110 tracing log; line 3 doc comment).
+  - `tests/helpers/http1-echo-server/src/main.rs` (line 98 bind; line 99 tracing log; line 3 doc comment).
+- **LoC:** 9 (3 bind + 3 log + 3 doc-comment), exactly matching plan projection.
+- **Verification:**
+  - `cargo test -p tcp-echo-server -p tls-echo-server -p http1-echo-server` — all green:
+    - `http1-echo-server`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`.
+    - `tcp-echo-server`: `test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`.
+    - `tls-echo-server`: `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`.
+  - `cargo clippy -p tcp-echo-server -p tls-echo-server -p http1-echo-server --all-targets -- -D warnings` — clean.
+  - `cargo fmt --all -- --check` — clean (no fmt drift; no remediation needed).
+  - Test-internal ephemeral binds at lines 212/236/281/332 (`"127.0.0.1:0"`) are intentionally unchanged — confirmed by `grep` only flagging the 3 production binds at 118/109/98.
+- **Deviations from PLAN:** None. Line numbers, exact `before`/`after` strings, and tracing-log shapes all matched the plan verbatim. The bind-address flip is mechanically transparent: `0.0.0.0` is a superset of `127.0.0.1` reachability, so all existing tests connecting to `127.0.0.1:<port>` still hit the listener (confirmed by 18/18 tests passing).

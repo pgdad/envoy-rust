@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `tls-echo-server` — a minimal localhost-only TLS echo server for the
+//! `tls-echo-server` — a minimal TLS echo server for the
 //! envoy-rust differential harness. Sibling of `tcp-echo-server` (phase 02.1)
 //! with rustls server-side termination on top. Single-cert ResolvesServerCert
 //! (no SNI multiplexing — this helper is single-purpose). See SPEC §D7 of
@@ -106,8 +106,8 @@ async fn run(args: Args) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("building server config: {e}"))?;
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
-    let listener = TcpListener::bind(("127.0.0.1", args.port)).await?;
-    tracing::info!("tls-echo-server listening on 127.0.0.1:{}", args.port);
+    let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
+    tracing::info!("tls-echo-server listening on 0.0.0.0:{}", args.port);
 
     let mut join_set: JoinSet<()> = JoinSet::new();
     let shutdown = tokio::signal::ctrl_c();

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! `tcp-echo-server` — a minimal localhost-only echo server for the envoy-rust
+//! `tcp-echo-server` — a minimal echo server for the envoy-rust
 //! differential harness. See SPEC §D3 of phase 02.1.
 
 use std::process::ExitCode;
@@ -115,8 +115,8 @@ async fn run_on(
 
 /// Full runtime entrypoint: bind → `run_on` with ctrl_c as shutdown.
 async fn run(port: u16) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    tracing::info!(port, "tcp-echo-server listening");
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    tracing::info!(port, "tcp-echo-server listening on 0.0.0.0:{port}");
     run_on(listener, async {
         let _ = tokio::signal::ctrl_c().await;
     })
