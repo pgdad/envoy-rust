@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! h2spec conformance runner. Spawns envoy-bin against an HCM HTTP2 config,
 //! runs h2spec via subprocess, parses output, asserts ≥95% pass rate +
 //! every failing test enumerated in known-failures.txt.
@@ -212,6 +214,25 @@ fn reserve_port() -> Result<u16> {
     Ok(p)
 }
 
+/// Returns true if `s` looks like an h2spec test ID: dotted-numeric optionally
+/// followed by `/<number>` (e.g., "5.1.1/2", "6.5", "8.1.2.3/14"). Used to
+/// reject stray `× <reason text>` lines from the failures set.
+fn looks_like_h2spec_test_id(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Must start with a digit; chars limited to digits, dots, slashes.
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_digit() {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == '/')
+}
+
 /// Parse h2spec's terminal output. Returns (passed, failed, failures) where
 /// `failures` is a sorted list of failing test IDs.
 ///
@@ -231,15 +252,17 @@ fn parse_h2spec_output(stdout: &str) -> Result<(usize, usize, std::collections::
     for line in stdout.lines() {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed
-            .strip_prefix('×')
-            .or_else(|| trimmed.strip_prefix('x'))
+            .strip_prefix("× ")
+            .or_else(|| trimmed.strip_prefix("x "))
         {
             // Failed test. The ID is the first whitespace-delimited token.
-            if let Some(id) = rest.split_whitespace().next() {
+            if let Some(id) = rest.split_whitespace().next()
+                && looks_like_h2spec_test_id(id)
+            {
                 failures.insert(id.to_string());
                 failed += 1;
             }
-        } else if trimmed.starts_with('✓') || trimmed.starts_with('o') {
+        } else if trimmed.starts_with("✓ ") || trimmed.starts_with("o ") {
             passed += 1;
         }
     }
