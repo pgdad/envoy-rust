@@ -703,3 +703,59 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 - **Carryforward note:** Phase 05.2 envoy-rust-only backstops are now complete. The HCM-on-H2 dispatch site is reachable end-to-end (envoy-bin → envoy-listener → envoy-http2::HCM → h2::server → route-walk → direct_response synth → h2 SendStream); the `BuildOutcome::Proxy` 502 stub remains the only surface that 05.3 D13.3 must replace. Task 11 picks up the gitignore allow-list entry for the new `e2e_http2_*.yaml` config-fuzz seeds + Task 12 lays in the Docker-gated differential equivalence test (`tests/differential/tests/http2_direct_response.rs`) against upstream Envoy.
 - **Post-review fixup:** Two Important findings closed in a single fixup commit. (I1) Converted `CodecType::HTTP3 => unreachable!(...)` to `anyhow::bail!(...)` at the HCM dispatch site, matching the surrounding "validator should have rejected this" posture (six other `anyhow::bail!` sites in main.rs). A future validator regression now surfaces as a clean config-load error rather than a SIGABRT-style process panic. (I2) Added a defensive symmetric H2+TLS bail immediately after the existing H1 TLS-detect-and-bail. The envoy-config validator's `Http2OverTlsNotSupported` (Task 2) already rejects TLS+HTTP2 at parse time; this runtime guard exists so a future validator regression cannot silently bind a non-functional plaintext H2 listener on a port the operator expected to be TLS-protected. Closes code-quality reviewer I1+I2 on Task 10. (M1+M2 quality-of-life improvements deferred to a 05.3 follow-up if needed; M3-M6 awareness-only.)
 
+## Task 11 — Differential harness `Driver::Http2` + `drive_http2` + dispatch arm
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** `tests/differential` lib gains the harness primitives needed by Task 12's `0009-http2-direct-response/` Docker-gated fixture. (1) `Driver::Http2 { method, path, host, expected_status, expected_body, expected_headers }` enum variant — mirrors `Driver::Http1`'s shape so existing per-axis equivalence rules drop in without modification; the `host` field becomes `:authority` on the H2 wire. (2) `pub async fn drive_http2(addr, method, path, host, extra_headers) -> Result<DriveHttp1Result>` — opens TCP, runs `h2::client::handshake`, sends the request with `end_of_stream=true`, drains the response into `DriveHttp1Result` (status + headers + body, shape-compatible with `diff_headers` + `assert_equivalence`). (3) `run_fixture`'s `port_key` match extended with `Driver::Http2 { .. } => "PORT"`. (4) Per-driver dispatch cascade gains the `Driver::Http2` arm (mirrors `Driver::Http1` byte-for-byte modulo the helper name). (5) One harness unit test `drive_http2_round_trip_against_in_process_listener` spawns `envoy-bin` against an HCM-on-H2 `direct_response: 200 "ok\n"` config, drives a `GET /` via `drive_http2`, asserts status 200 + body `"ok\n"`. Round-trip in 0.06s on first poll.
+- **ADR landed:** None (Task 11 directly applies the parent §6 signpost 8 carve-out; no new decisions).
+- **Files modified:**
+  - `tests/differential/Cargo.toml` — added `h2 = "0.4"` and `http = "1"` to `[dependencies]` (alphabetic insertion between `anyhow` and `httparse`). Both deps consumed by `drive_http2`. The `h2 = "0.4"` line is the documented carve-out from cross-sub-phase architectural rule 1 per parent-05 SPEC §6 signpost 8 (parallel to phase-04.1 REVIEW M-architectural-claim's `httparse` posture for `drive_http1`).
+  - `tests/differential/src/lib.rs` — `Driver` enum extended with `Http2 { ... }` variant (~14 lines incl. doc-comment + `#[serde(default)]` attrs). `drive_http2` helper appended after `drive_http1` (~80 lines incl. flow-control window release per chunk + `conn_handle.abort()` posture). `run_fixture` `port_key` match extended (1-line `| Driver::Http2 { .. }` addition). Per-driver dispatch cascade gains the `Driver::Http2` arm appended after `Driver::Http1ProbeList` (~95 lines, mirrors the `Driver::Http1` arm exactly). One harness unit test `drive_http2_round_trip_against_in_process_listener` appended to the `tests` module (~80 lines incl. inline HCM-on-H2 YAML + `tokio::process::Command` spawn + listener-readiness poll loop).
+  - `Cargo.lock` — auto-regenerated to record the new direct edge from `differential` to `h2 0.4.13` and `http 1.4.0` (both already present transitively via `envoy-http2`; no new versions resolved).
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~270 raw lines across all files. lib.rs delta ~270 (Driver variant ~14 + drive_http2 ~80 + port_key 1-line + dispatch arm ~95 + unit test ~80). Cargo.toml +2. Cargo.lock auto. PROGRESS section ~25. PLAN estimated ~170; actual ~270 incl. the verbatim Driver::Http1 cascade body that mirrors into the Http2 arm (PLAN's quoted dispatch arm at lines 2994-3041 was the minimal shape; the actual Driver::Http1 arm is more elaborate — 95 lines vs PLAN's 47 — and the Http2 arm mirrors it exactly for parity with the Http1 path's per-axis equivalence cascade).
+- **Verification:**
+
+  Step 11.7 — `cargo test -p differential drive_http2_round_trip -- --nocapture`:
+  ```
+  running 1 test
+  test tests::drive_http2_round_trip_against_in_process_listener ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 53 filtered out; finished in 0.06s
+  ```
+  envoy-bin spawn → HCM-on-H2 listener bind on 127.0.0.1:<reserved-port> → connect-loop poll (~50ms first poll) → `h2::client::handshake` → `GET /` with `:authority: test.example` → response status 200 + body `"ok\n"`. End-to-end round-trip via the new `drive_http2` helper.
+
+  Step 11.8 — workspace gates:
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.31s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.47s
+
+  $ cargo fmt --all -- --check
+  (empty — clean, after rustfmt's call-site rewrap of the `drive_http2(...)` arg-list was applied)
+
+  $ cargo test --workspace 2>&1 | grep -E '^test result' | aggregate
+  passed: 370 failed: 0 ignored: 2
+  ```
+  Workspace tests went from 369 (Task 10 baseline) to 370: the new `drive_http2_round_trip_against_in_process_listener` harness unit test adds exactly one. No other crate's count moved.
+
+- **Verified shapes (greps run at task time):**
+  - `pub async fn drive_http1(addr, method, path, host, extra_headers) -> Result<DriveHttp1Result>` at `tests/differential/src/lib.rs:694` — five-arg shape; `drive_http2` mirrors it exactly.
+  - `Driver` enum at lines 38-83 — six variants pre-Task-11 (`TcpEcho`, `HttpGet`, `TlsTcp`, `TlsTcpProbeList`, `Http1`, `Http1ProbeList`); Task 11 appends `Http2` after `Http1ProbeList` per PLAN.
+  - `port_key` match at lines 835-842 — five variants on the `"PORT"` arm pre-Task-11; Task 11 adds the sixth.
+  - Per-driver dispatch cascade — `Driver::Http1` arm at lines 1114-1201 has the full per-axis equivalence cascade (status/body/headers, envoy ↔ envoy-rust + per-driver `expected_*`); the new `Driver::Http2` arm mirrors this body verbatim modulo the `drive_http1` → `drive_http2` swap.
+  - `reserve_port() -> Result<u16>` at line 276 — confirmed `unwrap()`-able in the test.
+  - `Http1Method` enum at line 117 with `as_str() -> &'static str` at line 122 — confirmed `&Http1Method::Get` callable.
+  - `subject::locate_envoy_bin() -> Result<PathBuf>` at `subject.rs:60` — the convention for finding the binary from outside `crates/envoy-bin/`.
+
+- **Deviations from PLAN:**
+  1. **`http = "1"` added to `[dependencies]`** (PLAN's Step 11.1 named only `h2 = "0.4"`). The `drive_http2` body uses `http::Uri` and `http::Request::builder` directly; `h2 = "0.4"` does not re-export the `http` crate. Same `http = "1"` version that envoy-http2 already pins; no version skew. Functionally required for the PLAN's verbatim `drive_http2` body to compile.
+  2. **Test uses `subject::locate_envoy_bin()` instead of `env!("CARGO_BIN_EXE_envoy-bin")`** (PLAN's Step 11.2 verbatim test body used the latter). The `CARGO_BIN_EXE_<name>` env var is set by Cargo only for integration tests *of the package owning the binary* — it is NOT set for the `differential` crate, so the PLAN's verbatim test would fail to compile with "environment variable `CARGO_BIN_EXE_envoy-bin` not defined at compile time". The `subject::locate_envoy_bin()` helper (Task 7 / phase 00 vintage) is the existing convention for finding the binary from outside `crates/envoy-bin/` (walks up from `CARGO_MANIFEST_DIR` to the workspace `target/<profile>/envoy-bin`); the test mirrors `subject::tests::starts_and_shuts_down_envoy_rust`'s `if locate_envoy_bin().is_err() { return; }` skip-on-missing-bin posture.
+  3. **`drive_http2` calls `conn_handle.abort()` before `conn_handle.await`** instead of awaiting the connection task to its natural close (PLAN's verbatim body just `let _ = conn_handle.await;`). The `h2::client::Connection` future runs until peer EOF; for a server like envoy-bin's HCM-on-H2 that holds the connection open for follow-up requests until the client sends GOAWAY (or the TCP socket closes), awaiting the conn-task unconditionally would tie the helper's wall-time to whichever side closes first. With `kill_on_drop(true)` on the test's child binding, the original PLAN body would only return after the test's `drop(child)` at the bottom — observed empirically as a 1251-second test run before the abort fix; with `conn_handle.abort()` the test runs in 0.06s.
+  4. **`mut` removed from `let mut child = ...`** in the test body — rustc emits `unused_mut` under the `[warn(unused)]` workspace lint (which `-D warnings` turns into an error). Same kind of nudge as Task 10's parallel deviation; `child` is consumed by bare `drop(child)` with no method calls.
+  5. **Dispatch arm body is the full Http1-cascade shape (~95 lines), not the PLAN's minimal shape (~47 lines).** PLAN's Step 11.6 verbatim block was advertised as "the minimal correct shape" with a footnote ("verify the helper names + `assert_equivalence`-style invocation at task time"). The actual Http1 dispatch arm at lines 1114-1201 has the full per-axis cascade (envoy ↔ envoy-rust under `equivalence: response_status/response_body` + per-driver `expected_*` anchors + per-driver `Http1HeaderRule::SetEqualModuloAllowList` allow-list diff); the Http2 arm mirrors this verbatim modulo the `drive_http1` → `drive_http2` swap. Mirrors PLAN's intent ("mirror the shape of `Driver::Http1`") more literally than its minimal-body example. PLAN's pseudo-code referenced a `host_addr_for_listener` helper that does not exist in `upstream.rs` — the existing arm uses `upstream_addr` (`format!("127.0.0.1:{}", upstream.host_port()).parse()?`) computed at the top of the match expression, which the Http2 arm consumes the same way.
+
+- **Carryforward note:** The differential harness now has all the primitives Task 12's `0009-http2-direct-response/` Docker-gated fixture needs: `Driver::Http2` for the YAML grammar, `drive_http2` for the wire I/O, the `port_key` extension for template substitution, and the per-driver dispatch arm for the per-axis equivalence cascade. Task 12 lays in the upstream Envoy YAML + envoy-rust YAML + `expectations.yaml` + the Docker-gated test wrapper that calls `run_fixture` against the new fixture directory; no further harness lib changes expected for 05.2.
+

@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+h2 = "0.4"
+http = "1"
 httparse = "1"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }

@@ -261,6 +261,8 @@ name = "differential"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "h2",
+ "http",
  "httparse",
  "rcgen",
  "rustls",

@@ -80,6 +80,20 @@ pub enum Driver {
     Http1ProbeList {
         probes: Vec<Http1Probe>,
     },
+    /// 05.2 NEW: drive an HTTP/2 cleartext (H2C prior-knowledge) request and
+    /// assert the response shape. Mirrors `Http1`'s shape; the `host` field
+    /// becomes `:authority` on the H2 wire. Per SPEC §3 D5.
+    Http2 {
+        method: Http1Method,
+        path: String,
+        host: String,
+        #[serde(default)]
+        expected_status: Option<u16>,
+        #[serde(default)]
+        expected_body: Option<Http1BodyRule>,
+        #[serde(default)]
+        expected_headers: Option<Http1HeaderRule>,
+    },
 }
 
 /// One TLS-SNI probe entry inside `Driver::TlsTcpProbeList`. SPEC §D6.
@@ -778,6 +792,83 @@ pub async fn drive_http1(
     })
 }
 
+/// Drive an HTTP/2 cleartext (H2C prior-knowledge) request against the given
+/// listener address. Mirrors `drive_http1`'s shape so `assert_equivalence`'s
+/// `diff_headers` works without modification. Per parent-05 SPEC §6 signpost 8
+/// this helper consumes `h2 = "0.4"` directly — the documented carve-out from
+/// cross-sub-phase architectural rule 1, parallel to phase-04.1 REVIEW
+/// M-architectural-claim's `httparse` posture for `drive_http1`.
+pub async fn drive_http2(
+    addr: SocketAddr,
+    method: &Http1Method,
+    path: &str,
+    host: &str,
+    extra_headers: &[(String, String)],
+) -> Result<DriveHttp1Result> {
+    use tokio::net::TcpStream;
+
+    let tcp = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    let (mut send_request, conn) = h2::client::handshake(tcp).await.context("H2 handshake")?;
+
+    // Drive the connection in the background.
+    let conn_handle = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Build the request. Use absolute-form URI so :authority is populated.
+    let uri: http::Uri = format!("http://{host}{path}")
+        .parse()
+        .context("URI parse")?;
+    let mut builder = http::Request::builder().method(method.as_str()).uri(uri);
+    for (n, v) in extra_headers {
+        builder = builder.header(n.as_str(), v.as_str());
+    }
+    let req = builder.body(()).context("request build")?;
+
+    // Send the request with end_of_stream=true (no body for GET).
+    let (response_fut, _send_stream) = send_request
+        .send_request(req, true)
+        .context("H2 send_request")?;
+
+    let resp = response_fut.await.context("H2 response")?;
+    let status = resp.status().as_u16();
+    let header_map = resp.headers().clone();
+    let mut body_stream = resp.into_body();
+
+    let mut body = Vec::new();
+    while let Some(chunk) = body_stream.data().await {
+        let chunk = chunk.context("H2 body data")?;
+        body.extend_from_slice(&chunk);
+        // Release flow-control window.
+        body_stream
+            .flow_control()
+            .release_capacity(chunk.len())
+            .ok();
+    }
+
+    let headers: Vec<(String, String)> = header_map
+        .iter()
+        .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+
+    // Abort the connection task — we have the full response, and the server
+    // will not necessarily close the TCP socket on its own (h2's `Connection`
+    // future runs until peer EOF). Awaiting unconditionally would tie test
+    // wall-time to whichever side closes first; aborting makes the helper
+    // return as soon as the response is drained.
+    drop(send_request);
+    conn_handle.abort();
+    let _ = conn_handle.await;
+
+    Ok(DriveHttp1Result {
+        status,
+        headers,
+        body,
+    })
+}
+
 /// Decode HTTP/1.1 chunked transfer-encoded body bytes into plain body bytes.
 /// Each chunk has the form `<hex-size>\r\n<data>\r\n`; the last chunk is
 /// `0\r\n\r\n`. Trailer headers (if any) are ignored. Returns an error if the
@@ -837,7 +928,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::TlsTcp { .. }
         | Driver::TlsTcpProbeList { .. }
         | Driver::Http1 { .. }
-        | Driver::Http1ProbeList { .. } => "PORT",
+        | Driver::Http1ProbeList { .. }
+        | Driver::Http2 { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
     };
 
@@ -1304,6 +1396,96 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             }
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
+        }
+        // 05.2 Task 11: real H2 dispatch. Mirrors Driver::Http1 in shape; the
+        // only delta is `drive_http2` instead of `drive_http1`. Per SPEC §3 D5.
+        Driver::Http2 {
+            method,
+            path,
+            host,
+            expected_status,
+            expected_body,
+            expected_headers,
+        } => {
+            let upstream_resp = drive_http2(upstream_addr, method, path, host, &[])
+                .await
+                .context("upstream envoy http2 drive")?;
+            let subject_resp = drive_http2(subject_addr, method, path, host, &[])
+                .await
+                .context("envoy-rust http2 drive")?;
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+
+            // Status: envoy ↔ envoy-rust under `response_status: exact`.
+            if matches!(
+                expectations.equivalence.response_status,
+                Some(StatusRule::Exact)
+            ) && upstream_resp.status != subject_resp.status
+            {
+                bail!(
+                    "response status mismatch under `response_status: exact`\n  \
+                     upstream: {}\n  subject:  {}",
+                    upstream_resp.status,
+                    subject_resp.status,
+                );
+            }
+            // Per-driver `expected_status`: each side independently equals it.
+            if let Some(es) = expected_status {
+                if upstream_resp.status != *es {
+                    bail!(
+                        "upstream status {} != expected {}",
+                        upstream_resp.status,
+                        es,
+                    );
+                }
+                if subject_resp.status != *es {
+                    bail!("subject status {} != expected {}", subject_resp.status, es,);
+                }
+            }
+
+            // Body: envoy ↔ envoy-rust under `response_body: byte_exact`.
+            if matches!(
+                expectations.equivalence.response_body,
+                Some(BodyRule::ByteExact)
+            ) && upstream_resp.body != subject_resp.body
+            {
+                bail!(
+                    "byte-exact body mismatch\n  upstream: {:?}\n  subject:  {:?}",
+                    upstream_resp.body,
+                    subject_resp.body,
+                );
+            }
+            // Per-driver `expected_body`: each side independently equals bytes.
+            if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
+                let expected = body.as_bytes();
+                if upstream_resp.body != expected {
+                    bail!(
+                        "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                        upstream_resp.body,
+                        expected,
+                    );
+                }
+                if subject_resp.body != expected {
+                    bail!(
+                        "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                        subject_resp.body,
+                        expected,
+                    );
+                }
+            }
+
+            // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
+            if matches!(
+                expected_headers,
+                Some(Http1HeaderRule::SetEqualModuloAllowList)
+            ) {
+                diff_headers(
+                    &upstream_resp.headers,
+                    &subject_resp.headers,
+                    HEADER_ALLOW_LIST,
+                )
+                .context("diff_headers (set_equal_modulo_allow_list)")?;
+            }
         }
     }
 
@@ -2068,5 +2250,86 @@ expected_headers: set_equal_modulo_allow_list
 "#;
         let p: Http1Probe = serde_yaml::from_str(yaml).expect("parses");
         assert_eq!(p.extra_headers.len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_http2_round_trip_against_in_process_listener() {
+        // Spawn envoy-bin as a subprocess against an HCM HTTP2 direct_response
+        // config; drive a GET via drive_http2; assert the returned tuple
+        // matches expectations.
+        //
+        // Deviation from PLAN: the PLAN's `env!("CARGO_BIN_EXE_envoy-bin")`
+        // does not work here — that env var is only set for integration tests
+        // *of the package owning the binary*. The differential crate is
+        // separate, so we use the existing `subject::locate_envoy_bin()`
+        // helper (matching the convention in `subject::start`).
+        if crate::subject::locate_envoy_bin().is_err() {
+            eprintln!("skipping: envoy-bin not built");
+            return;
+        }
+        let bin = crate::subject::locate_envoy_bin().unwrap();
+        let port = reserve_port().unwrap();
+        let yaml = format!(
+            r#"
+node: {{ id: x, cluster: y }}
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: "ok\n" }} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("envoy-rust.yaml");
+        std::fs::write(&cfg, yaml).unwrap();
+
+        let child = tokio::process::Command::new(&bin)
+            .arg("-c")
+            .arg(&cfg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn envoy-bin");
+
+        // Wait for listener readiness.
+        let listener_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(listener_addr).await.is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                drop(child);
+                panic!("listener never became ready");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let result = drive_http2(listener_addr, &Http1Method::Get, "/", "test.example", &[]).await;
+        drop(child);
+        let result = result.expect("drive_http2 returns Ok");
+        assert_eq!(result.status, 200);
+        assert_eq!(&result.body[..], b"ok\n");
     }
 }
