@@ -85,6 +85,12 @@ impl ClusterManager {
     /// `from_bootstrap`; this is a test-shaped constructor that bypasses the
     /// validator-shaped `EmptyCluster`/`DuplicateClusterName` invariants
     /// because by definition there are no clusters to violate them.
+    ///
+    /// Callable from any crate (still `pub` for cross-crate test fixtures),
+    /// but `#[doc(hidden)]` to discourage production callers from reaching
+    /// past `from_bootstrap`. Production callers should always go through
+    /// `from_bootstrap(...)`.
+    #[doc(hidden)]
     pub fn empty() -> Self {
         Self {
             clusters: HashMap::new(),

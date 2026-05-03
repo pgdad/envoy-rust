@@ -67,7 +67,10 @@ async fn serve_h2_connection(
         let (req, send_response) = match result {
             Ok(pair) => pair,
             Err(source) => {
-                tracing::warn!(error = ?source, "H2 stream accept failed");
+                // Connection-level error per h2 docs; the listener logs the
+                // wrapped Http2Error::H2StreamAccept on return. Avoiding a
+                // tracing::warn! here eliminates double-logging on the noisy
+                // peer-reset path.
                 return Err(Http2Error::H2StreamAccept { source });
             }
         };
@@ -146,6 +149,19 @@ mod tests {
     use envoy_listener::ConnectionHandler;
     use std::sync::Arc;
 
+    /// RAII handle that aborts the spawned listener task when dropped. Used
+    /// by the per-test `_server` binding to stop per-test task leaks without
+    /// requiring a manual `server.abort()` at the end of each test.
+    struct TestServer {
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
     /// Build a minimal HCM config with a single VH + single direct_response
     /// route (status 200, body "ok\n"). Used by most tests below.
     fn synth_h2_hcm_config() -> Arc<Http1HCMConfig> {
@@ -184,12 +200,10 @@ mod tests {
     }
 
     /// Spawn an HCM-driven accept loop on an ephemeral port; return the bound
-    /// addr + a JoinHandle that owns the listener task. The accept loop runs
-    /// until the test drops it (the JoinHandle is held implicitly by the
-    /// test's `_server` binding).
-    async fn spawn_h2_hcm(
-        config: Arc<Http1HCMConfig>,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    /// addr + a `TestServer` RAII guard that aborts the listener task when
+    /// dropped. The accept loop runs until the test's `_server` binding falls
+    /// out of scope at end-of-test.
+    async fn spawn_h2_hcm(config: Arc<Http1HCMConfig>) -> (std::net::SocketAddr, TestServer) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let hcm = HCM::new(config);
@@ -205,7 +219,7 @@ mod tests {
                 });
             }
         });
-        (addr, h)
+        (addr, TestServer { handle: h })
     }
 
     #[tokio::test(flavor = "multi_thread")]

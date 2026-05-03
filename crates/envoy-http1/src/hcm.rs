@@ -24,6 +24,17 @@ const DEFAULT_CONTENT_TYPE: &str = "text/plain";
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_BUFFER_INITIAL_CAPACITY: usize = 8192;
 
+/// Unified HCM configuration consumed by both the H1 and H2 dispatch paths,
+/// per cross-sub-phase architectural rule 2 (one config struct, two codec
+/// edges). Built once at startup via `from_config(...)` and shared via
+/// `Arc<HCMConfig>` across all connections, regardless of which codec the
+/// listener wires up.
+///
+/// Fields specific to one codec path (e.g., `http2_protocol_options`) are
+/// inert on the other path — see per-field doc-comments for the asymmetric
+/// consumption rules. The struct lives in `envoy-http1` for historical
+/// reasons (it predates the H2 split); `envoy-http2` re-exports it as a
+/// type alias so cross-crate readers don't need to understand the layering.
 #[derive(Debug)]
 pub struct HCMConfig {
     pub stat_prefix: String,
