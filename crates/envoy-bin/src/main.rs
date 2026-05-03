@@ -222,7 +222,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 // 05.2 NEW: H1-vs-H2 dispatch on hcm_cfg.codec_type.
                 // - AUTO / HTTP1 → envoy_http1::HCM (existing 04.x path)
                 // - HTTP2       → envoy_http2::HCM (new in 05.2)
-                // - HTTP3       → unreachable (validator rejected at parse time)
+                // - HTTP3       → bail (validator rejected at parse time)
                 let hcm: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
                     match hcm_cfg.codec_type {
                         envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1 => {
@@ -232,7 +232,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                             std::sync::Arc::new(envoy_http2::HCM::new(hcm_config))
                         }
                         envoy_config::CodecType::HTTP3 => {
-                            unreachable!("CodecType::HTTP3 rejected by validator at parse time");
+                            anyhow::bail!(
+                                "CodecType::HTTP3 should have been rejected by the envoy-config \
+                             validator at parse time; this is a validator bug",
+                            );
                         }
                     };
 
@@ -254,6 +257,22 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         "HCM listener with downstream TLS is not supported in phase 04.x; \
                          TlsAcceptingHandler is currently TcpProxy-only and will be \
                          generalized in phase 05+ (SPEC §3 D4)",
+                    );
+                }
+                // Defensive symmetric bail for H2+TLS. The envoy-config validator
+                // (Http2OverTlsNotSupported, Task 2) rejects this combination at
+                // parse time, so this branch is unreachable from any well-formed
+                // config. Keep the runtime check anyway so a validator regression
+                // surfaces as a clean config-load error rather than a silently-
+                // non-functional plaintext listener on a port the operator
+                // expected to be TLS-protected.
+                if matches!(hcm_cfg.codec_type, envoy_config::CodecType::HTTP2)
+                    && build_downstream_tls_for_listener(listener_cfg)?.is_some()
+                {
+                    anyhow::bail!(
+                        "TLS+HTTP2 listener is unsupported in phase 05.2; the \
+                         envoy-config validator's Http2OverTlsNotSupported should \
+                         have rejected this combination at parse time"
                     );
                 }
                 let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = hcm;
