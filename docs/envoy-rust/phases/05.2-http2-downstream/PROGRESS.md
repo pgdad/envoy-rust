@@ -422,3 +422,70 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 - **Carryforward note:** The adapter is consumed by Task 9 (downstream H2C HCM dispatch) — that task drains `h2::RecvStream` into `Bytes` then hands the `http::Request<Bytes>` here. Task 7 (response emitter) operates on the symmetric output side; both share `Http2Error` as the typed-error currency. The `MalformedH2HeaderBlock` defense-in-depth path is exercised here for the first time (non-UTF-8 header value); the variant's other intended use (structurally invalid pseudo-headers — missing `:method` or `:path`) is gated by the `http::Request` type itself, which refuses to construct without those fields, so the adapter doesn't need to re-check. Future H2 trailers translation (not in 05.2 SPEC §4 scope) would extend this module with a sibling adapter; the current shape leaves room.
 - **Post-review fixup:** Six review findings closed in a single fixup commit. (I1) `MalformedH2HeaderBlock` doc-comment broadened to cover non-UTF-8 header values. (I2) Empty `Host:` value tightened to raise `MissingAuthority`. (I3) Added 2 failure-path tests (`http_to_envoy_request_missing_authority_returns_error`, `http_to_envoy_request_non_utf8_header_value_returns_error`). (M1) Added `pub use request::http_to_envoy_request;` re-export at crate root for symmetry with `Http2Error`. (M2) Removed dead `let _: &HeaderMap = req.headers();` line in `build_request` test helper + corresponding `HeaderMap` import. (M3) Added rationale comment for the `"/"` path fallback. Closes code-quality reviewer I1 + I2 + I3 + M1 + M2 + M3 on Task 6.
 
+---
+
+## Task 7 — `crates/envoy-http2/src/response.rs` (`build_http_response` + `send_envoy_response` adapters + 2 tests)
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** D3 response.rs — new `response` submodule under `envoy-http2` housing two adapters: `build_http_response` (pure function: `&envoy_http1::Response` → `http::Response<()>` carrying status + headers; H2-forbidden hop-by-hop headers stripped) and `send_envoy_response` (async: drives the actual H2 wire emission via `h2::server::SendResponse::send_response` + `SendStream::send_data`). H2-forbidden hop-by-hop strip per RFC 7540 §8.1.2.2 + cross-sub-phase architectural rule 4: `connection`, `transfer-encoding`, `upgrade`, `keep-alive`, `proxy-connection`. Header names lowercased before emission per RFC 7540 §8.1.2 (parent §6 signpost 11 — defense-in-depth; the h2 crate would reject uppercase names). 2 unit tests cover (a) hop-by-hop strip preserves non-forbidden headers and (b) status + content-type are preserved on the translation. Both `build_http_response` + `send_envoy_response` re-exported at crate root per the M1 convention established in Task 6.
+- **ADR landed:** None (Task 7 directly applies parent-05 SPEC §3 D3 + cross-sub-phase architectural rule 4 + RFC 7540 §8.1.2 / §8.1.2.2; no decisions needed beyond what SPEC + the RFC settle).
+- **Files modified:**
+  - `crates/envoy-http2/src/response.rs` (created) — 99 lines incl. doc-comments + 2 unit tests + 1 build-helper.
+  - `crates/envoy-http2/src/lib.rs` — appended `pub mod response;` after `pub mod request;` and `pub use response::{build_http_response, send_envoy_response};` after the existing `pub use request::http_to_envoy_request;` re-export. Mirrors the M1 convention from Task 6.
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~105 raw lines (99 response.rs + 2 lib.rs delta + this PROGRESS section). PLAN estimated ~120 (impl ~80 + hop-by-hop strip ~10 + 2 tests ~30); the implementation came in slightly under because the hop-by-hop strip is a 4-element `const &[&str]` + a single `contains` check (5 effective lines) rather than a separate helper. Functional content matches PLAN line-for-line.
+- **Verification:**
+
+  Step 7.2 — `cargo test -p envoy-http2` (failing-test confirmation, before `build_http_response` exists, with only the test module in `response.rs`):
+  ```
+  error[E0432]: unresolved import `response::build_http_response`
+   --> crates/envoy-http2/src/lib.rs:25:21
+    |
+  25 | pub use response::{build_http_response, send_envoy_response};
+    |                     ^^^^^^^^^^^^^^^^^^^ no `build_http_response` in `response`
+
+  error[E0425]: cannot find function `build_http_response` in this scope
+    --> crates/envoy-http2/src/response.rs:36:25
+     |
+  36 |         let http_resp = build_http_response(&resp).expect("builds");
+     |                         ^^^^^^^^^^^^^^^^^^^ not found in this scope
+  ```
+  Failed exactly as PLAN predicted (function not defined; both new tests + the crate-root re-export fail to resolve the symbol).
+
+  Step 7.4 — same command after Step 7.3:
+  ```
+  running 9 tests
+  test error::tests::h2_handshake_displays_with_source ... ok
+  test error::tests::missing_authority_displays_descriptively ... ok
+  test error::tests::bad_status_code_displays_value ... ok
+  test request::tests::http_to_envoy_request_missing_authority_returns_error ... ok
+  test response::tests::envoy_response_to_http2_strips_h2_forbidden_headers ... ok
+  test response::tests::envoy_response_to_http2_preserves_status_and_body ... ok
+  test request::tests::http_to_envoy_request_non_utf8_header_value_returns_error ... ok
+  test request::tests::http_to_envoy_request_synthesizes_host_from_authority ... ok
+  test request::tests::http_to_envoy_request_lowercases_headers ... ok
+
+  test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+  Suite goes 7 → 9 (Task 6 left it at 7 post-fixup; Task 7 adds 2). Matches PLAN's Step 7.4 expected count exactly.
+
+  Workspace gates:
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.80s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.60s
+
+  $ cargo fmt --all -- --check
+  (empty — clean)
+  ```
+
+  Workspace-wide test sanity: all green; envoy-http2 went 7 → 9 (matches per-crate run above); no other crate's test count moved.
+
+- **Deviations from PLAN:**
+  1. **Test helper `synth_response` augmented with `reason: None`.** PLAN Step 7.2's verbatim test helper omits the `reason` field, but `envoy_http1::Response` carries `pub reason: Option<&'static str>` (verified at task time via `grep -nA 6 'pub struct Response' crates/envoy-http1/src/response.rs`: 4 fields — `status`, `reason`, `headers`, `body`). Without `reason: None` the helper fails to compile. Added `reason: None,` between `status` and `headers` in the struct literal; otherwise verbatim. The reason field is not exercised by either H2 test (H2 has no reason-phrase concept — only `:status`), so `None` is the right neutral value; the H1 codec falls back to a built-in canonical-reason table for `None`.
+  2. **Crate-root re-export added: `pub use response::{build_http_response, send_envoy_response};`.** Adopting the M1 convention established in the Task 6 review fixup (which added `pub use request::http_to_envoy_request;` for symmetry with `Http2Error`). Both functions are public entry points downstream consumers (Task 9 HCM) will reach for; root-level re-export saves them an inner-path import. Task description called this out as a small departure from the literal PLAN.
+  3. **rustfmt collapsed the `HeaderValue::from_str(value)` mapping to a 2-line form.** PLAN's verbatim impl used a 3-line form (`let header_value = HeaderValue::from_str(value)\n    .map_err(|_| Http2Error::MalformedH2HeaderBlock)?;`); rustfmt deemed it short enough for the 100-col 2-line form and reflowed. Functionally identical; same kind of cosmetic rustfmt nudge as Tasks 2/4/5/6.
+- **Carryforward note:** Both adapters are consumed by Task 9 (downstream H2C HCM dispatch) — `build_http_response` is the pure status+headers translation step, exercised here in the unit tests; `send_envoy_response` is the async wire emission step, integration-tested in Task 9. The `Http2Error::H2BodyRead` variant name's "Read" suffix is a misnomer when applied to body WRITE (response emission); the doc-comment on `send_envoy_response` flags the future cleanup but defers it per SPEC §6 local signpost 21 (variant rename would touch the H2BodyRead read-side call sites in Task 9 too; deferring keeps the variant set stable across Tasks 5–9). The `H2_FORBIDDEN_HOP_BY_HOP` const list is the H2-side counterpart of the H1-side hop-by-hop handling that the H1 codec already does on the request path; symmetric coverage. Future H2 trailers emission (not in 05.2 SPEC §4 scope) would extend this module with a sibling `send_envoy_trailers` adapter; the current shape leaves room.
+

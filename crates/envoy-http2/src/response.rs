@@ -1,0 +1,141 @@
+//! envoy-Response → H2 SendStream emitter. See SPEC §3 D3.
+//!
+//! The response-translation surface is split into two pieces:
+//!   - `build_http_response(resp)` — translates an `envoy_http1::Response` into
+//!     an `http::Response<()>` (status + headers; body is sent separately).
+//!     Pure function; testable in isolation.
+//!   - `send_envoy_response(send_response, resp)` — drives the actual H2 wire
+//!     emission via `h2::server::SendResponse::send_response` + body
+//!     send_data. Async; integration-tested via the HCM tests in Task 9.
+//!
+//! H2-forbidden hop-by-hop headers (RFC 7540 §8.1.2.2: connection,
+//! transfer-encoding, upgrade, keep-alive, proxy-connection) are stripped
+//! defensively in `build_http_response` per cross-sub-phase architectural
+//! rule 4. Header names are emitted lowercase per RFC 7540 §8.1.2 (the h2
+//! crate would reject uppercase names; defense-in-depth).
+
+use envoy_http1::Response;
+use http::{HeaderName, HeaderValue, Response as HttpResponse, StatusCode};
+
+use crate::error::Http2Error;
+
+/// Headers that MUST NOT appear on H2 wire (RFC 7540 §8.1.2.2). The H2 codec
+/// would reject these at emission; the strip here is defense-in-depth and
+/// keeps the route-walk's H1-shaped response objects compatible with H2 wire
+/// emission.
+const H2_FORBIDDEN_HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "transfer-encoding",
+    "upgrade",
+    "keep-alive",
+    "proxy-connection",
+];
+
+/// Translate an `envoy_http1::Response` into an `http::Response<()>` carrying
+/// the status + headers (with H2-forbidden headers stripped). The body is
+/// sent separately via `h2::SendStream::send_data` in `send_envoy_response`.
+pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Error> {
+    let status = StatusCode::from_u16(resp.status).map_err(|_| Http2Error::BadStatusCode {
+        status: resp.status,
+    })?;
+    let mut builder = HttpResponse::builder().status(status);
+    for (name, value) in &resp.headers {
+        let name_lc = name.to_ascii_lowercase();
+        if H2_FORBIDDEN_HOP_BY_HOP.contains(&name_lc.as_str()) {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name_lc.as_bytes())
+            .map_err(|_| Http2Error::MalformedH2HeaderBlock)?;
+        let header_value =
+            HeaderValue::from_str(value).map_err(|_| Http2Error::MalformedH2HeaderBlock)?;
+        builder = builder.header(header_name, header_value);
+    }
+    builder
+        .body(())
+        .map_err(|_| Http2Error::MalformedH2HeaderBlock)
+}
+
+/// Drive the actual H2 response emission. Sends the response head via
+/// `send_response`, then the body via `send_data(end_of_stream=true)`. Errors
+/// surface as typed `Http2Error::H2BodyRead`-shaped variants on the wire side
+/// (a misnomer when applied to body WRITE; future cleanup may rename the
+/// variant — defer per SPEC §6 local signpost 21).
+pub async fn send_envoy_response(
+    mut send_response: h2::server::SendResponse<bytes::Bytes>,
+    resp: Response,
+) -> Result<(), Http2Error> {
+    let head = build_http_response(&resp)?;
+    let mut send_stream = send_response
+        .send_response(head, /* end_of_stream = */ resp.body.is_empty())
+        .map_err(|source| Http2Error::H2StreamAccept { source })?;
+    if !resp.body.is_empty() {
+        send_stream
+            .send_data(resp.body, /* end_of_stream = */ true)
+            .map_err(|source| Http2Error::H2BodyRead { source })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use envoy_http1::Response;
+
+    fn synth_response(status: u16, headers: Vec<(&str, &str)>, body: &[u8]) -> Response {
+        Response {
+            status,
+            reason: None,
+            headers: headers
+                .into_iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            body: Bytes::copy_from_slice(body),
+        }
+    }
+
+    #[test]
+    fn envoy_response_to_http2_strips_h2_forbidden_headers() {
+        let resp = synth_response(
+            200,
+            vec![
+                ("server", "envoy-rust"),
+                ("connection", "close"),
+                ("transfer-encoding", "chunked"),
+                ("upgrade", "h2c"),
+                ("keep-alive", "timeout=5"),
+                ("proxy-connection", "keep-alive"),
+                ("content-type", "text/plain"),
+            ],
+            b"ok",
+        );
+        let http_resp = build_http_response(&resp).expect("builds");
+        let names: Vec<&str> = http_resp
+            .headers()
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        for forbidden in &[
+            "connection",
+            "transfer-encoding",
+            "upgrade",
+            "keep-alive",
+            "proxy-connection",
+        ] {
+            assert!(
+                !names.iter().any(|n| n.eq_ignore_ascii_case(forbidden)),
+                "expected `{forbidden}` to be stripped, but found in {names:?}"
+            );
+        }
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("server")));
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("content-type")));
+    }
+
+    #[test]
+    fn envoy_response_to_http2_preserves_status_and_body() {
+        let resp = synth_response(418, vec![("content-type", "text/plain")], b"teapot");
+        let http_resp = build_http_response(&resp).expect("builds");
+        assert_eq!(http_resp.status().as_u16(), 418);
+        assert!(http_resp.headers().contains_key(http::header::CONTENT_TYPE));
+    }
+}

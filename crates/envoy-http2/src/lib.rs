@@ -19,6 +19,8 @@
 
 mod error;
 pub mod request;
+pub mod response;
 
 pub use error::Http2Error;
 pub use request::http_to_envoy_request;
+pub use response::{build_http_response, send_envoy_response};
