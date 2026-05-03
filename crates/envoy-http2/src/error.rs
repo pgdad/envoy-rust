@@ -39,12 +39,13 @@ pub enum Http2Error {
 
     /// The H2 HEADERS block carried structurally invalid pseudo-headers
     /// (e.g., missing `:method`, missing `:path`, or an unrecognized
-    /// pseudo-header name), OR carried a non-pseudo header value containing
+    /// pseudo-header name); OR carried a non-pseudo header NAME containing
+    /// non-token bytes; OR carried a non-pseudo header VALUE containing
     /// non-UTF-8 bytes. The h2 codec normally catches structural problems
     /// earlier, but does not pre-reject obs-text bytes in header values
     /// (HPACK literal decoding accepts arbitrary bytes), so this variant is
-    /// a defense-in-depth fallback at both the HEADERS-block and the
-    /// header-value layer.
+    /// a defense-in-depth fallback at the HEADERS-block, header-name, and
+    /// header-value layers.
     #[error("HTTP/2 header block is structurally malformed")]
     MalformedH2HeaderBlock,
 

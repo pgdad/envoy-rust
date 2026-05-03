@@ -39,6 +39,8 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
         status: resp.status,
     })?;
     let mut builder = HttpResponse::builder().status(status);
+    // resp.reason intentionally dropped — H2 has no reason-phrase
+    // (RFC 7540 §8.1.2.4: only :status pseudo-header).
     for (name, value) in &resp.headers {
         let name_lc = name.to_ascii_lowercase();
         if H2_FORBIDDEN_HOP_BY_HOP.contains(&name_lc.as_str()) {
@@ -56,10 +58,15 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
 }
 
 /// Drive the actual H2 response emission. Sends the response head via
-/// `send_response`, then the body via `send_data(end_of_stream=true)`. Errors
-/// surface as typed `Http2Error::H2BodyRead`-shaped variants on the wire side
-/// (a misnomer when applied to body WRITE; future cleanup may rename the
-/// variant — defer per SPEC §6 local signpost 21).
+/// `send_response`, then the body via `send_data(end_of_stream=true)`.
+///
+/// Error mapping note: response-head-send failures surface as
+/// `Http2Error::H2StreamAccept` (a misnomer — the variant's name implies
+/// stream-accept, but `send_response()` is the server's first wire egress
+/// for the stream). Body-write failures surface as `Http2Error::H2BodyRead`
+/// (also a misnomer when applied to body WRITE). Future cleanup may
+/// rename the variants and/or introduce a single `H2ResponseSend` —
+/// defer per SPEC §6 local signpost 21.
 pub async fn send_envoy_response(
     mut send_response: h2::server::SendResponse<bytes::Bytes>,
     resp: Response,
@@ -136,6 +143,34 @@ mod tests {
         let resp = synth_response(418, vec![("content-type", "text/plain")], b"teapot");
         let http_resp = build_http_response(&resp).expect("builds");
         assert_eq!(http_resp.status().as_u16(), 418);
+        // body() returns the unit body for an http::Response<()> (the actual
+        // body bytes are sent via h2::SendStream::send_data; here we verify
+        // build_http_response correctly carries the status + headers, and
+        // we delegate the body-write check to the integration test).
         assert!(http_resp.headers().contains_key(http::header::CONTENT_TYPE));
+    }
+
+    #[test]
+    fn build_http_response_rejects_invalid_status_code() {
+        // status 99 is below 100 → StatusCode::from_u16 fails → BadStatusCode.
+        let resp = synth_response(99, vec![], b"");
+        let err = build_http_response(&resp).expect_err("must fail on invalid status");
+        assert!(
+            matches!(err, Http2Error::BadStatusCode { status: 99 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_http_response_rejects_invalid_header_name() {
+        // A non-token byte ("é" = 0xC3 0xA9 in UTF-8; `é` is not a valid
+        // HTTP token character) in the header NAME causes
+        // HeaderName::from_bytes to fail → MalformedH2HeaderBlock.
+        let resp = synth_response(200, vec![("héllo", "v")], b"");
+        let err = build_http_response(&resp).expect_err("must fail on invalid header name");
+        assert!(
+            matches!(err, Http2Error::MalformedH2HeaderBlock),
+            "got {err:?}"
+        );
     }
 }
