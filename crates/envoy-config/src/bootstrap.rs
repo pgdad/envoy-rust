@@ -2280,6 +2280,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/tls_downstream_single_cert.yaml",
             "fuzz/corpus/parse_bootstrap/tls_upstream_validation_context.yaml",
             "fuzz/corpus/parse_bootstrap/tls_multi_cert_sni.yaml",
+            "fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml",
             "fuzz/corpus/parse_bootstrap/hcm_direct_response_happy.yaml",
             "fuzz/corpus/parse_bootstrap/hcm_route_to_cluster.yaml",
             "fuzz/corpus/parse_bootstrap/route_with_header_matchers.yaml",
@@ -4999,8 +5000,9 @@ static_resources:
     #[test]
     fn fuzz_corpus_hcm_codec_http2_seed_parses() {
         // Sanity-check that the new fuzz seed parses cleanly through the
-        // serde + validator pipeline. Mirrors the 04.x corpus-walk acceptance
-        // pattern (e.g., `fuzz_corpus_hcm_route_to_cluster_seed_parses`).
+        // serde + validator pipeline. First per-seed content-asserting
+        // corpus-walk test in this file; the cohort-level pattern lives
+        // in `fuzz_corpus_seeds_parse_or_reject_cleanly` (~line 2274).
         let yaml = include_str!("../fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml");
         let bs = crate::parse_bootstrap(yaml).expect("seed must parse");
         let TypedConfig::HttpConnectionManager(hcm) =
