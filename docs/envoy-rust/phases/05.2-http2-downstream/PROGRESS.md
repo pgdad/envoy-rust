@@ -897,3 +897,79 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 
 - **Post-CI-run fixup:** First end-to-end CI run (`25294002788`) revealed two parser issues + one real h2spec failure. Parser issues fixed: (1) h2spec emits `✔` (U+2714 HEAVY CHECK MARK) not `✓` (U+2713 CHECK MARK) — pass-marker scrape never matched; (2) test IDs in h2spec output are hierarchical (section heading `3.5. HTTP/2 Connection Preface` + per-test line `× 2: ...` ⇒ ID `3.5/2`), not inline; (3) summary line format is `<N> tests, <M> passed, <K> skipped, <L> failed`, not `Passed: <N>` / `Failed: <N>`. Parser rewrite tracks section context, derives full IDs, and reads the canonical summary line for counts. The `looks_like_h2spec_test_id` helper landed at I2 fixup is now unused and removed (the section-context construction guarantees dotted-numeric IDs by construction). Real failure: `3.5/2` (invalid PRI preface → h2 crate sends RST instead of GOAWAY) catalogued in known-failures.txt as a foundation limitation per parent-05 SPEC §6 signpost 13. Added 2 unit tests (`parse_summary_line_extracts_pass_fail_counts`, `parse_h2spec_output_extracts_section_failure_ids`) so future parser regressions surface locally without needing h2spec installed.
 
+
+---
+
+## Task 14 — CI workflow `h2spec` provisioning + state-4 phase-done gate verification
+
+- **Commit:** _(this commit — phase 05.2 state-4 phase-done gate verification close-out)_
+- **Deliverables:** D7 part 2 (CI provisioning half) + state-4 phase-done gate verification per phase 05.2 SPEC §1 acceptance signal (a)(b)(c)(d)(e). The CI workflow `h2spec` provisioning step landed at the standalone Task 14 step 14.1 commit `b3d1fe9`; the parser fix + `3.5/2` known-failure entry landed at the post-CI-run fixup `dac3f8b`; this close-out commit narrates the state-4 evidence and updates STATE.md / ROADMAP if applicable (Task 14 lifecycle: state-4 only — state-5 REVIEW.md and state-6 phase-done close-out land in subsequent sessions per `BOOTSTRAP_PROMPT.md` §5.1's "one state per session" discipline).
+- **ADR landed:** None at Task 14. ADR-0027 landed at Task 1; ADR-0028 explicitly NOT landed (recorded inline in Task 13 PROGRESS).
+- **Files modified:**
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section.
+- **LoC:** ~75 (PROGRESS Task 14 narration).
+- **Verification:**
+
+  Step 14.5 — state-4 phase-done gate verification per SPEC §1 acceptance signals:
+
+  **CI run:** `25294149612` (https://github.com/pgdad/envoy-rust/actions/runs/25294149612), HEAD `dac3f8b`, completed `2026-05-03T23:42:02Z`, duration 2m30s (build job) + 1m5s (fuzz job).
+
+  **Gate (a) — fixture 0009 GREEN at Docker-gated CI level:**
+  ```
+  test http2_direct_response_fixture ... ok
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+  ```
+  (Drives a real H2C GET against envoy-bin and against upstream Envoy v1.33.0 in Docker; per-axis equivalence cascade asserts byte-equal status + body + header-set-modulo-allow-list.)
+
+  **Gate (b) — fixtures 0001–0008 remain GREEN simultaneously:**
+  Per the same CI run's per-fixture matrix:
+  ```
+  test admin_ready_fixture ... ok           (fixture 0002, 7.06s)
+  test echo_fixture ... ok                  (fixture 0001, 1.05s)
+  test http1_direct_response_fixture ... ok (fixture 0007, 0.85s)
+  test http1_router_upstream_fixture ... ok (fixture 0008, 2.47s)
+  test http2_direct_response_fixture ... ok (fixture 0009, 0.85s)  [NEW]
+  test tcp_proxy_fixture ... ok             (fixture 0004, 2.65s)
+  test tls_downstream_fixture ... ok        (fixture 0003, 2.77s)
+  test tls_sni_fixture ... ok               (fixture 0005, 3.04s)
+  test tls_upstream_fixture ... ok          (fixture 0006, 2.68s)
+  ```
+  All 9 Docker-gated fixtures (0001 echo / 0002 admin_ready / 0003 tls_downstream / 0004 tcp_proxy / 0005 tls_sni / 0006 tls_upstream / 0007 http1_direct_response / 0008 http1_router_upstream / 0009 http2_direct_response) GREEN simultaneously. The phase-04.3 REVIEW C-1 carryforward (substantively closed at phase-05.4) remains closed; no regression on the 8 pre-existing fixtures.
+
+  **Gate (c) — h2spec ≥95% pass with classified failures in `known-failures.txt`:**
+  ```
+  test h2spec_pass_rate_gate ... ok
+  ```
+  h2spec 2.6.0 ran end-to-end against envoy-bin's HCM HTTP2 listener. Result: 144 passed / 1 failed / 1 skipped of 146 tests = **99.31% pass rate** (well above the 95% gate). The single failure (`3.5/2` — invalid PRI preface → h2 crate sends RST instead of GOAWAY) is catalogued in `tests/conformance/h2spec/known-failures.txt` with a foundation-limitation doctrine annotation per parent-05 SPEC §6 signpost 13 ("trust h2 codec to reject malformed handshakes"). Gate (b) (no surprise regressions) and Gate (c) (no stale entries) both green by construction.
+
+  **Gate (d) — fuzz target `parse_bootstrap` clean for short-budget CI run:**
+  ```
+  ✓ fuzz (parse_bootstrap, 30s) in 1m5s (ID 74150226090)
+  ```
+  CI fuzz job exercises the new `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml` corpus seed (Task 4) for 30s of fuzz time; clean run, no crashes. The seed validates the HCM HTTP2 + Http2ProtocolOptions schema landed in Tasks 2-3 against arbitrary mutations.
+
+  **Gate (e) — 5 stable-toolchain commands clean on CI:**
+  - `cargo build --workspace --all-targets` — ✓ clean
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` — ✓ clean
+  - `cargo fmt --all -- --check` — ✓ clean
+  - `cargo test --workspace` — ✓ clean (all per-test result lines green; no failures; 1 ignored test in envoy-http2 — `h2_protocol_options_max_concurrent_streams_applied`, deferred per Task 9 documented `#[ignore]` reason)
+  - `cargo deny check` — ✓ final line: `advisories ok, bans ok, licenses ok, sources ok` (5 pre-existing benign `license-not-encountered` advisory-only warnings on 0BSD / BSD-2-Clause / MPL-2.0 / Unicode-DFS-2016 / Zlib unmatched allowances — unchanged from the 05.4 baseline; do not represent new licenses brought in by 05.2)
+
+  **State-4 phase-done gate: GREEN** on all 5 acceptance signals. Phase 05.2 SPEC §1 acceptance signals (a)-(e) verified end-to-end on CI run `25294149612` against HEAD `dac3f8b`.
+
+- **Cargo.lock churn (across phase 05.2):** the projected new top-level dep `h2 v0.4.13` + transitive `fnv v1.0.7` (added at Task 1 with the `envoy-http2` crate scaffold per ADR-0027); the `http v1.x` crate graduated from transitive-only to a workspace foundation as projected in 05.2 SPEC §1 layer 2 (added as a direct dep at Task 1 alongside `h2` per ADR-0027's `http` typed-edge translation grant). Differential harness gained `h2 = "0.4"` and `http = "1"` direct deps at Task 11 per parent-05 SPEC §6 signpost 8 (carve-out from cross-sub-phase architectural rule 1, parallel to phase-04.1 REVIEW M-architectural-claim's `httparse` posture). All new licenses are MIT/Apache-2.0; no deny.toml edit needed.
+
+- **Known-failures cadence:** `tests/conformance/h2spec/known-failures.txt` shipped with one real entry (`3.5/2` foundation limitation) post the CI evidence pass; the entry will retire (file trimmed in same commit) when either the h2 crate adds a bad-preface GOAWAY hook or envoy-rust wraps `h2::server::handshake` with a manual byte-peek. Lockstep maintenance is enforced by gate (c) (any stale entry — i.e., a now-passing test still in the file — fails the gate).
+
+- **Workflow file scope:** `.github/workflows/ci.yml` gained a single new step (`install h2spec`) in the existing `build` job between the `build` step and the `test` step (Task 14 step 14.1 commit `b3d1fe9`); the existing 5 stable-toolchain commands and the parallel `fuzz (parse_bootstrap, 30s)` job stay byte-identical. h2spec version pinned to `2.6.0` (current latest at task time per `https://github.com/summerwind/h2spec/releases/latest`); revisit at phase 06+.
+
+- **Deviations from PLAN:** The PLAN's Step 14.3 originally projected a single state-4 close-out commit. In practice, three commits land between Task 13 close-out (`f6a0ad4`) and the state-4 close-out:
+  1. `b3d1fe9` — Task 14 step 14.1 (CI YAML edit standalone).
+  2. `dac3f8b` — post-first-CI-run fixup (parser rewrite + `3.5/2` known-failure + 2 unit tests; landed after CI run `25294002788` revealed parser bugs + the real h2spec failure that the PLAN explicitly anticipated in Step 14.3's classification guidance).
+  3. _(this commit)_ — state-4 PROGRESS narration close-out.
+  The PLAN's Step 14.3 explicitly anticipated this iteration cadence ("If the h2spec gate fails on first end-to-end run, classify each failure"), so this is a controlled landing pattern, not a deviation from intent.
+
+- **Carryforward note:** Task 14 closes the state-3 (execution) lifecycle for phase 05.2. Per PLAN Steps 14.6 + State 5/6 routing block, the next two sessions advance the lifecycle:
+  - **State 5** (next session): invoke `superpowers:requesting-code-review` against this commit. Output: `docs/envoy-rust/phases/05.2-http2-downstream/REVIEW.md`. If REVIEW finds Critical/Important issues → re-enter at state 3 per `SKILL_ROUTING.md` §5.2.
+  - **State 6** (next session after REVIEW approves): commit the phase-done close-out. Touches ROADMAP row `05.2` `planned` → `done` (parent ROADMAP row `05` stays `in-progress` until 05.3 closes per the schema invariant). STATE.md advances active phase from `05.2-http2-downstream` lifecycle state 5 to `05.3-http2-upstream` lifecycle state 2 (SPEC.md exists at parent-05 state-2 commit `f1804a7`; PLAN.md does not).
+
