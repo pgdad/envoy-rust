@@ -121,3 +121,19 @@ Source of truth: `SPEC.md` (D1–D7) + `PLAN.md` (Tasks 1–7).
   - `grep -n '^## ADR-' docs/envoy-rust/DECISIONS.md | tail -4` shows `ADR-0023` (line 424) → `ADR-0024` (line 437) → `ADR-0026` (line 459) → `ADR-0025` (line 478) — landing-time order preserved.
   - Fixture 0008 differential green re-baseline materializes at Task 7.
 - **Deviations from PLAN:** None. Line numbers had drifted slightly from the plan's projection (CL emission block at lines 94-103 actual; assertion at lines 460-463 actual), but the plan's intent matched verbatim. The `Request::body_bytes()` accessor was found at the projected location `crates/envoy-http1/src/codec.rs:62-64` with the projected signature `pub(crate) fn body_bytes(&self) -> Option<&[u8]>` — no deviation in accessor name or shape. `is_some_and(|b| !b.is_empty())` is the idiomatic Rust ≥1.70 form for the `Option<&[u8]>` non-empty predicate; clippy raised no objection.
+
+## Task 6 — Harness STRICT_DNS settle time 500ms → 2000ms for host_gateway fixtures
+
+- **Commit:** _(pending)_
+- **Deliverables:** SPEC §3 D6.
+- **ADR landed:** None (D6 has no ADR; test-harness timing constant per PLAN signpost L).
+- **Files modified:**
+  - `tests/differential/src/upstream.rs` (the flat `tokio::time::sleep(Duration::from_millis(500)).await;` after `get_host_port_ipv4` replaced with a `let settle_ms = if host_gateway { 2000 } else { 500 };` conditional + 5-line doc comment; the `host_gateway: bool` parameter was already in scope at the function signature `pub async fn start(envoy_yaml_path: &Path, host_gateway: bool, tls_pki: Option<&crate::tls::TlsTestPki>) -> Result<UpstreamProxy>`).
+- **LoC:** 7 (2 effective + 5 comment), replacing 1 line — net +6.
+- **Verification:**
+  - Verified `host_uses_host_gateway = upstream_yaml.contains("host.docker.internal")` derivation at `tests/differential/src/lib.rs:989` and pass-through at line 992; the 3 unaffected fixtures (0001/0002/0007) do NOT contain `host.docker.internal` in their upstream YAML and continue at the existing 500ms settle.
+  - `cargo test -p differential --lib`: `test result: ok. 52 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.04s` (the 1 ignored is `upstream::tests::starts_upstream_envoy_and_exposes_host_port` which `requires Docker; runs under cargo test --workspace in CI` — gated as expected per PLAN signpost K).
+  - `cargo clippy -p differential --all-targets -- -D warnings` — clean (`Finished dev profile` with no warnings).
+  - `cargo fmt --all -- --check` — clean (no output, no drift).
+  - Behavioral verification of the 2000ms bump (i.e. that DNS resolution actually completes by 2000ms on the 5 host-gateway fixtures) deferred to Task 7's CI run per PLAN signpost K.
+- **Deviations from PLAN:** None. Line drift inside `tests/differential/src/upstream.rs` was minor — the `tokio::time::sleep(Duration::from_millis(500)).await;` originally projected at line 88 was found at line 88 verbatim. Indentation note: the original sleep was at 4-space indent (function-body level, immediately after the `get_host_port_ipv4` `?;`), not 8-space — the planner's snippet showed 8-space leading whitespace; matched the surrounding `let host_port = ...;` block at 4 spaces. The 2000ms ceiling was NOT tightened in this task per SPEC §6 signpost 16.

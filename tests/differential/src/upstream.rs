@@ -85,7 +85,13 @@ pub async fn start(
         .get_host_port_ipv4(CONTAINER_PORT.tcp())
         .await
         .context("reading host-mapped port from testcontainers")?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 05.4 NEW per SPEC §3 D6: STRICT_DNS DNS resolution may not have
+    // completed by the 500ms mark on host-gateway fixtures (DNS via
+    // Docker's host-gateway races the first test probe); bump to 2000ms
+    // for those. The 3 unaffected fixtures (0001/0002/0007) do NOT set
+    // host_gateway = true and continue at 500ms.
+    let settle_ms = if host_gateway { 2000 } else { 500 };
+    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
     Ok(UpstreamProxy {
         _container: container,
         host_port,
