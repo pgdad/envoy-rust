@@ -16,3 +16,7 @@
 //!
 //! 05.3-projected (NOT in 05.2):
 //!   - `client`   — upstream H2C origination (envoy_http2::Client + ClientStream).
+
+mod error;
+
+pub use error::Http2Error;

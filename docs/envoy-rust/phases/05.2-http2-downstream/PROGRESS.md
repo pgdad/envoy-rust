@@ -286,3 +286,73 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 - **Deviations from PLAN:** None. Steps executed verbatim. The PLAN's reference test name `fuzz_corpus_hcm_route_to_cluster_seed_parses` is preserved in the new test's doc-comment for traceability even though no per-seed test by that name exists in `bootstrap.rs` today (the existing corpus-walk uses a single loop test `fuzz_corpus_seeds_parse_or_reject_cleanly`); the doc-comment still anchors the "04.x corpus-walk acceptance pattern" intent. The new `fuzz_corpus_hcm_codec_http2_seed_parses` is the first per-seed accept-test in the file — a stricter variant that asserts on parsed content, not just parse-or-reject. Future tasks may consolidate by either (a) extending the loop test with content-asserting branches, or (b) adding more per-seed tests next to this one; PLAN does not prescribe.
 - **Carryforward note:** The new seed exercises the schema landed in Tasks 2–3 and the parent `parse_bootstrap` fuzz target. CI fuzz job at Task 14 will run the existing `parse_bootstrap` target against the full corpus including this seed; no action needed before then. When `validate_hcm` gains additional HTTP2-related range checks (e.g., future `connection_keepalive` sub-message range bounds), this seed remains valid because all 4 currently-checked fields use mid-range values well inside the RFC 7540 windows. The `fuzz_corpus_seeds_parse_or_reject_cleanly` loop test does NOT yet list this seed; intentional — the per-seed `fuzz_corpus_hcm_codec_http2_seed_parses` test is stricter (content assertions) and serves a different role. A future cleanup task may add the seed to the loop's "expected to parse" list as a redundant gate.
 - **Post-review fixup:** Two Minor code-quality findings closed in a single fixup commit: (M1) the new test's doc-comment now points at the actual cohort-level loop test `fuzz_corpus_seeds_parse_or_reject_cleanly` (line 2274) instead of the non-existent `fuzz_corpus_hcm_route_to_cluster_seed_parses`; (M5) the seed `fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml` is now registered in the cohort loop's expected-parse list as belt-and-suspenders defense in depth.
+
+---
+
+## Task 5 — `crates/envoy-http2/src/error.rs` (`Http2Error` typed-error enum)
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** D3 error.rs — new `error` submodule under `envoy-http2` housing the `Http2Error` enum (6 variants per parent-05 SPEC §3 D3). Three source-preserving variants wrap `h2::Error` via `#[source]` (`H2Handshake`, `H2StreamAccept`, `H2BodyRead`); three pure-shape variants carry no source (`MissingAuthority`, `MalformedH2HeaderBlock`, `BadStatusCode { status: u16 }`). `Http2Error` re-exported at crate root via `pub use error::Http2Error`. 2 unit tests verify Display behaviour for the two non-`h2::Error`-wrapping shapes (the `h2::Error`-wrapping variants are not unit-testable in isolation — `h2::Error` has no public constructor, by design).
+- **ADR landed:** None (Task 5 directly implements parent-05 SPEC §3 D3; no decisions needed beyond what SPEC settles).
+- **Files modified:**
+  - `crates/envoy-http2/src/error.rs` (created) — 75 lines incl. doc-comments and tests.
+  - `crates/envoy-http2/src/lib.rs` — appended `mod error;` + `pub use error::Http2Error;` at module scope after the existing doc-comment block (4 added lines including blank lines). Note on placement: PLAN Step 5.1 said "Insert before the closing 05.3-projected doc comment"; the doc-comment block is one contiguous `//! ...` header (lines 3–18), so inserting code mid-block would syntactically break the file. Placed the mod declaration after the doc-comment per the PLAN's own escape clause ("standard interpretation: place at the top of the file's code section, AFTER the doc-comment block").
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~80 raw lines (75 error.rs + 4 lib.rs delta + this PROGRESS section). Matches PLAN's ~60 estimate within reasonable margin; the ~15-line overshoot is rustfmt-induced multi-line forms (the `MissingAuthority` `#[error("...")]` attribute exceeded rustfmt's 100-col threshold and reflowed to 3 lines; the `assert!` in `missing_authority_displays_descriptively` likewise reflowed to 4 lines from PLAN's 1-line form). Functional content matches PLAN line-for-line.
+- **Verification:**
+
+  Step 5.2 — `cargo test -p envoy-http2` (failing-test confirmation, before enum exists, with only the test module in `error.rs`):
+  ```
+  error[E0432]: unresolved import `error::Http2Error`
+    --> crates/envoy-http2/src/lib.rs:22:9
+     |
+  22 | pub use error::Http2Error;
+     |         ^^^^^^^^^^^^^^^^^ no `Http2Error` in `error`
+
+  error[E0432]: unresolved import `super::Http2Error`
+   --> crates/envoy-http2/src/error.rs:5:9
+    |
+  5 |     use super::Http2Error;
+    |         ^^^^^^^^^^^^^^^^^ no `Http2Error` in `error`
+
+  error: could not compile `envoy-http2` (lib test) due to 2 previous errors
+  ```
+  Failed exactly as PLAN predicted (`Http2Error` not defined; both lib and lib-test fail to compile because the `pub use` re-export and the test's `use super::Http2Error` both reference the not-yet-existent enum).
+
+  Step 5.4 — same command after Step 5.3:
+  ```
+  running 2 tests
+  test error::tests::missing_authority_displays_descriptively ... ok
+  test error::tests::bad_status_code_displays_value ... ok
+
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+  Suite goes 0 → 2 (the crate had no tests pre-Task-5).
+
+  `cargo build -p envoy-http2`:
+  ```
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.41s
+  ```
+
+  Workspace gates:
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.67s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.60s
+
+  $ cargo fmt --all -- --check
+  (empty — clean, after `cargo fmt --all` reflowed two lines per the LoC note)
+  ```
+
+  Workspace-wide test sanity (no other crate's test count changed; envoy-http2 went 0 → 2):
+  ```
+  $ cargo test --workspace 2>&1 | grep -E '^test result' | sort | uniq -c
+  (no failures across all test binaries; 2 envoy-http2 unit tests visible)
+  ```
+
+- **Deviations from PLAN:**
+  1. **`mod error;` placed AFTER the lib.rs doc-comment block, not "before the closing 05.3-projected paragraph" mid-comment.** PLAN Step 5.1's wording is ambiguous because `lib.rs`'s entire `//! ...` header (lines 3–18) is a contiguous doc-comment block ending with the 05.3-projected paragraph; a `mod error;` declaration cannot syntactically appear inside a `//! ...` block. PLAN itself anticipates this in the pre-task context: "the standard interpretation is: place the mod declaration at the top of the file's code section, AFTER the doc-comment block". Followed the standard interpretation. The doc-comment block is preserved intact.
+  2. **rustfmt reflowed 2 lines.** The `MissingAuthority` `#[error(...)]` attribute exceeded the 100-col line limit and rustfmt expanded it to a 3-line form. The first `assert!(s.contains(...), "...")` likewise expanded to 4 lines. Functionally identical; same as the rustfmt nudges noted in Tasks 2 and 4.
+- **Carryforward note:** Module slots `request.rs` (Task 6), `response.rs` (Task 7), `codec.rs` (Task 8), and `hcm.rs` (Task 9) will use `Http2Error` as their typed-error type. The 3 `h2::Error`-wrapping variants get exercised at those task boundaries (handshake → Task 9; stream accept → Task 9; body read → Task 6). The 3 pure-shape variants similarly: `MissingAuthority` gates the `:authority` → `Host:` synthesis (Task 6), `MalformedH2HeaderBlock` is defense-in-depth at the same site, and `BadStatusCode` gates the response status emission (Task 7). The `From<h2::Error>` blanket impl is intentionally absent — call sites must pick the right variant per failure context. The `BadStatusCode { status: u16 }` parameter type is `u16` (not `http::StatusCode`) because the variant exists precisely for emit-time values that escape the type-state guard; using `u16` keeps the failure path representable.
