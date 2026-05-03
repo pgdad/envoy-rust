@@ -223,3 +223,65 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
   2. **Helper YAML body's `max_concurrent_streams` push_str collapsed to one line.** rustfmt preferred the single-line form (`opts_block.push_str(&format!("                  max_concurrent_streams: {v}\n"));`) over the multi-line form copied verbatim from PLAN line 853-857. Cosmetic only; helper still produces identical YAML.
 - **Post-review fixup:** Post-Task-3 review fixup: switched `rejects_http2_protocol_options_unknown_field` from `matches!(err, ConfigError::Yaml(_))` to the file-local `assert_unknown_field(err)` helper for consistency with the 4 existing unknown-field tests at lines 1643-1703 (per code-quality reviewer follow-up I1).
 - **Carryforward note:** Runtime use of `Http2ProtocolOptions` (consuming the 4 fields when constructing the `h2::server::Builder` inside `envoy-http2`) lands in Tasks 8–9. The schema-level field-naming and range-validator obligations are settled here. Future Envoy `Http2ProtocolOptions` field additions (allow_connect, hpack_table_size, override_stream_error_on_invalid_http_message, connection_keepalive, ...) extend the struct under `deny_unknown_fields` and may add new `Http2ProtocolOptionsOutOfRange` callsites; the variant's `field: &'static str` parameterization is built for that growth.
+
+---
+
+## Task 4 — Fuzz corpus seed `hcm_codec_http2.yaml` + `.gitignore` allow-list + corpus-walk acceptance test
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** D2 fuzz signal — new fuzz corpus seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml` exercising HCM `codec_type: HTTP2` + listener-side `http2_protocol_options` (all 4 fields populated with mid-range values) through the existing `parse_bootstrap` fuzz target. Allow-list entry appended to `crates/envoy-config/fuzz/.gitignore`. 1 new corpus-walk acceptance test `fuzz_corpus_hcm_codec_http2_seed_parses` verifying the seed parses cleanly through the schema landed in Tasks 2–3 (asserts `CodecType::HTTP2` + `max_concurrent_streams == Some(100)`).
+- **ADR landed:** None (Task 4 is mechanical fuzz-corpus extension; no decisions needed beyond what SPEC §6 signpost 25 already settled).
+- **Files modified:**
+  - `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml` (created) — 32-line YAML mirroring PLAN Step 4.3 verbatim.
+  - `crates/envoy-config/fuzz/.gitignore` — 1-line allow-list entry appended after `!corpus/parse_bootstrap/strict_dns_cluster.yaml` (the prior 13th entry); seeds block now 14 entries.
+  - `crates/envoy-config/src/bootstrap.rs` — appended `fuzz_corpus_hcm_codec_http2_seed_parses` test inside `tests` mod just before the `http2_options_yaml` helper.
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~50 (32 seed YAML + 1 gitignore line + ~17 test incl. doc-comment + this PROGRESS section). PLAN estimated ~30 (seed ~25 + gitignore ~1 + test ~12); modest overshoot driven by rustfmt's let-else reflow expanding the test to 17 lines (expected pattern; same reflow happened in Task 2). YAML size matches PLAN line-for-line.
+- **Verification:**
+
+  Step 4.2 — `cargo test -p envoy-config fuzz_corpus_hcm_codec_http2_seed_parses -- --nocapture` (failing-test confirmation, before seed file exists):
+  ```
+  error: couldn't read `crates/envoy-config/src/../fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml`: No such file or directory (os error 2)
+      --> crates/envoy-config/src/bootstrap.rs:5004:20
+  error: could not compile `envoy-config` (lib test) due to 1 previous error
+  ```
+  Failed exactly as PLAN predicted (`include_str!` compile error; seed file absent).
+
+  Step 4.5 — same command after Steps 4.3 + 4.4:
+  ```
+  running 1 test
+  test bootstrap::tests::fuzz_corpus_hcm_codec_http2_seed_parses ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 155 filtered out; finished in 0.00s
+  ```
+
+  Step 4.6 — skipped per PLAN (local environment lacks `cargo +nightly fuzz`; CI fuzz job at Task 14 will exercise the seed).
+
+  Step 4.7 — `git status crates/envoy-config/fuzz/corpus/parse_bootstrap/`:
+  ```
+  Untracked files:
+        crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml
+  ```
+  Seed appears as new (not ignored); allow-list entry working.
+
+  Workspace gates (post-fmt):
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.02s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.19s
+
+  $ cargo fmt --all -- --check
+  (empty — clean)
+
+  $ cargo test -p envoy-config 2>&1 | grep '^test result'
+  test result: ok. 156 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+  Net delta: +1 (155 → 156). The new corpus-walk test passes.
+
+  Note: initial `cargo fmt --all -- --check` flagged a let-else reflow inside the new test (rustfmt prefers expanded multi-line form for the chained `.typed_config.as_ref().unwrap()` selector). Applied `cargo fmt --all`; re-ran check → clean. Test still passes after the reformat. Same rustfmt nudge as Task 2 Step 2.12.
+
+- **Deviations from PLAN:** None. Steps executed verbatim. The PLAN's reference test name `fuzz_corpus_hcm_route_to_cluster_seed_parses` is preserved in the new test's doc-comment for traceability even though no per-seed test by that name exists in `bootstrap.rs` today (the existing corpus-walk uses a single loop test `fuzz_corpus_seeds_parse_or_reject_cleanly`); the doc-comment still anchors the "04.x corpus-walk acceptance pattern" intent. The new `fuzz_corpus_hcm_codec_http2_seed_parses` is the first per-seed accept-test in the file — a stricter variant that asserts on parsed content, not just parse-or-reject. Future tasks may consolidate by either (a) extending the loop test with content-asserting branches, or (b) adding more per-seed tests next to this one; PLAN does not prescribe.
+- **Carryforward note:** The new seed exercises the schema landed in Tasks 2–3 and the parent `parse_bootstrap` fuzz target. CI fuzz job at Task 14 will run the existing `parse_bootstrap` target against the full corpus including this seed; no action needed before then. When `validate_hcm` gains additional HTTP2-related range checks (e.g., future `connection_keepalive` sub-message range bounds), this seed remains valid because all 4 currently-checked fields use mid-range values well inside the RFC 7540 windows. The `fuzz_corpus_seeds_parse_or_reject_cleanly` loop test does NOT yet list this seed; intentional — the per-seed `fuzz_corpus_hcm_codec_http2_seed_parses` test is stricter (content assertions) and serves a different role. A future cleanup task may add the seed to the loop's "expected to parse" list as a redundant gate.

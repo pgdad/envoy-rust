@@ -4996,6 +4996,29 @@ static_resources:
         assert_unknown_field(err);
     }
 
+    #[test]
+    fn fuzz_corpus_hcm_codec_http2_seed_parses() {
+        // Sanity-check that the new fuzz seed parses cleanly through the
+        // serde + validator pipeline. Mirrors the 04.x corpus-walk acceptance
+        // pattern (e.g., `fuzz_corpus_hcm_route_to_cluster_seed_parses`).
+        let yaml = include_str!("../fuzz/corpus/parse_bootstrap/hcm_codec_http2.yaml");
+        let bs = crate::parse_bootstrap(yaml).expect("seed must parse");
+        let TypedConfig::HttpConnectionManager(hcm) =
+            bs.static_resources.listeners[0].filter_chains[0].filters[0]
+                .typed_config
+                .as_ref()
+                .unwrap()
+        else {
+            panic!();
+        };
+        assert!(matches!(hcm.codec_type, CodecType::HTTP2));
+        let opts = hcm
+            .http2_protocol_options
+            .as_ref()
+            .expect("seed has options");
+        assert_eq!(opts.max_concurrent_streams, Some(100));
+    }
+
     /// Builds a minimal HCM `codec_type: HTTP2` bootstrap with the given
     /// http2_protocol_options field values. Helper for the 4 range-rejection
     /// tests above. Each Option<u32> argument controls one field.
