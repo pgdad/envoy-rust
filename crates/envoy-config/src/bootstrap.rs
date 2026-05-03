@@ -132,6 +132,15 @@ pub struct Listener {
     pub name: String,
     pub address: Address,
     pub filter_chains: Vec<FilterChain>,
+    /// 05.4 NEW per ADR-0026: optional listener filters declared by the
+    /// upstream Envoy `envoy.yaml`. Parse-and-ignore: stored as opaque
+    /// `serde_yaml::Value`s; envoy-rust does NOT execute listener filters
+    /// (SNI dispatch lives at the rustls layer per phase 03.2). The field
+    /// is accepted purely so envoy.yaml fixtures including a
+    /// `listener_filters: [...]` block do not trigger `deny_unknown_fields`
+    /// rejection on any path that parses envoy.yaml through envoy-config.
+    #[serde(default)]
+    pub listener_filters: Vec<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -4580,5 +4589,61 @@ admin:
         let c = &bootstrap.static_resources.clusters[0];
         assert!(matches!(c.cluster_type, ClusterType::StrictDns));
         assert_eq!(c.dns_lookup_family, Some(DnsLookupFamily::V4Only));
+    }
+
+    /// 05.4 NEW (D3, ADR-0026): Listener gains `listener_filters: Vec<serde_yaml::Value>`
+    /// parse-and-ignore field. envoy-rust never executes listener filters by design
+    /// (phase 03.2 chose to put SNI dispatch at the rustls layer); the field is
+    /// purely for upstream-Envoy `envoy.yaml` parseability. New pattern in
+    /// envoy-config — see ADR-0026.
+    #[test]
+    fn parses_listener_with_tls_inspector_listener_filter() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: tcp_listener
+      address: { socket_address: { address: "0.0.0.0", port_value: 0 } }
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+      filter_chains:
+        - filter_chain_match: { server_names: ["a.example.com"] }
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: "/tmp/leaf.pem" }
+                    private_key:       { filename: "/tmp/leaf.key" }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: "127.0.0.1", port_value: 9001 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parses");
+        assert_eq!(bootstrap.static_resources.listeners.len(), 1);
+        let listener = &bootstrap.static_resources.listeners[0];
+        assert_eq!(listener.listener_filters.len(), 1);
+        // Smoke-check the opaque value contains the tls_inspector filter name.
+        let filter_yaml =
+            serde_yaml::to_string(&listener.listener_filters[0]).expect("filter serialises back");
+        assert!(
+            filter_yaml.contains("envoy.filters.listener.tls_inspector"),
+            "filter yaml should contain tls_inspector name: {filter_yaml:?}"
+        );
     }
 }

@@ -4,6 +4,10 @@ static_resources:
   listeners:
     - name: tcp_listener
       address: { socket_address: { address: 0.0.0.0, port_value: {{PORT}} } }
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
       filter_chains:
         - filter_chain_match: { server_names: ["a.example.com"] }
           transport_socket:

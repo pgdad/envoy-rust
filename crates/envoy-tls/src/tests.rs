@@ -920,6 +920,7 @@ fn synth_listener_two_tls_chains(pki: &pki::Pki) -> envoy_config::Listener {
             },
         },
         filter_chains: vec![chain_a, chain_b],
+        listener_filters: vec![],
     }
 }
 

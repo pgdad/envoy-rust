@@ -51,3 +51,29 @@ Source of truth: `SPEC.md` (D1–D7) + `PLAN.md` (Tasks 1–7).
   - `grep -n 'dns_lookup_family' tests/fixtures/000*/envoy-rust.yaml` returns empty (the envoy-rust.yaml siblings are intentionally unchanged).
   - The actual differential green re-baseline is at Task 7 — Tasks 2-6 land progressively; the gate fires once.
 - **Deviations from PLAN:** _(none expected)_
+
+---
+
+## Task 3 — `envoy-config` `Listener.listener_filters` parse-and-ignore + ADR-0026 + fixture 0006 tls_inspector block
+
+- **Commit:** _(pending)_
+- **Deliverables:** SPEC §3 D3.
+- **ADR landed:** ADR-0026 (`Listener.listener_filters` parse-and-ignore field; new pattern in envoy-config).
+- **Files modified:**
+  - `docs/envoy-rust/DECISIONS.md` (ADR-0026 appended after ADR-0024).
+  - `crates/envoy-config/src/bootstrap.rs` (`Listener.listener_filters` field; `parses_listener_with_tls_inspector_listener_filter` parse test).
+  - `crates/envoy-tls/src/tests.rs` (`synth_listener_two_tls_chains` gains `listener_filters: vec![]`).
+  - `tests/fixtures/0006-tls-sni/envoy.yaml` (explicit `tls_inspector` listener-filter block inserted after the `address:` line).
+- **LoC:** ~138 (5 field + 60 parse test + 1 initialiser update + 4 fixture YAML + 13 ADR + ~25 PROGRESS narrative; parse test ran shorter than the planner's ~85 estimate because the YAML body uses `filename: "/tmp/leaf.pem"` flow-style entries rather than block-style + `inline_string:` strings).
+- **Coupling per SPEC §6 signpost 12:** schema + fixture YAML in same commit (splitting would red the parser or red Envoy on macOS Docker).
+- **Verification:**
+  - `cargo test -p envoy-config parses_listener_with_tls_inspector_listener_filter` — `test result: ok. 1 passed`.
+  - `cargo test -p envoy-config` — `test result: ok. 147 passed; 0 failed` (existing 146 + 1 new).
+  - `cargo test -p envoy-tls` — `test result: ok. 15 passed; 0 failed` (existing tests still pass after the literal update).
+  - `cargo clippy -p envoy-config -p envoy-tls --all-targets -- -D warnings` — clean.
+  - `cargo fmt --all -- --check` — clean (after a `cargo fmt --all` apply: rustfmt re-flowed the `let filter_yaml = serde_yaml::to_string(...)` line because the original two-line break put the `.expect(...)` on a continuation that fmt prefers to collapse onto the wrapped form `let filter_yaml = serde_yaml::to_string(&listener.listener_filters[0]).expect("filter serialises back");`; semantically equivalent).
+- **Deviations from PLAN:**
+  - **Step 2 `inline_string:` → `filename:` shape correction:** the plan's verbatim YAML uses `inline_string:` for the embedded cert/key (with explicit fallback note "if the parse rejects them as malformed, replace with `filename:` references"). The validator at `bootstrap.rs:960-968` calls `validate_data_source(..., Required::Filename)` which rejects `inline_string:`-only data sources at parse time (envoy-config's phase-03 baseline accepts `filename:` only; phase-04.1 added `inline_string:` to the schema but it's not yet accepted as the sole-value variant in the listener TLS validator path). Switched to `filename: "/tmp/leaf.pem"` / `filename: "/tmp/leaf.key"` mirroring the existing `parses_listener_with_downstream_tls_context` test (line 2228-2230). The runtime cert load doesn't run during parse, so the non-existent path is safely opaque. Test intent (assert listener_filters parses + smoke-check the opaque value contains the filter name) preserved verbatim.
+  - **Step 2 struct path correction:** as projected in the plan's "ALSO" note, the actual hierarchy is `bootstrap.static_resources.listeners`, not `bootstrap.listeners`. Adjusted to match the existing `parses_listener_with_downstream_tls_context` analogue.
+  - **Step 2 `admin:` block omitted intentionally:** the plan's "ALSO" note flagged the prior Task 1 defect of YAML missing `admin:`. In this test the bootstrap has 1 listener so the validator's `admin.is_none() && listeners.is_empty()` rejection at bootstrap.rs:885 does NOT fire; no `admin:` block needed. (The same shape is used by the analogous `parses_listener_with_downstream_tls_context` test at line 2211 with no admin block.)
+- **Pattern note:** parse-and-ignore is now a documented envoy-config posture per ADR-0026. Future fields meeting the criteria may follow the same pattern without a new ADR.
