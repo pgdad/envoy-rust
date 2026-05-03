@@ -91,12 +91,17 @@ impl ClientStream {
             wire.extend_from_slice(value.as_bytes());
             wire.extend_from_slice(b"\r\n");
         }
-        // CL header — only emit if the request doesn't already carry one.
+        // CL header — emit synthetic content-length only when the request
+        // does not carry an explicit Content-Length AND the body is
+        // non-empty. RFC 7230 §3.3.2 + Envoy v1.33 parity per ADR-0025
+        // ("a user agent SHOULD NOT send a Content-Length header field
+        // when the request message does not contain a payload body").
         let request_has_cl = request
             .headers
             .iter()
             .any(|(n, _)| n.eq_ignore_ascii_case(hdr::CONTENT_LENGTH));
-        if !request_has_cl {
+        let body_is_nonempty = request.body_bytes().is_some_and(|b| !b.is_empty());
+        if !request_has_cl && body_is_nonempty {
             wire.extend_from_slice(b"content-length: ");
             wire.extend_from_slice(request.body_len_string().as_bytes());
             wire.extend_from_slice(b"\r\n");
@@ -457,9 +462,13 @@ mod tests {
             s.contains("user-agent: test\r\n"),
             "missing user-agent: {s:?}"
         );
+        // 05.4 NEW per ADR-0025: empty-body GET requests do NOT carry
+        // a synthetic content-length: 0 header (RFC 7230 §3.3.2 + Envoy
+        // v1.33 parity). The previous assertion expected the spurious
+        // header; the new assertion confirms it is suppressed.
         assert!(
-            s.contains("content-length: 0\r\n"),
-            "missing content-length: {s:?}"
+            !s.contains("content-length: 0\r\n"),
+            "spurious content-length: 0 must NOT be emitted on empty-body GET: {s:?}"
         );
         assert!(s.ends_with("\r\n\r\n"), "wire end: {s:?}");
     }

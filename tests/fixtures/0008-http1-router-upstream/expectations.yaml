@@ -6,7 +6,7 @@ driver:
   expected_status: 200
   expected_body:
     kind: byte_exact
-    body: "method: GET\npath: /\nheaders:\n  content-length: 0\n  host: envoy-rust.test\nbody: \n"
+    body: "method: GET\npath: /\nheaders:\n  host: envoy-rust.test\nbody: \n"
   expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact

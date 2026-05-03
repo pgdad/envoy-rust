@@ -99,3 +99,25 @@ Source of truth: `SPEC.md` (D1–D7) + `PLAN.md` (Tasks 1–7).
   - `cargo fmt --all -- --check` — clean (no fmt drift; no remediation needed).
   - Test-internal ephemeral binds at lines 212/236/281/332 (`"127.0.0.1:0"`) are intentionally unchanged — confirmed by `grep` only flagging the 3 production binds at 118/109/98.
 - **Deviations from PLAN:** None. Line numbers, exact `before`/`after` strings, and tracing-log shapes all matched the plan verbatim. The bind-address flip is mechanically transparent: `0.0.0.0` is a superset of `127.0.0.1` reachability, so all existing tests connecting to `127.0.0.1:<port>` still hit the listener (confirmed by 18/18 tests passing).
+
+## Task 5 — `envoy-http1::Client` content-length: 0 suppression on empty-body + ADR-0025 + fixture 0008 expectations update
+
+- **Commit:** _(pending)_
+- **Deliverables:** SPEC §3 D5.
+- **ADR landed:** ADR-0025 (suppress synthetic `content-length: 0` on empty-body GET; RFC 7230 §3.3.2 + Envoy v1.33 parity).
+- **Files modified:**
+  - `docs/envoy-rust/DECISIONS.md` (ADR-0025 appended after ADR-0026 at line 478; landing-time order ADR-0023 → ADR-0024 → ADR-0026 → ADR-0025 preserved).
+  - `crates/envoy-http1/src/client.rs` (`body_is_nonempty` predicate added at the request-write CL emission block; `send_request_writes_serialized_request_bytes` assertion flipped from `s.contains(...)` to `!s.contains(...)` with a 4-line ADR-0025 reference comment).
+  - `tests/fixtures/0008-http1-router-upstream/expectations.yaml` (`expected_body.body:` line drops `  content-length: 0\n` substring; remaining shape `method: GET\npath: /\nheaders:\n  host: envoy-rust.test\nbody: \n` is unchanged).
+- **LoC:** ~46 (6 client predicate-and-comment + 8 unit test flip-and-comment + 1 fixture YAML + 13 ADR + 18 PROGRESS narrative).
+- **Coupling per SPEC §6 signpost 11:** client behavior change + expectations update in same commit (splitting would red the unit test or red fixture 0008 byte-equal echo body).
+- **Verification:**
+  - Pre-fix `cargo test -p envoy-http1 send_request_writes_serialized_request_bytes`: `test result: FAILED. 1 failed` (exactly as plan Step 3 projected; failure dump showed `GET / HTTP/1.1\r\nhost: envoy-rust.test\r\nuser-agent: test\r\ncontent-length: 0\r\n\r\n`).
+  - Post-fix `cargo test -p envoy-http1 send_request_writes_serialized_request_bytes`: `test result: ok. 1 passed; 0 failed`.
+  - Full `cargo test -p envoy-http1`: `test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`. No other test asserted on `content-length: 0` for an empty-body request — the fix is bounded as projected.
+  - `cargo clippy -p envoy-http1 --all-targets -- -D warnings` — clean.
+  - `cargo fmt --all -- --check` — clean (no fmt drift; no remediation needed).
+  - `grep -c '^## ADR-' docs/envoy-rust/DECISIONS.md` = `27` (was 26 pre-task; matches plan's controller-calibration projection of 27 = 24 active ADRs + the template-marker line at line 10 + ADR-0024 + ADR-0026 + ADR-0025 = 27 sectioned headings — consistent with the count post-Task-3).
+  - `grep -n '^## ADR-' docs/envoy-rust/DECISIONS.md | tail -4` shows `ADR-0023` (line 424) → `ADR-0024` (line 437) → `ADR-0026` (line 459) → `ADR-0025` (line 478) — landing-time order preserved.
+  - Fixture 0008 differential green re-baseline materializes at Task 7.
+- **Deviations from PLAN:** None. Line numbers had drifted slightly from the plan's projection (CL emission block at lines 94-103 actual; assertion at lines 460-463 actual), but the plan's intent matched verbatim. The `Request::body_bytes()` accessor was found at the projected location `crates/envoy-http1/src/codec.rs:62-64` with the projected signature `pub(crate) fn body_bytes(&self) -> Option<&[u8]>` — no deviation in accessor name or shape. `is_some_and(|b| !b.is_empty())` is the idiomatic Rust ≥1.70 form for the `Option<&[u8]>` non-empty predicate; clippy raised no objection.
