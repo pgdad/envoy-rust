@@ -31,6 +31,9 @@ pub fn http_to_envoy_request(req: HttpRequest<Bytes>) -> Result<Request, Http2Er
     // :path → path. h2 exposes the path through `parts.uri.path_and_query()`;
     // for absolute URIs (http://authority/path) the path component is just
     // `/path`. For path-only URIs it's the same. Preserve the query if present.
+    // Defensive default: real H2 always carries `:path`, but if the Uri lacks
+    // one, route-walk needs a non-empty path (else `prefix:` matchers would
+    // match every rule). "/" is the safe canonical default.
     let path = parts
         .uri
         .path_and_query()
@@ -50,7 +53,8 @@ pub fn http_to_envoy_request(req: HttpRequest<Bytes>) -> Result<Request, Http2Er
                 .get(http::header::HOST)
                 .and_then(|hv| hv.to_str().ok())
                 .map(str::to_string)
-        });
+        })
+        .filter(|s| !s.is_empty());
 
     let authority = authority_str.ok_or(Http2Error::MissingAuthority)?;
 
@@ -83,7 +87,7 @@ pub fn http_to_envoy_request(req: HttpRequest<Bytes>) -> Result<Request, Http2Er
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use http::{HeaderMap, Method, Request as HttpRequest, Uri};
+    use http::{Method, Request as HttpRequest, Uri};
 
     /// Build an `http::Request` with the given pseudo-header values + extra
     /// headers, with a body of given bytes. Used by the tests below.
@@ -108,7 +112,6 @@ mod tests {
             // when the Uri is in absolute form. Set the Uri appropriately instead:
             *req.uri_mut() = format!("http://{a}{uri}").parse().unwrap();
         }
-        let _: &HeaderMap = req.headers();
         req
     }
 
@@ -145,5 +148,36 @@ mod tests {
             .find(|(n, _)| n.eq_ignore_ascii_case("host"))
             .expect("Host header must be synthesized from :authority");
         assert_eq!(host.1, "test.example");
+    }
+
+    #[test]
+    fn http_to_envoy_request_missing_authority_returns_error() {
+        // No URI authority + no Host header → MissingAuthority.
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("/path".parse::<Uri>().unwrap())
+            .body(Bytes::new())
+            .unwrap();
+        let err = http_to_envoy_request(req).expect_err("must fail without authority");
+        assert!(matches!(err, Http2Error::MissingAuthority), "got {err:?}");
+    }
+
+    #[test]
+    fn http_to_envoy_request_non_utf8_header_value_returns_error() {
+        // A non-UTF-8 header value should raise MalformedH2HeaderBlock.
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("http://test.example/".parse::<Uri>().unwrap())
+            .header(
+                "x-binary",
+                http::HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
+            )
+            .body(Bytes::new())
+            .unwrap();
+        let err = http_to_envoy_request(req).expect_err("must fail on non-UTF-8");
+        assert!(
+            matches!(err, Http2Error::MalformedH2HeaderBlock),
+            "got {err:?}"
+        );
     }
 }

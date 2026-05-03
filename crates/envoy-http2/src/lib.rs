@@ -21,3 +21,4 @@ mod error;
 pub mod request;
 
 pub use error::Http2Error;
+pub use request::http_to_envoy_request;
