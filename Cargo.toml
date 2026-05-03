@@ -5,6 +5,7 @@ members = [
     "crates/envoy-cluster",
     "crates/envoy-config",
     "crates/envoy-http1",
+    "crates/envoy-http2",
     "crates/envoy-listener",
     "crates/envoy-tcp",
     "crates/envoy-tls",
