@@ -18,5 +18,6 @@
 //!   - `client`   — upstream H2C origination (envoy_http2::Client + ClientStream).
 
 mod error;
+pub mod request;
 
 pub use error::Http2Error;

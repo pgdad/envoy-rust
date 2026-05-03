@@ -357,3 +357,67 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
   2. **rustfmt reflowed 2 lines.** The `MissingAuthority` `#[error(...)]` attribute exceeded the 100-col line limit and rustfmt expanded it to a 3-line form. The first `assert!(s.contains(...), "...")` likewise expanded to 4 lines. Functionally identical; same as the rustfmt nudges noted in Tasks 2 and 4.
 - **Carryforward note:** Module slots `request.rs` (Task 6), `response.rs` (Task 7), `codec.rs` (Task 8), and `hcm.rs` (Task 9) will use `Http2Error` as their typed-error type. The 3 `h2::Error`-wrapping variants get exercised at those task boundaries (handshake → Task 9; stream accept → Task 9; body read → Task 6). The 3 pure-shape variants similarly: `MissingAuthority` gates the `:authority` → `Host:` synthesis (Task 6), `MalformedH2HeaderBlock` is defense-in-depth at the same site, and `BadStatusCode` gates the response status emission (Task 7). The `From<h2::Error>` blanket impl is intentionally absent — call sites must pick the right variant per failure context. The `BadStatusCode { status: u16 }` parameter type is `u16` (not `http::StatusCode`) because the variant exists precisely for emit-time values that escape the type-state guard; using `u16` keeps the failure path representable.
 - **Post-review fixup:** Added `h2_handshake_displays_with_source` test (Display-with-source shape coverage for H2Handshake/H2StreamAccept/H2BodyRead, which share the `{source}` Display attribute) and corrected the Task 5 rationale that erroneously claimed `h2::Error` has no public constructor (it does, via `From<h2::Reason>`). Closes code-quality reviewer M1.
+
+---
+
+## Task 6 — `crates/envoy-http2/src/request.rs` (`http_to_envoy_request` adapter + 2 tests)
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** D3 request.rs — new `request` submodule under `envoy-http2` housing the `http_to_envoy_request` adapter that translates an `http::Request<Bytes>` (post-body-drain shape produced by the runtime caller in Task 9) into an `envoy_http1::codec::Request` value type. Pseudo-header mapping per parent-05 SPEC §6 signpost 12: `:method` → `Request.method`, `:path` → `Request.path` (preserving query string), `:authority` → synthesized as a `Host:` row appended at the bottom of `Request.headers` (per cross-sub-phase architectural rule 3, required by the existing 04.x Host-driven route-walk), `:scheme` → ignored. `Request.version` is set to `HttpVersion::Http11` because the route-walk treats requests uniformly post-codec-edge; H2 framing concerns stay inside `envoy-http2`. The adapter is `pub` (entry point for the future Task 9 HCM dispatch). 2 unit tests cover (a) header preservation through translation (lowercase-name + value pass-through) and (b) `:authority` → `Host:` synthesis. `MissingAuthority` is the failure mode when neither `parts.uri.authority()` nor a `Host:` header exists; `MalformedH2HeaderBlock` covers non-UTF-8 header values (defense-in-depth — h2 normally catches these earlier).
+- **ADR landed:** None (Task 6 directly applies parent-05 SPEC §6 signpost 12 + cross-sub-phase architectural rule 3; no decisions needed beyond what SPEC settles).
+- **Files modified:**
+  - `crates/envoy-http2/src/request.rs` (created) — 149 lines incl. doc-comments + 2 unit tests + 1 build-helper.
+  - `crates/envoy-http2/src/lib.rs` — appended `pub mod request;` at module scope. rustfmt reordered the two module declarations into alphabetical form (`mod error;` first, then `pub mod request;`) on `cargo fmt --all`; preserved.
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~150 raw lines (149 request.rs + 1 lib.rs delta + this PROGRESS section). PLAN estimated ~110 (impl ~80 + 2 tests ~30); the ~40-line overshoot is dominated by the 14-line module-level `//!` doc-comment block (PLAN budgeted impl-only at 80 incl. doc) and the 23-line `build_request` helper which encodes the H2-specific Uri-mutation pattern (`http://{authority}{uri}`) needed to mirror `parts.uri.authority()` from real h2 traffic. Functional content matches PLAN line-for-line.
+- **Verification:**
+
+  Step 6.2 — `cargo test -p envoy-http2` (failing-test confirmation, before `http_to_envoy_request` exists, with only the test module in `request.rs`):
+  ```
+  error[E0425]: cannot find function `http_to_envoy_request` in this scope
+    --> crates/envoy-http2/src/request.rs:45:19
+     |
+  45 |         let out = http_to_envoy_request(req).expect("translates");
+     |                   ^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+  error[E0425]: cannot find function `http_to_envoy_request` in this scope
+    --> crates/envoy-http2/src/request.rs:68:19
+     |
+  68 |         let out = http_to_envoy_request(req).expect("translates");
+     |                   ^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+  ```
+  Failed exactly as PLAN predicted (function not defined; both new tests fail to resolve the symbol).
+
+  Step 6.4 — same command after Step 6.3:
+  ```
+  running 5 tests
+  test error::tests::h2_handshake_displays_with_source ... ok
+  test error::tests::bad_status_code_displays_value ... ok
+  test error::tests::missing_authority_displays_descriptively ... ok
+  test request::tests::http_to_envoy_request_synthesizes_host_from_authority ... ok
+  test request::tests::http_to_envoy_request_lowercases_headers ... ok
+
+  test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+  Suite goes 3 → 5 (Task 5 left it at 3 post-fixup; Task 6 adds 2).
+
+  Workspace gates (post-fmt + post-doc-list-fix):
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.64s
+
+  $ cargo fmt --all -- --check
+  (empty — clean)
+  ```
+
+  Workspace-wide test sanity: all green; envoy-http2 went 3 → 5 (matches per-crate run above); no other crate's test count moved.
+
+- **Deviations from PLAN:**
+  1. **rustfmt reordered `mod error;` and `pub mod request;` alphabetically.** PLAN Step 6.1 said "Insert immediately above the `mod error;` line" (i.e., `pub mod request;` first). After running `cargo fmt --all`, rustfmt produced the canonical `mod error;\npub mod request;` ordering (alphabetical, matching the standard library and most workspace conventions). Functionally identical; module-resolution order is independent of declaration order.
+  2. **Doc-list continuation lines de-indented from 17 spaces to 4 spaces.** Initial clippy run flagged `clippy::doc_overindented_list_items` on the `:authority` bullet's continuation lines (PLAN's verbatim text used 17-space indent to align under the back-tick; clippy 1.95 demands list-item-relative 4-space indent). Reduced to 4-space continuation; meaning preserved.
+  3. **Second test's `build_request(...)` call collapsed to one line by rustfmt.** PLAN's verbatim test body used multi-line argument form for the second test call too; rustfmt deemed it short enough for the 100-col single-line form and reflowed. Functionally identical; same kind of cosmetic rustfmt nudge as Tasks 2/4/5.
+- **Carryforward note:** The adapter is consumed by Task 9 (downstream H2C HCM dispatch) — that task drains `h2::RecvStream` into `Bytes` then hands the `http::Request<Bytes>` here. Task 7 (response emitter) operates on the symmetric output side; both share `Http2Error` as the typed-error currency. The `MalformedH2HeaderBlock` defense-in-depth path is exercised here for the first time (non-UTF-8 header value); the variant's other intended use (structurally invalid pseudo-headers — missing `:method` or `:path`) is gated by the `http::Request` type itself, which refuses to construct without those fields, so the adapter doesn't need to re-check. Future H2 trailers translation (not in 05.2 SPEC §4 scope) would extend this module with a sibling adapter; the current shape leaves room.
+
