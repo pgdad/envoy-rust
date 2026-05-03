@@ -9,6 +9,7 @@ members = [
     "crates/envoy-listener",
     "crates/envoy-tcp",
     "crates/envoy-tls",
+    "tests/conformance/h2spec",
     "tests/differential",
     "tests/helpers/http1-echo-server",
     "tests/helpers/tcp-echo-server",

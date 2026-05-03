@@ -1,0 +1,20 @@
+[package]
+name = "h2spec-conformance"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "h2spec_runner"
+path = "tests/h2spec_runner.rs"
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util", "net"] }
+anyhow = "1"
+tempfile = "3"

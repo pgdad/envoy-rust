@@ -825,3 +825,71 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 
 - **Carryforward note:** Phase 05.2 differential surface is now complete. The fixture exercises the full HCM-on-H2 dispatch path (envoy-bin → envoy-listener → envoy-http2::HCM → h2::server → route-walk → direct_response synth → h2 SendStream) under cross-implementation equivalence vs upstream Envoy v1.33.0. Task 13 lays in the h2spec conformance runner (orthogonal to differential); Task 14 wires the new fixture into the GitHub Actions workflow alongside the existing 04.x H1 fixtures. No further fixture work expected for 05.2.
 
+## Task 13 — `tests/conformance/h2spec/` runner crate scaffold
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** First conformance suite in the project's history. New workspace member at `tests/conformance/h2spec/` (`h2spec-conformance` package, version `0.0.0`, `publish = false`) housing five files: `Cargo.toml` + `src/lib.rs` (empty `#![forbid(unsafe_code)]` shell) + `tests/h2spec_runner.rs` (~245 lines, the runner) + `h2spec.yaml` (HCM HTTP2 config with `{{PORT}}` template marker) + `known-failures.txt` (header doc + empty body — entries populated at Task 14 when h2spec runs end-to-end in CI). The runner spawns `envoy-bin` against the rendered HCM HTTP2 config, runs h2spec via subprocess, parses h2spec's terminal output for pass/fail counts and failing test IDs, and asserts three gates: (a) overall pass rate ≥ 95% (`PASS_RATE_GATE = 0.95`), (b) every failing test must be enumerated in `known-failures.txt` (no surprise regressions), (c) every entry in `known-failures.txt` must still actually fail (lockstep maintenance — when an h2spec test starts passing, the file MUST be trimmed in the same commit). When `which h2spec` fails locally the test `eprintln!`-skips per phase 05.2 SPEC §3 D7; CI provisions the binary at Task 14.
+- **ADR landed:** None. Per parent SPEC §7 / PLAN Task 13 narrative, ADR-0028 (h2spec integration posture) was RECOMMENDED NOT TO LAND — the gate-mechanics are mechanically deterministic per parent §6 signposts 3-4 (h2spec binary management via curl-tar in CI + `which h2spec` skip locally; known-failures.txt format = one-line-per-test-id with `# reason`), so inline PROGRESS narration here suffices. The ADR-0028 number stays available for phase-06+.
+- **Files modified:**
+  - `Cargo.toml` (root) — added `"tests/conformance/h2spec",` to `[workspace] members` between `"crates/envoy-tls"` and `"tests/differential"` (alphabetic order). Member count went from 12 to 13.
+  - `tests/conformance/h2spec/Cargo.toml` (created, 21 lines) — package manifest. `[lib] path = "src/lib.rs"`; `[[test]] name = "h2spec_runner" path = "tests/h2spec_runner.rs"`; empty `[dependencies]`; `[dev-dependencies]` lists `tokio` (with `rt-multi-thread`, `macros`, `process`, `time`, `io-util`, `net` features), `anyhow`, and `tempfile = "3"`. PLAN Step 13.1's verbatim block omitted `tempfile`; added at task time per PLAN's explicit hedge ("verify by trying to compile and add what's needed").
+  - `tests/conformance/h2spec/src/lib.rs` (created, 6 lines) — `#![forbid(unsafe_code)]` + module-level doc-comment. Empty lib (the runner lives in `tests/h2spec_runner.rs`).
+  - `tests/conformance/h2spec/h2spec.yaml` (created, 33 lines) — HCM HTTP2 config; bind 127.0.0.1, `{{PORT}}` placeholder substituted by the runner at test time, single VH + single route returning `direct_response: { status: 200, body: { inline_string: "h2spec" } }`. Pasted verbatim from PLAN Step 13.4.
+  - `tests/conformance/h2spec/known-failures.txt` (created, 23 lines) — header doc-comment block describing the file format + empty body + two example commented-out entries. Pasted verbatim from PLAN Step 13.5 with one localized edit: "Populated at Task 13 execution time" → "Populated at Task 14 execution time" because Task 13 is the scaffold and Task 14 is when h2spec actually runs end-to-end in CI (h2spec is not installed on the dev machine, so the Task 13 run skips with `eprintln!`).
+  - `tests/conformance/h2spec/tests/h2spec_runner.rs` (created, ~245 lines) — the runner. Pasted from PLAN Step 13.6 with the binary-locate adapted: `env!("CARGO_BIN_EXE_envoy-bin")` (PLAN's verbatim) does NOT work from a sibling crate (Cargo only defines that env var for tests inside the crate that owns the binary target), so an inline `locate_envoy_bin()` helper mirrors the pattern at `tests/differential/src/subject.rs::locate_envoy_bin` — walk up from `CARGO_MANIFEST_DIR` to the workspace root (three parents up, vs. two in the differential crate), honor `CARGO_TARGET_DIR`, then `target/<profile>/envoy-bin`. Three additional task-time fixups landed: (1) `failures.contains(t)` → `failures.contains(*t)` to satisfy `BTreeSet<String>::contains` (PLAN's verbatim caused E0277), (2) `let mut child = ...` → `let child = ...` (the binding is never reassigned; PLAN's verbatim warned under `#[warn(unused_mut)]`), (3) two clippy fixups — `if let && if` collapsed into `if let && ` (clippy::collapsible_if), and a doc-comment list got a blank line before its trailing paragraph (clippy::doc_lazy_continuation).
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~330 raw lines across the five new files (Cargo.toml 21 + lib.rs 6 + h2spec.yaml 33 + known-failures.txt 23 + h2spec_runner.rs ~245) + PROGRESS section ~30. PLAN estimated ~370; actual ~330 within margin.
+- **Verification:**
+
+  Step 13.7 — `cargo build --workspace --all-targets`:
+  ```
+   Compiling h2spec-conformance v0.0.0 (/Users/esa/git/envoy-rust/tests/conformance/h2spec)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+  ```
+  Clean compile after the three task-time fixups (E0277 type-check, `unused_mut` warning, clippy `collapsible_if` + `doc_lazy_continuation`).
+
+  Step 13.8 — `cargo test -p h2spec-conformance -- --nocapture`:
+  ```
+       Running tests/h2spec_runner.rs (target/debug/deps/h2spec_runner-...)
+
+  running 1 test
+  h2spec_runner: h2spec not found — skipping locally
+  test h2spec_pass_rate_gate ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  ```
+  Skipped via `eprintln!` per SPEC §3 D7 — `which h2spec` fails on the dev machine; the runner caught the bail and printed the skip line. End-to-end h2spec invocation is deferred to Task 14 CI provisioning. No local-platform classification of failures is possible at this task; `known-failures.txt` ships with empty body and Task 14 populates it after the first CI run.
+
+  Workspace gates:
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.57s
+
+  $ cargo fmt --all -- --check
+  (empty — clean)
+
+  $ cargo test --workspace 2>&1 | grep -E '^test result' | aggregate
+  passed: 372 failed: 0 ignored: 2
+  ```
+  Workspace tests went from 371 (Task 12 baseline) to 372: the new `h2spec_pass_rate_gate` runner test adds exactly one (skipped locally, but counted as `passed`). No other crate's count moved; no regression.
+
+- **Verified shapes (greps run at task time):**
+  - Root `Cargo.toml` `[workspace] members` ordering: `crates/envoy-bin`, `crates/envoy-cluster`, `crates/envoy-config`, `crates/envoy-http1`, `crates/envoy-http2`, `crates/envoy-listener`, `crates/envoy-tcp`, `crates/envoy-tls`, `tests/differential`, `tests/helpers/http1-echo-server`, `tests/helpers/tcp-echo-server`, `tests/helpers/tls-echo-server` (12 entries pre-Task-13). `tests/conformance/h2spec` inserted between `crates/envoy-tls` and `tests/differential` per alphabetic order.
+  - `tests/differential/src/subject.rs::locate_envoy_bin` confirmed as the cross-crate envoy-bin location pattern: walks up `CARGO_MANIFEST_DIR` (two parents to workspace root in the differential case), honors `CARGO_TARGET_DIR`, picks `debug` vs `release` profile via `cfg!(debug_assertions)`, appends `.exe` on Windows, asserts the binary exists. Mirrored verbatim with one substitution: `tests/conformance/h2spec` is three parents up from workspace root (vs. two for `tests/differential`), so the helper chains three `.parent()` calls.
+  - `crates/envoy-bin/tests/http2_direct_response.rs` confirmed as the same-crate envoy-bin invocation pattern: uses `env!("CARGO_BIN_EXE_envoy-bin")` directly because it lives inside the envoy-bin crate's `tests/` directory. This pattern is NOT portable to the new sibling crate — Cargo only defines that env var for tests inside the binary's owning crate. Hence the `locate_envoy_bin` walk-pattern instead of an artifact dependency (artifact dependencies require nightly Rust per the cargo book).
+  - h2spec is not installed locally (`which h2spec` returns "not found"); the runner's `eprintln!`-skip path is exercised. End-to-end invocation deferred to Task 14 CI.
+
+- **Deviations from PLAN:**
+  1. **`tempfile` added to `[dev-dependencies]`.** PLAN Step 13.1's verbatim Cargo.toml block listed only `tokio` and `anyhow`. The runner uses `tempfile::tempdir()` (PLAN Step 13.6 line `let dir = tempfile::tempdir()?;`). PLAN's task description explicitly hedged: "verify by trying to compile and add what's needed." Added `tempfile = "3"` (matches the version used by other workspace test crates).
+  2. **Sibling-crate envoy-bin location.** PLAN Step 13.6 used `env!("CARGO_BIN_EXE_envoy-bin")` to locate the binary. That `CARGO_BIN_EXE_*` env var is only defined for tests inside the crate that owns the binary target — sibling-crate tests (which is what `tests/conformance/h2spec/tests/h2spec_runner.rs` is) get a "no such macro" compile error. PLAN's task description anticipated this and recommended the `subject::locate_envoy_bin()`-style helper. Inlined a `locate_envoy_bin()` helper modeled on `tests/differential/src/subject.rs::locate_envoy_bin` (three parents up to workspace root, vs. two in the differential crate).
+  3. **Task-time fixup: `BTreeSet::contains` argument type.** PLAN's verbatim Gate (c) used `failures.contains(t)` where `t: &&String`; `BTreeSet<String>::contains` wants `&String`, so changed to `failures.contains(*t)`. Mirrors the working PLAN Gate (b) line which uses `*t` already — Gate (c) was a copy-paste-near-miss.
+  4. **Task-time fixup: `let mut child` → `let child`.** PLAN's verbatim runner declared `let mut child = ...` for the envoy-bin subprocess, but the binding is never reassigned (just `drop(child)` later). `#[warn(unused_mut)]` fired; dropped the `mut`. (`drop(child)` does not require `mut`.)
+  5. **Task-time fixup: clippy `collapsible_if` + `doc_lazy_continuation`.** Two clippy lints fired under `-D warnings`: `locate_h2spec`'s `if let Ok(out) = ... { if out.status.success() { ... } }` collapsed into `if let Ok(out) = ... && out.status.success() { ... }`; and `parse_h2spec_output`'s doc-comment got a blank line inserted before its trailing paragraph ("If the actual h2spec format differs..."). Both are mechanical lint fixes; no semantic change.
+  6. **`known-failures.txt` task-reference shifted Task 13 → Task 14.** PLAN Step 13.5's verbatim header said "Populated at Task 13 execution time after h2spec is run end-to-end for the first time"; reworded to "Populated at Task 14 execution time after h2spec is run end-to-end for the first time in CI" because Task 13 is the scaffold (h2spec is not installed locally; runner skips), and Task 14 is when h2spec actually runs end-to-end via CI provisioning.
+  7. **ADR-0028 NOT landed.** Per PLAN Task 13 narrative + parent SPEC §7. The decision is recorded inline above (no DECISIONS.md edit). ADR-0028 number stays available for phase-06+.
+
+- **Carryforward note:** The `h2spec_runner` test currently passes via skip (no h2spec binary on the dev machine). Task 14 lands the CI provisioning (curl-tar from `summerwind/h2spec` GitHub releases), at which point the test runs end-to-end and the planner classifies any failures into `known-failures.txt` (deferral / foundation-limitation / regression-blocker). The runner's parser (`parse_h2spec_output`) is the planner's best-guess at PLAN-write time; if h2spec's actual output format doesn't match the assumed `× <id>` / `✓ <id>` markers + `Failed: N` summary line, Task 14 adjusts the parser. The conformance scaffold is otherwise complete and orthogonal to the differential surface (Task 12 closed differential).
+

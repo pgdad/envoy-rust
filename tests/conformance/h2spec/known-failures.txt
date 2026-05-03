@@ -1,0 +1,23 @@
+# h2spec known-failures for envoy-rust at phase 05.2.
+#
+# Each non-comment line is a single h2spec test ID (the dotted-numeric ID
+# h2spec emits in its terminal output, e.g., "5.1.1/2") followed optionally
+# by spaces and a `# <reason>` doctrine annotation. Failures NOT listed
+# here regress the gate. Failures listed here BUT now passing also regress
+# the gate (forces lockstep maintenance — when an h2spec test starts
+# passing, this file MUST be trimmed in the same commit).
+#
+# Format: <h2spec-test-id>  # <one-line reason>
+#
+# Initial population: empty. Populated at Task 14 execution time after
+# h2spec is run end-to-end for the first time in CI (planner identifies
+# which tests fail, classifies each as "deferred-to-future-phase" /
+# "codec-foundation-limitation" / "intentional-Envoy-divergence-per-ADR" /
+# "regression-blocker", and lands the file with one annotated entry per
+# expected failure). If a failure cannot be classified as deferral or
+# foundation limitation, it is a blocker — re-loop into REVIEW.md state 5
+# rather than landing it as a known-failure.
+
+# Example entries (replace at task time with the actual failures):
+# 5.1.1/2                    # GOAWAY handling deferred to phase-08 graceful drain
+# 6.5.3/1                    # SETTINGS_INITIAL_WINDOW_SIZE override deferred per parent SPEC §4
