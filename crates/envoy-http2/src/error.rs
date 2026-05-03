@@ -72,4 +72,19 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("999"), "expected mention of 999: {s}");
     }
+
+    #[test]
+    fn h2_handshake_displays_with_source() {
+        // Smoke-test the Display-with-source shape used by H2Handshake /
+        // H2StreamAccept / H2BodyRead. h2::Error has a public construction
+        // path via `From<h2::Reason>`; that's enough to assemble a real
+        // wrapped-source variant for the format-string check.
+        let src: h2::Error = h2::Reason::PROTOCOL_ERROR.into();
+        let e = Http2Error::H2Handshake { source: src };
+        let s = format!("{e}");
+        assert!(
+            s.starts_with("HTTP/2 handshake failed:"),
+            "expected handshake prefix: {s}"
+        );
+    }
 }
