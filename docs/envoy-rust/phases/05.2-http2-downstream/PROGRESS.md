@@ -760,3 +760,68 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 - **Carryforward note:** The differential harness now has all the primitives Task 12's `0009-http2-direct-response/` Docker-gated fixture needs: `Driver::Http2` for the YAML grammar, `drive_http2` for the wire I/O, the `port_key` extension for template substitution, and the per-driver dispatch arm for the per-axis equivalence cascade. Task 12 lays in the upstream Envoy YAML + envoy-rust YAML + `expectations.yaml` + the Docker-gated test wrapper that calls `run_fixture` against the new fixture directory; no further harness lib changes expected for 05.2.
 - **Post-review fixup:** Three substantive Minor findings closed in a single fixup. (M2) Added a one-line comment above `release_capacity(...).ok();` in `drive_http2` explaining why the helper swallows the error (best-effort; any real error surfaces on next `data()` call) — clarifies the asymmetry with HCM's `?`-propagation pattern. (M6) Added `debug_assert!(matches!(method, Http1Method::Get), ...)` at the top of `drive_http2` to make the GET-only limitation visible at runtime in debug builds; updated the inline `end_of_stream=true` comment to point to the assertion. (M7) Changed the headers-conversion loop to error on non-UTF-8 header values via `with_context` (mirrors `drive_http1`'s posture) instead of silently mapping to empty strings. Closes code-quality reviewer M2 + M6 + M7 on Task 11. (M1, M3, M4, M5 cosmetic — deferred.)
 
+## Task 12 — Fixture `0009-http2-direct-response/` + Docker-gated test wrapper
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** First H2C differential fixture in the project's history. Five fixture files (envoy.yaml + envoy-rust.yaml + inputs/payload.bin + expectations.yaml + README.md) under `tests/fixtures/0009-http2-direct-response/` mirror fixture 0007's shape with `codec_type: HTTP1` → `codec_type: HTTP2` substituted; the Docker-gated test wrapper at `tests/differential/tests/http2_direct_response.rs` is a 7-line `tokio::test` that calls `differential::run_fixture` against the fixture directory. The driver in `expectations.yaml` is `kind: http2 / method: get / path: "/" / host: envoy-rust.test / expected_status: 200 / expected_body: { kind: byte_exact, body: "ok\n" } / expected_headers: set_equal_modulo_allow_list` — the harness's Task-11 `Driver::Http2` arm consumes these fields and runs the per-axis equivalence cascade across upstream Envoy v1.33.0 ↔ envoy-rust. The fixture is the differential counterpart of Task 10's in-process integration test: same HCM-on-H2 dispatch surface, same direct_response: 200 "ok\n" payload, but now compared against upstream Envoy's emitted response under H2 prior-knowledge.
+- **ADR landed:** None (Task 12 directly applies the parent §6 signpost 20 fixture-YAML precedent; no new decisions).
+- **Files modified:**
+  - `tests/fixtures/0009-http2-direct-response/envoy.yaml` (created, 30 lines) — upstream-Envoy YAML; bind 0.0.0.0, includes `admin: { ... port_value: 0 }` block and `generate_request_id: false` to suppress upstream's request-id stamp (which envoy-rust does not emit).
+  - `tests/fixtures/0009-http2-direct-response/envoy-rust.yaml` (created, 28 lines) — envoy-rust YAML; bind 127.0.0.1, no admin block, no `generate_request_id` field. Per parent-04 fixture-pair convention.
+  - `tests/fixtures/0009-http2-direct-response/inputs/payload.bin` (created, empty) — required by the harness's fixture-shape contract even when the driver is HTTP-not-TCP.
+  - `tests/fixtures/0009-http2-direct-response/expectations.yaml` (created, 13 lines) — `Driver::Http2` body + `Equivalence { response_status: Exact, response_body: ByteExact }`.
+  - `tests/fixtures/0009-http2-direct-response/README.md` (created, 28 lines) — fixture surface + cross-reference to SPEC §3 D6 + sibling H1 fixture pointer.
+  - `tests/differential/tests/http2_direct_response.rs` (created, 19 lines) — Docker-gated test wrapper; mirrors `http1_direct_response.rs`'s shape verbatim modulo the fixture path.
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~118 raw lines across the six new files (envoy.yaml 30 + envoy-rust.yaml 28 + inputs/payload.bin 0 + expectations.yaml 13 + README.md 28 + Docker wrapper test 19) + PROGRESS section ~25. PLAN estimated ~130; actual ~118 within margin (PLAN's per-file estimates were conservative).
+- **Verification:**
+
+  Step 12.7 — `cargo test -p envoy-bin --test http2_direct_response`:
+  ```
+  running 1 test
+  test http2_direct_response_round_trip ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+  ```
+  In-process integration backstop from Task 10 still passes — confirms fixture 0009's YAML shape is mechanically valid against the envoy-rust dispatch path and that adding the fixture did not regress Task 10's surface.
+
+  Bonus — `cargo test -p differential --test http2_direct_response`:
+  ```
+  running 1 test
+  ...
+  envoy-rust listening (http_connection_manager) addr=127.0.0.1:58613 stat_prefix=ingress_http2 codec_type=HTTP2
+  test http2_direct_response_fixture ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+  ```
+  Docker is available locally on this machine, so the Docker-gated test ran end-to-end against upstream Envoy v1.33.0 (`envoyproxy/envoy:v1.33.0` container) ↔ envoy-rust. Both sides produced byte-equal responses (status 200, body `"ok\n"`) under the per-axis equivalence cascade. The "connection closed before reading preface" WARN line is the harness's `wait_ready` TCP-connect probe before the H2 client handshake — expected.
+
+  Step 12.8 — workspace gates:
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.79s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.47s
+
+  $ cargo fmt --all -- --check
+  (empty — clean)
+
+  $ cargo test --workspace 2>&1 | grep -E '^test result' | aggregate
+  passed: 371 failed: 0 ignored: 2
+  ```
+  Workspace tests went from 370 (Task 11 baseline) to 371: the new `http2_direct_response_fixture` Docker-gated test adds exactly one. No other crate's count moved; no regression.
+
+- **Verified shapes (greps run at task time):**
+  - `tests/fixtures/0007-http1-direct-response/` directory listing confirmed the 5-file shape (envoy.yaml + envoy-rust.yaml + expectations.yaml + inputs/ + README.md). Mirrored exactly.
+  - `tests/differential/tests/http1_direct_response.rs` is the canonical Docker-gated wrapper — 19 lines, unconditional `#[tokio::test]` calling `differential::run_fixture`. Mirrored byte-for-byte modulo the fixture-path tail (`0007-http1-direct-response` → `0009-http2-direct-response`) and the doc-comment text.
+  - `Driver::Http2 { method, path, host, expected_status?, expected_body?, expected_headers? }` confirmed at `tests/differential/src/lib.rs:86-96` (Task 11 lift). The `kind: http2` discriminant lands via `#[serde(tag = "kind", rename_all = "snake_case")]` on the `Driver` enum; `expected_*` fields all `#[serde(default)]`.
+  - `run_fixture(&Path) -> Result<()>` at `tests/differential/src/lib.rs:927` is unconditional — there is no skip-on-missing-docker gate at the test-wrapper level. Docker availability is implicit: if `docker` is not installed (or the daemon is not running), the upstream-Envoy spawn at `tests/differential/src/upstream.rs::start_upstream_envoy` fails with `starting upstream envoy container`, which propagates as a test failure. Sibling fixtures (`echo.rs`, `tcp_proxy.rs`, `tls_*.rs`, `http1_*.rs`) all use the same posture; CI's `ubuntu-latest` runner has Docker pre-installed. No skip-pattern needed.
+  - Sibling `http1_direct_response.rs`'s opening doc-comment ("phase-00 echo, phase-01 admin_ready, phase-02.2 tcp_proxy, and phase-03 tls_* fixtures") was extended in the new test's doc-comment to add "phase-04 http1_*" — keeps the fixture-list-in-doc-comments running tally consistent across the test family.
+
+- **Deviations from PLAN:**
+  1. **Fixture YAMLs use empty leading line / no leading line per file's natural shape** — `envoy.yaml` and `envoy-rust.yaml` are pasted verbatim from the PLAN. No deviation; this is just a note that line counts (30 / 28) are slightly higher than PLAN's per-file estimates (~40 / ~38) because the PLAN-quoted blocks count YAML lines including leading blank-line ceremony that the actual file does not need. The semantic content is verbatim.
+  2. **No skip-on-missing-docker pattern in the Docker-gated test wrapper.** PLAN Step 12.7 hedges: "If the test fails because Docker is unavailable, document the skip-on-missing posture and ensure the test compiles cleanly." Reviewed sibling Docker-gated tests (`echo.rs`, `http1_direct_response.rs`, etc.) — none use a skip-on-missing-docker gate; the convention is unconditional `#[tokio::test]` and let upstream-spawn failure surface. CI runs on `ubuntu-latest` which has Docker; local runs without Docker would fail at the upstream container spawn. No deviation from PLAN's verbatim test body — just confirming the chosen posture.
+
+- **Carryforward note:** Phase 05.2 differential surface is now complete. The fixture exercises the full HCM-on-H2 dispatch path (envoy-bin → envoy-listener → envoy-http2::HCM → h2::server → route-walk → direct_response synth → h2 SendStream) under cross-implementation equivalence vs upstream Envoy v1.33.0. Task 13 lays in the h2spec conformance runner (orthogonal to differential); Task 14 wires the new fixture into the GitHub Actions workflow alongside the existing 04.x H1 fixtures. No further fixture work expected for 05.2.
+
