@@ -807,6 +807,11 @@ pub async fn drive_http2(
 ) -> Result<DriveHttp1Result> {
     use tokio::net::TcpStream;
 
+    debug_assert!(
+        matches!(method, Http1Method::Get),
+        "drive_http2 currently only supports GET; widen the helper if/when a fixture needs body request methods"
+    );
+
     let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connecting to {addr}"))?;
@@ -827,7 +832,9 @@ pub async fn drive_http2(
     }
     let req = builder.body(()).context("request build")?;
 
-    // Send the request with end_of_stream=true (no body for GET).
+    // Send the request with end_of_stream=true. Currently GET-only — see the
+    // debug_assert! above; a future widening would compute end_of_stream from
+    // a body parameter.
     let (response_fut, _send_stream) = send_request
         .send_request(req, true)
         .context("H2 send_request")?;
@@ -841,17 +848,24 @@ pub async fn drive_http2(
     while let Some(chunk) = body_stream.data().await {
         let chunk = chunk.context("H2 body data")?;
         body.extend_from_slice(&chunk);
-        // Release flow-control window.
+        // Best-effort window release — any error here will also surface on the
+        // next body_stream.data() call, so swallowing keeps the helper readable.
+        // (Asymmetric to HCM at crates/envoy-http2/src/hcm.rs:104 which
+        // propagates with `?`; HCM owns the connection lifetime, this helper
+        // does not.)
         body_stream
             .flow_control()
             .release_capacity(chunk.len())
             .ok();
     }
 
-    let headers: Vec<(String, String)> = header_map
-        .iter()
-        .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-        .collect();
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(header_map.len());
+    for (n, v) in header_map.iter() {
+        let value_str = v
+            .to_str()
+            .with_context(|| format!("non-UTF-8 H2 response header value for `{}`", n.as_str()))?;
+        headers.push((n.as_str().to_string(), value_str.to_string()));
+    }
 
     // Abort the connection task — we have the full response, and the server
     // will not necessarily close the TCP socket on its own (h2's `Connection`
