@@ -321,12 +321,16 @@ name = "envoy-bin"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "envoy-cluster",
  "envoy-config",
  "envoy-http1",
+ "envoy-http2",
  "envoy-listener",
  "envoy-tcp",
  "envoy-tls",
+ "h2",
+ "http",
  "httparse",
  "rcgen",
  "rustls",

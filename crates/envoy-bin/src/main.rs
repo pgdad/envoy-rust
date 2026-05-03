@@ -218,21 +218,38 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     hcm_cfg,
                     std::sync::Arc::clone(&cluster_mgr),
                 )?);
-                let hcm: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
-                    std::sync::Arc::new(envoy_http1::HCM { config: hcm_config });
 
-                // Per-listener TLS detection (factored to
-                // `build_downstream_tls_for_listener` at task 11). The
-                // TLS-wrap path is unreachable in 04.x fixtures (no 04.x
-                // fixture combines HTTP/1.1 + TLS) — the existing
-                // `TlsAcceptingHandler` is hard-coded to `Arc<TcpProxy>`
-                // (per the inherent-generic `handle::<S>` design in
-                // `tls_handler.rs`), so wrapping HCM in TLS requires
-                // generalizing the adapter, which is deliberately deferred
-                // to phase 05+ per SPEC §3 D4. We still detect-and-bail
-                // here so a misconfigured HCM+TLS listener fails loudly
-                // rather than silently serving plaintext on a TLS port.
-                if build_downstream_tls_for_listener(listener_cfg)?.is_some() {
+                // 05.2 NEW: H1-vs-H2 dispatch on hcm_cfg.codec_type.
+                // - AUTO / HTTP1 → envoy_http1::HCM (existing 04.x path)
+                // - HTTP2       → envoy_http2::HCM (new in 05.2)
+                // - HTTP3       → unreachable (validator rejected at parse time)
+                let hcm: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
+                    match hcm_cfg.codec_type {
+                        envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1 => {
+                            std::sync::Arc::new(envoy_http1::HCM { config: hcm_config })
+                        }
+                        envoy_config::CodecType::HTTP2 => {
+                            std::sync::Arc::new(envoy_http2::HCM::new(hcm_config))
+                        }
+                        envoy_config::CodecType::HTTP3 => {
+                            unreachable!("CodecType::HTTP3 rejected by validator at parse time");
+                        }
+                    };
+
+                // TLS-detect-and-bail: only meaningful for the H1 path.
+                // For H2 the validator already rejected TLS+HTTP2 at parse
+                // time (Http2OverTlsNotSupported) so this branch is
+                // unreachable for H2. The H1 branch retains the 04.x
+                // detect-and-bail: TlsAcceptingHandler is hard-coded to
+                // `Arc<TcpProxy>` (per the inherent-generic `handle::<S>`
+                // design in `tls_handler.rs`), so wrapping HCM in TLS
+                // requires generalizing the adapter, which is deliberately
+                // deferred to phase 05+ per SPEC §3 D4.
+                if matches!(
+                    hcm_cfg.codec_type,
+                    envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1
+                ) && build_downstream_tls_for_listener(listener_cfg)?.is_some()
+                {
                     anyhow::bail!(
                         "HCM listener with downstream TLS is not supported in phase 04.x; \
                          TlsAcceptingHandler is currently TcpProxy-only and will be \
@@ -247,6 +264,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 tracing::info!(
                     addr = %bind_addr,
                     stat_prefix = %hcm_cfg.stat_prefix,
+                    codec_type = ?hcm_cfg.codec_type,
                     "envoy-rust listening (http_connection_manager)",
                 );
                 let shutdown = token.clone();

@@ -649,3 +649,56 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 - **Carryforward note:** The HCM-on-H2 dispatch contract is now in place. `envoy-bin` Task 10 wires the new `envoy_http2::HCM` into the listener-walk site at `crates/envoy-bin/src/main.rs:207` HCM arm with H1-vs-H2 branching on `hcm_cfg.codec_type`. The `BuildOutcome::Proxy` 502 stub is the only surface that 05.3 D13.3 must replace; everything else (handshake, stream accept, route-walk, synth, header strip, body emit, hop-by-hop strip) is final-shape. Future H2 trailers emission, body forwarding for chunked-request-body, and upstream H2 origination all extend this module without disturbing the 05.2 contract.
 - **Post-review fixup:** Four code-quality findings closed in a single fixup commit. (I1) Added struct-level doc-comment on `HCMConfig` explaining that the struct is shared across H1+H2 dispatch paths per cross-sub-phase architectural rule 2 (clarifies why `http2_protocol_options` lives in the envoy-http1 crate). (I3) Removed the redundant `tracing::warn!` in `serve_h2_connection`'s accept-error arm (the wrapped `Http2Error::H2StreamAccept` is already logged by the listener on return; double-logging eliminated). (M2) Introduced a `TestServer` RAII guard in `hcm::tests` that calls `JoinHandle::abort()` on drop, fixing the per-test listener-task leak. (M3) Marked `ClusterManager::empty()` `#[doc(hidden)]` to discourage production misuse while keeping it callable for test fixtures. Closes code-quality reviewer I1+I3+M2+M3 on Task 9. (I2 deferred per reviewer recommendation; M4/M5 acceptably deferred to 05.3 / future test-tightening.)
 
+## Task 10 — `envoy-bin` HCM-on-H2 wiring + in-process integration test
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** Listener-walk dispatch wiring at `crates/envoy-bin/src/main.rs:207` HCM_FILTER arm gains H1-vs-H2 dispatch on `hcm_cfg.codec_type`. AUTO/HTTP1 continue through the existing `envoy_http1::HCM { config }` shape; HTTP2 routes to `envoy_http2::HCM::new(hcm_config)` (the same `Arc<envoy_http1::HCMConfig>` is consumed via the type-alias re-export from Task 9). HTTP3 is `unreachable!` (validator rejected at parse time per Task 2's accept-flip). The TLS-detect-and-bail (04.1 Task 11) is now gated by `matches!(codec_type, AUTO | HTTP1)` so the H2 path is never funneled into the H1-only `TlsAcceptingHandler`; the H2+TLS combination is already rejected upstream by the validator's `Http2OverTlsNotSupported` (Task 2). The `tracing::info!` at listener-bind time gains a `codec_type = ?hcm_cfg.codec_type` field for operability. Local in-process integration test `crates/envoy-bin/tests/http2_direct_response.rs` spawns `envoy-bin` via `CARGO_BIN_EXE_envoy-bin` against a minimal HCM-direct_response config with `codec_type: HTTP2`, drives a single `GET /` via `h2::client::handshake`, and asserts status 200 + body `"ok\n"`. `kill_on_drop(true)` posture per SPEC §6 local signpost 22.
+- **ADR landed:** None (Task 10 directly applies the parent §6 signpost 22 dispatch contract + SPEC §6 local signposts 18 and 22; no new decisions).
+- **Files modified:**
+  - `crates/envoy-bin/Cargo.toml` — added `envoy-http2 = { path = "../envoy-http2" }` to `[dependencies]` (alphabetic insertion between `envoy-http1` and `envoy-listener`); added `bytes = "1"`, `h2 = "0.4"`, `http = "1"` to `[dev-dependencies]` (consumed by the new integration test).
+  - `crates/envoy-bin/src/main.rs` — replaced the single-arm `Arc::new(envoy_http1::HCM { ... })` construction at line 222 with a `match hcm_cfg.codec_type { AUTO|HTTP1 => http1::HCM, HTTP2 => http2::HCM::new(hcm_config), HTTP3 => unreachable!() }`. Gated the TLS-detect-and-bail by `matches!(codec_type, AUTO | HTTP1)`. Added `codec_type` to the listener-bind `tracing::info!`. rustfmt rewrapped the `match` expression to break across `match hcm_cfg.codec_type {` (one extra indent level over the verbatim PLAN block, functionally identical).
+  - `crates/envoy-bin/tests/http2_direct_response.rs` (created) — ~130 lines incl. doc-header + `reserve_port` / `wait_ready` helpers + the `#[tokio::test]` body. Verbatim from PLAN lines 2571-2703 with one tweak: dropped `mut` on the `child` binding (rustc/clippy `unused_mut` warning — `child` is consumed by the bare `drop(child)` SIGKILL line, never mutated).
+  - `Cargo.lock` — auto-regenerated to reflect the new `envoy-bin → envoy-http2` runtime edge plus `bytes`, `h2`, `http` dev-edges (already present transitively via other workspace crates; no new versions resolved).
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~165 raw lines across all files. envoy-bin/main.rs delta ~32 (match block + comment + matches! gate + codec_type tracing field). Cargo.toml +5 (1 dep + 3 dev-deps + alphabetic-insertion churn). Integration test ~130. Cargo.lock auto. PROGRESS section ~25. PLAN estimated ~160; actual ~165 within margin.
+- **Verification:**
+
+  Step 10.4 — `cargo test -p envoy-bin --test http2_direct_response -- --nocapture`:
+  ```
+  running 1 test
+  test http2_direct_response_round_trip ... ok
+
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+  ```
+  envoy-bin spawn → listener bind on 127.0.0.1:<reserved-port> → `wait_ready` connect-loop (~50ms first poll) → `h2::client::handshake` → `GET /` with `:authority: envoy-rust.test` → response status 200 + body `"ok\n"`. End-to-end round-trip via the new HCM-on-H2 dispatch arm.
+
+  Step 10.5 — workspace gates:
+  ```
+  $ cargo build --workspace --all-targets 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.81s
+
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.58s
+
+  $ cargo fmt --all -- --check
+  (empty — clean, after rustfmt's match-expression rewrap was applied)
+
+  $ cargo test --workspace 2>&1 | grep -E '^test result:' | aggregate
+  passed: 369 failed: 0 ignored: 2
+  ```
+  Workspace tests went from 368 (Task 9 baseline) to 369: the new `http2_direct_response_round_trip` integration test adds exactly one. envoy-http1 stayed at 43; envoy-http2 stayed at 19 + 1 ignored; no other crate's count moved. The H1 integration test (`http1_direct_response_round_trip`) continues to pass — confirms the `matches!(AUTO|HTTP1)` gate did not regress the existing TLS-detect-and-bail or the H1 dispatch arm.
+
+- **Verified shapes (greps run at task time):**
+  - `crates/envoy-bin/src/main.rs` line 207 HCM arm matched the PLAN's quoted shape exactly (variable names `hcm_cfg`, `hcm_config`, `bind_addr`, `cluster_mgr`, `token`, `set` — all match). The pre-existing TLS-detect-and-bail at lines 235-241 was unconditional; the new wiring gates it by `matches!(codec_type, AUTO | HTTP1)`.
+  - `envoy_http2::HCM::new(Arc<HCMConfig>) -> Self` confirmed at `crates/envoy-http2/src/hcm.rs:36` (Task 9 contract).
+  - `envoy_http2::HCMConfig` is a type alias for `envoy_http1::HCMConfig` per `crates/envoy-http2/src/hcm.rs:26`, so the same `Arc<envoy_http1::HCMConfig>` constructed at line 217 flows into both dispatch arms without any conversion.
+  - `bytes`, `h2`, `http` were absent from envoy-bin's `[dev-dependencies]`; all three added (bytes for `BytesMut::new()`, h2 for `client::handshake`, http for `Request::builder`).
+  - The `http1_direct_response.rs` integration test was the binary-locate / retry-loop pattern source; the new H2 test mirrors it (same `reserve_port`, `wait_ready`, `CARGO_BIN_EXE_envoy-bin`, `kill_on_drop(true)` shape).
+
+- **Deviations from PLAN:**
+  1. **`http = "1"` added to `[dev-dependencies]`** (not explicitly listed in PLAN's `Cargo.toml` step). PLAN named only `tempfile`, `bytes`, `anyhow`, `h2`. The integration test body uses `http::Request::builder()` directly — `h2` does not re-export `http`, so the dev-dep is mandatory for the test to compile. Same `http = "1"` version that envoy-http2 already pins in its own `[dependencies]`; no version skew.
+  2. **`mut` removed from `let mut child = ...`** in the integration test — rustc emits `unused_mut` warning under the `[warn(unused)]` workspace lint, which `-D warnings` turns into an error. PLAN's verbatim block had `let mut child` because the H1 sibling test does explicit `child.kill().await` + `child.stderr.take()` for stderr-on-failure post-mortem; the H2 test instead uses bare `drop(child)` (SIGKILL via `kill_on_drop(true)`) with no method calls on `child`, so the `mut` is genuinely unused. Functionally identical to PLAN's intent.
+  3. **rustfmt match-expression rewrap** in main.rs HCM arm. PLAN's verbatim block writes the match on one line (`let hcm: ... = match hcm_cfg.codec_type {`); rustfmt breaks it across two lines (`let hcm: ... =\n        match hcm_cfg.codec_type {`) when the type annotation pushes the line past the 100-column limit. Functionally identical; same kind of cosmetic rustfmt nudge as Tasks 2/4/5/6/7/8/9.
+
+- **Carryforward note:** Phase 05.2 envoy-rust-only backstops are now complete. The HCM-on-H2 dispatch site is reachable end-to-end (envoy-bin → envoy-listener → envoy-http2::HCM → h2::server → route-walk → direct_response synth → h2 SendStream); the `BuildOutcome::Proxy` 502 stub remains the only surface that 05.3 D13.3 must replace. Task 11 picks up the gitignore allow-list entry for the new `e2e_http2_*.yaml` config-fuzz seeds + Task 12 lays in the Docker-gated differential equivalence test (`tests/differential/tests/http2_direct_response.rs`) against upstream Envoy.
+

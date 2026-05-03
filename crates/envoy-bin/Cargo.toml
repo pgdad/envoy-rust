@@ -14,6 +14,7 @@ anyhow = "1"
 envoy-cluster = { path = "../envoy-cluster" }
 envoy-config = { path = "../envoy-config" }
 envoy-http1 = { path = "../envoy-http1" }
+envoy-http2 = { path = "../envoy-http2" }
 envoy-listener = { path = "../envoy-listener" }
 envoy-tcp = { path = "../envoy-tcp" }
 envoy-tls = { path = "../envoy-tls" }
@@ -24,6 +25,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+bytes = "1"
+h2 = "0.4"
+http = "1"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pki-types = "1"
