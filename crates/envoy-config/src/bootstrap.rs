@@ -952,6 +952,14 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
     // Per-listener invariants.
     for listener in &mut bootstrap.static_resources.listeners {
         for chain in &mut listener.filter_chains {
+            // Snapshot per-chain TLS state for `validate_hcm`'s D2.a check
+            // (phase 05.2 SPEC §3 — reject `codec_type: HTTP2` on TLS chains).
+            // Mirrors the predicate just below: a chain is "TLS" iff its
+            // `transport_socket.name == TLS_TRANSPORT_SOCKET`.
+            let chain_has_tls = chain
+                .transport_socket
+                .as_ref()
+                .is_some_and(|ts| ts.name == crate::TLS_TRANSPORT_SOCKET);
             if let Some(ts) = chain.transport_socket.as_ref() {
                 if ts.name != crate::TLS_TRANSPORT_SOCKET {
                     return Err(crate::ConfigError::UnknownTransportSocketName(
@@ -1030,7 +1038,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                         let TypedConfig::HttpConnectionManager(hcm) = typed else {
                             return Err(crate::ConfigError::MissingTypedConfig(crate::HCM_FILTER));
                         };
-                        validate_hcm(hcm, &bootstrap.static_resources.clusters)?;
+                        validate_hcm(hcm, &bootstrap.static_resources.clusters, chain_has_tls)?;
                     }
                     _ => {
                         return Err(crate::ConfigError::UnsupportedFilter(
@@ -1103,18 +1111,31 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
 
 /// Validate a fully-parsed `HttpConnectionManagerConfig` against the phase-04.1
 /// surface. SPEC §3 D2 enumerates the rejections this function fires.
+///
+/// `chain_has_tls` is the enclosing `filter_chain.transport_socket.is_some()`
+/// folded down to a bool; phase 05.2 SPEC §3 D2.a uses it to reject
+/// `codec_type: HTTP2` on TLS chains (TLS+ALPN+H2 deferred per parent-05 SPEC §4).
 fn validate_hcm(
     hcm: &mut HttpConnectionManagerConfig,
     clusters: &[Cluster],
+    chain_has_tls: bool,
 ) -> Result<(), crate::ConfigError> {
-    // codec_type: only AUTO and HTTP1 are runtime-supported in phase 04.
+    // codec_type: AUTO, HTTP1, and HTTP2 are runtime-supported. HTTP3 is
+    // rejected pending future work. HTTP2 over TLS is rejected separately
+    // below per phase 05.2 SPEC §3 D2.a (TLS+ALPN+H2 deferred per parent-05
+    // SPEC §4); the per-chain TLS state is plumbed in via `chain_has_tls`.
     match hcm.codec_type {
-        CodecType::AUTO | CodecType::HTTP1 => {}
-        CodecType::HTTP2 | CodecType::HTTP3 => {
+        CodecType::AUTO | CodecType::HTTP1 | CodecType::HTTP2 => {}
+        CodecType::HTTP3 => {
             return Err(crate::ConfigError::UnsupportedCodecType {
                 got: hcm.codec_type,
             });
         }
+    }
+
+    // 05.2 NEW — D2.a TLS+HTTP2 rejection.
+    if matches!(hcm.codec_type, CodecType::HTTP2) && chain_has_tls {
+        return Err(crate::ConfigError::Http2OverTlsNotSupported);
     }
 
     // http_filters: cardinality + name.
@@ -3275,38 +3296,11 @@ admin:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 "#;
 
-    #[test]
-    fn rejects_codec_type_http2() {
-        let hcm = format!(
-            r#"
-                stat_prefix: x
-                codec_type: HTTP2
-                route_config:
-                  name: r
-                  virtual_hosts:
-                    - name: vh
-                      domains: ["*"]
-                      routes:
-                        - match: {{ prefix: "/" }}
-                          direct_response:
-                            status: 200
-                            body: {{ inline_string: "ok" }}
-{}"#,
-            VALID_ROUTER_FILTER
-        );
-        let yaml = make_hcm_listener_yaml(&hcm);
-        let err = parse_then_validate(&yaml).expect_err("should reject HTTP2");
-        assert!(
-            matches!(
-                err,
-                crate::ConfigError::UnsupportedCodecType {
-                    got: CodecType::HTTP2
-                }
-            ),
-            "got: {:?}",
-            err
-        );
-    }
+    // Pre-Task-2 `rejects_codec_type_http2` deleted: phase 05.2 Task 2 flipped
+    // codec_type: HTTP2 from "rejected" to "accepted on plaintext listeners".
+    // The new positive test `parses_hcm_with_codec_type_http2` (above, defined
+    // alongside `rejects_hcm_with_codec_type_http2_on_tls_listener`) replaces
+    // it; the HTTP3 rejection test below remains the lone codec_type negative.
 
     #[test]
     fn rejects_codec_type_http3() {
@@ -4644,6 +4638,94 @@ static_resources:
         assert!(
             filter_yaml.contains("envoy.filters.listener.tls_inspector"),
             "filter yaml should contain tls_inspector name: {filter_yaml:?}"
+        );
+    }
+
+    // --- phase 05.2 Task 2: codec_type: HTTP2 accept-flip + TLS-rejection ---
+
+    #[test]
+    fn parses_hcm_with_codec_type_http2() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: http2_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http2
+                codec_type: HTTP2
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#;
+        let bs = crate::parse_bootstrap(yaml).expect("parses");
+        let listener = &bs.static_resources.listeners[0];
+        let TypedConfig::HttpConnectionManager(hcm) = listener.filter_chains[0].filters[0]
+            .typed_config
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("expected HCM");
+        };
+        assert!(matches!(hcm.codec_type, CodecType::HTTP2));
+    }
+
+    #[test]
+    fn rejects_hcm_with_codec_type_http2_on_tls_listener() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+static_resources:
+  listeners:
+    - name: tls_h2_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response: { status: 200, body: { inline_string: "ok\n" } }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: /tmp/cert.pem }
+                    private_key: { filename: /tmp/key.pem }
+  clusters: []
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject TLS+HTTP2");
+        assert!(
+            matches!(err, crate::ConfigError::Http2OverTlsNotSupported),
+            "expected Http2OverTlsNotSupported, got {err:?}"
         );
     }
 }

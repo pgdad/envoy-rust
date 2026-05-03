@@ -98,7 +98,16 @@ pub enum ConfigError {
     /// require `tls_inspector` listener filter, deferred to a later phase).
     #[error("listener {listener:?} mixes TLS and plaintext filter chains")]
     MixedTlsAndPlaintextFilterChainsOnListener { listener: String },
-    #[error("unsupported codec_type: {got:?}; only AUTO and HTTP1 are supported in phase 04")]
+    /// HCM `codec_type: HTTP2` declared on a listener whose `filter_chains[*]`
+    /// carries a `transport_socket` of name `envoy.transport_sockets.tls`. Phase
+    /// 05's H2 posture is plaintext H2C only — TLS+ALPN+H2 is deferred per
+    /// parent-05 SPEC §4. Whichever later phase ships ALPN-negotiated H2 over
+    /// TLS retires this variant.
+    #[error(
+        "HTTP/2 over TLS is not supported in phase 05; the listener must be plaintext or use codec_type: HTTP1/AUTO"
+    )]
+    Http2OverTlsNotSupported,
+    #[error("unsupported codec_type: {got:?}; only AUTO, HTTP1, and HTTP2 are supported")]
     UnsupportedCodecType { got: bootstrap::CodecType },
     #[error(
         "unsupported HTTP filter: {name}; only envoy.filters.http.router is supported in phase 04.x"
