@@ -91,14 +91,10 @@ async fn run_h2spec_gate() -> Result<()> {
 
     eprintln!("=== h2spec stdout ===\n{stdout}\n=== h2spec stderr ===\n{stderr}");
 
-    // Parse h2spec's summary line. h2spec emits a final summary like:
-    //   Tests: NNN
-    //   Passed: MM
-    //   Skipped: KK
-    //   Failed:  LL
-    // The exact format may vary by h2spec version; the planner verifies at
-    // task time and adjusts the parser. The minimal correct parser greps
-    // for "Passed:" and "Failed:" lines and parses the integer.
+    // Parse h2spec's summary line. h2spec emits a final summary of the form
+    //   `<N> tests, <M> passed, <K> skipped, <L> failed`
+    // (verified against CI run 25294002788). See `parse_h2spec_output` below
+    // for the section-context derivation that recovers full failure IDs.
     let (passed, failed, failures) = parse_h2spec_output(&stdout)?;
     let total = passed + failed;
     let pass_rate = if total == 0 {
@@ -214,78 +210,133 @@ fn reserve_port() -> Result<u16> {
     Ok(p)
 }
 
-/// Returns true if `s` looks like an h2spec test ID: dotted-numeric optionally
-/// followed by `/<number>` (e.g., "5.1.1/2", "6.5", "8.1.2.3/14"). Used to
-/// reject stray `× <reason text>` lines from the failures set.
-fn looks_like_h2spec_test_id(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    // Must start with a digit; chars limited to digits, dots, slashes.
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_digit() {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_digit() || c == '.' || c == '/')
-}
-
 /// Parse h2spec's terminal output. Returns (passed, failed, failures) where
-/// `failures` is a sorted list of failing test IDs.
+/// `failures` is a sorted set of failing test IDs.
 ///
-/// h2spec's actual output format varies by version. The planner verifies at
-/// task time by running `h2spec -h 127.0.0.1 -p <port>` against a known-
-/// good H2 server and inspecting the output. The parser below assumes:
-///   - A line `Failed: N tests` carries the failed count.
-///   - Failed test IDs appear inline as `× <test-id>` markers.
-///   - Passed test IDs appear inline as `✓ <test-id>` markers.
+/// h2spec's actual output (verified against the CI run `25294002788` log) is
+/// hierarchical: section headings of the form `<digits>(.<digits>)*\. <title>`
+/// announce a context, and per-test lines `× <N>: <description>` (failures)
+/// or `✔ <N>: <description>` (passes — note U+2714 HEAVY CHECK MARK, NOT the
+/// U+2713 CHECK MARK the original parser scraped) appear underneath. The full
+/// test ID is `<section>/<N>`, e.g., section `3.5` + test `2` ⇒ `3.5/2`.
 ///
-/// If the actual h2spec format differs, adjust the parser; this is the
-/// load-bearing planner-time verification per parent §6 signpost 4.
+/// Counts come from the canonical summary line, emitted (twice) as:
+///   `<N> tests, <M> passed, <K> skipped, <L> failed`
+/// Per-line marker scraping is unreliable for counts (sub-tests nested under
+/// a parent test, header ornamentation), so we read the summary instead and
+/// only use marker scraping to recover failing test IDs.
 fn parse_h2spec_output(stdout: &str) -> Result<(usize, usize, std::collections::BTreeSet<String>)> {
-    let mut passed = 0usize;
-    let mut failed = 0usize;
+    let mut current_section: Option<String> = None;
     let mut failures = std::collections::BTreeSet::new();
+
     for line in stdout.lines() {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed
-            .strip_prefix("× ")
-            .or_else(|| trimmed.strip_prefix("x "))
+
+        // Section heading: "3.5. HTTP/2 Connection Preface"
+        if let Some(section) = parse_section_heading(trimmed) {
+            current_section = Some(section);
+            continue;
+        }
+
+        // Failure line: "× 2: Sends invalid connection preface"
+        if let Some(rest) = trimmed.strip_prefix("× ")
+            && let Some(num_str) = rest.split(':').next()
+            && !num_str.is_empty()
+            && num_str.chars().all(|c| c.is_ascii_digit())
+            && let Some(section) = &current_section
         {
-            // Failed test. The ID is the first whitespace-delimited token.
-            if let Some(id) = rest.split_whitespace().next()
-                && looks_like_h2spec_test_id(id)
-            {
-                failures.insert(id.to_string());
-                failed += 1;
-            }
-        } else if trimmed.starts_with("✓ ") || trimmed.starts_with("o ") {
-            passed += 1;
+            failures.insert(format!("{section}/{num_str}"));
         }
     }
-    // Cross-check via the summary line if present.
-    if let Some(summary_passed) = extract_summary_count(stdout, "Passed") {
-        passed = summary_passed;
-    }
-    if let Some(summary_failed) = extract_summary_count(stdout, "Failed") {
-        failed = summary_failed;
-    }
+
+    let (passed, failed) = parse_summary_line(stdout)
+        .ok_or_else(|| anyhow::anyhow!("h2spec summary line not found in output"))?;
+
     Ok((passed, failed, failures))
 }
 
-fn extract_summary_count(stdout: &str, key: &str) -> Option<usize> {
+/// Parse a section heading line of the form `<digits>(.<digits>)*\. <title>`.
+/// Returns the dotted-numeric prefix (e.g., `"3.5"`) if matched.
+fn parse_section_heading(line: &str) -> Option<String> {
+    // Look for the first ". " (dot+space) separating prefix from title.
+    let dot_space = line.find(". ")?;
+    let prefix = &line[..dot_space];
+    if prefix.is_empty() {
+        return None;
+    }
+    if !prefix.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    if prefix.starts_with('.') || prefix.ends_with('.') {
+        return None;
+    }
+    if prefix.contains("..") {
+        return None;
+    }
+    Some(prefix.to_string())
+}
+
+/// Parse the summary line `<N> tests, <M> passed, <K> skipped, <L> failed`.
+/// Returns `(passed, failed)`. Returns `None` if no such line is present.
+fn parse_summary_line(stdout: &str) -> Option<(usize, usize)> {
     for line in stdout.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(&format!("{key}:")) {
-            for tok in rest.split_whitespace() {
-                if let Ok(n) = tok.parse::<usize>() {
-                    return Some(n);
-                }
+        if !trimmed.contains(" tests,") || !trimmed.contains(" passed") {
+            continue;
+        }
+        let mut passed = None;
+        let mut failed = None;
+        for chunk in trimmed.split(',') {
+            // Each chunk is "<N> <label>".
+            let (num, label) = chunk.trim().split_once(' ')?;
+            let n: usize = num.parse().ok()?;
+            match label.trim() {
+                "passed" => passed = Some(n),
+                "failed" => failed = Some(n),
+                _ => {}
             }
+        }
+        if let (Some(p), Some(f)) = (passed, failed) {
+            return Some((p, f));
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_summary_line_extracts_pass_fail_counts() {
+        let line = "146 tests, 144 passed, 1 skipped, 1 failed";
+        assert_eq!(parse_summary_line(line), Some((144, 1)));
+    }
+
+    #[test]
+    fn parse_h2spec_output_extracts_section_failure_ids() {
+        // Excerpt synthesized from CI run 25294002788's h2spec output.
+        let stdout = "\
+Hypertext Transfer Protocol Version 2 (HTTP/2)
+  3. Starting HTTP/2
+    3.5. HTTP/2 Connection Preface
+      using source address 127.0.0.1:55152
+      × 2: Sends invalid connection preface
+        -> The endpoint MUST terminate the TCP connection.
+           Expected: GOAWAY Frame (Error Code: PROTOCOL_ERROR)
+                     Connection closed
+             Actual: Error: read tcp ...: read: connection reset by peer
+
+Finished in 0.2086 seconds
+146 tests, 144 passed, 1 skipped, 1 failed
+";
+        let (passed, failed, failures) = parse_h2spec_output(stdout).expect("parse");
+        assert_eq!(passed, 144);
+        assert_eq!(failed, 1);
+        assert!(
+            failures.contains("3.5/2"),
+            "expected 3.5/2 in failures, got {failures:?}"
+        );
+        assert_eq!(failures.len(), 1);
+    }
 }
