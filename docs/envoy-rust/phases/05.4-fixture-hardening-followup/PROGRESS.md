@@ -137,3 +137,141 @@ Source of truth: `SPEC.md` (D1–D7) + `PLAN.md` (Tasks 1–7).
   - `cargo fmt --all -- --check` — clean (no output, no drift).
   - Behavioral verification of the 2000ms bump (i.e. that DNS resolution actually completes by 2000ms on the 5 host-gateway fixtures) deferred to Task 7's CI run per PLAN signpost K.
 - **Deviations from PLAN:** None. Line drift inside `tests/differential/src/upstream.rs` was minor — the `tokio::time::sleep(Duration::from_millis(500)).await;` originally projected at line 88 was found at line 88 verbatim. Indentation note: the original sleep was at 4-space indent (function-body level, immediately after the `get_host_port_ipv4` `?;`), not 8-space — the planner's snippet showed 8-space leading whitespace; matched the surrounding `let host_port = ...;` block at 4 spaces. The 2000ms ceiling was NOT tightened in this task per SPEC §6 signpost 16.
+
+---
+
+## Task 7 — State-4 phase-done gate verification — substantively closes phase-04.3 REVIEW C-1
+
+- **Commit:** _(pending — this verification commit)_
+- **Deliverables:** SPEC §3 D7.
+- **ADR landed:** None (D7 is verification only).
+- **Files modified:**
+  - `docs/envoy-rust/phases/05.4-fixture-hardening-followup/PROGRESS.md` (this section).
+  - _(`Cargo.lock` — no-op; no diff, as projected)_
+
+### Local stable-toolchain command outputs (tail-quoted)
+
+```
+$ cargo build --workspace --all-targets 2>&1 | tail -10
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -15
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+
+$ cargo fmt --all -- --check 2>&1 | tail -5
+(empty)
+
+$ cargo test --workspace 2>&1 | tail -25
+   Doc-tests envoy_tls
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+(workspace aggregate: 339 passed; 0 failed; 1 ignored across 13 test binaries + 7 doc-tests; the 1 ignored is `differential::upstream::tests::starts_upstream_envoy_and_exposes_host_port` — Docker-gated and runs under `cargo test --workspace` in CI per PLAN signpost K)
+
+$ cargo deny check 2>&1 | tail -15
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The four `license-not-encountered` warnings (BSD-2-Clause, MPL-2.0, Unicode-DFS-2016, Zlib at `deny.toml:40/47/43/45`) are advisory-only — they flag licenses the policy permits but no in-tree crate carries. Pre-existing across the 05.x baseline; not gated by `-D warnings` semantics. Final line `advisories ok, bans ok, licenses ok, sources ok` is the pass signal.
+
+### Fuzz short-budget output (tail-quoted)
+
+```
+$ cd crates/envoy-config/fuzz && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30 2>&1 | tail -20
+#630034	REDUCE cov: 9458 ft: 26030 corp: 2875/1308Kb lim: 4096 exec/s: 21001 rss: 490Mb L: 178/4020 MS: 2 ChangeBinInt-EraseBytes-
+#630154	DONE   cov: 9458 ft: 26030 corp: 2875/1308Kb lim: 4096 exec/s: 20327 rss: 490Mb
+###### Recommended dictionary. ######
+"\000\000\000\000\000\000\000\011" # Uses: 16466
+"\377\377\377\377" # Uses: 9809
+"\000\000\000\000\000\000\000\001" # Uses: 8114
+"\011\000" # Uses: 4951
+"\013\000" # Uses: 4769
+"\177\000" # Uses: 4792
+"\000\000\000\037" # Uses: 2034
+"`\000\000\000" # Uses: 541
+"\000\000\000\000\000\000\000\000" # Uses: 444
+###### End of recommended dictionary. ######
+Done 630154 runs in 31 second(s)
+```
+
+630154 runs / 9458 cov / 26030 ft / corp 2875 — no crash. Schema additions from Tasks 1 and 3 (`Cluster.dns_lookup_family`, `Listener.listener_filters`) parse cleanly through the fuzzer's mutation surface. Per PLAN Step 2 expectation: short-budget run completes with no crash; the existing 12-seed corpus continues to parse through the new `Option<DnsLookupFamily>` and `Vec<ListenerFilter>` fields (both default to `None`/`vec![]` via `#[serde(default)]`).
+
+### Cargo.lock sync
+
+```
+$ cargo build --workspace 2>&1 | tail -3
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+   Compiling http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.74s
+$ git status Cargo.lock
+On branch main
+Your branch is ahead of 'origin/main' by 10 commits.
+nothing to commit, working tree clean
+$ git diff Cargo.lock
+(empty)
+```
+
+Per PLAN signpost I + SPEC §6 signpost 2: phase 05.4 introduces no new top-level deps; `Cargo.lock` no-op as projected. No staged change to lockfile in this task's commit.
+
+### Docker-gated CI run
+
+- **Run URL:** https://github.com/pgdad/envoy-rust/actions/runs/25276504502
+- **Run ID:** 25276504502
+- **HEAD SHA:** `06c706d5f76e539470a8e387adad27fa48663b33` (`phase 05.4: STRICT_DNS settle time 500ms→2000ms for host_gateway fixtures (task 6)`)
+- **Result:** SUCCESS
+- **Jobs:**
+  - `build + test + lint` (includes differential harness → Docker): 1m36s ✓
+  - `fuzz (parse_bootstrap, 30s)`: 1m54s ✓ (273161 runs / 7394 cov / 16280 ft / corp 1435 in 31 seconds; no crash on CI's nightly toolchain)
+- **CI cargo deny tail (final line):** `advisories ok, bans ok, licenses ok, sources ok`
+- **Annotation:** 1 unrelated GitHub Actions runner deprecation notice (Node.js 20 / `actions/checkout@v4`), no test impact.
+
+### Per-fixture matrix
+
+All 8 fixtures green simultaneously per SPEC §1 acceptance signal (a) + (b). Pulled from CI integration-test results in `build + test + lint > test (includes differential harness → Docker)` step (timestamps `10:20:52` → `10:21:08`):
+
+| Fixture | Test binary | Status | CI duration | Note |
+|---|---|---|---|---|
+| `tests/fixtures/0001-tcp-echo` | `echo_fixture` | GREEN | 1.06s | unchanged from 05.1; no host_gateway, settle 500ms |
+| `tests/fixtures/0002-static-admin-ready` | `admin_ready_fixture` | GREEN | 6.53s | unchanged from earlier phases |
+| `tests/fixtures/0003-tcp-proxy` | `tcp_proxy_fixture` | GREEN | 2.67s | RESTORED — `dns_lookup_family: V4_ONLY` (Task 2) + 0.0.0.0 echo bind (Task 4) + settle 2000ms (Task 6) |
+| `tests/fixtures/0004-tls-downstream` | `tls_downstream_fixture` | GREEN | 2.81s | RESTORED — same trio |
+| `tests/fixtures/0005-tls-upstream` | `tls_upstream_fixture` | GREEN | 2.70s | RESTORED — same trio |
+| `tests/fixtures/0006-tls-sni` | `tls_sni_fixture` | GREEN | 3.08s | RESTORED — same trio + `tls_inspector` listener filter (Task 3) |
+| `tests/fixtures/0007-http1-direct-response` | `http1_direct_response_fixture` | GREEN | 0.85s | unchanged; no host_gateway, settle 500ms |
+| `tests/fixtures/0008-http1-router-upstream` | `http1_router_upstream_fixture` | GREEN | 2.47s | RESTORED — same trio + content-length: 0 suppression (Task 5) |
+
+CI-side `cargo test --workspace` reports `test result: ok` across every test binary including the previously Docker-gated `differential::upstream::tests::starts_upstream_envoy_and_exposes_host_port` (1 passed under CI Docker). Differential lib unittests: 53 passed; 0 failed; 0 ignored on CI vs. 52 passed; 0 failed; 1 ignored locally — the lone delta is Docker availability.
+
+**Substantively closes phase-04.3 REVIEW C-1.** The C-1 carryforward chain — originating at phase-02.2's ADR-0015 landing `435c6fa` (host-gateway grant), latent across phases 02.2 → 03.1 → 03.2 → 04.1 → 04.2 → 04.3, partially closed at 05.1 state-6 commit `1d05cd0` — ends here. The 6 root-cause fixes that close the chain:
+
+1. `Cluster.dns_lookup_family` schema knob + `DnsLookupFamily` enum (Task 1 / ADR-0024).
+2. 5-fixture coordinated `dns_lookup_family: V4_ONLY` (Task 2).
+3. `Listener.listener_filters` parse-and-ignore + `tls_inspector` block on fixture 0006 (Task 3 / ADR-0026).
+4. 3 echo-server helpers bind `0.0.0.0` (Task 4).
+5. `envoy-http1::Client` suppress synthetic `content-length: 0` on empty-body GETs + fixture 0008 expectations update (Task 5 / ADR-0025).
+6. Differential harness STRICT_DNS settle bump 500ms → 2000ms for host_gateway fixtures (Task 6).
+
+**Phase-04.1 REVIEW M-claim** (drive_http1 per-function unit test) is unblocked by the fixture-mask removal but stays deferred per the 04.3 disposition. No new I3-style or A-style closures expected at 05.4.
+
+### Deviations from PLAN
+
+None. Steps 1-7 of the plan executed verbatim. Notes:
+
+- **Step 1 cargo deny warnings count:** The plan's Step 1 expectation cited `0 errors` only; the actual CI + local outputs include 4 `license-not-encountered` advisory-only warnings (BSD-2-Clause, MPL-2.0, Unicode-DFS-2016, Zlib at `deny.toml:40/47/43/45`). These are pre-existing across the 05.x baseline — they flag policy-permitted licenses that no in-tree crate carries — and are not gated by `cargo deny`'s pass signal. Final line `advisories ok, bans ok, licenses ok, sources ok` is the gate; both local and CI runs pass.
+- **Step 2 fuzz corpus seed projection:** The plan projected "12 corpus-walk seeds parsed cleanly". Actual local libFuzzer-mode run grew the corpus to 2875 entries via mutation in 31 seconds (CI: 1435 entries; the local machine is faster), exercising the full mutation surface rather than just the seed walk. No crash — the gate signal — confirmed at both run sites. The 12-seed accounting is preserved through the corpus directory `crates/envoy-config/fuzz/corpus/parse_bootstrap` which retains the deterministic seeds; libFuzzer's incremental mode merely augments them.
+- **Step 3 `git status Cargo.lock` output:** The plan's Step 3 expectation was that `git status Cargo.lock` would print a focused single-file status. Git's actual behaviour with a clean lockfile is to print the wider working-tree summary including the global `nothing to commit, working tree clean` line — this is the pass signal for an unmodified path. Verified `git diff Cargo.lock` is empty as projected.
+- **Step 4 push scope:** The push to `origin/HEAD` advanced origin/main from `a64d9fc` to `06c706d` — 10 commits including the 8 phase-05.4 commits (state-2 SPEC + state-2 PLAN + Tasks 1-6) and the 2 phase-05.1 carryforward commits (`283a4b9` REVIEW.md and `1d05cd0` ClusterType::StrictDns) that were locally landed but not yet pushed. The remote was behind the 05.1 state-6 commit, not just the 05.4 work.
