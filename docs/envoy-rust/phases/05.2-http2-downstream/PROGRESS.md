@@ -490,3 +490,75 @@ Phase 05.2 PROGRESS log. SPEC at `docs/envoy-rust/phases/05.2-http2-downstream/S
 - **Carryforward note:** Both adapters are consumed by Task 9 (downstream H2C HCM dispatch) — `build_http_response` is the pure status+headers translation step, exercised here in the unit tests; `send_envoy_response` is the async wire emission step, integration-tested in Task 9. The `Http2Error::H2BodyRead` variant name's "Read" suffix is a misnomer when applied to body WRITE (response emission); the doc-comment on `send_envoy_response` flags the future cleanup but defers it per SPEC §6 local signpost 21 (variant rename would touch the H2BodyRead read-side call sites in Task 9 too; deferring keeps the variant set stable across Tasks 5–9). The `H2_FORBIDDEN_HOP_BY_HOP` const list is the H2-side counterpart of the H1-side hop-by-hop handling that the H1 codec already does on the request path; symmetric coverage. Future H2 trailers emission (not in 05.2 SPEC §4 scope) would extend this module with a sibling `send_envoy_trailers` adapter; the current shape leaves room.
 - **Post-review fixup:** Five review findings closed in a single fixup commit. (I1) `MalformedH2HeaderBlock` doc-comment broadened a third time to cover invalid header NAMES (Task 7's third trigger via `HeaderName::from_bytes`). (I2) `send_envoy_response` doc-comment now enumerates BOTH misnomers — `H2StreamAccept` for response-head-send + `H2BodyRead` for body-write — under the deferred-cleanup ledger. (M3) Added 2 failure-path tests covering `BadStatusCode` (status 99) and `MalformedH2HeaderBlock` (non-token header name). (M2) Added inline comment marking the intentional drop of `resp.reason` (RFC 7540 §8.1.2.4). (M4) Restored the load-bearing comment in `envoy_response_to_http2_preserves_status_and_body` explaining why the body-bytes assertion is delegated to integration tests. Closes code-quality reviewer I1 + I2 + M2 + M3 + M4 on Task 7.
 
+## Task 8 — `crates/envoy-http2/src/codec.rs` (`Http2Codec` adapter / `h2::server::Builder` configurer)
+
+- **Commit:** _(pending — set on commit; this task lands in a single commit per phase 05.2 PLAN convention)_
+- **Deliverables:** D3 codec.rs — new `codec` submodule under `envoy-http2` housing a single thin adapter `build_h2_server(Option<&Http2ProtocolOptions>) -> h2::server::Builder` that maps the four 05.2-supported `Http2ProtocolOptions` fields onto the corresponding `h2::server::Builder` setters (`max_concurrent_streams`, `initial_window_size`, `initial_connection_window_size`, `max_frame_size`). Absent options leave the field at the `h2`-crate default. Centralizes the configuration shape so the HCM (Task 9) and the future Client (05.3) share it; only the listener-side Builder is mapped in 05.2 — the client-side `h2::client::Builder` mapping defers to 05.3 alongside `client.rs`. 1 unit smoke test covers both the configured-builder path and the `None` (defaults) path; the behavioral wire-effect verification of `max_concurrent_streams` is delegated to Task 9's `hcm.rs` integration test per PLAN. `build_h2_server` re-exported at crate root per the M1 convention established in Task 6.
+- **ADR landed:** None (Task 8 directly applies parent-05 SPEC §3 D3; no decisions needed beyond what SPEC settles).
+- **Files modified:**
+  - `crates/envoy-http2/src/codec.rs` (created) — 55 lines incl. doc-comments + impl + 1 smoke test.
+  - `crates/envoy-http2/src/lib.rs` — added `pub mod codec;` and `pub use codec::build_h2_server;`. rustfmt re-sorted both module declarations and re-exports alphabetically (`codec` before `error`/`request`/`response`).
+  - `docs/envoy-rust/phases/05.2-http2-downstream/PROGRESS.md` — this section appended.
+- **LoC:** ~58 raw lines (55 codec.rs + 3 lib.rs delta after rustfmt's alpha-sort). PLAN estimated ~80 (impl ~60 + 1 unit test ~20); the implementation came in slightly under because the smoke test is intentionally minimal (the wire-effect test is delegated to Task 9 per PLAN) and the impl's `if let Some(...)` ladder is tight.
+- **Verification:**
+
+  Step 8.2 — `cargo test -p envoy-http2` (failing-test confirmation, before `build_h2_server` exists, with only the test module in `codec.rs` plus the crate-root `pub use`):
+  ```
+  error[E0432]: unresolved import `codec::build_h2_server`
+    --> crates/envoy-http2/src/lib.rs:28:21
+     |
+  28 | pub use codec::build_h2_server;
+     |         ^^^^^^^^^^^^^^^^^^^^^^ no `build_h2_server` in `codec`
+
+  error[E0425]: cannot find function `build_h2_server` in this scope
+    --> crates/envoy-http2/src/codec.rs:23:24
+  error[E0425]: cannot find function `build_h2_server` in this scope
+    --> crates/envoy-http2/src/codec.rs:24:32
+  ```
+  Failed exactly as PLAN predicted (function not defined; both call sites + the crate-root re-export fail to resolve the symbol).
+
+  Step 8.4 — same command after Step 8.3:
+  ```
+  running 12 tests
+  test codec::tests::build_h2_server_applies_protocol_options ... ok
+  test error::tests::bad_status_code_displays_value ... ok
+  test error::tests::missing_authority_displays_descriptively ... ok
+  test error::tests::h2_handshake_displays_with_source ... ok
+  test response::tests::build_http_response_rejects_invalid_status_code ... ok
+  test request::tests::http_to_envoy_request_missing_authority_returns_error ... ok
+  test response::tests::build_http_response_rejects_invalid_header_name ... ok
+  test request::tests::http_to_envoy_request_synthesizes_host_from_authority ... ok
+  test request::tests::http_to_envoy_request_lowercases_headers ... ok
+  test request::tests::http_to_envoy_request_non_utf8_header_value_returns_error ... ok
+  test response::tests::envoy_response_to_http2_preserves_status_and_body ... ok
+  test response::tests::envoy_response_to_http2_strips_h2_forbidden_headers ... ok
+
+  test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+  Suite goes 11 → 12 (Task 7 left it at 11 post-fixup; Task 8 adds 1). Matches PLAN's Step 8.4 expected count exactly.
+
+  Workspace gates:
+  ```
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -1
+   Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.59s
+
+  $ cargo fmt --all -- --check
+  (empty — clean, after rustfmt's alpha-sort of the module + re-export lines was applied)
+  ```
+
+  Workspace-wide test sanity: all green; envoy-http2 went 11 → 12 (matches per-crate run above); no other crate's test count moved.
+
+- **h2 setter signature verification (PLAN's escape clause):** Confirmed at task time against `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/h2-0.4.13/src/server.rs`. All four setters take `&mut self, u32` and return `&mut Self`:
+  ```
+  692:    pub fn initial_window_size(&mut self, size: u32) -> &mut Self {
+  726:    pub fn initial_connection_window_size(&mut self, size: u32) -> &mut Self {
+  764:    pub fn max_frame_size(&mut self, max: u32) -> &mut Self {
+  846:    pub fn max_concurrent_streams(&mut self, max: u32) -> &mut Self {
+  ```
+  Setter names match PLAN exactly; `&mut Self` return is not `#[must_use]`-annotated, so the bare-statement call form (`builder.max_concurrent_streams(v);`) compiles cleanly without unused-result warnings. No call-site adjustments needed.
+
+- **Deviations from PLAN:**
+  1. **rustfmt re-sorted module declarations + re-exports alphabetically.** PLAN Step 8.1 said "insert after `pub mod response;`" and "after `pub use response::{...};`"; rustfmt enforces alphabetical ordering for both `mod` and `use` blocks, so the final ordering is `pub mod codec; mod error; pub mod request; pub mod response;` and `pub use codec::build_h2_server; pub use error::Http2Error; pub use request::http_to_envoy_request; pub use response::{build_http_response, send_envoy_response};`. Same kind of cosmetic rustfmt nudge as in Tasks 2/4/5/6/7. Functionally identical to the PLAN's intent.
+
+- **Carryforward note:** `build_h2_server` is consumed by Task 9's HCM, which calls it on connection accept to obtain a configured `h2::server::Builder` and then drives `Builder::handshake(io)` to obtain a `h2::server::Connection`. The 05.2 SPEC §3 D3 contract is now in place: HCM does NOT touch `Http2ProtocolOptions` directly — it passes `listener.http2_protocol_options.as_ref()` straight to `build_h2_server`, keeping the option-to-setter mapping in one place. When 05.3 adds `client.rs`, a sibling `build_h2_client(Option<&Http2ProtocolOptions>) -> h2::client::Builder` will live in this same module, sharing the field-by-field mapping shape; the listener-side / client-side `Http2ProtocolOptions` type is intentionally a single struct (cf. SPEC §3 D2.b — Envoy's upstream + downstream H2 use the same `Http2ProtocolOptions` proto, just attached to different config nodes). The smoke test compiles-only; the wire-effect verification (a peer observing `SETTINGS_MAX_CONCURRENT_STREAMS = 50` after handshake) lands in Task 9's `hcm.rs` `h2_protocol_options_max_concurrent_streams_applied` integration test.
+

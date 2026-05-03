@@ -17,10 +17,12 @@
 //! 05.3-projected (NOT in 05.2):
 //!   - `client`   — upstream H2C origination (envoy_http2::Client + ClientStream).
 
+pub mod codec;
 mod error;
 pub mod request;
 pub mod response;
 
+pub use codec::build_h2_server;
 pub use error::Http2Error;
 pub use request::http_to_envoy_request;
 pub use response::{build_http_response, send_envoy_response};
