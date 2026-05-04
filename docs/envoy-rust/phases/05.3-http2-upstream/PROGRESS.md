@@ -399,3 +399,32 @@ body:
 (Trailing space after `body: ` is literal — no body bytes for empty GET.)
 
 **Carryforward:** Task 10 is closed. Task 11 (in-process integration backstop at `crates/envoy-bin/tests/http2_router_upstream.rs`) is next.
+
+---
+
+## Task 11 — In-process integration backstop `crates/envoy-bin/tests/http2_router_upstream.rs`
+
+**Commit:** (this commit)
+
+**Deliverables:** SPEC §3 D7 in-process backstop: single-file test at `crates/envoy-bin/tests/http2_router_upstream.rs` (~150 LoC) that spawns envoy-bin via `CARGO_BIN_EXE_envoy-bin` against an HCM-HTTP2-listener config pointing its `backend` cluster at an in-test-spawned http2-echo-server; drives a single H2C `GET /` via `h2::client`; asserts status 200 + body starts with `"method: GET\n"` + body contains `":authority: envoy-rust.test\n"`.
+
+**ADR landed:** none.
+
+**Files modified:**
+- `crates/envoy-bin/tests/http2_router_upstream.rs` — new file (~150 LoC; mirrors 04.3's `http1_router_upstream.rs` and 05.2's `http2_direct_response.rs`; includes `locate_http2_echo_server()`, `reserve_port()`, `wait_h2_ready()` helpers and `#[tokio::test(flavor = "multi_thread")] async fn http2_router_upstream_in_process`).
+- `docs/envoy-rust/phases/05.3-http2-upstream/PROGRESS.md` (this entry).
+
+**LoC:** ~150 net insertions (test file).
+
+**Verification:**
+- `cargo build -p envoy-bin -p http2-echo-server` — clean.
+- `cargo test -p envoy-bin --test http2_router_upstream -- --nocapture` — **1 PASSED**. H2-on-H2 round-trip confirmed: helper spawned, h2-ready handshake awaited, envoy-bin spawned with H2 listener + H2 cluster pointing at helper, `GET /` → 200 with body starting `"method: GET\n"` and containing `":authority: envoy-rust.test\n"`.
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean (formatting fixup applied: line-folded `SocketAddr` assignments collapsed to single line; `tokio::spawn` block expanded per rustfmt style).
+
+**Deviations from PLAN:**
+1. **`use bytes::Bytes;` import removed**: PLAN line 4183 includes `use bytes::Bytes;` in the verbatim snippet, but `Bytes` is never referenced in the function body (only `bytes::BytesMut` is used inline). Removed to avoid unused-import clippy error under `-D warnings`. The `bytes` crate is still exercised via `bytes::BytesMut`.
+2. **`cargo fmt` fixups**: Three formatting adjustments applied by `cargo fmt`: line-folded `SocketAddr` parse statements collapsed to single lines; `tokio::spawn(async move { let _ = conn.await; })` expanded to multi-line block form. No logic changes.
+
+**Carryforward:** Task 11 is closed. Task 12 (state-4 phase-done gate verification + h2spec re-run) is next.
