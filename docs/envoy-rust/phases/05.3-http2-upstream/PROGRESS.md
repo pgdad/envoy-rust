@@ -433,7 +433,7 @@ body:
 
 ## Task 12 — State-4 phase-done gate verification
 
-**Commit:** `<SHA>` (filled in after commit below)
+**Commit:** `83e4da7`
 
 **Deliverables:** SPEC §1 acceptance signal (a)–(f) GREEN; the parent-05 acceptance surface verified.
 
