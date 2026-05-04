@@ -66,6 +66,12 @@ impl Client {
     }
 }
 
+/// Active per-connection H2 client state: the `h2::client::SendRequest` handle
+/// (the channel to the spawned connection task) and the host string captured
+/// at connect time (used as the synthesized `:authority` pseudo-header default
+/// if the outgoing request doesn't carry an explicit `Host:` header). Mirrors
+/// `envoy_http1::ClientStream`'s shape; one `ClientStream` owns one TCP
+/// connection per parent-05 SPEC §4 (no pooling).
 pub struct ClientStream {
     send_request: h2::client::SendRequest<Bytes>,
     host: String,
@@ -92,6 +98,32 @@ const H2_FORBIDDEN_HOP_BY_HOP: &[&str] = &[
 ];
 
 impl ClientStream {
+    /// Translate `request` to an H2 frame stream and read the response back.
+    /// Seven-step pipeline: (a) resolve `:authority` — explicit `Host:`
+    /// (case-insensitive) wins over the captured host per parent §6 signpost
+    /// 12 + SPEC §3 cross-sub-phase architectural rule 3, mirroring
+    /// `envoy_http1::Client::send_request`; (b) build the `http::Request<()>`
+    /// head with absolute-form URI so the h2 codec populates `:method` /
+    /// `:authority` / `:path` / `:scheme: http` correctly; (c) apply request
+    /// headers, lowercasing names per parent §6 signpost 11 and stripping
+    /// H2-forbidden hop-by-hop names per SPEC §3 architectural rule 4
+    /// (defense-in-depth — the h2 codec also rejects them); skip `Host:`
+    /// (became `:authority`); (d) send via `h2::client::SendRequest::send_request`
+    /// with `end_of_stream=true` for empty bodies, otherwise HEADERS +
+    /// `send_data(body, end_of_stream=true)`; (e) read the response head via
+    /// the returned `ResponseFuture`; (f) drain the response body from
+    /// `h2::RecvStream` into `Bytes` via the same pattern 05.2 D3 uses on the
+    /// listener-side body intake (per parent §6 signpost 9 the drain budget
+    /// is unbounded in 05.3); (g) translate `http::Response<()>` + body bytes
+    /// into the protocol-agnostic `envoy_http1::response::Response` value type
+    /// per cross-sub-phase architectural rule 2.
+    ///
+    /// Errors map per failure site: TCP/`SocketAddr` failures handled at
+    /// `Client::connect`; here `MalformedH2HeaderBlock` covers builder
+    /// failures (URI/header name/value parse), `H2SendRequest` covers
+    /// send-stream / response-future failures, `H2RecvBody` covers body-read
+    /// / flow-control failures, `BadStatusCode` is defense-in-depth on the
+    /// 100..=599 range invariant.
     pub async fn send_request(&mut self, request: Request) -> Result<Response, Http2Error> {
         // (a) :authority resolution. Explicit Host: wins over the captured
         // host. Mirrors envoy_http1::Client::send_request's host-resolution
