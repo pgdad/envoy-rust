@@ -13,6 +13,10 @@ pub struct Cluster {
     pub(crate) name: String,
     pub(crate) endpoints: Vec<SocketAddr>,
     pub(crate) cursor: AtomicUsize,
+    /// 05.3 NEW per SPEC §3 D3: cluster-level upstream protocol selector.
+    /// Set in `from_bootstrap` from the parsed cluster's
+    /// `typed_extension_protocol_options`. Defaulted to `Http1`.
+    pub(crate) upstream_protocol: UpstreamProtocol,
 }
 
 impl Cluster {
@@ -23,6 +27,14 @@ impl Cluster {
     /// REVIEW M1).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// 05.3 NEW: cluster-level upstream protocol. See `UpstreamProtocol`'s
+    /// docs. Mirrors the `name()` accessor's posture (typed value, copy
+    /// semantics; no Result, no panic). Per SPEC §6 inherited signpost 1
+    /// the typed value is set at cluster-build time, not derived per call.
+    pub fn upstream_protocol(&self) -> UpstreamProtocol {
+        self.upstream_protocol
     }
 
     /// Picks the next endpoint in round-robin order. `Relaxed` ordering is
@@ -59,6 +71,12 @@ impl ClusterHandle {
     /// public posture per phase-04.3 SPEC §3 D5.
     pub fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    /// 05.3 NEW: delegates to `Cluster::upstream_protocol`. Mirrors `name()`'s
+    /// posture per SPEC §6 inherited signpost 1.
+    pub fn upstream_protocol(&self) -> UpstreamProtocol {
+        self.inner.upstream_protocol()
     }
 }
 
@@ -138,6 +156,21 @@ pub enum ClusterError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Per-cluster upstream protocol selector. Defaulted to `Http1` for
+/// backwards-compat with all phase-04 clusters; set at cluster-build time in
+/// `from_bootstrap` from the parsed cluster's `typed_extension_protocol_options.
+/// HttpProtocolOptions.explicit_http_config`. Mirrors the established
+/// `LbPolicy` shape (Clone/Copy/Debug/Default/PartialEq/Eq derives).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpstreamProtocol {
+    /// Default. The 04.3-landed router H1 dispatch path.
+    #[default]
+    Http1,
+    /// 05.3 NEW per ADR-0022 (parent-05 split). Selects the
+    /// envoy_http2::Client dispatch path at the router H2-arm.
+    Http2,
 }
 
 /// Constructs a `ClusterManager` from a validated `Bootstrap`. The caller
@@ -227,10 +260,29 @@ pub async fn from_bootstrap(
                 name: cfg.name.clone(),
             });
         }
+        // 05.3 NEW per SPEC §3 D3: project upstream_protocol from the parsed
+        // cluster's typed_extension_protocol_options. The match arm is sync;
+        // 05.1's lookup_host async branch is unaffected (the two are
+        // orthogonal — cluster_type controls endpoint shape, upstream_protocol
+        // controls upstream dispatch). Per SPEC §6 local signpost 15: the
+        // "both Some" case is validator-rejected; defense-in-depth defaults
+        // to Http1.
+        let upstream_protocol = match &cfg.typed_extension_protocol_options {
+            None => UpstreamProtocol::Http1,
+            Some(teo) => {
+                let ehc = &teo.http_protocol_options.explicit_http_config;
+                match (&ehc.http_protocol_options, &ehc.http2_protocol_options) {
+                    (_, Some(_)) => UpstreamProtocol::Http2,
+                    (Some(_), None) => UpstreamProtocol::Http1,
+                    (None, None) => UpstreamProtocol::Http1,
+                }
+            }
+        };
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
             endpoints,
             cursor: AtomicUsize::new(0),
+            upstream_protocol,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -260,6 +312,7 @@ mod tests {
                 name: name.to_string(),
                 endpoints,
                 cursor: AtomicUsize::new(0),
+                upstream_protocol: UpstreamProtocol::default(),
             }),
         }
     }
@@ -527,6 +580,7 @@ admin:
             name: "backend".to_string(),
             endpoints: mk_endpoints(1),
             cursor: AtomicUsize::new(0),
+            upstream_protocol: UpstreamProtocol::default(),
         };
         assert_eq!(c.name(), "backend");
     }
@@ -714,5 +768,155 @@ admin:
             ),
             "expected DnsResolutionFailed{{cluster:'backend',address:'this-host-does-not-exist.invalid',..}}, got {err:?}",
         );
+    }
+
+    /// Helper: build a Bootstrap from a YAML string and run from_bootstrap;
+    /// returns the resulting ClusterManager. Panics on parse / build error.
+    async fn build_cluster_mgr(yaml: &str) -> ClusterManager {
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("parse");
+        from_bootstrap(&bootstrap).await.expect("from_bootstrap")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_upstream_protocol_defaults_to_http1() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+"#;
+        let mgr = build_cluster_mgr(yaml).await;
+        let handle = mgr.get("backend").expect("backend cluster");
+        assert_eq!(handle.upstream_protocol(), UpstreamProtocol::Http1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_upstream_protocol_http2_set_from_typed_extension_protocol_options() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_concurrent_streams: 100
+"#;
+        let mgr = build_cluster_mgr(yaml).await;
+        let handle = mgr.get("backend").expect("backend cluster");
+        assert_eq!(handle.upstream_protocol(), UpstreamProtocol::Http2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_upstream_protocol_http1_set_from_explicit_http1_options() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+"#;
+        let mgr = build_cluster_mgr(yaml).await;
+        let handle = mgr.get("backend").expect("backend cluster");
+        assert_eq!(handle.upstream_protocol(), UpstreamProtocol::Http1);
     }
 }

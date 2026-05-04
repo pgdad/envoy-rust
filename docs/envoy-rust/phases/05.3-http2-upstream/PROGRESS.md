@@ -151,3 +151,34 @@ SPEC at `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md` (committed at paren
 **Deviations from PLAN:** None.
 
 **Carryforward:** The `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30 --runs=10000` step (Step 4.5) is deferred to Task 12 state-4 verification per PLAN's explicit guidance ("If `cargo +nightly fuzz` is unavailable in the local env, defer the run to Task 12 state-4"). Local nightly fuzz is not available; CI's nightly fuzz job covers the corpus exercise.
+
+---
+
+## Task 5 — `envoy-cluster::UpstreamProtocol` enum + `Cluster.upstream_protocol` field + `from_bootstrap` projection
+
+**Commit:** (pending — filled in after commit)
+
+**Deliverables:** SPEC §3 D3 — new `UpstreamProtocol { Http1, Http2 }` typed enum; `Cluster.upstream_protocol` field set at cluster-build time in `from_bootstrap` from the parsed cluster's `typed_extension_protocol_options`; `Cluster::upstream_protocol()` + `ClusterHandle::upstream_protocol()` accessor pair mirroring the existing `name()` pair; 3 new unit tests covering all 3 logical projection cases.
+
+**ADR landed:** none (per SPEC §7).
+
+**Files modified:**
+- `crates/envoy-cluster/src/cluster.rs` — `UpstreamProtocol` enum inserted after `ClusterError`; `upstream_protocol` field added to `Cluster` struct; `Cluster::upstream_protocol()` accessor added after `name()`; `ClusterHandle::upstream_protocol()` delegate added after `name()`; `upstream_protocol` projection match added in `from_bootstrap` before `Arc::new(Cluster { ... })`; `Arc::new(Cluster { ... })` construction updated with `upstream_protocol` field; `mk_handle` test helper updated with `upstream_protocol: UpstreamProtocol::default()`; `cluster_name_returns_configured_name` test updated with `upstream_protocol: UpstreamProtocol::default()`; 3 new unit tests appended (~115 LoC inserted).
+- `crates/envoy-cluster/Cargo.toml` — `rt-multi-thread` feature added to `[dev-dependencies]` tokio entry (required by the 3 new `#[tokio::test(flavor = "multi_thread")]` tests; existing tests use the `rt` single-thread flavor).
+
+**LoC:** ~115 net insertions per git diff.
+
+**Verification:**
+- `cargo test -p envoy-cluster -- --nocapture` — 17 passed, 0 failed (was 14 before Task 5; +3 new tests: `cluster_upstream_protocol_defaults_to_http1`, `cluster_upstream_protocol_http2_set_from_typed_extension_protocol_options`, `cluster_upstream_protocol_http1_set_from_explicit_http1_options`).
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean.
+
+**Verified shapes from greps run at task time:**
+- `grep -n 'Cluster {' crates/envoy-cluster/src/cluster.rs` — 5 sites found: line 12 (struct def), line 230 (`Arc::new`), line 259 (`mk_handle`), lines 445/477 (envoy_config::Cluster in tests — different type, unchanged), line 526 (`cluster_name_returns_configured_name` — updated).
+- `grep -n 'typed_extension_protocol_options' crates/envoy-config/src/bootstrap.rs` — field confirmed on `envoy_config::Cluster` at line 74.
+- Field access chain `teo.http_protocol_options.explicit_http_config.{http_protocol_options,http2_protocol_options}` confirmed correct against `TypedExtensionProtocolOptions → HttpProtocolOptions → ExplicitHttpConfig` chain in `envoy-config/src/bootstrap.rs`.
+- TDD red phase confirmed: compile failed with `error[E0063]: missing field 'upstream_protocol'` on all 3 Cluster construction sites before Step 5.5/5.7.
+
+**Deviations from PLAN:**
+1. **`rt-multi-thread` dev-dependency**: The PLAN's 3 new tests use `#[tokio::test(flavor = "multi_thread")]` but `envoy-cluster/Cargo.toml`'s `[dev-dependencies]` tokio entry lacked the `rt-multi-thread` feature. Added to fix compile error. The `[dependencies]` entry is unchanged (production code uses single-thread `rt`).
