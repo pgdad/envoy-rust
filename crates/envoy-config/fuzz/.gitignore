@@ -13,5 +13,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/route_with_header_matchers.yaml
 !corpus/parse_bootstrap/strict_dns_cluster.yaml
 !corpus/parse_bootstrap/hcm_codec_http2.yaml
+!corpus/parse_bootstrap/cluster_http2_protocol_options.yaml
 artifacts/
 target/

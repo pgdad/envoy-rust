@@ -5109,6 +5109,18 @@ static_resources:
         assert_eq!(opts.max_concurrent_streams, Some(100));
     }
 
+    #[test]
+    fn fuzz_corpus_cluster_http2_protocol_options_seed_parses() {
+        // Mirrors the existing fuzz_corpus_hcm_codec_http2_seed_parses
+        // pattern. The seed exercises the cluster-side
+        // typed_extension_protocol_options accept-path; the fuzzer never runs
+        // the H2 codec or the runtime cluster construction
+        // (`parse_bootstrap` only exercises serde + the validator).
+        let yaml =
+            include_str!("../fuzz/corpus/parse_bootstrap/cluster_http2_protocol_options.yaml");
+        crate::parse_bootstrap(yaml).expect("seed parses cleanly");
+    }
+
     /// Builds a minimal HCM `codec_type: HTTP2` bootstrap with the given
     /// http2_protocol_options field values. Helper for the 4 range-rejection
     /// tests above. Each Option<u32> argument controls one field.
