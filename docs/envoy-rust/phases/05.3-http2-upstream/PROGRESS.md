@@ -156,7 +156,7 @@ SPEC at `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md` (committed at paren
 
 ## Task 5 — `envoy-cluster::UpstreamProtocol` enum + `Cluster.upstream_protocol` field + `from_bootstrap` projection
 
-**Commit:** (pending — filled in after commit)
+**Commit:** c807ca2
 
 **Deliverables:** SPEC §3 D3 — new `UpstreamProtocol { Http1, Http2 }` typed enum; `Cluster.upstream_protocol` field set at cluster-build time in `from_bootstrap` from the parsed cluster's `typed_extension_protocol_options`; `Cluster::upstream_protocol()` + `ClusterHandle::upstream_protocol()` accessor pair mirroring the existing `name()` pair; 3 new unit tests covering all 3 logical projection cases.
 
