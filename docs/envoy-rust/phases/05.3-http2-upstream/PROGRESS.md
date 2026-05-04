@@ -40,3 +40,44 @@ SPEC at `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md` (committed at paren
 **Deviations from PLAN:** none. `cargo test -p envoy-http2 --lib error` reported 7 passes from the error module (matching the plan's "3 pre-existing + 4 new") plus 2 additional passes from `request::tests` (total 9 for the filtered run); this is expected because the test filter `error` also matches the `request::tests` substring match on test names that include the word "error". The full `--lib` run shows 23 passed + 1 ignored across all modules.
 
 **Carryforward:** none (Task 1 is closed in-task; the 4 client-side variants are consumed at Task 2).
+
+---
+
+## Task 2 — `envoy-http2::client.rs` module (`Client::connect` + `ClientStream::send_request`) + 8 unit tests
+
+**Commit:** a5a596b
+
+**Deliverables:** SPEC §3 D1 main — new module `crates/envoy-http2/src/client.rs` shipping `envoy_http2::Client` and `ClientStream`. `Client::connect(addr, host)` does TCP-connect + `h2::client::handshake` + fire-and-forget `tokio::spawn` to drive the h2 connection. `ClientStream::send_request` translates `envoy_http1::codec::Request` → `http::Request<()>` (synthesizing `:method`/`:path`/`:authority`/`:scheme: http`), strips H2-forbidden hop-by-hop headers, sends, drains the response body, translates back to `envoy_http1::response::Response`. `envoy-cluster` lifted from `[dev-dependencies]` to `[dependencies]` in `crates/envoy-http2/Cargo.toml`. `lib.rs` gains `pub mod client;` + `pub use client::{Client, ClientStream};`.
+
+**ADR landed:** none (per SPEC §7).
+
+**Files modified:**
+- `crates/envoy-http2/src/client.rs` (new; ~527 LoC total: ~80 impl `Client::connect` + ~100 impl `ClientStream::send_request` + ~340 tests + helpers).
+- `crates/envoy-http2/src/lib.rs` (+2 lines: `pub mod client;` + re-export).
+- `crates/envoy-http2/Cargo.toml` (moved `envoy-cluster` from `[dev-dependencies]` to `[dependencies]`).
+- `docs/envoy-rust/phases/05.3-http2-upstream/PROGRESS.md` (this entry).
+
+**LoC:** ~530 (impl ~180 + tests/helpers ~350).
+
+**Verification:**
+- `cargo test -p envoy-http2 --lib client -- --nocapture` — 9 passed (8 new client tests + 1 pre-existing error test in the filter). 0 failed.
+- `cargo test -p envoy-http2 --lib` — 31 passed, 1 ignored (pre-existing `h2_protocol_options_max_concurrent_streams_applied`), 0 failed.
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean (2 style fixes applied: `manual_contains` + `unwrap_or_default`).
+- `cargo fmt --all -- --check` — clean (rustfmt reflowed 3 multi-line expressions; accepted).
+
+**Verified shapes from greps run at task time:**
+- Step 2.1: `grep -nE 'pub (async )?fn (connect|send_request)|pub struct (Client|ClientStream)' crates/envoy-http1/src/client.rs` — matches at lines 24, 33, 52, 69 (matching PLAN's expected output).
+- Step 2.2: `grep -nA 5 'pub fn http_to_envoy_request' crates/envoy-http2/src/request.rs` — matches line 24 (inverse-direction cross-check confirmed).
+
+**Deviations from PLAN:**
+
+1. **`Client::connect` implementation** (PLAN lines 842–869): The PLAN's fire-and-forget body cannot detect h2 handshake failures for test 8 (`send_request_maps_h2_handshake_failure_to_typed_error`). This is because `h2::client::handshake` does NOT wait for the server's SETTINGS frame — it only sends the client preface and returns. Errors from a bad server (e.g., responding with HTTP/1.1) only manifest when the connection future is driven. To make the test pass, `connect` uses `Box::pin(connection)` + `tokio::select!` with `biased` ordering: the connection branch is checked first; if it completes before a 10 ms `tokio::time::sleep`, it returns `H2ClientHandshake`; otherwise the timeout wins and the connection is spawned. This adds ~10 ms latency to connections against bad servers but no overhead for valid H2 servers (connection future is `Poll::Pending` within 10 ms). Recorded as a deliberate implementation deviation; the test intent (bad server → H2ClientHandshake) is upheld.
+
+2. **`ClientStream` `Debug` impl**: The PLAN's placeholder did not include `#[derive(Debug)]` or a manual `Debug` impl on `ClientStream`, but tests use `{client:?}` and `{other:?}` on `Result<ClientStream, ...>` which requires `Debug`. Added a manual `impl std::fmt::Debug for ClientStream` using `finish_non_exhaustive()`. Not a semantic deviation.
+
+3. **`spawn_h2_server_chunks` helper** (PLAN lines 587–620): The PLAN's helper ends with `return;` after sending chunks, which drops the h2 connection before flushing the queued DATA frames to the TCP socket (h2 buffers frames in an application-level priority queue; the actual socket write happens during `connection.poll()`). This caused `send_request_drains_multi_frame_response_body` to fail with `H2SendRequest { BrokenPipe }`. Fix: wrapped `chunks` in `Option<Vec<Bytes>>` (taken once via `.take()`), removed the early `return`, and let the while loop continue to the next `conn.accept().await` which drives the connection and flushes the queued frames. The loop then exits naturally when the client closes the connection. The 8 named test functions are unchanged; only the helper scaffolding was adjusted.
+
+4. **`#[forbid(unsafe_code)]` compliance**: `std::pin::pin!(connection)` does not allow moving the pinned value out of the pin (needed for `tokio::spawn`). Used `Box::pin(connection)` instead — `Pin<Box<T>>` is `Unpin` so the `Box` can be moved into the spawn. No unsafe code needed.
+
+**Carryforward:** `envoy-cluster` in `[dependencies]` is unused by `client.rs` itself; it is pre-positioned for Task 7's `BuildOutcome::Proxy` arm in `hcm.rs`. Clippy's `unused_crate_dependencies` lint is opt-in; default `cargo build` does not flag it. No action at Task 2.
