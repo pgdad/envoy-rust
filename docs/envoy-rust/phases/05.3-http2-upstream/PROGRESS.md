@@ -81,3 +81,41 @@ SPEC at `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md` (committed at paren
 4. **`#[forbid(unsafe_code)]` compliance**: `std::pin::pin!(connection)` does not allow moving the pinned value out of the pin (needed for `tokio::spawn`). Used `Box::pin(connection)` instead — `Pin<Box<T>>` is `Unpin` so the `Box` can be moved into the spawn. No unsafe code needed.
 
 **Carryforward:** `envoy-cluster` in `[dependencies]` is unused by `client.rs` itself; it is pre-positioned for Task 7's `BuildOutcome::Proxy` arm in `hcm.rs`. Clippy's `unused_crate_dependencies` lint is opt-in; default `cargo build` does not flag it. No action at Task 2.
+
+---
+
+## Task 3 — `envoy-config` cluster-side `typed_extension_protocol_options` schema + validator + 2 new `ConfigError` variants
+
+**Commit:** cb6dfdd
+
+**Deliverables:** SPEC §3 D2.a/b — cluster-side `typed_extension_protocol_options` on `Cluster`; 4 new types (`TypedExtensionProtocolOptions`, `HttpProtocolOptions`, `ExplicitHttpConfig`, `Http1ProtocolOptions`); 2 new `ConfigError` variants (`MutuallyExclusiveExplicitHttpConfig`, `UnsupportedTypedConfigUrl`); `validate_http2_protocol_options_ranges` free function hoisted from `validate_hcm` body; cluster-side typed_extension walk in `validate`; `pub use` re-export extended with 4 new types; 7 new unit tests + 1 load-bearing combined-surface test.
+
+**ADR landed:** none (per SPEC §7).
+
+**Files modified:**
+- `crates/envoy-config/src/bootstrap.rs` — 4 new types after `LoadAssignment`; `typed_extension_protocol_options` field on `Cluster`; `validate_http2_protocol_options_ranges` free function; cluster-side validator walk in `validate`; 8 new unit tests (~520 LoC inserted; 39 LoC deleted from `validate_hcm` body → replaced by single call).
+- `crates/envoy-config/src/lib.rs` — 2 new `ConfigError` variants; `pub use` re-export extended with 4 new types (~25 LoC inserted).
+- `crates/envoy-cluster/src/cluster.rs` — 2 test struct literals updated with `typed_extension_protocol_options: None` (~2 LoC inserted).
+
+**LoC:** ~549 net insertions per git diff (588 inserted, 39 deleted). Slightly above the ~335 estimate due to fmt-reflowed assertion chains in tests.
+
+**Verification:**
+- `cargo test -p envoy-config -- --nocapture` — 164 passed, 0 failed (was 157 before Task 3; +7 new tests).
+- `cargo test -p envoy-config http2_protocol_options` — 7 passed (4 pre-existing range tests + 3 others confirmed structurally unchanged after hoist).
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean (rustfmt reflowed assertion chains in `parses_cluster_with_typed_extension_protocol_options_http1` test; accepted via `cargo fmt --all`).
+
+**Verified shapes from greps run at task time:**
+- `grep -n 'pub struct Cluster\b' crates/envoy-config/src/bootstrap.rs` — line 48 confirmed.
+- `grep -n 'fn validate(' crates/envoy-config/src/bootstrap.rs` — line 927 confirmed.
+- `grep -nA 8 'pub struct Http2ProtocolOptions' crates/envoy-config/src/bootstrap.rs` — line 352 confirmed; 4-field struct unchanged.
+- `grep -n 'UnsupportedTypedConfigUrl\|MutuallyExclusiveExplicitHttpConfig' crates/envoy-config/src/lib.rs` — both variants confirmed absent before Task 3, present after.
+- TDD red phase confirmed: first test failed at compile with `no field 'typed_extension_protocol_options' on type '&Cluster'`.
+
+**Deviations from PLAN:**
+1. **`validate_http2_protocol_options_ranges` body style**: The PLAN's pseudocode (lines 1318–1346) used a different if-let style from the actual codebase. The actual body at HEAD uses Rust let-chains (`if let Some(v) = opts.max_frame_size && !(...)`) and local consts (`MAX_FRAME_SIZE_RANGE`, `WINDOW_SIZE_RANGE`). The free function was extracted verbatim from the actual body (keeping the let-chain style and local consts), not the PLAN's pseudocode. This is correct — the PLAN explicitly said "Re-grep at task time and copy the exact block."
+2. **`envoy-cluster/src/cluster.rs` update**: The PLAN did not enumerate `envoy-cluster` as a file needing changes. Two test struct literals for `envoy_config::Cluster` required `typed_extension_protocol_options: None` due to non-exhaustive struct update (no `..Default::default()` is available since `Cluster` does not impl `Default`). Fixed at Step 3.11 build check.
+3. **`UnsupportedTypedConfigUrl` formatting**: The PLAN's multi-line struct body was reformatted by `cargo fmt` to a single line. Accepted.
+
+**Carryforward:** The corpus-walk test `fuzz_corpus_cluster_http2_protocol_options_seed_parses` is omitted per Step 3.11/PLAN Step 3.10 instruction — it depends on Task 4's seed file and lands there alongside it.
