@@ -10,13 +10,14 @@ pub mod matcher;
 pub use bootstrap::{
     Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType, CodecType,
     CommonTlsContext, DataSource, DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint,
-    FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode, Http2ProtocolOptions,
-    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, Int64Range, LbEndpoint,
-    LbPolicy, Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node, Route,
-    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, SafeRegex,
-    SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
-    TlsCertificate, TransportSocket, TransportSocketTypedConfig, TypedConfig, UpstreamTlsContext,
-    VirtualHost,
+    ExplicitHttpConfig, FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode,
+    Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
+    HttpFilterTypedConfig, HttpProtocolOptions, Int64Range, LbEndpoint, LbPolicy, Listener,
+    LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node, Route, RouteAction,
+    RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, SafeRegex, SocketAddress,
+    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, TlsCertificate,
+    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
+    UpstreamTlsContext, VirtualHost,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
@@ -120,6 +121,18 @@ pub enum ConfigError {
         value: u32,
         range: (u32, u32),
     },
+    /// Cluster-side `typed_extension_protocol_options.HttpProtocolOptions`'s
+    /// `explicit_http_config` had BOTH `http_protocol_options` (H1 arm) AND
+    /// `http2_protocol_options` (H2 arm) set. Envoy's proto defines these as
+    /// a oneof; at most one may be set. 05.3 NEW per SPEC §3 D2.a.
+    #[error(
+        "cluster '{cluster}': explicit_http_config has both http_protocol_options and http2_protocol_options set; at most one is permitted"
+    )]
+    MutuallyExclusiveExplicitHttpConfig { cluster: String },
+    /// `typed_extension_protocol_options.HttpProtocolOptions.@type` did not
+    /// equal the expected URL literal. 05.3 NEW per SPEC §3 D2.a.
+    #[error("typed config @type {got:?} not supported; expected {expected:?}")]
+    UnsupportedTypedConfigUrl { got: String, expected: &'static str },
     #[error("unsupported codec_type: {got:?}; only AUTO, HTTP1, and HTTP2 are supported")]
     UnsupportedCodecType { got: bootstrap::CodecType },
     #[error(

@@ -61,6 +61,17 @@ pub struct Cluster {
     /// (D2 of phase 05.4 — see SPEC §3 D2).
     #[serde(default)]
     pub dns_lookup_family: Option<DnsLookupFamily>,
+    /// 05.3 NEW per SPEC §3 D2.a: cluster-side typed_extension_protocol_options
+    /// carrying the upstreams.http.v3.HttpProtocolOptions extension. Defaults
+    /// to None, which projects to UpstreamProtocol::Http1 at envoy-cluster
+    /// from_bootstrap time (envoy-cluster Task 5) — backwards-compat with all
+    /// phase-04 clusters. The validator enforces:
+    ///   - @type URL literal "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions"
+    ///   - mutual exclusion of explicit_http_config arms
+    ///   - RFC 7540 range checks on http2_protocol_options (delegated to
+    ///     validate_http2_protocol_options_ranges; same checks as listener-side).
+    #[serde(default)]
+    pub typed_extension_protocol_options: Option<TypedExtensionProtocolOptions>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -106,6 +117,49 @@ pub struct LoadAssignment {
     pub cluster_name: String,
     pub endpoints: Vec<LocalityLbEndpoints>,
 }
+
+/// Cluster-side typed_extension_protocol_options (Envoy's mechanism for
+/// per-cluster protocol-extension config). 05.3 NEW per SPEC §3 D2.a.
+/// The single recognized key is the upstreams.http.v3.HttpProtocolOptions
+/// extension; the validator additionally rejects unknown @type URLs and
+/// mutually-exclusive explicit_http_config arms.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TypedExtensionProtocolOptions {
+    #[serde(rename = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions")]
+    pub http_protocol_options: HttpProtocolOptions,
+}
+
+/// The upstreams.http.v3.HttpProtocolOptions typed-extension. Carries the
+/// `@type` URL (validated literal) + the `explicit_http_config` oneof.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpProtocolOptions {
+    #[serde(rename = "@type")]
+    pub type_url: String,
+    pub explicit_http_config: ExplicitHttpConfig,
+}
+
+/// Envoy's `ExplicitHttpConfig` is a oneof: either http_protocol_options
+/// (H1 arm; empty in 05.3 — see Http1ProtocolOptions) or
+/// http2_protocol_options (H2 arm; reuses 05.2 D2.b's Http2ProtocolOptions
+/// unchanged). The validator (validate, line 927) enforces mutual
+/// exclusion via ConfigError::MutuallyExclusiveExplicitHttpConfig.
+#[derive(Debug, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ExplicitHttpConfig {
+    #[serde(default)]
+    pub http_protocol_options: Option<Http1ProtocolOptions>,
+    #[serde(default)]
+    pub http2_protocol_options: Option<Http2ProtocolOptions>,
+}
+
+/// H1 arm of ExplicitHttpConfig. Empty in 05.3; future fields like
+/// chunk_encoding / allow_chunked_length / enable_trailers defer per
+/// SPEC §4 to whichever phase first needs cluster-side H1 protocol-tuning.
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Http1ProtocolOptions {}
 
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -986,6 +1040,27 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                 }
             }
         }
+        // 05.3 NEW per SPEC §3 D2.a: validate cluster-side
+        // typed_extension_protocol_options.
+        if let Some(teo) = &cluster.typed_extension_protocol_options {
+            const EXPECTED_TYPE_URL: &str =
+                "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+            if teo.http_protocol_options.type_url != EXPECTED_TYPE_URL {
+                return Err(crate::ConfigError::UnsupportedTypedConfigUrl {
+                    got: teo.http_protocol_options.type_url.clone(),
+                    expected: EXPECTED_TYPE_URL,
+                });
+            }
+            let ehc = &teo.http_protocol_options.explicit_http_config;
+            if ehc.http_protocol_options.is_some() && ehc.http2_protocol_options.is_some() {
+                return Err(crate::ConfigError::MutuallyExclusiveExplicitHttpConfig {
+                    cluster: cluster.name.clone(),
+                });
+            }
+            if let Some(h2_opts) = &ehc.http2_protocol_options {
+                validate_http2_protocol_options_ranges(h2_opts)?;
+            }
+        }
     }
 
     // Per-listener invariants.
@@ -1179,39 +1254,9 @@ fn validate_hcm(
 
     // 05.2 NEW — D2.b: validate Http2ProtocolOptions ranges per RFC 7540
     // §6.5.2 / §6.9.1 / §6.9.2. Run only if Some; absent = h2-crate defaults.
+    // 05.3: hoisted to validate_http2_protocol_options_ranges free function.
     if let Some(opts) = &hcm.http2_protocol_options {
-        const MAX_FRAME_SIZE_RANGE: (u32, u32) = (16384, 16_777_215);
-        const WINDOW_SIZE_RANGE: (u32, u32) = (0, (1u32 << 31) - 1);
-
-        if let Some(v) = opts.max_frame_size
-            && !(MAX_FRAME_SIZE_RANGE.0..=MAX_FRAME_SIZE_RANGE.1).contains(&v)
-        {
-            return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
-                field: "max_frame_size",
-                value: v,
-                range: MAX_FRAME_SIZE_RANGE,
-            });
-        }
-        if let Some(v) = opts.initial_stream_window_size
-            && v > WINDOW_SIZE_RANGE.1
-        {
-            return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
-                field: "initial_stream_window_size",
-                value: v,
-                range: WINDOW_SIZE_RANGE,
-            });
-        }
-        if let Some(v) = opts.initial_connection_window_size
-            && v > WINDOW_SIZE_RANGE.1
-        {
-            return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
-                field: "initial_connection_window_size",
-                value: v,
-                range: WINDOW_SIZE_RANGE,
-            });
-        }
-        // max_concurrent_streams has no upper bound per RFC 7540 §6.5.2;
-        // zero is valid. No range check.
+        validate_http2_protocol_options_ranges(opts)?;
     }
 
     // http_filters: cardinality + name.
@@ -1291,6 +1336,49 @@ fn validate_hcm(
             }
         }
     }
+    Ok(())
+}
+
+/// Validate RFC 7540 wire-format range constraints on Http2ProtocolOptions
+/// fields. Hoisted from validate_hcm at 05.3 Task 3 so the listener-side
+/// (validate_hcm) and cluster-side (validate's typed_extension walk) sites
+/// share the same range checks. Mutates nothing; returns ConfigError on
+/// out-of-range values.
+fn validate_http2_protocol_options_ranges(
+    opts: &Http2ProtocolOptions,
+) -> Result<(), crate::ConfigError> {
+    const MAX_FRAME_SIZE_RANGE: (u32, u32) = (16384, 16_777_215);
+    const WINDOW_SIZE_RANGE: (u32, u32) = (0, (1u32 << 31) - 1);
+
+    if let Some(v) = opts.max_frame_size
+        && !(MAX_FRAME_SIZE_RANGE.0..=MAX_FRAME_SIZE_RANGE.1).contains(&v)
+    {
+        return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+            field: "max_frame_size",
+            value: v,
+            range: MAX_FRAME_SIZE_RANGE,
+        });
+    }
+    if let Some(v) = opts.initial_stream_window_size
+        && v > WINDOW_SIZE_RANGE.1
+    {
+        return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+            field: "initial_stream_window_size",
+            value: v,
+            range: WINDOW_SIZE_RANGE,
+        });
+    }
+    if let Some(v) = opts.initial_connection_window_size
+        && v > WINDOW_SIZE_RANGE.1
+    {
+        return Err(crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+            field: "initial_connection_window_size",
+            value: v,
+            range: WINDOW_SIZE_RANGE,
+        });
+    }
+    // max_concurrent_streams has no upper bound per RFC 7540 §6.5.2;
+    // zero is valid. No range check.
     Ok(())
 }
 
@@ -5076,5 +5164,451 @@ static_resources:
   clusters: []
 "#,
         )
+    }
+
+    #[test]
+    fn parses_cluster_with_typed_extension_protocol_options_http2() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: http_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_concurrent_streams: 100
+              initial_stream_window_size: 65535
+              initial_connection_window_size: 65535
+              max_frame_size: 16384
+"#;
+        let bs = crate::parse_bootstrap(yaml).expect("parses");
+        let cluster = &bs.static_resources.clusters[0];
+        let teo = cluster
+            .typed_extension_protocol_options
+            .as_ref()
+            .expect("typed_extension_protocol_options present");
+        let h2 = teo
+            .http_protocol_options
+            .explicit_http_config
+            .http2_protocol_options
+            .as_ref()
+            .expect("http2 arm present");
+        assert_eq!(h2.max_concurrent_streams, Some(100));
+        assert_eq!(h2.max_frame_size, Some(16384));
+    }
+
+    #[test]
+    fn parses_cluster_with_typed_extension_protocol_options_http1() {
+        // The H1 arm of explicit_http_config is the empty Http1ProtocolOptions.
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+"#;
+        let bs = crate::parse_bootstrap(yaml).expect("parses");
+        let cluster = &bs.static_resources.clusters[0];
+        let teo = cluster
+            .typed_extension_protocol_options
+            .as_ref()
+            .expect("teo present");
+        assert!(
+            teo.http_protocol_options
+                .explicit_http_config
+                .http_protocol_options
+                .is_some()
+        );
+        assert!(
+            teo.http_protocol_options
+                .explicit_http_config
+                .http2_protocol_options
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_cluster_with_both_http1_and_http2_in_explicit_http_config() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+            http2_protocol_options: {}
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("rejects mutual");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MutuallyExclusiveExplicitHttpConfig { ref cluster }
+                    if cluster == "backend"
+            ),
+            "expected MutuallyExclusiveExplicitHttpConfig {{cluster: backend}}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_cluster_with_wrong_typed_config_url() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.config.core.v3.Http2ProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("rejects wrong URL");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedTypedConfigUrl { .. }),
+            "expected UnsupportedTypedConfigUrl, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_cluster_http2_protocol_options_max_frame_size_too_small() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_frame_size: 1024
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("rejects out-of-range");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Http2ProtocolOptionsOutOfRange {
+                    field: "max_frame_size",
+                    value: 1024,
+                    ..
+                }
+            ),
+            "expected Http2ProtocolOptionsOutOfRange, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_cluster_without_typed_extension_protocol_options_defaults_to_http1() {
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+"#;
+        let bs = crate::parse_bootstrap(yaml).expect("parses");
+        let cluster = &bs.static_resources.clusters[0];
+        assert!(cluster.typed_extension_protocol_options.is_none());
+    }
+
+    #[test]
+    fn rejects_cluster_with_unknown_typed_extension_key() {
+        // Key other than HttpProtocolOptions; serde deny_unknown_fields rejects.
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.UnknownExtension":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.UnknownExtension
+          explicit_http_config:
+            http2_protocol_options: {}
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("rejects unknown key");
+        // serde "unknown field" on TypedExtensionProtocolOptions surfaces as
+        // ConfigError::Yaml (the deny_unknown_fields path on the
+        // TypedExtensionProtocolOptions wrapper struct).
+        assert!(
+            matches!(err, crate::ConfigError::Yaml(_)),
+            "expected serde Yaml error for unknown typed-extension key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parses_cluster_with_strict_dns_and_http2_protocol_options_combined() {
+        // Load-bearing for fixture 0010 (Task 10) which combines exactly these
+        // two surfaces.
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 9000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: localhost, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+"#;
+        let bs = crate::parse_bootstrap(yaml).expect("parses STRICT_DNS + H2 combined");
+        let cluster = &bs.static_resources.clusters[0];
+        assert!(matches!(cluster.cluster_type, ClusterType::StrictDns));
+        assert!(cluster.typed_extension_protocol_options.is_some());
     }
 }
