@@ -1,0 +1,29 @@
+[package]
+name = "http2-echo-server"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "http2-echo-server"
+path = "src/main.rs"
+
+[dependencies]
+envoy-http2 = { path = "../../../crates/envoy-http2" }
+anyhow = "1"
+bytes = "1"
+http = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dependencies.h2]
+# Re-exported by envoy_http2::codec::server_handshake; the helper's accept
+# loop consumes h2::server::Connection / h2::server::SendResponse /
+# h2::SendStream / h2::RecvStream via the returned Connection. This is the
+# documented helper-side h2-direct surface per parent §6 signpost 7's
+# "h2 types leak via the return value" caveat — same shape as
+# tests/differential's drive_http2 carve-out.
+version = "0.4"

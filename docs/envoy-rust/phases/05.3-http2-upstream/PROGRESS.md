@@ -263,3 +263,45 @@ crates/envoy-http2/Cargo.toml:21:envoy-http1 = { path = "../envoy-http1" }
 2. **`UpstreamProtocol` re-export added to `envoy-cluster/src/lib.rs`**: Not mentioned in PLAN. Required because `envoy_cluster::UpstreamProtocol` was `pub` inside `cluster.rs` but not re-exported from the crate root, so `envoy-http2`'s dispatch arm couldn't name it. Minimal (~1 line) fix.
 
 **Carryforward:** Task 2 review I2 (`H2_FORBIDDEN_HOP_BY_HOP` consolidation) closed at this task. 05.2 REVIEW M8 (502 stub body literal) closed structurally at this task. H1-listener-with-H2-cluster dispatch remains deferred per ADR-0028.
+
+---
+
+## Task 8 — `tests/helpers/http2-echo-server/` workspace member + `crates/envoy-http2/src/codec.rs::server_handshake` thin wrapper
+
+**Commit:** (this commit)
+
+**Deliverables:** SPEC §3 D5 — new workspace member `tests/helpers/http2-echo-server/` shipping a deterministic HTTP/2 cleartext echo server. Sibling of `tcp-echo-server` (02.1), `tls-echo-server` (03.2), and `http1-echo-server` (04.3). Argv parser shape mirrors `http1-echo-server` verbatim per parent §6 signpost 7 (`--port <u16>` + `--help` + `--version`). The deterministic echo body lists `method` + `path` + alphabetically-sorted H2 pseudo-headers + non-pseudo headers + `body`. The alphabetic sort is LOAD-BEARING for differential body equivalence. New `pub async fn server_handshake` thin wrapper on `crates/envoy-http2/src/codec.rs` allows the helper to consume `envoy_http2` instead of `h2` directly per parent §6 signpost 7.
+
+**ADR landed:** none (per SPEC §7).
+
+**Files modified:**
+- `crates/envoy-http2/src/codec.rs` — `pub async fn server_handshake` appended after `build_h2_server`; `server_handshake_accepts_h2_connection` unit test appended (+21 LoC impl + ~22 LoC test).
+- `tests/helpers/http2-echo-server/Cargo.toml` — new file (~30 LoC; `[dependencies.h2]` carve-out documented).
+- `tests/helpers/http2-echo-server/src/main.rs` — new file (~280 LoC: argv parser ~60 + run loop + handle_connection ~75 + make_response_body ~45 + main ~30 + 5 tests ~70).
+- `Cargo.toml` (root) — `tests/helpers/http2-echo-server` added to `[workspace] members` in alphabetic order.
+- `Cargo.lock` — synced (near-no-op; no new top-level deps).
+- `docs/envoy-rust/phases/05.3-http2-upstream/PROGRESS.md` (this entry).
+
+**LoC:** ~340 net insertions.
+
+**Verification:**
+- `cargo build -p envoy-http2` — clean.
+- `cargo test -p envoy-http2 --lib codec -- --nocapture` — 2 passed (`build_h2_server_applies_protocol_options` + `server_handshake_accepts_h2_connection`).
+- `cargo build -p http2-echo-server` — clean (Cargo.lock synced).
+- `cargo test -p http2-echo-server` — 5 passed (`parse_argv_accepts_port`, `parse_argv_rejects_missing_port`, `parse_argv_help_returns_help_requested`, `parse_argv_version_returns_version_requested`, `echo_round_trip_against_in_test_h2_client`). 0 failed.
+- `cargo build -p http2-echo-server --release` — clean.
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean.
+
+**Verified shapes from greps run at task time:**
+- `grep -n 'pub async fn server_handshake' crates/envoy-http2/src/codec.rs` — present at line 42.
+- `grep -n 'server_handshake_accepts_h2_connection' crates/envoy-http2/src/codec.rs` — present.
+- `grep -n 'forbid(unsafe_code)' tests/helpers/http2-echo-server/src/main.rs` — present at line 1.
+- `grep -n 'http2-echo-server' Cargo.toml` — workspace member present between `http1-echo-server` and `tcp-echo-server`.
+- `grep -n 'dependencies.h2' tests/helpers/http2-echo-server/Cargo.toml` — carve-out block present.
+
+**Deviations from PLAN:**
+1. **`make_response_body` pseudo-header block formatting**: The PLAN's single-line `.push()` calls (lines 3247–3250) were reformatted to multi-line per `rustfmt`'s line-length preference. No semantic change — same 4 pseudo-headers pushed in identical order.
+
+**Carryforward:** Task 8 is closed. `http2-echo-server` is consumed at Task 9 (`differential::Http2EchoBackend` spawns the binary) and Task 10 (fixture 0010 references it via `HTTP2_BACKEND_PORT`).

@@ -758,6 +758,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "http2-echo-server"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "envoy-http2",
+ "h2",
+ "http",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

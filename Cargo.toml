@@ -12,6 +12,7 @@ members = [
     "tests/conformance/h2spec",
     "tests/differential",
     "tests/helpers/http1-echo-server",
+    "tests/helpers/http2-echo-server",
     "tests/helpers/tcp-echo-server",
     "tests/helpers/tls-echo-server",
 ]
