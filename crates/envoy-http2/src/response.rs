@@ -19,17 +19,9 @@ use http::{HeaderName, HeaderValue, Response as HttpResponse, StatusCode};
 
 use crate::error::Http2Error;
 
-/// Headers that MUST NOT appear on H2 wire (RFC 7540 §8.1.2.2). The H2 codec
-/// would reject these at emission; the strip here is defense-in-depth and
-/// keeps the route-walk's H1-shaped response objects compatible with H2 wire
-/// emission.
-const H2_FORBIDDEN_HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "transfer-encoding",
-    "upgrade",
-    "keep-alive",
-    "proxy-connection",
-];
+// H2-forbidden hop-by-hop headers: crate::H2_FORBIDDEN_HOP_BY_HOP (lib.rs).
+// Per Task 2 review I2: consolidated from per-module duplicates into a single
+// crate-level constant. See lib.rs for the canonical definition + rationale.
 
 /// Translate an `envoy_http1::Response` into an `http::Response<()>` carrying
 /// the status + headers (with H2-forbidden headers stripped). The body is
@@ -43,7 +35,7 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
     // (RFC 7540 §8.1.2.4: only :status pseudo-header).
     for (name, value) in &resp.headers {
         let name_lc = name.to_ascii_lowercase();
-        if H2_FORBIDDEN_HOP_BY_HOP.contains(&name_lc.as_str()) {
+        if crate::H2_FORBIDDEN_HOP_BY_HOP.contains(&name_lc.as_str()) {
             continue;
         }
         let header_name = HeaderName::from_bytes(name_lc.as_bytes())

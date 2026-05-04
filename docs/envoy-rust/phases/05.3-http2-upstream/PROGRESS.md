@@ -226,3 +226,40 @@ crates/envoy-http2/Cargo.toml:21:envoy-http1 = { path = "../envoy-http1" }
 3. **3 unit tests skipped**: PLAN Step 6.5 marks these as "Conditional: include only if option (A) chosen." Option (B) does not land the dispatch at H1 listener side, so no new H1 tests are needed.
 
 **Carryforward:** H1-listener-with-H2-cluster combinations deferred to a later phase per ADR-0028. The H2-listener-side dispatch (Task 7) handles both H1-cluster and H2-cluster cases from an H2 listener. SPEC §3 D4 H1-side projection is partial — flagged in ADR-0028 + the 05.3 REVIEW.md state-5 file (per PLAN's state-machine: state-5 REVIEW.md records partial deliverables). The `envoy-http2 → envoy-http1` path-dep is preserved unchanged.
+
+---
+
+## Task 7 — Symmetric H1-or-H2 dispatch at `crates/envoy-http2/src/hcm.rs` (replace 05.2 502 stub) — closes M8 structurally
+
+**Commit:** (this commit)
+
+**Deliverables:** SPEC §3 D4 H2-side + SPEC §6 local signpost 27: replaced the 05.2-landed 502 stub at `crates/envoy-http2/src/hcm.rs`'s `BuildOutcome::Proxy` arm with the symmetric H1-or-H2 dispatch keyed on `cluster.upstream_protocol()`. Task 6 chose option (B) (per ADR-0028); the dispatch calls `envoy_http1::Client::connect` for H1 clusters and `crate::Client::connect` for H2 clusters — cycle-free because `envoy-http2` already path-deps `envoy-http1` per 05.2 Task 1. Renamed `h2_proxy_outcome_returns_502_in_05_2` → `h2_proxy_outcome_dispatches_to_upstream` and flipped assertion from 502 to 200. Added `h2_proxy_outcome_dispatches_to_h1_upstream_when_cluster_is_http1` per SPEC §3 D4 test 5. Consolidated `H2_FORBIDDEN_HOP_BY_HOP` from `client.rs` and `response.rs` into a single `pub(crate) const` in `lib.rs` (closes Task 2 review I2). Also added `UpstreamProtocol` to `envoy-cluster/src/lib.rs`'s re-exports (was `pub` in `cluster.rs` but missing from the crate's public surface).
+
+**ADR landed:** none.
+
+**Files modified:**
+- `crates/envoy-http2/src/hcm.rs` — `BuildOutcome::Proxy` arm replaced with H1-or-H2 dispatch (~85 LoC); `synth_h2_502()` free function added; `use std::time::Instant` import added; test helpers `build_cluster_mgr_with_upstream` (async), `synth_h2_hcm_config_proxy`, `spawn_upstream_h2_server` added; `use std::net::SocketAddr` import added in `mod tests`; `h2_proxy_outcome_returns_502_in_05_2` renamed + rewritten as `h2_proxy_outcome_dispatches_to_upstream`; `h2_proxy_outcome_dispatches_to_h1_upstream_when_cluster_is_http1` appended.
+- `crates/envoy-http2/src/lib.rs` — `H2_FORBIDDEN_HOP_BY_HOP` crate-level `pub(crate) const` added; doc comment + consolidation rationale.
+- `crates/envoy-http2/src/client.rs` — per-module `H2_FORBIDDEN_HOP_BY_HOP` const removed; reference updated to `crate::H2_FORBIDDEN_HOP_BY_HOP`.
+- `crates/envoy-http2/src/response.rs` — per-module `H2_FORBIDDEN_HOP_BY_HOP` const removed; reference updated to `crate::H2_FORBIDDEN_HOP_BY_HOP`.
+- `crates/envoy-cluster/src/lib.rs` — `UpstreamProtocol` added to the `pub use cluster::{...}` re-export list.
+
+**LoC:** ~175 net insertions (dispatch arm + synth_h2_502 + 3 test helpers + 2 new tests ~125 LoC; I2 consolidation ~15 LoC net; cluster lib.rs +1 line).
+
+**Verification:**
+- `cargo test -p envoy-http2 -- --nocapture` — 32 passed, 0 failed, 1 ignored (pre-existing `h2_protocol_options_max_concurrent_streams_applied`). New tests pass: `h2_proxy_outcome_dispatches_to_upstream` (200, body "h2-upstream-ok") and `h2_proxy_outcome_dispatches_to_h1_upstream_when_cluster_is_http1` (200). Old test `h2_proxy_outcome_returns_502_in_05_2` no longer exists.
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean.
+
+**Verified shapes from greps run at task time:**
+- `grep -n 'upstream H2 not yet wired' crates/envoy-http2/src/hcm.rs` — zero results (stub body literal gone; M8 closed structurally).
+- `grep -n 'H2_FORBIDDEN_HOP_BY_HOP' crates/envoy-http2/src/{client,response,lib}.rs` — constant defined once in `lib.rs`; `client.rs` and `response.rs` reference `crate::H2_FORBIDDEN_HOP_BY_HOP`.
+- `grep -n 'UpstreamProtocol' crates/envoy-cluster/src/lib.rs` — one re-export line.
+- `grep -n 'x-envoy-upstream-service-time' crates/envoy-http2/src/hcm.rs` — injection present at the elapsed_ms measurement site.
+
+**Deviations from PLAN:**
+1. **`build_cluster_mgr_with_upstream` via YAML instead of direct struct construction**: The PLAN sketched `Cluster { ... }` direct construction, but `Cluster` fields are `pub(crate)` (not accessible cross-crate). Instead, the helper builds the ClusterManager via `envoy_config::parse_bootstrap` + `envoy_cluster::from_bootstrap` with a format-string YAML. This exercises more of the production path (the same path used at startup) and is more robust than the sketched approach. No test behavior is lost.
+2. **`UpstreamProtocol` re-export added to `envoy-cluster/src/lib.rs`**: Not mentioned in PLAN. Required because `envoy_cluster::UpstreamProtocol` was `pub` inside `cluster.rs` but not re-exported from the crate root, so `envoy-http2`'s dispatch arm couldn't name it. Minimal (~1 line) fix.
+
+**Carryforward:** Task 2 review I2 (`H2_FORBIDDEN_HOP_BY_HOP` consolidation) closed at this task. 05.2 REVIEW M8 (502 stub body literal) closed structurally at this task. H1-listener-with-H2-cluster dispatch remains deferred per ADR-0028.

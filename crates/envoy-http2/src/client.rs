@@ -85,17 +85,9 @@ impl std::fmt::Debug for ClientStream {
     }
 }
 
-/// H2-forbidden hop-by-hop headers per RFC 7540 §8.1.2.2 + RFC 9113 §8.2.2.
-/// Stripped defensively at the codec edge (the h2 crate also rejects, but the
-/// project's posture per parent SPEC §3 architectural rule 4 is to strip at
-/// the codec edge symmetric with 05.2's listener-side strip in response.rs).
-const H2_FORBIDDEN_HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "transfer-encoding",
-    "keep-alive",
-    "upgrade",
-    "proxy-connection",
-];
+// H2-forbidden hop-by-hop headers: crate::H2_FORBIDDEN_HOP_BY_HOP (lib.rs).
+// Per Task 2 review I2: consolidated from per-module duplicates into a single
+// crate-level constant. See lib.rs for the canonical definition + rationale.
 
 impl ClientStream {
     /// Translate `request` to an H2 frame stream and read the response back.
@@ -154,7 +146,7 @@ impl ClientStream {
             if lower == "host" {
                 continue;
             }
-            if H2_FORBIDDEN_HOP_BY_HOP.contains(&lower.as_str()) {
+            if crate::H2_FORBIDDEN_HOP_BY_HOP.contains(&lower.as_str()) {
                 continue;
             }
             let header_name = http::HeaderName::from_bytes(lower.as_bytes())

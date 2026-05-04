@@ -11,4 +11,6 @@
 
 mod cluster;
 
-pub use cluster::{Cluster, ClusterError, ClusterHandle, ClusterManager, from_bootstrap};
+pub use cluster::{
+    Cluster, ClusterError, ClusterHandle, ClusterManager, UpstreamProtocol, from_bootstrap,
+};

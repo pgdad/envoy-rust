@@ -24,6 +24,21 @@ pub mod hcm;
 pub mod request;
 pub mod response;
 
+/// H2-forbidden hop-by-hop headers per RFC 7540 §8.1.2.2 + RFC 9113 §8.2.2.
+/// Consolidated per Task 2 review I2: was duplicated across `client.rs` and
+/// `response.rs`; now a single canonical crate-level constant. Both modules
+/// import this via `crate::H2_FORBIDDEN_HOP_BY_HOP`.
+///
+/// Stripped defensively at codec edges (the h2 crate also rejects these names,
+/// but our posture per parent SPEC §3 architectural rule 4 is to strip first).
+pub(crate) const H2_FORBIDDEN_HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "transfer-encoding",
+    "keep-alive",
+    "upgrade",
+    "proxy-connection",
+];
+
 pub use client::{Client, ClientStream};
 pub use codec::build_h2_server;
 pub use error::Http2Error;

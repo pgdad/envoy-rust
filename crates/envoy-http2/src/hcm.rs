@@ -18,6 +18,7 @@ use bytes::Bytes;
 use envoy_http1::{BuildOutcome, HCMConfig as Http1HCMConfig, Response, build_response};
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpStream;
 
 /// Re-export of envoy_http1::HCMConfig under the envoy-http2 namespace.
@@ -114,27 +115,112 @@ async fn handle_one_stream(
 
     let resp: Response = match outcome {
         BuildOutcome::Synth(r) => r,
-        BuildOutcome::Proxy { .. } => {
-            // 05.2 STUB: the upstream H2 dispatch lands in 05.3 D13.3.
-            // Per SPEC §6 local signpost 21: emit a generic 502 with a
-            // doctrine-line body; no cluster names or endpoint addresses.
-            tracing::warn!(
-                "H2 BuildOutcome::Proxy reached at sub-phase 05.2 — upstream H2 dispatch \
-                 not yet wired (lands in 05.3); responding 502 Bad Gateway"
-            );
+        BuildOutcome::Proxy {
+            cluster: cluster_name,
+        } => {
+            // SPEC §3 D4 H2-side: symmetric H1-or-H2 dispatch keyed on
+            // cluster.upstream_protocol(). The validator ensures every cluster
+            // name referenced from a RouteAction::Route exists in the
+            // bootstrap; the .expect() is defense-in-depth (mirrors
+            // envoy-http1/src/hcm.rs:215-218).
+            let cluster = config
+                .cluster_mgr
+                .get(&cluster_name)
+                .expect("validator ensures cluster present");
+
+            let endpoint = match cluster.pick_endpoint() {
+                Some(e) => e,
+                None => {
+                    tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
+                    return send_envoy_response(send_response, synth_h2_502()).await;
+                }
+            };
+
+            // Extract Host: from the synthesized envoy_req. http_to_envoy_request
+            // always synthesizes host from :authority at the bottom of headers
+            // (per SPEC §6 signpost 12 + request.rs line 74), so the .expect()
+            // is effectively infallible here.
+            let host_header = envoy_req
+                .headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+                .map(|(_, v)| v.clone())
+                .expect("http_to_envoy_request always synthesizes Host from :authority");
+
+            // Build the outbound request: strip H1 hop-by-hop headers (Connection,
+            // Transfer-Encoding) mirroring envoy-http1/src/hcm.rs:244-248.
+            let mut out_headers = envoy_req.headers.clone();
+            out_headers.retain(|(n, _)| {
+                !n.eq_ignore_ascii_case("connection")
+                    && !n.eq_ignore_ascii_case("transfer-encoding")
+            });
+            let out_req = envoy_http1::codec::Request {
+                method: envoy_req.method.clone(),
+                path: envoy_req.path.clone(),
+                version: envoy_http1::codec::HttpVersion::Http11,
+                headers: out_headers,
+                bytes_consumed: 0,
+                body: envoy_req.body.clone(),
+            };
+
+            let start = Instant::now();
+            let upstream_resp_result = match cluster.upstream_protocol() {
+                envoy_cluster::UpstreamProtocol::Http1 => {
+                    match envoy_http1::Client::connect(endpoint, &host_header).await {
+                        Ok(mut s) => s.send_request(out_req).await.map_err(|e| format!("{e}")),
+                        Err(e) => Err(format!("{e}")),
+                    }
+                }
+                envoy_cluster::UpstreamProtocol::Http2 => {
+                    match crate::Client::connect(endpoint, &host_header).await {
+                        Ok(mut s) => s.send_request(out_req).await.map_err(|e| format!("{e}")),
+                        Err(e) => Err(format!("{e}")),
+                    }
+                }
+            };
+
+            let upstream_resp = match upstream_resp_result {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
+                    return send_envoy_response(send_response, synth_h2_502()).await;
+                }
+            };
+
+            // Append x-envoy-upstream-service-time per parent §6 signpost 10.
+            let elapsed_ms = start.elapsed().as_millis();
+            let mut headers = upstream_resp.headers;
+            headers.push((
+                "x-envoy-upstream-service-time".to_string(),
+                elapsed_ms.to_string(),
+            ));
             Response {
-                status: 502,
-                reason: None,
-                headers: vec![
-                    ("server".to_string(), "envoy-rust".to_string()),
-                    ("content-type".to_string(), "text/plain".to_string()),
-                ],
-                body: Bytes::from_static(b"upstream H2 not yet wired (sub-phase 05.3)\n"),
+                status: upstream_resp.status,
+                reason: upstream_resp.reason,
+                headers,
+                body: upstream_resp.body,
             }
         }
     };
 
     send_envoy_response(send_response, resp).await
+}
+
+/// Emit a generic 502 Bad Gateway response with no body. Used by
+/// `handle_one_stream` when upstream dispatch fails (no healthy endpoint,
+/// connect error, or send_request error). Mirrors the shape of
+/// envoy-http1's `synth_status(502, _)` without the H1 Connection:
+/// header (H2 has its own connection lifecycle).
+fn synth_h2_502() -> Response {
+    Response {
+        status: 502,
+        reason: None,
+        headers: vec![
+            ("server".to_string(), "envoy-rust".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ],
+        body: Bytes::from_static(b""),
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +233,7 @@ mod tests {
     };
     use envoy_http1::HCMConfig as Http1HCMConfig;
     use envoy_listener::ConnectionHandler;
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     /// RAII handle that aborts the spawned listener task when dropped. Used
@@ -220,6 +307,149 @@ mod tests {
             }
         });
         (addr, TestServer { handle: h })
+    }
+
+    /// Build a ClusterManager containing a single STATIC cluster named
+    /// "backend" pointing at the given `upstream_addr` with the given
+    /// `protocol`. Builds via YAML so that the envoy-cluster `from_bootstrap`
+    /// path is exercised (fields on `Cluster` are `pub(crate)`, so direct
+    /// construction isn't available cross-crate).
+    ///
+    /// `Http2` protocol is expressed via `typed_extension_protocol_options`;
+    /// `Http1` is expressed by omitting the field (default).
+    async fn build_cluster_mgr_with_upstream(
+        upstream_addr: SocketAddr,
+        protocol: envoy_cluster::UpstreamProtocol,
+    ) -> Arc<envoy_cluster::ClusterManager> {
+        let yaml = if protocol == envoy_cluster::UpstreamProtocol::Http2 {
+            format!(
+                r#"
+node: {{ id: x, cluster: y }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: {addr}
+                      port_value: {port}
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_concurrent_streams: 100
+"#,
+                addr = upstream_addr.ip(),
+                port = upstream_addr.port(),
+            )
+        } else {
+            format!(
+                r#"
+node: {{ id: x, cluster: y }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: {addr}
+                      port_value: {port}
+"#,
+                addr = upstream_addr.ip(),
+                port = upstream_addr.port(),
+            )
+        };
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse bootstrap");
+        Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap)
+                .await
+                .expect("from_bootstrap"),
+        )
+    }
+
+    /// Build a minimal HCM config whose single route proxies everything to
+    /// the "backend" cluster. The caller supplies the ClusterManager so both
+    /// H1- and H2-cluster variants can reuse this helper.
+    fn synth_h2_hcm_config_proxy(
+        cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+    ) -> Arc<Http1HCMConfig> {
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test-proxy".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr).expect("build HCM config"))
+    }
+
+    /// Spawn an in-process H2 server that responds to the first accepted
+    /// request with 200 and a fixed body. Returns the bound addr + a
+    /// `JoinHandle` that is the server's lifecycle.
+    async fn spawn_upstream_h2_server(
+        body: &'static [u8],
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (tcp, _peer) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut conn = match h2::server::handshake(tcp).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            while let Some(result) = conn.accept().await {
+                let (_req, mut send_response) = match result {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let resp = http::Response::builder().status(200).body(()).unwrap();
+                let mut send_stream = match send_response.send_response(resp, false) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let _ = send_stream.send_data(bytes::Bytes::from_static(body), true);
+            }
+        });
+        (addr, handle)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -421,40 +651,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn h2_proxy_outcome_returns_502_in_05_2() {
-        // Build an HCM whose route action proxies to a non-existent cluster
-        // ("backend"); cluster_mgr is empty. The HCM's Proxy arm returns the
-        // 05.2 STUB 502 (per SPEC §6 local signpost 21) — the real upstream
-        // H2 dispatch lands in 05.3 D13.3.
-        let cfg = HttpConnectionManagerConfig {
-            stat_prefix: "test".to_string(),
-            codec_type: CodecType::HTTP2,
-            http2_protocol_options: None,
-            route_config: RouteConfiguration {
-                name: "r".to_string(),
-                virtual_hosts: vec![VirtualHost {
-                    name: "vh".to_string(),
-                    domains: vec!["*".to_string()],
-                    routes: vec![Route {
-                        r#match: RouteMatch {
-                            prefix: Some("/".to_string()),
-                            path: None,
-                            headers: vec![],
-                        },
-                        action: RouteAction::Route(RouteAction_Route {
-                            cluster: "backend".to_string(),
-                        }),
-                    }],
-                }],
-            },
-            http_filters: vec![HttpFilter {
-                name: "envoy.filters.http.router".to_string(),
-                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
-            }],
-        };
-        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
-        let config = Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr).unwrap());
-        let (addr, _server) = spawn_h2_hcm(config).await;
+    async fn h2_proxy_outcome_dispatches_to_upstream() {
+        // SPEC §3 D4 H2-side: H2 listener with an H2-cluster upstream.
+        // Spawns an in-process H2 upstream returning 200 "h2-upstream-ok",
+        // wires the HCM to proxy the "backend" cluster there, drives a GET /
+        // through the HCM, and asserts 200 with body "h2-upstream-ok".
+        let (upstream_addr, _upstream_handle) = spawn_upstream_h2_server(b"h2-upstream-ok").await;
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
+                .await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr)).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
         tokio::spawn(async move {
@@ -467,11 +673,16 @@ mod tests {
             .unwrap();
         let (response_fut, _) = send_request.send_request(req, true).unwrap();
         let resp = response_fut.await.expect("response");
-        assert_eq!(
-            resp.status().as_u16(),
-            502,
-            "Proxy outcome at 05.2 must return 502 (upstream H2 dispatch lands in 05.3)"
-        );
+        assert_eq!(resp.status().as_u16(), 200);
+        // Drain body and assert.
+        let (_parts, mut body) = resp.into_parts();
+        let mut body_bytes = bytes::BytesMut::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            body_bytes.extend_from_slice(&chunk);
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        assert_eq!(body_bytes.as_ref(), b"h2-upstream-ok");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -510,6 +721,50 @@ mod tests {
             }
             Err(_) => { /* RST / ECONNRESET — also expected */ }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_proxy_outcome_dispatches_to_h1_upstream_when_cluster_is_http1() {
+        // Per SPEC §3 D4 test 5: H2 listener-side HCM with a cluster of
+        // upstream_protocol: Http1 dispatches via envoy_http1::Client.
+        // Uses a minimal ad-hoc H1 server (raw TCP write) since the
+        // tests/helpers/http1-echo-server isn't usable from a unit test.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        // Spawn a minimal H1 server that returns 200 with body "h1-from-h2-listener".
+        // Content-Length must match the body exactly (19 bytes).
+        let _upstream_handle = tokio::spawn(async move {
+            if let Ok((mut tcp, _)) = upstream_listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = tcp.read(&mut buf).await;
+                let _ = tcp
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\nh1-from-h2-listener")
+                    .await;
+                let _ = tcp.shutdown().await;
+            }
+        });
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http1)
+                .await;
+        let (listener_addr, _hcm) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr)).await;
+        let tcp = tokio::net::TcpStream::connect(listener_addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "H2 listener with H1 cluster must proxy to the H1 upstream and return 200"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
