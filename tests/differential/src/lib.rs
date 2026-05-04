@@ -1016,6 +1016,22 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let http1_backend_port_str = _http1_backend.as_ref().map(|b| b.port().to_string());
 
+    // 05.3 NEW per SPEC §3 D6.b: spawn Http2EchoBackend if either template
+    // needs one. Same alive-keeper binding-order discipline as _backend /
+    // _tls_backend / _http1_backend above.
+    let needs_http2_backend = upstream_template.contains("{{HTTP2_BACKEND_PORT}}")
+        || subject_template.contains("{{HTTP2_BACKEND_PORT}}");
+    let _http2_backend: Option<crate::backend::Http2EchoBackend> = if needs_http2_backend {
+        Some(
+            crate::backend::Http2EchoBackend::spawn()
+                .await
+                .context("spawning Http2EchoBackend")?,
+        )
+    } else {
+        None
+    };
+    let http2_backend_port_str = _http2_backend.as_ref().map(|b| b.port().to_string());
+
     // (c) Build per-side substitution maps with TLS path keys.
     // Type is Vec<(&str, String)> to accommodate owned strings from TLS paths.
     let upstream_tls_paths = tls_pki.as_ref().map(|p| p.envoy_side_paths());
@@ -1032,15 +1048,20 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(hp) = http1_backend_port_str.as_deref() {
             v.push(("HTTP1_BACKEND_PORT", hp.to_string()));
         }
+        if let Some(h2p) = http2_backend_port_str.as_deref() {
+            v.push(("HTTP2_BACKEND_PORT", h2p.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
+            || http2_backend_port_str.is_some()
         {
             // Per ADR-0015: container-side reaches the host backend via
             // host.docker.internal (with the harness's with_host call below).
             // Generalized in Task 9 to fire for either backend variant; was
             // previously gated only on BACKEND_PORT (Task 8 cadence). Task 13
-            // extends the gate to HTTP1_BACKEND_PORT.
+            // extends the gate to HTTP1_BACKEND_PORT. 05.3 Task 9 extends to
+            // HTTP2_BACKEND_PORT.
             v.push(("BACKEND_HOST", "host.docker.internal".to_string()));
         }
         if let Some(map) = upstream_tls_paths.as_ref() {
@@ -1061,9 +1082,13 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(hp) = http1_backend_port_str.as_deref() {
             v.push(("HTTP1_BACKEND_PORT", hp.to_string()));
         }
+        if let Some(h2p) = http2_backend_port_str.as_deref() {
+            v.push(("HTTP2_BACKEND_PORT", h2p.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
+            || http2_backend_port_str.is_some()
         {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
         }
@@ -1631,6 +1656,26 @@ mod tests {
             "rendered: {rendered}"
         );
         drop(backend);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_fixture_dispatches_http2_backend_on_template_marker() {
+        // Per SPEC §3 D6.b: run_fixture spawns Http2EchoBackend when either
+        // upstream_template or subject_template contains {{HTTP2_BACKEND_PORT}}.
+        // Test by passing a synthetic template through render_yaml directly
+        // and asserting the substitution occurred (the spawn-side is exercised
+        // by the dedicated http2_router_upstream Docker-gated test at Task 10).
+        let template = "endpoint: {{BACKEND_HOST}}:{{HTTP2_BACKEND_PORT}}";
+        let port_str = "7000";
+        let kvs: Vec<(&str, &str)> = vec![
+            ("HTTP2_BACKEND_PORT", port_str),
+            ("BACKEND_HOST", "host.docker.internal"),
+        ];
+        let rendered = render_yaml(template, &kvs);
+        assert!(
+            rendered.contains("endpoint: host.docker.internal:7000"),
+            "expected substitution; got: {rendered}"
+        );
     }
 
     #[test]

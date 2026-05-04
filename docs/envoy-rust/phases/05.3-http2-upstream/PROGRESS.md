@@ -305,3 +305,41 @@ crates/envoy-http2/Cargo.toml:21:envoy-http1 = { path = "../envoy-http1" }
 1. **`make_response_body` pseudo-header block formatting**: The PLAN's single-line `.push()` calls (lines 3247–3250) were reformatted to multi-line per `rustfmt`'s line-length preference. No semantic change — same 4 pseudo-headers pushed in identical order.
 
 **Carryforward:** Task 8 is closed. `http2-echo-server` is consumed at Task 9 (`differential::Http2EchoBackend` spawns the binary) and Task 10 (fixture 0010 references it via `HTTP2_BACKEND_PORT`).
+
+---
+
+## Task 9 — Differential harness `Http2EchoBackend` + `run_fixture` `{{HTTP2_BACKEND_PORT}}` cascade extension
+
+**Commit:** (this commit)
+
+**Deliverables:** SPEC §3 D6 — new `Http2EchoBackend` struct (sibling of `TcpProxyBackend` / `TlsEchoBackend` / `Http1EchoBackend`) at `tests/differential/src/backend.rs`. Public surface mirrors `Http1EchoBackend`'s exactly: `spawn` / `port` / `container_host` / `Drop`. Locator helper `locate_http2_echo_server` is the sibling of `locate_http1_echo_server` in the same module. Accept-readiness polling is H2-shape aware: opens TCP then runs `h2::client::handshake` via `tokio::time::timeout` — 2-second budget (vs Http1EchoBackend's 1-second; H2 handshake adds the SETTINGS exchange round-trip). `run_fixture` cascade extended at `tests/differential/src/lib.rs` with `{{HTTP2_BACKEND_PORT}}` template-marker substitution. Per-side substitution maps gain `HTTP2_BACKEND_PORT` entries. The `BACKEND_HOST` gate extends to include `http2_backend_port_str.is_some()`. M10 (05.2 REVIEW: `Driver::Http2` lacks `extra_headers` field) deferred — fixture 0010 does not need `extra_headers` per SPEC §3 D7.
+
+**ADR landed:** none (per SPEC §7).
+
+**Files modified:**
+- `tests/differential/src/backend.rs` — `Http2EchoBackend` struct + `spawn` + `port` + `container_host` + `Drop` impl + `wait_h2_accept_ready` helper + `locate_http2_echo_server` locator + 3 unit tests (`http2_echo_backend_spawns_and_echoes`, `http2_echo_backend_drop_terminates_child`, `locate_http2_echo_server_returns_existing_path`).
+- `tests/differential/src/lib.rs` — `_http2_backend` spawn block + `http2_backend_port_str` + `HTTP2_BACKEND_PORT` entries in both `upstream_kvs` and `subject_kvs` + `BACKEND_HOST` gate extensions + 1 unit test (`run_fixture_dispatches_http2_backend_on_template_marker`).
+- `docs/envoy-rust/phases/05.3-http2-upstream/PROGRESS.md` (this entry).
+
+**LoC:** ~230 net insertions (~120 LoC `Http2EchoBackend` + locator; ~35 LoC `run_fixture` cascade extension; ~80 LoC 4 unit tests).
+
+**Verification:**
+- `cargo build -p http2-echo-server` — clean (pre-built at Task 8; verified still present).
+- `cargo test -p differential -- http2 --nocapture` — 5 passed (4 new: `http2_echo_backend_spawns_and_echoes`, `http2_echo_backend_drop_terminates_child`, `locate_http2_echo_server_returns_existing_path`, `run_fixture_dispatches_http2_backend_on_template_marker`; 1 pre-existing: `drive_http2_round_trip_against_in_process_listener`). 0 failed.
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean.
+
+**Verified shapes from greps run at task time:**
+- `grep -n 'pub fn render_yaml' tests/differential/src/lib.rs` — present at line 302.
+- `h2 = "0.4"` in `tests/differential/Cargo.toml` — pre-existing dep (added at 05.2 D5.b for `drive_http2`).
+- `Http2EchoBackend`, `locate_http2_echo_server`, `wait_h2_accept_ready` — all in `backend.rs` after line 240.
+- `_http2_backend` spawn block — present after `_http1_backend` block in `run_fixture`.
+- `HTTP2_BACKEND_PORT` entries — present in both `upstream_kvs` and `subject_kvs` blocks.
+
+**Deviations from PLAN:**
+1. None. Implementation follows PLAN lines 3567–3735 verbatim.
+
+**M10 disposition:** DEFERRED. `Driver::Http2` `extra_headers` field not added. Fixture 0010 (Task 10) does not need `extra_headers` per SPEC §3 D7 expectations.yaml example. M10 carries forward to whichever fixture first needs it.
+
+**Carryforward:** Task 9 is closed. `Http2EchoBackend` is consumed at Task 10 (fixture 0010's `run_fixture` call will spawn it via `{{HTTP2_BACKEND_PORT}}`). The `Driver::Http2` variant + `drive_http2` helper from 05.2 D5 are reused unchanged at Task 10.

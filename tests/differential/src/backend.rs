@@ -238,6 +238,135 @@ impl Drop for Http1EchoBackend {
     }
 }
 
+/// Spawns the workspace's `http2-echo-server` helper on an ephemeral
+/// 127.0.0.1 port and waits until an H2C handshake against it completes.
+///
+/// Mirrors `Http1EchoBackend`'s posture (per phase-04.3 D14 / SPEC §3 D6.a):
+/// ephemeral port reservation; subprocess spawn via `tokio::process::Command`
+/// with `kill_on_drop(true)`; SIGKILL-on-Drop polling loop with the awareness-
+/// only 02.2 REVIEW M1 carryforward (`std::thread::sleep` from a tokio-runtime
+/// thread) — inherited verbatim.
+///
+/// Accept-readiness polling is H2-shape aware: the poll opens a TCP connection
+/// AND runs `h2::client::handshake` via `tokio::time::timeout` — success means
+/// the helper has completed its H2 codec setup, not just that it's accepting
+/// TCP. (Per SPEC §3 D6.a's option (a) — "H2 handshake polling because the
+/// codec setup is what makes the helper actually ready to serve".)
+pub struct Http2EchoBackend {
+    port: u16,
+    child: Option<tokio::process::Child>,
+}
+
+impl Http2EchoBackend {
+    pub async fn spawn() -> Result<Self> {
+        let port = reserve_port().context("reserving http2 backend port")?;
+        let bin = locate_http2_echo_server().context("locating http2-echo-server binary")?;
+        let child = tokio::process::Command::new(&bin)
+            .arg("--port")
+            .arg(port.to_string())
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning {} --port {port}", bin.display()))?;
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        wait_h2_accept_ready(addr, Duration::from_secs(2))
+            .await
+            .with_context(|| format!("http2-echo-server never became h2-accept-ready on {addr}"))?;
+
+        Ok(Self {
+            port,
+            child: Some(child),
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Hostname the upstream Envoy container uses to reach this backend.
+    /// Per ADR-0015 + 05.1 STRICT_DNS posture: always `host.docker.internal`.
+    pub fn container_host(&self) -> &'static str {
+        "host.docker.internal"
+    }
+}
+
+impl Drop for Http2EchoBackend {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+}
+
+/// H2-aware accept-readiness poll. Connects TCP then runs h2::client::handshake;
+/// retries with exponential backoff up to `budget`. Distinct from
+/// `wait_accept_ready` (which is TCP-only) per SPEC §3 D6.a's recommendation.
+async fn wait_h2_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut delay = Duration::from_millis(10);
+    loop {
+        let attempt = async {
+            let tcp = tokio::net::TcpStream::connect(addr).await?;
+            let (_send, conn) = h2::client::handshake(tcp).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(Duration::from_millis(500), attempt).await {
+            Ok(Ok(())) => return Ok(()),
+            _ if tokio::time::Instant::now() >= deadline => {
+                bail!("http2-echo-server not h2-handshake-ready on {addr} within {budget:?}");
+            }
+            _ => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// Locate the workspace's `http2-echo-server` binary. Mirrors
+/// `locate_http1_echo_server`. `pub(crate)` so the `lib.rs::tests`
+/// cross-module dispatch test can probe binary availability.
+pub(crate) fn locate_http2_echo_server() -> Result<PathBuf> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .context("walking up from CARGO_MANIFEST_DIR to workspace root")?;
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root.join("target"));
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let mut bin = target_dir.join(profile).join("http2-echo-server");
+    if cfg!(windows) {
+        bin.set_extension("exe");
+    }
+    if !bin.exists() {
+        bail!(
+            "http2-echo-server not found at {}; run `cargo build -p http2-echo-server` or `cargo test --workspace`",
+            bin.display()
+        );
+    }
+    Ok(bin)
+}
+
 /// Locate the workspace's `http1-echo-server` binary. Mirrors
 /// `locate_tcp_echo_server` and `locate_tls_echo_server`. `pub(crate)` so the
 /// `lib.rs::tests` cross-module dispatch test can probe binary availability.
@@ -544,6 +673,69 @@ mod tests {
             Err(_) => {
                 eprintln!(
                     "skipping locate_http1_echo_server_returns_existing_path — binary not built"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http2_echo_backend_spawns_and_echoes() {
+        if locate_http2_echo_server().is_err() {
+            eprintln!("skipping http2_echo_backend_spawns_and_echoes — binary not built");
+            return;
+        }
+        let backend = Http2EchoBackend::spawn().await.expect("spawn");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", backend.port()).parse().unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://testharness/probe")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http2_echo_backend_drop_terminates_child() {
+        if locate_http2_echo_server().is_err() {
+            eprintln!("skipping http2_echo_backend_drop_terminates_child — binary not built");
+            return;
+        }
+        let port;
+        {
+            let backend = Http2EchoBackend::spawn().await.expect("spawn");
+            port = backend.port();
+        } // backend dropped here — SIGKILL fires
+        // Give the OS up to 2s to finalize the kill (mirrors Http1EchoBackend
+        // posture per phase-02.2 REVIEW M1 carryforward).
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Best-effort assertion: the port is now free (re-bindable).
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await;
+        assert!(
+            listener.is_ok(),
+            "expected port {port} to be re-bindable after backend drop"
+        );
+    }
+
+    #[test]
+    fn locate_http2_echo_server_returns_existing_path() {
+        match locate_http2_echo_server() {
+            Ok(p) => {
+                assert!(
+                    p.exists(),
+                    "locator returned non-existent path {}",
+                    p.display()
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "skipping locate_http2_echo_server_returns_existing_path — binary not built"
                 );
             }
         }
