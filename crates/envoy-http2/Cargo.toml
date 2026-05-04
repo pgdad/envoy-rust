@@ -19,7 +19,7 @@ tracing = "0.1"
 envoy-config = { path = "../envoy-config" }
 envoy-listener = { path = "../envoy-listener" }
 envoy-http1 = { path = "../envoy-http1" }
+envoy-cluster = { path = "../envoy-cluster" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
-envoy-cluster = { path = "../envoy-cluster" }
