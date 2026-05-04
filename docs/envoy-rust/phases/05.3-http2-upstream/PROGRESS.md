@@ -182,3 +182,47 @@ SPEC at `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md` (committed at paren
 
 **Deviations from PLAN:**
 1. **`rt-multi-thread` dev-dependency**: The PLAN's 3 new tests use `#[tokio::test(flavor = "multi_thread")]` but `envoy-cluster/Cargo.toml`'s `[dev-dependencies]` tokio entry lacked the `rt-multi-thread` feature. Added to fix compile error. The `[dependencies]` entry is unchanged (production code uses single-thread `rt`).
+
+**Carryforward:** Task 5 is closed; `UpstreamProtocol` is consumed at Task 6 (ADR-0028) + Task 7 (`hcm.rs` dispatch arm).
+
+---
+
+## Task 6 — Router H2-arm at `crates/envoy-http1/src/hcm.rs`'s `BuildOutcome::Proxy` (cycle resolution + deferral)
+
+**Commit:** (this commit)
+
+**Deliverables:** ADR-0028 documenting the `envoy-http1` ↔ `envoy-http2` dep cycle and the chosen resolution (Option B — defer H1-listener-side dispatch). No code changes. SPEC §3 D4 H1-side projection is partial per ADR-0028.
+
+**ADR landed:** ADR-0028 (`docs/envoy-rust/DECISIONS.md`).
+
+**Cycle evidence (grep at task time):**
+
+```
+grep -n 'envoy-http' crates/envoy-http1/Cargo.toml crates/envoy-http2/Cargo.toml
+crates/envoy-http1/Cargo.toml:2:name = "envoy-http1"
+crates/envoy-http2/Cargo.toml:2:name = "envoy-http2"
+crates/envoy-http2/Cargo.toml:21:envoy-http1 = { path = "../envoy-http1" }
+```
+
+`crates/envoy-http2/Cargo.toml:21` path-deps `envoy-http1`. Adding `envoy-http2` as a path-dep of `envoy-http1` (as SPEC §3 D4 H1-side projects) would create a circular dep that Cargo rejects. The cycle was unanticipated at parent-05 + 05.3 SPEC writeup (commit `f1804a7`).
+
+**Decision:** Option (B) — defer the H1-listener-side dispatch. Rationale: phase 05.3's only new fixture (0010) is H2-listener + H2-cluster (SPEC §1 D7); the H1-listener-side dispatch is not exercised by any 05.3 fixture. Option (A) (trait-object hoist via `envoy-bin`) would cost ~200-250 LoC of restructure for zero 05.3 fixture benefit. Option (B) achieves the same fixture-0010 outcome via Task 7's H2-listener-side dispatch (which can call both `envoy_http1::Client` and `envoy_http2::Client` without cycle, since `envoy-http2` already deps on `envoy-http1`).
+
+**Files modified:**
+- `docs/envoy-rust/DECISIONS.md` — ADR-0028 appended after ADR-0027 block (~50 LoC).
+- `docs/envoy-rust/phases/05.3-http2-upstream/PROGRESS.md` — this Task 6 section (~45 LoC).
+
+**LoC:** ~95 (ADR-0028 ~50 LoC + PROGRESS Task 6 ~45 LoC). No Rust code changed.
+
+**Verification:**
+- `cargo build --workspace --all-targets` — clean (no code changed; no-op).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean.
+- `cargo test -p envoy-http1` — all pre-existing tests pass; no new tests (option B skips the 3 conditional H1-side dispatch tests per PLAN Step 6.5 note).
+
+**Deviations from PLAN:**
+1. **Option (B) chosen instead of (A)**: The PLAN's PLAN Step 6.4 note says "recommendation: (A) if restructure fits ≤200 LoC; otherwise (B)." The controller evaluated the restructure at task time and decided option (B) per the task prompt's explicit rationale — fixture 0010 is H2-listener side; the H1-listener-side restructure is not justified by 05.3's scope. The PLAN itself acknowledged (B) as the alternative; ADR-0028 documents the choice.
+2. **No code changes in Task 6**: The PLAN projected ~100 LoC of code changes (for option A) or ~50 LoC (for option B, documentation only). Task 6 ships documentation only per the controller's decision.
+3. **3 unit tests skipped**: PLAN Step 6.5 marks these as "Conditional: include only if option (A) chosen." Option (B) does not land the dispatch at H1 listener side, so no new H1 tests are needed.
+
+**Carryforward:** H1-listener-with-H2-cluster combinations deferred to a later phase per ADR-0028. The H2-listener-side dispatch (Task 7) handles both H1-cluster and H2-cluster cases from an H2 listener. SPEC §3 D4 H1-side projection is partial — flagged in ADR-0028 + the 05.3 REVIEW.md state-5 file (per PLAN's state-machine: state-5 REVIEW.md records partial deliverables). The `envoy-http2 → envoy-http1` path-dep is preserved unchanged.
