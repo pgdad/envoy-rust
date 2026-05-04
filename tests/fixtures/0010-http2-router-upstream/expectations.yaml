@@ -1,0 +1,14 @@
+driver:
+  kind: http2
+  method: get
+  path: /
+  host: envoy-rust.test
+  expected_status: 200
+  expected_body:
+    kind: byte_exact
+    body: "method: GET\npath: /\nheaders:\n  :authority: envoy-rust.test\n  :method: GET\n  :path: /\n  :scheme: http\nbody: "
+  expected_headers: set_equal_modulo_allow_list
+
+equivalence:
+  response_status: exact
+  response_body: byte_exact

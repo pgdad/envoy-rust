@@ -1,0 +1,60 @@
+# Phase 05.3 fixture 0010 — HTTP/2 router upstream (H2C end-to-end).
+# Downstream listener accepts H2C; cluster `backend` selects upstream H2 via
+# typed_extension_protocol_options.HttpProtocolOptions.explicit_http_config.
+# http2_protocol_options. STRICT_DNS cluster type inherited from 05.1; the
+# dns_lookup_family: V4_ONLY override is per 05.4 REVIEW R-2 for
+# `host.docker.internal` reachability (avoids IPv6-resolution flakiness on
+# Docker for Linux/macOS).
+
+node: { id: envoy-rust-phase-05.3-fixture-0010, cluster: envoy-rust-phase-05.3 }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+static_resources:
+  listeners:
+    - name: http2_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: {{PORT}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http2
+                codec_type: HTTP2
+                # Suppress the default x-request-id injection per the 04.3
+                # fixture 0008 precedent so the deterministic-echo body is
+                # byte-equal across both proxies.
+                generate_request_id: false
+                route_config:
+                  name: local_route
+                  request_headers_to_remove:
+                    - x-forwarded-for
+                    - x-forwarded-proto
+                    - x-request-id
+                    - x-envoy-expected-rq-timeout-ms
+                    - x-envoy-internal
+                    - x-envoy-external-address
+                  virtual_hosts:
+                    - name: backend_vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: {{BACKEND_HOST}}, port_value: {{HTTP2_BACKEND_PORT}} } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}

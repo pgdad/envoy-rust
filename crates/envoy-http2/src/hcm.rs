@@ -18,7 +18,7 @@ use bytes::Bytes;
 use envoy_http1::{BuildOutcome, HCMConfig as Http1HCMConfig, Response, build_response};
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 use tokio::net::TcpStream;
 
 /// Re-export of envoy_http1::HCMConfig under the envoy-http2 namespace.
@@ -187,9 +187,36 @@ async fn handle_one_stream(
                 }
             };
 
-            // Append x-envoy-upstream-service-time per parent §6 signpost 10.
+            // Build the downstream response: mirror envoy-http1::router::
+            // write_proxied_response's header policy — replace upstream
+            // `server` with `server: envoy-rust`; replace or inject `date`
+            // with a fresh IMF-fixdate; append x-envoy-upstream-service-time.
+            // The H2 forbidden hop-by-hop headers (connection, transfer-encoding,
+            // etc.) are stripped later by build_http_response in response.rs.
             let elapsed_ms = start.elapsed().as_millis();
-            let mut headers = upstream_resp.headers;
+            let now_date = envoy_http1::date::format_imf_fixdate(SystemTime::now());
+            let mut headers: Vec<(String, String)> =
+                Vec::with_capacity(upstream_resp.headers.len() + 3);
+            let mut saw_server = false;
+            let mut saw_date = false;
+            for (name, value) in upstream_resp.headers.into_iter() {
+                let lc = name.to_ascii_lowercase();
+                if lc == "server" {
+                    saw_server = true;
+                    headers.push(("server".to_string(), "envoy-rust".to_string()));
+                } else if lc == "date" {
+                    saw_date = true;
+                    headers.push(("date".to_string(), now_date.clone()));
+                } else {
+                    headers.push((lc, value));
+                }
+            }
+            if !saw_server {
+                headers.push(("server".to_string(), "envoy-rust".to_string()));
+            }
+            if !saw_date {
+                headers.push(("date".to_string(), now_date));
+            }
             headers.push((
                 "x-envoy-upstream-service-time".to_string(),
                 elapsed_ms.to_string(),

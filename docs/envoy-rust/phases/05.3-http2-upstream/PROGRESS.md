@@ -343,3 +343,59 @@ crates/envoy-http2/Cargo.toml:21:envoy-http1 = { path = "../envoy-http1" }
 **M10 disposition:** DEFERRED. `Driver::Http2` `extra_headers` field not added. Fixture 0010 (Task 10) does not need `extra_headers` per SPEC §3 D7 expectations.yaml example. M10 carries forward to whichever fixture first needs it.
 
 **Carryforward:** Task 9 is closed. `Http2EchoBackend` is consumed at Task 10 (fixture 0010's `run_fixture` call will spawn it via `{{HTTP2_BACKEND_PORT}}`). The `Driver::Http2` variant + `drive_http2` helper from 05.2 D5 are reused unchanged at Task 10.
+
+---
+
+## Task 10 — Fixture `tests/fixtures/0010-http2-router-upstream/` + Docker-gated wrapper
+
+**Commit:** (this commit)
+
+**Deliverables:** SPEC §3 D7 — 5-file fixture at `tests/fixtures/0010-http2-router-upstream/` (`envoy.yaml` + `envoy-rust.yaml` + `inputs/payload.bin` (0 bytes) + `expectations.yaml` + `README.md`) + 7-line Docker-gated test wrapper at `tests/differential/tests/http2_router_upstream.rs`. The first H2-on-H2 round-trip in the project: HCM `codec_type: HTTP2` listener proxying to a `STRICT_DNS` cluster with `typed_extension_protocol_options.HttpProtocolOptions.explicit_http_config.http2_protocol_options: {}`.
+
+**ADR landed:** none (per SPEC §7).
+
+**Files modified:**
+- `tests/fixtures/0010-http2-router-upstream/envoy.yaml` — new file (~55 LoC; Envoy-side YAML with `codec_type: HTTP2`, `generate_request_id: false`, `request_headers_to_remove` list, `dns_lookup_family: V4_ONLY`, `typed_extension_protocol_options` block).
+- `tests/fixtures/0010-http2-router-upstream/envoy-rust.yaml` — new file (~45 LoC; per-side divergences: `127.0.0.1` bind, no admin, no `generate_request_id`, no `request_headers_to_remove`, no `dns_lookup_family`).
+- `tests/fixtures/0010-http2-router-upstream/inputs/payload.bin` — new file (0 bytes; verified with `wc -c`).
+- `tests/fixtures/0010-http2-router-upstream/expectations.yaml` — new file (~13 LoC; `kind: http2` driver, `expected_status: 200`, `kind: byte_exact` body with byte-exact echo shape, `expected_headers: set_equal_modulo_allow_list`).
+- `tests/fixtures/0010-http2-router-upstream/README.md` — new file (~25 LoC).
+- `tests/differential/tests/http2_router_upstream.rs` — new file (19 LoC; uses `PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(...)` per 04.3 + 05.2 wrapper precedent).
+- `crates/envoy-http2/src/hcm.rs` — H2 proxy response path updated to inject `server: envoy-rust` and `date: <IMF-fixdate>` (mirroring `envoy-http1::router::write_proxied_response`'s posture); `std::time::SystemTime` added to imports.
+- `docs/envoy-rust/phases/05.3-http2-upstream/PROGRESS.md` (this entry).
+
+**LoC:** ~160 net insertions (~55 envoy.yaml + ~45 envoy-rust.yaml + ~13 expectations.yaml + ~25 README + ~19 wrapper + ~25 H2 HCM server/date injection).
+
+**Verification:**
+- `cargo build -p envoy-bin -p http2-echo-server` — clean.
+- `cargo test -p differential --test http2_router_upstream -- --nocapture` — **1 PASSED**. Docker daemon running; Envoy v1.33 container started; envoy-rust + http2-echo-server spawned; GET / → 200 with byte-exact body equivalence verified. H2C downstream handshake + H2C upstream dispatch (first H2-on-H2 round-trip) confirmed green.
+- `cargo test -p envoy-http2 --lib hcm -- --nocapture` — 8 passed; 1 ignored (pre-existing); 0 failed.
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean (one formatting fixup applied to `let now_date = ...` single-line form).
+
+**Verified shapes from greps run at task time:**
+- `wc -c tests/fixtures/0010-http2-router-upstream/inputs/payload.bin` → 0 bytes confirmed.
+- Test output: "1 passed; 0 failed" with `--nocapture`.
+- `cargo fmt` diff applied; re-check clean.
+
+**Deviations from PLAN:**
+1. **Wrapper calling convention**: PLAN (line 4066) shows `differential::run_fixture("0010-http2-router-upstream")` passing a `&str`, but the actual `run_fixture` signature takes `&Path`. Corrected to `PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("...").join("tests/fixtures/0010-http2-router-upstream")` per the 04.3 and 05.2 wrapper precedent (PLAN's snippet was a simplified pseudo-code; the actual calling form is explicit per existing wrappers).
+2. **H2 HCM server/date injection (unplanned fix)**: The PLAN did not anticipate that the H2 proxy response path was missing `server: envoy-rust` and `date:` injection (present in the H1 router path via `write_proxied_response`). The initial test run failed with `only-in-envoy=["date", "server"], only-in-envoy-rust=[]`. Added `server`/`date` injection in `crates/envoy-http2/src/hcm.rs` (mirroring the H1 posture); all 8 existing H2 HCM unit tests still pass.
+3. **expectations.yaml format**: PLAN's projected body used `byte_exact: |` YAML block scalar format (planner-time pseudo-YAML). Actual serde deserializer uses `#[serde(tag = "kind")]` so the correct format is `kind: byte_exact` + `body: "..."` (matching fixture 0009 precedent). Applied.
+
+**Body shape captured at task time:**
+Expected body (byte-exact, no trailing newline after `body: `):
+```
+method: GET
+path: /
+headers:
+  :authority: envoy-rust.test
+  :method: GET
+  :path: /
+  :scheme: http
+body: 
+```
+(Trailing space after `body: ` is literal — no body bytes for empty GET.)
+
+**Carryforward:** Task 10 is closed. Task 11 (in-process integration backstop at `crates/envoy-bin/tests/http2_router_upstream.rs`) is next.
