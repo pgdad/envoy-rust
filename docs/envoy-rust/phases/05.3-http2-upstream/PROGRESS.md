@@ -119,3 +119,35 @@ SPEC at `docs/envoy-rust/phases/05.3-http2-upstream/SPEC.md` (committed at paren
 3. **`UnsupportedTypedConfigUrl` formatting**: The PLAN's multi-line struct body was reformatted by `cargo fmt` to a single line. Accepted.
 
 **Carryforward:** The corpus-walk test `fuzz_corpus_cluster_http2_protocol_options_seed_parses` is omitted per Step 3.11/PLAN Step 3.10 instruction — it depends on Task 4's seed file and lands there alongside it.
+
+---
+
+## Task 4 — `cluster_http2_protocol_options.yaml` fuzz corpus seed + corpus-walk acceptance test
+
+**Commit:** 06ebf43
+
+**Deliverables:** SPEC §1 acceptance signal (d) + SPEC §6 local signpost 22 — new fuzz corpus seed exercising cluster-side `typed_extension_protocol_options` accept-path; `.gitignore` allow-list extended; corpus-walk acceptance test `fuzz_corpus_cluster_http2_protocol_options_seed_parses` appended per existing precedent.
+
+**ADR landed:** none (per SPEC §7).
+
+**Files modified:**
+- `crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_http2_protocol_options.yaml` — new 48-line YAML seed file exercising listener-side `codec_type: HTTP2 + http2_protocol_options`, cluster-side `type: STRICT_DNS + typed_extension_protocol_options.HttpProtocolOptions.explicit_http_config.http2_protocol_options`.
+- `crates/envoy-config/fuzz/.gitignore` — allow-list entry appended after `hcm_codec_http2.yaml`.
+- `crates/envoy-config/src/bootstrap.rs` — corpus-walk test appended after `fuzz_corpus_hcm_codec_http2_seed_parses` (~12 LoC inserted).
+
+**LoC:** ~62 net insertions per git diff (62 inserted, 0 deleted).
+
+**Verification:**
+- `cargo test -p envoy-config fuzz_corpus_cluster_http2_protocol_options_seed_parses -- --nocapture` — PASS (1 passed, 0 failed).
+- `cargo build --workspace --all-targets` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean.
+
+**Verified shapes from greps run at task time:**
+- `grep -n 'fn fuzz_corpus_hcm_codec_http2_seed_parses' crates/envoy-config/src/bootstrap.rs` — line 5089 confirmed; new test appended at line 5113.
+- Seed file path matches existing 04.x + 05.1 + 05.2 shape: `crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_http2_protocol_options.yaml`.
+- TDD red phase confirmed: test fails at compile if seed file missing or path incorrect.
+
+**Deviations from PLAN:** None.
+
+**Carryforward:** The `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30 --runs=10000` step (Step 4.5) is deferred to Task 12 state-4 verification per PLAN's explicit guidance ("If `cargo +nightly fuzz` is unavailable in the local env, defer the run to Task 12 state-4"). Local nightly fuzz is not available; CI's nightly fuzz job covers the corpus exercise.
