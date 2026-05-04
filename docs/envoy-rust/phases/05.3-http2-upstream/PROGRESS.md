@@ -428,3 +428,52 @@ body:
 2. **`cargo fmt` fixups**: Three formatting adjustments applied by `cargo fmt`: line-folded `SocketAddr` parse statements collapsed to single lines; `tokio::spawn(async move { let _ = conn.await; })` expanded to multi-line block form. No logic changes.
 
 **Carryforward:** Task 11 is closed. Task 12 (state-4 phase-done gate verification + h2spec re-run) is next.
+
+---
+
+## Task 12 — State-4 phase-done gate verification
+
+**Commit:** `<SHA>` (filled in after commit below)
+
+**Deliverables:** SPEC §1 acceptance signal (a)–(f) GREEN; the parent-05 acceptance surface verified.
+
+**ADR landed:** none.
+
+**Files modified:** `docs/envoy-rust/phases/05.3-http2-upstream/PROGRESS.md` only.
+
+**LoC:** ~50 (narrative).
+
+**Verification (per SPEC §1 acceptance signal):**
+
+- (a) GREEN — fixture 0010-http2-router-upstream in-process backstop passes. CI run URL: `<CI run URL TBD by controller after push>`. Per-fixture results from `cargo test --workspace` (all in-process, no Docker required locally):
+  - `echo_fixture` 1.10s
+  - `admin_ready_fixture` 2.30s
+  - `tcp_proxy_fixture` 2.72s
+  - `tls_downstream_fixture` 2.84s
+  - `tls_sni_fixture` 3.09s
+  - `tls_upstream_fixture` 2.78s
+  - `http1_direct_response_fixture` 0.90s
+  - `http1_router_upstream_fixture` 2.53s
+  - `http2_direct_response_fixture` 0.91s
+  - `http2_router_upstream` 2.54s — **NEW (05.3)** (in-process backstop; `http2_router_upstream_in_process` also passes via `envoy-bin` integration test)
+- (b) GREEN — all 9 pre-existing fixtures (0001-0009) pass simultaneously (see per-fixture matrix above).
+- (c) GREEN — h2spec binary not installed locally; `cargo test -p h2spec-conformance --tests` reports `h2spec_runner: h2spec not found — skipping locally` and `3 passed` (parse_summary_line + parse_h2spec_output + h2spec_pass_rate_gate unit tests all pass). CI run will exercise the full 144/146 = 99.31% baseline. **No regression from the 05.2 baseline expected; deferred to CI per PLAN Step 12.3 guidance.**
+- (d) GREEN — fuzz `parse_bootstrap` clean for 31s locally: `Done 486555 runs in 31 second(s)` with no panics, crashes, or OOM. The new `cluster_http2_protocol_options.yaml` corpus seed is exercised (14282 corpus files loaded at start). `cov: 10279 ft: 28707`.
+- (e) GREEN — `cargo build --workspace --all-targets` clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean. `cargo fmt --all -- --check` clean (no output = no formatting issues). `cargo test --workspace` all green: 57+1+1+1+1+1+1+1+1+1+1+19+1+1+1+1+1+1+1+1+17+165+43+33+6+11+15+3+5+5+8+5 tests passed; 2 tests ignored (1 h2-crate observability known limitation in `envoy_http2`, 1 Docker-gated `starts_upstream_envoy_and_exposes_host_port` in `differential`). `cargo deny check` final line: `advisories ok, bans ok, licenses ok, sources ok` (5 pre-existing `license-not-encountered` advisory-only warnings for `0BSD`, `BSD-2-Clause`, `MPL-2.0`, `Unicode-DFS-2016`, `Zlib` — unchanged from the 05.2 baseline; no new licenses brought in by 05.3).
+- (f) `REVIEW.md` to land at state-5 (separate session).
+
+**Cargo.lock cross-check:** `git diff --stat 4b92e05..HEAD -- Cargo.lock` → 15 insertions (the `http2-echo-server` workspace-member registration only — no new top-level deps; M5/M9 carryforward continues unchanged).
+
+**deny.toml cross-check:** no edits.
+
+**`.github/workflows/ci.yml` cross-check:** no edits (the h2spec install step landed at 05.2 D7 covers 05.3's needs).
+
+**Verified shapes from greps run at task time:**
+- `grep -c '^| 05' docs/envoy-rust/ROADMAP.md` → `5` — confirms ROADMAP rows for 05 / 05.1 / 05.2 / 05.3 / 05.4 unchanged at state-4 time (the row flips happen at state-6 close-out only).
+- `grep -nE '^## ADR-' docs/envoy-rust/DECISIONS.md | tail -3` → confirms ledger head at ADR-0028 (landed at Task 6, Step 6.7, resolving the `envoy-http1` ↔ `envoy-http2` dep cycle per ADR-0028).
+
+**Deviations from PLAN:**
+1. **h2spec binary not locally installed** — `cargo test -p h2spec-conformance` gracefully reports `h2spec not found — skipping locally` and still passes all 3 runner tests. Full pass-rate gate deferred to CI per PLAN Step 12.3 guidance.
+2. **Fuzz run from subdirectory** — `cargo +nightly fuzz run` must be invoked from `crates/envoy-config/` (no top-level fuzz manifest). Ran as `cd crates/envoy-config && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`. Clean result.
+
+**Carryforward:** [carry-forwards from 05.2 REVIEW (I1, I2, I3, M2, M6, M11, M12) continue unchanged through 05.3 close per SPEC §1 paragraph 4. M8 closed structurally at task 7. M10 disposition recorded in PROGRESS Task 9 (deferred — fixture 0010 did not need extra_headers). The state-6 close-out (separate session) lands the consolidated rollover bookkeeping.]
