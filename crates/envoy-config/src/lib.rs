@@ -129,8 +129,12 @@ pub enum ConfigError {
         "cluster '{cluster}': explicit_http_config has both http_protocol_options and http2_protocol_options set; at most one is permitted"
     )]
     MutuallyExclusiveExplicitHttpConfig { cluster: String },
-    /// `typed_extension_protocol_options.HttpProtocolOptions.@type` did not
-    /// equal the expected URL literal. 05.3 NEW per SPEC §3 D2.a.
+    /// A `@type` URL field did not equal its expected literal. General-
+    /// purpose: any future call site running an `@type` URL check (typed
+    /// extensions, transport sockets, network filters, http filters, ...) may
+    /// reuse this variant. First instantiated at 05.3 for cluster-side
+    /// `typed_extension_protocol_options.HttpProtocolOptions.@type`
+    /// per SPEC §3 D2.a; the variant carries no use-site discriminator.
     #[error("typed config @type {got:?} not supported; expected {expected:?}")]
     UnsupportedTypedConfigUrl { got: String, expected: &'static str },
     #[error("unsupported codec_type: {got:?}; only AUTO, HTTP1, and HTTP2 are supported")]

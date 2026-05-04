@@ -143,7 +143,7 @@ pub struct HttpProtocolOptions {
 /// Envoy's `ExplicitHttpConfig` is a oneof: either http_protocol_options
 /// (H1 arm; empty in 05.3 — see Http1ProtocolOptions) or
 /// http2_protocol_options (H2 arm; reuses 05.2 D2.b's Http2ProtocolOptions
-/// unchanged). The validator (validate, line 927) enforces mutual
+/// unchanged). The validator (`validate` fn) enforces mutual
 /// exclusion via ConfigError::MutuallyExclusiveExplicitHttpConfig.
 #[derive(Debug, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
