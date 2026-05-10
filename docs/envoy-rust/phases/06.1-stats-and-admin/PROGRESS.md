@@ -1,0 +1,55 @@
+# Phase 06.1 — Implementation Progress
+
+Per-task narrative log for sub-phase 06.1 (`envoy-stats` foundation + `envoy-admin` HCM-backed listener migration + Prometheus exposition + fixture 0011). Mirrors the 05.x PROGRESS.md cadence (one section per task; appended at task commit time; quotes meaningful command output inline).
+
+The companion artifacts:
+- **SPEC.md** — `docs/envoy-rust/phases/06.1-stats-and-admin/SPEC.md` (committed at the parent-06 state-1+state-2 combined-recovery commit `1f7661a`; the design contract).
+- **PLAN.md** — `docs/envoy-rust/phases/06.1-stats-and-admin/PLAN.md` (committed at this sub-phase's state-2 commit, alongside this PROGRESS.md skeleton; the per-task task list).
+
+## PLAN-write posture (recorded at sub-phase 06.1 state-2 commit, before any task commits)
+
+### LoC drift posture (per 06.1 SPEC §6 signpost 20)
+
+The 06.1 SPEC's §3 D1–D7 deliverable estimates total **~1960 LoC**, a ~50% drift over the parent-06 SPEC §3's projection of ~1300 LoC. The PLAN-time refinement to 14 tasks projects **~2010 LoC** in line with the SPEC's estimate. Per 06.1 SPEC §6 signpost 20:
+
+> Per parent-06 SPEC §5, do not nest-split a sub-phase that was itself produced by a split. The PLAN-write planner accepts the estimate and proceeds; if the actual PLAN-time refinement crosses 25 tasks, the planner invokes `superpowers:systematic-debugging` first to confirm the scope is genuine, not creep.
+
+The 14-task count is comfortably under the §6.1 25-task gate; the LoC overage is genuine (concentrated in D1's multi-module envoy-stats decomposition with thorough torture-test surface, and D2's per-endpoint-per-method admin handler test surface). The named trims listed in STATE.md's prior "Next expected skill" guidance — (i) defer `Driver::AdminScrape`'s optional shape, (ii) defer the in-process backstop test to 06.3, (iii) defer the new fuzz-corpus seed — were considered at PLAN-write time and **not applied**:
+
+- **(i) defer `Driver::AdminScrape`'s optional shape** — would scatter fixture-0011's implementation across sub-phases; saves ~50 LoC at the cost of doctrine clarity.
+- **(ii) defer in-process backstop to 06.3** — would lose the local regression-equivalence guard for the admin migration that runs without Docker; saves ~120 LoC at the cost of catch-rate for migration regressions on dev machines without Docker.
+- **(iii) defer fuzz-corpus seed** — saves ~30 LoC; the seed is small and the corpus-walk acceptance test absorbs it for free; the seed is the primary parse-acceptance evidence for the new `Admin.access_log_path` field.
+
+Total potential savings: ~200 LoC. Even with all three trims applied, the projection (~1810 LoC) would still exceed the 1500 LoC gate. The trims weaken the gate without sufficient LoC reduction; the doctrinally cleaner posture per signpost 20 is to accept the estimate. **Acceptance posture: do NOT trim; do NOT nest-split.** This PROGRESS entry is the documented record of the planner's decision per the established 05.2 / 05.3 cadence.
+
+### Signpost-9 schema correction (per 06.1 SPEC §6 signpost 9)
+
+Parent-06 SPEC §3 D5.1 phrased `HttpConnectionManagerConfig.stat_prefix` as `Option<String> parse-and-consume`. At HEAD `1f7661a` the field is **already required**: `pub stat_prefix: String` at `crates/envoy-config/src/bootstrap.rs:351`. Confirmed via `grep -n 'stat_prefix' crates/envoy-config/src/bootstrap.rs`.
+
+06.1 D5 lands NO schema change for `stat_prefix`; instead, Task 10 consumes the existing required field at HCM construction time (it threads into the per-HCM `HCMStats` registration namespace via `format!("http.{stat_prefix}.downstream_rq_total")`). The SPEC's projection is corrected here in PROGRESS rather than via SPEC edit per D-3.5 (append-only).
+
+### PLAN-write SPEC corrections (recorded for the executor)
+
+The PLAN.md's preamble section "SPEC corrections recorded at PLAN-write time" lists 4 minor projection inaccuracies in the 06.1 SPEC that the planner verified against HEAD `1f7661a`. Reproduced here for stranger-readability:
+
+1. **`envoy_listener::ConnectionHandler::handle` return type.** SPEC §3 D2 projects `BoxFuture<'_, std::io::Result<()>>`. The actual trait at `crates/envoy-listener/src/lib.rs:29` returns `BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>`. PLAN uses the actual signature for `AdminHandler`'s `ConnectionHandler` impl.
+
+2. **`envoy_listener::Listener::serve` signature.** SPEC §3 D3 step 4 projects `envoy_listener::Listener::serve(lst, admin_handler, shutdown)` — a 3-arg free function. The actual `Listener::serve(self, shutdown)` is method-on-self, where `Listener` was constructed via `Listener::bind(&envoy_config::Listener, Arc<dyn ConnectionHandler>)`. Since admin doesn't have an `envoy_config::Listener` (it's an `envoy_config::Admin`), PLAN does NOT route through `envoy_listener::Listener` for the admin path. Instead, **`envoy-admin` exposes its own `serve(listener: tokio::net::TcpListener, handler: Arc<AdminHandler>, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<(), AdminError>` free function** that mirrors the existing `crates/envoy-bin/src/admin.rs::serve` accept-loop pattern. envoy-bin calls this directly. Future phases may unify the admin and data-plane serve loops if a need surfaces.
+
+3. **`Admin` struct does not derive `PartialEq`.** SPEC §3 D5.a's example schema adds `PartialEq` to the derives. PLAN's parse tests compare via direct field access (`assert_eq!(parsed.admin.unwrap().access_log_path, Some(...))`), which avoids the derive churn entirely; if a follow-up phase needs `Admin: PartialEq`, it lands then.
+
+4. **`HttpConnectionManagerConfig.stat_prefix` is already required (not Option).** Per 06.1 SPEC §6 signpost 9 — confirmed at HEAD `1f7661a` line 351: `pub stat_prefix: String`. No schema change needed; HCM consumes the existing field at construction time per Task 10.
+
+These are minor projection inaccuracies; the SPEC remains in-tree unedited per D-3.5.
+
+### Task ordering note
+
+The 14 PLAN tasks are numbered for documentation. The recommended **execution order** is `1 → 2 → 3 → 4 → 5 → 9 → 6 → 7 → 8 → 10 → 11 → 12 → 13 → 14` because Task 9 lands the `Admin.access_log_path` field that Task 6's `AdminConfig::from_envoy_config` reads. Tasks 1-5 build envoy-stats; Task 9 lands the schema; Tasks 6-8 build envoy-admin atop both; Task 10 wires consumers; Task 11 migrates the admin handler; Tasks 12-13 add the harness extensions and fixture; Task 14 verifies.
+
+## Task 1 — PROGRESS.md preamble + LoC drift + SPEC corrections
+
+(THIS section. Lands at sub-phase 06.1 state-2 commit alongside PLAN.md and the STATE.md / ROADMAP.md advance.)
+
+## Tasks 2 through 14
+
+Appended at execution time, one section per task commit, mirroring the 05.x per-task cadence.
