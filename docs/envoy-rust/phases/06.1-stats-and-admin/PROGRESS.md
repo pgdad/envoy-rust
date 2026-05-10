@@ -330,3 +330,92 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 D6 (harness + fixture) complete at this task.
 
+## Task 14 — State-4 phase-done verification
+
+Per `BOOTSTRAP_PROMPT.md` §7.5 + 06.1 SPEC §1.
+
+### Pre-state-4 fmt drift catch
+
+State-4 verification ran `cargo fmt --all -- --check` and found 13 files with rustfmt drift accumulated across Tasks 2-13 (all 06.1-introduced code; the parent-05 close commit `53ac466` was fmt-clean and CI's last green run was at that HEAD). Each per-task PROGRESS section had logged "clippy clean" but not "fmt clean" — the gate caught the drift exactly as intended.
+
+Resolution: applied `cargo fmt --all` (mechanical line-wrapping / brace-form / use-statement-ordering changes; no behavior change) in a dedicated pre-state-4 commit `36fedd8` ("phase 06.1: cargo fmt --all (task 14 pre-push catch)"). Files touched: `crates/envoy-admin/src/{endpoint.rs,handler.rs,lib.rs}`, `crates/envoy-bin/src/main.rs`, `crates/envoy-cluster/src/cluster.rs`, `crates/envoy-{http1,http2}/src/hcm.rs`, `crates/envoy-listener/src/lib.rs`, `crates/envoy-stats/src/{error.rs,lib.rs,prometheus.rs,registry.rs}`, `tests/differential/src/lib.rs` (13 files; +103 / −63 LoC).
+
+Post-fix: `cargo fmt --all -- --check` clean; rest of the gate (build / clippy / test / deny / fuzz) re-run from the fixed tree per the §7.5 discipline. The state-4 evidence quoted below is from the post-fix tree.
+
+### (a) New differential fixture green
+
+Fixture `tests/fixtures/0011-admin-stats-prometheus/` green at the Docker-gated CI level.
+
+CI run: <https://github.com/pgdad/envoy-rust/actions/runs/25625271032>. HEAD: `36fedd8` (`36fedd879e53cbdcfc7ed83be397ad0f23fab654`). Conclusion: `success`. Date: 2026-05-10 (CI completed at `2026-05-10T09:33:41Z`).
+
+Test result (verbatim from CI `build + test + lint` job, step `test (includes differential harness → Docker)`):
+```
+     Running tests/admin_stats_prometheus.rs (target/debug/deps/admin_stats_prometheus-4ce074aca887ccc5)
+
+running 1 test
+test admin_stats_prometheus ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94s
+```
+
+### (b) 10 pre-existing fixtures green
+
+All 10 baseline fixtures (0001–0010) green simultaneously at the Docker-gated CI level on the same CI run `25625271032` at HEAD `36fedd8`.
+
+Per-fixture top-level test results (verbatim from CI `build + test + lint` job, step `test (includes differential harness → Docker)`; 10 baseline + new fixture 0011 = 11 lines):
+```
+test admin_ready_fixture ... ok
+test admin_stats_prometheus ... ok
+test echo_fixture ... ok
+test http1_direct_response_fixture ... ok
+test http1_router_upstream_fixture ... ok
+test http2_direct_response_fixture ... ok
+test http2_router_upstream ... ok
+test tcp_proxy_fixture ... ok
+test tls_downstream_fixture ... ok
+test tls_sni_fixture ... ok
+test tls_upstream_fixture ... ok
+```
+
+### (c) Conformance suite carry-forward
+
+`tests/conformance/h2spec/` continues at ≥95% pass per the parent-05 close baseline (CI run `25333279366` HEAD `53ac466`: 99.31% pass, 144/145 of unfiltered tests). 06.1 does not engage H2 framing; the runner and gate are unedited; the gate carries forward unchanged. h2spec pass on the fresh CI run `25625271032` test step is bundled inside the `cargo test --workspace` step (the `h2spec_conformance` test crate runs alongside the other workspace test bins) — the step concluded `success`.
+
+### (d) Fuzz short-budget run
+
+`cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` clean — both locally and in CI.
+
+Local run (rust toolchain 1.95.0 stable workspace pin overridden by `+nightly` for cargo-fuzz; nightly version `cargo 1.97.0-nightly (eb9b60f1f 2026-04-24)`; cargo-fuzz `0.13.1`):
+```
+INFO: seed corpus: files: 15119 min: 1b max: 4080b total: 5980171b rss: 57Mb
+#15120	INITED cov: 10300 ft: 28731 corp: 3076/1544Kb exec/s: 3780 rss: 493Mb
+…
+#510929	DONE   cov: 11520 ft: 31133 corp: 3198/1708Kb lim: 4096 exec/s: 16481 rss: 563Mb
+Done 510929 runs in 31 second(s)
+```
+
+CI run (job `fuzz (parse_bootstrap, 30s)` of `25625271032`):
+```
+INFO: seed corpus: files: 16 min: 203b max: 2076b total: 20397b rss: 50Mb
+…
+Done 251297 runs in 31 second(s)
+```
+
+The new `admin_with_stats_route.yaml` corpus seed (Task 9) was exercised — the CI seed-corpus count `16` reflects the 15 pre-06.1 seeds + 1 new seed, matching the explicit corpus-walk allow-list update at Task 9. (The local seed corpus `15119` is much larger because libfuzzer writes back every coverage-discovering input as a new corpus entry on each run; the 16 hand-curated `.gitignore`-allowlisted seeds are the canonical contract surface.) Zero crashes in either environment.
+
+### (e) Stable-toolchain CI gates
+
+All five clean both locally (rust 1.95.0 stable per `rust-toolchain.toml`) and in CI (same pin honored via `dtolnay/rust-toolchain@stable` reading the workspace `rust-toolchain.toml`; CI run `25625271032` `build + test + lint` job):
+
+- `cargo build --workspace --all-targets`: `Finished` clean (CI step "build" success; local `Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.66s`).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean (CI step "clippy" success; local `Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.72s`).
+- `cargo fmt --all -- --check`: clean post the pre-state-4 fmt fix in commit `36fedd8` (CI step "fmt" success).
+- `cargo test --workspace`: 467 passed; 0 failed; 2 ignored across the workspace (locally; CI bundles the same plus the Docker-gated differential fixtures and the in-process h2spec conformance suite, all in the `success` test step). The 2 ignored are pre-existing (one in `differential` lib unittests, one in `envoy-bin` integration tests; documented in prior 05.x PROGRESS).
+- `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok` (CI step "cargo deny check" success; the three `unmatched license allowance` warnings on `Unicode-DFS-2016` / `Zlib` / one other are pre-existing config-side allow-list entries that no current dependency needs — non-fatal).
+
+### (f) REVIEW.md verdict
+
+REVIEW.md verdict: lands at state 5 per the lifecycle (out of scope for Task 14 per §7.5 (f)). The next session runs `superpowers:requesting-code-review` to produce REVIEW.md.
+
+State-4 phase-done verification complete at this task. CI run `25625271032` HEAD `36fedd8` is the durable evidence anchor.
+
