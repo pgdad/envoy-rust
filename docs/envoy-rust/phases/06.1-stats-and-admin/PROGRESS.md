@@ -125,3 +125,19 @@ Total LoC delta: ~10 schema (struct field + doc comment) + ~50 unit tests + ~38 
 **Plan-time deviation (downstream call sites):** Two by-hand `Admin {}` literals in `crates/envoy-cluster/src/cluster.rs` test code (`from_bootstrap_rejects_empty_cluster` and `from_bootstrap_rejects_duplicate_cluster_name`) needed `access_log_path: None` to compile under `cargo clippy --workspace --all-targets -- -D warnings`. Patched both per D-3.6. envoy-cluster tests (17) still pass.
 
 Sequenced BEFORE Task 6 in execution order (per PLAN's "Executor sequencing notes": 1 → 2 → 3 → 4 → 5 → 9 → 6 → 7 → 8 → 10 → 11 → 12 → 13 → 14) — Task 6's `AdminConfig::from_envoy_config` reads the new `Admin.access_log_path` field landed here.
+
+## Task 6 — envoy-admin crate scaffold + AdminConfig + AdminError
+
+New workspace member `crates/envoy-admin/`. Cargo deps: envoy-config + envoy-http1 + envoy-listener + envoy-stats path-deps + tokio + bytes + thiserror + tracing. **No envoy-http2 dep** per cross-sub-phase architectural rule 3 (admin is HTTP/1.1 only in 06.1).
+
+`AdminConfig::from_envoy_config(&Admin) -> Result<Self, AdminError>` parses `address` to `SocketAddr` and stores `access_log_path` opaquely as `Option<PathBuf>` (parse-and-ignore per ADR-0026). 3 unit tests pass: round-trip-address, carries-access-log-path, rejects-unparseable-address.
+
+`AdminError::{BadAddress, Io}`.
+
+`AdminEndpoint` and `AdminHandler` are placeholder types pending Tasks 7 / 8. The placeholder `serve` returns `unimplemented!()` — Task 8 lands the real implementation. The `_config` / `_registry` field names + `_listener` / `_handler` / `_shutdown` parameter names use the leading-underscore Rust idiom to suppress `dead_code` and `unused_variables` lints; no `#[allow]` annotations needed. Workspace `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean — clippy did not flag the `unimplemented!()` placeholder.
+
+This task is sequenced AFTER Task 9 in execution order so the `Admin.access_log_path` field exists when `AdminConfig` parses it.
+
+`#![forbid(unsafe_code)]` on lib.rs per D-3.8.
+
+Workspace members at this commit: 16 (Task 2's 15 + envoy-admin). The PLAN's reminder noted "15 (Task 2's 14 + envoy-admin)" — Task 2 actually landed the 15th member (envoy-stats); this commit is the 16th. Adjusted per PLAN's "Adjust the workspace count if it differs" instruction.
