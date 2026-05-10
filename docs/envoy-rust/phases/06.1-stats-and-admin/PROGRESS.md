@@ -141,3 +141,20 @@ This task is sequenced AFTER Task 9 in execution order so the `Admin.access_log_
 `#![forbid(unsafe_code)]` on lib.rs per D-3.8.
 
 Workspace members at this commit: 16 (Task 2's 15 + envoy-admin). The PLAN's reminder noted "15 (Task 2's 14 + envoy-admin)" — Task 2 actually landed the 15th member (envoy-stats); this commit is the 16th. Adjusted per PLAN's "Adjust the workspace count if it differs" instruction.
+
+## Task 7 — envoy-admin AdminEndpoint + per-endpoint render
+
+`AdminEndpoint::{Ready, Stats, StatsPrometheus}` + `from_path(&str) -> Option<Self>` (exact-match per cross-sub-phase rule 5) + `render(&StatsRegistry) -> envoy_http1::Response`.
+
+`render_ready` returns 200 + body `LIVE\n` + `content-type: text/plain`. `render_stats` walks the registry snapshot emitting `name: value\n`. `render_stats_prometheus` calls `envoy_stats::prometheus::write_exposition`.
+
+`render_404` and `render_405` are crate-private helpers used by Task 8's AdminHandler.
+
+Tests: 10 unit tests across path lookup + render shapes + 404/405. All pass; clippy clean.
+
+Plan-time deviations (per D-3.5):
+- PLAN's `envoy_http1::codec::Response` path is wrong: `Response` lives in `envoy_http1::response`, not `envoy_http1::codec`. Used the crate-root re-export `envoy_http1::Response` (canonical path; matches existing call sites in envoy-http2).
+- PLAN's `Response.reason: String` is wrong: actual shape at HEAD is `reason: Option<&'static str>` (per `crates/envoy-http1/src/response.rs:15`). All `reason: "OK".to_string()` → `reason: Some("OK")`; `reason: "Not Found".to_string()` → `reason: Some("Not Found")`; etc. Test assertion `resp.reason == "OK"` → `resp.reason == Some("OK")`.
+- `write!(buf, "{}: {}\n", ...)` → `writeln!(buf, "{}: {}", ...)` for `clippy::write_with_newline` (mirrors Task 5's identical fix in the prometheus emitter; output byte-identical).
+- Test name normalization: `render_ready_returns_200_LIVE` → `render_ready_returns_200_live` (lowercase per Rust naming convention; test body / assertion semantics unchanged).
+- `render_404` / `render_405` flagged by `-D dead-code` because they're called only from `#[cfg(test)]` and (eventually) Task 8's not-yet-landed `AdminHandler`. Added `#[allow(dead_code)] // wired up by Task 8's AdminHandler::handle_inner` comment, mirroring the same idiom at `crates/envoy-http1/src/codec.rs:51` (`#[allow(dead_code)] // wired up by Task 9's router-proxy arm`).
