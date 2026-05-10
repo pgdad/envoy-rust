@@ -223,4 +223,32 @@ mod tests {
         assert!(!is_valid_name("contains/slash"));
         assert!(!is_valid_name("contains#hash"));
     }
+
+    #[test]
+    fn stat_handle_kind_str_returns_correct_label() {
+        let h_c = StatHandle::Counter(Arc::new(Counter::new()));
+        let h_g = StatHandle::Gauge(Arc::new(Gauge::new()));
+        assert_eq!(h_c.kind_str(), "counter");
+        assert_eq!(h_g.kind_str(), "gauge");
+    }
+
+    #[test]
+    fn registry_register_counter_contended_same_name_returns_same_arc() {
+        let reg = Arc::new(StatsRegistry::new());
+        let mut handles = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let r = Arc::clone(&reg);
+            handles.push(std::thread::spawn(move || {
+                r.register_counter("contended").unwrap()
+            }));
+        }
+        let arcs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = &arcs[0];
+        for other in &arcs[1..] {
+            assert!(
+                Arc::ptr_eq(first, other),
+                "contended same-name registration must return the same Arc"
+            );
+        }
+    }
 }

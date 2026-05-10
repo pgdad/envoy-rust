@@ -91,3 +91,19 @@ Stat-name validation per Prometheus rules `[a-zA-Z_:][a-zA-Z0-9_:.-]*`; dots / d
 Tests: 17 total (8 Counter+Gauge from Task 3 + 1 error.rs format + 6 registry behavior + 2 `is_valid_name` accept/reject). All pass under `cargo test -p envoy-stats`; clippy clean.
 
 Closes Task 3's `#[allow(dead_code)]` deviation: removed from both `Counter::new()` and `Gauge::new()` since the registry now calls them at `register_counter` / `register_gauge`.
+
+## Task 5 — envoy-stats Prometheus text-exposition emitter
+
+`pub fn write_exposition(registry: &StatsRegistry, w: &mut bytes::BytesMut)`. Hand-rolled emitter; Envoy stat-tree dots / dashes translate to Prometheus underscores; leading `envoy_` prefix mirrors upstream's emit-side convention.
+
+`# HELP` lines emit as a generic placeholder per SPEC §6 signpost 15; rich per-metric descriptions defer to 06.3+.
+
+Tests: 6 unit tests (empty / counter / gauge / lex-order / dot-translate / dash-translate). All 25 envoy-stats tests pass; clippy clean.
+
+D1 (envoy-stats) complete at this task. Counter/Gauge primitives (Task 3) + StatsError/StatsRegistry (Task 4) + Prometheus emitter (Task 5) total ~470 LoC impl + ~250 LoC tests = ~720 LoC.
+
+Tokio dev-dep removed from envoy-stats Cargo.toml — no test in the crate uses tokio (Task 3's torture tests use `std::thread::spawn`). Cleanup of Task 2's preemptive dep. `cargo build --workspace --all-targets` green after removal.
+
+Added 2 follow-up tests per Task 4 code reviewer's recommendation: `stat_handle_kind_str_returns_correct_label` and `registry_register_counter_contended_same_name_returns_same_arc` (8 threads racing same name → all return same Arc via `Arc::ptr_eq`). These bumped the suite from 23 to 25.
+
+**Plan-time deviation (clippy `write_with_newline`):** PLAN's emitter sketch used `let _ = write!(w, "...{var}...\n")` at four sites; clippy under `-D warnings` flags this as `clippy::write_with_newline` and suggests `writeln!` (no trailing `\n` in the format string). Adopted clippy's suggestion at all four sites (`# HELP`, `# TYPE`, counter line, gauge line). Output is byte-identical (`writeln!` appends `\n`, matching the LF discipline in the planner's reminder). PLAN.md remains in-tree unedited per D-3.5 (append-only); this entry is the documented record.

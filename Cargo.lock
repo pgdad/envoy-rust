@@ -411,7 +411,6 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "thiserror",
- "tokio",
  "tracing",
 ]
 
