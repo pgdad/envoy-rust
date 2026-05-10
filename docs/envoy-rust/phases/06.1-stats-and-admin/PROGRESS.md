@@ -207,3 +207,27 @@ Plan-time deviations (per D-3.5):
 Stat-name discipline (Task 5 carryforward): `register_counter` call-sites grepped — all 3 templates are alphanumeric + dot + underscore. No `:` introduced.
 
 Total LoC: ~580 insertions across 16 files.
+
+
+## Task 11 — Phase-01 admin migration + in-process backstop test
+
+`crates/envoy-bin/src/main.rs` admin block replaced. The new block:
+1. Builds `envoy_admin::AdminConfig` from `bootstrap.admin`.
+2. Binds `tokio::net::TcpListener` to the parsed address.
+3. Logs `envoy-rust listening (admin)` with the bound port (preserves the existing log shape so the backstop test can scrape it; `local_addr()` is used so `port_value: 0` resolves to the actual ephemeral port).
+4. Constructs `Arc<envoy_admin::AdminHandler>` over the global `Arc<StatsRegistry>` (constructed at Task 10).
+5. Spawns `envoy_admin::serve(lst, handler, shutdown)`.
+
+`crates/envoy-bin/src/admin.rs` deleted; the `mod admin;` declaration removed from `main.rs`. envoy-admin's surface fully covers what was previously in-package.
+
+In-process backstop test at `crates/envoy-bin/tests/admin_ready.rs`: spawns envoy-bin via `CARGO_BIN_EXE_envoy-bin` against an admin-only bootstrap with `port_value: 0`, scrapes the bound port from the tracing log, drives `GET /ready` via `std::net::TcpStream`, asserts 200 OK + body `LIVE\n`. SIGKILL on tear-down (mirrors the 04.x / 05.x integration-test posture; phase-02.2 REVIEW M1 awareness-only carryforward continues unchanged).
+
+Fixture 0002 unchanged at the YAML level. The Docker-gated `tests/differential/tests/admin_ready.rs` continues green (the migration preserves `/ready` byte-equivalence per SPEC §5's dual-track guard).
+
+Tests pass (450 passed; 0 failed; 2 ignored across the workspace); clippy clean.
+
+Plan-time deviation (per D-3.5):
+- The PLAN's draft test scraped stderr for the `listening (admin)` line, but `tracing_subscriber::fmt()` (as configured in `install_tracing()`) writes to stdout by default — not stderr. The backstop test therefore captures and scrapes `child.stdout` (and `scrape_admin_port` takes `&mut std::process::ChildStdout`). The log line shape (`envoy-rust listening (admin) addr=127.0.0.1:NNNNN`, with optional ANSI color codes around `addr=`) is unchanged; the literal `127.0.0.1:` substring search remains correct.
+
+D3 (admin migration) complete at this task.
+

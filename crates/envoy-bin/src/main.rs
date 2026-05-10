@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 
-mod admin;
 mod argv;
 mod echo;
 mod tls_handler;
@@ -320,20 +319,25 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     }
 
     if let Some(admin_cfg) = bootstrap.admin.as_ref() {
-        let sock = &admin_cfg.address.socket_address;
-        let addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
-            .parse()
-            .with_context(|| {
-                format!("parsing admin address {}:{}", sock.address, sock.port_value)
-            })?;
-        let lst = TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("binding admin listener to {addr}"))?;
-        tracing::info!(%addr, "envoy-rust listening (admin)");
-        let shutdown = token.clone();
-        set.spawn(
-            async move { admin::serve(lst, async move { shutdown.cancelled().await }).await },
+        let admin_config = std::sync::Arc::new(
+            envoy_admin::AdminConfig::from_envoy_config(admin_cfg)
+                .with_context(|| "building AdminConfig")?,
         );
+        let lst = TcpListener::bind(admin_config.address)
+            .await
+            .with_context(|| format!("binding admin listener to {}", admin_config.address))?;
+        let addr = lst.local_addr().unwrap_or(admin_config.address);
+        tracing::info!(%addr, "envoy-rust listening (admin)");
+        let admin_handler = std::sync::Arc::new(envoy_admin::AdminHandler::new(
+            std::sync::Arc::clone(&admin_config),
+            std::sync::Arc::clone(&registry),
+        ));
+        let shutdown = token.clone();
+        set.spawn(async move {
+            envoy_admin::serve(lst, admin_handler, async move { shutdown.cancelled().await })
+                .await
+                .map_err(anyhow::Error::from)
+        });
     }
 
     while let Some(res) = set.join_next().await {

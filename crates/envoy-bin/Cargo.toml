@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+envoy-admin = { path = "../envoy-admin" }
 envoy-cluster = { path = "../envoy-cluster" }
 envoy-config = { path = "../envoy-config" }
 envoy-http1 = { path = "../envoy-http1" }
