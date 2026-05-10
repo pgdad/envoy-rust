@@ -406,6 +406,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-stats"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "envoy-tcp"
 version = "0.0.0"
 dependencies = [

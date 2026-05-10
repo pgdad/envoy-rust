@@ -1,0 +1,18 @@
+[package]
+name = "envoy-stats"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+name = "envoy_stats"
+path = "src/lib.rs"
+
+[dependencies]
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

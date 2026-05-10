@@ -50,6 +50,18 @@ The 14 PLAN tasks are numbered for documentation. The recommended **execution or
 
 (THIS section. Lands at sub-phase 06.1 state-2 commit alongside PLAN.md and the STATE.md / ROADMAP.md advance.)
 
-## Tasks 2 through 14
+## Task 2 — envoy-stats crate scaffold
+
+Lands the new `crates/envoy-stats/` workspace member with empty placeholder modules. Cargo deps: `bytes = "1"` + `thiserror = "2"` + `tracing = "0.1"` + `[dev-dependencies] tokio = "1"` (for Task 3's torture tests). No `tokio` runtime dep on the library side per SPEC §3 D1's runtime-agnostic posture.
+
+`#![forbid(unsafe_code)]` on `crates/envoy-stats/src/lib.rs` per D-3.8.
+
+`cargo build --workspace --all-targets` green; harmless `never_constructed` / `never_used` warnings on the placeholder types in `counter.rs` / `gauge.rs` / `registry.rs` / `error.rs` (Tasks 3 / 4 land the real types).
+
+**PLAN-write correction discovered at task time:** PLAN.md Step C declares `pub use counter::Counter;` and `pub use gauge::Gauge;` in `lib.rs`, but PLAN.md Step D's placeholder `counter.rs` and `gauge.rs` were docstring-only (no type defined) — `lib.rs` would fail to compile. Mirrored the PLAN's already-established `registry.rs` / `error.rs` placeholder-type pattern by adding `pub struct Counter;` and `pub struct Gauge;` to the placeholder files. Task 3 replaces both files wholesale; the placeholder stubs cost nothing. PLAN.md remains in-tree unedited per D-3.5 (append-only); this PROGRESS entry is the documented record per the established 05.x cadence.
+
+Workspace members at this commit: existing crates + envoy-stats. envoy-admin lands at Task 6.
+
+## Tasks 3 through 14
 
 Appended at execution time, one section per task commit, mirroring the 05.x per-task cadence.
