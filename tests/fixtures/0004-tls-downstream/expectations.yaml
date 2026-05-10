@@ -2,4 +2,5 @@ driver:
   kind: tls_tcp
   sni: a.example.com
 equivalence:
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact

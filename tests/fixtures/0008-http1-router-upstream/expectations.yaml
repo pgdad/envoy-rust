@@ -10,4 +10,5 @@ driver:
   expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact

@@ -248,3 +248,36 @@ SPEC §3 D3 lines 953-959 explicitly require these for "non-negotiable mirroring
 
 19 envoy-admin tests pass (17 prior + 2 new). Workspace clean.
 
+## Task 12 — Differential harness extensions (Driver::AdminScrape + BodyRule::PrometheusExposition)
+
+`Driver::AdminScrape { pre_requests, path, expected_status, expected_content_type, expected_body_rule }` — new variant on `differential::Driver`. Drives a sequence of HCM-side `PreRequest`s (so the registry has counters incremented) followed by an admin scrape; asserts on the admin response.
+
+`PreRequest { method, path, host, port_key }` — new struct. `method` is held as `String` (not `Http1Method`) per the PLAN's grammar projection; the dispatch arm converts to `Http1Method` at drive time (only `GET` supported in 06.1; future widening adds more methods at the converter).
+
+`BodyRule::PrometheusExposition { allowlist_envoy_only, allowlist_envoy_rust_only }` — new variant on `differential::BodyRule`. Both fields default to empty so a fixture can declare the rule without pre-seeding (Task 13 territory per signpost 12). The hand-rolled `parse_prometheus_metric_names(body: &[u8]) -> BTreeSet<String>` extracts the metric-name set; the matcher (`assert_body_rule`) asserts on the symmetric difference modulo the per-fixture allow-lists. Does NOT assert on numeric values (06.3 extends).
+
+`drive_admin_scrape(pre_requests, admin_addr, hcm_addrs: &BTreeMap<String, SocketAddr>, path) -> Result<DriveHttp1Result>` — new async helper. Drives pre-requests via `drive_http1`, sleeps 50ms (signpost 11) for Relaxed-ordering visibility, drives the admin scrape via `drive_http1`, returns the response tuple.
+
+`run_fixture` extended:
+- New dispatch arm on `Driver::AdminScrape` — reserves a kernel-ephemeral admin host port, plumbs `{{ADMIN_PORT}}` substitution into both per-side kvs maps (subject side: reserved host port; upstream side: `upstream::ADMIN_CONTAINER_PORT`).
+- `port_key` resolution extended so AdminScrape uses `"PORT"` for HCM (mirrors the other HCM-shaped drivers); the admin port is plumbed as a separate `{{ADMIN_PORT}}` substitution + a separate `host_admin_port: Option<u16>` reservation.
+- New `check_content_type` + `assert_body_rule` helpers consume the dispatch arm's expected_content_type / expected_body_rule fields. `assert_equivalence` was reshaped to call `assert_body_rule` so `BodyRule::PrometheusExposition` works under `equivalence.response_body` too (forward-compatible).
+
+`upstream::start` signature extended with `expose_admin_port: bool`. When true, the testcontainers image exposes `ADMIN_CONTAINER_PORT` (9901) in addition to `CONTAINER_PORT` (10000); the host-mapped admin port is read post-start and exposed via `UpstreamProxy::host_admin_port() -> Option<u16>`. Pre-existing call sites in 0001-0010 fixtures are unaffected (`expose_admin_port = false`); fixture 0011 (Task 13) drives `true` via the AdminScrape dispatch arm.
+
+Tests: 71 lib tests (was 57; +14 new). 466 workspace tests pass; 2 ignored (Docker-gated). Clippy clean.
+
+### Plan-time deviations (per D-3.5)
+
+1. **`BodyRule` serde representation switched from externally-tagged-with-rename_all to internally-tagged via `#[serde(tag = "kind")]`** to accommodate the new struct-form `PrometheusExposition` variant. serde_yaml's externally-tagged form requires explicit YAML tags (`!Variant`) for struct variants — incompatible with the existing `byte_exact` scalar form. The internally-tagged form parses both `{ kind: byte_exact }` (the unit variant) and `{ kind: prometheus_exposition, allowlist_envoy_only: [...], ... }` (the struct variant) uniformly. **Wire-shape consequence**: existing fixtures 0001-0010 had `response_body: byte_exact`; under the new shape they read `response_body: { kind: byte_exact }`. All 10 fixtures updated mechanically in this commit. The 4 inline-YAML test strings in `tests/differential/src/lib.rs` updated similarly. The PLAN's draft (lines 3388-3404) was silent on serde encoding; the executor selected the encoding that minimized blast radius while preserving struct-variant capacity.
+
+2. **`drive_admin_scrape` takes `&BTreeMap<String, SocketAddr>` for the HCM port lookup** rather than the PLAN's draft `&dyn Fn(&str) -> Option<SocketAddr>`. The map is simpler at the call site and matches the existing template-marker discipline (`port_key` strings keying into a per-side address map). Per the PLAN's "Sanctioned trade-offs" note, this adaptation is documented rather than improvised structurally.
+
+3. **`drive_admin_scrape` constructs `(Http1Method, &str, &str, &str, &[])` calls directly** rather than the PLAN's draft `Http1Probe { ..Default::default() }` form. `Http1Probe` carries a required `name: String` (and other per-probe fields) that have no analog in `PreRequest`; `drive_http1` is the lower-level helper that takes the four method/path/host/headers args directly, so the helper calls it unwrapped. Documented as a fit-to-actual-shape adaptation rather than a new wrapper layer.
+
+4. **In-process round-trip test uses `subject::locate_envoy_bin()` rather than `env!("CARGO_BIN_EXE_envoy-bin")`**. Same reason as the prior `drive_http2_round_trip_against_in_process_listener` (line 2320 `lib.rs`): `CARGO_BIN_EXE_envoy-bin` is only set for integration tests *of the package owning the binary*, not for the differential crate. Mirrors the existing convention.
+
+5. **Container-side admin port plumbing** (`upstream::ADMIN_CONTAINER_PORT = 9901`, `expose_admin_port` parameter on `upstream::start`, `host_admin_port: Option<u16>` field on `UpstreamProxy`) was beyond the PLAN's harness-only scope but mechanically necessary for the dispatch arm to drive the upstream side end-to-end. The pre-existing `_backend` / `_tls_backend` cadence already establishes the "fixture template references {{X}} → harness opportunistically wires up X" pattern; this extension fits inside it without an ADR.
+
+D6.harness complete at this task. Task 13 lands fixture 0011 + the Docker-gated wrapper test that exercises the new dispatch arm end-to-end.
+

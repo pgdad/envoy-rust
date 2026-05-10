@@ -11,4 +11,5 @@ driver:
 
 equivalence:
   response_status: exact
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact

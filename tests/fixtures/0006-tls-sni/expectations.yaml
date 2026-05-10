@@ -4,4 +4,5 @@ driver:
     - { sni: "a.example.com", expected_cn: "a.example.com" }
     - { sni: "b.example.com", expected_cn: "b.example.com" }
 equivalence:
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact

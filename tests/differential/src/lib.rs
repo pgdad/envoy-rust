@@ -94,6 +94,40 @@ pub enum Driver {
         #[serde(default)]
         expected_headers: Option<Http1HeaderRule>,
     },
+    /// 06.1 D6.a: drive a sequence of HCM-side `PreRequest`s (so the registry
+    /// has counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
+    /// Relaxed-ordered counter writes become visible), then scrape the admin
+    /// listener at `path` and assert on the response. The
+    /// `expected_body_rule` reuses the harness-level `BodyRule` enum so
+    /// `BodyRule::PrometheusExposition` can drive metric-name-set equality
+    /// modulo per-fixture allow-lists.
+    AdminScrape {
+        #[serde(default)]
+        pre_requests: Vec<PreRequest>,
+        path: String,
+        expected_status: u16,
+        expected_content_type: String,
+        expected_body_rule: BodyRule,
+    },
+}
+
+/// 06.1 D6.a: minimal HTTP/1.1 request shape used by `Driver::AdminScrape` to
+/// drive the HCM listener before scraping the admin listener. `port_key`
+/// names the template marker (e.g. `"PORT"`) whose substituted address the
+/// pre-request is sent to — fixtures may eventually drive multiple listeners
+/// from one scrape, but 06.1 only uses the single HCM listener under
+/// `{{PORT}}`.
+///
+/// `method` is held as `String` (not `Http1Method`) per the PLAN's grammar
+/// projection; the dispatch arm converts it to `Http1Method` at drive time
+/// (only `GET` is supported in 06.1; future methods widen the conversion).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreRequest {
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub port_key: String,
 }
 
 /// One TLS-SNI probe entry inside `Driver::TlsTcpProbeList`. SPEC §D6.
@@ -120,10 +154,62 @@ pub enum StatusRule {
     Exact,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+/// Body equivalence rule.
+///
+/// 06.1 Task 12 extended this enum with the struct-form
+/// `BodyRule::PrometheusExposition` variant. To accommodate struct-form
+/// variants alongside the original unit-form `ByteExact`, the serde
+/// representation switched from externally-tagged-with-rename_all to
+/// internally-tagged via `#[serde(tag = "kind", rename_all = "snake_case")]`,
+/// matching the existing `Driver` enum's shape.
+///
+/// Wire-shape consequence: existing fixtures (0001-0010) had
+/// `response_body: byte_exact`; under the new shape they read
+/// `response_body: { kind: byte_exact }`. All 10 fixtures were updated in
+/// the same commit; no other fixture grammar change ships with 06.1.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BodyRule {
     ByteExact,
+    /// 06.1 D6.b: parse the body as Prometheus text-exposition format and
+    /// assert the metric-name set is equal between envoy and envoy-rust
+    /// modulo the per-fixture allow-lists. Does NOT assert on numeric values
+    /// (06.3 extends). The allow-lists are populated empirically per SPEC §6
+    /// signpost 12 (Task 13's territory); both default to empty so a fixture
+    /// can declare the rule without pre-seeding.
+    PrometheusExposition {
+        /// Metric names emitted by upstream Envoy that envoy-rust does not.
+        #[serde(default)]
+        allowlist_envoy_only: Vec<String>,
+        /// Metric names emitted by envoy-rust that upstream Envoy does not.
+        #[serde(default)]
+        allowlist_envoy_rust_only: Vec<String>,
+    },
+}
+
+/// 06.1 D6.b: parse a Prometheus text-exposition body into the set of metric
+/// names. Skips `#`-prefixed lines (HELP / TYPE comments) and blank lines;
+/// for sample lines, extracts the leading whitespace-or-`{`-delimited token.
+/// Returns a `BTreeSet` for deterministic ordering when failure messages are
+/// constructed.
+pub fn parse_prometheus_metric_names(body: &[u8]) -> std::collections::BTreeSet<String> {
+    let s = std::str::from_utf8(body).unwrap_or("");
+    let mut out = std::collections::BTreeSet::new();
+    for line in s.lines() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        // Sample line shape: `<name>{<labels>} <value>` or `<name> <value>`.
+        let name_end = t
+            .find(|c: char| c.is_whitespace() || c == '{')
+            .unwrap_or(t.len());
+        let name = &t[..name_end];
+        if !name.is_empty() {
+            out.insert(name.to_string());
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -883,6 +969,63 @@ pub async fn drive_http2(
     })
 }
 
+/// 06.1 D6.c: drive a sequence of HCM-side `PreRequest`s (so the registry has
+/// counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
+/// Relaxed-ordered counter writes become visible to the scrape), then scrape
+/// the admin listener at `path`. Returns the admin response shape so the
+/// caller can dispatch on `expected_status` / `expected_content_type` /
+/// `expected_body_rule`.
+///
+/// `hcm_addrs` maps `PreRequest.port_key` (e.g. `"PORT"`) to the per-side
+/// listener address. Each pre-request resolves its port via this map; missing
+/// keys surface as `Err`. 06.1 only uses `"PORT"` (the single HCM listener),
+/// but the map shape matches the existing template-marker discipline so
+/// future fixtures with multiple listeners (e.g. ingress + egress) slot in
+/// without harness churn.
+///
+/// `method` strings on each `PreRequest` are converted to `Http1Method` here;
+/// 06.1 only supports `GET` (case-insensitive). Other methods bail with a
+/// descriptive error so a fixture-time typo surfaces immediately rather than
+/// silently driving a `GET`.
+pub async fn drive_admin_scrape(
+    pre_requests: &[PreRequest],
+    admin_addr: SocketAddr,
+    hcm_addrs: &std::collections::BTreeMap<String, SocketAddr>,
+    path: &str,
+) -> Result<DriveHttp1Result> {
+    for pre in pre_requests {
+        let addr = hcm_addrs
+            .get(&pre.port_key)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("unknown PreRequest.port_key: {}", pre.port_key))?;
+        let method = match pre.method.to_ascii_uppercase().as_str() {
+            "GET" => Http1Method::Get,
+            other => bail!(
+                "PreRequest.method {other:?} not supported in 06.1 (only GET); widen drive_admin_scrape to add more"
+            ),
+        };
+        let _ = drive_http1(addr, &method, &pre.path, &pre.host, &[])
+            .await
+            .with_context(|| {
+                format!(
+                    "pre-request {} {} (host={}, port_key={})",
+                    pre.method, pre.path, pre.host, pre.port_key,
+                )
+            })?;
+    }
+
+    // SPEC §6 signpost 11: sleep ~50ms so the registry's Relaxed-ordered
+    // counter writes are visible to the scrape's read. Do NOT shorten — the
+    // exact figure is the documented worst-case Relaxed-ordering visibility
+    // window for Counter::inc on x86_64+ARM under the std::sync::atomic
+    // happens-before relations the registry relies on.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    drive_http1(admin_addr, &Http1Method::Get, path, "admin.local", &[])
+        .await
+        .with_context(|| format!("admin scrape GET {path}"))
+}
+
 /// Decode HTTP/1.1 chunked transfer-encoded body bytes into plain body bytes.
 /// Each chunk has the form `<hex-size>\r\n<data>\r\n`; the last chunk is
 /// `0\r\n\r\n`. Trailer headers (if any) are ignored. Returns an error if the
@@ -943,8 +1086,27 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::TlsTcpProbeList { .. }
         | Driver::Http1 { .. }
         | Driver::Http1ProbeList { .. }
-        | Driver::Http2 { .. } => "PORT",
+        | Driver::Http2 { .. }
+        // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
+        // HCM-shaped drivers. The admin listener is separately substituted
+        // via {{ADMIN_PORT}} (see admin_host_port reservation below).
+        | Driver::AdminScrape { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
+    };
+
+    // 06.1 D6.a: reserve a kernel-ephemeral admin port whenever either
+    // template references `{{ADMIN_PORT}}` AND the driver is AdminScrape
+    // (the other consumer, Driver::HttpGet, drives admin via the single
+    // listener port and does not need a separate reservation). Mirrors
+    // the existing `_backend` / `_tls_backend` cadence: the reservation
+    // happens once at run_fixture start so kvs and dispatch both see it.
+    let needs_admin_port = matches!(&expectations.driver, Driver::AdminScrape { .. })
+        && (upstream_template.contains("{{ADMIN_PORT}}")
+            || subject_template.contains("{{ADMIN_PORT}}"));
+    let admin_host_port: Option<u16> = if needs_admin_port {
+        Some(reserve_port().context("reserving admin host port for Driver::AdminScrape")?)
+    } else {
+        None
     };
 
     // (a) Detect TLS templates — if any TLS substitution token appears in
@@ -1064,6 +1226,13 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // HTTP2_BACKEND_PORT.
             v.push(("BACKEND_HOST", "host.docker.internal".to_string()));
         }
+        if needs_admin_port {
+            // 06.1 D6.a: container-internal admin port. The host-mapped
+            // admin port is read from `upstream.host_admin_port()` after
+            // `upstream::start` returns and is plumbed into the dispatch
+            // arm separately.
+            v.push(("ADMIN_PORT", upstream::ADMIN_CONTAINER_PORT.to_string()));
+        }
         if let Some(map) = upstream_tls_paths.as_ref() {
             for (k, val) in map {
                 v.push((*k, val.clone()));
@@ -1092,6 +1261,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
         }
+        if let Some(admin) = admin_host_port {
+            // 06.1 D6.a: reserved host admin port for the subject.
+            v.push(("ADMIN_PORT", admin.to_string()));
+        }
         if let Some(map) = subject_tls_paths.as_ref() {
             for (k, val) in map {
                 v.push((*k, val.clone()));
@@ -1118,9 +1291,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // upstream YAML actually references the hostname — silent when it
     // doesn't, so fixtures 0001 and 0002 stay unchanged.
     let host_uses_host_gateway = upstream_yaml.contains("host.docker.internal");
-    // (e) Thread tls_pki through to upstream::start.
-    let upstream =
-        upstream::start(&upstream_path, host_uses_host_gateway, tls_pki.as_ref()).await?;
+    // (e) Thread tls_pki through to upstream::start. 06.1: also thread
+    // `needs_admin_port` so the container exposes ADMIN_CONTAINER_PORT for
+    // Driver::AdminScrape fixtures.
+    let upstream = upstream::start(
+        &upstream_path,
+        host_uses_host_gateway,
+        tls_pki.as_ref(),
+        needs_admin_port,
+    )
+    .await?;
     let mut subject = subject::start(&subject_path, host_port).await?;
 
     let upstream_addr: SocketAddr = format!("127.0.0.1:{}", upstream.host_port()).parse()?;
@@ -1526,10 +1706,152 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 .context("diff_headers (set_equal_modulo_allow_list)")?;
             }
         }
+        // 06.1 D6.a: HCM pre-requests then admin scrape. Drives both proxies,
+        // applies expected_status / expected_content_type / expected_body_rule
+        // assertions on each side. Body-rule equivalence (Prometheus exposition
+        // metric-name set modulo allow-lists) is enforced by `assert_body_rule`.
+        Driver::AdminScrape {
+            pre_requests,
+            path,
+            expected_status,
+            expected_content_type,
+            expected_body_rule,
+        } => {
+            let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::AdminScrape requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
+                )
+            })?;
+            let subject_admin_port = admin_host_port.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::AdminScrape requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
+                )
+            })?;
+            let upstream_admin_addr: SocketAddr =
+                format!("127.0.0.1:{upstream_admin_port}").parse()?;
+            let subject_admin_addr: SocketAddr =
+                format!("127.0.0.1:{subject_admin_port}").parse()?;
+            wait_accept_ready(upstream_admin_addr, budget)
+                .await
+                .context("upstream admin listener never became accept-ready")?;
+            wait_accept_ready(subject_admin_addr, budget)
+                .await
+                .context("envoy-rust admin listener never became accept-ready")?;
+
+            // Per-side HCM port maps. Today only `"PORT"` is populated; the
+            // map shape matches the existing template-marker discipline so
+            // future fixtures with multiple HCM listeners slot in without
+            // harness churn.
+            let mut upstream_hcm = std::collections::BTreeMap::new();
+            upstream_hcm.insert("PORT".to_string(), upstream_addr);
+            let mut subject_hcm = std::collections::BTreeMap::new();
+            subject_hcm.insert("PORT".to_string(), subject_addr);
+
+            let upstream_resp =
+                drive_admin_scrape(pre_requests, upstream_admin_addr, &upstream_hcm, path)
+                    .await
+                    .context("upstream envoy admin scrape")?;
+            let subject_resp =
+                drive_admin_scrape(pre_requests, subject_admin_addr, &subject_hcm, path)
+                    .await
+                    .context("envoy-rust admin scrape")?;
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+
+            // expected_status: each side independently equals it.
+            if upstream_resp.status != *expected_status {
+                bail!(
+                    "upstream admin status {} != expected {}",
+                    upstream_resp.status,
+                    expected_status,
+                );
+            }
+            if subject_resp.status != *expected_status {
+                bail!(
+                    "subject admin status {} != expected {}",
+                    subject_resp.status,
+                    expected_status,
+                );
+            }
+
+            // expected_content_type: each side independently has a
+            // `content-type:` header whose (case-insensitive) value matches.
+            check_content_type(&upstream_resp.headers, expected_content_type)
+                .context("upstream admin content-type")?;
+            check_content_type(&subject_resp.headers, expected_content_type)
+                .context("envoy-rust admin content-type")?;
+
+            // Body rule: dispatch on BodyRule variant. ByteExact compares
+            // bytes; PrometheusExposition compares metric-name sets modulo
+            // per-fixture allow-lists.
+            assert_body_rule(expected_body_rule, &upstream_resp.body, &subject_resp.body)?;
+        }
     }
 
     // _backend Drop fires here.
     Ok(())
+}
+
+/// 06.1 D6.a: assert that the headers carry a `content-type:` whose
+/// (case-insensitive) value equals `expected`. Bails with a descriptive error
+/// if the header is missing or mismatched.
+fn check_content_type(headers: &[(String, String)], expected: &str) -> Result<()> {
+    let actual = headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("response is missing the `content-type` header (expected {expected:?})")
+        })?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("content-type {actual:?} != expected {expected:?}");
+    }
+    Ok(())
+}
+
+/// 06.1 D6.b: dispatch on `BodyRule` variant. `ByteExact` enforces exact byte
+/// equality between envoy ↔ envoy-rust. `PrometheusExposition` parses both
+/// bodies via `parse_prometheus_metric_names` and asserts the metric-name
+/// symmetric difference is empty after subtracting the per-fixture
+/// allow-lists (does NOT compare numeric values; 06.3 extends).
+fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Result<()> {
+    match rule {
+        BodyRule::ByteExact => {
+            if envoy_body != rust_body {
+                bail!(
+                    "byte-exact body mismatch\n  upstream: {envoy_body:?}\n  subject:  {rust_body:?}",
+                );
+            }
+            Ok(())
+        }
+        BodyRule::PrometheusExposition {
+            allowlist_envoy_only,
+            allowlist_envoy_rust_only,
+        } => {
+            let envoy_names = parse_prometheus_metric_names(envoy_body);
+            let rust_names = parse_prometheus_metric_names(rust_body);
+            let allow_envoy: std::collections::BTreeSet<String> =
+                allowlist_envoy_only.iter().cloned().collect();
+            let allow_rust: std::collections::BTreeSet<String> =
+                allowlist_envoy_rust_only.iter().cloned().collect();
+            let envoy_only: Vec<String> = envoy_names
+                .difference(&rust_names)
+                .filter(|n| !allow_envoy.contains(*n))
+                .cloned()
+                .collect();
+            let rust_only: Vec<String> = rust_names
+                .difference(&envoy_names)
+                .filter(|n| !allow_rust.contains(*n))
+                .cloned()
+                .collect();
+            if !envoy_only.is_empty() || !rust_only.is_empty() {
+                bail!(
+                    "prometheus exposition metric-name sets diverged after allow-lists:\n  envoy-only:      {envoy_only:?}\n  envoy-rust-only: {rust_only:?}",
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn assert_equivalence(
@@ -1551,14 +1873,8 @@ fn assert_equivalence(
             ),
         }
     }
-    if matches!(
-        expectations.equivalence.response_body,
-        Some(BodyRule::ByteExact)
-    ) && upstream_body != subject_body
-    {
-        bail!(
-            "byte-exact body mismatch\n  upstream: {upstream_body:?}\n  subject:  {subject_body:?}",
-        );
+    if let Some(rule) = &expectations.equivalence.response_body {
+        assert_body_rule(rule, upstream_body, subject_body)?;
     }
     // Neither rule configured → silently pass + log a warning (SPEC §D5).
     if expectations.equivalence.response_status.is_none()
@@ -1577,7 +1893,7 @@ mod tests {
 
     #[test]
     fn expectations_parse_byte_exact() {
-        let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: byte_exact\n";
+        let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\n";
         let e: Expectations = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
         assert!(matches!(e.driver, Driver::TcpEcho));
@@ -1595,7 +1911,7 @@ mod tests {
     #[test]
     fn expectations_reject_unknown_field() {
         let yaml =
-            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: byte_exact\nfoo: bar\n";
+            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\nfoo: bar\n";
         let err = serde_yaml::from_str::<Expectations>(yaml)
             .expect_err("must reject unknown top-level field");
         let msg = err.to_string();
@@ -1606,7 +1922,7 @@ mod tests {
     #[test]
     fn equivalence_reject_unknown_field() {
         let yaml =
-            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: byte_exact\n  extra: true\n";
+            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\n  extra: true\n";
         let err = serde_yaml::from_str::<Expectations>(yaml)
             .expect_err("must reject unknown nested field");
         let msg = err.to_string();
@@ -1738,7 +2054,8 @@ mod tests {
 driver:
   kind: tcp_echo
 equivalence:
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact
 "#;
         let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
         assert!(matches!(e.driver, Driver::TcpEcho));
@@ -1755,7 +2072,8 @@ driver:
   host: envoy-rust-phase-01
 equivalence:
   response_status: exact
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact
 "#;
         let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
         match e.driver {
@@ -1821,7 +2139,8 @@ driver:
 driver:
   kind: quantum_bogon
 equivalence:
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact
 "#;
         let r: Result<Expectations, _> = serde_yaml::from_str(yaml);
         assert!(r.is_err(), "quantum_bogon must not parse: {r:?}");
@@ -2279,7 +2598,8 @@ driver:
       expected_headers: set_equal_modulo_allow_list
 equivalence:
   response_status: exact
-  response_body: byte_exact
+  response_body:
+    kind: byte_exact
 "#;
         let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
         let Driver::Http1ProbeList { probes } = e.driver else {
@@ -2390,5 +2710,287 @@ static_resources:
         let result = result.expect("drive_http2 returns Ok");
         assert_eq!(result.status, 200);
         assert_eq!(&result.body[..], b"ok\n");
+    }
+
+    // 06.1 D6.c: round-trips `drive_admin_scrape` against a spawned
+    // envoy-bin subprocess running an admin-only bootstrap. Validates the
+    // helper's wire-shape end to end (no mocks): the scrape lands a real
+    // GET on `/stats/prometheus`, parses the response, and we assert
+    // status=200 + body parses as a Prometheus exposition (the metric set
+    // may be empty when no HCM listeners feed the registry — the registry
+    // emits no samples, which `parse_prometheus_metric_names` returns as
+    // an empty BTreeSet without erroring). Pre-requests are empty here
+    // since the subprocess has no HCM listener; the HCM-pre-request path
+    // is exercised by fixture 0011 (Task 13).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_admin_scrape_round_trips_against_envoy_bin_admin() {
+        if crate::subject::locate_envoy_bin().is_err() {
+            eprintln!("skipping: envoy-bin not built");
+            return;
+        }
+        let bin = crate::subject::locate_envoy_bin().unwrap();
+        let admin_port = reserve_port().expect("reserve_port");
+        let yaml = format!(
+            r#"
+node:
+  id: backstop
+  cluster: backstop
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: {admin_port}
+static_resources:
+  listeners: []
+  clusters: []
+"#
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = dir.path().join("admin_only.yaml");
+        std::fs::write(&cfg, yaml).expect("write yaml");
+
+        let mut child = tokio::process::Command::new(&bin)
+            .arg("-c")
+            .arg(&cfg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn envoy-bin");
+
+        let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+        if let Err(err) = wait_accept_ready(admin_addr, Duration::from_secs(5)).await {
+            let _ = child.kill().await;
+            panic!("admin listener never accept-ready: {err}");
+        }
+
+        let hcm_addrs: std::collections::BTreeMap<String, SocketAddr> =
+            std::collections::BTreeMap::new();
+        let result = drive_admin_scrape(&[], admin_addr, &hcm_addrs, "/stats/prometheus").await;
+        let _ = child.kill().await;
+        let resp = result.expect("drive_admin_scrape returns Ok");
+        assert_eq!(resp.status, 200, "headers: {:?}", resp.headers);
+
+        // Body parses as Prometheus exposition. Empty registry → empty
+        // metric-name set; the parser must return Ok(empty BTreeSet)
+        // rather than panic.
+        let names = parse_prometheus_metric_names(&resp.body);
+        assert!(
+            names.is_empty() || names.iter().all(|n| !n.contains(' ')),
+            "metric names contain whitespace: {names:?}",
+        );
+
+        // Content-type is text/plain (our admin emits text-exposition).
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .expect("content-type header present");
+        assert!(
+            ct.starts_with("text/plain"),
+            "unexpected content-type: {ct:?}",
+        );
+    }
+
+    #[test]
+    fn parse_prometheus_metric_names_handles_labels_and_comments() {
+        // Mixed input: HELP/TYPE comments, blank lines, samples with and
+        // without labels. Output must be the set of leading-token metric
+        // names in BTreeSet (sorted) order.
+        let body = b"# HELP foo total\n\
+                     # TYPE foo counter\n\
+                     foo 1\n\
+                     bar{le=\"0.5\"} 2\n\
+                     \n\
+                     baz_total{name=\"x\"} 3\n";
+        let names = parse_prometheus_metric_names(body);
+        let expected: std::collections::BTreeSet<String> = ["bar", "baz_total", "foo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn parse_prometheus_metric_names_handles_empty_input() {
+        assert!(parse_prometheus_metric_names(b"").is_empty());
+        assert!(parse_prometheus_metric_names(b"# only a comment\n").is_empty());
+        assert!(parse_prometheus_metric_names(b"\n\n\n").is_empty());
+    }
+
+    #[test]
+    fn body_rule_prometheus_exposition_parses_with_default_allowlists() {
+        // Harness consumers can declare the rule without seeding either
+        // allow-list (empirical seeding lands at Task 13 per signpost 12).
+        let yaml = "kind: prometheus_exposition";
+        let r: BodyRule = serde_yaml::from_str(yaml).expect("parses");
+        match r {
+            BodyRule::PrometheusExposition {
+                allowlist_envoy_only,
+                allowlist_envoy_rust_only,
+            } => {
+                assert!(allowlist_envoy_only.is_empty());
+                assert!(allowlist_envoy_rust_only.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_rule_prometheus_exposition_parses_with_seeded_allowlists() {
+        let yaml = r#"
+kind: prometheus_exposition
+allowlist_envoy_only:
+  - server.uptime
+  - cluster.x.upstream_cx_total
+allowlist_envoy_rust_only:
+  - foo_total
+"#;
+        let r: BodyRule = serde_yaml::from_str(yaml).expect("parses");
+        match r {
+            BodyRule::PrometheusExposition {
+                allowlist_envoy_only,
+                allowlist_envoy_rust_only,
+            } => {
+                assert_eq!(allowlist_envoy_only.len(), 2);
+                assert_eq!(allowlist_envoy_rust_only, vec!["foo_total".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_rule_byte_exact_parses_under_internally_tagged_form() {
+        // 06.1 Task 12 switched BodyRule from externally-tagged (YAML scalar
+        // `byte_exact`) to internally-tagged (`{ kind: byte_exact }`) so
+        // struct-form variants like PrometheusExposition could land
+        // alongside ByteExact. Existing fixtures (0001-0010) updated in
+        // the same commit.
+        let yaml = "kind: byte_exact";
+        let r: BodyRule = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(r, BodyRule::ByteExact);
+    }
+
+    #[test]
+    fn driver_admin_scrape_parses_with_default_pre_requests() {
+        let yaml = r#"
+kind: admin_scrape
+path: /stats/prometheus
+expected_status: 200
+expected_content_type: text/plain
+expected_body_rule:
+  kind: prometheus_exposition
+"#;
+        let d: Driver = serde_yaml::from_str(yaml).expect("parses");
+        match d {
+            Driver::AdminScrape {
+                pre_requests,
+                path,
+                expected_status,
+                expected_content_type,
+                expected_body_rule,
+            } => {
+                assert!(pre_requests.is_empty());
+                assert_eq!(path, "/stats/prometheus");
+                assert_eq!(expected_status, 200);
+                assert_eq!(expected_content_type, "text/plain");
+                assert!(matches!(
+                    expected_body_rule,
+                    BodyRule::PrometheusExposition { .. }
+                ));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn driver_admin_scrape_parses_with_pre_requests() {
+        let yaml = r#"
+kind: admin_scrape
+pre_requests:
+  - method: GET
+    path: /
+    host: x.test
+    port_key: PORT
+path: /stats/prometheus
+expected_status: 200
+expected_content_type: text/plain; version=0.0.4
+expected_body_rule:
+  kind: prometheus_exposition
+  allowlist_envoy_only: []
+  allowlist_envoy_rust_only: []
+"#;
+        let d: Driver = serde_yaml::from_str(yaml).expect("parses");
+        match d {
+            Driver::AdminScrape { pre_requests, .. } => {
+                assert_eq!(pre_requests.len(), 1);
+                assert_eq!(pre_requests[0].method, "GET");
+                assert_eq!(pre_requests[0].port_key, "PORT");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_yaml_substitutes_admin_port_in_admin_scrape_template() {
+        // 06.1 D6.a: Driver::AdminScrape fixtures use {{ADMIN_PORT}}
+        // substitution for the admin listener (joins {{PORT}} for the
+        // HCM listener). This test exercises only the render path; the
+        // run_fixture-side reservation+expose is exercised by the
+        // Docker-gated fixture 0011 test (Task 13).
+        let template = "admin: 127.0.0.1:{{ADMIN_PORT}}\nlistener: 127.0.0.1:{{PORT}}";
+        let rendered = render_yaml(
+            template,
+            &[("ADMIN_PORT", "29999"), ("PORT", "10000")],
+        );
+        assert_eq!(rendered, "admin: 127.0.0.1:29999\nlistener: 127.0.0.1:10000");
+    }
+
+    #[test]
+    fn assert_body_rule_byte_exact_passes_on_equal_bytes() {
+        assert_body_rule(&BodyRule::ByteExact, b"hello", b"hello").unwrap();
+    }
+
+    #[test]
+    fn assert_body_rule_byte_exact_fails_on_unequal_bytes() {
+        let err = assert_body_rule(&BodyRule::ByteExact, b"hello", b"world").unwrap_err();
+        assert!(err.to_string().contains("byte-exact"), "msg: {err}");
+    }
+
+    #[test]
+    fn assert_body_rule_prometheus_exposition_passes_on_equal_metric_sets() {
+        let rule = BodyRule::PrometheusExposition {
+            allowlist_envoy_only: vec![],
+            allowlist_envoy_rust_only: vec![],
+        };
+        let envoy = b"foo 1\nbar 2\n";
+        let rust = b"bar 5\nfoo 9\n"; // values differ; names equal — must pass
+        assert_body_rule(&rule, envoy, rust).unwrap();
+    }
+
+    #[test]
+    fn assert_body_rule_prometheus_exposition_fails_on_envoy_only_outside_allowlist() {
+        let rule = BodyRule::PrometheusExposition {
+            allowlist_envoy_only: vec![],
+            allowlist_envoy_rust_only: vec![],
+        };
+        let envoy = b"foo 1\nbar 2\n";
+        let rust = b"foo 1\n"; // bar only on envoy side — must fail
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("envoy-only"), "msg: {msg}");
+        assert!(msg.contains("bar"), "msg: {msg}");
+    }
+
+    #[test]
+    fn assert_body_rule_prometheus_exposition_passes_when_diff_inside_allowlist() {
+        let rule = BodyRule::PrometheusExposition {
+            allowlist_envoy_only: vec!["bar".to_string()],
+            allowlist_envoy_rust_only: vec!["baz".to_string()],
+        };
+        let envoy = b"foo 1\nbar 2\n";
+        let rust = b"foo 1\nbaz 3\n";
+        assert_body_rule(&rule, envoy, rust).unwrap();
     }
 }

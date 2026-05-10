@@ -14,16 +14,34 @@ pub const IMAGE_TAG: &str = "v1.33.0";
 /// Container-internal listener port. Host-side port is assigned by
 /// testcontainers at runtime and reported via `host_port()`.
 pub const CONTAINER_PORT: u16 = 10000;
+/// 06.1 D6.a: container-internal admin listener port. Used by
+/// `Driver::AdminScrape` fixtures (e.g. fixture 0011); host-mapped port is
+/// reported via `host_admin_port()` when the caller passes
+/// `expose_admin_port = true` to `start`. Distinct from `CONTAINER_PORT` so
+/// upstream Envoy can listen on both simultaneously inside the container.
+pub const ADMIN_CONTAINER_PORT: u16 = 9901;
 
 /// Running upstream Envoy. Dropping this handle stops the container.
 pub struct UpstreamProxy {
     _container: ContainerAsync<GenericImage>,
     host_port: u16,
+    /// Host-side mapped port for the container's admin listener
+    /// (`ADMIN_CONTAINER_PORT`), populated when `start` was called with
+    /// `expose_admin_port = true`. None for fixtures that do not need an
+    /// admin listener (the pre-06.1 default).
+    host_admin_port: Option<u16>,
 }
 
 impl UpstreamProxy {
     pub fn host_port(&self) -> u16 {
         self.host_port
+    }
+
+    /// Host-mapped admin port if the container was started with
+    /// `expose_admin_port = true`. None for fixtures that do not need an
+    /// admin listener.
+    pub fn host_admin_port(&self) -> Option<u16> {
+        self.host_admin_port
     }
 }
 
@@ -47,13 +65,20 @@ pub async fn start(
     envoy_yaml_path: &Path,
     host_gateway: bool,
     tls_pki: Option<&crate::tls::TlsTestPki>,
+    expose_admin_port: bool,
 ) -> Result<UpstreamProxy> {
     let absolute = envoy_yaml_path
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", envoy_yaml_path.display()))?;
-    let image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
+    let mut image = GenericImage::new(IMAGE_NAME, IMAGE_TAG)
         .with_exposed_port(CONTAINER_PORT.tcp())
         .with_wait_for(WaitFor::message_on_stderr("starting main dispatch loop"));
+    // 06.1 D6.a: when the fixture references {{ADMIN_PORT}}, expose the
+    // container's admin listener port too so the harness can scrape
+    // /stats/prometheus over the host-mapped address.
+    if expose_admin_port {
+        image = image.with_exposed_port(ADMIN_CONTAINER_PORT.tcp());
+    }
     let mut request = image
         .with_cmd(["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"])
         .with_mount(Mount::bind_mount(
@@ -85,6 +110,16 @@ pub async fn start(
         .get_host_port_ipv4(CONTAINER_PORT.tcp())
         .await
         .context("reading host-mapped port from testcontainers")?;
+    let host_admin_port = if expose_admin_port {
+        Some(
+            container
+                .get_host_port_ipv4(ADMIN_CONTAINER_PORT.tcp())
+                .await
+                .context("reading host-mapped admin port from testcontainers")?,
+        )
+    } else {
+        None
+    };
     // 05.4 NEW per SPEC §3 D6: STRICT_DNS DNS resolution may not have
     // completed by the 500ms mark on host-gateway fixtures (DNS via
     // Docker's host-gateway races the first test probe); bump to 2000ms
@@ -95,6 +130,7 @@ pub async fn start(
     Ok(UpstreamProxy {
         _container: container,
         host_port,
+        host_admin_port,
     })
 }
 
@@ -133,7 +169,7 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path(), false, None).await.unwrap();
+        let proxy = start(yaml.path(), false, None, false).await.unwrap();
         assert!(proxy.host_port() > 0);
         // Validate accept-readiness via the library's own helper.
         let addr: std::net::SocketAddr =
