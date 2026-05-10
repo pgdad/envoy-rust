@@ -281,3 +281,51 @@ Tests: 71 lib tests (was 57; +14 new). 466 workspace tests pass; 2 ignored (Dock
 
 D6.harness complete at this task. Task 13 lands fixture 0011 + the Docker-gated wrapper test that exercises the new dispatch arm end-to-end.
 
+## Task 13 — Fixture 0011-admin-stats-prometheus + Docker-gated wrapper
+
+5 fixture files under `tests/fixtures/0011-admin-stats-prometheus/` (envoy.yaml, envoy-rust.yaml, inputs/payload.bin (0 bytes), expectations.yaml, README.md) + 1 Docker-gated wrapper at `tests/differential/tests/admin_stats_prometheus.rs`.
+
+The fixture exercises:
+- 1 HCM listener on `{{PORT}}` serving `direct_response 200 "ok\n"` (HTTP/1.1).
+- 1 admin listener on `{{ADMIN_PORT}}` serving `/ready` `/stats` `/stats/prometheus`.
+- Harness drives `GET /` against the HCM listener (counters increment) then `GET /stats/prometheus` against the admin listener; the matcher asserts metric-name-set equality between envoy ↔ envoy-rust modulo per-fixture allow-lists (does NOT compare numeric values; 06.3 extends).
+
+### Empirical allow-list seeding (SPEC §6 signpost 12)
+
+First run with empty allow-lists surfaced **204 envoy-only** metric names + **2 envoy-rust-only** names. Final allow-list state:
+
+- `allowlist_envoy_only`: **202 entries**. Categories (counts in parens):
+  - `server.*` (29) — server-state stats not yet ported.
+  - `http.downstream.*` (60) — HCM stats beyond `downstream_rq_total`.
+  - `listener.*` + `listener.admin.*` (46) — auto-emitted listener stats.
+  - `listener_manager.*` (12), `cluster_manager.*` (9) — manager book-keeping.
+  - `runtime.*` (9) — RTDS layer (defers to xDS family).
+  - `filesystem.*` (6) — file I/O stats.
+  - `http.tracing.*` (5), `http.passthrough.*` (5), `http.rq.*` (5), `http1.*` (4), `http.no_*`/`rs.*` (3) — HCM-adjacent counters.
+  - `overload.*` (3), `main_thread.*` (2), `workers.*` (2), `thread_local.*` (2), `tcmalloc.*` (1) — runtime-overload bookkeeping.
+- `allowlist_envoy_rust_only`: **2 entries**. `envoy_http_ingress_http_downstream_rq_total` + `envoy_listener_ingress_http_downstream_cx_total`. **Investigated** per the discipline reminder: these are not typos — they're the dynamic-segment-embedded form of two counters that upstream Envoy emits as bare names with Prometheus labels (`envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="ingress_http"}` etc.). Both proxies emit the same counters; the Prometheus *shape* differs. Documented in BEHAVIOR_CONTRACT.md "Stat-name mapping" §06.1 ("Prometheus exposition shape divergence"); resolution defers to a later phase that adds a `StatsTagExtractor`-equivalent.
+
+### Carryforward from Task 12 (centralize body-rule dispatch)
+
+The 3 HTTP arms in `tests/differential/src/lib.rs` (Driver::Http1, Driver::Http1ProbeList, Driver::Http2) now route through `assert_body_rule` instead of inline `matches!(BodyRule::ByteExact)` — closes the latent inconsistency from Task 12's code review. Behaviorally equivalent for ByteExact; admits future BodyRule variants without re-touching the arms. Http1ProbeList wraps the per-probe failure context via `with_context(|| format!("probe {}", probe.name))?`.
+
+### Plan-time deviations (per D-3.5)
+
+1. **Upstream Envoy `/stats/prometheus` content-type is `text/plain; charset=UTF-8`** (NOT the Prometheus-spec `text/plain; version=0.0.4; charset=utf-8` that envoy-rust originally emitted). Empirically verified at task-execution time. Per D-3.3 (envoy-rust mirrors upstream Envoy verbatim), the product side was updated: `crates/envoy-admin/src/endpoint.rs` now emits `text/plain; charset=UTF-8` for `/stats/prometheus`. The associated unit test (`render_response_carries_correct_content_type`) was updated to lock the new value.
+
+2. **`drive_http1` lacked `transfer-encoding: chunked` handling.** Surfaced at first-run: upstream Envoy's `/stats/prometheus` ships chunked, so the harness was decoding the body as 0 bytes (default `content_length = 0` when Content-Length absent). Fixed by mirroring `drive_http_get`'s chunked handling: the framing precedence is now `chunked` (drain + `decode_chunked`) → `content-length` (read N) → connection-close (read-to-EOF). This is a Task 12 latent harness bug surfaced (and fixed) at fixture-time per D-3.3 — the latent path was unused before fixture 0011 since no prior fixture asserted on a chunked admin body.
+
+3. **Prometheus name-vs-label shape divergence** documented in BEHAVIOR_CONTRACT.md §06.1 ("Prometheus exposition shape divergence"). Two paired entries on each allow-list bridge the divergence; the dot-tree contract `http.<stat_prefix>.downstream_rq_total = value-exact` remains authoritative.
+
+### Acceptance signal
+
+Docker-gated test green locally (3 stable runs):
+```
+test admin_stats_prometheus ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+`cargo test --workspace` → 467 passed; 0 failed; 2 ignored. `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean.
+
+D6 (harness + fixture) complete at this task.
+

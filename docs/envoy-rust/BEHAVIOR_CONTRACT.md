@@ -69,6 +69,31 @@
 | `cluster.<name>.upstream_cx_total` | name-required, value-may-differ | Counter; one increment per established upstream TCP connection. Envoy's stat semantics are "per-established-connection-from-the-pool" with default connection pooling enabled; envoy-rust under the no-pooling regime (per phase-04.3 / 05.3 posture) increments once per upstream call. Both are correct under their respective contracts. When connection pooling lands (upstream-robustness family), the disposition tightens to value-exact. |
 | `http.<stat_prefix>.downstream_rq_total` | value-exact | Counter; one increment per HCM-handled request (any response code; any method). Both proxies emit on every request; under deterministic harness load (a fixed request count) the values are byte-equal. The `<stat_prefix>` segment is sourced from `HttpConnectionManagerConfig.stat_prefix`. |
 
+**06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
+
+> Upstream Envoy's Prometheus emitter projects dynamic name segments
+> (the `<name>` in `listener.<name>.downstream_cx_total`, the
+> `<stat_prefix>` in `http.<stat_prefix>.downstream_rq_total`, etc.) into
+> Prometheus *labels*: the wire shape is
+> `envoy_listener_downstream_cx_total{envoy_listener_address="0.0.0.0_10000"} 0`.
+> envoy-rust's emitter (`crates/envoy-stats/src/prometheus.rs`) instead
+> projects the dynamic segment directly into the metric name:
+> `envoy_listener_ingress_http_downstream_cx_total 0`.
+>
+> Both projections carry the same counter; only the Prometheus
+> name-vs-label shape differs. Fixture 0011 bridges this via paired
+> `allowlist_envoy_only` / `allowlist_envoy_rust_only` entries (see
+> `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`).
+> The dot-tree contract above (`http.<stat_prefix>.downstream_rq_total`
+> as value-exact) remains the authoritative semantic — the emitter-side
+> shape divergence does not loosen the equivalence dimension.
+>
+> This divergence is documented for transparency; resolution defers to
+> a later phase that adds a `StatsTagExtractor`-equivalent which
+> extracts the dynamic segments back into Prometheus labels at scrape
+> time. When that lands, the paired allow-list entries drop together
+> and this paragraph is removed (no contract loosening).
+
 ---
 
 ## Access log field mapping

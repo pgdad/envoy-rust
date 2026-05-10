@@ -818,7 +818,7 @@ pub async fn drive_http1(
     let read_timeout = Duration::from_secs(5);
 
     // Read headers until httparse signals Complete; then read Content-Length body.
-    let (status, headers, headers_end, content_length) = loop {
+    let (status, headers, headers_end, content_length, chunked) = loop {
         let mut chunk = [0u8; 4096];
         let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await??;
         if n == 0 {
@@ -844,32 +844,72 @@ pub async fn drive_http1(
                 let content_length = headers
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-                    .and_then(|(_, v)| v.parse::<usize>().ok())
-                    .unwrap_or(0);
-                break (status, headers, headers_end, content_length);
+                    .and_then(|(_, v)| v.parse::<usize>().ok());
+                let chunked = headers
+                    .iter()
+                    .any(|(n, v)| {
+                        n.eq_ignore_ascii_case("transfer-encoding")
+                            && v.eq_ignore_ascii_case("chunked")
+                    });
+                break (status, headers, headers_end, content_length, chunked);
             }
             httparse::Status::Partial => continue,
         }
     };
 
-    // Read remaining body bytes.
-    while buf.len() < headers_end + content_length {
-        let mut chunk = [0u8; 4096];
-        let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await??;
-        if n == 0 {
-            if buf.len() < headers_end + content_length {
-                anyhow::bail!(
-                    "unexpected EOF before body complete: have {}, expected {}",
-                    buf.len() - headers_end,
-                    content_length,
-                );
+    // Body framing precedence per RFC 7230 §3.3.3 (with the simpler subset
+    // sufficient for the harness): `transfer-encoding: chunked` overrides
+    // `content-length`. `content-length`-framed: read exactly N. Otherwise
+    // (no length, no chunked): read-until-EOF (`Connection: close`-framed,
+    // which is what the harness always asks for via the close header).
+    //
+    // 06.1 Task 13 fix: this arm previously hard-defaulted content_length
+    // to 0 and only handled the `Some(content_length)` shape, so an admin
+    // scrape against upstream Envoy v1.33.0's `/stats/prometheus` (which
+    // ships chunked) was decoded as a 0-byte body. Mirrors `drive_http_get`'s
+    // chunked handling (added in phase 01 for `/ready`).
+    let body = if chunked {
+        // Drain the rest of the wire to EOF, then chunk-decode.
+        let mut wire = buf[headers_end..].to_vec();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await??;
+            if n == 0 {
+                break;
             }
-            break;
+            wire.extend_from_slice(&chunk[..n]);
         }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-
-    let body = buf[headers_end..headers_end + content_length].to_vec();
+        decode_chunked(&wire).context("chunked decoding failed")?
+    } else if let Some(cl) = content_length {
+        while buf.len() < headers_end + cl {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await??;
+            if n == 0 {
+                if buf.len() < headers_end + cl {
+                    anyhow::bail!(
+                        "unexpected EOF before body complete: have {}, expected {}",
+                        buf.len() - headers_end,
+                        cl,
+                    );
+                }
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf[headers_end..headers_end + cl].to_vec()
+    } else {
+        // Connection-close framing: read until the peer EOFs.
+        let mut body = buf[headers_end..].to_vec();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await??;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body
+    };
 
     Ok(DriveHttp1Result {
         status,
@@ -1466,17 +1506,14 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 }
             }
 
-            // Body: envoy ↔ envoy-rust under `response_body: byte_exact`.
-            if matches!(
-                expectations.equivalence.response_body,
-                Some(BodyRule::ByteExact)
-            ) && upstream_resp.body != subject_resp.body
-            {
-                bail!(
-                    "byte-exact body mismatch\n  upstream: {:?}\n  subject:  {:?}",
-                    upstream_resp.body,
-                    subject_resp.body,
-                );
+            // Body: envoy ↔ envoy-rust per `equivalence.response_body` rule.
+            // 06.1 Task 13 carryforward: route through `assert_body_rule` so
+            // BodyRule variants (ByteExact / PrometheusExposition) dispatch
+            // through the single centralized helper instead of inline
+            // `matches!`. Behaviorally equivalent for ByteExact; admits
+            // PrometheusExposition without re-touching the arm.
+            if let Some(rule) = &expectations.equivalence.response_body {
+                assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
             }
             // Per-driver `expected_body`: each side independently equals bytes.
             if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
@@ -1567,18 +1604,12 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     }
                 }
 
-                // Body.
-                if matches!(
-                    expectations.equivalence.response_body,
-                    Some(BodyRule::ByteExact)
-                ) && upstream_resp.body != subject_resp.body
-                {
-                    bail!(
-                        "probe {}: byte-exact body mismatch\n  upstream: {:?}\n  subject:  {:?}",
-                        probe.name,
-                        upstream_resp.body,
-                        subject_resp.body,
-                    );
+                // Body. 06.1 Task 13 carryforward: route through
+                // `assert_body_rule` so BodyRule variants dispatch through the
+                // single centralized helper instead of inline `matches!`.
+                if let Some(rule) = &expectations.equivalence.response_body {
+                    assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
+                        .with_context(|| format!("probe {}", probe.name))?;
                 }
                 if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
                     let expected = body.as_bytes();
@@ -1662,17 +1693,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 }
             }
 
-            // Body: envoy ↔ envoy-rust under `response_body: byte_exact`.
-            if matches!(
-                expectations.equivalence.response_body,
-                Some(BodyRule::ByteExact)
-            ) && upstream_resp.body != subject_resp.body
-            {
-                bail!(
-                    "byte-exact body mismatch\n  upstream: {:?}\n  subject:  {:?}",
-                    upstream_resp.body,
-                    subject_resp.body,
-                );
+            // Body: envoy ↔ envoy-rust per `equivalence.response_body` rule.
+            // 06.1 Task 13 carryforward: route through `assert_body_rule` (see
+            // Driver::Http1 arm above for rationale).
+            if let Some(rule) = &expectations.equivalence.response_body {
+                assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
             }
             // Per-driver `expected_body`: each side independently equals bytes.
             if let Some(Http1BodyRule::ByteExact { body }) = expected_body {

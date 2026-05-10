@@ -90,9 +90,16 @@ impl AdminEndpoint {
             status: 200,
             reason: Some("OK"),
             headers: vec![
+                // Mirror upstream Envoy 1.33's `/stats/prometheus`
+                // content-type verbatim: `text/plain; charset=UTF-8`.
+                // (The Prometheus-spec value `text/plain; version=0.0.4;
+                // charset=utf-8` is what Prometheus exposition strictly
+                // documents, but upstream Envoy emits the un-versioned
+                // form; envoy-rust mirrors per D-3.3 doctrine — empirical
+                // verification landed in 06.1 fixture 0011.)
                 (
                     "content-type".to_string(),
-                    "text/plain; version=0.0.4; charset=utf-8".to_string(),
+                    "text/plain; charset=UTF-8".to_string(),
                 ),
                 ("content-length".to_string(), body.len().to_string()),
             ],
@@ -211,7 +218,7 @@ mod tests {
 
         let prom = AdminEndpoint::StatsPrometheus.render(&reg);
         assert!(prom.headers.iter().any(|(k, v)| k == "content-type"
-            && v == "text/plain; version=0.0.4; charset=utf-8"));
+            && v == "text/plain; charset=UTF-8"));
     }
 
     #[test]
