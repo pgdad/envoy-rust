@@ -101,9 +101,8 @@ impl AdminEndpoint {
     }
 }
 
-/// Render a 404 for unknown admin paths. Used by `AdminHandler` (Task 8) when
-/// `from_path` returns `None`.
-#[allow(dead_code)] // wired up by Task 8's AdminHandler::handle_inner
+/// Render a 404 for unknown admin paths. Used by `AdminHandler::handle_inner`
+/// when `from_path` returns `None`.
 pub(crate) fn render_404() -> envoy_http1::Response {
     let body = Bytes::from_static(b"unknown admin endpoint\n");
     envoy_http1::Response {
@@ -117,8 +116,7 @@ pub(crate) fn render_404() -> envoy_http1::Response {
     }
 }
 
-/// Render a 405 for non-GET methods. Used by `AdminHandler` (Task 8).
-#[allow(dead_code)] // wired up by Task 8's AdminHandler::handle_inner
+/// Render a 405 for non-GET methods. Used by `AdminHandler::handle_inner`.
 pub(crate) fn render_405() -> envoy_http1::Response {
     let body = Bytes::from_static(b"admin endpoints are GET-only\n");
     envoy_http1::Response {

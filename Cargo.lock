@@ -327,6 +327,7 @@ dependencies = [
  "envoy-http1",
  "envoy-listener",
  "envoy-stats",
+ "httparse",
  "thiserror",
  "tokio",
  "tracing",

@@ -158,3 +158,23 @@ Plan-time deviations (per D-3.5):
 - `write!(buf, "{}: {}\n", ...)` → `writeln!(buf, "{}: {}", ...)` for `clippy::write_with_newline` (mirrors Task 5's identical fix in the prometheus emitter; output byte-identical).
 - Test name normalization: `render_ready_returns_200_LIVE` → `render_ready_returns_200_live` (lowercase per Rust naming convention; test body / assertion semantics unchanged).
 - `render_404` / `render_405` flagged by `-D dead-code` because they're called only from `#[cfg(test)]` and (eventually) Task 8's not-yet-landed `AdminHandler`. Added `#[allow(dead_code)] // wired up by Task 8's AdminHandler::handle_inner` comment, mirroring the same idiom at `crates/envoy-http1/src/codec.rs:51` (`#[allow(dead_code)] // wired up by Task 9's router-proxy arm`).
+
+## Task 8 — envoy-admin AdminHandler + serve accept loop
+
+`AdminHandler::handle(stream)` impls `envoy_listener::ConnectionHandler::handle` (returns `BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>`). Reads HTTP/1.1 request via `httparse` (~150 LoC inline parser); dispatches via `AdminEndpoint::from_path`; renders via `AdminEndpoint::render`; serializes the response inline (~30 LoC; injects `connection: close` so each request closes the connection — no keep-alive in 06.1).
+
+`pub async fn serve(listener, handler, shutdown)` runs the accept loop with shutdown-gated drain (5s budget; matches `Listener::serve`'s behavior). This is envoy-admin's own accept loop — not routed through `envoy_listener::Listener::serve` per PLAN-write SPEC correction #2.
+
+`crates/envoy-admin/Cargo.toml` gains `httparse = "1"` direct dep (consistent with the pre-existing 04.3 REVIEW M-architectural-claim carve-out posture for `httparse`; no new ADR).
+
+`AdminHandler::new` no longer uses `_`-prefix on `config` / `registry` fields (Task 6's placeholder discipline retired now that the handler reads them).
+
+`#[allow(dead_code)]` annotations on `render_404` / `render_405` (added at Task 7) retired — `handle_inner` calls both.
+
+Tests: 4 in-process tests (ready / stats-prometheus / 404 / 405). All 17 envoy-admin tests pass; clippy clean.
+
+Plan-time deviations (per D-3.5):
+- The PLAN's draft `let n = stream.read(&mut scratch[..cap.min(scratch.len())]).await?;` triggers E0502 (immutable borrow of `scratch.len()` while mutable-borrowing `&mut scratch[..]`). Hoisted into `let take = cap.min(scratch.len()); let n = stream.read(&mut scratch[..take]).await?;` — same semantics, two-step borrow.
+- `clippy::doc_lazy_continuation` required indenting the wrapped second line of the `MAX_REQUEST_HEAD` doc comment by two spaces. Cosmetic; doc text unchanged.
+
+D2 (envoy-admin foundation) complete at this task.
