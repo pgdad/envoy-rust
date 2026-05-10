@@ -178,3 +178,32 @@ Plan-time deviations (per D-3.5):
 - `clippy::doc_lazy_continuation` required indenting the wrapped second line of the `MAX_REQUEST_HEAD` doc comment by two spaces. Cosmetic; doc text unchanged.
 
 D2 (envoy-admin foundation) complete at this task.
+
+## Task 10 — Stats wiring (D4) + BEHAVIOR_CONTRACT.md initial 3 rows
+
+Three counters wired across the data plane per SPEC §3 D4:
+- `listener.<name>.downstream_cx_total` (D4.a; per-accept; `Listener::bind` signature ripple — gains `registry: Arc<StatsRegistry>`; `serve` accept loop calls `cx_total.inc()` on the success arm).
+- `cluster.<name>.upstream_cx_total` (D4.b; per-upstream-connect; `from_bootstrap` signature ripple — gains `registry: Arc<StatsRegistry>`; counter Arc is registered at construct time and exposed via `Cluster::cx_total()` + `ClusterHandle::cx_total()`. The increment site lives at the call site — envoy-tcp::TcpProxy::handle, envoy-http1::serve_connection's proxy arm, envoy-http2::handle_one_stream's two upstream-protocol arms — NOT inside envoy-cluster, because the cluster crate is a configuration / load-balancing data structure and does not own a `TcpStream::connect` call site).
+- `http.<stat_prefix>.downstream_rq_total` (D4.c; per-request; `HCMConfig::from_config` signature ripple — gains `registry`; `HCMStats { downstream_rq_total: Arc<Counter> }` registered at construct time on `HCMConfig.stats: Arc<HCMStats>`. Increment fires at the entry of `serve_connection`'s per-request loop (H1) and `handle_one_stream` (H2), per signpost 5 — BEFORE route walk, counts attempts including malformed bodies).
+
+`envoy-bin` constructs the global `Arc<StatsRegistry>` once at the top of `run()` and threads it via `Arc::clone(&registry)` into `from_bootstrap`, both `Listener::bind` call sites (tcp_proxy + HCM dispatch arms), and `HCMConfig::from_config`. envoy-bin gains an `envoy-stats` path-dep.
+
+H2 HCM inherits the wiring via the 05.2-established `HCMConfig` type-alias (the H2 listener-side dispatch reads `config.stats.downstream_rq_total` at `handle_one_stream` entry; the H2 router-proxy arm reads `cluster.cx_total()` after each successful Client::connect on either upstream protocol).
+
+BEHAVIOR_CONTRACT.md `Stat-name mapping` first-time populated with 3 rows per SPEC §2 (1 value-exact + 1 name-required-value-may-differ + 1 value-exact). Header allow-list unchanged in 06.1 per cross-sub-phase rule 8.
+
+Tests: 1 listener (`listener_increments_cx_total_on_accept`) + 1 cluster (`cluster_increments_cx_total_on_connect`) + 1 H1 HCM (`hcm1_increments_downstream_rq_total_on_request`) + 1 H2 HCM (`hcm2_increments_downstream_rq_total_on_request`) = 4 new unit tests. All pass; clippy clean.
+
+New error variants: `ListenerError::StatsRegistration(String)`, `ClusterError::StatsRegistration { cluster, message }`, `Http1Error::StatsRegistration { stat_prefix, message }`. Each wraps the registry error's `Display` rendering rather than re-exporting `envoy_stats::StatsError` in the host crate's error surface.
+
+Plan-time deviations (per D-3.5):
+- The PLAN's sketch put the cluster-side `cx_total.inc()` inside `cluster.rs` ("connect-site increment (currently `tokio::net::TcpStream::connect(...).await?`) becomes…"), but `envoy-cluster` does NOT own any `TcpStream::connect` call site — connects live in envoy-tcp::TcpProxy + envoy-http1::Client::connect + envoy-http2::Client::connect, and the call-site context (where `ClusterHandle` is in scope) is in their callers. Implemented as: `Cluster::cx_total(&self) -> &Arc<Counter>` accessor (mirrored on `ClusterHandle`), with the increment performed at each call site (envoy-tcp::TcpProxy::handle, envoy-http1::serve_connection's proxy arm Client::connect Ok-arm, envoy-http2::handle_one_stream's two upstream-protocol Client::connect Ok-arms). The cluster-side unit test exercises the cluster's wiring (registration + accessor) by simulating the call-site `cluster.cx_total().inc()` pattern; cross-crate call-site wiring is exercised by the H1 + H2 HCM tests' router-proxy paths and by fixture 0011 (Task 13).
+- `ClusterError::StatsRegistration` carries `{ cluster: String, message: String }` rather than the PLAN's `(String)`-shape — the cluster name is useful diagnostic context when registration fails, and uniform with `EmptyCluster { name }` and `EndpointParse { cluster, … }` shapes already in the enum.
+- `Http1Error::StatsRegistration` similarly carries `{ stat_prefix, message }` for the same reason (uniform with `UpstreamConnect { addr, source }` shape).
+- The PLAN's listener test used `..Default::default()` for `envoy_config::Listener`, but `Listener` does not derive `Default` (verified in `crates/envoy-config/src/bootstrap.rs:192`). The new test reuses the existing `mk_listener_cfg` YAML helper, which spells out all required fields and uses `name: "test_listener"` — the test asserts on the resulting `listener.test_listener.downstream_cx_total` name.
+- The H1 HCM test (`hcm1_increments_downstream_rq_total_on_request`) builds the config via the production constructor `HCMConfig::from_config` rather than the existing struct-literal helper `hcm_config_single_route`, because the latter manufactures `HCMStats` from a throwaway registry per `mk_stats(...)` and the counter would not be observable from the test. The 5 existing struct-literal helpers were updated to add `stats: mk_stats("<stat_prefix>")` so all 33 pre-existing H1 HCM tests continue to compile and pass.
+- envoy-tcp gains an `envoy-stats` dev-dep (its updated test helper builds a registry to satisfy the new `from_bootstrap(registry)` signature). Production code in envoy-tcp does not need a direct envoy-stats dep — `cluster.cx_total().inc()` reaches `&Arc<envoy_stats::Counter>` via the envoy-cluster re-export.
+
+Stat-name discipline (Task 5 carryforward): `register_counter` call-sites grepped — all 3 templates are alphanumeric + dot + underscore. No `:` introduced.
+
+Total LoC: ~580 insertions across 16 files.

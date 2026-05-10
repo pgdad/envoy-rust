@@ -61,7 +61,13 @@
 > stats, etc.) updates this section or produces an ADR explaining why the
 > defaults suffice.
 
-_(empty; populated starting phase 06)_
+**06.1 initial entries:**
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `listener.<name>.downstream_cx_total` | value-exact | Counter; one increment per accepted TCP connection on the listener. envoy-rust internal label matches Envoy's documented name one-to-one. Both proxies emit on every accept; under deterministic harness load (a fixed connection count) the values are byte-equal. |
+| `cluster.<name>.upstream_cx_total` | name-required, value-may-differ | Counter; one increment per established upstream TCP connection. Envoy's stat semantics are "per-established-connection-from-the-pool" with default connection pooling enabled; envoy-rust under the no-pooling regime (per phase-04.3 / 05.3 posture) increments once per upstream call. Both are correct under their respective contracts. When connection pooling lands (upstream-robustness family), the disposition tightens to value-exact. |
+| `http.<stat_prefix>.downstream_rq_total` | value-exact | Counter; one increment per HCM-handled request (any response code; any method). Both proxies emit on every request; under deterministic harness load (a fixed request count) the values are byte-equal. The `<stat_prefix>` segment is sourced from `HttpConnectionManagerConfig.stat_prefix`. |
 
 ---
 

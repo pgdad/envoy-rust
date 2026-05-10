@@ -93,6 +93,12 @@ impl TcpProxy {
                 Box::new(TcpProxyError::UpstreamConnect { addr, source })
                     as Box<dyn std::error::Error + Send + Sync>
             })?;
+        // 06.1 D4.b: per-cluster `upstream_cx_total` increment on
+        // successful upstream TCP connect. Mirrors the H1 + H2 router-proxy
+        // arms in envoy-http1::serve_connection / envoy-http2::handle_one_stream.
+        // Fires only on the success arm; the `?` above short-circuits the
+        // refused-connect path.
+        self.cluster.cx_total().inc();
 
         // 03.2 branched dial: TLS or plaintext upstream. Both arms unify into
         // `Box<dyn AsyncReadWrite + Send + Unpin>` so the bidirectional copy
@@ -241,9 +247,12 @@ admin:
             port = addr.port(),
         );
         let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("valid YAML");
-        let mgr = envoy_cluster::from_bootstrap(&bootstrap)
-            .await
-            .expect("manager builds");
+        let mgr = envoy_cluster::from_bootstrap(
+            &bootstrap,
+            std::sync::Arc::new(envoy_stats::StatsRegistry::new()),
+        )
+        .await
+        .expect("manager builds");
         mgr.get(name).expect("cluster present")
     }
 

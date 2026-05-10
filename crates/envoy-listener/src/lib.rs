@@ -48,6 +48,13 @@ pub enum ListenerError {
     DrainTimeout(Duration),
     #[error("resolving listener address '{0}:{1}'")]
     AddressParse(String, u16),
+    /// 06.1 D4.a: registering the per-listener counter
+    /// (`listener.<name>.downstream_cx_total`) against the global
+    /// `StatsRegistry` failed. Wraps the registry error's `Display`
+    /// rendering so this crate doesn't need to publicly re-export
+    /// `envoy_stats::StatsError` in its error surface.
+    #[error("registering listener stats: {0}")]
+    StatsRegistration(String),
 }
 
 /// A bound TCP listener with a per-connection handler. Construct via
@@ -55,6 +62,12 @@ pub enum ListenerError {
 pub struct Listener {
     listener: tokio::net::TcpListener,
     handler: Arc<dyn ConnectionHandler>,
+    /// 06.1 D4.a: per-listener counter incremented once per accepted TCP
+    /// connection. Registered at construct time as
+    /// `listener.<name>.downstream_cx_total`. Threaded through the
+    /// `tokio::select!` accept arm in `serve` (moved into a local at the
+    /// top of the loop to keep the borrow shape simple).
+    cx_total: Arc<envoy_stats::Counter>,
 }
 
 impl std::fmt::Debug for Listener {
@@ -74,6 +87,7 @@ impl Listener {
     pub async fn bind(
         cfg: &envoy_config::Listener,
         handler: Arc<dyn ConnectionHandler>,
+        registry: Arc<envoy_stats::StatsRegistry>,
     ) -> Result<Self, ListenerError> {
         let sock = &cfg.address.socket_address;
         let addr_str = format!("{}:{}", sock.address, sock.port_value);
@@ -83,7 +97,19 @@ impl Listener {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|source| ListenerError::Bind { addr, source })?;
-        Ok(Self { listener, handler })
+        // 06.1 D4.a: register `listener.<name>.downstream_cx_total`. The
+        // registry call is idempotent for same-kind re-registration, so
+        // multiple `Listener::bind` calls with the same `cfg.name` (a
+        // configuration error in production but possible in tests) reuse
+        // the existing handle rather than erroring.
+        let cx_total = registry
+            .register_counter(&format!("listener.{}.downstream_cx_total", cfg.name))
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        Ok(Self {
+            listener,
+            handler,
+            cx_total,
+        })
     }
 
     /// Returns the actual bound socket address (resolves `port_value: 0` to
@@ -110,6 +136,11 @@ impl Listener {
 
         let listener = self.listener;
         let handler = self.handler;
+        // 06.1 D4.a: hoist the per-listener counter out of `self` so the
+        // accept arm of `tokio::select!` can call `cx_total.inc()` without
+        // borrowing `self` (which has been consumed by the `let listener =
+        // self.listener;` move above).
+        let cx_total = self.cx_total;
         let mut join_set: tokio::task::JoinSet<
             Result<(), Box<dyn std::error::Error + Send + Sync>>,
         > = tokio::task::JoinSet::new();
@@ -125,6 +156,8 @@ impl Listener {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, peer)) => {
+                            // 06.1 D4.a: increment per-listener accept counter.
+                            cx_total.inc();
                             tracing::debug!(%peer, "listener accepted connection");
                             let h = handler.clone();
                             join_set.spawn(async move { h.handle(stream).await });
@@ -196,11 +229,15 @@ mod tests {
         }
     }
 
+    fn mk_registry() -> Arc<envoy_stats::StatsRegistry> {
+        Arc::new(envoy_stats::StatsRegistry::new())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn serves_accepts_and_dispatches_to_handler() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
-        let listener = Listener::bind(&cfg, h).await.expect("bind ok");
+        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind ok");
         let addr = listener.local_addr().expect("local_addr");
 
         let (tx, rx) = oneshot::channel::<()>();
@@ -232,7 +269,7 @@ mod tests {
     async fn serves_honors_shutdown_signal() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
-        let listener = Listener::bind(&cfg, h).await.expect("bind");
+        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind");
         let (tx, rx) = oneshot::channel::<()>();
         let start = std::time::Instant::now();
         let server = tokio::spawn(async move {
@@ -262,7 +299,7 @@ mod tests {
     async fn serves_drains_in_flight_connection_within_budget() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
-        let listener = Listener::bind(&cfg, h).await.expect("bind");
+        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -315,7 +352,7 @@ mod tests {
     async fn serves_aborts_stragglers_past_drain_budget() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(StalledHandler);
-        let listener = Listener::bind(&cfg, h).await.expect("bind");
+        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -388,7 +425,9 @@ filter_chains:
     async fn bind_returns_socket_address() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let handler: Arc<dyn ConnectionHandler> = Arc::new(NullHandler);
-        let listener = Listener::bind(&cfg, handler).await.expect("bind ok");
+        let listener = Listener::bind(&cfg, handler, mk_registry())
+            .await
+            .expect("bind ok");
         let local = listener.local_addr().expect("local_addr");
         assert!(local.port() > 0, "ephemeral port must be assigned: {local}");
         assert_eq!(local.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
@@ -400,13 +439,18 @@ filter_chains:
         // bind again to that same port to provoke EADDRINUSE.
         let cfg_first = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(NullHandler);
-        let first = Listener::bind(&cfg_first, h.clone())
+        // Share a single registry so the second bind exercises the
+        // idempotent same-kind re-registration path (Task 5 contract); a
+        // distinct registry per call would equally work since the names
+        // collide only within a registry.
+        let registry = mk_registry();
+        let first = Listener::bind(&cfg_first, h.clone(), Arc::clone(&registry))
             .await
             .expect("first bind ok");
         let port = first.local_addr().expect("local_addr").port();
 
         let cfg_second = mk_listener_cfg("127.0.0.1", port);
-        let err = Listener::bind(&cfg_second, h)
+        let err = Listener::bind(&cfg_second, h, registry)
             .await
             .expect_err("second bind to same port must fail");
         match err {
@@ -420,5 +464,60 @@ filter_chains:
             }
             other => panic!("expected ListenerError::Bind, got {other:?}"),
         }
+    }
+
+    /// 06.1 D4.a: per-listener `downstream_cx_total` counter increments
+    /// once per accepted TCP connection. Drives 3 client connects against
+    /// an ephemeral-port listener (using `NullHandler` so per-connection
+    /// work resolves immediately) and asserts the counter reads `3`.
+    ///
+    /// The counter Arc is captured via a second `register_counter` call on
+    /// the same registry — `register_counter` is idempotent for same-kind
+    /// re-registration (per Task 5's contract), so the value the test
+    /// observes is the same one the listener increments.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_increments_cx_total_on_accept() {
+        let registry = mk_registry();
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(NullHandler);
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind ok");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // The listener registered the counter at bind time; re-registering
+        // by name yields the same Arc (Task 5 idempotent contract). Note
+        // the listener config name is "test_listener" (per `mk_listener_cfg`).
+        let cx_total = registry
+            .register_counter("listener.test_listener.downstream_cx_total")
+            .expect("counter registers");
+        assert_eq!(cx_total.value(), 0, "counter starts at zero");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(listener.serve(async move {
+            let _ = rx.await;
+        }));
+
+        // Open and immediately close 3 TCP connections; each accept
+        // increments the counter exactly once per signpost 5.
+        for _ in 0..3 {
+            let _stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect ok");
+        }
+        // Brief settle window so all accepts complete before assertion.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            cx_total.value(),
+            3,
+            "expected one increment per accepted connection",
+        );
+
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("serve resolves within 6s")
+            .expect("join")
+            .expect("serve ok");
     }
 }

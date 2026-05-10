@@ -24,6 +24,42 @@ const DEFAULT_CONTENT_TYPE: &str = "text/plain";
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_BUFFER_INITIAL_CAPACITY: usize = 8192;
 
+/// 06.1 D4.c: per-HCM counters registered against the global StatsRegistry.
+/// Names use the configured `stat_prefix` from `HCMConfig`. Currently
+/// carries the single representative counter `downstream_rq_total`; future
+/// HCM stats (downstream_rq_2xx, downstream_rq_4xx, etc.) join this struct
+/// in 06.3 per parent SPEC §3 D14.3.
+///
+/// The struct lives in `envoy-http1` because that's the `HCMConfig` owner
+/// per cross-sub-phase rule 2; `envoy-http2`'s HCM reaches the same Arc
+/// via the re-exported `HCMConfig` type alias.
+#[derive(Debug)]
+pub struct HCMStats {
+    /// `http.<stat_prefix>.downstream_rq_total` — incremented once per
+    /// HCM-handled request (any response code; any method) at the entry
+    /// path per SPEC §6 signpost 5. Counts attempts including malformed
+    /// requests (the increment fires after request-head parsing succeeds
+    /// but BEFORE the route walk dispatches to direct_response or proxy).
+    pub downstream_rq_total: Arc<envoy_stats::Counter>,
+}
+
+impl HCMStats {
+    /// Register the HCM's counters under `http.{stat_prefix}.…` against
+    /// the supplied registry. Idempotent for same-kind re-registration
+    /// (Task 5 contract); two HCMs with the same `stat_prefix` (a config
+    /// error in production but possible in tests) share the same counter
+    /// Arc.
+    pub fn register(
+        registry: &envoy_stats::StatsRegistry,
+        stat_prefix: &str,
+    ) -> Result<Self, envoy_stats::StatsError> {
+        Ok(Self {
+            downstream_rq_total: registry
+                .register_counter(&format!("http.{stat_prefix}.downstream_rq_total"))?,
+        })
+    }
+}
+
 /// Unified HCM configuration consumed by both the H1 and H2 dispatch paths,
 /// per cross-sub-phase architectural rule 2 (one config struct, two codec
 /// edges). Built once at startup via `from_config(...)` and shared via
@@ -44,21 +80,35 @@ pub struct HCMConfig {
     /// dispatch path (envoy-http1's HCM doesn't read this); consumed on the
     /// H2 dispatch path (envoy-http2's HCM reads it at handshake time).
     pub http2_protocol_options: Option<envoy_config::Http2ProtocolOptions>,
+    /// 06.1 D4.c: per-HCM stats handles. Registered at `from_config` time
+    /// and shared across H1 + H2 dispatch (the H2 HCM consumes this same
+    /// HCMConfig type-alias per cross-sub-phase rule 2). The increment
+    /// site is at the per-request entry path (signpost 5).
+    pub stats: Arc<HCMStats>,
 }
 
 impl HCMConfig {
     pub fn from_config(
         cfg: &HttpConnectionManagerConfig,
         cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+        registry: Arc<envoy_stats::StatsRegistry>,
     ) -> Result<Self, Http1Error> {
         // The validator (envoy-config Task 2) has already enforced shape.
         // This constructor is `Result<>` for forward-compat with 04.3's
-        // cluster lookup; in 04.1 it never returns Err.
+        // cluster lookup; the 06.1 stats-registration path is the second
+        // failure surface (registry name-collision across kinds).
+        let stats = Arc::new(HCMStats::register(&registry, &cfg.stat_prefix).map_err(|e| {
+            Http1Error::StatsRegistration {
+                stat_prefix: cfg.stat_prefix.clone(),
+                message: e.to_string(),
+            }
+        })?);
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
             route_config: Arc::new(clone_route_config(&cfg.route_config)),
             cluster_mgr,
             http2_protocol_options: cfg.http2_protocol_options.clone(),
+            stats,
         })
     }
 }
@@ -152,6 +202,14 @@ async fn serve_connection(
                 }
             }
         };
+
+        // 06.1 D4.c: per-request entry-path counter. Per SPEC §6 signpost 5,
+        // the increment fires at the entry of the per-request handler — the
+        // first action after request-head parsing succeeds, BEFORE the route
+        // walk. Counts attempts including malformed bodies (chunked-rejected,
+        // synthesized 4xx). Mirrors the H2-side increment in
+        // envoy-http2::hcm::handle_one_stream.
+        config.stats.downstream_rq_total.inc();
 
         // 3. Determine close/keep-alive decision before any move.
         let close = req.headers.iter().any(|(n, v)| {
@@ -258,7 +316,15 @@ async fn serve_connection(
 
                 let start = std::time::Instant::now();
                 let mut client_stream = match Client::connect(endpoint, &host_header).await {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        // 06.1 D4.b: per-cluster `upstream_cx_total`
+                        // counter incremented once per established
+                        // upstream TCP connection. Fires only on the
+                        // success arm (a refused-connect path returns 502
+                        // without incrementing).
+                        cluster.cx_total().inc();
+                        s
+                    }
                     Err(source) => {
                         tracing::warn!(
                             cluster = %cluster.name(),
@@ -520,7 +586,7 @@ static_resources:
         );
         let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
         Arc::new(
-            envoy_cluster::from_bootstrap(&bootstrap)
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
                 .await
                 .expect("cluster mgr"),
         )
@@ -542,10 +608,19 @@ static_resources:
 "#;
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
         Arc::new(
-            envoy_cluster::from_bootstrap(&bootstrap)
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
                 .await
                 .expect("cluster mgr"),
         )
+    }
+
+    /// 06.1 NEW: register an HCMStats handle against a fresh registry
+    /// under the given `stat_prefix`. Mirrors the production
+    /// `HCMConfig::from_config` registration but lets tests construct
+    /// HCMConfig as a struct-literal without going through `from_config`.
+    fn mk_stats(stat_prefix: &str) -> Arc<HCMStats> {
+        let registry = envoy_stats::StatsRegistry::new();
+        Arc::new(HCMStats::register(&registry, stat_prefix).expect("HCMStats register"))
     }
 
     /// Build a minimal HCMConfig with a single VH `domains: ["*"]`,
@@ -555,6 +630,7 @@ static_resources:
             stat_prefix: "ingress_http".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -631,6 +707,7 @@ static_resources:
             stat_prefix: "x".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
+            stats: mk_stats("x"),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -669,6 +746,7 @@ static_resources:
             stat_prefix: "x".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
+            stats: mk_stats("x"),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -735,6 +813,7 @@ static_resources:
             stat_prefix: "x".to_string(),
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
+            stats: mk_stats("x"),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -818,6 +897,7 @@ static_resources:
             stat_prefix: "test".into(),
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
+            stats: mk_stats("test"),
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 virtual_hosts: vec![VirtualHost {
@@ -1047,6 +1127,7 @@ static_resources:
             stat_prefix: "ingress_http".to_string(),
             cluster_mgr,
             http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1275,6 +1356,73 @@ static_resources:
         assert!(
             !s.contains("nginx/1.x"),
             "upstream Server must not pass through: {s}"
+        );
+    }
+
+    /// 06.1 D4.c: per-HCM `downstream_rq_total` counter increments once
+    /// per HCM-handled request. Drives one direct-response request through
+    /// `serve_connection` and asserts the counter reads `1`. Test uses a
+    /// dedicated registry + stat_prefix so the counter Arc returned by
+    /// `register_counter` is the same one the HCMConfig increments
+    /// (Task 5 idempotent-same-kind contract).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm1_increments_downstream_rq_total_on_request() {
+        // Build the HCMConfig via the production constructor so the
+        // increment site is exercised end-to-end (rather than via the
+        // struct-literal helpers above, which manufacture HCMStats from a
+        // throwaway registry and would not be observable here).
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = cluster_mgr_empty().await;
+        let envoy_cfg = envoy_config::HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: envoy_config::CodecType::HTTP1,
+            http2_protocol_options: None,
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            }],
+        };
+        let hcm_config = Arc::new(
+            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry))
+                .expect("HCMConfig builds"),
+        );
+
+        // Re-register the counter to capture the same Arc the HCM holds.
+        let cx_counter = registry
+            .register_counter("http.ingress_http.downstream_rq_total")
+            .expect("counter registers");
+        assert_eq!(cx_counter.value(), 0);
+
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _resp = drive(hcm_config, req).await;
+
+        assert_eq!(
+            cx_counter.value(),
+            1,
+            "expected exactly one downstream_rq_total increment per HCM-handled request",
         );
     }
 }

@@ -16,6 +16,7 @@ envoy-config = { path = "../envoy-config" }
 envoy-http1 = { path = "../envoy-http1" }
 envoy-http2 = { path = "../envoy-http2" }
 envoy-listener = { path = "../envoy-listener" }
+envoy-stats = { path = "../envoy-stats" }
 envoy-tcp = { path = "../envoy-tcp" }
 envoy-tls = { path = "../envoy-tls" }
 httparse = "1"

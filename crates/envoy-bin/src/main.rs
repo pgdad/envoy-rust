@@ -75,12 +75,20 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     let mut set: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
 
+    // 06.1 D4: build the global StatsRegistry once at process startup.
+    // envoy-bin owns the constructor; consumers (cluster_mgr, listener-walk,
+    // HCMConfig::from_config) receive `Arc::clone(&registry)` per the
+    // cross-sub-phase architectural rule "envoy-bin owns the global
+    // Arc<StatsRegistry>" (parent SPEC §3 D4 + 06.1 PLAN Task 10 Step I).
+    let registry: std::sync::Arc<envoy_stats::StatsRegistry> =
+        std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+
     // Build the cluster manager once. Empty `clusters` is permitted at the
     // envoy-config validator (admin-only configs); the manager is empty in
     // that case and `tcp_proxy` filters reference clusters by name, which
     // the validator already verified exist (`ConfigError::UnknownCluster`).
     let cluster_mgr = std::sync::Arc::new(
-        envoy_cluster::from_bootstrap(&bootstrap)
+        envoy_cluster::from_bootstrap(&bootstrap, std::sync::Arc::clone(&registry))
             .await
             .context("building cluster manager")?,
     );
@@ -192,9 +200,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         None => proxy,
                     };
 
-                let listener = envoy_listener::Listener::bind(listener_cfg, handler)
-                    .await
-                    .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
+                let listener = envoy_listener::Listener::bind(
+                    listener_cfg,
+                    handler,
+                    std::sync::Arc::clone(&registry),
+                )
+                .await
+                .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
                 tracing::info!(addr = %bind_addr, cluster = %tp_cfg.cluster, "envoy-rust listening (tcp_proxy)");
                 let shutdown = token.clone();
                 set.spawn(async move {
@@ -217,6 +229,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 let hcm_config = std::sync::Arc::new(envoy_http1::HCMConfig::from_config(
                     hcm_cfg,
                     std::sync::Arc::clone(&cluster_mgr),
+                    std::sync::Arc::clone(&registry),
                 )?);
 
                 // 05.2 NEW: H1-vs-H2 dispatch on hcm_cfg.codec_type.
@@ -277,9 +290,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 }
                 let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = hcm;
 
-                let listener = envoy_listener::Listener::bind(listener_cfg, handler)
-                    .await
-                    .with_context(|| format!("binding HCM listener to {bind_addr}"))?;
+                let listener = envoy_listener::Listener::bind(
+                    listener_cfg,
+                    handler,
+                    std::sync::Arc::clone(&registry),
+                )
+                .await
+                .with_context(|| format!("binding HCM listener to {bind_addr}"))?;
                 tracing::info!(
                     addr = %bind_addr,
                     stat_prefix = %hcm_cfg.stat_prefix,

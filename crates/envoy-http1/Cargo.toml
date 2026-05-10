@@ -9,6 +9,7 @@ license = "Apache-2.0"
 envoy-config = { path = "../envoy-config" }
 envoy-cluster = { path = "../envoy-cluster" }
 envoy-listener = { path = "../envoy-listener" }
+envoy-stats = { path = "../envoy-stats" }
 httparse = "1"
 bytes = "1"
 tokio = { version = "1", features = ["net", "io-util", "macros", "sync", "time"] }

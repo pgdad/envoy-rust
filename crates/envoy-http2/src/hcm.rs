@@ -90,6 +90,12 @@ async fn handle_one_stream(
     req: http::Request<h2::RecvStream>,
     send_response: h2::server::SendResponse<Bytes>,
 ) -> Result<(), Http2Error> {
+    // 06.1 D4.c: per-request entry-path counter (mirrors envoy-http1's
+    // increment in `serve_connection`). Per SPEC §6 signpost 5 the
+    // increment fires at the entry of the per-stream handler, BEFORE the
+    // route walk + dispatch. Counts attempts including malformed bodies.
+    config.stats.downstream_rq_total.inc();
+
     // Drain the body. For 05.2 fixture 0009 (direct_response) the body is
     // empty; the drain is a no-op. For future fixtures with a body, the
     // unbounded drain is per parent §6 signpost 9 (deferred body-budget
@@ -167,13 +173,25 @@ async fn handle_one_stream(
             let upstream_resp_result = match cluster.upstream_protocol() {
                 envoy_cluster::UpstreamProtocol::Http1 => {
                     match envoy_http1::Client::connect(endpoint, &host_header).await {
-                        Ok(mut s) => s.send_request(out_req).await.map_err(|e| format!("{e}")),
+                        Ok(mut s) => {
+                            // 06.1 D4.b: per-cluster upstream_cx_total
+                            // increment on successful upstream H1 connect
+                            // (mirrors envoy-http1::serve_connection's
+                            // proxy arm).
+                            cluster.cx_total().inc();
+                            s.send_request(out_req).await.map_err(|e| format!("{e}"))
+                        }
                         Err(e) => Err(format!("{e}")),
                     }
                 }
                 envoy_cluster::UpstreamProtocol::Http2 => {
                     match crate::Client::connect(endpoint, &host_header).await {
-                        Ok(mut s) => s.send_request(out_req).await.map_err(|e| format!("{e}")),
+                        Ok(mut s) => {
+                            // 06.1 D4.b: per-cluster upstream_cx_total
+                            // increment on successful upstream H2 connect.
+                            cluster.cx_total().inc();
+                            s.send_request(out_req).await.map_err(|e| format!("{e}"))
+                        }
                         Err(e) => Err(format!("{e}")),
                     }
                 }
@@ -310,7 +328,10 @@ mod tests {
             }],
         };
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
-        Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr).expect("build HCM config"))
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).expect("build HCM config"),
+        )
     }
 
     /// Spawn an HCM-driven accept loop on an ephemeral port; return the bound
@@ -405,7 +426,7 @@ static_resources:
         };
         let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse bootstrap");
         Arc::new(
-            envoy_cluster::from_bootstrap(&bootstrap)
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
                 .await
                 .expect("from_bootstrap"),
         )
@@ -443,7 +464,10 @@ static_resources:
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
             }],
         };
-        Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr).expect("build HCM config"))
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).expect("build HCM config"),
+        )
     }
 
     /// Spawn an in-process H2 server that responds to the first accepted
@@ -580,7 +604,9 @@ static_resources:
             }],
         };
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
-        let config = Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr).unwrap());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let config =
+            Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).unwrap());
         let (addr, _server) = spawn_h2_hcm(config).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
@@ -806,5 +832,81 @@ static_resources:
         // expands to: open client, observe SETTINGS_MAX_CONCURRENT_STREAMS=1,
         // attempt 2 concurrent send_request calls, assert the second blocks
         // until the first stream closes.
+    }
+
+    /// 06.1 D4.c: per-HCM `downstream_rq_total` increments once per H2
+    /// stream handled. Mirrors the H1 unit test in
+    /// `envoy_http1::hcm::tests::hcm1_increments_downstream_rq_total_on_request`.
+    /// Builds the HCMConfig via the production constructor so the H2
+    /// handler reaches the same `Arc<Counter>` the test re-registers via
+    /// the shared registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm2_increments_downstream_rq_total_on_request() {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let config = Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, Arc::clone(&registry))
+                .expect("HCMConfig builds"),
+        );
+
+        let cx_counter = registry
+            .register_counter("http.test_h2.downstream_rq_total")
+            .expect("counter registers");
+        assert_eq!(cx_counter.value(), 0);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status().as_u16(), 200, "direct response 200");
+
+        // Brief settle so the spawn'd handle_one_stream task's increment
+        // is observable from this thread (the increment happens inside a
+        // `tokio::spawn` per `serve_h2_connection`).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            cx_counter.value(),
+            1,
+            "expected exactly one downstream_rq_total increment per H2 stream",
+        );
     }
 }

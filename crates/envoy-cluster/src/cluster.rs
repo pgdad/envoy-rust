@@ -17,6 +17,16 @@ pub struct Cluster {
     /// Set in `from_bootstrap` from the parsed cluster's
     /// `typed_extension_protocol_options`. Defaulted to `Http1`.
     pub(crate) upstream_protocol: UpstreamProtocol,
+    /// 06.1 D4.b: per-cluster counter incremented once per established
+    /// upstream TCP connection. Registered at construct time as
+    /// `cluster.<name>.upstream_cx_total`. Exposed via `cx_total()` so the
+    /// connect-site callers (envoy-tcp::TcpProxy, envoy_http1::Client and
+    /// envoy_http2::Client invocations from the HCM router-proxy arm)
+    /// can `inc()` after a successful upstream connect. The connect site
+    /// itself does NOT live in this crate: `Cluster` is a configuration /
+    /// load-balancing data structure, not a connection factory. See SPEC
+    /// §3 D4.b's increment-site-at-call-site posture.
+    pub(crate) cx_total: Arc<envoy_stats::Counter>,
 }
 
 impl Cluster {
@@ -35,6 +45,16 @@ impl Cluster {
     /// the typed value is set at cluster-build time, not derived per call.
     pub fn upstream_protocol(&self) -> UpstreamProtocol {
         self.upstream_protocol
+    }
+
+    /// 06.1 D4.b: shared accessor for the per-cluster upstream connection
+    /// counter (`cluster.<name>.upstream_cx_total`). Returns the cached
+    /// `Arc<Counter>` registered at `from_bootstrap` time. The connect-site
+    /// caller does `cluster.cx_total().inc()` after the upstream
+    /// `TcpStream::connect` succeeds. Mirrors `name()`'s borrow shape
+    /// (returns a `&` into the `Cluster`'s lifetime).
+    pub fn cx_total(&self) -> &Arc<envoy_stats::Counter> {
+        &self.cx_total
     }
 
     /// Picks the next endpoint in round-robin order. `Relaxed` ordering is
@@ -77,6 +97,14 @@ impl ClusterHandle {
     /// posture per SPEC §6 inherited signpost 1.
     pub fn upstream_protocol(&self) -> UpstreamProtocol {
         self.inner.upstream_protocol()
+    }
+
+    /// 06.1 D4.b: delegates to `Cluster::cx_total`. The connect-site
+    /// callers (see `Cluster::cx_total` doc) hold a `ClusterHandle` rather
+    /// than a `Cluster`, so the accessor is mirrored here for ergonomic
+    /// reach.
+    pub fn cx_total(&self) -> &Arc<envoy_stats::Counter> {
+        self.inner.cx_total()
     }
 }
 
@@ -156,6 +184,13 @@ pub enum ClusterError {
         #[source]
         source: std::io::Error,
     },
+    /// 06.1 D4.b: registering the per-cluster counter
+    /// (`cluster.<name>.upstream_cx_total`) against the global
+    /// `StatsRegistry` failed. Wraps the registry error's `Display`
+    /// rendering so this crate doesn't need to publicly re-export
+    /// `envoy_stats::StatsError` in its error surface.
+    #[error("registering cluster '{cluster}' stats: {message}")]
+    StatsRegistration { cluster: String, message: String },
 }
 
 /// Per-cluster upstream protocol selector. Defaulted to `Http1` for
@@ -185,6 +220,7 @@ pub enum UpstreamProtocol {
 /// at startup, before serving any traffic.
 pub async fn from_bootstrap(
     bootstrap: &envoy_config::Bootstrap,
+    registry: Arc<envoy_stats::StatsRegistry>,
 ) -> Result<ClusterManager, ClusterError> {
     let mut clusters: HashMap<String, Arc<Cluster>> = HashMap::new();
     for cfg in &bootstrap.static_resources.clusters {
@@ -278,11 +314,23 @@ pub async fn from_bootstrap(
                 }
             }
         };
+        // 06.1 D4.b: register `cluster.<name>.upstream_cx_total` against
+        // the global registry. Idempotent for same-kind re-registration
+        // (Task 5 contract); a `Bootstrap` with two clusters of the same
+        // name is rejected by the `clusters.insert(...).is_some()` check
+        // below, so this is the cluster's first registration in practice.
+        let cx_total = registry
+            .register_counter(&format!("cluster.{}.upstream_cx_total", cfg.name))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
             endpoints,
             cursor: AtomicUsize::new(0),
             upstream_protocol,
+            cx_total,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -306,13 +354,23 @@ mod tests {
             .collect()
     }
 
+    /// Construct a per-test Cluster + ClusterHandle bypassing
+    /// `from_bootstrap`. Counter is registered against a fresh registry so
+    /// the test mirrors the real `from_bootstrap` Arc-clone shape (Counter's
+    /// constructor is `pub(crate)` to envoy-stats; consumers always go
+    /// through the registry).
     fn mk_handle(name: &str, endpoints: Vec<SocketAddr>) -> ClusterHandle {
+        let registry = envoy_stats::StatsRegistry::new();
+        let cx_total = registry
+            .register_counter(&format!("cluster.{name}.upstream_cx_total"))
+            .expect("counter registers");
         ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
                 endpoints,
                 cursor: AtomicUsize::new(0),
                 upstream_protocol: UpstreamProtocol::default(),
+                cx_total,
             }),
         }
     }
@@ -420,7 +478,7 @@ admin:
     #[tokio::test]
     async fn from_bootstrap_builds_single_endpoint_cluster() {
         let bootstrap = envoy_config::parse_bootstrap(SINGLE_ENDPOINT_YAML).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap).await.expect("construct");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new())).await.expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
         let picked = handle.pick_endpoint().expect("non-empty");
         assert_eq!(picked, "127.0.0.1:10042".parse::<SocketAddr>().unwrap());
@@ -462,7 +520,7 @@ admin:
     #[tokio::test]
     async fn from_bootstrap_builds_three_endpoint_cluster() {
         let bootstrap = envoy_config::parse_bootstrap(THREE_ENDPOINT_YAML).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap).await.expect("construct");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new())).await.expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
         let picks: Vec<SocketAddr> = (0..3).map(|_| handle.pick_endpoint().unwrap()).collect();
         assert_eq!(
@@ -510,7 +568,7 @@ admin:
                 }],
             },
         };
-        let err = crate::from_bootstrap(&bootstrap)
+        let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect_err("must reject");
         assert!(
@@ -567,7 +625,7 @@ admin:
                 clusters: vec![mk_cluster(), mk_cluster()],
             },
         };
-        let err = crate::from_bootstrap(&bootstrap)
+        let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect_err("must reject");
         assert!(
@@ -578,11 +636,15 @@ admin:
 
     #[test]
     fn cluster_name_returns_configured_name() {
+        let registry = envoy_stats::StatsRegistry::new();
         let c = Cluster {
             name: "backend".to_string(),
             endpoints: mk_endpoints(1),
             cursor: AtomicUsize::new(0),
             upstream_protocol: UpstreamProtocol::default(),
+            cx_total: registry
+                .register_counter("cluster.backend.upstream_cx_total")
+                .expect("counter registers"),
         };
         assert_eq!(c.name(), "backend");
     }
@@ -631,7 +693,7 @@ admin:
       port_value: 9901
 "#;
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("serde accepts");
-        let err = crate::from_bootstrap(&bootstrap)
+        let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect_err("must reject");
         assert!(
@@ -674,7 +736,7 @@ admin:
       port_value: 9901
 "#;
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap)
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect("Static cluster constructs cleanly");
         let handle = mgr.get("backend").expect("cluster present");
@@ -710,7 +772,7 @@ admin:
       port_value: 9901
 "#;
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap)
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect("STRICT_DNS cluster resolves localhost cleanly");
         let handle = mgr.get("backend").expect("cluster present");
@@ -756,7 +818,7 @@ admin:
       port_value: 9901
 "#;
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
-        let err = crate::from_bootstrap(&bootstrap)
+        let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect_err("STRICT_DNS resolution of .invalid TLD must fail");
         assert!(
@@ -776,7 +838,7 @@ admin:
     /// returns the resulting ClusterManager. Panics on parse / build error.
     async fn build_cluster_mgr(yaml: &str) -> ClusterManager {
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("parse");
-        from_bootstrap(&bootstrap).await.expect("from_bootstrap")
+        from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new())).await.expect("from_bootstrap")
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -920,5 +982,82 @@ static_resources:
         let mgr = build_cluster_mgr(yaml).await;
         let handle = mgr.get("backend").expect("backend cluster");
         assert_eq!(handle.upstream_protocol(), UpstreamProtocol::Http1);
+    }
+
+    /// 06.1 D4.b: per-cluster `upstream_cx_total` counter increments via
+    /// the call-site pattern (`cluster.cx_total().inc()` after a
+    /// successful upstream connect). The actual `TcpStream::connect` site
+    /// lives in envoy-tcp / envoy-http1::client / envoy-http2::client per
+    /// SPEC §3 D4.b's "increment-at-call-site" posture; this test exercises
+    /// the cluster-side wiring (registration + accessor) by simulating
+    /// that pattern in-place. Cross-crate call-site wiring is verified by
+    /// fixture 0011 and the H1/H2 HCM integration tests in Task 11+.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_increments_cx_total_on_connect() {
+        // Spawn a no-op TCP listener as the upstream backend so the
+        // simulated connect succeeds.
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                if backend.accept().await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let yaml = format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: {}
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#,
+            backend_addr.port()
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("from_bootstrap");
+
+        // Re-register by name to fetch the same Arc the cluster holds
+        // (idempotent same-kind contract from Task 5).
+        let cx_total = registry
+            .register_counter("cluster.backend_cluster.upstream_cx_total")
+            .expect("counter registers");
+        assert_eq!(cx_total.value(), 0, "counter starts at zero");
+
+        // Simulate the call-site connect-then-increment pattern.
+        let handle = mgr.get("backend_cluster").expect("cluster present");
+        for _ in 0..3 {
+            let endpoint = handle.pick_endpoint().expect("endpoint");
+            let _stream = tokio::net::TcpStream::connect(endpoint).await.unwrap();
+            // 06.1 D4.b: this is the call-site increment pattern that
+            // envoy-tcp / envoy_http1::Client::connect / envoy_http2::
+            // Client::connect callers in the HCM router-proxy arm perform.
+            handle.cx_total().inc();
+        }
+        assert_eq!(
+            cx_total.value(),
+            3,
+            "expected one increment per simulated successful upstream connect",
+        );
     }
 }

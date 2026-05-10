@@ -47,6 +47,18 @@ pub enum Http1Error {
     /// in `client.rs` (Task 7).
     #[error("malformed chunked-encoding framing in upstream response")]
     MalformedChunkedFraming,
+
+    /// 06.1 D4.c: registering one of the per-HCM counters (e.g.,
+    /// `http.<stat_prefix>.downstream_rq_total`) against the global
+    /// `StatsRegistry` failed. Wraps the registry error's `Display`
+    /// rendering so this crate doesn't need to publicly re-export
+    /// `envoy_stats::StatsError` in its error surface. Surfaces from
+    /// `HCMConfig::from_config`.
+    #[error("registering HCM stats for stat_prefix '{stat_prefix}': {message}")]
+    StatsRegistration {
+        stat_prefix: String,
+        message: String,
+    },
 }
 
 impl From<std::io::Error> for Http1Error {

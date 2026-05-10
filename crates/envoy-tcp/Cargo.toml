@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
+envoy-stats = { path = "../envoy-stats" }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2"

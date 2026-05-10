@@ -344,6 +344,7 @@ dependencies = [
  "envoy-http1",
  "envoy-http2",
  "envoy-listener",
+ "envoy-stats",
  "envoy-tcp",
  "envoy-tls",
  "h2",
@@ -365,6 +366,7 @@ name = "envoy-cluster"
 version = "0.0.0"
 dependencies = [
  "envoy-config",
+ "envoy-stats",
  "thiserror",
  "tokio",
 ]
@@ -387,6 +389,7 @@ dependencies = [
  "envoy-cluster",
  "envoy-config",
  "envoy-listener",
+ "envoy-stats",
  "httparse",
  "thiserror",
  "tokio",
@@ -402,6 +405,7 @@ dependencies = [
  "envoy-config",
  "envoy-http1",
  "envoy-listener",
+ "envoy-stats",
  "h2",
  "http",
  "thiserror",
@@ -414,6 +418,7 @@ name = "envoy-listener"
 version = "0.0.0"
 dependencies = [
  "envoy-config",
+ "envoy-stats",
  "serde_yaml",
  "thiserror",
  "tokio",
@@ -436,6 +441,7 @@ dependencies = [
  "envoy-cluster",
  "envoy-config",
  "envoy-listener",
+ "envoy-stats",
  "envoy-tls",
  "rcgen",
  "rustls",

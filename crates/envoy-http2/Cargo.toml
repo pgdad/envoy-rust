@@ -20,6 +20,7 @@ envoy-config = { path = "../envoy-config" }
 envoy-listener = { path = "../envoy-listener" }
 envoy-http1 = { path = "../envoy-http1" }
 envoy-cluster = { path = "../envoy-cluster" }
+envoy-stats = { path = "../envoy-stats" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
