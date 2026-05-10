@@ -14,11 +14,8 @@ pub struct Counter {
 }
 
 impl Counter {
-    // `pub(crate)` per Task 3 discipline: the registry (Task 4) is the only
-    // intended construction site; consumers receive `Arc<Counter>` from it.
-    // Until Task 4 lands, the constructor is exercised only by unit tests, so
-    // the lib build sees it as dead code — allow it for this brief window.
-    #[allow(dead_code)]
+    // `pub(crate)` per Task 3 discipline: the registry is the only intended
+    // construction site; consumers receive `Arc<Counter>` from it.
     pub(crate) fn new() -> Self {
         Self {
             value: AtomicU64::new(0),

@@ -10,11 +10,8 @@ pub struct Gauge {
 }
 
 impl Gauge {
-    // `pub(crate)` per Task 3 discipline: the registry (Task 4) is the only
-    // intended construction site; consumers receive `Arc<Gauge>` from it.
-    // Until Task 4 lands, the constructor is exercised only by unit tests, so
-    // the lib build sees it as dead code — allow it for this brief window.
-    #[allow(dead_code)]
+    // `pub(crate)` per Task 3 discipline: the registry is the only intended
+    // construction site; consumers receive `Arc<Gauge>` from it.
     pub(crate) fn new() -> Self {
         Self {
             value: AtomicI64::new(0),

@@ -79,3 +79,15 @@ Task 2's PLAN-correction placeholder stubs (`pub struct Counter;` / `pub struct 
 **Plan-time deviation (clippy `dead_code`):** `Counter::new()` / `Gauge::new()` are `pub(crate)` per Task 3 discipline (registry-only construction site, Task 4). With the constructors exercised only inside `#[cfg(test)]` modules, the lib build flags both as dead code and `-D warnings` fails. Added a brief `#[allow(dead_code)]` with an inline rationale comment on each constructor; the allow is intended to remain only until Task 4's registry calls them. PLAN.md remains in-tree unedited per D-3.5 (append-only); this entry is the documented record.
 
 LoC: ~55 counter.rs + ~65 gauge.rs (impl + tests + dead_code rationale comment) ≈ ~120 LoC of primitives.
+
+## Task 4 — envoy-stats StatsError + StatsRegistry
+
+`StatsError`: `ConflictingKind { name, expected, got }` + `InvalidName { name, reason }`. No `DuplicateRegistration` variant — same-kind re-registration is idempotent (returns the existing `Arc`).
+
+`StatsRegistry` over `RwLock<BTreeMap<String, StatHandle>>`. `BTreeMap` for deterministic snapshot order per SPEC §6 signpost 6. `register_counter` / `register_gauge` return `Arc<...>`; `.snapshot() -> Vec<(String, StatHandle)>` produces a lexicographic name list.
+
+Stat-name validation per Prometheus rules `[a-zA-Z_:][a-zA-Z0-9_:.-]*`; dots / dashes accepted (Envoy uses dots as separators; emitter translates at emission time).
+
+Tests: 17 total (8 Counter+Gauge from Task 3 + 1 error.rs format + 6 registry behavior + 2 `is_valid_name` accept/reject). All pass under `cargo test -p envoy-stats`; clippy clean.
+
+Closes Task 3's `#[allow(dead_code)]` deviation: removed from both `Counter::new()` and `Gauge::new()` since the registry now calls them at `register_counter` / `register_gauge`.
