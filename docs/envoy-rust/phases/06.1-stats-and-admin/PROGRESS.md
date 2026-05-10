@@ -107,3 +107,21 @@ Tokio dev-dep removed from envoy-stats Cargo.toml — no test in the crate uses 
 Added 2 follow-up tests per Task 4 code reviewer's recommendation: `stat_handle_kind_str_returns_correct_label` and `registry_register_counter_contended_same_name_returns_same_arc` (8 threads racing same name → all return same Arc via `Arc::ptr_eq`). These bumped the suite from 23 to 25.
 
 **Plan-time deviation (clippy `write_with_newline`):** PLAN's emitter sketch used `let _ = write!(w, "...{var}...\n")` at four sites; clippy under `-D warnings` flags this as `clippy::write_with_newline` and suggests `writeln!` (no trailing `\n` in the format string). Adopted clippy's suggestion at all four sites (`# HELP`, `# TYPE`, counter line, gauge line). Output is byte-identical (`writeln!` appends `\n`, matching the LF discipline in the planner's reminder). PLAN.md remains in-tree unedited per D-3.5 (append-only); this entry is the documented record.
+
+## Task 9 — envoy-config schema additions (Admin.access_log_path) + fuzz seed
+
+`Admin.access_log_path: Option<String>` parse-and-ignore field per ADR-0026 (precedent: `Listener.listener_filters` from 05.4). `#[serde(default)]`; absent → `None`; present → stored opaquely; envoy-rust never inspects.
+
+3 new validator tests: `parses_admin_with_access_log_path` / `parses_admin_without_access_log_path` / `rejects_admin_with_unknown_field`. All pass. envoy-config suite count: 165 → 168.
+
+1 new fuzz corpus seed: `crates/envoy-config/fuzz/corpus/parse_bootstrap/admin_with_stats_route.yaml`. Allow-list entry added to `crates/envoy-config/fuzz/.gitignore`. The 04.x / 05.x corpus-walk acceptance test (`fuzz_corpus_seeds_parse_or_reject_cleanly`) is an explicit list (not an auto directory walk); appended the new seed name to the success-list array so the gate covers it.
+
+`HttpConnectionManagerConfig.stat_prefix` is **already required** at HEAD (per signpost 9 correction); D5.b is a schema-no-op. Task 10 consumes the existing field at HCM construction time.
+
+Total LoC delta: ~10 schema (struct field + doc comment) + ~50 unit tests + ~38 fuzz seed + 2 sites in envoy-cluster cluster.rs by-hand `Admin {}` test literals patched with `access_log_path: None` (D-3.6 green-build maintenance) ≈ ~100 LoC. In line with SPEC §3 D5's projection.
+
+**Plan-time deviation (corpus-walk shape):** The PLAN described `fuzz_corpus_seeds_parse_or_reject_cleanly` as auto-walking the corpus directory; in reality (HEAD) it is an explicit `&[...]` list of filenames partitioned into success / reject buckets. Added the new seed name to the success bucket array — same gate effect, but required a one-line edit, not zero. PLAN.md remains in-tree unedited per D-3.5 (append-only); this entry is the documented record.
+
+**Plan-time deviation (downstream call sites):** Two by-hand `Admin {}` literals in `crates/envoy-cluster/src/cluster.rs` test code (`from_bootstrap_rejects_empty_cluster` and `from_bootstrap_rejects_duplicate_cluster_name`) needed `access_log_path: None` to compile under `cargo clippy --workspace --all-targets -- -D warnings`. Patched both per D-3.6. envoy-cluster tests (17) still pass.
+
+Sequenced BEFORE Task 6 in execution order (per PLAN's "Executor sequencing notes": 1 → 2 → 3 → 4 → 5 → 9 → 6 → 7 → 8 → 10 → 11 → 12 → 13 → 14) — Task 6's `AdminConfig::from_envoy_config` reads the new `Admin.access_log_path` field landed here.

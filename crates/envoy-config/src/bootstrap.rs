@@ -32,6 +32,14 @@ pub struct Node {
 #[serde(deny_unknown_fields)]
 pub struct Admin {
     pub address: Address,
+
+    /// 06.1 NEW (per ADR-0026 parse-and-ignore pattern; SPEC §3 D5.a).
+    /// Optional admin-side access log path; envoy-rust does not inspect or
+    /// honor this field. Stored so fixtures with upstream Envoy admin
+    /// configs that include it round-trip cleanly through the parser.
+    /// Admin-side access logging defers indefinitely from 06.1.
+    #[serde(default)]
+    pub access_log_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2373,6 +2381,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/hcm_route_to_cluster.yaml",
             "fuzz/corpus/parse_bootstrap/route_with_header_matchers.yaml",
             "fuzz/corpus/parse_bootstrap/strict_dns_cluster.yaml",
+            "fuzz/corpus/parse_bootstrap/admin_with_stats_route.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
@@ -5622,5 +5631,54 @@ static_resources:
         let cluster = &bs.static_resources.clusters[0];
         assert!(matches!(cluster.cluster_type, ClusterType::StrictDns));
         assert!(cluster.typed_extension_protocol_options.is_some());
+    }
+
+    // --- 06.1 Task 9: Admin.access_log_path parse-and-ignore (ADR-0026) ---
+
+    #[test]
+    fn parses_admin_with_access_log_path() {
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+  access_log_path: /var/log/envoy_admin.log
+static_resources: { listeners: [], clusters: [] }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parse OK");
+        let admin = bootstrap.admin.expect("admin present");
+        assert_eq!(
+            admin.access_log_path,
+            Some("/var/log/envoy_admin.log".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_admin_without_access_log_path() {
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+static_resources: { listeners: [], clusters: [] }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parse OK");
+        let admin = bootstrap.admin.expect("admin present");
+        assert_eq!(admin.access_log_path, None);
+    }
+
+    #[test]
+    fn rejects_admin_with_unknown_field() {
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+  profile_path: /tmp
+static_resources: { listeners: [], clusters: [] }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("unknown field rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("profile_path") || msg.contains("unknown field"),
+            "diagnostic should mention the unknown field; got: {msg}"
+        );
     }
 }

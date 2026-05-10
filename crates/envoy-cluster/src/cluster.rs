@@ -492,6 +492,7 @@ admin:
                         port_value: 9901,
                     },
                 },
+                access_log_path: None,
             }),
             static_resources: StaticResources {
                 listeners: vec![],
@@ -559,6 +560,7 @@ admin:
                         port_value: 9901,
                     },
                 },
+                access_log_path: None,
             }),
             static_resources: StaticResources {
                 listeners: vec![],
