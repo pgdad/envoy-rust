@@ -82,11 +82,19 @@ impl AdminHandler {
     }
 
     /// Serialize an `envoy_http1::Response` into wire bytes (status line +
-    /// headers + CRLF + body). Inlined here (~30 LoC) per the PLAN-write
-    /// decision to keep envoy-admin's accept-loop self-contained. Always
-    /// injects `connection: close` (06.1 has no keep-alive).
+    /// headers + CRLF + body). Inlined here per the PLAN-write decision to
+    /// keep envoy-admin's accept-loop self-contained.
+    ///
+    /// Always injects 5 standard admin-response headers (preserved verbatim
+    /// from the pre-migration `crates/envoy-bin/src/admin.rs::render_response`
+    /// shape per SPEC §3 D3 lines 953-959 "non-negotiable mirroring"):
+    /// - `cache-control: no-cache, max-age=0`
+    /// - `x-content-type-options: nosniff`
+    /// - `server: envoy-rust` (ADR-0011 divergence from upstream)
+    /// - `date: <RFC 7231 IMF-fixdate>` (sourced from `envoy_http1::date`)
+    /// - `connection: close` (06.1 has no keep-alive)
     fn serialize_response(resp: &envoy_http1::Response) -> BytesMut {
-        let mut out = BytesMut::with_capacity(256 + resp.body.len());
+        let mut out = BytesMut::with_capacity(384 + resp.body.len());
         let reason = resp.reason.unwrap_or("OK");
         let head = format!("HTTP/1.1 {status} {reason}\r\n", status = resp.status);
         out.extend_from_slice(head.as_bytes());
@@ -96,6 +104,14 @@ impl AdminHandler {
             out.extend_from_slice(value.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
+        // Standard admin-response headers (preserved verbatim from pre-migration
+        // shape per SPEC §3 D3 — "non-negotiable mirroring").
+        out.extend_from_slice(b"cache-control: no-cache, max-age=0\r\n");
+        out.extend_from_slice(b"x-content-type-options: nosniff\r\n");
+        out.extend_from_slice(b"server: envoy-rust\r\n");
+        let date = envoy_http1::date::format_imf_fixdate(std::time::SystemTime::now());
+        let date_line = format!("date: {date}\r\n");
+        out.extend_from_slice(date_line.as_bytes());
         // Always close the connection (06.1 has no keep-alive).
         out.extend_from_slice(b"connection: close\r\n");
         out.extend_from_slice(b"\r\n");
@@ -335,6 +351,71 @@ mod tests {
         let s = std::str::from_utf8(&resp).unwrap();
         assert!(s.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
         assert!(s.contains("allow: GET\r\n"));
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn handler_response_carries_server_header() {
+        let (lst, addr) = bind_random().await;
+        let registry = Arc::new(StatsRegistry::new());
+        let cfg = Arc::new(admin_config(addr.port()));
+        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(lst, handler, async move {
+            let _ = rx.await;
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let resp = drive_request(addr, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(
+            s.contains("server: envoy-rust\r\n"),
+            "missing server header: {s:?}"
+        );
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn handler_response_carries_admin_headers() {
+        let (lst, addr) = bind_random().await;
+        let registry = Arc::new(StatsRegistry::new());
+        let cfg = Arc::new(admin_config(addr.port()));
+        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(serve(lst, handler, async move {
+            let _ = rx.await;
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let resp = drive_request(addr, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let s = std::str::from_utf8(&resp).unwrap();
+        // SPEC §3 D3 "non-negotiable mirroring" — all 4 standard admin headers present.
+        assert!(
+            s.contains("cache-control: no-cache, max-age=0\r\n"),
+            "missing cache-control: {s:?}"
+        );
+        assert!(
+            s.contains("x-content-type-options: nosniff\r\n"),
+            "missing x-content-type-options: {s:?}"
+        );
+        assert!(
+            s.contains("server: envoy-rust\r\n"),
+            "missing server: {s:?}"
+        );
+        // date header is dynamic; assert presence with a reasonable shape.
+        assert!(s.contains("date: "), "missing date header: {s:?}");
+        assert!(
+            s.contains(" GMT\r\n"),
+            "date header malformed (no GMT): {s:?}"
+        );
         let _ = tx.send(());
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await

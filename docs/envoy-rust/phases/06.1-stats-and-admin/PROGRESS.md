@@ -231,3 +231,20 @@ Plan-time deviation (per D-3.5):
 
 D3 (admin migration) complete at this task.
 
+### Task 11 follow-up — restore SPEC §3 D3 "non-negotiable" admin response headers
+
+Code-quality review of the original Task 11 commit (`739d0ab`) discovered that envoy-admin's `serialize_response` was missing 4 headers that the deleted in-package `crates/envoy-bin/src/admin.rs::render_response` emitted:
+
+- `cache-control: no-cache, max-age=0`
+- `x-content-type-options: nosniff`
+- `server: envoy-rust` (ADR-0011 divergence from upstream)
+- `date: <RFC 7231 IMF-fixdate>` (sourced from `envoy_http1::date::format_imf_fixdate`)
+
+SPEC §3 D3 lines 953-959 explicitly require these for "non-negotiable mirroring" of the pre-migration shape. The dual-track guard (fixture 0002 + new backstop test) didn't catch the regression: fixture 0002's `expectations.yaml` only diffs status + body; the backstop only asserted `200 OK\r\n` + `LIVE\n`.
+
+**Root cause:** the regression originated at Tasks 6-8 (envoy-admin should have emitted these headers from the start); Task 11 propagated it into the production binary by substituting envoy-admin's response shape for the pre-migration shape without re-checking each header.
+
+**Fix:** all 4 missing headers added to `serialize_response` (uniformly applied to all admin responses including the 400 Bad Request error path). Two new envoy-admin unit tests (`handler_response_carries_server_header` + `handler_response_carries_admin_headers`) plus 4 new assertions in `crates/envoy-bin/tests/admin_ready.rs` lock down the wire shape against future drift.
+
+19 envoy-admin tests pass (17 prior + 2 new). Workspace clean.
+

@@ -52,6 +52,23 @@ fn admin_ready_returns_200_post_migration() {
     );
     assert!(s.ends_with("LIVE\n"), "expected LIVE\\n body, got: {s}");
 
+    // SPEC §3 D3 "non-negotiable mirroring" guard — all 4 standard admin
+    // headers preserved across the migration (the deleted in-package
+    // crates/envoy-bin/src/admin.rs::render_response emitted these too).
+    assert!(
+        s.contains("server: envoy-rust\r\n"),
+        "missing server header: {s}"
+    );
+    assert!(
+        s.contains("cache-control: no-cache, max-age=0\r\n"),
+        "missing cache-control: {s}"
+    );
+    assert!(
+        s.contains("x-content-type-options: nosniff\r\n"),
+        "missing x-content-type-options: {s}"
+    );
+    assert!(s.contains("date: "), "missing date header: {s}");
+
     // SIGKILL — matches the 04.x / 05.x integration-test posture
     // (phase-02.2 REVIEW M1 awareness-only carryforward).
     let _ = child.kill();
