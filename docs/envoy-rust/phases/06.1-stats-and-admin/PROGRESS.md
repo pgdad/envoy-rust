@@ -65,3 +65,17 @@ Workspace members at this commit: existing crates + envoy-stats. envoy-admin lan
 ## Tasks 3 through 14
 
 Appended at execution time, one section per task commit, mirroring the 05.x per-task cadence.
+
+## Task 3 — envoy-stats Counter + Gauge primitives
+
+`Counter` over `AtomicU64`: inc / add / value. Lock-free `Ordering::Relaxed` per SPEC §6 signpost 3.
+
+`Gauge` over `AtomicI64`: set / inc / dec / value. Permits negative values.
+
+Tests: 4 Counter + 4 Gauge = 8 unit tests including 2 multi-thread torture tests (Counter 8×10_000 inc; Gauge 4 inc + 4 dec × 10_000). All 8 pass under `cargo test -p envoy-stats`. Clippy clean.
+
+Task 2's PLAN-correction placeholder stubs (`pub struct Counter;` / `pub struct Gauge;`) are replaced wholesale by this task as anticipated.
+
+**Plan-time deviation (clippy `dead_code`):** `Counter::new()` / `Gauge::new()` are `pub(crate)` per Task 3 discipline (registry-only construction site, Task 4). With the constructors exercised only inside `#[cfg(test)]` modules, the lib build flags both as dead code and `-D warnings` fails. Added a brief `#[allow(dead_code)]` with an inline rationale comment on each constructor; the allow is intended to remain only until Task 4's registry calls them. PLAN.md remains in-tree unedited per D-3.5 (append-only); this entry is the documented record.
+
+LoC: ~55 counter.rs + ~65 gauge.rs (impl + tests + dead_code rationale comment) ≈ ~120 LoC of primitives.
