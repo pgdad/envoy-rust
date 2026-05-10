@@ -294,15 +294,16 @@ The fixture exercises:
 
 First run with empty allow-lists surfaced **204 envoy-only** metric names + **2 envoy-rust-only** names. Final allow-list state:
 
-- `allowlist_envoy_only`: **202 entries**. Categories (counts in parens):
+- `allowlist_envoy_only`: **204 entries**. Categories (counts in parens):
   - `server.*` (29) — server-state stats not yet ported.
   - `http.downstream.*` (60) — HCM stats beyond `downstream_rq_total`.
-  - `listener.*` + `listener.admin.*` (46) — auto-emitted listener stats.
+  - `listener.*` (22) + `listener.admin.*` (22) — auto-emitted listener stats for the HCM and admin listeners.
   - `listener_manager.*` (12), `cluster_manager.*` (9) — manager book-keeping.
   - `runtime.*` (9) — RTDS layer (defers to xDS family).
   - `filesystem.*` (6) — file I/O stats.
   - `http.tracing.*` (5), `http.passthrough.*` (5), `http.rq.*` (5), `http1.*` (4), `http.no_*`/`rs.*` (3) — HCM-adjacent counters.
-  - `overload.*` (3), `main_thread.*` (2), `workers.*` (2), `thread_local.*` (2), `tcmalloc.*` (1) — runtime-overload bookkeeping.
+  - `overload.*` (3), `main_thread.*` (2), `workers.*` (2), `listener_worker.*` (2), `thread_local.*` (2), `tcmalloc.*` (1) — runtime-overload bookkeeping.
+  - `envoy.envoy_overload_actions_reset_high_memory_stream_count` (1) — anomalous double-`envoy_` prefix emitted by upstream Envoy.
 - `allowlist_envoy_rust_only`: **2 entries**. `envoy_http_ingress_http_downstream_rq_total` + `envoy_listener_ingress_http_downstream_cx_total`. **Investigated** per the discipline reminder: these are not typos — they're the dynamic-segment-embedded form of two counters that upstream Envoy emits as bare names with Prometheus labels (`envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="ingress_http"}` etc.). Both proxies emit the same counters; the Prometheus *shape* differs. Documented in BEHAVIOR_CONTRACT.md "Stat-name mapping" §06.1 ("Prometheus exposition shape divergence"); resolution defers to a later phase that adds a `StatsTagExtractor`-equivalent.
 
 ### Carryforward from Task 12 (centralize body-rule dispatch)

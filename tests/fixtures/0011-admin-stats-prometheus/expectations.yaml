@@ -16,11 +16,12 @@ driver:
   expected_body_rule:
     kind: prometheus_exposition
     # Empirically seeded per SPEC §6 signpost 12 from the first failing
-    # run's `envoy-only` diff. Categories (counts in parens; see README.md
-    # for the doctrine reasons):
+    # run's `envoy-only` diff. Total: 204 entries. Categories (counts in
+    # parens; see README.md for the doctrine reasons):
     #   - server.* (29) — server-state stats not yet ported.
     #   - http.downstream.* (60) — HCM stats beyond downstream_rq_total.
-    #   - listener.* + listener.admin.* (46) — auto-emitted listener stats.
+    #   - listener.* (22) + listener.admin.* (22) — auto-emitted listener
+    #     stats for the HCM and admin listeners.
     #   - listener_manager.* (12) — listener manager book-keeping.
     #   - cluster_manager.* (9) — cluster manager book-keeping.
     #   - runtime.* (9) — RTDS runtime layer (defers to xDS family).
@@ -28,7 +29,10 @@ driver:
     #   - http.tracing.* (5), http.passthrough.* (5), http.rq.* (5),
     #     http1.* (4), http.no_*/rs.* (3) — HCM-adjacent counters.
     #   - overload.* (3), main_thread.* (2), workers.* (2),
-    #     thread_local.* (2), tcmalloc.* (1) — runtime-overload bookkeeping.
+    #     listener_worker.* (2), thread_local.* (2), tcmalloc.* (1) —
+    #     runtime-overload bookkeeping.
+    #   - envoy.envoy_overload_actions_reset_high_memory_stream_count (1)
+    #     — anomalous double-`envoy_` prefix emitted by upstream Envoy.
     # Sorted alphabetically for diff-readability under future churn.
     allowlist_envoy_only:
       - envoy_cluster_manager_active_clusters

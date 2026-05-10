@@ -37,7 +37,7 @@ helper process is required.
 
 The `allowlist_envoy_only` is populated from the first run's
 `envoy-only` diff and represents metrics that upstream Envoy emits but
-envoy-rust does not (yet, in 06.1). Final size: **202 entries**.
+envoy-rust does not (yet, in 06.1). Final size: **204 entries**.
 Categories:
 
 - `server.*` (29) — server-state stats (uptime, live, memory,
@@ -45,8 +45,8 @@ Categories:
   today; deferred to a later phase.
 - `http.downstream.*` (60) — HCM stats beyond `downstream_rq_total`
   (the one HCM stat envoy-rust emits in 06.1).
-- `listener.*` + `listener.admin.*` (46) — auto-emitted listener stats
-  for both the HCM and admin listeners. envoy-rust emits only the bare
+- `listener.*` (22) + `listener.admin.*` (22) — auto-emitted listener
+  stats for the HCM and admin listeners. envoy-rust emits only the bare
   `downstream_cx_total` per listener.
 - `listener_manager.*` (12) — listener manager book-keeping. envoy-rust
   has no listener manager surface in 06.1.
@@ -57,7 +57,11 @@ Categories:
 - `http.tracing.*` (5), `http.passthrough.*` (5), `http.rq.*` (5),
   `http1.*` (4), `http.no_*`/`rs.*` (3) — HCM-adjacent counters.
 - `overload.*` (3), `main_thread.*` (2), `workers.*` (2),
-  `thread_local.*` (2), `tcmalloc.*` (1) — runtime-overload bookkeeping.
+  `listener_worker.*` (2), `thread_local.*` (2), `tcmalloc.*` (1) —
+  runtime-overload bookkeeping.
+- `envoy.envoy_overload_actions_reset_high_memory_stream_count` (1) —
+  anomalous double-`envoy_` prefix emitted by upstream Envoy under
+  the overload-manager action namespace.
 
 ## Prometheus name-vs-label shape divergence
 
