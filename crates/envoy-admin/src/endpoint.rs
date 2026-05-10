@@ -144,7 +144,10 @@ mod tests {
 
     #[test]
     fn from_path_ready_matches_exact() {
-        assert_eq!(AdminEndpoint::from_path("/ready"), Some(AdminEndpoint::Ready));
+        assert_eq!(
+            AdminEndpoint::from_path("/ready"),
+            Some(AdminEndpoint::Ready)
+        );
         assert_eq!(AdminEndpoint::from_path("/ready/"), None);
         assert_eq!(AdminEndpoint::from_path("/Ready"), None);
         assert_eq!(AdminEndpoint::from_path("/ready/foo"), None);
@@ -152,7 +155,10 @@ mod tests {
 
     #[test]
     fn from_path_stats_matches_exact() {
-        assert_eq!(AdminEndpoint::from_path("/stats"), Some(AdminEndpoint::Stats));
+        assert_eq!(
+            AdminEndpoint::from_path("/stats"),
+            Some(AdminEndpoint::Stats)
+        );
     }
 
     #[test]
@@ -177,20 +183,24 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.reason, Some("OK"));
         assert_eq!(&resp.body[..], b"LIVE\n");
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "content-type" && v == "text/plain"));
-        assert!(resp
-            .headers
-            .iter()
-            .any(|(k, v)| k == "content-length" && v == "5"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v == "text/plain")
+        );
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "content-length" && v == "5")
+        );
     }
 
     #[test]
     fn render_stats_text_format() {
         let reg = StatsRegistry::new();
-        let c = reg.register_counter("listener.foo.downstream_cx_total").unwrap();
+        let c = reg
+            .register_counter("listener.foo.downstream_cx_total")
+            .unwrap();
         c.add(7);
         let resp = AdminEndpoint::Stats.render(&reg);
         assert_eq!(resp.status, 200);
@@ -201,7 +211,9 @@ mod tests {
     #[test]
     fn render_stats_prometheus_format() {
         let reg = StatsRegistry::new();
-        let c = reg.register_counter("listener.foo.downstream_cx_total").unwrap();
+        let c = reg
+            .register_counter("listener.foo.downstream_cx_total")
+            .unwrap();
         c.add(7);
         let resp = AdminEndpoint::StatsPrometheus.render(&reg);
         assert_eq!(resp.status, 200);
@@ -214,11 +226,19 @@ mod tests {
     fn render_response_carries_correct_content_type() {
         let reg = StatsRegistry::new();
         let stats = AdminEndpoint::Stats.render(&reg);
-        assert!(stats.headers.iter().any(|(k, v)| k == "content-type" && v == "text/plain"));
+        assert!(
+            stats
+                .headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v == "text/plain")
+        );
 
         let prom = AdminEndpoint::StatsPrometheus.render(&reg);
-        assert!(prom.headers.iter().any(|(k, v)| k == "content-type"
-            && v == "text/plain; charset=UTF-8"));
+        assert!(
+            prom.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v == "text/plain; charset=UTF-8")
+        );
     }
 
     #[test]

@@ -845,12 +845,9 @@ pub async fn drive_http1(
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
                     .and_then(|(_, v)| v.parse::<usize>().ok());
-                let chunked = headers
-                    .iter()
-                    .any(|(n, v)| {
-                        n.eq_ignore_ascii_case("transfer-encoding")
-                            && v.eq_ignore_ascii_case("chunked")
-                    });
+                let chunked = headers.iter().any(|(n, v)| {
+                    n.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
+                });
                 break (status, headers, headers_end, content_length, chunked);
             }
             httparse::Status::Partial => continue,
@@ -1918,7 +1915,8 @@ mod tests {
 
     #[test]
     fn expectations_parse_byte_exact() {
-        let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\n";
+        let yaml =
+            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\n";
         let e: Expectations = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(e.equivalence.response_body, Some(BodyRule::ByteExact));
         assert!(matches!(e.driver, Driver::TcpEcho));
@@ -1935,8 +1933,7 @@ mod tests {
     // a typo'd or unexpected top-level key rather than silently dropping it.
     #[test]
     fn expectations_reject_unknown_field() {
-        let yaml =
-            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\nfoo: bar\n";
+        let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\nfoo: bar\n";
         let err = serde_yaml::from_str::<Expectations>(yaml)
             .expect_err("must reject unknown top-level field");
         let msg = err.to_string();
@@ -1946,8 +1943,7 @@ mod tests {
     // Regression for REVIEW.md M3 at the nested `Equivalence` level.
     #[test]
     fn equivalence_reject_unknown_field() {
-        let yaml =
-            "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\n  extra: true\n";
+        let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: { kind: byte_exact }\n  extra: true\n";
         let err = serde_yaml::from_str::<Expectations>(yaml)
             .expect_err("must reject unknown nested field");
         let msg = err.to_string();
@@ -2965,11 +2961,11 @@ expected_body_rule:
         // run_fixture-side reservation+expose is exercised by the
         // Docker-gated fixture 0011 test (Task 13).
         let template = "admin: 127.0.0.1:{{ADMIN_PORT}}\nlistener: 127.0.0.1:{{PORT}}";
-        let rendered = render_yaml(
-            template,
-            &[("ADMIN_PORT", "29999"), ("PORT", "10000")],
+        let rendered = render_yaml(template, &[("ADMIN_PORT", "29999"), ("PORT", "10000")]);
+        assert_eq!(
+            rendered,
+            "admin: 127.0.0.1:29999\nlistener: 127.0.0.1:10000"
         );
-        assert_eq!(rendered, "admin: 127.0.0.1:29999\nlistener: 127.0.0.1:10000");
     }
 
     #[test]

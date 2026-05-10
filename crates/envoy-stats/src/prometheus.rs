@@ -66,7 +66,9 @@ mod tests {
     #[test]
     fn write_exposition_single_counter() {
         let reg = StatsRegistry::new();
-        let c = reg.register_counter("listener.foo.downstream_cx_total").unwrap();
+        let c = reg
+            .register_counter("listener.foo.downstream_cx_total")
+            .unwrap();
         c.add(5);
         let mut buf = BytesMut::new();
         write_exposition(&reg, &mut buf);
@@ -80,7 +82,9 @@ mod tests {
     #[test]
     fn write_exposition_single_gauge() {
         let reg = StatsRegistry::new();
-        let g = reg.register_gauge("cluster.svc.upstream_cx_active").unwrap();
+        let g = reg
+            .register_gauge("cluster.svc.upstream_cx_active")
+            .unwrap();
         g.set(-3);
         let mut buf = BytesMut::new();
         write_exposition(&reg, &mut buf);
@@ -121,7 +125,9 @@ mod tests {
     #[test]
     fn write_exposition_dash_to_underscore() {
         let reg = StatsRegistry::new();
-        let _ = reg.register_counter("cluster.svc-A.upstream_cx_total").unwrap();
+        let _ = reg
+            .register_counter("cluster.svc-A.upstream_cx_total")
+            .unwrap();
         let mut buf = BytesMut::new();
         write_exposition(&reg, &mut buf);
         let s = std::str::from_utf8(&buf).unwrap();

@@ -156,7 +156,11 @@ mod tests {
         let _ = reg.register_gauge("foo").unwrap();
         let err = reg.register_counter("foo").unwrap_err();
         match err {
-            StatsError::ConflictingKind { name, expected, got } => {
+            StatsError::ConflictingKind {
+                name,
+                expected,
+                got,
+            } => {
                 assert_eq!(name, "foo");
                 assert_eq!(expected, "counter");
                 assert_eq!(got, "gauge");

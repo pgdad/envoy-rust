@@ -97,12 +97,14 @@ impl HCMConfig {
         // This constructor is `Result<>` for forward-compat with 04.3's
         // cluster lookup; the 06.1 stats-registration path is the second
         // failure surface (registry name-collision across kinds).
-        let stats = Arc::new(HCMStats::register(&registry, &cfg.stat_prefix).map_err(|e| {
-            Http1Error::StatsRegistration {
-                stat_prefix: cfg.stat_prefix.clone(),
-                message: e.to_string(),
-            }
-        })?);
+        let stats = Arc::new(
+            HCMStats::register(&registry, &cfg.stat_prefix).map_err(|e| {
+                Http1Error::StatsRegistration {
+                    stat_prefix: cfg.stat_prefix.clone(),
+                    message: e.to_string(),
+                }
+            })?,
+        );
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
             route_config: Arc::new(clone_route_config(&cfg.route_config)),

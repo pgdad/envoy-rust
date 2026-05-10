@@ -478,7 +478,9 @@ admin:
     #[tokio::test]
     async fn from_bootstrap_builds_single_endpoint_cluster() {
         let bootstrap = envoy_config::parse_bootstrap(SINGLE_ENDPOINT_YAML).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new())).await.expect("construct");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
         let picked = handle.pick_endpoint().expect("non-empty");
         assert_eq!(picked, "127.0.0.1:10042".parse::<SocketAddr>().unwrap());
@@ -520,7 +522,9 @@ admin:
     #[tokio::test]
     async fn from_bootstrap_builds_three_endpoint_cluster() {
         let bootstrap = envoy_config::parse_bootstrap(THREE_ENDPOINT_YAML).expect("valid");
-        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new())).await.expect("construct");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
         let picks: Vec<SocketAddr> = (0..3).map(|_| handle.pick_endpoint().unwrap()).collect();
         assert_eq!(
@@ -838,7 +842,9 @@ admin:
     /// returns the resulting ClusterManager. Panics on parse / build error.
     async fn build_cluster_mgr(yaml: &str) -> ClusterManager {
         let bootstrap = envoy_config::parse_bootstrap(yaml).expect("parse");
-        from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new())).await.expect("from_bootstrap")
+        from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("from_bootstrap")
     }
 
     #[tokio::test(flavor = "multi_thread")]

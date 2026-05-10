@@ -2,7 +2,9 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum StatsError {
-    #[error("stat '{name}' is already registered with a different kind (expected {expected}, got {got})")]
+    #[error(
+        "stat '{name}' is already registered with a different kind (expected {expected}, got {got})"
+    )]
     ConflictingKind {
         name: String,
         expected: &'static str,
@@ -10,10 +12,7 @@ pub enum StatsError {
     },
 
     #[error("stat name '{name}' is invalid: {reason}")]
-    InvalidName {
-        name: String,
-        reason: &'static str,
-    },
+    InvalidName { name: String, reason: &'static str },
 }
 
 #[cfg(test)]

@@ -237,7 +237,9 @@ mod tests {
     async fn serves_accepts_and_dispatches_to_handler() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
-        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind ok");
+        let listener = Listener::bind(&cfg, h, mk_registry())
+            .await
+            .expect("bind ok");
         let addr = listener.local_addr().expect("local_addr");
 
         let (tx, rx) = oneshot::channel::<()>();

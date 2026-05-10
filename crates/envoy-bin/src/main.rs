@@ -334,9 +334,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         ));
         let shutdown = token.clone();
         set.spawn(async move {
-            envoy_admin::serve(lst, admin_handler, async move { shutdown.cancelled().await })
-                .await
-                .map_err(anyhow::Error::from)
+            envoy_admin::serve(
+                lst,
+                admin_handler,
+                async move { shutdown.cancelled().await },
+            )
+            .await
+            .map_err(anyhow::Error::from)
         });
     }
 

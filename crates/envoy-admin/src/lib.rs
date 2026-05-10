@@ -9,10 +9,10 @@
 
 pub mod config;
 pub mod endpoint;
-pub mod handler;
 mod error;
+pub mod handler;
 
 pub use config::AdminConfig;
 pub use endpoint::AdminEndpoint;
-pub use handler::{serve, AdminHandler};
 pub use error::AdminError;
+pub use handler::{AdminHandler, serve};

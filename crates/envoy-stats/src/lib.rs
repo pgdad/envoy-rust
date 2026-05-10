@@ -10,12 +10,12 @@
 //! See parent-phase-06 SPEC §6 architectural rule 1 + ADR-0029.
 
 pub mod counter;
-pub mod gauge;
-pub mod registry;
-pub mod prometheus;
 mod error;
+pub mod gauge;
+pub mod prometheus;
+pub mod registry;
 
 pub use counter::Counter;
+pub use error::StatsError;
 pub use gauge::Gauge;
 pub use registry::{StatHandle, StatsRegistry};
-pub use error::StatsError;

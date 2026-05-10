@@ -169,9 +169,8 @@ pub async fn serve(
     handler: Arc<AdminHandler>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), AdminError> {
-    let mut join_set: tokio::task::JoinSet<
-        Result<(), Box<dyn std::error::Error + Send + Sync>>,
-    > = tokio::task::JoinSet::new();
+    let mut join_set: tokio::task::JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>> =
+        tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
 
     loop {
@@ -217,7 +216,10 @@ pub async fn serve(
         }
     };
     if tokio::time::timeout(DRAIN_BUDGET, drain).await.is_err() {
-        tracing::warn!(?DRAIN_BUDGET, "admin drain budget exceeded; aborting stragglers");
+        tracing::warn!(
+            ?DRAIN_BUDGET,
+            "admin drain budget exceeded; aborting stragglers"
+        );
         join_set.abort_all();
         while join_set.join_next().await.is_some() {}
     }

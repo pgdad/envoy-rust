@@ -605,8 +605,7 @@ static_resources:
         };
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
-        let config =
-            Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).unwrap());
+        let config = Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).unwrap());
         let (addr, _server) = spawn_h2_hcm(config).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
