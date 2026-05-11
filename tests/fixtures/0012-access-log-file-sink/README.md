@@ -15,10 +15,15 @@ diffs per-token per the rules in `expectations.yaml`.
 
 ## Per-side divergences
 
-| Side | bind address | admin block | access-log path                      | `generate_request_id` |
-|------|--------------|-------------|--------------------------------------|-----------------------|
-| envoy | `0.0.0.0`   | yes (port 0)| `/tmp/0012-envoy-access.log`         | `false` (load-bearing) |
-| envoy-rust | `127.0.0.1` | omitted | `/tmp/0012-envoy-rust-access.log`    | omitted (never injects) |
+| Side | bind address | admin block | access-log path                              | `generate_request_id` |
+|------|--------------|-------------|----------------------------------------------|-----------------------|
+| envoy | `0.0.0.0`   | yes (port 0)| `/tmp/0012-envoy-mount/access.log`           | `false` (load-bearing) |
+| envoy-rust | `127.0.0.1` | omitted | `/tmp/0012-envoy-rust-mount/access.log`     | omitted (never injects) |
+
+The parent directory is bind-mounted from the host into the Envoy
+container so the harness can read the access.log file after the
+request completes; see `tests/differential/src/lib.rs` for the
+bind-mount wiring.
 
 The `generate_request_id: false` on the Envoy side prevents Envoy from
 injecting an `x-request-id` header at HCM time; envoy-rust never injects

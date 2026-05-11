@@ -108,6 +108,114 @@ isolated mid-PLAN; Task 10 (D15.3.e + 06.2 REVIEW I2 diagnosis); Task 11
 - **06.2 REVIEW I2** (closed at Task 10 via empirical diagnosis — tighten fixture 0012 expectations.yaml row 12 from `wildcard` to `exact: "-"`, observe outcome, update BEHAVIOR_CONTRACT.md row 12 OR commit the fixture tightening).
 - **06.2 REVIEW M3** (closed at Task 11 via fixture 0012 README.md path correction; ~5 LoC).
 
+---
+
+## Task 11 — BEHAVIOR_CONTRACT extension + fixture 0011 value-exact + README fix (task 11 commit)
+
+### Work summary
+
+**BEHAVIOR_CONTRACT.md `Stat-name mapping` table — 10 new rows (`06.3 entries:`):**
+
+Added a `**06.3 entries:**` subsection immediately before the existing `**06.1 Prometheus
+exposition shape divergence**` paragraph, covering the comprehensive stat set landed at
+Tasks 4-10:
+- `http.<stat_prefix>.downstream_rq_{2xx,3xx,4xx,5xx}` — value-exact; status-class
+  bucketing via integer division at the factored access-log dispatch site.
+- `http.<stat_prefix>.access_logs_total` — value-exact; `Counter::add(N)` at queue-enter.
+- `http.<stat_prefix>.access_logs_failed` — value-exact (0-failures case); per-sink `Err` arm.
+- `listener.<name>.downstream_cx_active` — value-exact (deterministic close); RAII decrement
+  via Arc<Gauge> clone in spawned task; terminal-zero gauge.
+- `listener.<name>.downstream_cx_accept_failed` — value-exact (0-failures case); accept `Err` arm.
+- `cluster.<name>.upstream_cx_active` — value-exact (deterministic close); ConnGaugeGuard RAII.
+- `cluster.<name>.upstream_rq_total` — value-exact; per upstream response received (not per connect).
+- `cluster.<name>.upstream_rq_5xx` — value-exact; conditional sibling.
+
+**Fixture 0012 README path correction (06.2 REVIEW M3):**
+
+`tests/fixtures/0012-access-log-file-sink/README.md` "Per-side divergences" table corrected:
+- `envoy` row: `/tmp/0012-envoy-access.log` → `/tmp/0012-envoy-mount/access.log`
+- `envoy-rust` row: `/tmp/0012-envoy-rust-access.log` → `/tmp/0012-envoy-rust-mount/access.log`
+
+Added a one-line note explaining that the parent directory is bind-mounted from the host
+into the Envoy container (the actual paths match fixture 0012's `expectations.yaml` lines 12-13
+and the bind-mount wiring in `tests/differential/src/lib.rs`).
+
+**Fixture 0011 `expectations.yaml` value-side assertion extension:**
+
+Added three new fields (`value_exact`, `value_must_be_zero`, `value_present_only`) to the
+`prometheus_exposition` body rule, inserted BEFORE `allowlist_envoy_only` for visual grouping:
+
+```yaml
+value_exact:
+  - - envoy_http_ingress_http_downstream_rq_total
+    - 1
+  - - envoy_http_ingress_http_downstream_rq_2xx
+    - 1
+  - - envoy_listener_ingress_http_downstream_cx_total
+    - 1
+value_must_be_zero: []
+value_present_only: []
+```
+
+The set is conservative — only the 3 counters known to be incremented by the current
+single-request `GET /` (direct_response 200) scenario. Confirmed via code inspection:
+`envoy-stats/src/prometheus.rs` `write_exposition` emits ALL registered metrics regardless
+of value (BTreeMap-backed `snapshot()` includes every registration). So `downstream_rq_3xx`,
+`downstream_rq_4xx`, `downstream_rq_5xx`, `access_logs_total`, `access_logs_failed`,
+`cx_active`, and `cx_accept_failed` ARE present in the exposition at value 0 — asserting
+them via `value_must_be_zero` would be technically correct. The conservative choice (empty
+`value_must_be_zero`) is intentional: multi-class zero-assertions make most sense when paired
+with non-zero sibling assertions from a multi-request `pre_requests` setup, which is the
+deferred scope described below.
+
+### Scope deviation — multi-request pre_requests extension DEFERRED
+
+The original PLAN scope included extending fixture 0011's `pre_requests` to drive 4 requests
+(one per 2xx/3xx/4xx/5xx status class) and adding a synthetic 5xx backend to produce a
+real 5xx response. This scope was narrowed before task execution (per the PLAN.md Task 11
+narrowing note). The deferral rationale:
+
+1. A synthetic 5xx backend (e.g., a direct_response 500 route) is straightforward for
+   `downstream_rq_5xx` but requires adding new routes and possibly a second listener to
+   fixture 0011's `envoy.yaml` + `envoy-rust.yaml` — a meaningful config-surface change that
+   goes well beyond "add 3 more pre_requests".
+2. The per-class counter wiring is already unit-tested end-to-end (Task 4's
+   `hcm_increments_downstream_rq_Nxx_on_Nxx_response` tests cover all 4 classes; Task 7's
+   `write_proxied_response_increments_upstream_rq_5xx` covers the cluster-side 5xx path).
+3. The CI Docker-gated run (Task 12) will validate the 3 `value_exact` assertions added here.
+   Multi-class Docker-gated validation belongs to a future fixture with multi-route setup.
+
+Deferred item recorded per D-3.5. No ADR needed (no contract change; implementation is correct
+per unit tests).
+
+### prometheus.rs finding (read at task-execution time)
+
+`crates/envoy-stats/src/prometheus.rs::write_exposition` iterates `registry.snapshot()` which
+is a BTreeMap-backed clone of ALL registered entries. Counters appear in the output regardless
+of value — a counter registered at startup but never incremented emits `<name> 0`. This means
+`value_must_be_zero` assertions on the not-bumped counters would be valid and would not fail
+due to "name absent" (the `value_must_be_zero` assertion would find the name with value 0 and
+pass). The conservative choice to leave `value_must_be_zero: []` is doctrine-driven (pair
+0-assertions with non-zero sibling assertions in a multi-request fixture), not correctness-driven.
+
+### Carryforward closures
+
+- **06.2 REVIEW M3** — closed substantively at this task.
+  `tests/fixtures/0012-access-log-file-sink/README.md` paths corrected from the wrong
+  flat `/tmp/0012-envoy-access.log` and `/tmp/0012-envoy-rust-access.log` paths to the
+  bind-mount-aware `/tmp/0012-envoy-mount/access.log` and `/tmp/0012-envoy-rust-mount/access.log`
+  paths. One-line bind-mount note added.
+
+### LoC delta
+
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md`: +~30 LoC (10 new table rows + section header).
+- `tests/fixtures/0012-access-log-file-sink/README.md`: +~7 LoC (table paths corrected +
+  bind-mount note; net change ~5 corrected values + 4 new lines).
+- `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`: +~30 LoC (3 fields +
+  comments explaining the conservative choice).
+- `docs/envoy-rust/phases/06.3-stats-wiring-and-close/PROGRESS.md`: this entry (~60 LoC).
+- Total: ~127 LoC (PLAN estimated ~120 LoC; within-estimate).
+
 ### Standing carryforwards untouched in 06.3 (per parent-06 SPEC §4 + 06.1/06.2 REVIEW §4 inventories)
 
 - 06.2 REVIEW M1 (`Http1Error::AccessLogOpen` source-chain typing) — indefinite.
