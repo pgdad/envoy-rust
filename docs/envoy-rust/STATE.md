@@ -9,8 +9,8 @@
 
 **id:** `06.3`
 **slug:** `06.3-stats-wiring-and-close`.
-**directory:** `docs/envoy-rust/phases/06.3-stats-wiring-and-close/` now holds `SPEC.md` (684 lines; landed at the parent-06 state-1+state-2 combined-recovery commit `1f7661a`) + **`PLAN.md` (NEW at this commit; 12 tasks; standalone-pre-Task-1 cadence)** + **`PROGRESS.md` (NEW at this commit; Task 1 preamble — LoC drift posture + 5 SPEC corrections + 22 architecture decisions)**. Sibling directory `docs/envoy-rust/phases/06.2-access-log/` continues to hold the full closed-out artifact set — `SPEC.md` (1130 lines) + `PLAN.md` (3545 lines; standalone-PLAN commit `dc00750`; 11 tasks) + `PROGRESS.md` + `REVIEW.md` (state-5 commit `d0238e1`; verdict **Approved with M-track follow-ups** — 0 Critical / 2 Important / 5 Minor). Sibling directory `docs/envoy-rust/phases/06.1-stats-and-admin/` continues to hold the full closed-out artifact set — `SPEC.md` + `PLAN.md` + `PROGRESS.md` + `REVIEW.md` (verdict **Approved with M-track follow-ups** — 0 Critical / 2 Important / 6 Minor). Parent directory `docs/envoy-rust/phases/06-observability/` continues to hold the parent SPEC unedited per D-3.4 / D-3.5.
-**status:** sub-phase 06.3 lifecycle **state 2 REACHED / state 3 NEXT** — `SPEC.md` + `PLAN.md` + `PROGRESS.md` (Task 1 preamble) all exist as of THIS commit. ROADMAP row `06.3` flipped `status: planned` → `status: in-progress` at THIS commit (per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3 + the established 06.1 `505653d` / 06.2 `dc00750` standalone-PLAN-commit precedent). ROADMAP row `06.2` is `status: done` (since the 06.2 state-6 commit `389ef96`). ROADMAP row `06` stays `status: in-progress` (flips to `done` only at the closing sub-phase 06.3's own state-6 commit per the ROADMAP-schema invariant — mirrors phase 04's `e626862`-shape close-out and phase 05's `82c26b8`-shape close-out). The next session — operating as the **sub-phase-06.3 state-3 executor** — invokes **`superpowers:subagent-driven-development`** (per the user's standing preference auto-memory `feedback_execution_style`) scoped to `docs/envoy-rust/phases/06.3-stats-wiring-and-close/PLAN.md` Task 2 (D14.3 `ConfigError::Http2ClusterFromHttp1Listener` parse-time validator gate; closes 05.3 REVIEW I1 substantively).
+**directory:** `docs/envoy-rust/phases/06.3-stats-wiring-and-close/` holds `SPEC.md` (684 lines; landed at the parent-06 state-1+state-2 combined-recovery commit `1f7661a`) + `PLAN.md` (1843 lines; 12 tasks; landed at the state-2 standalone-PLAN commit `3a964cc`) + `PROGRESS.md` (extended through Task 12; Task 1 preamble at `3a964cc`; per-task sections Tasks 2-12 appended at commits `1516cb8` / `c995cce` / `a23a21b` / `45cb096` / `b32f096` / `6bb0aa7` / `fb9f277` / `3d36c11` / `d050e23` / `06bdf14` + fixup `b46025e` / `7cdc1a8`). Sibling directory `docs/envoy-rust/phases/06.2-access-log/` continues to hold the full closed-out artifact set — `SPEC.md` (1130 lines) + `PLAN.md` (3545 lines; standalone-PLAN commit `dc00750`; 11 tasks) + `PROGRESS.md` + `REVIEW.md` (state-5 commit `d0238e1`; verdict **Approved with M-track follow-ups** — 0 Critical / 2 Important / 5 Minor). Sibling directory `docs/envoy-rust/phases/06.1-stats-and-admin/` continues to hold the full closed-out artifact set — `SPEC.md` + `PLAN.md` + `PROGRESS.md` + `REVIEW.md` (verdict **Approved with M-track follow-ups** — 0 Critical / 2 Important / 6 Minor). Parent directory `docs/envoy-rust/phases/06-observability/` continues to hold the parent SPEC unedited per D-3.4 / D-3.5.
+**status:** sub-phase 06.3 lifecycle **state 4 REACHED / state 5 NEXT** — all 12 PLAN tasks have landed as their own commits. Task 12 (`7cdc1a8`) materializes the §7.5 phase-done gate evidence in PROGRESS: all 5 stable-toolchain gates clean locally (`cargo build` / `cargo clippy --workspace --all-targets --all-features -- -D warnings` / `cargo fmt --all -- --check` / `cargo test --workspace --lib --bins` 499 passed 0 failed 2 ignored / `cargo deny check` advisories+bans+licenses+sources ok); all 12 Docker-gated differential fixtures (0001-0012) GREEN locally simultaneously; h2spec ≥95% carries from 05.2 D7 baseline 99.31% (no H2 surface engaged in 06.3); `parse_bootstrap` fuzz unchanged at 17 seeds (no new target per architecture decision 20). The CI URL capture (the canonical §7.5 (a)-(e) re-verification) is deferred to a state-4-followup in a session with explicit push authorization (this executor session did not push to `origin/main` per shared-state-impact discipline; the local-gate results are the substantive verification material). The next session — operating as the **sub-phase-06.3 state-5 reviewer** — invokes **`superpowers:requesting-code-review`** scoped to the 11-commit range `3a964cc..7cdc1a8` (Tasks 2-12 + Task 11 fixup) to draft `docs/envoy-rust/phases/06.3-stats-wiring-and-close/REVIEW.md`. ROADMAP row `06.3` stays `status: in-progress` (flips to `done` only at the closing 06.3 state-6 commit). ROADMAP row `06` stays `status: in-progress` (flips to `done` at the same 06.3 state-6 commit per the ROADMAP-schema invariant — closing-sub-phase invariant mirrors phase 04's `e626862`-shape and phase 05's `82c26b8`-shape close-outs).
 
 **Phase 06.2 (`06.2-access-log`) is DONE as of THIS commit** (the 06.2 state-6 phase-done close-out; predecessor `d0238e1` is the state-5 REVIEW.md commit). The `envoy-accesslog` foundation crate (sole-dep-owner of any access-log surface — module decomposition: `record` + `file_sink` + `default_format` + `error` + a doc-comment-only `sink` placeholder; ships with `tokio` + `bytes` + `tracing` + `thiserror` only; no `time` / `chrono` / `async_trait` / `regex`) + Envoy default-format emitter (hand-rolled atop `std::time::SystemTime` with a Gregorian calendar arithmetic helper covering full leap-year semantics; ISO-8601 `YYYY-MM-DDTHH:MM:SS.sssZ` byte-strict 24-byte rendering) + concrete `FileSink` (hand-rolled atop `tokio::fs::OpenOptions::append(true)` + `Arc<tokio::sync::Mutex<File>>` for serializing concurrent emissions; the `Sink` trait deferred per parent-06 SPEC §3 D8.2 option (c) so HCMConfig.access_log carries `Vec<Arc<envoy_accesslog::FileSink>>` concretely — avoids the `async_trait = "0.1"` foundations grant) + HCM access-log wiring on both H1 and H2 codepaths (factored single-dispatch site after each writer arm populates the captured `response_status_for_log` / `response_body_len` / `response_headers_for_log` / `upstream_host_for_log` locals; emission fire-and-forget with `tracing::warn!` on per-sink failure per architectural Rule 4) + envoy-config schema additions (`HttpConnectionManagerConfig.access_log: Vec<AccessLogConfig>` with serde-tagged `AccessLogTypedConfig` enum gating on `name = "envoy.access_loggers.file"` + `@type = .../FileAccessLog`; new `ConfigError::UnsupportedAccessLogType` + `InvalidAccessLogPath` variants; format-string customization OUT of scope — `FileAccessLog`'s `deny_unknown_fields` rejects `format` / `log_format` / `json_format` / `typed_json_format` at parse time) + differential harness extension (`Driver::Http1WithAccessLog` + per-token `AccessLogLineRule` enum with 5 variants `Exact` / `Iso8601Format` / `DurationMs` / `Wildcard` / `EnvoyOnly` + hand-rolled `tokenize_default_format` state-machine tokenizer + `assert_access_log_lines_equivalent` per-token cascade + `HeaderRule` enum + `AccessLogPaths` struct) + first-time population of BEHAVIOR_CONTRACT.md `Access log field mapping` section (14 rows — one per Envoy default-format token; per-token equivalence dispositions value-exact for deterministic-load tokens, name-required-value-may-differ for wall-clock-non-deterministic tokens). Landed in 9 substantive tasks across 13 commits between base `dc00750` (the 06.2 state-2 standalone-PLAN commit) and head `b9b782b` (the Task 11 state-4 phase-done verification commit), plus a Task 6 follow-up review-fix commit `f73face` (gate `FileSink::from_file_for_test` behind `#[cfg(any(test, feature = "test-util"))]`; closes a code-quality review Important #1 — doc-vs-code cfg-gate mismatch) and two CI-fix commits (`fa71b0e` chmod 0o666 — insufficient on Linux Docker; `4aba10b` parent-directory bind-mount at 0o777 — succeeded; PROGRESS Task 11 narrates the cross-Docker bind-mount UID-mismatch lesson in-tree at `tests/differential/src/lib.rs:1374-1432`), plus the state-4-reached / state-5-next STATE advance commit `4262b64`, plus the state-5 REVIEW.md commit `d0238e1`, plus this state-6 close-out commit. Highlights: Task 2 (`a7ebbfa`) shipped the `crates/envoy-accesslog/` crate scaffold (~165 LoC; `record.rs` 15-field POD with no `Default` derive per signpost 14; `error.rs` thiserror enum; `sink.rs` doc-comment-only placeholder); Task 3 (`d316118`) shipped `default_format::format_iso8601` + `epoch_seconds_to_ymd_hms` Gregorian helper + 8 unit tests including 7 golden epochs covering Y2K leap day, year-2100 century-not-leap, Y2K38 i32::MAX, year 9999 (`PROGRESS Task 3 dev 1` caught a stale table constant 1709209096 vs correct 1709210096 at PLAN-write); Task 4 (`e6ddee8`) shipped `FileSink` concrete impl + 4 unit tests including a 10-thread × 1-emission concurrency torture test verifying mutex-serialization at the kernel append boundary; Task 5 (`1548242`) added `envoy-config` schema additions + validator at `validate_access_logs` + 6 new unit tests + 1 fuzz seed (`hcm_access_log_file.yaml`); Task 6 (`ece6fdf`) wired HCM H1 access-log dispatch + factored the H1 `serve_connection` site after the `match outcome` block ends + new `Http1Error::AccessLogOpen { message: String }` variant + 4 unit tests including `hcm_with_file_access_log_emission_failure_does_not_fail_request` end-to-end; Task 7 (`5729f8f`) wired HCM H2 access-log dispatch via `finalize_h2_stream` unified join point covering all 3 writer paths + envoy-http2 path-dep on envoy-accesslog + 2 unit tests; Task 8 (`77de85e`) shipped the in-process integration backstop `crates/envoy-bin/tests/access_log_file_sink.rs` parallel to the 05.2 `http2_direct_response.rs` precedent; Task 9 (`96ef278`) extended the differential harness with the access-log line-equivalence machinery; Task 10 (`ee924a6`) shipped fixture `tests/fixtures/0012-access-log-file-sink/` (5 files; HCM `codec_type: HTTP1` + `direct_response 200 "ok\n"` + `access_log: [{ name: envoy.access_loggers.file, typed_config: { @type: .../FileAccessLog, path: /tmp/0012-*-mount/access.log } }]`) + the BEHAVIOR_CONTRACT.md `Access log field mapping` first-time-population (14 rows); Task 11 (`b9b782b`) materialized the state-4 phase-done gate evidence (CI run `25670699370` HEAD `4aba10b` shows fixture 0012 GREEN + 11 baseline fixtures `0001-0011` GREEN simultaneously + h2spec 99.31% gate held + `parse_bootstrap` fuzz clean on the 17-seed corpus + all 5 stable-toolchain gates clean, conclusion `success`, completed `2026-05-11T12:42:59Z`). Phase 06.2 `REVIEW.md` (landed at `d0238e1`) verdict is **Approved with M-track follow-ups** — see "Phase-06.2 rollovers" below for the carryforward disposition.
 
@@ -50,7 +50,7 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` state 3, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 3): the next session — operating as the **sub-phase-06.3 state-3 executor** — invokes **`superpowers:subagent-driven-development`** (per the user's standing preference auto-memory `feedback_execution_style`; mirrors the 06.1 / 06.2 execution cadence) scoped to `docs/envoy-rust/phases/06.3-stats-wiring-and-close/PLAN.md` Task 2 (D14.3 `ConfigError::Http2ClusterFromHttp1Listener` parse-time validator gate). The PLAN.md commit lands at THIS session as a single doc-only commit (no code; no test runs; no CI push) per the established standalone-pre-Task-1-PLAN cadence (precedent commits: `c02eea7` 04.3, `f23d08f` 05.1, `252725b` 05.4, `ce471ad` 05.2, `4b92e05` 05.3, `505653d` 06.1, `dc00750` 06.2). Per `BOOTSTRAP_PROMPT.md` §5.1 ("one state per session"), state 3 implementation begins in the NEXT session — this session lands ONLY the PLAN.md + ROADMAP row flip + STATE advance and exits.
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` state 5, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 5): the next session — operating as the **sub-phase-06.3 state-5 reviewer** — invokes **`superpowers:requesting-code-review`** scoped to the state-3 commit range `3a964cc..7cdc1a8` (11 commits: Tasks 2-12 substantive + Task 11 fixup) to draft `docs/envoy-rust/phases/06.3-stats-wiring-and-close/REVIEW.md`. Mirrors the 06.1 `499e374` / 06.2 `d0238e1` state-5 cadence. After REVIEW.md lands at state 5, the 06.3 state-6 close-out commit (in a subsequent session) flips ROADMAP row `06.3` `in-progress` → `done` AND parent row `06` `in-progress` → `done` (closing-sub-phase invariant). The state-6 commit title per signpost 10: `phase 06.3: comprehensive stats wiring + 05.3 I1 closure + parent-06 close [parent 06 done] [ADR-0029]` (mirrors phase 05's `82c26b8`-shape close-out).
 
 After 06.3's PLAN.md lands (THIS commit) and execution proceeds through state-3 (subagent-driven implementation; 11 substantive tasks Tasks 2-12) → state-4 (verification-before-completion against §7.5's six gates; Task 12) → state-5 (REVIEW.md per `superpowers:requesting-code-review`) → state-6 (close-out commit), the closing-sub-phase invariant takes effect: 06.3's state-6 phase-done commit ALSO closes parent-06 (mirrors phase 04's `e626862`-shape close-out and phase 05's `82c26b8`-shape close-out per the ROADMAP-schema invariant — "the parent flips to `done` only after all sub-phases are `done`"). After parent-06 closes, parent phase 07 enters lifecycle state 0 → 1 (filter chain framework — currently `status: planned` in ROADMAP).
 
@@ -94,28 +94,62 @@ Inputs the 06.3 state-2 PLAN-writer session should read, in order:
 
 ## Last commit
 
-Sub-phase 06.3 state-2 standalone-PLAN.md commit:
-`phase 06.3: state-2 standalone PLAN.md` (THIS commit).
-Touches `docs/envoy-rust/phases/06.3-stats-wiring-and-close/PLAN.md`
-(NEW; 12 tasks; ~770 LoC code+tests projection + ~120 LoC doc; well under
-the §6.1 split-gate's ~25 task / ~1500 LoC thresholds) +
-`docs/envoy-rust/phases/06.3-stats-wiring-and-close/PROGRESS.md`
-(NEW; Task 1 preamble — LoC drift posture + 5 PLAN-write SPEC corrections +
-22 architecture decisions + task-ordering rationale + carryforward closures
-planned + DECISIONS.md ledger head ADR-0029 unchanged) +
-`docs/envoy-rust/ROADMAP.md` (flips row `06.3` `planned` → `in-progress`;
-parent row `06` stays `in-progress`) +
-`docs/envoy-rust/STATE.md` (advances Active phase from lifecycle state 2 to
-state-3-next; advances Next-skill from `superpowers:writing-plans` to
-**`superpowers:subagent-driven-development`** scoped to PLAN Task 2;
-appends "Phase-06.3 state-2 commit composition" details below). NO code
-changes; NO test runs; NO CI push; NO new ADRs.
+Sub-phase 06.3 state-4-reached / state-5-next STATE advance commit (THIS commit):
+`phase 06.3: advance STATE.md to state-4-reached / state-5-next (task 12 follow-up)`.
+Touches `docs/envoy-rust/STATE.md` only (advances Active phase status from
+"state 2 REACHED / state 3 NEXT" to "state 4 REACHED / state 5 NEXT";
+advances Next-skill from **`superpowers:subagent-driven-development`** scoped
+to PLAN Task 2 to **`superpowers:requesting-code-review`** scoped to the
+11-commit Tasks 2-12 + fixup range; updates Last commit + Last updated
+sections). NO code changes; NO test runs; NO CI push; NO new ADRs.
 
-Per the established standalone-pre-Task-1-PLAN cadence (06.1 `505653d` +
-06.2 `dc00750` precedents): the PLAN.md commit lands as a single doc-only
-commit; the next session enters state 3 and executes Task 2
-(D14.3 `ConfigError::Http2ClusterFromHttp1Listener` parse-time validator
-gate; closes 05.3 REVIEW I1 substantively).
+Mirrors the 06.2 `4262b64` state-advance commit shape exactly (predecessor of
+06.2's state-5 REVIEW.md commit `d0238e1`). Per `BOOTSTRAP_PROMPT.md` §5.1
+"one state per session": the next session enters state 5 and drafts
+REVIEW.md.
+
+**Sub-phase 06.3 state-3 commit chain (Tasks 2-12 + Task 11 fixup), in
+chronological order:**
+
+- `1516cb8` — `phase 06.3: Http2ClusterFromHttp1Listener parse-time validator gate (task 2)`. Closes 05.3 REVIEW I1 substantively. New `ConfigError::Http2ClusterFromHttp1Listener { listener: String, cluster: String }` variant + per-listener cluster-reachability scan at the existing route-walk in `crates/envoy-config/src/bootstrap.rs::validate_hcm`. 6 unit tests (3 positive: H1×H1, H2×H2, H2×H1; 2 negative: H1×H2, AUTO×H2; 1 carve-out: TCP-proxy listener × H2 cluster passes).
+
+- `c995cce` — `phase 06.3: BodyRule::PrometheusExposition value-side assertion (task 3)`. Extends the harness `BodyRule::PrometheusExposition` with 3 new `#[serde(default)]` fields (`value_exact: Vec<(String, u64)>`, `value_must_be_zero: Vec<String>`, `value_present_only: Vec<String>`). New `parse_prometheus_samples` sibling parser. 2 unit tests.
+
+- `a23a21b` — `phase 06.3: per-response-class HCM counters + 06.2 I1 H1 state-init (task 4)`. Closes 06.2 REVIEW I1 co-located. 4 new `HCMStats` per-class counter fields (`downstream_rq_{2xx,3xx,4xx,5xx}`); increment at H1 post-`match outcome` factored site + symmetric H2 inline increment in `finalize_h2_stream`. H1 state-init tightened from `let mut x = 0/default` to `let x;` posture mirroring H2. 5 unit tests.
+
+- `45cb096` — `phase 06.3: listener cx_active gauge (data-path scope; task 5)`. New `Listener.cx_active: Arc<Gauge>` field. Hoist + spawn-task wrap pattern. Authorized deviation: `ListenerConfig.count_active: bool` flag NOT added (admin listener doesn't use `envoy_listener::Listener::bind` — uses `tokio::net::TcpListener` + `envoy_admin::serve` directly at `crates/envoy-bin/src/main.rs:324-345`, so data-path scoping is automatic). 2 unit tests.
+
+- `b32f096` — `phase 06.3: cluster cx_active gauge + ConnGaugeGuard RAII (task 6)`. New `Cluster.cx_active: Arc<Gauge>` field + `ConnGaugeGuard` RAII struct (architecture decision 13). Single guard above the `match cluster.upstream_protocol()` block in H2 (covers both H1 + H2 arms via lexical scope); per-call-site wrap at H1 HCM proxy arm + envoy-tcp dial site. 3 unit tests.
+
+- `6bb0aa7` — `phase 06.3: upstream router counters + H2 inline increments (task 7)`. 2 new `Cluster` fields (`upstream_rq_total`, `upstream_rq_5xx`). `write_proxied_response` signature extended with `cluster: &ClusterHandle` (position 2). H2 inline 2-line increment at the post-dispatch success site per PLAN-write SPEC correction 3. 4 unit tests (200 + 503 paths on both H1 and H2).
+
+- `fb9f277` — `phase 06.3: listener accept-failure counter (task 8)`. New `Listener.cx_accept_failed: Arc<Counter>` field; `cx_accept_failed.inc()` as the FIRST statement in the existing `Err(err)` arm of the accept loop, BEFORE `tracing::warn!`. 1 unit test (counter-registered + zero-init + no-spurious-increment under 3 successful connections; the no-spurious assertion catches the regression of someone moving the inc() to the `Ok` arm or before the match).
+
+- `3d36c11` — `phase 06.3: admin handler idle read timeout (closes 06.1 REVIEW I1; task 9)`. Closes 06.1 REVIEW I1. `IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5)` constant near `MAX_REQUEST_HEAD` in `crates/envoy-admin/src/handler.rs`. Wraps `stream.read(&mut scratch[..take]).await?` with `tokio::time::timeout`. 1 unit test (silent client triggers timeout within 7s hard deadline; observed 5.02s actual).
+
+- `d050e23` — `phase 06.3: access_logs_total + access_logs_failed counters + 06.2 I2 (task 10)`. Closes 06.2 REVIEW I2 via empirical diagnosis (inspection of `tests/differential/src/lib.rs::drive_http1` confirms no User-Agent injection; tightens fixture 0012 row 12 from `rule: wildcard` to `rule: exact, value: "-"`). 2 new HCMStats counter fields + `Counter::add(N)` bulk-increment at the H1 + H2 access-log dispatch sites per 06.1 REVIEW §7 R-8. 2 unit tests.
+
+- `06bdf14` — `phase 06.3: BEHAVIOR_CONTRACT extension + fixture 0011 value-exact + M3 (task 11)`. BEHAVIOR_CONTRACT.md `Stat-name mapping` table grows 10 new rows (one per comprehensive-set stat with rationale). Fixture 0012 README path correction closes 06.2 REVIEW M3. Initial `value_exact` set landed (3 entries on envoy-rust-only stat names).
+
+- `b46025e` — `phase 06.3: Task 11 fixup — empty value_exact (bilateral-assertion mismatch)`. Code-quality reviewer discovered that the 3 `value_exact` entries from `06bdf14` referenced envoy-rust-only stat names already in `allowlist_envoy_rust_only`. Bilateral `value_exact` requires both proxies to emit the same name; the assertions failed at runtime with `envoy=None, envoy-rust=Some(N)`. Fixup empties `value_exact` and adds inline comment explaining the StatsTagExtractor deferral. Docker-gated `admin_stats_prometheus` fixture restored to green.
+
+- `7cdc1a8` — `phase 06.3: state-4 phase-done gate verification (task 12)`. Materializes §7.5 phase-done gate evidence in PROGRESS (local-run results for all 5 stable-toolchain gates + 12 Docker-gated fixtures + h2spec carry-forward + parse_bootstrap fuzz unchanged). CI URL capture deferred to state-4-followup (push not performed in executor session).
+
+**Phase-06.3 state-3 + state-4 summary:**
+- 10 substantive task commits + 1 fixup commit + 1 state-4 verification commit + THIS state-advance commit = 13 commits in this session arc.
+- 5 carryforwards closed: 05.3 REVIEW I1 (Task 2), 06.1 REVIEW I1 (Task 9), 06.2 REVIEW I1 (Task 4), 06.2 REVIEW I2 (Task 10), 06.2 REVIEW M3 (Task 11).
+- No new ADRs (recommended posture honored). DECISIONS.md ledger head stays ADR-0029.
+- Workspace tests: 499 passing (lib + bins), 0 failed, 2 ignored. fmt clean, clippy clean, deny check clean.
+- Fixture 0011 `expectations.yaml` extended with the `value_exact` / `value_must_be_zero` / `value_present_only` schema fields (the latter two remain empty at this state-3 close; multi-class assertion scope deferred to a future phase per the Task 11 narrowing).
+- Fixture 0012 `expectations.yaml` row 12 tightened from wildcard to `exact: "-"`; fixture 0012 README paths corrected.
+
+Predecessor commits (in reverse chronological order):
+
+- `3a964cc` — `phase 06.3: state-2 standalone PLAN.md` (the standalone-PLAN.md commit; the state-3 commit chain's base; THIS session's entry point).
+- `389ef96` — `phase 06.2: envoy-accesslog + Envoy default format + HCM access-log wiring + fixture 0012` (06.2 state-6 phase-done close-out).
+- `d0238e1` — `phase 06.2: state 5 REVIEW.md Approved with M-track follow-ups` (06.2 state-5 REVIEW.md commit).
+- `4262b64` — `phase 06.2: advance STATE.md to state-4-reached / state-5-next (task 11 follow-up)` (06.2 STATE advance — direct precedent for THIS commit).
+- `b9b782b` — `phase 06.2: state-4 phase-done gate verification (task 11)` (06.2 state-4 close-out).
 
 **Carryforwards planned for 06.3 closure** (per PLAN.md Task summary):
 - **05.3 REVIEW I1** at Task 2 (Task-1-preamble shape per parent-06 SPEC §3 + 06.3 SPEC §5).
@@ -149,25 +183,26 @@ Predecessor commits (in reverse chronological order):
 
 ## Last updated
 
-2026-05-11 (sub-phase 06.3 state-2 standalone-PLAN.md commit lands at
-THIS commit; STATE.md advances Active phase from `06.3-stats-wiring-and-close`
-lifecycle state 2 (SPEC.md exists at `1f7661a`; PLAN.md did not exist) to
-lifecycle state-3-next (`SPEC.md` + `PLAN.md` + `PROGRESS.md` Task 1
-preamble all exist as of THIS commit). Next-skill advances from
-`superpowers:writing-plans` to **`superpowers:subagent-driven-development`**
-scoped to PLAN Task 2. ROADMAP row `06.3` flipped `planned` → `in-progress`
-at THIS commit; row `06` stays `in-progress` until 06.3 state-6.
-DECISIONS.md ledger head remains **ADR-0029** (no ADRs landed at the
-PLAN.md commit per the standalone-PLAN cadence; the recommended
-no-foundations-grant posture per parent-06 SPEC §7 + 06.3 SPEC §7 + §8
-holds entering state-3 execution).
+2026-05-11 (sub-phase 06.3 state-4-reached / state-5-next STATE advance
+commit lands at THIS commit; STATE.md advances Active phase from
+`06.3-stats-wiring-and-close` lifecycle state 3-in-progress (PLAN.md + Task 1
+preamble at `3a964cc`) to lifecycle state-4-reached (`SPEC.md` + `PLAN.md` +
+`PROGRESS.md` extended through Task 12 phase-done verification all exist).
+Next-skill advances from **`superpowers:subagent-driven-development`** scoped
+to PLAN Task 2 to **`superpowers:requesting-code-review`** scoped to the
+11-commit `3a964cc..7cdc1a8` range. ROADMAP row `06.3` stays `in-progress`;
+row `06` stays `in-progress` until 06.3 state-6. DECISIONS.md ledger head
+remains **ADR-0029** (no ADRs landed in 06.3 state-3 execution per the
+recommended posture; no-foundations-grant posture honored end-to-end —
+all stat-wiring extends 06.1's hand-rolled primitives without engaging
+new foundations).
 
-Predecessor session (06.2 state-6 close-out at commit `389ef96`)
-advanced from `06.2-access-log` lifecycle state 5 to `06.3-stats-wiring-and-close`
-lifecycle state 2; this PLAN.md commit closes that state-2 entry and
-opens state-3 entry. Per `BOOTSTRAP_PROMPT.md` §5.1 "one state per
-session": THIS commit lands state-2 reach; the next session enters
-state 3 and executes PLAN Task 2.
+THIS session executed PLAN Tasks 2-12 across 13 commits (10 substantive
+task commits + 1 Task 11 fixup commit + 1 state-4 verification commit +
+THIS state-advance commit). Per `BOOTSTRAP_PROMPT.md` §5.1 "one state per
+session": THIS commit closes state-4-reach; the next session enters
+state 5 and drafts REVIEW.md. The state-5 → state-6 close-out follows
+in a subsequent session per the established cadence.
 
 (Original 2026-05-11 06.2 state-6 close-out narrative below — preserved
 unedited for stranger-readability per D-3.4):
