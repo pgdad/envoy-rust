@@ -282,3 +282,26 @@ Test fixture (in-test only): `h2_hcm_config_with_access_log` (HCMConfig builder 
 4. **`upstream_host_for_log_h2` declared `mut` while other access-log locals are non-`mut`.** The 3 string-typed locals (`response_status_for_log`, `response_body_len`, `response_headers_for_log`) are populated exactly once per stream by every match-arm path (so Rust's flow analysis accepts them as `let`-without-`mut`). `upstream_host_for_log_h2` defaults to `None` and is only re-assigned on the successful proxy path; this requires `mut` per Rust's let-rebind rules. Minor style asymmetry vs the H1 path where all 4 are `mut`; documented here so reviewers don't flag it.
 
 **LoC:** ~310 LoC across 2 files (envoy-http2/src/hcm.rs: ~130 impl in the `handle_one_stream` refactor + `finalize_h2_stream` + 3 cloned helpers; ~180 in test body + 2 test helpers; envoy-http2/Cargo.toml: 3 lines for the path-dep + dev-dep overlay + tempfile dev-dep). PROGRESS.md: ~50 lines.
+
+## Task 8 — In-process integration backstop (no Docker)
+
+Lands `crates/envoy-bin/tests/access_log_file_sink.rs` per SPEC §6 signpost 18 — a single in-process integration test that exercises the full Task 2-7 wiring end-to-end at the binary level. Spawns `envoy-bin` via `CARGO_BIN_EXE_envoy-bin` against an HCM-with-file-sink YAML config written to a tempdir; drives one `GET /` over HTTP/1.1 to an ephemerally-picked listener port; reads the access-log file post-request; asserts the default-format line tokens (`"GET / HTTP/1.1" 200 - 0 3 `). No Docker. Mirrors the 04.1 (`http1_direct_response.rs`), 05.2 (`http2_direct_response.rs`), and 06.1 (`admin_ready.rs`) in-process integration-test pattern; inherits the standing 02.2 REVIEW M1 SIGKILL-on-Drop posture (`let _ = child.kill(); let _ = child.wait();` after the test body).
+
+**Test shape:**
+- `pick_free_port()` — bind ephemeral, capture port, drop listener (the race between drop and child bind is the same as the 04.1/05.2 pattern; the `wait_for_port` retry loop covers it).
+- `write_yaml_config(...)` — emits a self-contained HCM YAML with `access_log:` block at the typed_config tempdir path; uses a 200 direct-response route (no upstream cluster required, keeps `clusters: []`).
+- `wait_for_port(addr, deadline)` — 5s deadline; retries `connect_timeout` every 50ms.
+- Drives one `GET / HTTP/1.1` with `Connection: close`, reads to EOF, asserts response contains `200` and `ok`.
+- Sleeps 100ms for kernel-page-cache settle (the HCM dispatches `sink.emit().await` synchronously after the write, but the test reads the file from a separate process via `std::fs::read_to_string`; the 100ms is generous headroom on top of the in-process synchronous emission).
+- Reads the access-log file; asserts exactly 1 line; asserts line contains `"GET / HTTP/1.1" 200 - 0 3 ` (the request body length is 0, the response body length is 3 = `ok\n`; the trailing space is followed by `%RESPONSE_FLAGS%` which is `-` for the happy path).
+
+**Dev-deps:** no additions. `tempfile = "3"` already in `crates/envoy-bin/Cargo.toml`'s `[dev-dependencies]` (per 06.1 admin-ready test pattern). `anyhow = "1"` is a regular dependency of `envoy-bin`, so it's accessible from `tests/*.rs` without a dev-dep entry.
+
+**Tests:** `cargo test -p envoy-bin --test access_log_file_sink` → `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`. Completes in ~0.65s (subprocess startup + 100ms settle + cleanup dominates).
+
+**Workspace gates:** `cargo build --workspace --all-targets` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo fmt --all -- --check` clean (after a `cargo fmt --all` pass — initial fmt-check reported drift on the long-line `assert!(resp_str.contains("ok\n") ...)` wrap, the `std::fs::read_to_string(&access_log_path).context(...)` chain wrap, and the multi-arg `assert_eq!(lines.len(), 1, ...)` wrap; `cargo fmt --all` applied; re-verified clean per R-9); `cargo test --workspace --no-fail-fast` no regressions — the existing 10 envoy-bin integration tests (`admin_only`, `admin_ready`, `http1_direct_response`, `http1_router_upstream`, `http2_direct_response`, `http2_router_upstream`, `tcp_proxy`, `tls_downstream`, `tls_sni`, `tls_upstream`) all still pass.
+
+**Execution-time deviations from PLAN's verbatim implementation:**
+1. **fmt drift** (per R-9 disclosure requirement): the verbatim test source as PLAN-specified failed the initial `cargo fmt --all -- --check` on three sites — (a) the second `assert!` (response body check) needed wrap to multi-line, (b) the `read_to_string(...).context(...)` chain needed wrap, (c) the single-line `assert_eq!(lines.len(), 1, "expected 1 ...", lines.len(), log_contents)` needed expansion to multi-line. `cargo fmt --all` applied; re-verified clean. Functionally identical.
+
+**LoC:** ~155 LoC (single test file; no impl changes).
