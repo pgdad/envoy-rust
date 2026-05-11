@@ -15,7 +15,7 @@ use crate::error::Http2Error;
 use crate::request::http_to_envoy_request;
 use crate::response::send_envoy_response;
 use bytes::Bytes;
-use envoy_http1::{BuildOutcome, HCMConfig as Http1HCMConfig, Response, build_response};
+use envoy_http1::{BuildOutcome, HCMConfig as Http1HCMConfig, Request, Response, build_response};
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -96,6 +96,12 @@ async fn handle_one_stream(
     // route walk + dispatch. Counts attempts including malformed bodies.
     config.stats.downstream_rq_total.inc();
 
+    // 06.2 Task 7: capture arrival time-points before the body drain so
+    // the access-log's %START_TIME% and %DURATION% tokens cover the full
+    // per-stream lifecycle (mirrors envoy-http1::serve_connection).
+    let req_arrival_instant = Instant::now();
+    let req_arrival_systime = SystemTime::now();
+
     // Drain the body. For 05.2 fixture 0009 (direct_response) the body is
     // empty; the drain is a no-op. For future fixtures with a body, the
     // unbounded drain is per parent §6 signpost 9 (deferred body-budget
@@ -110,6 +116,7 @@ async fn handle_one_stream(
             .release_capacity(chunk.len())
             .map_err(|source| Http2Error::H2BodyRead { source })?;
     }
+    let request_body_len: u64 = body_bytes.len() as u64;
     let req_with_body = http::Request::from_parts(parts, body_bytes.freeze());
 
     // Translate H2 request → envoy Request value-type.
@@ -119,8 +126,23 @@ async fn handle_one_stream(
     // own connection lifecycle; the close flag is only meaningful for H1.
     let outcome = build_response(&config, &envoy_req, /* close = */ false);
 
+    // 06.2 Task 7: per-stream access-log state. Populated below as the
+    // build/proxy dispatch resolves the final downstream response. The
+    // `upstream_host_for_log_h2` variable is `None` on synth + picker-None
+    // paths and is set to the resolved endpoint on the successful proxy
+    // path before any upstream IO is attempted.
+    let response_status_for_log: u16;
+    let response_body_len: u64;
+    let response_headers_for_log: Vec<(String, String)>;
+    let mut upstream_host_for_log_h2: Option<String> = None;
+
     let resp: Response = match outcome {
-        BuildOutcome::Synth(r) => r,
+        BuildOutcome::Synth(r) => {
+            response_status_for_log = r.status;
+            response_body_len = r.body.len() as u64;
+            response_headers_for_log = r.headers.clone();
+            r
+        }
         BuildOutcome::Proxy {
             cluster: cluster_name,
         } => {
@@ -138,13 +160,37 @@ async fn handle_one_stream(
                 Some(e) => e,
                 None => {
                     tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
-                    return send_envoy_response(send_response, synth_h2_502()).await;
+                    let r = synth_h2_502();
+                    response_status_for_log = r.status;
+                    response_body_len = r.body.len() as u64;
+                    response_headers_for_log = r.headers.clone();
+                    // Funnel through the unified send + access-log
+                    // dispatch site at the bottom of handle_one_stream.
+                    return finalize_h2_stream(
+                        &config,
+                        send_response,
+                        r,
+                        req_arrival_instant,
+                        req_arrival_systime,
+                        &envoy_req,
+                        request_body_len,
+                        response_status_for_log,
+                        response_body_len,
+                        &response_headers_for_log,
+                        upstream_host_for_log_h2,
+                    )
+                    .await;
                 }
             };
 
-            // Extract Host: from the synthesized envoy_req. http_to_envoy_request
-            // always synthesizes host from :authority at the bottom of headers
-            // (per SPEC §6 signpost 12 + request.rs line 74), so the .expect()
+            // 06.2 Task 7: capture the resolved upstream endpoint
+            // for the access-log `%UPSTREAM_HOST%` token.
+            upstream_host_for_log_h2 = Some(endpoint.to_string());
+
+            // Extract Host: from the synthesized envoy_req.
+            // http_to_envoy_request always synthesizes host from
+            // :authority at the bottom of headers (per SPEC §6
+            // signpost 12 + request.rs line 74), so the .expect()
             // is effectively infallible here.
             let host_header = envoy_req
                 .headers
@@ -153,8 +199,9 @@ async fn handle_one_stream(
                 .map(|(_, v)| v.clone())
                 .expect("http_to_envoy_request always synthesizes Host from :authority");
 
-            // Build the outbound request: strip H1 hop-by-hop headers (Connection,
-            // Transfer-Encoding) mirroring envoy-http1/src/hcm.rs:244-248.
+            // Build the outbound request: strip H1 hop-by-hop headers
+            // (Connection, Transfer-Encoding) mirroring
+            // envoy-http1/src/hcm.rs:244-248.
             let mut out_headers = envoy_req.headers.clone();
             out_headers.retain(|(n, _)| {
                 !n.eq_ignore_ascii_case("connection")
@@ -201,7 +248,26 @@ async fn handle_one_stream(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
-                    return send_envoy_response(send_response, synth_h2_502()).await;
+                    let r = synth_h2_502();
+                    response_status_for_log = r.status;
+                    response_body_len = r.body.len() as u64;
+                    response_headers_for_log = r.headers.clone();
+                    // Funnel through the unified send + access-log
+                    // dispatch site at the bottom of handle_one_stream.
+                    return finalize_h2_stream(
+                        &config,
+                        send_response,
+                        r,
+                        req_arrival_instant,
+                        req_arrival_systime,
+                        &envoy_req,
+                        request_body_len,
+                        response_status_for_log,
+                        response_body_len,
+                        &response_headers_for_log,
+                        upstream_host_for_log_h2,
+                    )
+                    .await;
                 }
             };
 
@@ -239,16 +305,129 @@ async fn handle_one_stream(
                 "x-envoy-upstream-service-time".to_string(),
                 elapsed_ms.to_string(),
             ));
-            Response {
+            let proxy_resp = Response {
                 status: upstream_resp.status,
                 reason: upstream_resp.reason,
                 headers,
                 body: upstream_resp.body,
-            }
+            };
+            response_status_for_log = proxy_resp.status;
+            response_body_len = proxy_resp.body.len() as u64;
+            response_headers_for_log = proxy_resp.headers.clone();
+            proxy_resp
         }
     };
 
-    send_envoy_response(send_response, resp).await
+    finalize_h2_stream(
+        &config,
+        send_response,
+        resp,
+        req_arrival_instant,
+        req_arrival_systime,
+        &envoy_req,
+        request_body_len,
+        response_status_for_log,
+        response_body_len,
+        &response_headers_for_log,
+        upstream_host_for_log_h2,
+    )
+    .await
+}
+
+/// 06.2 Task 7: factored per-stream finalization — sends the
+/// downstream response via `send_envoy_response`, then (if the HCM
+/// config carries access-log sinks) builds an `AccessLogRecord` and
+/// emits it once per sink. Mirrors the H1 factored join-point at
+/// `envoy_http1::serve_connection`'s tail.
+///
+/// Per PLAN-write SPEC correction 2 the access-log dispatch lands
+/// AFTER `send_envoy_response` returns (covers both the empty-body
+/// `send_response(.., end_of_stream=true)` branch and the non-empty
+/// `send_data(.., end_of_stream=true)` branch uniformly).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_h2_stream(
+    config: &Arc<HCMConfig>,
+    send_response: h2::server::SendResponse<Bytes>,
+    resp: Response,
+    req_arrival_instant: Instant,
+    req_arrival_systime: SystemTime,
+    envoy_req: &Request,
+    request_body_len: u64,
+    response_status_for_log: u16,
+    response_body_len: u64,
+    response_headers_for_log: &[(String, String)],
+    upstream_host_for_log_h2: Option<String>,
+) -> Result<(), Http2Error> {
+    let send_result = send_envoy_response(send_response, resp).await;
+
+    // 06.2: per-stream access-log dispatch on the H2 path. Mirrors the
+    // H1 factored join-point per parent-06 SPEC §3 D3.2 + PLAN-write
+    // SPEC correction 2. Lands AFTER send_envoy_response returns
+    // (covering both empty-body and non-empty-body emit branches).
+    if !config.access_log.is_empty() {
+        let duration = req_arrival_instant.elapsed();
+        let record = envoy_accesslog::AccessLogRecord {
+            start_time: req_arrival_systime,
+            method: envoy_req.method.clone(),
+            path: x_envoy_original_path_or_path(envoy_req).to_owned(),
+            protocol: "HTTP/2".to_owned(),
+            response_code: response_status_for_log,
+            response_flags: "-".to_owned(),
+            bytes_received: request_body_len,
+            bytes_sent: response_body_len,
+            duration,
+            upstream_service_time: extract_upstream_service_time(response_headers_for_log),
+            forwarded_for: access_log_header_value(&envoy_req.headers, "x-forwarded-for"),
+            user_agent: access_log_header_value(&envoy_req.headers, "user-agent"),
+            request_id: access_log_header_value(&envoy_req.headers, "x-request-id"),
+            authority: access_log_header_value(&envoy_req.headers, "host"),
+            upstream_host: upstream_host_for_log_h2,
+        };
+        for sink in &config.access_log {
+            if let Err(err) = sink.emit(&record).await {
+                tracing::warn!(error = ?err, "access log emission failed");
+            }
+        }
+    }
+
+    send_result
+}
+
+// 06.2 Task 7 — access-log dispatch helpers. Cloned verbatim from
+// `envoy_http1::hcm` (PLAN's recommendation: clone ~30 LoC rather
+// than re-export across the crate boundary). Mirrors the
+// field-population shape expected by `AccessLogRecord` + Envoy's
+// default-format substitutions.
+
+/// Resolve `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%`: returns the value
+/// of `x-envoy-original-path` header if present, else the
+/// request-target/path. Case-insensitive lookup per RFC 7230.
+fn x_envoy_original_path_or_path(req: &Request) -> &str {
+    for (name, value) in &req.headers {
+        if name.eq_ignore_ascii_case("x-envoy-original-path") {
+            return value.as_str();
+        }
+    }
+    req.path.as_str()
+}
+
+/// Case-insensitive header-value lookup returning an owned `String`.
+fn access_log_header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+/// Parse the upstream's `x-envoy-upstream-service-time` response
+/// header (integer milliseconds per envoy-rust's own injection in
+/// `router::write_proxied_response` / the H2 proxy arm above) into a
+/// `Duration`. Returns `None` when the header is absent or the value
+/// isn't a parseable `u64`.
+fn extract_upstream_service_time(headers: &[(String, String)]) -> Option<std::time::Duration> {
+    let v = access_log_header_value(headers, "x-envoy-upstream-service-time")?;
+    let ms: u64 = v.parse().ok()?;
+    Some(std::time::Duration::from_millis(ms))
 }
 
 /// Emit a generic 502 Bad Gateway response with no body. Used by
@@ -928,6 +1107,139 @@ static_resources:
             cx_counter.value(),
             1,
             "expected exactly one downstream_rq_total increment per H2 stream",
+        );
+    }
+
+    // ----- 06.2 Task 7: H2 access-log wiring tests -----
+
+    /// Build an HCMConfig with a single VH `domains: ["*"]`, a single
+    /// `/`-prefix DirectResponse route returning 200 `ok\n`, and the
+    /// supplied access-log sinks. Mirrors envoy-http1's
+    /// `hcm_config_with_access_log` (the field already exists via the
+    /// 05.2 D1 type-aliased `HCMConfig`).
+    async fn h2_hcm_config_with_access_log(
+        sinks: Vec<Arc<envoy_accesslog::FileSink>>,
+    ) -> Arc<Http1HCMConfig> {
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            // Bypass envoy-config's AccessLog parsing — directly seed
+            // the materialized sinks below.
+            access_log: vec![],
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+            .await
+            .expect("build HCM config");
+        built.access_log = sinks;
+        Arc::new(built)
+    }
+
+    /// Open a FileSink at each path, drive one direct-response GET /
+    /// request through an in-process H2 HCM, drop the sinks (forcing
+    /// flush at file close), and return the per-sink line contents.
+    /// Mirrors envoy-http1's `serve_one_request_with_access_log`.
+    async fn serve_one_h2_request_with_access_log(
+        paths: &[std::path::PathBuf],
+    ) -> Vec<Vec<String>> {
+        let mut sinks: Vec<Arc<envoy_accesslog::FileSink>> = Vec::new();
+        for p in paths {
+            sinks.push(Arc::new(
+                envoy_accesslog::FileSink::new(p.clone())
+                    .await
+                    .expect("open sink"),
+            ));
+        }
+        let config = h2_hcm_config_with_access_log(sinks).await;
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        // Brief settle: the access-log emit happens inside the
+        // server's per-stream `tokio::spawn` (see
+        // `serve_h2_connection`), which only writes to the FileSink
+        // AFTER `send_envoy_response` returns. 200ms is enough headroom
+        // for the spawn to drain + flush its line on a loaded macOS
+        // runner; mirrors the H1 test's `sleep(50ms)` posture inflated
+        // for the extra H2 codec turn.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut result: Vec<Vec<String>> = Vec::new();
+        for p in paths {
+            let contents = tokio::fs::read_to_string(p).await.unwrap_or_default();
+            let lines: Vec<String> = contents.lines().map(str::to_owned).collect();
+            result.push(lines);
+        }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h2_with_file_access_log_writes_one_line_per_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let lines_per_sink =
+            serve_one_h2_request_with_access_log(std::slice::from_ref(&path)).await;
+        assert_eq!(lines_per_sink.len(), 1);
+        assert_eq!(lines_per_sink[0].len(), 1);
+        let line = &lines_per_sink[0][0];
+        assert!(line.contains("\"GET / HTTP/2\""), "line: {}", line);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h2_records_protocol_as_http2_on_h2_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let lines_per_sink =
+            serve_one_h2_request_with_access_log(std::slice::from_ref(&path)).await;
+        let line = &lines_per_sink[0][0];
+        assert!(line.contains("HTTP/2"), "line: {}", line);
+        assert!(
+            !line.contains("HTTP/1.1"),
+            "line should not contain HTTP/1.1: {}",
+            line
         );
     }
 }

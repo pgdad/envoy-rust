@@ -16,6 +16,7 @@ bytes = "1"
 tokio = { version = "1", features = ["net", "io-util", "macros", "sync", "time"] }
 thiserror = "2"
 tracing = "0.1"
+envoy-accesslog = { path = "../envoy-accesslog" }
 envoy-config = { path = "../envoy-config" }
 envoy-listener = { path = "../envoy-listener" }
 envoy-http1 = { path = "../envoy-http1" }
@@ -24,3 +25,5 @@ envoy-stats = { path = "../envoy-stats" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+envoy-accesslog = { path = "../envoy-accesslog", features = ["test-util"] }
+tempfile = "3"

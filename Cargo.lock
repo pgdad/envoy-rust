@@ -416,6 +416,7 @@ name = "envoy-http2"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "envoy-accesslog",
  "envoy-cluster",
  "envoy-config",
  "envoy-http1",
@@ -423,6 +424,7 @@ dependencies = [
  "envoy-stats",
  "h2",
  "http",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
