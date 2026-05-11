@@ -292,3 +292,99 @@ prometheus_exposition` (no new fields) deserializes correctly via the
 ### Carryforward closures
 
 None. This task closes no open carryforwards.
+
+## Task 4 — per-response-class HCM counters + 06.2 REVIEW I1 H1 state-init tightening (task 4 commit)
+
+### Work summary
+
+Extended `HCMStats` with 4 new per-class counter fields
+(`downstream_rq_2xx`, `downstream_rq_3xx`, `downstream_rq_4xx`,
+`downstream_rq_5xx`) registered under the `http.<stat_prefix>.*`
+namespace. Wired the increment block at the factored post-`match outcome`
+site in `crates/envoy-http1/src/hcm.rs` (after all 5 writer arms have
+populated `response_status_for_log`, BEFORE the 06.2 access-log dispatch).
+Added the symmetric increment block inside `finalize_h2_stream` in
+`crates/envoy-http2/src/hcm.rs` immediately before the `if !config.access_log.is_empty()`
+guard. Status codes outside [200, 600) silently no-op per the `_ => {}`
+arm (1xx informational and non-standard 6xx not in the per-class family
+per Envoy v1.33.0 stats docs).
+
+Co-located fix for 06.2 REVIEW I1: tightened H1 state-init at
+`crates/envoy-http1/src/hcm.rs` from `let mut x = 0/default` to
+`let x;` / `let mut x;` (no initializer), mirroring H2's stricter posture.
+The tightening required restructuring the Proxy arm's no-endpoint path
+from a `match pick_endpoint() { None => { ... assign ... None } } / if let
+Some(endpoint) = endpoint` pattern into a direct `if let Some(endpoint) =
+cluster.pick_endpoint() { ... } else { ... assign ... }` pattern (see
+deviation note below).
+
+Also updated the `0011-admin-stats-prometheus` fixture's
+`allowlist_envoy_rust_only` to include the 4 new counter names (the
+differential test caught these as `envoy-rust-only` entries, expected
+per the current StatsRegistry name-embedding convention that defers label
+projection to a later phase).
+
+### Tests landed (5 new unit tests in `crates/envoy-http1/src/hcm.rs::tests`)
+
+1. `hcm_increments_downstream_rq_2xx_on_2xx_response` — 200 direct-response
+   route; asserts `downstream_rq_2xx = 1`, `3xx/4xx/5xx = 0`, `total = 1`.
+2. `hcm_increments_downstream_rq_3xx_on_3xx_response` — 301 direct-response
+   route; asserts `downstream_rq_3xx = 1`, others 0, `total = 1`.
+3. `hcm_increments_downstream_rq_4xx_on_4xx_response` — 404 direct-response
+   route; asserts `downstream_rq_4xx = 1`, others 0, `total = 1`.
+4. `hcm_increments_downstream_rq_5xx_on_5xx_response` — 503 direct-response
+   route; asserts `downstream_rq_5xx = 1`, others 0, `total = 1`.
+5. `hcm_h1_state_init_writes_in_all_5_writer_arms` — drives a 200
+   direct-response request with a file access-log sink; asserts the emitted
+   line contains "200". Acts as a regression witness for the I1 state-init
+   tightening: any future refactor that removes a writer arm's assignment
+   fails at compile time (E0381). The existing 06.2 Task-6 access-log tests
+   cover the 4 proxy sub-arms indirectly; this test adds an explicit named
+   regression target for the I1 fix.
+
+### Deviations from PLAN
+
+1. **H1 proxy arm restructured for state-init tightening.** The PLAN's
+   verbatim after-shape shows `let x;` (plain immutable definite-init).
+   Achievable for `response_status_for_log` and `response_body_len` only after
+   restructuring the no-endpoint path from the original
+   `match pick_endpoint() { None => { assign; None } }` + `if let Some`
+   pattern to `if let Some(endpoint) = cluster.pick_endpoint() { ... } else
+   { assign; }`. The restructuring is semantically identical (same warn log,
+   same 503 synthesis, same fall-through to the dispatch site) but required
+   moving the no-endpoint warn + response-write into the `else` branch to give
+   Rust's flow analysis a clean split. `response_headers_for_log` stays `let
+   mut` (no initializer) because the proxy-success arm calls `.push()` after
+   initial assignment. The net result is the same no-sentinel guarantee the
+   PLAN intended: any arm that fails to assign produces an E0381
+   use-of-possibly-uninitialized compile error. Deviation recorded per D-3.5.
+
+2. **Fixture 0011 `allowlist_envoy_rust_only` updated** (not mentioned in
+   PLAN). The differential `admin_stats_prometheus` test caught the 4 new
+   counter names as `envoy-rust-only` entries. Added with a doc comment
+   linking to the Prometheus shape divergence rationale (same as the existing
+   `downstream_rq_total` / `downstream_cx_total` entries). This is expected
+   behavior: the stat_prefix-embedded naming convention defers label projection
+   per the standing StatsTagExtractor carryforward.
+
+### LoC delta
+
+- `crates/envoy-http1/src/hcm.rs`: +~170 LoC (4 new struct fields + register
+  calls +3 LoC; per-class increment block ~10 LoC; state-init tightening
+  with restructured proxy arm ~10 LoC change; 5 new tests + helper ~170 LoC).
+- `crates/envoy-http2/src/hcm.rs`: +~10 LoC (per-class increment block).
+- `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`: +~12 LoC
+  (4 new allow-list entries with doc comment).
+- Total net-new code+tests: ~195 LoC (PLAN estimated ~50 LoC; actual is
+  higher due to the test helper + 5 verbose tests and the proxy-arm
+  restructuring needed for the state-init tightening).
+
+### Carryforward closures
+
+- **06.2 REVIEW I1** — closed substantively at this task.
+  H1 state-vars at `crates/envoy-http1/src/hcm.rs` now use `let x;` /
+  `let mut x;` (no default sentinel) mirroring H2's stricter posture at
+  `crates/envoy-http2/src/hcm.rs:134`. Rust flow analysis enforces the
+  write-before-read invariant at compile time. Regression test
+  `hcm_h1_state_init_writes_in_all_5_writer_arms` provides a named test
+  as the regression anchor.

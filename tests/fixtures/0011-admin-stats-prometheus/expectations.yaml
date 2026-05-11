@@ -260,4 +260,15 @@ driver:
     # dynamic segment into a label, both lists drop these entries together.
     allowlist_envoy_rust_only:
       - envoy_http_ingress_http_downstream_rq_total
+      # 06.3 D15.3.a: per-response-class HCM counters. Envoy emits these
+      # as `envoy_http_downstream_rq_xx` (generic) with a label-keyed tag
+      # approach; envoy-rust embeds the stat_prefix in the name per its
+      # current StatsRegistry convention (no label/tag extraction yet).
+      # Both entries (downstream_rq_xx on the envoy-only side and these
+      # four name-embedded variants on the envoy-rust-only side) will drop
+      # together when a StatsTagExtractor-equivalent lands.
+      - envoy_http_ingress_http_downstream_rq_2xx
+      - envoy_http_ingress_http_downstream_rq_3xx
+      - envoy_http_ingress_http_downstream_rq_4xx
+      - envoy_http_ingress_http_downstream_rq_5xx
       - envoy_listener_ingress_http_downstream_cx_total

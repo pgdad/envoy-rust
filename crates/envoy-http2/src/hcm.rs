@@ -360,6 +360,19 @@ async fn finalize_h2_stream(
 ) -> Result<(), Http2Error> {
     let send_result = send_envoy_response(send_response, resp).await;
 
+    // 06.3 D15.3.a NEW — symmetric per-response-class HCM counter increment
+    // on the H2 path. Uses the `response_status_for_log` parameter already
+    // threaded through finalize_h2_stream from each H2 writer arm. The
+    // `envoy_http2::HCMConfig` type alias makes `config.stats.downstream_rq_Nxx`
+    // resolve via the envoy_http1::HCMStats struct.
+    match response_status_for_log / 100 {
+        2 => config.stats.downstream_rq_2xx.inc(),
+        3 => config.stats.downstream_rq_3xx.inc(),
+        4 => config.stats.downstream_rq_4xx.inc(),
+        5 => config.stats.downstream_rq_5xx.inc(),
+        _ => {}
+    }
+
     // 06.2: per-stream access-log dispatch on the H2 path. Mirrors the
     // H1 factored join-point per parent-06 SPEC §3 D3.2 + PLAN-write
     // SPEC correction 2. Lands AFTER send_envoy_response returns

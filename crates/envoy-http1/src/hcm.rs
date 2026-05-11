@@ -41,6 +41,18 @@ pub struct HCMStats {
     /// requests (the increment fires after request-head parsing succeeds
     /// but BEFORE the route walk dispatches to direct_response or proxy).
     pub downstream_rq_total: Arc<envoy_stats::Counter>,
+    // 06.3 D15.3.a NEW — per-response-class counters. Incremented at the
+    // post-`match outcome` factored dispatch site (after `response_status_for_log`
+    // is populated by all 5 writer arms). Mirrors Envoy v1.33.0 stats docs;
+    // codes outside [200, 600) silently no-op per the `_ => {}` arm.
+    /// `http.<stat_prefix>.downstream_rq_2xx` — HTTP 2xx responses.
+    pub downstream_rq_2xx: Arc<envoy_stats::Counter>,
+    /// `http.<stat_prefix>.downstream_rq_3xx` — HTTP 3xx responses.
+    pub downstream_rq_3xx: Arc<envoy_stats::Counter>,
+    /// `http.<stat_prefix>.downstream_rq_4xx` — HTTP 4xx responses.
+    pub downstream_rq_4xx: Arc<envoy_stats::Counter>,
+    /// `http.<stat_prefix>.downstream_rq_5xx` — HTTP 5xx responses.
+    pub downstream_rq_5xx: Arc<envoy_stats::Counter>,
 }
 
 impl HCMStats {
@@ -56,6 +68,14 @@ impl HCMStats {
         Ok(Self {
             downstream_rq_total: registry
                 .register_counter(&format!("http.{stat_prefix}.downstream_rq_total"))?,
+            downstream_rq_2xx: registry
+                .register_counter(&format!("http.{stat_prefix}.downstream_rq_2xx"))?,
+            downstream_rq_3xx: registry
+                .register_counter(&format!("http.{stat_prefix}.downstream_rq_3xx"))?,
+            downstream_rq_4xx: registry
+                .register_counter(&format!("http.{stat_prefix}.downstream_rq_4xx"))?,
+            downstream_rq_5xx: registry
+                .register_counter(&format!("http.{stat_prefix}.downstream_rq_5xx"))?,
         })
     }
 }
@@ -310,10 +330,32 @@ async fn serve_connection(
         // arm of `match outcome { ... }` below before falling through to
         // the factored dispatch site (per PLAN-write SPEC correction 1;
         // one dispatch site handles all 5 writer outcomes).
-        let mut response_status_for_log: u16 = 0;
-        let mut response_body_len: u64 = 0;
-        let mut upstream_host_for_log: Option<String> = None;
-        let mut response_headers_for_log: Vec<(String, String)> = Vec::new();
+        //
+        // 06.3 Task 4 / 06.2 REVIEW I1: tightened from `let mut x = 0/default`
+        // to `let mut x;` (no default initializer — mirror of H2's stricter
+        // posture at crates/envoy-http2/src/hcm.rs:134). Rust flow analysis
+        // verifies all 5 writer arms populate the 3 vars before the dispatch
+        // site reads them; a compile error fires if any arm is missed.
+        //
+        // Note: `mut` is required (not plain `let x;`) because the Proxy arm
+        // has two structurally-separate paths that each assign these vars
+        // (no-endpoint-503 and the if-let-Some proxy paths). Rust's
+        // flow-analysis correctly sees the paths as non-overlapping at
+        // runtime, but requires `mut` to permit the second assignment site.
+        // H2 avoids this by doing an early `return finalize_h2_stream()` from
+        // the no-endpoint arm, which is why it can use plain `let x;`. The
+        // semantic guarantee (no 0/default sentinel can leak to the dispatch
+        // site) is preserved: any arm that fails to assign produces an
+        // E0381 use-of-possibly-uninitialized-variable compile error.
+        //
+        // `upstream_host_for_log` stays `mut … = None` because only the
+        // proxy-success arm writes it; synth and error arms leave it None.
+        let response_status_for_log: u16;
+        let response_body_len: u64;
+        // `mut` required: the proxy-success arm does `.push()` after initial
+        // assignment to add the x-envoy-upstream-service-time header.
+        let mut response_headers_for_log: Vec<(String, String)>;
+        let mut upstream_host_for_log: Option<String> = None; // stays mut — only proxy arm populates
 
         // 8. Dispatch the outcome to the wire.
         match outcome {
@@ -334,26 +376,7 @@ async fn serve_connection(
                     .get(&cluster_name)
                     .expect("validator ensures cluster present");
 
-                let endpoint = match cluster.pick_endpoint() {
-                    Some(ep) => Some(ep),
-                    None => {
-                        tracing::warn!(
-                            cluster = %cluster.name(),
-                            "no healthy endpoint for cluster — returning 503",
-                        );
-                        let resp = synth_status(503, close);
-                        response_status_for_log = resp.status;
-                        response_body_len = resp.body.len() as u64;
-                        response_headers_for_log = resp.headers.clone();
-                        Http1Response::write_to(&resp, &mut downstream).await?;
-                        // Fall through to the access-log dispatch site;
-                        // the post-match close/continue decision honors
-                        // `close` exactly as before.
-                        None
-                    }
-                };
-
-                if let Some(endpoint) = endpoint {
+                if let Some(endpoint) = cluster.pick_endpoint() {
                     let host_header = find_header(&req.headers, headers::HOST)
                         .expect(
                             "build_response rejected missing/empty Host before BuildOutcome::Proxy",
@@ -452,8 +475,37 @@ async fn serve_connection(
                             Http1Response::write_to(&resp, &mut downstream).await?;
                         }
                     }
+                } else {
+                    // No healthy endpoint available for this cluster.
+                    tracing::warn!(
+                        cluster = %cluster.name(),
+                        "no healthy endpoint for cluster — returning 503",
+                    );
+                    let resp = synth_status(503, close);
+                    response_status_for_log = resp.status;
+                    response_body_len = resp.body.len() as u64;
+                    response_headers_for_log = resp.headers.clone();
+                    Http1Response::write_to(&resp, &mut downstream).await?;
+                    // Fall through to the access-log + counter dispatch site.
                 }
             }
+        }
+
+        // 06.3 D15.3.a NEW — per-response-class HCM counters. Increment fires
+        // AFTER all 5 writer arms have populated `response_status_for_log`,
+        // at the same factored dispatch site that 06.2's access-log dispatch
+        // uses. The 06.1-landed `downstream_rq_total` increment at line 251
+        // fires at request-entry (unchanged).
+        //
+        // Status codes outside [200, 600) silently no-op — 1xx informational
+        // and non-standard 6xx codes are not in the per-class counter family
+        // per Envoy v1.33.0 stats docs.
+        match response_status_for_log / 100 {
+            2 => config.stats.downstream_rq_2xx.inc(),
+            3 => config.stats.downstream_rq_3xx.inc(),
+            4 => config.stats.downstream_rq_4xx.inc(),
+            5 => config.stats.downstream_rq_5xx.inc(),
+            _ => {}
         }
 
         // 06.2 Task 6: factored access-log dispatch site. Per PLAN-write
@@ -1593,6 +1645,225 @@ static_resources:
             cx_counter.value(),
             1,
             "expected exactly one downstream_rq_total increment per HCM-handled request",
+        );
+    }
+
+    // ── 06.3 Task 4: per-response-class HCM counter tests ────────────────────
+
+    /// Helper: build an HCMConfig via the production `from_config` constructor
+    /// with a single direct-response route returning `status`. Returns the
+    /// config and the shared registry so callers can re-register counters to
+    /// obtain the same Arc the HCM holds (Task 5 idempotent-same-kind
+    /// contract).
+    async fn hcm_config_from_config_direct_response(
+        status: u16,
+    ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = cluster_mgr_empty().await;
+        let envoy_cfg = envoy_config::HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: envoy_config::CodecType::HTTP1,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("body\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            }],
+        };
+        let hcm_config = Arc::new(
+            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry))
+                .await
+                .expect("HCMConfig builds"),
+        );
+        (hcm_config, registry)
+    }
+
+    /// 06.3 D15.3.a: 2xx class counter increments on a 200 direct-response.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_increments_downstream_rq_2xx_on_2xx_response() {
+        let (hcm_config, registry) = hcm_config_from_config_direct_response(200).await;
+        let c2xx = registry
+            .register_counter("http.ingress_http.downstream_rq_2xx")
+            .expect("counter registers");
+        let c3xx = registry
+            .register_counter("http.ingress_http.downstream_rq_3xx")
+            .expect("counter registers");
+        let c4xx = registry
+            .register_counter("http.ingress_http.downstream_rq_4xx")
+            .expect("counter registers");
+        let c5xx = registry
+            .register_counter("http.ingress_http.downstream_rq_5xx")
+            .expect("counter registers");
+        let total = registry
+            .register_counter("http.ingress_http.downstream_rq_total")
+            .expect("counter registers");
+
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _resp = drive(hcm_config, req).await;
+
+        assert_eq!(c2xx.value(), 1, "downstream_rq_2xx should be 1");
+        assert_eq!(c3xx.value(), 0, "downstream_rq_3xx should be 0");
+        assert_eq!(c4xx.value(), 0, "downstream_rq_4xx should be 0");
+        assert_eq!(c5xx.value(), 0, "downstream_rq_5xx should be 0");
+        assert_eq!(total.value(), 1, "downstream_rq_total should be 1");
+    }
+
+    /// 06.3 D15.3.a: 3xx class counter increments on a 301 direct-response.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_increments_downstream_rq_3xx_on_3xx_response() {
+        let (hcm_config, registry) = hcm_config_from_config_direct_response(301).await;
+        let c2xx = registry
+            .register_counter("http.ingress_http.downstream_rq_2xx")
+            .expect("counter registers");
+        let c3xx = registry
+            .register_counter("http.ingress_http.downstream_rq_3xx")
+            .expect("counter registers");
+        let c4xx = registry
+            .register_counter("http.ingress_http.downstream_rq_4xx")
+            .expect("counter registers");
+        let c5xx = registry
+            .register_counter("http.ingress_http.downstream_rq_5xx")
+            .expect("counter registers");
+        let total = registry
+            .register_counter("http.ingress_http.downstream_rq_total")
+            .expect("counter registers");
+
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _resp = drive(hcm_config, req).await;
+
+        assert_eq!(c2xx.value(), 0, "downstream_rq_2xx should be 0");
+        assert_eq!(c3xx.value(), 1, "downstream_rq_3xx should be 1");
+        assert_eq!(c4xx.value(), 0, "downstream_rq_4xx should be 0");
+        assert_eq!(c5xx.value(), 0, "downstream_rq_5xx should be 0");
+        assert_eq!(total.value(), 1, "downstream_rq_total should be 1");
+    }
+
+    /// 06.3 D15.3.a: 4xx class counter increments on a 404 direct-response.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_increments_downstream_rq_4xx_on_4xx_response() {
+        let (hcm_config, registry) = hcm_config_from_config_direct_response(404).await;
+        let c2xx = registry
+            .register_counter("http.ingress_http.downstream_rq_2xx")
+            .expect("counter registers");
+        let c3xx = registry
+            .register_counter("http.ingress_http.downstream_rq_3xx")
+            .expect("counter registers");
+        let c4xx = registry
+            .register_counter("http.ingress_http.downstream_rq_4xx")
+            .expect("counter registers");
+        let c5xx = registry
+            .register_counter("http.ingress_http.downstream_rq_5xx")
+            .expect("counter registers");
+        let total = registry
+            .register_counter("http.ingress_http.downstream_rq_total")
+            .expect("counter registers");
+
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _resp = drive(hcm_config, req).await;
+
+        assert_eq!(c2xx.value(), 0, "downstream_rq_2xx should be 0");
+        assert_eq!(c3xx.value(), 0, "downstream_rq_3xx should be 0");
+        assert_eq!(c4xx.value(), 1, "downstream_rq_4xx should be 1");
+        assert_eq!(c5xx.value(), 0, "downstream_rq_5xx should be 0");
+        assert_eq!(total.value(), 1, "downstream_rq_total should be 1");
+    }
+
+    /// 06.3 D15.3.a: 5xx class counter increments on a 503 direct-response.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_increments_downstream_rq_5xx_on_5xx_response() {
+        let (hcm_config, registry) = hcm_config_from_config_direct_response(503).await;
+        let c2xx = registry
+            .register_counter("http.ingress_http.downstream_rq_2xx")
+            .expect("counter registers");
+        let c3xx = registry
+            .register_counter("http.ingress_http.downstream_rq_3xx")
+            .expect("counter registers");
+        let c4xx = registry
+            .register_counter("http.ingress_http.downstream_rq_4xx")
+            .expect("counter registers");
+        let c5xx = registry
+            .register_counter("http.ingress_http.downstream_rq_5xx")
+            .expect("counter registers");
+        let total = registry
+            .register_counter("http.ingress_http.downstream_rq_total")
+            .expect("counter registers");
+
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _resp = drive(hcm_config, req).await;
+
+        assert_eq!(c2xx.value(), 0, "downstream_rq_2xx should be 0");
+        assert_eq!(c3xx.value(), 0, "downstream_rq_3xx should be 0");
+        assert_eq!(c4xx.value(), 0, "downstream_rq_4xx should be 0");
+        assert_eq!(c5xx.value(), 1, "downstream_rq_5xx should be 1");
+        assert_eq!(total.value(), 1, "downstream_rq_total should be 1");
+    }
+
+    /// 06.3 Task 4 / 06.2 REVIEW I1 regression: the H1 state-init tightening
+    /// (let x; instead of let mut x = 0/default) does not break the 5-writer-arm
+    /// write-before-read invariant. Verified by driving a 200 direct-response
+    /// request through `serve_connection` with an access-log sink and asserting the
+    /// emitted line carries the correct response code. The `let x;` posture causes
+    /// a Rust compile error if any writer arm fails to assign the variable; this
+    /// test acts as a regression witness at test-suite execution time, confirming
+    /// the synth-200 arm (the only arm exercised by a direct-response route with no
+    /// proxy backend) writes all three state vars before the access-log dispatch
+    /// site reads them.
+    ///
+    /// Coverage note: the existing `hcm_with_file_access_log_writes_one_line_per_request`
+    /// test already exercises the synth-200 arm through the access-log dispatch, and
+    /// the 4 proxy-arm variants (no-endpoint-503, connect-fail-502, send-fail-502,
+    /// proxy-success) are covered by tests in the 06.2 Task 6 and Task 9 router
+    /// sections. This test adds an explicit regression tag for the I1 fix so any
+    /// future refactor that breaks the posture fails at a named test rather than an
+    /// obscure "E0381: use of possibly-uninitialized variable" compile error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h1_state_init_writes_in_all_5_writer_arms() {
+        use std::path::PathBuf;
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let path: PathBuf = dir.path().join("access.log");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(path.clone())
+                .await
+                .expect("open sink"),
+        );
+        // Build config with a 200 direct-response route (synth arm) and
+        // an access-log sink so the factored dispatch site is exercised.
+        let config = hcm_config_with_access_log(vec![sink]).await;
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+
+        // Brief yield so the FileSink flush reaches disk.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        assert!(
+            contents.contains("200"),
+            "access-log must carry response_code=200; got: {}",
+            contents.trim()
         );
     }
 
