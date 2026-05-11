@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/envoy-accesslog",
     "crates/envoy-admin",
     "crates/envoy-bin",
     "crates/envoy-cluster",

@@ -1,0 +1,21 @@
+[package]
+name = "envoy-accesslog"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+name = "envoy_accesslog"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["fs", "io-util", "sync"] }
+bytes = "1"
+tracing = "0.1"
+thiserror = "2"
+envoy-http1 = { path = "../envoy-http1" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time"] }
+tempfile = "3"

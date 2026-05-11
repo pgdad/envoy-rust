@@ -66,3 +66,24 @@ The 11 PLAN tasks are numbered for documentation. The recommended **execution or
 ## Tasks 2 through 11
 
 Appended at execution time, one section per task commit, mirroring the 06.1 / 05.x per-task cadence.
+
+## Task 2 — envoy-accesslog crate scaffold + record + error + sink placeholder
+
+Lands the new `crates/envoy-accesslog/` workspace member per SPEC §3 D1.2.
+
+**Modules created:**
+- `crates/envoy-accesslog/Cargo.toml` — 5 deps (tokio fs+io-util+sync, bytes, tracing, thiserror, envoy-http1 path-dep); `tempfile = "3"` as dev-dep per architecture decision 16.
+- `crates/envoy-accesslog/src/lib.rs` — crate root with `#![forbid(unsafe_code)]` + 5 module declarations + 3 public re-exports.
+- `crates/envoy-accesslog/src/record.rs` — 15-field `AccessLogRecord` struct + 2 unit tests.
+- `crates/envoy-accesslog/src/error.rs` — 3-variant `AccessLogError` (`Open`, `Write`, `InvalidPath`).
+- `crates/envoy-accesslog/src/sink.rs` — doc-comment-only placeholder explaining option-(c) deferral.
+- `crates/envoy-accesslog/src/default_format.rs` — placeholder for Task 3.
+- `crates/envoy-accesslog/src/file_sink.rs` — placeholder (`pub struct FileSink;` stub for `pub use`).
+
+**Workspace registration:** `Cargo.toml` `[workspace] members` += `"crates/envoy-accesslog"` (alphabetically first).
+
+**Tests:** `cargo test -p envoy-accesslog` → `test result: ok. 2 passed; 0 failed` (the two `record::tests::*` cases).
+
+**Workspace gates:** `cargo build --workspace --all-targets` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo fmt --all -- --check` clean (after a `cargo fmt --all` pass — initial fmt-check reported drift in the auto-generated module ordering of `lib.rs`, struct-variant expansion in `error.rs`, and the long `assert!` wrap in `record.rs`; `cargo fmt --all` applied, re-verified clean per R-9).
+
+**LoC:** ~165 LoC (the 5 module files + Cargo.toml + workspace `members` line).
