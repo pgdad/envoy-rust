@@ -893,6 +893,11 @@ static_resources:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cluster_upstream_protocol_http2_set_from_typed_extension_protocol_options() {
+        // 06.3 D14.3: changed from codec_type HTTP1 → HTTP2 so the H2 cluster
+        // target remains valid under the new H1×H2 reachability gate. The
+        // purpose of this test is to verify UpstreamProtocol::Http2 is set from
+        // typed_extension_protocol_options; HTTP2 listener + H2 cluster is the
+        // correct canonical shape for that combination.
         let yaml = r#"
 node: { id: x, cluster: y }
 admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
@@ -906,7 +911,7 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress
-                codec_type: HTTP1
+                codec_type: HTTP2
                 route_config:
                   name: r
                   virtual_hosts:

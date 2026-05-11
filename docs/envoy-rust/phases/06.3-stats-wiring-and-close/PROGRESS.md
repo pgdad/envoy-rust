@@ -145,3 +145,81 @@ state-3 each as their own commit.
 Per BOOTSTRAP_PROMPT.md §5.1 "one state per session": this session lands the
 state-2 commit and exits; the next session enters state 3 and executes Task 2
 (D14.3 validator gate) via `superpowers:subagent-driven-development`.
+
+## Task 2 — D14.3 `Http2ClusterFromHttp1Listener` parse-time validator gate (task 2 commit)
+
+### Work summary
+
+Added a new `ConfigError::Http2ClusterFromHttp1Listener { listener: String, cluster: String }`
+variant to `crates/envoy-config/src/lib.rs` and wired a H1×H2 reachability gate
+inside `validate_hcm` in `crates/envoy-config/src/bootstrap.rs`. The gate fires
+when a listener with `codec_type: HTTP1` or `AUTO` has a route pointing to a
+cluster whose `typed_extension_protocol_options.HttpProtocolOptions.
+explicit_http_config.http2_protocol_options` is set. This closes 05.3 REVIEW I1
+substantively: ADR-0028's option-(B) deferral of the H1-listener × H2-arm
+dispatch remains correct doctrine, but the deferred path is now visibly rejected
+at config-load time so operators don't get a confusing 502 (or silent H1-on-the-
+wire to an H2-only backend) at runtime.
+
+### Tests landed (6 unit tests; ~245 LoC total new test code)
+
+All six tests reside in `crates/envoy-config/src/bootstrap.rs::tests`:
+
+1. `validates_h1_listener_with_h1_cluster_passes` — codec_type HTTP1 + cluster
+   with no `typed_extension_protocol_options` → validator accepts.
+2. `validates_h2_listener_with_h2_cluster_passes` — codec_type HTTP2 + cluster
+   with `http2_protocol_options` → validator accepts.
+3. `validates_h2_listener_with_h1_cluster_passes` — codec_type HTTP2 + cluster
+   with no `typed_extension_protocol_options` → validator accepts (load-bearing
+   per 05.3 D4: H2 listener proxying to H1 cluster must keep working).
+4. `rejects_h1_listener_with_h2_cluster` — codec_type HTTP1 + H2 cluster →
+   `ConfigError::Http2ClusterFromHttp1Listener { listener: "ingress_http",
+   cluster: "backend" }`. Both fields asserted.
+5. `rejects_auto_listener_with_h2_cluster` — codec_type AUTO + H2 cluster →
+   same rejection. AUTO treated as H1-only per parent §4.
+6. `tcp_proxy_listener_with_h2_cluster_unaffected` — TCP-proxy listener (no HCM,
+   no codec_type) + H2 cluster → validator accepts. Gate is HCM-scoped only.
+
+### Implementation notes
+
+- `validate_hcm`'s signature extended with `listener_name: &str`; call site at
+  line 1214 updated to pass `&listener.name`.
+- The H1×H2 check uses `if let Some(teo) = ... && teo...is_some()` (collapsed
+  per `clippy::collapsible_if` lint) after the existing `UnknownCluster` guard,
+  using `iter().find()` consistent with the adjacent code per the PLAN's
+  minimal-diff guidance.
+
+### Deviations from PLAN
+
+1. **Two pre-existing tests updated** (not mentioned in PLAN): two tests from
+   prior phases used `codec_type: HTTP1` + H2 cluster to test unrelated
+   parse-surface behavior, not codec-gate behavior; both now reject under the new
+   gate. Updated to `codec_type: HTTP2` with a brief comment:
+   - `crates/envoy-config/src/bootstrap.rs::parses_cluster_with_typed_extension_protocol_options_http2`
+     (05.3-landed; tests typed_extension parse path).
+   - `crates/envoy-cluster/src/cluster.rs::cluster_upstream_protocol_http2_set_from_typed_extension_protocol_options`
+     (05.3-landed; tests UpstreamProtocol::Http2 resolution).
+   The semantics of both tests are preserved; only the listener codec_type was
+   wrong relative to the gate's intent.
+2. **Clippy `collapsible_if` lint** triggered on the nested `if let Some(teo)` +
+   `if teo...is_some()` pattern. Applied the clippy-suggested `&&`-collapse; the
+   resulting form (`if let Some(teo) = ... && teo...is_some()`) is idiomatic
+   and passes `cargo clippy --workspace --all-targets --all-features -D warnings`.
+
+### LoC delta
+
+- `crates/envoy-config/src/lib.rs`: +16 LoC (variant + rustdoc).
+- `crates/envoy-config/src/bootstrap.rs`: +256 LoC (6 tests + gate logic +
+  signature extension); 2 existing tests updated (~8 LoC changed, not net-new).
+- `crates/envoy-cluster/src/cluster.rs`: +7 LoC (comment in updated test).
+- Total net-new code+tests: ~279 LoC (PLAN estimated ~130; growth is test
+  verbosity — each YAML fixture is ~40 LoC; PLAN's ~100-LoC test estimate
+  assumed more compact fixtures).
+
+### Carryforward closures
+
+- **05.3 REVIEW I1** — closed substantively at this task.
+  The H1-listener × H2-cluster combination is now rejected at parse/config-load
+  time with a descriptive error naming both the listener and cluster. The ADR-0028
+  option-(B) H1-listener H2-arm dispatch deferral remains correct doctrine; the
+  deferred path is now guarded rather than silently mis-wired.

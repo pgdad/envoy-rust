@@ -1211,7 +1211,12 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                         let TypedConfig::HttpConnectionManager(hcm) = typed else {
                             return Err(crate::ConfigError::MissingTypedConfig(crate::HCM_FILTER));
                         };
-                        validate_hcm(hcm, &bootstrap.static_resources.clusters, chain_has_tls)?;
+                        validate_hcm(
+                            hcm,
+                            &bootstrap.static_resources.clusters,
+                            chain_has_tls,
+                            &listener.name,
+                        )?;
                     }
                     _ => {
                         return Err(crate::ConfigError::UnsupportedFilter(
@@ -1288,10 +1293,14 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
 /// `chain_has_tls` is the enclosing `filter_chain.transport_socket.is_some()`
 /// folded down to a bool; phase 05.2 SPEC §3 D2.a uses it to reject
 /// `codec_type: HTTP2` on TLS chains (TLS+ALPN+H2 deferred per parent-05 SPEC §4).
+///
+/// `listener_name` is the enclosing listener's `name` field; phase 06.3 D14.3
+/// uses it to name the offending listener in `ConfigError::Http2ClusterFromHttp1Listener`.
 fn validate_hcm(
     hcm: &mut HttpConnectionManagerConfig,
     clusters: &[Cluster],
     chain_has_tls: bool,
+    listener_name: &str,
 ) -> Result<(), crate::ConfigError> {
     // codec_type: AUTO, HTTP1, and HTTP2 are runtime-supported. HTTP3 is
     // rejected pending future work. HTTP2 over TLS is rejected separately
@@ -1390,6 +1399,26 @@ fn validate_hcm(
                     // per SPEC §3 D2.
                     if !clusters.iter().any(|c| c.name == ar.cluster) {
                         return Err(crate::ConfigError::UnknownCluster(ar.cluster.clone()));
+                    }
+                    // 06.3 D14.3 NEW: H1-listener × H2-cluster reachability gate.
+                    // Closes 05.3 REVIEW I1 per parent-06 SPEC §3 D14.3.
+                    if matches!(hcm.codec_type, CodecType::HTTP1 | CodecType::AUTO) {
+                        let cluster_ref = clusters
+                            .iter()
+                            .find(|c| c.name == ar.cluster)
+                            .expect("UnknownCluster check above guarantees presence");
+                        if let Some(teo) = &cluster_ref.typed_extension_protocol_options
+                            && teo
+                                .http_protocol_options
+                                .explicit_http_config
+                                .http2_protocol_options
+                                .is_some()
+                        {
+                            return Err(crate::ConfigError::Http2ClusterFromHttp1Listener {
+                                listener: listener_name.to_string(),
+                                cluster: ar.cluster.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -5287,6 +5316,11 @@ static_resources:
 
     #[test]
     fn parses_cluster_with_typed_extension_protocol_options_http2() {
+        // 06.3 D14.3: changed from codec_type HTTP1 → HTTP2 so the H2 cluster
+        // target remains valid under the new H1×H2 reachability gate. The
+        // purpose of this test is to verify typed_extension_protocol_options
+        // parsing, not codec negotiation; HTTP2 listener + H2 cluster is the
+        // correct canonical shape.
         let yaml = r#"
 node: { id: x, cluster: y }
 admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
@@ -5300,7 +5334,7 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress
-                codec_type: HTTP1
+                codec_type: HTTP2
                 route_config:
                   name: r
                   virtual_hosts:
@@ -5923,5 +5957,315 @@ static_resources:
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
         assert!(matches!(err, crate::ConfigError::InvalidAccessLogPath));
+    }
+
+    // --- 06.3 Task 2: D14.3 H1-listener × H2-cluster parse-time validator gate ---
+
+    /// Positive: codec_type HTTP1 + cluster with NO typed_extension_protocol_options →
+    /// validator accepts. The default-H1 cluster is always reachable from an H1 listener.
+    #[test]
+    fn validates_h1_listener_with_h1_cluster_passes() {
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: ingress_http
+      address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+"#;
+        let mut b: Bootstrap = serde_yaml::from_str(yaml).unwrap();
+        validate(&mut b).expect("H1 listener + H1 cluster (no teo) must be accepted");
+    }
+
+    /// Positive: codec_type HTTP2 + cluster with typed_extension_protocol_options carrying
+    /// http2_protocol_options → validator accepts. H2×H2 is the canonical H2 path.
+    #[test]
+    fn validates_h2_listener_with_h2_cluster_passes() {
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: ingress_http
+      address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+"#;
+        let mut b: Bootstrap = serde_yaml::from_str(yaml).unwrap();
+        validate(&mut b).expect("H2 listener + H2 cluster must be accepted");
+    }
+
+    /// Positive: codec_type HTTP2 + cluster with NO typed_extension_protocol_options →
+    /// validator accepts. Per 05.3 D4, an H2 listener proxying to an H1 cluster MUST
+    /// keep working — the gate is H1/AUTO × H2-cluster only, not H2 × H1-cluster.
+    #[test]
+    fn validates_h2_listener_with_h1_cluster_passes() {
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: ingress_http
+      address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP2
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+"#;
+        let mut b: Bootstrap = serde_yaml::from_str(yaml).unwrap();
+        validate(&mut b).expect("H2 listener + H1 cluster (no teo) must be accepted");
+    }
+
+    /// Negative: codec_type HTTP1 + cluster carries http2_protocol_options →
+    /// validator returns ConfigError::Http2ClusterFromHttp1Listener.
+    /// Closes 05.3 REVIEW I1 per ADR-0028 option-(B) deferral gate.
+    #[test]
+    fn rejects_h1_listener_with_h2_cluster() {
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: ingress_http
+      address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+"#;
+        let mut b: Bootstrap = serde_yaml::from_str(yaml).unwrap();
+        let err = validate(&mut b).unwrap_err();
+        match err {
+            crate::ConfigError::Http2ClusterFromHttp1Listener {
+                ref listener,
+                ref cluster,
+            } => {
+                assert_eq!(listener, "ingress_http");
+                assert_eq!(cluster, "backend");
+            }
+            other => panic!(
+                "expected Http2ClusterFromHttp1Listener {{listener: ingress_http, cluster: backend}}, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Negative: codec_type AUTO + cluster carries http2_protocol_options →
+    /// same rejection as HTTP1. AUTO is treated as H1-only per parent §4 of the spec.
+    #[test]
+    fn rejects_auto_listener_with_h2_cluster() {
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: ingress_http
+      address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+"#;
+        let mut b: Bootstrap = serde_yaml::from_str(yaml).unwrap();
+        let err = validate(&mut b).unwrap_err();
+        match err {
+            crate::ConfigError::Http2ClusterFromHttp1Listener {
+                ref listener,
+                ref cluster,
+            } => {
+                assert_eq!(listener, "ingress_http");
+                assert_eq!(cluster, "backend");
+            }
+            other => panic!(
+                "expected Http2ClusterFromHttp1Listener {{listener: ingress_http, cluster: backend}}, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Carve-out: TCP-proxy listener (no codec_type, no HCM) + cluster carrying
+    /// http2_protocol_options → validator accepts. The H1×H2 gate is HCM-scoped only;
+    /// TCP-proxy routes don't undergo codec negotiation on the listener side.
+    #[test]
+    fn tcp_proxy_listener_with_h2_cluster_unaffected() {
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners:
+    - name: ingress_tcp
+      address: { socket_address: { address: 0.0.0.0, port_value: 8080 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+"#;
+        let mut b: Bootstrap = serde_yaml::from_str(yaml).unwrap();
+        validate(&mut b)
+            .expect("TCP-proxy listener + H2 cluster must be accepted (gate is HCM-only)");
     }
 }

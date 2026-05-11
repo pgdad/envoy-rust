@@ -216,6 +216,20 @@ pub enum ConfigError {
     /// "" — reject at parse time rather than letting the open fail later.
     #[error("access log path must be non-empty")]
     InvalidAccessLogPath,
+
+    /// 06.3 D14.3: listener with codec_type HTTP1 or AUTO routes to a cluster
+    /// whose typed_extension_protocol_options.HttpProtocolOptions.
+    /// explicit_http_config.http2_protocol_options is set. Closes
+    /// phase-05.3 REVIEW I1 substantively — ADR-0028's option-(B) deferred
+    /// the H1-listener H2-arm dispatch (envoy-http1 ↔ envoy-http2 cycle);
+    /// the deferral is correct doctrine but the deferred path must be
+    /// visibly rejected at config-load time so operators don't get a
+    /// confusing 502 (or worse, silent H1-on-the-wire to an H2-only backend)
+    /// at runtime.
+    #[error(
+        "listener '{listener}' has codec_type HTTP1 (or AUTO) but routes to cluster '{cluster}' whose typed_extension_protocol_options selects HTTP/2 upstream; H1-listener × H2-cluster dispatch is deferred per ADR-0028"
+    )]
+    Http2ClusterFromHttp1Listener { listener: String, cluster: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
