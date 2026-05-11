@@ -87,3 +87,24 @@ Lands the new `crates/envoy-accesslog/` workspace member per SPEC §3 D1.2.
 **Workspace gates:** `cargo build --workspace --all-targets` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo fmt --all -- --check` clean (after a `cargo fmt --all` pass — initial fmt-check reported drift in the auto-generated module ordering of `lib.rs`, struct-variant expansion in `error.rs`, and the long `assert!` wrap in `record.rs`; `cargo fmt --all` applied, re-verified clean per R-9).
 
 **LoC:** ~165 LoC (the 5 module files + Cargo.toml + workspace `members` line).
+
+## Task 3 — envoy-accesslog default_format emitter + ISO-8601 + Gregorian helper
+
+Lands `crates/envoy-accesslog/src/default_format.rs` per SPEC §3 D1.2 + §6 signpost 1 (ISO-8601 emitter takes `&mut String`) + signpost 2 (Gregorian helper inline, not separate module) + signpost 9 (`%DURATION%` rendered in integer milliseconds).
+
+**Functions landed:**
+- `pub fn format(record: &AccessLogRecord) -> String` — 14-token Envoy default format, no trailing newline.
+- `pub(crate) fn format_iso8601(s: &mut String, t: SystemTime)` — appends 24 ASCII bytes `YYYY-MM-DDTHH:MM:SS.sssZ`.
+- `fn epoch_seconds_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32)` — Gregorian calendar arithmetic with full leap-year handling (4/100/400 rule).
+- Helpers: `push_or_dash`, `is_leap_year`, `days_in_year`, `days_in_month`.
+
+**Tests:** `cargo test -p envoy-accesslog --lib default_format::tests` → `test result: ok. 8 passed; 0 failed`. Test 5 (`format_iso8601_known_date`) validates the leap-day boundary (2024-02-29T12:34:56.789Z); test 6 (`epoch_seconds_to_ymd_hms_known_dates`) is table-driven across 7 known epochs including the Y2K leap day boundary + the year-2100-non-leap-year boundary + the Y2K38 boundary. `cargo test -p envoy-accesslog` full crate → `10 passed` (2 record + 8 default_format).
+
+**Workspace gates:** `cargo build --workspace --all-targets` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean (after two execution-time clippy fixups detailed below); `cargo fmt --all -- --check` clean (after a `cargo fmt --all` pass — initial fmt-check reported drift on three long-line assert! wraps + the days_in_year body single-line collapse; `cargo fmt --all` applied, re-verified clean per R-9); `cargo test --workspace --lib` 422 passed (no regression elsewhere).
+
+**Execution-time deviations from PLAN's verbatim implementation (recorded for stranger-readability):**
+1. **PLAN's `1709209096` constant is stale by 1000 seconds.** The PLAN's Step 1 test scaffold encodes `1_709_209_096` as the epoch seconds for `2024-02-29T12:34:56Z` (in both `format_iso8601_known_date` and the table-driven `epoch_seconds_to_ymd_hms_known_dates` Test 6). Independent verification via Python `datetime.fromtimestamp(1709209096, tz=utc).isoformat()` yields `2024-02-29T12:18:16+00:00`; the correct epoch seconds for `2024-02-29T12:34:56Z` is `1_709_210_096`. The implementation correctly decodes `1709209096` to `12:18:16` (the algorithm is sound; the test constant was wrong). Fixed by replacing `1_709_209_096` with `1_709_210_096` in both test sites. All other 6 epoch constants in the table verified correct against Python.
+2. **`clippy::manual_is_multiple_of` (3 hits on `is_leap_year`).** The PLAN's verbatim predicate `(year % 4 == 0) && (year % 100 != 0 || year % 400 == 0)` trips this new (Rust 1.95+) lint. Rewrote using `year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))` — semantically identical; predicate ordering 4→100→400 preserved (load-bearing for the 2100-not-leap and 2000-is-leap tests; documented in a code comment).
+3. **`clippy::type_complexity` on the test cases slice.** The PLAN's verbatim `&[(u64, (u32, u32, u32, u32, u32, u32))]` trips this lint. Resolved with a local `type YmdHms = (u32, u32, u32, u32, u32, u32);` inside the test fn (no public surface added).
+
+**LoC:** ~310 LoC (149 impl + 160 tests; the test set is unusually dense per the SPEC §3 D1.2 14-test projection split across 8 tests in default_format + 2 in record + 4 in file_sink).
