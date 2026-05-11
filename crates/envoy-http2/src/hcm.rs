@@ -301,6 +301,9 @@ mod tests {
             stat_prefix: "test".to_string(),
             codec_type: CodecType::HTTP2,
             http2_protocol_options: None,
+            // 06.2 Task 5: field added to the schema; access-log wiring
+            // lands in Task 7 (H2). Empty here.
+            access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -442,6 +445,9 @@ static_resources:
             stat_prefix: "test-proxy".to_string(),
             codec_type: CodecType::HTTP2,
             http2_protocol_options: None,
+            // 06.2 Task 5: field added to the schema; access-log wiring
+            // lands in Task 7 (H2). Empty here.
+            access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -557,6 +563,9 @@ static_resources:
             stat_prefix: "test".to_string(),
             codec_type: CodecType::HTTP2,
             http2_protocol_options: None,
+            // 06.2 Task 5: field added to the schema; access-log wiring
+            // lands in Task 7 (H2). Empty here.
+            access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![
@@ -846,6 +855,9 @@ static_resources:
             stat_prefix: "test_h2".to_string(),
             codec_type: CodecType::HTTP2,
             http2_protocol_options: None,
+            // 06.2 Task 5: field added to the schema; access-log wiring
+            // lands in Task 7 (H2). Empty here.
+            access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {

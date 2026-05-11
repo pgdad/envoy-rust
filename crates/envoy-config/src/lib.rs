@@ -8,16 +8,16 @@ pub mod bootstrap;
 pub mod matcher;
 
 pub use bootstrap::{
-    Address, Admin, Bootstrap, CertificateValidationContext, Cluster, ClusterType, CodecType,
-    CommonTlsContext, DataSource, DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint,
-    ExplicitHttpConfig, FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode,
-    Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
-    HttpFilterTypedConfig, HttpProtocolOptions, Int64Range, LbEndpoint, LbPolicy, Listener,
-    LoadAssignment, LocalityLbEndpoints, NetworkFilter, Node, Route, RouteAction,
-    RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, SafeRegex, SocketAddress,
-    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, TlsCertificate,
-    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
-    UpstreamTlsContext, VirtualHost,
+    AccessLog, AccessLogTypedConfig, Address, Admin, Bootstrap, CertificateValidationContext,
+    Cluster, ClusterType, CodecType, CommonTlsContext, DataSource, DirectResponse, DnsLookupFamily,
+    DownstreamTlsContext, Endpoint, ExplicitHttpConfig, FileAccessLog, FilterChain,
+    FilterChainMatch, HeaderMatcher, HeaderMatcherMode, Http1ProtocolOptions, Http2ProtocolOptions,
+    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpProtocolOptions,
+    Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter,
+    Node, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
+    SafeRegex, SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
+    TlsCertificate, TransportSocket, TransportSocketTypedConfig, TypedConfig,
+    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
@@ -201,6 +201,21 @@ pub enum ConfigError {
         "unknown StringMatcher mode key: {got:?}; expected one of exact, prefix, suffix, safe_regex, contains"
     )]
     UnknownStringMatcherMode { got: String },
+
+    /// 06.2 NEW: an `access_log[*].name` value is not
+    /// `envoy.access_loggers.file`. Phase 06.2 supports only the file
+    /// access logger; stdout / gRPC / OpenTelemetry loggers are deferred
+    /// to later observability-family phases per parent-06 SPEC §4.
+    #[error(
+        "unsupported access log type: {actual}; only 'envoy.access_loggers.file' with @type ending in .FileAccessLog is supported"
+    )]
+    UnsupportedAccessLogType { actual: String },
+
+    /// 06.2 NEW: a `FileAccessLog.path` was the empty string. The file
+    /// sink (`envoy-accesslog::FileSink::new`) cannot meaningfully open
+    /// "" — reject at parse time rather than letting the open fail later.
+    #[error("access log path must be non-empty")]
+    InvalidAccessLogPath,
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

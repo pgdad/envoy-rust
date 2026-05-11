@@ -1379,6 +1379,9 @@ static_resources:
             stat_prefix: "ingress_http".to_string(),
             codec_type: envoy_config::CodecType::HTTP1,
             http2_protocol_options: None,
+            // 06.2 Task 5: field added to the schema; access-log wiring
+            // lands in Task 6 (H1) / Task 7 (H2). Empty here.
+            access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {

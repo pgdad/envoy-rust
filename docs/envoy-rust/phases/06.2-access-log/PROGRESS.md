@@ -130,3 +130,46 @@ Lands `crates/envoy-accesslog/src/file_sink.rs` per SPEC §3 D1.2 + signpost 3 (
 3. **fmt drift** (per R-9 disclosure requirement): `cargo fmt --all -- --check` flagged two sites after Step 3 impl landed — (a) the long-line `assert!(line.ends_with(...))` in `file_sink_writes_one_record` rewrapped to multi-line, (b) the inline `AccessLogError::Open { path: got_path, source: _ } => { ... }` arm rewrapped to a vertically-stacked struct-pattern block. `cargo fmt --all` applied; re-check clean.
 
 **LoC:** ~225 LoC (~70 impl including derive + ~155 tests; the concurrent-emissions test alone is ~45 LoC including the spawned-task plumbing).
+
+## Task 5 — envoy-config access_log schema + validator + fuzz seed
+
+Lands the parse-side access-log schema per SPEC §3 D2.2 + PLAN-write SPEC correction 4 (the `#[serde(default)]` posture is load-bearing for the 5 existing HCM-bearing fixtures 0007/0008/0009/0010/0011, which do not declare an `access_log:` block).
+
+**Types landed (in `crates/envoy-config/src/bootstrap.rs`):**
+- `pub struct AccessLog { name: String, typed_config: AccessLogTypedConfig }` — `#[serde(deny_unknown_fields)]`; mirrors Envoy's `envoy.config.accesslog.v3.AccessLog`.
+- `pub enum AccessLogTypedConfig { FileAccessLog(FileAccessLog) }` — `#[serde(tag = "@type", deny_unknown_fields)]`; single variant in 06.2 (file logger only). Unknown `@type` URLs surface as `ConfigError::Yaml` at serde-deserialize time; the validator does NOT re-check the URL. The enum exists so future observability phases can add stdout / gRPC / OpenTelemetry loggers without reshaping the schema.
+- `pub struct FileAccessLog { path: String }` — `#[serde(deny_unknown_fields)]`; 06.2 consumes only `path` (format-string customization is OUT of scope per parent-06 SPEC §4 + 06.2 SPEC §4 — the emitter uses the default Envoy v3 format string).
+- `HttpConnectionManagerConfig` gains `#[serde(default)] pub access_log: Vec<AccessLog>` — `default` is load-bearing per PLAN-write correction 4 (HCM carries `#[serde(deny_unknown_fields)]`, so omitting the field is the only way the 5 existing HCM-bearing fixtures can parse back-compat).
+
+**ConfigError variants added (in `crates/envoy-config/src/lib.rs`):**
+- `UnsupportedAccessLogType { actual: String }` — fired by the validator when `access_log[*].name != "envoy.access_loggers.file"`.
+- `InvalidAccessLogPath` — fired by the validator when `FileAccessLog.path` is empty. The sink-side `FileSink::new` would also fail on `""`, but rejecting at parse time gives a clearer diagnostic.
+
+**Re-exports:** `AccessLog`, `AccessLogTypedConfig`, `FileAccessLog` added to the `pub use bootstrap::{...}` block in `crates/envoy-config/src/lib.rs` (alphabetical insertion).
+
+**Validator:** new free function `validate_access_logs(&[AccessLog]) -> Result<(), ConfigError>` hoisted next to `validate_http2_protocol_options_ranges` (same shape — mutates nothing, returns first error); called from `validate_hcm` after the http2-options range check and before the http_filters cardinality check. The hoisting style follows 05.3's `validate_http2_protocol_options_ranges` precedent.
+
+**Tests (6 new in `bootstrap::tests`):**
+- `parses_hcm_with_file_access_log` — happy path: file logger with `/tmp/access.log`; asserts the structural projection (name + path).
+- `parses_hcm_with_no_access_log_block` — back-compat: HCM YAML with no `access_log:` key at all; `#[serde(default)]` produces empty Vec.
+- `parses_hcm_with_empty_access_log_array` — `access_log: []` parses to empty Vec.
+- `rejects_hcm_with_unsupported_access_log_name` — `name: envoy.access_loggers.stdout` → `ConfigError::UnsupportedAccessLogType { actual: "envoy.access_loggers.stdout" }`.
+- `rejects_hcm_with_unsupported_access_log_type_url` — unknown `@type` URL → either `ConfigError::Yaml` (serde-tagged-enum rejection) or `UnsupportedAccessLogType`; both paths accepted.
+- `rejects_hcm_with_empty_access_log_path` — empty `path: ""` → `ConfigError::InvalidAccessLogPath`.
+
+**Corpus walk + fuzz seed:**
+- New seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_access_log_file.yaml` (full HCM with `access_log` block).
+- `fuzz_corpus_seeds_parse_or_reject_cleanly` (acceptance loop in `bootstrap::tests`) extended with the new seed.
+- `crates/envoy-config/fuzz/.gitignore` allow-listed `!corpus/parse_bootstrap/hcm_access_log_file.yaml`.
+
+**Tests:** `cargo test -p envoy-config` → `174 passed; 0 failed` (+6 vs Task 4: the 5 new validator tests + the corpus-walk read-back of the new seed; the 6th new test, `parses_hcm_with_no_access_log_block`, replaces no prior test — net is +6 envoy-config tests). Workspace lib regression: `cargo test --workspace --lib` → `432 passed; 0 failed` (+6 vs Task 4's 426 = the new envoy-config tests; envoy-accesslog and other crates unchanged).
+
+**Workspace gates:** `cargo build --workspace --all-targets` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean (no new warnings on the single-variant `AccessLogTypedConfig` enum — clippy treats the `#[serde(tag = "@type")]` posture as legitimate); `cargo fmt --all -- --check` clean (after a `cargo fmt --all` pass — disclosure per R-9 below).
+
+**Execution-time deviations from PLAN's verbatim implementation (recorded for stranger-readability):**
+1. **Test-prescribed `match &filter.typed_config` adjusted to `match &filter.typed_config { Some(TypedConfig::HttpConnectionManager(h)) => h, ... }`.** The PLAN's verbatim test code matches `TypedConfig::HttpConnectionManager(h)` directly. `NetworkFilter::typed_config` is actually `Option<TypedConfig>` (introduced pre-Task-5 to make `typed_config` optional for filters that don't carry one). Adapted in `parses_hcm_with_file_access_log` and `parses_hcm_with_no_access_log_block` to match `Some(TypedConfig::HttpConnectionManager(h))`. Pure ergonomic adaptation; the structural assertion still verifies it's an HCM.
+2. **Pre-existing test `rejects_unknown_field_in_hcm_config` sentinel update.** This test (added pre-06.2) used `access_log: []` as a "definitely-not-an-HCM-field" sentinel to prove `HttpConnectionManagerConfig`'s `#[serde(deny_unknown_fields)]` rejects unrecognized fields. Task 5 added `access_log` to the schema, so the original sentinel is no longer unknown. Swapped to `bogus_hcm_field: 1` (a name reserved for sentinel duty, mirroring the `bogus_ep_field` pattern in `rejects_endpoint_with_unknown_field` at ~line 2360). The test's intent is preserved; both the YAML and the assertion message updated.
+3. **Mechanical struct-literal compat fixes in envoy-http1 + envoy-http2.** Adding the new `access_log` field to `HttpConnectionManagerConfig` broke 5 struct-literal construction sites in test code that initialize the struct directly: 1 site in `crates/envoy-http1/src/hcm.rs` and 4 sites in `crates/envoy-http2/src/hcm.rs`. Each got a one-liner `access_log: vec![],` (mirroring the existing `http2_protocol_options: None,` line). These are pure mechanical zero-semantics fixes required for green build per D-3.6; the actual access-log wiring lands in Task 6 (H1) / Task 7 (H2). Each site carries a `// 06.2 Task 5:` doc-comment explaining the placeholder.
+4. **fmt drift** (per R-9 disclosure requirement): `cargo fmt --all -- --check` flagged drift on the re-export block in `crates/envoy-config/src/lib.rs` after inserting `AccessLog, AccessLogTypedConfig, FileAccessLog` (the line wraps shifted). `cargo fmt --all` applied; re-verified clean.
+
+**LoC:** ~265 LoC across 5 files (~95 impl: types + validator + ConfigError variants + re-exports; ~140 tests: 6 new tests + corpus-walk extension; ~30 placeholder one-liners in envoy-http1/envoy-http2 hcm.rs).

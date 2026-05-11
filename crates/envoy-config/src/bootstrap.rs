@@ -261,6 +261,46 @@ pub enum TypedConfig {
     HttpConnectionManager(HttpConnectionManagerConfig),
 }
 
+// 06.2 Task 5 — access-log schema additions per SPEC §3 D2.2.
+
+/// AccessLog — one entry in an HCM's `access_log:` block. The shape mirrors
+/// Envoy's `envoy.config.accesslog.v3.AccessLog`: `name` selects the logger
+/// extension (only `envoy.access_loggers.file` is accepted in 06.2; the
+/// validator rejects anything else) and `typed_config` carries the
+/// extension-specific payload via a `@type`-tagged enum. Future
+/// observability-family phases extend `AccessLogTypedConfig` rather than
+/// reshaping `AccessLog`.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AccessLog {
+    pub name: String,
+    pub typed_config: AccessLogTypedConfig,
+}
+
+/// AccessLogTypedConfig — the `@type`-tagged envelope for an AccessLog
+/// entry's `typed_config`. Single variant in 06.2 (file access logger);
+/// the enum exists so future observability phases can add stdout / gRPC /
+/// OpenTelemetry loggers without reshaping the schema. Unknown `@type`
+/// URLs are rejected by serde at deserialization time (surfaces as
+/// `ConfigError::Yaml`); see `rejects_hcm_with_unsupported_access_log_type_url`.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "@type", deny_unknown_fields)]
+pub enum AccessLogTypedConfig {
+    #[serde(rename = "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog")]
+    FileAccessLog(FileAccessLog),
+}
+
+/// FileAccessLog — typed_config payload for the file access logger. 06.2
+/// consumes only `path`; format-string customization (`log_format`,
+/// `json_format`, …) is OUT of scope per parent-06 SPEC §4 + 06.2 SPEC §4
+/// (the emitter uses the default Envoy v3 format string). Empty paths
+/// are rejected by the validator (`ConfigError::InvalidAccessLogPath`).
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FileAccessLog {
+    pub path: String,
+}
+
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TcpProxyConfig {
@@ -364,6 +404,17 @@ pub struct HttpConnectionManagerConfig {
     /// RFC 7540 range checks at parse time only when `Some`.
     #[serde(default)]
     pub http2_protocol_options: Option<Http2ProtocolOptions>,
+
+    /// 06.2 NEW: per-listener access-log entries. `#[serde(default)]` is
+    /// load-bearing because `HttpConnectionManagerConfig` carries
+    /// `#[serde(deny_unknown_fields)]` and the 5 existing HCM-bearing
+    /// fixtures (0007/0008/0009/0010/0011) do not declare an `access_log:`
+    /// block — without the default they would fail to parse. The
+    /// validator (`validate_access_logs`) rejects non-file loggers
+    /// (`UnsupportedAccessLogType`) and empty paths
+    /// (`InvalidAccessLogPath`).
+    #[serde(default)]
+    pub access_log: Vec<AccessLog>,
 
     pub route_config: RouteConfiguration,
     pub http_filters: Vec<HttpFilter>,
@@ -1267,6 +1318,11 @@ fn validate_hcm(
         validate_http2_protocol_options_ranges(opts)?;
     }
 
+    // 06.2 NEW — D2.2: validate access_log entries (name allow-list +
+    // non-empty path). Hoisted to a free function for symmetry with the
+    // http2_protocol_options pattern.
+    validate_access_logs(&hcm.access_log)?;
+
     // http_filters: cardinality + name.
     match hcm.http_filters.len() {
         1 => {
@@ -1341,6 +1397,39 @@ fn validate_hcm(
             // 04.2 NEW: walk the headers Vec.
             for hm in &mut r.r#match.headers {
                 validate_header_matcher(hm)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 06.2 Task 5 — validate an HCM's `access_log` Vec.
+///
+/// Two rejections enforced here (see SPEC §3 D2.2):
+///   1. `name` allow-list: only `envoy.access_loggers.file` is accepted.
+///      Anything else surfaces as `ConfigError::UnsupportedAccessLogType`.
+///      The `@type` URL allow-list is enforced by serde's tagged-enum
+///      deserialization on `AccessLogTypedConfig` (unknown URLs surface as
+///      `ConfigError::Yaml`); this validator does NOT re-check the URL.
+///   2. Non-empty path: `FileAccessLog.path` must not be the empty string.
+///      Empty paths surface as `ConfigError::InvalidAccessLogPath`. The
+///      sink-side `FileSink::new` would also fail on `""`, but rejecting
+///      at parse time gives a clearer diagnostic.
+///
+/// Mutates nothing; returns the first error encountered (validator-wide
+/// convention).
+fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigError> {
+    for entry in access_logs {
+        if entry.name != "envoy.access_loggers.file" {
+            return Err(crate::ConfigError::UnsupportedAccessLogType {
+                actual: entry.name.clone(),
+            });
+        }
+        match &entry.typed_config {
+            AccessLogTypedConfig::FileAccessLog(cfg) => {
+                if cfg.path.is_empty() {
+                    return Err(crate::ConfigError::InvalidAccessLogPath);
+                }
             }
         }
     }
@@ -2382,6 +2471,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/route_with_header_matchers.yaml",
             "fuzz/corpus/parse_bootstrap/strict_dns_cluster.yaml",
             "fuzz/corpus/parse_bootstrap/admin_with_stats_route.yaml",
+            "fuzz/corpus/parse_bootstrap/hcm_access_log_file.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
@@ -3398,20 +3488,28 @@ filename: "/tmp/cert.pem"
 
     #[test]
     fn rejects_unknown_field_in_hcm_config() {
+        // The original sentinel was `access_log`, chosen pre-06.2 because
+        // it was not yet recognized by `HttpConnectionManagerConfig`. 06.2
+        // Task 5 added `access_log` to the schema; swapping to a fresh
+        // not-an-HCM-field sentinel preserves the test's intent (verify
+        // that `deny_unknown_fields` still rejects unrecognized fields).
         let yaml = r#"
 stat_prefix: ingress_http
 codec_type: HTTP1
-access_log: []
+bogus_hcm_field: 1
 route_config:
   name: r
   virtual_hosts: []
 http_filters: []
 "#;
         let res: Result<HttpConnectionManagerConfig, _> = serde_yaml::from_str(yaml);
-        assert!(res.is_err(), "deny_unknown_fields should reject access_log");
+        assert!(
+            res.is_err(),
+            "deny_unknown_fields should reject bogus_hcm_field"
+        );
         let err = res.err().unwrap().to_string();
         assert!(
-            err.contains("access_log") || err.contains("unknown field"),
+            err.contains("bogus_hcm_field") || err.contains("unknown field"),
             "error mentions unknown field: {err}"
         );
     }
@@ -5680,5 +5778,150 @@ static_resources: { listeners: [], clusters: [] }
             msg.contains("profile_path") || msg.contains("unknown field"),
             "diagnostic should mention the unknown field; got: {msg}"
         );
+    }
+
+    // ----- 06.2 Task 5: access_log schema tests -----
+
+    fn hcm_with_access_log_yaml(access_log_block: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: t }}
+static_resources:
+  listeners:
+    - name: l1
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+{access_log_block}
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: v
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: "ok\n" }} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#,
+            access_log_block = access_log_block
+        )
+    }
+
+    #[test]
+    fn parses_hcm_with_file_access_log() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+"#,
+        );
+        let bootstrap = crate::parse_bootstrap(&yaml).expect("parse + validate");
+        let listener = &bootstrap.static_resources.listeners[0];
+        let filter = &listener.filter_chains[0].filters[0];
+        let hcm = match &filter.typed_config {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        assert_eq!(hcm.access_log.len(), 1);
+        assert_eq!(hcm.access_log[0].name, "envoy.access_loggers.file");
+        match &hcm.access_log[0].typed_config {
+            AccessLogTypedConfig::FileAccessLog(cfg) => {
+                assert_eq!(cfg.path, "/tmp/access.log");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_hcm_with_no_access_log_block() {
+        let yaml = hcm_with_access_log_yaml("");
+        let bootstrap = crate::parse_bootstrap(&yaml).expect("parse + validate");
+        let hcm = match &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0]
+            .typed_config
+        {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        assert!(hcm.access_log.is_empty());
+    }
+
+    #[test]
+    fn parses_hcm_with_empty_access_log_array() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log: []
+"#,
+        );
+        let bootstrap = crate::parse_bootstrap(&yaml).expect("parse + validate");
+        let hcm = match &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0]
+            .typed_config
+        {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        assert!(hcm.access_log.is_empty());
+    }
+
+    #[test]
+    fn rejects_hcm_with_unsupported_access_log_name() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        match err {
+            crate::ConfigError::UnsupportedAccessLogType { actual } => {
+                assert_eq!(actual, "envoy.access_loggers.stdout");
+            }
+            other => panic!("expected UnsupportedAccessLogType; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_hcm_with_unsupported_access_log_type_url() {
+        // The serde-tagged `@type` enum rejects unknown URLs at
+        // deserialization time (wrapped as ConfigError::Yaml).
+        // The test accepts either error path.
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.unknown.v3.UnknownAccessLog
+                      path: /tmp/access.log
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        match err {
+            crate::ConfigError::Yaml(_) => {}
+            crate::ConfigError::UnsupportedAccessLogType { .. } => {}
+            other => panic!("expected Yaml or UnsupportedAccessLogType; got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_hcm_with_empty_access_log_path() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: ""
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(err, crate::ConfigError::InvalidAccessLogPath));
     }
 }
