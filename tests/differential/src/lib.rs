@@ -19,6 +19,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub mod access_log;
 pub mod backend;
 pub mod subject;
 pub mod tls;
@@ -79,6 +80,23 @@ pub enum Driver {
     /// `TlsTcpProbeList` shape (03.2). Per SPEC §3 D3.
     Http1ProbeList {
         probes: Vec<Http1Probe>,
+    },
+    /// 06.2 NEW: HTTP/1.1 driver with post-request access-log line
+    /// assertion. Drives one GET/POST via `drive_http1` (reused from
+    /// 04.1), then reads the configured access-log files from each
+    /// proxy and asserts per-token equivalence via
+    /// `access_log::assert_access_log_lines_equivalent`.
+    Http1WithAccessLog {
+        method: String,
+        path: String,
+        host: String,
+        expected_status: u16,
+        expected_body: BodyRule,
+        expected_headers: HeaderRule,
+        #[serde(default)]
+        extra_headers: Vec<(String, String)>,
+        expected_access_log_paths: AccessLogPaths,
+        expected_access_log_lines: Vec<Vec<crate::access_log::AccessLogLineRule>>,
     },
     /// 05.2 NEW: drive an HTTP/2 cleartext (H2C prior-knowledge) request and
     /// assert the response shape. Mirrors `Http1`'s shape; the `host` field
@@ -250,6 +268,26 @@ pub enum Http1BodyRule {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Http1HeaderRule {
     SetEqualModuloAllowList,
+}
+
+/// 06.2 NEW: header equivalence rule for `Driver::Http1WithAccessLog`.
+/// Internally-tagged under `tag = "rule"` so the fixture YAML reads
+/// `expected_headers: { rule: set_equal_modulo_allow_list }`, paralleling
+/// `BodyRule`'s `tag = "kind"` shape. Distinct from `Http1HeaderRule`
+/// (externally-tagged unit variant, used by the 04.x drivers).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "rule", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HeaderRule {
+    SetEqualModuloAllowList,
+}
+
+/// 06.2 NEW: per-proxy file paths for access-log diff. The harness
+/// reads both files after the wire-protocol leg completes.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AccessLogPaths {
+    pub envoy: String,
+    pub envoy_rust: String,
 }
 
 /// 04.2 NEW: one probe entry inside `Driver::Http1ProbeList`. Each probe drives
@@ -1123,6 +1161,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::TlsTcpProbeList { .. }
         | Driver::Http1 { .. }
         | Driver::Http1ProbeList { .. }
+        | Driver::Http1WithAccessLog { .. }
         | Driver::Http2 { .. }
         // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
         // HCM-shaped drivers. The admin listener is separately substituted
@@ -1643,6 +1682,120 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             }
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
+        }
+        // 06.2 NEW: HTTP/1.1 driver with post-request access-log line
+        // assertion. Wire-protocol leg reuses `drive_http1` (04.1); after the
+        // response equivalence cascade, file-reads both proxies' configured
+        // access-log files and dispatches per-token equivalence through
+        // `access_log::assert_access_log_lines_equivalent`. Per SPEC §3 D4.2.
+        Driver::Http1WithAccessLog {
+            method,
+            path,
+            host,
+            expected_status,
+            expected_body,
+            expected_headers,
+            extra_headers,
+            expected_access_log_paths,
+            expected_access_log_lines,
+        } => {
+            // Wire-protocol leg: reuse drive_http1 unchanged from 04.1.
+            // `Http1Method` is the harness's narrow GET-only enum today;
+            // mirror the conversion shape used by `drive_admin_scrape`.
+            let http1_method = match method.as_str() {
+                "GET" => Http1Method::Get,
+                other => bail!("Driver::Http1WithAccessLog: unsupported method {:?}", other),
+            };
+            let upstream_resp =
+                drive_http1(upstream_addr, &http1_method, path, host, extra_headers)
+                    .await
+                    .context("upstream envoy http1 drive (Http1WithAccessLog)")?;
+            let subject_resp = drive_http1(subject_addr, &http1_method, path, host, extra_headers)
+                .await
+                .context("envoy-rust http1 drive (Http1WithAccessLog)")?;
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+
+            // Status: per-driver `expected_status` — each side independently
+            // equals the value (the Http1WithAccessLog variant requires it,
+            // unlike Http1's Option<u16>).
+            if upstream_resp.status != *expected_status {
+                bail!(
+                    "upstream status {} != expected {}",
+                    upstream_resp.status,
+                    expected_status,
+                );
+            }
+            if subject_resp.status != *expected_status {
+                bail!(
+                    "subject status {} != expected {}",
+                    subject_resp.status,
+                    expected_status,
+                );
+            }
+
+            // Body: envoy ↔ envoy-rust via `assert_body_rule` (mirrors the
+            // Http1 arm). The `expected_body: BodyRule` is required (not
+            // Option), so dispatch unconditionally.
+            assert_body_rule(expected_body, &upstream_resp.body, &subject_resp.body)?;
+
+            // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
+            // `expected_headers: HeaderRule` is required; the only variant
+            // today is `SetEqualModuloAllowList` (matches Http1HeaderRule's
+            // sole variant).
+            match expected_headers {
+                HeaderRule::SetEqualModuloAllowList => {
+                    diff_headers(
+                        &upstream_resp.headers,
+                        &subject_resp.headers,
+                        HEADER_ALLOW_LIST,
+                    )
+                    .context("diff_headers (set_equal_modulo_allow_list)")?;
+                }
+            }
+
+            // Access-log files. Wait up to 5s for both files to appear (the
+            // synchronous-after-write dispatch should have emitted before the
+            // response completed, but flush timing is best-effort).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
+            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+            while std::time::Instant::now() < deadline {
+                if envoy_path.exists() && envoy_rust_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            // One final yield to let the OS flush.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
+                format!("read envoy access-log file at {}", envoy_path.display())
+            })?;
+            let envoy_rust_contents =
+                std::fs::read_to_string(&envoy_rust_path).with_context(|| {
+                    format!(
+                        "read envoy-rust access-log file at {}",
+                        envoy_rust_path.display()
+                    )
+                })?;
+            let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
+            let envoy_rust_lines: Vec<String> =
+                envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
+
+            crate::access_log::assert_access_log_lines_equivalent(
+                &envoy_lines,
+                &envoy_rust_lines,
+                expected_access_log_lines,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "access log mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
+                    e,
+                    envoy_lines,
+                    envoy_rust_lines,
+                )
+            })?;
         }
         // 05.2 Task 11: real H2 dispatch. Mirrors Driver::Http1 in shape; the
         // only delta is `drive_http2` instead of `drive_http1`. Per SPEC §3 D5.
