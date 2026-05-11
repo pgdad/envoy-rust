@@ -191,10 +191,10 @@ pub enum BodyRule {
     ByteExact,
     /// 06.1 D6.b: parse the body as Prometheus text-exposition format and
     /// assert the metric-name set is equal between envoy and envoy-rust
-    /// modulo the per-fixture allow-lists. Does NOT assert on numeric values
-    /// (06.3 extends). The allow-lists are populated empirically per SPEC §6
-    /// signpost 12 (Task 13's territory); both default to empty so a fixture
-    /// can declare the rule without pre-seeding.
+    /// modulo the per-fixture allow-lists. 06.3 extends with the three fields
+    /// below (D18.3 + signpost 9 option (1)). The allow-lists are populated
+    /// empirically per SPEC §6 signpost 12 (Task 13's territory); both default
+    /// to empty so a fixture can declare the rule without pre-seeding.
     PrometheusExposition {
         /// Metric names emitted by upstream Envoy that envoy-rust does not.
         #[serde(default)]
@@ -202,6 +202,21 @@ pub enum BodyRule {
         /// Metric names emitted by envoy-rust that upstream Envoy does not.
         #[serde(default)]
         allowlist_envoy_rust_only: Vec<String>,
+        /// 06.3 NEW: each pair `(stat_name, expected_value)` must match
+        /// exactly on BOTH proxies' scrapes. Pairs are `Vec` (not HashMap)
+        /// for deterministic ordering in error messages.
+        #[serde(default)]
+        value_exact: Vec<(String, u64)>,
+        /// 06.3 NEW: each stat name must equal 0 on BOTH proxies' scrapes
+        /// (terminal-zero gauges; e.g., listener.<name>.downstream_cx_active
+        /// after the test's connections have closed).
+        #[serde(default)]
+        value_must_be_zero: Vec<String>,
+        /// 06.3 NEW: each stat name must be present on BOTH proxies'
+        /// scrapes; value may differ (for stats with disposition
+        /// "name-required, value-may-differ" per BEHAVIOR_CONTRACT.md).
+        #[serde(default)]
+        value_present_only: Vec<String>,
     },
 }
 
@@ -225,6 +240,47 @@ pub fn parse_prometheus_metric_names(body: &[u8]) -> std::collections::BTreeSet<
         let name = &t[..name_end];
         if !name.is_empty() {
             out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+/// 06.3 D18.3: parse Prometheus text-exposition body into name → value
+/// pairs. Skips `#`-prefixed lines + blanks. For sample lines, extracts
+/// the leading name (up to whitespace or `{`) and the trailing value
+/// (parses as `u64`; non-parseable values silently skipped). Returns
+/// `BTreeMap` for deterministic ordering when failure messages are
+/// constructed. Labels (e.g., `metric{key="value"} 42`) are dropped —
+/// the value-side of value_exact / value_must_be_zero / value_present_only
+/// asserts only on the bare-name → value projection.
+pub fn parse_prometheus_samples(body: &[u8]) -> std::collections::BTreeMap<String, u64> {
+    let s = std::str::from_utf8(body).unwrap_or("");
+    let mut out = std::collections::BTreeMap::new();
+    for line in s.lines() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let name_end = t
+            .find(|c: char| c.is_whitespace() || c == '{')
+            .unwrap_or(t.len());
+        let name = &t[..name_end];
+        if name.is_empty() {
+            continue;
+        }
+        let after_name = &t[name_end..];
+        let after_labels = if let Some(rest) = after_name.strip_prefix('{') {
+            match rest.find('}') {
+                Some(close_idx) => &rest[close_idx + 1..],
+                None => continue,
+            }
+        } else {
+            after_name
+        };
+        let value_str = after_labels.trim();
+        let value_field = value_str.split_whitespace().next().unwrap_or("");
+        if let Ok(v) = value_field.parse::<u64>() {
+            out.insert(name.to_string(), v);
         }
     }
     out
@@ -2065,6 +2121,9 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
         BodyRule::PrometheusExposition {
             allowlist_envoy_only,
             allowlist_envoy_rust_only,
+            value_exact,
+            value_must_be_zero,
+            value_present_only,
         } => {
             let envoy_names = parse_prometheus_metric_names(envoy_body);
             let rust_names = parse_prometheus_metric_names(rust_body);
@@ -2086,6 +2145,51 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
                 bail!(
                     "prometheus exposition metric-name sets diverged after allow-lists:\n  envoy-only:      {envoy_only:?}\n  envoy-rust-only: {rust_only:?}",
                 );
+            }
+            // 06.3 D18.3: value_exact — both proxies must have the expected value.
+            if !value_exact.is_empty() {
+                let envoy_samples = parse_prometheus_samples(envoy_body);
+                let rust_samples = parse_prometheus_samples(rust_body);
+                for (name, expected) in value_exact {
+                    let envoy_val = envoy_samples.get(name.as_str()).copied();
+                    let rust_val = rust_samples.get(name.as_str()).copied();
+                    if envoy_val != Some(*expected) || rust_val != Some(*expected) {
+                        bail!(
+                            "value_exact mismatch for {name:?}: expected {expected}, \
+                             envoy={envoy_val:?}, envoy-rust={rust_val:?}",
+                        );
+                    }
+                }
+            }
+            // 06.3 D18.3: value_must_be_zero — both proxies must report 0.
+            if !value_must_be_zero.is_empty() {
+                let envoy_samples = parse_prometheus_samples(envoy_body);
+                let rust_samples = parse_prometheus_samples(rust_body);
+                for name in value_must_be_zero {
+                    let envoy_val = envoy_samples.get(name.as_str()).copied();
+                    let rust_val = rust_samples.get(name.as_str()).copied();
+                    if envoy_val != Some(0) || rust_val != Some(0) {
+                        bail!(
+                            "value_must_be_zero violated for {name:?}: \
+                             envoy={envoy_val:?}, envoy-rust={rust_val:?}",
+                        );
+                    }
+                }
+            }
+            // 06.3 D18.3: value_present_only — both proxies must have the name; value may differ.
+            if !value_present_only.is_empty() {
+                let envoy_samples = parse_prometheus_samples(envoy_body);
+                let rust_samples = parse_prometheus_samples(rust_body);
+                for name in value_present_only {
+                    let envoy_present = envoy_samples.contains_key(name.as_str());
+                    let rust_present = rust_samples.contains_key(name.as_str());
+                    if !envoy_present || !rust_present {
+                        bail!(
+                            "value_present_only: {name:?} missing from one or both proxies: \
+                             envoy={envoy_present}, envoy-rust={rust_present}",
+                        );
+                    }
+                }
             }
             Ok(())
         }
@@ -3066,6 +3170,7 @@ static_resources:
             BodyRule::PrometheusExposition {
                 allowlist_envoy_only,
                 allowlist_envoy_rust_only,
+                ..
             } => {
                 assert!(allowlist_envoy_only.is_empty());
                 assert!(allowlist_envoy_rust_only.is_empty());
@@ -3089,6 +3194,7 @@ allowlist_envoy_rust_only:
             BodyRule::PrometheusExposition {
                 allowlist_envoy_only,
                 allowlist_envoy_rust_only,
+                ..
             } => {
                 assert_eq!(allowlist_envoy_only.len(), 2);
                 assert_eq!(allowlist_envoy_rust_only, vec!["foo_total".to_string()]);
@@ -3200,6 +3306,9 @@ expected_body_rule:
         let rule = BodyRule::PrometheusExposition {
             allowlist_envoy_only: vec![],
             allowlist_envoy_rust_only: vec![],
+            value_exact: vec![],
+            value_must_be_zero: vec![],
+            value_present_only: vec![],
         };
         let envoy = b"foo 1\nbar 2\n";
         let rust = b"bar 5\nfoo 9\n"; // values differ; names equal — must pass
@@ -3211,6 +3320,9 @@ expected_body_rule:
         let rule = BodyRule::PrometheusExposition {
             allowlist_envoy_only: vec![],
             allowlist_envoy_rust_only: vec![],
+            value_exact: vec![],
+            value_must_be_zero: vec![],
+            value_present_only: vec![],
         };
         let envoy = b"foo 1\nbar 2\n";
         let rust = b"foo 1\n"; // bar only on envoy side — must fail
@@ -3225,9 +3337,45 @@ expected_body_rule:
         let rule = BodyRule::PrometheusExposition {
             allowlist_envoy_only: vec!["bar".to_string()],
             allowlist_envoy_rust_only: vec!["baz".to_string()],
+            value_exact: vec![],
+            value_must_be_zero: vec![],
+            value_present_only: vec![],
         };
         let envoy = b"foo 1\nbar 2\n";
         let rust = b"foo 1\nbaz 3\n";
         assert_body_rule(&rule, envoy, rust).unwrap();
+    }
+
+    #[test]
+    fn assert_body_rule_prometheus_exposition_passes_on_value_exact_match() {
+        let envoy_body = b"# TYPE foo counter\nfoo 5\n# TYPE bar counter\nbar 0\n";
+        let rust_body = b"# TYPE foo counter\nfoo 5\n# TYPE bar counter\nbar 0\n";
+        let rule = BodyRule::PrometheusExposition {
+            allowlist_envoy_only: vec![],
+            allowlist_envoy_rust_only: vec![],
+            value_exact: vec![("foo".to_string(), 5)],
+            value_must_be_zero: vec!["bar".to_string()],
+            value_present_only: vec![],
+        };
+        assert_body_rule(&rule, envoy_body, rust_body).expect("value-exact + must-be-zero match");
+    }
+
+    #[test]
+    fn assert_body_rule_prometheus_exposition_fails_on_value_mismatch() {
+        let envoy_body = b"# TYPE foo counter\nfoo 5\n";
+        let rust_body = b"# TYPE foo counter\nfoo 6\n";
+        let rule = BodyRule::PrometheusExposition {
+            allowlist_envoy_only: vec![],
+            allowlist_envoy_rust_only: vec![],
+            value_exact: vec![("foo".to_string(), 5)],
+            value_must_be_zero: vec![],
+            value_present_only: vec![],
+        };
+        let err = assert_body_rule(&rule, envoy_body, rust_body).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("value_exact mismatch"),
+            "expected value_exact mismatch, got: {msg}"
+        );
     }
 }

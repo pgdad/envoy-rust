@@ -223,3 +223,72 @@ All six tests reside in `crates/envoy-config/src/bootstrap.rs::tests`:
   time with a descriptive error naming both the listener and cluster. The ADR-0028
   option-(B) H1-listener H2-arm dispatch deferral remains correct doctrine; the
   deferred path is now guarded rather than silently mis-wired.
+
+## Task 3 — D18.3 `BodyRule::PrometheusExposition` value-side assertion (task 3 commit)
+
+### Work summary
+
+Extended `BodyRule::PrometheusExposition` in `tests/differential/src/lib.rs` with
+three new `#[serde(default)]` fields per 06.3 SPEC §3 D18.3 + signpost 9 option (1):
+
+- `value_exact: Vec<(String, u64)>` — each pair must match exactly on both proxies'
+  scrapes.
+- `value_must_be_zero: Vec<String>` — each named stat must equal 0 on both proxies.
+- `value_present_only: Vec<String>` — each named stat must be present on both proxies;
+  value may differ.
+
+Added sibling parser `parse_prometheus_samples(body: &[u8]) -> BTreeMap<String, u64>`
+to extract name→value pairs from a Prometheus text-exposition body (labels dropped,
+non-parseable values silently skipped; `BTreeMap` for deterministic error message
+ordering). Extended `assert_body_rule`'s `PrometheusExposition` arm to dispatch
+`value_exact` → `value_must_be_zero` → `value_present_only` in order, using `bail!`
+with descriptive error messages including per-proxy observed values.
+
+Three pre-existing tests that constructed `BodyRule::PrometheusExposition` with the
+old 2-field form were updated to include the three new fields (all set to `vec![]`);
+two match arms destructuring the variant in parse-round-trip tests were updated to
+add `..` (pattern completeness). All changes are purely additive; existing
+behavior is unchanged.
+
+Backwards-compat verified: fixture 0011 `expectations.yaml` with `kind:
+prometheus_exposition` (no new fields) deserializes correctly via the
+`#[serde(default)]` fallback.
+
+### Tests landed (2 new unit tests)
+
+1. `assert_body_rule_prometheus_exposition_passes_on_value_exact_match` — body with
+   `foo 5` and `bar 0`; rule asserts `value_exact: [("foo", 5)]` and
+   `value_must_be_zero: ["bar"]`; both proxies identical → `Ok(())`.
+
+2. `assert_body_rule_prometheus_exposition_fails_on_value_mismatch` — envoy body
+   `foo 5`, rust body `foo 6`; rule asserts `value_exact: [("foo", 5)]`; error
+   message contains `"value_exact mismatch"`.
+
+### Deviations from PLAN
+
+1. **rustfmt reformatted the `parse_prometheus_samples` body** (the inline
+   `name_end` assignment was split to chained method form, matching
+   `parse_prometheus_metric_names` above it) and reformatted two test variable
+   declarations (`rust_body  =` → `rust_body =`) + one `assert!` call
+   (split to multi-line). No semantic diff; all PLAN-verbatim snippets are
+   functionally identical after auto-format.
+
+2. **Three existing tests updated** (not mentioned in PLAN): the pre-existing
+   `assert_body_rule_prometheus_exposition_*` tests in `mod tests` constructed
+   `BodyRule::PrometheusExposition` with the old 2-field form and required the
+   three new fields. Added `value_exact: vec![], value_must_be_zero: vec![],
+   value_present_only: vec![]` to each. Two parse-round-trip match arms got `..`
+   for pattern completeness. All semantics preserved.
+
+### LoC delta
+
+- `tests/differential/src/lib.rs`: +~85 LoC net (3 new fields + rustdoc on variant
+  + `parse_prometheus_samples` ~35 LoC + `assert_body_rule` extension ~40 LoC +
+  2 new tests ~30 LoC; minus the small field-addition boilerplate already counted
+  in the enum). PLAN estimated ~50 LoC code + 2 tests; actual is modestly higher
+  due to the three existing-test updates and the value-assertion logic being
+  spelled out in full per-field rather than compressed.
+
+### Carryforward closures
+
+None. This task closes no open carryforwards.
