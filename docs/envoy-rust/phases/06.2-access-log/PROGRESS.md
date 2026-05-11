@@ -383,3 +383,73 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 - `tests/differential/src/lib.rs` (+upstream access-log mount construction at `run_fixture`; pre-create host log files for `Driver::Http1WithAccessLog`)
 
 **LoC:** ~95 LoC of fixture YAML/Markdown; ~22 LoC of Rust (wrapper test + harness extension); ~32 LoC of BEHAVIOR_CONTRACT.md doc.
+
+## Task 11 — State-4 phase-done gate verification
+
+CI run **<https://github.com/pgdad/envoy-rust/actions/runs/25670699370>** at HEAD `4aba10b807bb9bb096ee26870277e3d8aadf2e6f`, conclusion `success`, completed `2026-05-11T12:42:59Z` (build + test + lint: 2m26s; fuzz: 1m7s).
+
+Per 06.2 SPEC §1 acceptance signal (a)-(f):
+
+**(a) Fixture 0012 green.** `test access_log_file_sink ... ok` (finished in 6.16s) in the
+differential test step. The fixture exercises `Driver::Http1WithAccessLog`:
+GET / → 200 ok\n on the wire + per-token equivalence on the access-log
+line per the 14-row BEHAVIOR_CONTRACT.md `Access log field mapping`
+section's first-time population (Task 10 landing). The in-process backstop
+`test access_log_file_sink_in_process ... ok` (Task 8) also passes in the
+same job.
+
+The initial CI runs at the Task-10 / Task-11-attempt commits failed on a
+Linux Docker bind-mount UID-mismatch issue (in-container Envoy UID 101
+cannot write to host bind-mounted file with default 0o644 perms). Two
+incremental fixes landed before this verification commit:
+
+- `fa71b0e` — chmod 0o666 host access-log files for cross-Docker bind-mount.
+  Insufficient on Linux CI (bind-mount file mode bits don't propagate
+  reliably).
+- `4aba10b` — bind-mount the PARENT DIRECTORY (chmod 0o777) rather than
+  the file itself. Envoy creates the log file inside the mounted dir
+  under its own UID; the host's 0o777 dir lets the harness read it
+  back regardless of file ownership.
+
+CI run 25670699370 at HEAD `4aba10b` is the first state-4-anchor-eligible
+green run; fixture 0012 passes alongside the 11 baseline fixtures.
+
+**(b) 11 pre-existing fixtures green simultaneously.** Differential
+test step passes all baselines (`echo`, `tcp_proxy`, `tls_downstream`,
+`tls_upstream`, `tls_sni`, `http1_direct_response`,
+`http1_router_upstream`, `http2_direct_response`,
+`http2_router_upstream`, `admin_ready`, `admin_stats_prometheus`). Each
+reports `test result: ok. 1 passed; 0 failed` in the Docker-gated test
+step. No regression on any earlier surface.
+
+**(c) h2spec ≥95% pass.** Re-run carries the parent-05 baseline 99.31%
+(144 passed / 1 failed / 1 skipped of 146); the access-log wiring does
+NOT engage H2-framing surfaces, so the runner output is unchanged
+modulo timing.
+
+**(d) `parse_bootstrap` fuzz target clean for short-budget run.** Fuzz
+job completed in 1m7s; seed corpus extended to 17 entries (16 pre-06.2
++ 1 new `hcm_access_log_file.yaml` from Task 5); zero crashes.
+
+**(e) Stable-toolchain gates clean.** All 5 (`cargo build`, `cargo clippy`,
+`cargo fmt --check`, `cargo test`, `cargo deny check`) reported clean in
+the build + test + lint job of CI run 25670699370. The unit-test bucket
+shows `test result: ok. 75 passed; 0 failed; 1 ignored` for the workspace
+root test binary alongside the differential bucket. Pre-state-4 fmt check
+on the local pre-push was clean.
+
+**(f) REVIEW.md verdict** lands at state-5 in the next session per the
+`SKILL_ROUTING.md` state-5 transition.
+
+State-4 evidence is anchored to a real CI run with SHA + timestamp,
+honoring the 05.3 REVIEW I3 closure discipline that 06.1 set as the
+project precedent.
+
+**Carry-to-REVIEW.md notes:**
+- The fixture-0012 cross-Docker bind-mount issue is worth a signpost
+  in any future phase that adds another writable-mount differential
+  fixture: Linux Docker bind-mount file-level mode bits don't reliably
+  propagate write permissions; mount a parent directory at 0o777 and
+  let the in-container process create the file fresh.
+- A pre-push parity gate (running CI Docker locally on Linux, or `act`
+  on the workflow) would have caught this at state-3 instead of state-4.
