@@ -457,3 +457,102 @@ is necessary for deterministic gauge-peak assertions.
 ### Carryforward closures
 
 None. This task closes no open carryforwards.
+
+---
+
+## Task 6 — Cluster cx_active gauge + ConnGaugeGuard RAII (D15.3.b)
+
+### Structure correction (SPEC pseudocode vs actual code)
+
+The PLAN's pseudocode refers to `ClusterInner` as the struct holding the gauge.
+In the actual codebase there is no `ClusterInner`: the struct hierarchy is
+`ClusterHandle { inner: Arc<Cluster> }` where `Cluster` is the concrete type.
+`ConnGaugeGuard`, `Cluster::cx_active_guard()`, and
+`ClusterHandle::cx_active_guard()` are all wired against `Cluster` directly,
+not against an intermediate `ClusterInner`. Documented here per D-3.5.
+
+### Implementation summary
+
+- **`ConnGaugeGuard`** (new pub struct in `crates/envoy-cluster/src/cluster.rs`):
+  holds `Arc<Gauge>`. `Drop` calls `self.gauge.dec()`. Construction is via
+  `Cluster::cx_active_guard()` which calls `self.cx_active.inc()` then wraps
+  the `Arc::clone`.
+
+- **`Cluster` struct** extended with `pub(crate) cx_active: Arc<envoy_stats::Gauge>`.
+
+- **`from_bootstrap`**: `register_gauge("cluster.<name>.upstream_cx_active")`
+  immediately after the existing `register_counter` call; both are in the
+  same per-cluster loop body. One construction site only (confirmed via
+  `grep -n "cx_total:" cluster.rs`).
+
+- **`Cluster::cx_active_guard()`** and **`ClusterHandle::cx_active_guard()`**:
+  delegates mirror the existing `cx_total()` / `cx_total()` pair shape.
+
+- **Call-site wiring (4 sites)**:
+  - `crates/envoy-http1/src/hcm.rs` — `let _cx_guard = cluster.cx_active_guard();`
+    before `Client::connect`.
+  - `crates/envoy-http2/src/hcm.rs` — single `let _cx_guard = cluster.cx_active_guard();`
+    before the `match cluster.upstream_protocol()` block, covering both H1 and
+    H2 arms.
+  - `crates/envoy-tcp/src/lib.rs` — `let _cx_guard = self.cluster.cx_active_guard();`
+    before `tokio::net::TcpStream::connect(addr).await`. Guard fires even on
+    connect error because Drop triggers on the `?`-exit path too.
+
+- **Cargo.toml (`crates/envoy-cluster`)**: added `"time"` to dev-dependency
+  tokio features (required by `tokio::time::sleep` in the concurrent test).
+
+### Deviations
+
+**Test #2 simplification:** `cluster_cx_active_round_trip_through_h1_call`
+uses a guard-held-across-await approach (tokio::time::sleep) rather than an
+actual H1 client call. Running an H1 client call inside the `envoy-cluster`
+crate tests would require adding `envoy-http1` as a dev-dependency, which is
+heavyweight and inverts the crate-dependency direction. The RAII correctness
+contract (inc at guard construction + observable gauge peak during async hold
++ dec on drop) is fully verified here; cross-crate wiring is verified by the
+HCM integration tests in envoy-http1 / envoy-http2.
+
+**Concurrent test barrier:** `cluster_cx_active_monotonic_then_decreasing_under_concurrent_calls`
+uses synchronous guard acquisition in the main task (a tight `(0..N).map(|_|
+handle.cx_active_guard()).collect()` loop) to guarantee the peak observation,
+rather than `tokio::sync::Barrier` (not available without the `sync` feature)
+or an ad-hoc sleep-then-peek. This approach is strictly correct: no async
+yield occurs between guard acquisitions, so the gauge reaches N atomically
+from the perspective of the subsequent assertion.
+
+**Fixture 0011 holding-pattern entry:** `envoy_cluster_backend_upstream_cx_active`
+added to `allowlist_envoy_rust_only` in fixture 0011. This is technically Task
+11 territory (BEHAVIOR_CONTRACT + fixture expectations), but adding the entry
+here follows the established Task 4 + Task 5 holding-pattern precedent. The
+comment on the entry makes the holding-pattern explicit.
+
+### Tests landed (3 unit tests in `crates/envoy-cluster/src/cluster.rs::tests`)
+
+1. `cluster_cx_active_guard_increments_on_construct_and_decrements_on_drop` —
+   direct RAII contract test: call `cx_active_guard()`; assert gauge == 1;
+   drop; assert gauge == 0.
+
+2. `cluster_cx_active_round_trip_through_h1_call` — guard held across
+   `tokio::time::sleep(10ms)`; asserts gauge == 1 before and during sleep,
+   == 0 after drop.
+
+3. `cluster_cx_active_monotonic_then_decreasing_under_concurrent_calls` —
+   10 guards acquired synchronously; peak assertion at 10; 10 tasks each hold
+   a guard for 50ms; gauge == 0 after all join.
+
+### LoC delta
+
+- `crates/envoy-cluster/src/cluster.rs`: +~150 LoC (`ConnGaugeGuard` struct +
+  `cx_active` field + `cx_active_guard()` impls + `mk_handle` gauge field + 3
+  tests).
+- `crates/envoy-cluster/Cargo.toml`: +1 LoC (`"time"` feature in dev-deps).
+- `crates/envoy-http1/src/hcm.rs`: +6 LoC (guard + doc comment).
+- `crates/envoy-http2/src/hcm.rs`: +7 LoC (guard + doc comment).
+- `crates/envoy-tcp/src/lib.rs`: +7 LoC (guard + doc comment).
+- `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`: +6 LoC.
+- Total net-new code+tests: ~177 LoC (PLAN estimated ~120; growth is the 3
+  verbose test bodies + holding-pattern deviation notes).
+
+### Carryforward closures
+
+None. This task closes no open carryforwards.

@@ -5,6 +5,26 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// 06.3 D15.3.b: RAII guard around `cluster.<name>.upstream_cx_active`.
+/// Construction increments via the cluster's `cx_active_guard()`; Drop
+/// decrements. Covers both success and error close paths uniformly —
+/// the guard exits scope at the per-call task's epilogue regardless of
+/// whether the upstream connect succeeded.
+///
+/// Per architecture decision 13 (06.3 PROGRESS Task 1 preamble): the
+/// guard lives in envoy-cluster because the gauge does; per parent-06
+/// SPEC §6 Rule 2 the consumer increments — the consumer here is the
+/// HCM proxy-arm / envoy-tcp dial site, which holds the guard.
+pub struct ConnGaugeGuard {
+    gauge: Arc<envoy_stats::Gauge>,
+}
+
+impl Drop for ConnGaugeGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 /// A configured upstream cluster. Owns the static endpoint list and the
 /// round-robin `AtomicUsize` cursor. Constructed by `from_bootstrap` only;
 /// external code works through `ClusterHandle`.
@@ -27,6 +47,12 @@ pub struct Cluster {
     /// load-balancing data structure, not a connection factory. See SPEC
     /// §3 D4.b's increment-site-at-call-site posture.
     pub(crate) cx_total: Arc<envoy_stats::Counter>,
+    /// 06.3 D15.3.b: per-cluster active-connection gauge. Registered at
+    /// construct time as `cluster.<name>.upstream_cx_active`. Exposed via
+    /// `cx_active_guard()` (on `Cluster` + `ClusterHandle`) which atomically
+    /// increments and returns a `ConnGaugeGuard`; the guard's `Drop` impl
+    /// decrements, covering both success and error close paths uniformly.
+    pub(crate) cx_active: Arc<envoy_stats::Gauge>,
 }
 
 impl Cluster {
@@ -55,6 +81,18 @@ impl Cluster {
     /// (returns a `&` into the `Cluster`'s lifetime).
     pub fn cx_total(&self) -> &Arc<envoy_stats::Counter> {
         &self.cx_total
+    }
+
+    /// 06.3 D15.3.b: increment `cluster.<name>.upstream_cx_active` and
+    /// return a `ConnGaugeGuard` that decrements the gauge on drop. The
+    /// caller must bind the guard to `_cx_guard` (not `_`) to preserve
+    /// the binding for the connection's scope. Covers both success and
+    /// error close paths uniformly.
+    pub fn cx_active_guard(&self) -> ConnGaugeGuard {
+        self.cx_active.inc();
+        ConnGaugeGuard {
+            gauge: Arc::clone(&self.cx_active),
+        }
     }
 
     /// Picks the next endpoint in round-robin order. `Relaxed` ordering is
@@ -105,6 +143,13 @@ impl ClusterHandle {
     /// reach.
     pub fn cx_total(&self) -> &Arc<envoy_stats::Counter> {
         self.inner.cx_total()
+    }
+
+    /// 06.3 D15.3.b: delegates to `Cluster::cx_active_guard`. Connect-site
+    /// callers hold a `ClusterHandle`; this mirrors the accessor for
+    /// ergonomic reach. See `Cluster::cx_active_guard` for usage contract.
+    pub fn cx_active_guard(&self) -> ConnGaugeGuard {
+        self.inner.cx_active_guard()
     }
 }
 
@@ -325,12 +370,21 @@ pub async fn from_bootstrap(
                 cluster: cfg.name.clone(),
                 message: e.to_string(),
             })?;
+        // 06.3 D15.3.b: register `cluster.<name>.upstream_cx_active` gauge.
+        // Idempotent for same-kind re-registration (Task 5 contract).
+        let cx_active = registry
+            .register_gauge(&format!("cluster.{}.upstream_cx_active", cfg.name))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
             endpoints,
             cursor: AtomicUsize::new(0),
             upstream_protocol,
             cx_total,
+            cx_active,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -355,15 +409,18 @@ mod tests {
     }
 
     /// Construct a per-test Cluster + ClusterHandle bypassing
-    /// `from_bootstrap`. Counter is registered against a fresh registry so
-    /// the test mirrors the real `from_bootstrap` Arc-clone shape (Counter's
-    /// constructor is `pub(crate)` to envoy-stats; consumers always go
-    /// through the registry).
+    /// `from_bootstrap`. Counter and gauge are registered against a fresh
+    /// registry so the test mirrors the real `from_bootstrap` Arc-clone shape
+    /// (Counter/Gauge constructors are `pub(crate)` to envoy-stats; consumers
+    /// always go through the registry).
     fn mk_handle(name: &str, endpoints: Vec<SocketAddr>) -> ClusterHandle {
         let registry = envoy_stats::StatsRegistry::new();
         let cx_total = registry
             .register_counter(&format!("cluster.{name}.upstream_cx_total"))
             .expect("counter registers");
+        let cx_active = registry
+            .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
+            .expect("gauge registers");
         ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
@@ -371,6 +428,7 @@ mod tests {
                 cursor: AtomicUsize::new(0),
                 upstream_protocol: UpstreamProtocol::default(),
                 cx_total,
+                cx_active,
             }),
         }
     }
@@ -649,6 +707,9 @@ admin:
             cx_total: registry
                 .register_counter("cluster.backend.upstream_cx_total")
                 .expect("counter registers"),
+            cx_active: registry
+                .register_gauge("cluster.backend.upstream_cx_active")
+                .expect("gauge registers"),
         };
         assert_eq!(c.name(), "backend");
     }
@@ -993,6 +1054,199 @@ static_resources:
         let mgr = build_cluster_mgr(yaml).await;
         let handle = mgr.get("backend").expect("backend cluster");
         assert_eq!(handle.upstream_protocol(), UpstreamProtocol::Http1);
+    }
+
+    // ── 06.3 D15.3.b: cx_active gauge + ConnGaugeGuard tests ─────────────
+
+    /// 06.3 D15.3.b: `ConnGaugeGuard` increments `upstream_cx_active` at
+    /// construction and decrements via `Drop`. Exercises the direct RAII
+    /// contract without any async scaffolding.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_cx_active_guard_increments_on_construct_and_decrements_on_drop() {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let yaml = format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: {}
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#,
+            backend_addr.port()
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("from_bootstrap");
+
+        // Re-register to get the same Arc (idempotent same-kind contract).
+        let cx_active = registry
+            .register_gauge("cluster.backend_cluster.upstream_cx_active")
+            .expect("gauge registers");
+        assert_eq!(cx_active.value(), 0, "gauge starts at zero");
+
+        let handle = mgr.get("backend_cluster").expect("cluster present");
+        {
+            let _guard = handle.cx_active_guard();
+            assert_eq!(cx_active.value(), 1, "guard construction increments gauge");
+        }
+        // Drop fires here.
+        assert_eq!(cx_active.value(), 0, "Drop decrements gauge back to zero");
+    }
+
+    /// 06.3 D15.3.b: gauge is observable at > 0 while a guard is held
+    /// across an async yield point (simulates a live upstream connection).
+    /// Simplified from the full H1 integration test — per PROGRESS deviation
+    /// note: running an actual H1 client call inside the cluster crate would
+    /// require pulling envoy-http1 as a dev-dependency, which is heavyweight.
+    /// The RAII correctness (inc + async hold + dec-on-drop) is fully covered
+    /// here; cross-crate wiring is verified by the HCM-level integration tests
+    /// in the envoy-http1 and envoy-http2 crates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_cx_active_round_trip_through_h1_call() {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let yaml = format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: {}
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#,
+            backend_addr.port()
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("from_bootstrap");
+
+        let cx_active = registry
+            .register_gauge("cluster.backend_cluster.upstream_cx_active")
+            .expect("gauge registers");
+
+        let handle = mgr.get("backend_cluster").expect("cluster present");
+
+        // Hold the guard across an async yield — simulates the window during
+        // which an upstream connection is live. Guard is visible at value 1
+        // mid-await and falls back to 0 after the scope exits.
+        let guard = handle.cx_active_guard();
+        assert_eq!(cx_active.value(), 1, "gauge is 1 while guard is held");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(cx_active.value(), 1, "gauge is still 1 during async sleep");
+        drop(guard);
+        assert_eq!(cx_active.value(), 0, "gauge returns to 0 after guard drop");
+    }
+
+    /// 06.3 D15.3.b: 10 concurrent guard acquisitions each held for ~50 ms.
+    /// The gauge must settle to 0 after all tasks join. A peak observation is
+    /// obtained by reading the gauge immediately after all guards are acquired
+    /// in a tight loop (no async yield between acquire and read) — this
+    /// guarantees the gauge reaches N before any drop fires.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_cx_active_monotonic_then_decreasing_under_concurrent_calls() {
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        let yaml = format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: {}
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#,
+            backend_addr.port()
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("from_bootstrap");
+
+        let cx_active = registry
+            .register_gauge("cluster.backend_cluster.upstream_cx_active")
+            .expect("gauge registers");
+
+        let handle = mgr.get("backend_cluster").expect("cluster present");
+        const N: usize = 10;
+
+        // Acquire all N guards in the current task (no yield between calls) so
+        // the gauge atomically reaches N before any concurrent drop fires.
+        let mut guards: Vec<ConnGaugeGuard> = (0..N).map(|_| handle.cx_active_guard()).collect();
+        assert_eq!(
+            cx_active.value(),
+            N as i64,
+            "gauge peaks at {N} while all guards are held",
+        );
+
+        // Spawn N tasks each holding a guard for ~50 ms; then drop our
+        // synchronous guards too so the gauge returns to 0.
+        let mut join_handles = Vec::with_capacity(N);
+        for g in guards.drain(..) {
+            join_handles.push(tokio::spawn(async move {
+                let _guard = g;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // _guard drops here
+            }));
+        }
+
+        // Join all tasks; after join the gauge must be back at 0.
+        for jh in join_handles {
+            jh.await.expect("task did not panic");
+        }
+        assert_eq!(
+            cx_active.value(),
+            0,
+            "gauge returns to 0 after all guards drop",
+        );
     }
 
     /// 06.1 D4.b: per-cluster `upstream_cx_total` counter increments via

@@ -216,6 +216,13 @@ async fn handle_one_stream(
                 body: envoy_req.body.clone(),
             };
 
+            // 06.3 D15.3.b: RAII guard increments
+            // `cluster.<name>.upstream_cx_active` before either protocol arm
+            // connects and decrements via Drop at scope exit, covering both
+            // success and error close paths uniformly. A single guard covers
+            // both the H1 and H2 arms of the match below.
+            let _cx_guard = cluster.cx_active_guard();
+
             let start = Instant::now();
             let upstream_resp_result = match cluster.upstream_protocol() {
                 envoy_cluster::UpstreamProtocol::Http1 => {

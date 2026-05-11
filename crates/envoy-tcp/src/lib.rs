@@ -87,6 +87,13 @@ impl TcpProxy {
             }) as Box<dyn std::error::Error + Send + Sync>
         })?;
 
+        // 06.3 D15.3.b: RAII guard increments
+        // `cluster.<name>.upstream_cx_active` before the dial attempt and
+        // decrements via Drop at scope exit, covering both success and error
+        // close paths uniformly (the `?` below short-circuits on error but
+        // Drop still fires). Mirrors the H1 + H2 HCM guard placement.
+        let _cx_guard = self.cluster.cx_active_guard();
+
         let stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|source| {

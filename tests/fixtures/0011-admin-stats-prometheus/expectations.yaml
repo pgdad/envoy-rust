@@ -278,3 +278,9 @@ driver:
       # per its current StatsRegistry convention. Will drop together with
       # `downstream_cx_total` when a StatsTagExtractor-equivalent lands.
       - envoy_listener_ingress_http_downstream_cx_active
+      # 06.3 D15.3.b: per-cluster active-connection gauge. Envoy emits this
+      # as `envoy_cluster_backend_upstream_cx_active` (with label-based
+      # cluster naming); envoy-rust embeds the cluster name in the stat name
+      # per its current StatsRegistry convention. Will drop together with
+      # `upstream_cx_total` when a StatsTagExtractor-equivalent lands.
+      - envoy_cluster_backend_upstream_cx_active

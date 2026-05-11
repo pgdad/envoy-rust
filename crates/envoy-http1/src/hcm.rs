@@ -408,6 +408,12 @@ async fn serve_connection(
                     // `addr:port` rendering envoy uses.
                     upstream_host_for_log = Some(endpoint.to_string());
 
+                    // 06.3 D15.3.b: RAII guard increments
+                    // `cluster.<name>.upstream_cx_active` at the start of the
+                    // proxy arm and decrements via Drop at scope exit, covering
+                    // both success and error close paths uniformly.
+                    let _cx_guard = cluster.cx_active_guard();
+
                     let start = std::time::Instant::now();
                     let client_result = Client::connect(endpoint, &host_header).await;
                     match client_result {
