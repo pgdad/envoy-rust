@@ -1390,6 +1390,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             ] {
                 std::fs::File::create(p)
                     .with_context(|| format!("pre-creating host access-log file {p}"))?;
+                // 06.2 CI fix: Linux Docker bind-mounts do NOT translate UIDs, so the
+                // in-container envoy user (UID 101) cannot write to a host file owned
+                // by the runner UID with default 0644 permissions. Permissive mode
+                // here is safe — these files are ephemeral test data in /tmp/.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o666))
+                        .with_context(|| format!("chmod host access-log file {p}"))?;
+                }
             }
             vec![(
                 expected_access_log_paths.envoy.clone(),
