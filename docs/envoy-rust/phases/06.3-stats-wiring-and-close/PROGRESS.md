@@ -965,3 +965,86 @@ Prometheus label at scrape time. Until then, value-side verification stays
 at the unit-test level (per-task unit tests in Tasks 4 / 5 / 6 / 7 / 8 / 10).
 
 Fixture 0011 differential test restored to green.
+
+---
+
+## Task 12 — State-4 phase-done gate verification (D20.3)
+
+Per BOOTSTRAP_PROMPT.md §7.5 + 06.3 SPEC §1 acceptance signals (a)-(f).
+This task materializes the state-3 → state-4 transition by quoting the
+local gate results into PROGRESS. The CI run URL is deferred to a
+state-4-followup (push not performed in this executor session per
+shared-state-impact discipline).
+
+### Local §7.5 gate results (HEAD b46025ecc3c621815b8c9005dabc9814da2c5e52)
+
+**(e) Stable-toolchain gates:**
+
+- `cargo build --workspace --all-targets`:
+  ```
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+  ```
+
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  ```
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+  ```
+
+- `cargo fmt --all -- --check`:
+  ```
+  (no output — clean; exit code 0)
+  ```
+
+- `cargo test --workspace --lib --bins`:
+  ```
+  TOTAL: 499 passed; 0 failed; 2 ignored
+  (all individual crate "test result:" lines: ok)
+  ```
+
+- `cargo deny check`:
+  ```
+     │      ━━━━ unmatched license allowance
+  
+  advisories ok, bans ok, licenses ok, sources ok
+  ```
+  (Two "unmatched license allowance" warnings for Unicode-DFS-2016 and Zlib are
+  pre-existing and expected — the allow-list is intentionally conservative.
+  `cargo deny` exits 0.)
+
+**(a) + (b) Differential fixture suite (Docker-gated):**
+
+Docker version 28.0.4 available. All 12 fixtures green:
+
+```
+admin_stats_prometheus : test result: ok. 1 passed; 0 failed
+echo                   : test result: ok. 1 passed; 0 failed
+tcp_proxy              : test result: ok. 1 passed; 0 failed
+tls_downstream         : test result: ok. 1 passed; 0 failed
+tls_upstream           : test result: ok. 1 passed; 0 failed
+tls_sni                : test result: ok. 1 passed; 0 failed
+http1_direct_response  : test result: ok. 1 passed; 0 failed
+http1_router_upstream  : test result: ok. 1 passed; 0 failed
+http2_direct_response  : test result: ok. 1 passed; 0 failed
+http2_router_upstream  : test result: ok. 1 passed; 0 failed
+admin_ready            : test result: ok. 1 passed; 0 failed
+access_log_file_sink   : test result: ok. 1 passed; 0 failed
+
+12/12 fixtures GREEN
+```
+
+**(c) Conformance:** h2spec ≥95% pass — carries from 05.2 D7 baseline 99.31%. CI run that will validate at push time.
+
+**(d) Fuzz:** No new fuzz target in 06.3 per architecture decision 20; the existing `parse_bootstrap` target from 06.1 covers unchanged at 17 seeds.
+
+**(f) REVIEW.md:** lands at state-5 in a subsequent session per BOOTSTRAP_PROMPT.md §5.1 "one state per session".
+
+### State-4 followup (CI URL capture)
+
+This session does not push to origin/main. The CI URL capture is deferred
+to: (i) a state-4-followup task in a session where the user explicitly
+authorizes the push, OR (ii) the user pushes manually and the next session
+(state-5) captures the CI URL alongside REVIEW.md drafting.
+
+The local-gate results above substantively verify §7.5 (a)-(e); the CI run
+will re-verify (c) h2spec + (a)+(b) differential under the project's
+standard CI environment.
