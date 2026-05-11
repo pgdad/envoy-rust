@@ -292,3 +292,10 @@ driver:
       # StatsTagExtractor-equivalent lands.
       - envoy_cluster_backend_upstream_rq_total
       - envoy_cluster_backend_upstream_rq_5xx
+      # 06.3 D15.3.d: per-listener accept-failure counter. Envoy emits this
+      # as `envoy_listener_downstream_cx_overflow`-adjacent (no direct upstream
+      # Envoy equivalent for accept-OS-error; the closest upstream stat lives
+      # under listener manager). envoy-rust embeds the listener name in the stat
+      # name per the current StatsRegistry convention. Holding-pattern entry;
+      # Task 11's territory for BEHAVIOR_CONTRACT update.
+      - envoy_listener_ingress_http_downstream_cx_accept_failed

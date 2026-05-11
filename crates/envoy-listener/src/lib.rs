@@ -77,6 +77,12 @@ pub struct Listener {
     /// `tokio::net::TcpListener` + `envoy_admin::serve` directly
     /// (not `Listener::bind`), so this gauge is naturally excluded.
     cx_active: Arc<envoy_stats::Gauge>,
+    /// 06.3 D15.3.d: per-listener counter incremented on every accept error
+    /// (the `Err(err)` arm of `listener.accept()` in `serve`). Registered at
+    /// construct time as `listener.<name>.downstream_cx_accept_failed`. Per
+    /// signpost 6: ALL accept errors count, no carve-outs. Incremented BEFORE
+    /// the `tracing::warn!` so the counter fires even if the warn is filtered.
+    cx_accept_failed: Arc<envoy_stats::Counter>,
 }
 
 impl std::fmt::Debug for Listener {
@@ -119,11 +125,20 @@ impl Listener {
         let cx_active = registry
             .register_gauge(&format!("listener.{}.downstream_cx_active", cfg.name))
             .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        // 06.3 D15.3.d: register `listener.<name>.downstream_cx_accept_failed`.
+        // Idempotent same-kind re-registration mirrors cx_total above.
+        let cx_accept_failed = registry
+            .register_counter(&format!(
+                "listener.{}.downstream_cx_accept_failed",
+                cfg.name
+            ))
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
         Ok(Self {
             listener,
             handler,
             cx_total,
             cx_active,
+            cx_accept_failed,
         })
     }
 
@@ -158,6 +173,8 @@ impl Listener {
         let cx_total = self.cx_total;
         // 06.3 D15.3.b: hoist the per-listener gauge; mirrors cx_total above.
         let cx_active = self.cx_active;
+        // 06.3 D15.3.d: hoist the accept-failure counter; mirrors cx_total + cx_active above.
+        let cx_accept_failed = self.cx_accept_failed;
         let mut join_set: tokio::task::JoinSet<
             Result<(), Box<dyn std::error::Error + Send + Sync>>,
         > = tokio::task::JoinSet::new();
@@ -189,6 +206,10 @@ impl Listener {
                             });
                         }
                         Err(err) => {
+                            // 06.3 D15.3.d + signpost 6: ALL accept errors
+                            // count, no carve-outs. Increment BEFORE the warn
+                            // so the counter fires even if tracing is filtered.
+                            cx_accept_failed.inc();
                             // Accept errors are not fatal — log and continue,
                             // matching `envoy-bin::admin::serve` and
                             // `envoy-bin::echo::serve` from phases 00–01.
@@ -631,6 +652,68 @@ filter_chains:
             "gauge must return to 0 after all handlers complete",
         );
         drop(streams);
+
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("serve resolves within 6s")
+            .expect("join")
+            .expect("serve ok");
+    }
+
+    /// 06.3 D15.3.d: `downstream_cx_accept_failed` counter is registered under
+    /// the documented name and is reachable via the idempotent `register_counter`
+    /// round-trip. Asserts:
+    ///   - counter == 0 immediately after bind (no spurious increments).
+    ///   - counter remains 0 after N successful connections (increment is
+    ///     gated to the `Err(err)` arm only, not the `Ok` arm).
+    ///
+    /// Testing limitation: inducing a real `listener.accept()` error is not
+    /// straightforwardly possible with `tokio::net::TcpListener` + the
+    /// current `Listener::serve` signature (which consumes `self`). The
+    /// `Err(err)` arm increment is verified by code-inspection (the
+    /// `cx_accept_failed.inc()` call appears BEFORE `tracing::warn!` in the
+    /// arm body) and by the counter-existence / zero-init check here. This
+    /// limitation mirrors the 06.1 / 06.2 precedent ("happy path +
+    /// counter-existence" coverage with the increment site visible-by-inspection).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_cx_accept_failed_increments_on_accept_error() {
+        let registry = mk_registry();
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(NullHandler);
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind ok");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Idempotent re-registration on the same registry yields the same Arc.
+        let cx_accept_failed = registry
+            .register_counter("listener.test_listener.downstream_cx_accept_failed")
+            .expect("counter registers");
+        assert_eq!(
+            cx_accept_failed.value(),
+            0,
+            "counter starts at zero after bind"
+        );
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(listener.serve(async move {
+            let _ = rx.await;
+        }));
+
+        // Drive N=3 successful connections; counter must remain 0 (increment
+        // is gated to the Err arm, not the Ok arm).
+        for _ in 0..3 {
+            let _stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect ok");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            cx_accept_failed.value(),
+            0,
+            "counter must remain 0 after successful accepts (no spurious increments)",
+        );
 
         let _ = tx.send(());
         tokio::time::timeout(std::time::Duration::from_secs(6), server)

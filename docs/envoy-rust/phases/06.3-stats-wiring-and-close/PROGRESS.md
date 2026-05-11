@@ -605,3 +605,55 @@ Two new counters registered per cluster in `from_bootstrap`:
 ### Carryforward closures
 
 None. This task closes no open carryforwards.
+
+## Task 8 — D15.3.d Listener accept-failure counter (task 8 commit)
+
+### Work summary
+
+Added `cx_accept_failed: Arc<envoy_stats::Counter>` field to the `Listener`
+struct (sibling of `cx_total` and `cx_active`). Registered at bind-time as
+`listener.<name>.downstream_cx_accept_failed` following the same idempotent
+`register_counter` pattern as `cx_total`. Hoisted in `serve` via `let
+cx_accept_failed = self.cx_accept_failed;` alongside the existing hoists for
+`cx_total` / `cx_active`. Incremented inside the `Err(err) =>` arm of
+`listener.accept()` as the very first statement, BEFORE the `tracing::warn!`
+call, per signpost 6 ("ALL accept errors count, no carve-outs").
+
+Also added holding-pattern entry
+`envoy_listener_ingress_http_downstream_cx_accept_failed` to
+`allowlist_envoy_rust_only` in fixture 0011. Entry mirrors the Tasks 4–7
+holding-pattern precedent; BEHAVIOR_CONTRACT update is Task 11's territory.
+
+### Test choice and Err-arm testing limitation
+
+Test `listener_cx_accept_failed_increments_on_accept_error` uses the
+"counter-registered + zero-init + no-spurious-increment" pattern:
+
+1. Bind a `Listener`.
+2. Re-register `"listener.test_listener.downstream_cx_accept_failed"` on the
+   same registry to obtain the same Arc (idempotent contract).
+3. Assert `value() == 0` immediately after bind.
+4. Drive 3 successful connections; assert counter remains 0 (increment is
+   gated to the `Err(err)` arm, not the `Ok` arm).
+
+**Testing limitation:** Inducing a real `tokio::net::TcpListener::accept()`
+error deterministically is not straightforward without either platform-specific
+`setrlimit`/fd exhaustion tricks or refactoring `Listener::serve` to accept a
+trait-abstracted accept call. Neither is in scope for this task. The increment
+at the `Err(err)` arm is verified by code-inspection (the `cx_accept_failed.inc()`
+call appears as the first statement before `tracing::warn!`). This matches the
+06.1 / 06.2 precedent ("happy path + counter-existence" coverage with the
+increment site visible-by-inspection).
+
+### LoC delta
+
+- `crates/envoy-listener/src/lib.rs`: +~55 LoC (struct field + rustdoc ~10;
+  bind registration ~7; serve hoist + Err-arm increment ~5; test ~33).
+- `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`: +~8 LoC
+  (1 new allow-list entry with doc comment).
+- Total net-new code+tests: ~63 LoC (PLAN estimated ~30 code + 1 test; growth
+  is test verbosity and the testing-limitation narrative comment).
+
+### Carryforward closures
+
+None. This task closes no open carryforwards.
