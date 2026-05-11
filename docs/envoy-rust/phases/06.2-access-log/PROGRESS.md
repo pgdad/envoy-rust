@@ -230,3 +230,16 @@ Test fixture (in-test only): `WarnCapture` + `CaptureWriter` (thread-safe `Arc<M
 6. **fmt drift** (per R-9 disclosure requirement): `cargo fmt --all -- --check` flagged drift on two sites after the Step-6 refactor — (a) the long `crate::router::X_ENVOY_UPSTREAM_SERVICE_TIME.to_string()` line in `serve_connection` (the multi-line wrap fmt prefers single-line), (b) the call site in `crates/envoy-http2/src/hcm.rs::h2_proxy_outcome_dispatches_to_h1_upstream_when_cluster_is_http1` whose `let (listener_addr, _hcm) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;` line crossed 100 col after the `.await` insertion. `cargo fmt --all` applied; re-verified clean.
 
 **LoC:** ~360 LoC across 5 files (envoy-http1: ~85 impl in `serve_connection` refactor + helpers + ~150 in test body and helpers; envoy-accesslog: ~15 for the test-only constructor; error.rs: ~10 for the AccessLogOpen variant; envoy-bin: ~5 for the `.await` ripple; envoy-http2: ~10 for the 4 `.await` ripples + 2 sync→async helper promotions + their 7 call-site updates).
+
+## Task 6 follow-up — gate `FileSink::from_file_for_test` behind a `test-util` feature
+
+Closes the Task 6 code-quality review's Important #1: the doc-comment claimed `#[cfg(any(test, feature = "test-util"))]` gating but only `#[doc(hidden)]` was applied. The function compiled into production builds.
+
+**Fix:**
+- `crates/envoy-accesslog/src/file_sink.rs` — added `#[cfg(any(test, feature = "test-util"))]` to `from_file_for_test`.
+- `crates/envoy-accesslog/Cargo.toml` — added `[features] test-util = []`.
+- `crates/envoy-http1/Cargo.toml` — `[dev-dependencies]` now overlays the runtime dep with `envoy-accesslog = { path = "../envoy-accesslog", features = ["test-util"] }`.
+
+Result: the helper is only compiled when running tests (or when a future consumer explicitly enables the feature). Release builds of `envoy-accesslog` no longer carry the symbol.
+
+**Workspace gates:** build/clippy/fmt/test all clean; 4 envoy-http1 access-log tests still pass.

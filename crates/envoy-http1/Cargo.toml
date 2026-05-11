@@ -18,6 +18,7 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+envoy-accesslog = { path = "../envoy-accesslog", features = ["test-util"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 tracing-subscriber = "0.3"

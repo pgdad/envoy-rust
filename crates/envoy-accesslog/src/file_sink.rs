@@ -67,6 +67,7 @@ impl FileSink {
     /// Gated by `#[doc(hidden)]` + `#[cfg(any(test, feature = "test-util"))]`
     /// — production code uses `FileSink::new` exclusively.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_file_for_test(path: PathBuf, file: File) -> Self {
         Self {
             path,
