@@ -66,11 +66,15 @@ pub async fn start(
     host_gateway: bool,
     tls_pki: Option<&crate::tls::TlsTestPki>,
     expose_admin_port: bool,
-    // 06.2 D4.2.c: bind-mount each (host_path, container_path) pair so the
-    // container's access-log writes surface on the host where the harness
-    // reads them. The bind_mount target file must exist on the host; the
-    // caller pre-creates an empty file before invoking `start`. Empty
-    // slice for fixtures with no access-log surface (pre-06.2 behavior).
+    // 06.2 D4.2.c (revised CI fix #2): bind-mount each (host_dir, container_dir)
+    // pair so the container's access-log writes surface on the host where
+    // the harness reads them. The PARENT DIRECTORY of the access-log file
+    // is mounted (not the file itself): Linux Docker bind-mount semantics
+    // for individual files don't reliably propagate write permission to
+    // the in-container envoy UID even at 0o666. The caller pre-creates the
+    // host-side directory with 0o777 perms; the in-container envoy creates
+    // the log file fresh inside under its own UID. Empty slice for fixtures
+    // with no access-log surface (pre-06.2 behavior).
     access_log_mounts: &[(String, String)],
 ) -> Result<UpstreamProxy> {
     let absolute = envoy_yaml_path

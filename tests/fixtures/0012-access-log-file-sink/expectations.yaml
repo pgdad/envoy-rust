@@ -9,8 +9,8 @@ driver:
   expected_headers:
     rule: set_equal_modulo_allow_list
   expected_access_log_paths:
-    envoy: /tmp/0012-envoy-access.log
-    envoy_rust: /tmp/0012-envoy-rust-access.log
+    envoy: /tmp/0012-envoy-mount/access.log
+    envoy_rust: /tmp/0012-envoy-rust-mount/access.log
   expected_access_log_lines:
     - - rule: iso8601_format                                        # %START_TIME%
       - rule: exact

@@ -1371,40 +1371,64 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // `needs_admin_port` so the container exposes ADMIN_CONTAINER_PORT for
     // Driver::AdminScrape fixtures.
     //
-    // 06.2 D4.2.c: for Driver::Http1WithAccessLog, pre-create both host-side
-    // access-log files (truncating any existing content per signpost 7) and
-    // bind-mount the envoy-side path into the container so the
-    // container-side `path:` write surfaces on the host. The envoy-rust side
-    // runs as a subprocess and writes directly to the host path; only the
-    // upstream Envoy needs the bind-mount.
+    // 06.2 D4.2.c (revised CI fix #2): bind-mount the PARENT DIRECTORY of
+    // each access-log path rather than the file itself. Linux Docker
+    // bind-mount semantics for individual files don't reliably propagate
+    // write permission to the in-container UID even at 0o666; bind-mounting
+    // a 0o777 directory and letting Envoy create the file fresh sidesteps
+    // this entirely. The host-side file is created by Envoy under its own
+    // UID, but the host's 0o777 dir lets the harness read it back regardless
+    // of ownership. The envoy-rust side runs as a subprocess and writes
+    // directly to the host path; only the upstream Envoy needs the mount.
     let upstream_access_log_mounts: Vec<(String, String)> = match &expectations.driver {
         Driver::Http1WithAccessLog {
             expected_access_log_paths,
             ..
         } => {
-            // Truncate (or create) both host-side log files so a previous
-            // run's content does not leak into this run's per-token diff.
+            let to_parent = |p: &str| -> Result<(std::path::PathBuf, String)> {
+                let path = std::path::PathBuf::from(p);
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("access-log path {} has no parent", p))?;
+                Ok((parent.to_path_buf(), parent.to_string_lossy().into_owned()))
+            };
+            let (envoy_parent, envoy_parent_s) = to_parent(&expected_access_log_paths.envoy)?;
+            let (envoy_rust_parent, _) = to_parent(&expected_access_log_paths.envoy_rust)?;
+
+            // Create both host-side parent dirs; chmod 0o777 so the in-
+            // container envoy UID can create the log file inside on Linux
+            // Docker without UID-translation. Remove any leftover file from
+            // a previous run so the harness's per-token diff doesn't see
+            // stale lines.
+            for parent in [&envoy_parent, &envoy_rust_parent] {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("create access-log parent dir {}", parent.display())
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777))
+                        .with_context(|| {
+                            format!("chmod access-log parent dir {}", parent.display())
+                        })?;
+                }
+            }
             for p in [
                 &expected_access_log_paths.envoy,
                 &expected_access_log_paths.envoy_rust,
             ] {
-                std::fs::File::create(p)
-                    .with_context(|| format!("pre-creating host access-log file {p}"))?;
-                // 06.2 CI fix: Linux Docker bind-mounts do NOT translate UIDs, so the
-                // in-container envoy user (UID 101) cannot write to a host file owned
-                // by the runner UID with default 0644 permissions. Permissive mode
-                // here is safe — these files are ephemeral test data in /tmp/.
-                #[cfg(unix)]
+                // Best-effort remove of any leftover file; ignore NotFound.
+                if let Err(e) = std::fs::remove_file(p)
+                    && e.kind() != std::io::ErrorKind::NotFound
                 {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o666))
-                        .with_context(|| format!("chmod host access-log file {p}"))?;
+                    return Err(e).with_context(|| format!("remove leftover access-log file {p}"));
                 }
             }
-            vec![(
-                expected_access_log_paths.envoy.clone(),
-                expected_access_log_paths.envoy.clone(),
-            )]
+
+            // Bind-mount the envoy-side parent directory into the container
+            // at the same path. Envoy-rust runs as a host subprocess so no
+            // mount is needed for its side.
+            vec![(envoy_parent_s.clone(), envoy_parent_s)]
         }
         _ => Vec::new(),
     };
