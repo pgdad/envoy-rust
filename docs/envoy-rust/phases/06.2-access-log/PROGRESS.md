@@ -108,3 +108,25 @@ Lands `crates/envoy-accesslog/src/default_format.rs` per SPEC §3 D1.2 + §6 sig
 3. **`clippy::type_complexity` on the test cases slice.** The PLAN's verbatim `&[(u64, (u32, u32, u32, u32, u32, u32))]` trips this lint. Resolved with a local `type YmdHms = (u32, u32, u32, u32, u32, u32);` inside the test fn (no public surface added).
 
 **LoC:** ~310 LoC (149 impl + 160 tests; the test set is unusually dense per the SPEC §3 D1.2 14-test projection split across 8 tests in default_format + 2 in record + 4 in file_sink).
+
+## Task 4 — envoy-accesslog FileSink
+
+Lands `crates/envoy-accesslog/src/file_sink.rs` per SPEC §3 D1.2 + signpost 3 (`Arc<tokio::sync::Mutex<File>>` posture preserves append-semantic atomicity inside the process).
+
+**API landed:**
+- `pub struct FileSink { path, handle: Arc<Mutex<File>> }` (derives `Debug` — see deviation 1 below).
+- `pub async fn FileSink::new(path: PathBuf) -> Result<Self, AccessLogError>` — opens with `append(true).create(true)`; maps `io::Error` → `AccessLogError::Open`.
+- `pub async fn FileSink::emit(&self, record: &AccessLogRecord) -> Result<(), AccessLogError>` — formats via `default_format::format`, writes line + `\n` under the mutex, maps `io::Error` → `AccessLogError::Write`.
+
+**Tests:** `cargo test -p envoy-accesslog --lib file_sink::tests` → `test result: ok. 4 passed; 0 failed`. The serialize-concurrent-emissions test spawns 10 concurrent emissions on one `Arc<FileSink>` and verifies the resulting file contains 10 complete lines with no interleaving.
+
+**Crate-wide tests:** `cargo test -p envoy-accesslog` → `14 passed` (2 record + 8 default_format + 4 file_sink).
+
+**Workspace gates:** `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean (after deviation 2 below); `cargo fmt --all -- --check` clean (after a `cargo fmt --all` pass — initial fmt-check reported drift on the long-line `assert!` wrap in `file_sink_writes_one_record` plus the `AccessLogError::Open` struct-pattern block in `file_sink_emit_returns_error_on_invalid_path`; `cargo fmt --all` applied, re-verified clean per R-9); `cargo test --workspace --lib` 426 passed (no regression — +4 vs Task 3's 422 = the 4 new file_sink tests).
+
+**Execution-time deviations from PLAN's verbatim implementation (recorded for stranger-readability):**
+1. **`#[derive(Debug)]` on `FileSink`.** The PLAN's Step 1 test `file_sink_emit_returns_error_on_invalid_path` calls `.expect_err("expected open error")` on the `Result<FileSink, AccessLogError>` from `FileSink::new`. `expect_err` requires `Debug` on the `Ok` variant. The PLAN's Step 3 impl block defined `FileSink` without `#[derive(Debug)]`; added it. `Arc<tokio::sync::Mutex<File>>` + `PathBuf` both implement `Debug`, so the derive compiles cleanly. No semantic change.
+2. **`SystemTime` unused-import lint.** The PLAN's Step 1 test scaffold imports `use std::time::{Duration, SystemTime, UNIX_EPOCH};` but `make_record()` only references `UNIX_EPOCH` (the field type for `AccessLogRecord::start_time` is inferred, so `SystemTime` does not need to be in scope). Trips `-D warnings` via the `unused_imports` lint. Removed `SystemTime` from the import — semantics-preserving (per doctrine, source fix preferred over `#[allow]`).
+3. **fmt drift** (per R-9 disclosure requirement): `cargo fmt --all -- --check` flagged two sites after Step 3 impl landed — (a) the long-line `assert!(line.ends_with(...))` in `file_sink_writes_one_record` rewrapped to multi-line, (b) the inline `AccessLogError::Open { path: got_path, source: _ } => { ... }` arm rewrapped to a vertically-stacked struct-pattern block. `cargo fmt --all` applied; re-check clean.
+
+**LoC:** ~225 LoC (~70 impl including derive + ~155 tests; the concurrent-emissions test alone is ~45 LoC including the spawned-task plumbing).
