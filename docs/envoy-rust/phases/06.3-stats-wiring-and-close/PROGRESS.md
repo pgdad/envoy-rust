@@ -717,3 +717,127 @@ All three outcomes satisfy the liveness property (connection closed within 7s).
   HCM's established 5s idle budget at `crates/envoy-http1/src/hcm.rs:24`.
   Regression test `admin_handler_idle_read_times_out_at_5s` provides the
   named anchor.
+
+## Task 10 — access_logs_total + access_logs_failed counters + 06.2 REVIEW I2 (task 10 commit)
+
+### What landed
+
+**Counter wiring:**
+
+`HCMStats` (in `crates/envoy-http1/src/hcm.rs`) gains two new fields:
+
+- `access_logs_total: Arc<envoy_stats::Counter>` — stat name
+  `http.<stat_prefix>.access_logs_total`. Incremented at queue-enter time (BEFORE
+  the per-sink await loop) via `Counter::add(config.access_log.len() as u64)`.
+  Per parent SPEC §6 Rule 4: fires regardless of emit success; counts intent-to-emit,
+  not successful-emit. Uses `Counter::add(N)` (not N individual `.inc()` calls)
+  per 06.1 REVIEW §7 R-8.
+
+- `access_logs_failed: Arc<envoy_stats::Counter>` — stat name
+  `http.<stat_prefix>.access_logs_failed`. Incremented inside the per-sink `Err(err)`
+  arm alongside the existing `tracing::warn!(... "access log emission failed")`.
+
+Both counters are registered in `HCMStats::register` following the existing
+per-class counter pattern.
+
+Increment sites:
+- H1 path: `crates/envoy-http1/src/hcm.rs` at the factored access-log dispatch
+  site (inside the `if !config.access_log.is_empty()` block that precedes the
+  per-sink for-loop).
+- H2 path: `crates/envoy-http2/src/hcm.rs` — symmetric increment in
+  `finalize_h2_stream` at the existing `if !config.access_log.is_empty()` block.
+
+**Fixture 0012 tightening (06.2 REVIEW I2 closure):**
+
+Row 12 of `tests/fixtures/0012-access-log-file-sink/expectations.yaml` (the
+`%REQ(USER-AGENT)%` token) was previously `rule: wildcard` with comment
+"drive_http1 may inject a default". Tightened to `rule: exact` + `value: "-"`.
+
+Diagnosis is code-inspection-based (Docker-gated test unavailable locally):
+`tests/differential/src/lib.rs::drive_http1` (lines 888–908) formats the wire
+request as:
+
+```
+{method} {path} HTTP/1.1\r\nHost: {host}\r\n{extra_headers}\r\nConnection: close\r\n\r\n
+```
+
+No `User-Agent:` header is injected. Both proxies see no User-Agent and both
+emit `"-"` in their access logs. The wildcard was unnecessarily loose. The
+exact-value rule matches the existing BEHAVIOR_CONTRACT.md row 12 disposition
+(`value-exact`; row was already correct — the fixture was behind the contract).
+CI run at Task 12 will validate the empirical diagnosis.
+
+**BEHAVIOR_CONTRACT.md row 12 check:**
+
+Read `docs/envoy-rust/BEHAVIOR_CONTRACT.md` line 138. The `%REQ(USER-AGENT)%`
+row already carries `value-exact` disposition — no textual change needed. The
+fixture 0012 tightening brings the test expectation in line with the contract
+that was already in place.
+
+**Fixture 0011 holding entries:**
+
+Added two `allowlist_envoy_rust_only` entries to
+`tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`:
+
+```
+- envoy_http_ingress_http_access_logs_total
+- envoy_http_ingress_http_access_logs_failed
+```
+
+Mirrors the Task 4–8 precedent: Envoy does not expose these counters in its
+Prometheus stats; envoy-rust embeds the stat_prefix in the name. BEHAVIOR_CONTRACT
+update is Task 11's territory.
+
+### Test design
+
+Two new unit tests in `crates/envoy-http1/src/hcm.rs::hcm::tests`:
+
+1. `hcm_increments_access_logs_total_on_emission` — builds `HCMConfig` via
+   `hcm_config_with_access_log_and_registry` (a new helper that exposes the
+   shared registry), opens a writable FileSink, drives one request via the
+   `drive` helper, asserts `access_logs_total == 1` and `access_logs_failed == 0`.
+   Counter values read directly from `config.stats.access_logs_total` Arc (no
+   re-registration needed).
+
+2. `hcm_increments_access_logs_failed_on_emission_error_but_total_still_increments`
+   — uses `FileSink::from_file_for_test` with a read-only file handle (the
+   established trick from `hcm_with_file_access_log_emission_failure_does_not_fail_request`).
+   Drives one request, asserts `access_logs_total == 1` AND `access_logs_failed == 1`.
+
+**Test isolation note (deviation from task spec's expected approach):**
+
+The failing-sink test installs a `tracing::subscriber::NoSubscriber` via
+`set_default` for its duration. This prevents the `tracing::warn!` emitted by
+the read-only-sink failure from being captured by the sibling test's
+`WarnCapture` subscriber when tests run concurrently. Investigation showed the
+interference is a thread-local-subscriber / test-harness-thread-pool interaction:
+the Rust test harness can schedule multiple tests concurrently on a small thread
+pool, and `set_default` is per-OS-thread. When the test harness reuses a thread
+that previously had WarnCapture installed, a warn from another test running on
+that thread could appear in the wrong capture buffer. The null-subscriber
+installation is the minimal, clean fix — it is test-isolation hygiene, not a
+change to the production code path. The existing
+`hcm_with_file_access_log_emission_failure_does_not_fail_request` test (which
+uses WarnCapture) continues to pass cleanly since it is the ONLY test that
+checks warn capture from an emission failure.
+
+### LoC delta
+
+- `crates/envoy-http1/src/hcm.rs`: +~85 LoC (struct fields + rustdoc ~15;
+  register calls ~4; H1 dispatch increment site ~8; test helper ~30; 2 tests
+  ~38; isolation note comment ~10).
+- `crates/envoy-http2/src/hcm.rs`: +~10 LoC (H2 symmetric increment ~8;
+  comment ~2).
+- `tests/fixtures/0012-access-log-file-sink/expectations.yaml`: +1 LoC net
+  (wildcard line split into exact + value; net +1).
+- `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`: +7 LoC
+  (2 new entries + doc comment).
+- Total net-new code+tests: ~103 LoC (PLAN estimated ~50 LoC; growth is the
+  test-isolation narrative and the expanded test helper).
+
+### Carryforward closures
+
+- **06.2 REVIEW I2** — closed by code inspection (see diagnosis above). Fixture
+  0012 row 12 tightened from `wildcard` to `exact: "-"`. BEHAVIOR_CONTRACT.md
+  row 12 was already correct (`value-exact`); no doc edit needed. CI validation
+  deferred to Task 12 Docker-gated run.

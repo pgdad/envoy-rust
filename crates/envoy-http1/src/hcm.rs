@@ -53,6 +53,19 @@ pub struct HCMStats {
     pub downstream_rq_4xx: Arc<envoy_stats::Counter>,
     /// `http.<stat_prefix>.downstream_rq_5xx` — HTTP 5xx responses.
     pub downstream_rq_5xx: Arc<envoy_stats::Counter>,
+    // 06.3 D15.3.e NEW — access-log emission counters. `access_logs_total`
+    // fires at queue-enter time (BEFORE the per-sink await loop) using
+    // Counter::add(N) where N is the configured sink count, per 06.1 REVIEW
+    // §7 R-8 (one bulk increment per request, not N individual .inc() calls).
+    // `access_logs_failed` fires inside the per-sink Err arm alongside
+    // tracing::warn!. Per parent SPEC §6 Rule 4: sink failures do NOT deflate
+    // access_logs_total — the total counts intent-to-emit, not successful emit.
+    /// `http.<stat_prefix>.access_logs_total` — total access-log records
+    /// dispatched to sinks (bulk-incremented by sink count at queue-enter time).
+    pub access_logs_total: Arc<envoy_stats::Counter>,
+    /// `http.<stat_prefix>.access_logs_failed` — per-sink emission failures
+    /// (incremented inside the Err arm alongside tracing::warn!).
+    pub access_logs_failed: Arc<envoy_stats::Counter>,
 }
 
 impl HCMStats {
@@ -76,6 +89,10 @@ impl HCMStats {
                 .register_counter(&format!("http.{stat_prefix}.downstream_rq_4xx"))?,
             downstream_rq_5xx: registry
                 .register_counter(&format!("http.{stat_prefix}.downstream_rq_5xx"))?,
+            access_logs_total: registry
+                .register_counter(&format!("http.{stat_prefix}.access_logs_total"))?,
+            access_logs_failed: registry
+                .register_counter(&format!("http.{stat_prefix}.access_logs_failed"))?,
         })
     }
 }
@@ -540,8 +557,19 @@ async fn serve_connection(
                 authority: access_log_header_value(&req.headers, "host"),
                 upstream_host: upstream_host_for_log,
             };
+            // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
+            // time (BEFORE the per-sink await), per parent SPEC §6 Rule 4 —
+            // fire-and-forget emission's failures do NOT deflate the count.
+            // Counter::add(N) per 06.1 REVIEW §7 R-8 — one bulk increment per
+            // request, not N individual .inc() calls.
+            config
+                .stats
+                .access_logs_total
+                .add(config.access_log.len() as u64);
             for sink in &config.access_log {
                 if let Err(err) = sink.emit(&record).await {
+                    // 06.3 D15.3.e NEW: count emission failures alongside the warn.
+                    config.stats.access_logs_failed.inc();
                     tracing::warn!(error = ?err, "access log emission failed");
                 }
             }
@@ -2115,5 +2143,175 @@ static_resources:
         let lines_per_sink = serve_one_request_with_access_log(std::slice::from_ref(&path)).await;
         let line = &lines_per_sink[0][0];
         assert!(line.contains("HTTP/1.1"), "line: {}", line);
+    }
+
+    // ── 06.3 Task 10: access_logs_total + access_logs_failed counter tests ────
+
+    /// Build HCMConfig via `from_config` with a single FileSink at `path`,
+    /// using a shared registry so the test can re-register the counters to
+    /// obtain the same Arc the HCM holds. Returns (config, registry).
+    async fn hcm_config_with_access_log_and_registry(
+        sinks: Vec<Arc<envoy_accesslog::FileSink>>,
+    ) -> (Arc<HCMConfig>, Arc<envoy_stats::StatsRegistry>) {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let stats =
+            Arc::new(HCMStats::register(&registry, "ingress_http").expect("HCMStats register"));
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats,
+            access_log: sinks,
+            route_config: Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            }),
+        });
+        (config, registry)
+    }
+
+    /// 06.3 D15.3.e: access_logs_total increments once per request (by sink
+    /// count) and access_logs_failed stays at 0 on a working FileSink.
+    ///
+    /// Counter values are read directly from `config.stats` (the Arc the HCM
+    /// holds) without re-registering from a separate registry — avoids the
+    /// tracing-subscriber thread-locality issue that could arise if the server
+    /// task ran on a different thread from a concurrent `WarnCapture` test.
+    #[tokio::test]
+    async fn hcm_increments_access_logs_total_on_emission() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(path.clone())
+                .await
+                .expect("open sink"),
+        );
+        let (config, _registry) = hcm_config_with_access_log_and_registry(vec![sink]).await;
+
+        // Read the counters directly from the Arc the HCM holds.
+        let total = Arc::clone(&config.stats.access_logs_total);
+        let failed = Arc::clone(&config.stats.access_logs_failed);
+
+        assert_eq!(total.value(), 0, "access_logs_total pre-request");
+        assert_eq!(failed.value(), 0, "access_logs_failed pre-request");
+
+        let req = b"GET / HTTP/1.1\r\nHost: envoy-rust.test\r\nConnection: close\r\n\r\n";
+        let _resp = drive(config, req).await;
+
+        assert_eq!(
+            total.value(),
+            1,
+            "access_logs_total should be 1 (1 sink * 1 request)"
+        );
+        assert_eq!(
+            failed.value(),
+            0,
+            "access_logs_failed should be 0 on successful emission"
+        );
+    }
+
+    /// 06.3 D15.3.e: access_logs_total still increments (fires BEFORE the
+    /// per-sink await) when a sink fails; access_logs_failed also increments.
+    ///
+    /// The failing-sink strategy reuses the `FileSink::from_file_for_test`
+    /// read-only-handle trick established by
+    /// `hcm_with_file_access_log_emission_failure_does_not_fail_request`.
+    /// Per parent SPEC §6 Rule 4 (fire-and-forget), total counts intent-to-emit,
+    /// not successful emit, so total == 1 and failed == 1 after one request.
+    ///
+    /// Counter values read directly from `config.stats` (the shared Arc) to
+    /// avoid needing a separately-accessible registry.
+    ///
+    /// Note: a null tracing subscriber is installed for the duration so the
+    /// emission-failure warn! from this test does not compete with the
+    /// WarnCapture thread-local subscriber used by the sibling test
+    /// `hcm_with_file_access_log_emission_failure_does_not_fail_request`.
+    /// Both tests run in the same process and the `set_default` mechanism is
+    /// per-thread; when the test harness reuses threads the subscriber state
+    /// can briefly overlap. The null subscriber is the cleanest isolation.
+    #[tokio::test]
+    async fn hcm_increments_access_logs_failed_on_emission_error_but_total_still_increments() {
+        // Install a null subscriber so this test's tracing::warn! (from the
+        // read-only sink emit failure) is silently discarded and does not
+        // interfere with WarnCapture in the sibling test.
+        let _guard = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        // Touch the file so an O_RDONLY open succeeds.
+        tokio::fs::File::create(&path)
+            .await
+            .expect("touch file")
+            .sync_all()
+            .await
+            .ok();
+        let ro_file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .await
+            .expect("open read-only");
+        let sink = Arc::new(envoy_accesslog::FileSink::from_file_for_test(
+            path.clone(),
+            ro_file,
+        ));
+        let (config, _registry) = hcm_config_with_access_log_and_registry(vec![sink]).await;
+
+        // Snapshot the counter Arcs before driving the request.
+        let total = Arc::clone(&config.stats.access_logs_total);
+        let failed = Arc::clone(&config.stats.access_logs_failed);
+
+        assert_eq!(total.value(), 0, "access_logs_total pre-request");
+        assert_eq!(failed.value(), 0, "access_logs_failed pre-request");
+
+        // Drive the request; serve_connection returns Ok even on sink failure
+        // (fire-and-forget posture). Inline the TCP-pair pattern so we retain
+        // access to the config Arc (and thus its stats fields).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(config, sock).await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: envoy-rust.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        drop(client);
+        let result = server.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "serve_connection should succeed despite sink failure"
+        );
+
+        assert_eq!(
+            total.value(),
+            1,
+            "access_logs_total should be 1 (intent-to-emit fires before await)"
+        );
+        assert_eq!(
+            failed.value(),
+            1,
+            "access_logs_failed should be 1 (one sink failed)"
+        );
     }
 }

@@ -32,7 +32,8 @@ driver:
         value: "-"                                                   # %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%
       - rule: exact
         value: "-"                                                   # %REQ(X-FORWARDED-FOR)%
-      - rule: wildcard                                               # %REQ(USER-AGENT)% (drive_http1 may inject a default)
+      - rule: exact
+        value: "-"                                                   # %REQ(USER-AGENT)% (drive_http1 does not inject; both proxies emit "-")
       - rule: exact
         value: "-"                                                   # %REQ(X-REQUEST-ID)%
       - rule: exact

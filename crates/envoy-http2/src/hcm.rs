@@ -413,8 +413,18 @@ async fn finalize_h2_stream(
             authority: access_log_header_value(&envoy_req.headers, "host"),
             upstream_host: upstream_host_for_log_h2,
         };
+        // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
+        // Counter::add(N) per 06.1 REVIEW §7 R-8; fires BEFORE the per-sink
+        // await so failures do NOT deflate access_logs_total (parent SPEC §6
+        // Rule 4 fire-and-forget posture).
+        config
+            .stats
+            .access_logs_total
+            .add(config.access_log.len() as u64);
         for sink in &config.access_log {
             if let Err(err) = sink.emit(&record).await {
+                // 06.3 D15.3.e NEW: count emission failures alongside the warn.
+                config.stats.access_logs_failed.inc();
                 tracing::warn!(error = ?err, "access log emission failed");
             }
         }

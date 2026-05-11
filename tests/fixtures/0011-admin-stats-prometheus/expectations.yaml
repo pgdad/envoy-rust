@@ -299,3 +299,10 @@ driver:
       # name per the current StatsRegistry convention. Holding-pattern entry;
       # Task 11's territory for BEHAVIOR_CONTRACT update.
       - envoy_listener_ingress_http_downstream_cx_accept_failed
+      # 06.3 D15.3.e: access-log emission counters. Envoy does not expose
+      # these counters in its Prometheus stats; envoy-rust emits them with
+      # the stat_prefix embedded in the name per the current StatsRegistry
+      # convention. Holding-pattern entry; BEHAVIOR_CONTRACT update is
+      # Task 11's territory.
+      - envoy_http_ingress_http_access_logs_total
+      - envoy_http_ingress_http_access_logs_failed
