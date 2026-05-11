@@ -68,6 +68,15 @@ pub struct Listener {
     /// `tokio::select!` accept arm in `serve` (moved into a local at the
     /// top of the loop to keep the borrow shape simple).
     cx_total: Arc<envoy_stats::Counter>,
+    /// 06.3 D15.3.b: per-listener gauge tracking in-flight connections.
+    /// Incremented on each accepted TCP connection; decremented at the
+    /// per-connection task epilogue (both success and error paths).
+    /// Registered at construct time as
+    /// `listener.<name>.downstream_cx_active`. Scoped to data-path
+    /// listeners only — the admin listener uses
+    /// `tokio::net::TcpListener` + `envoy_admin::serve` directly
+    /// (not `Listener::bind`), so this gauge is naturally excluded.
+    cx_active: Arc<envoy_stats::Gauge>,
 }
 
 impl std::fmt::Debug for Listener {
@@ -105,10 +114,16 @@ impl Listener {
         let cx_total = registry
             .register_counter(&format!("listener.{}.downstream_cx_total", cfg.name))
             .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        // 06.3 D15.3.b: register `listener.<name>.downstream_cx_active`.
+        // Idempotent same-kind re-registration mirrors cx_total above.
+        let cx_active = registry
+            .register_gauge(&format!("listener.{}.downstream_cx_active", cfg.name))
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
         Ok(Self {
             listener,
             handler,
             cx_total,
+            cx_active,
         })
     }
 
@@ -141,6 +156,8 @@ impl Listener {
         // borrowing `self` (which has been consumed by the `let listener =
         // self.listener;` move above).
         let cx_total = self.cx_total;
+        // 06.3 D15.3.b: hoist the per-listener gauge; mirrors cx_total above.
+        let cx_active = self.cx_active;
         let mut join_set: tokio::task::JoinSet<
             Result<(), Box<dyn std::error::Error + Send + Sync>>,
         > = tokio::task::JoinSet::new();
@@ -158,9 +175,18 @@ impl Listener {
                         Ok((stream, peer)) => {
                             // 06.1 D4.a: increment per-listener accept counter.
                             cx_total.inc();
+                            // 06.3 D15.3.b: increment active-connection gauge.
+                            cx_active.inc();
                             tracing::debug!(%peer, "listener accepted connection");
                             let h = handler.clone();
-                            join_set.spawn(async move { h.handle(stream).await });
+                            // Clone the gauge Arc into the task; dec after
+                            // handle returns (both success and error paths).
+                            let cx_active_clone = Arc::clone(&cx_active);
+                            join_set.spawn(async move {
+                                let result = h.handle(stream).await;
+                                cx_active_clone.dec();
+                                result
+                            });
                         }
                         Err(err) => {
                             // Accept errors are not fatal — log and continue,
@@ -466,6 +492,152 @@ filter_chains:
             }
             other => panic!("expected ListenerError::Bind, got {other:?}"),
         }
+    }
+
+    /// A `ConnectionHandler` that holds each connection open until a
+    /// `tokio::sync::broadcast` receiver fires (the sender is cloned from an
+    /// `Arc`). Used in cx_active tests to control exactly when each connection
+    /// task completes so we can observe the gauge before and after decrement.
+    struct HoldHandler {
+        release: tokio::sync::broadcast::Sender<()>,
+    }
+    impl ConnectionHandler for HoldHandler {
+        fn handle(
+            &self,
+            _downstream: tokio::net::TcpStream,
+        ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+            let mut rx = self.release.subscribe();
+            Box::pin(async move {
+                // Wait until the sender fires or the channel closes (also
+                // fine — treat closed as "released").
+                let _ = rx.recv().await;
+                Ok(())
+            })
+        }
+    }
+
+    /// 06.3 D15.3.b: `downstream_cx_active` gauge increments on accept and
+    /// decrements when the per-connection handler task completes.
+    ///
+    /// Uses `HoldHandler` so the handler task stays live until we explicitly
+    /// signal release. Pattern: connect → settle → assert gauge==1 → release
+    /// → settle → assert gauge==0.
+    ///
+    /// The gauge Arc is captured via `register_gauge` on the same registry
+    /// (idempotent same-kind re-registration, same as cx_total pattern).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_cx_active_increments_on_accept_decrements_on_close() {
+        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+        let registry = mk_registry();
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(HoldHandler {
+            release: release_tx.clone(),
+        });
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind ok");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let cx_active = registry
+            .register_gauge("listener.test_listener.downstream_cx_active")
+            .expect("gauge registers");
+        assert_eq!(cx_active.value(), 0, "gauge starts at zero");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(listener.serve(async move {
+            let _ = rx.await;
+        }));
+
+        // Open 1 connection; HoldHandler keeps it live until we release.
+        let _stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect ok");
+        // Brief settle window so the accept + increment fires.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            cx_active.value(),
+            1,
+            "gauge must be 1 while connection is held",
+        );
+
+        // Release the handler task → decrement fires.
+        let _ = release_tx.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            cx_active.value(),
+            0,
+            "gauge must return to 0 after handler completes",
+        );
+
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("serve resolves within 6s")
+            .expect("join")
+            .expect("serve ok");
+    }
+
+    /// 06.3 D15.3.b: gauge is monotonically increasing under a burst of 5
+    /// simultaneous connections, then returns to 0 once all 5 complete.
+    ///
+    /// Uses `HoldHandler` to keep all 5 connections live while we assert the
+    /// peak gauge, then releases all 5 and asserts the gauge returns to 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listener_cx_active_monotonic_then_decreasing_under_burst() {
+        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+        let registry = mk_registry();
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(HoldHandler {
+            release: release_tx.clone(),
+        });
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind ok");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let cx_active = registry
+            .register_gauge("listener.test_listener.downstream_cx_active")
+            .expect("gauge registers");
+        assert_eq!(cx_active.value(), 0, "gauge starts at zero");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(listener.serve(async move {
+            let _ = rx.await;
+        }));
+
+        // Open 5 connections concurrently; HoldHandler keeps them live.
+        let mut streams = Vec::with_capacity(5);
+        for _ in 0..5 {
+            streams.push(
+                tokio::net::TcpStream::connect(addr)
+                    .await
+                    .expect("connect ok"),
+            );
+        }
+        // Wait for all 5 accepts + increments to land.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            cx_active.value(),
+            5,
+            "gauge must be 5 while all 5 connections are held",
+        );
+
+        // Release all 5 handler tasks → 5 decrements fire.
+        let _ = release_tx.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            cx_active.value(),
+            0,
+            "gauge must return to 0 after all handlers complete",
+        );
+        drop(streams);
+
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("serve resolves within 6s")
+            .expect("join")
+            .expect("serve ok");
     }
 
     /// 06.1 D4.a: per-listener `downstream_cx_total` counter increments

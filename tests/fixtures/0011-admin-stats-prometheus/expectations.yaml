@@ -272,3 +272,9 @@ driver:
       - envoy_http_ingress_http_downstream_rq_4xx
       - envoy_http_ingress_http_downstream_rq_5xx
       - envoy_listener_ingress_http_downstream_cx_total
+      # 06.3 D15.3.b: per-listener active-connection gauge. Envoy emits this
+      # as `envoy_listener_downstream_cx_active` (generic, with label-based
+      # listener naming); envoy-rust embeds the listener name in the stat name
+      # per its current StatsRegistry convention. Will drop together with
+      # `downstream_cx_total` when a StatsTagExtractor-equivalent lands.
+      - envoy_listener_ingress_http_downstream_cx_active

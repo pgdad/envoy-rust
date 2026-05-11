@@ -388,3 +388,72 @@ projection to a later phase).
   write-before-read invariant at compile time. Regression test
   `hcm_h1_state_init_writes_in_all_5_writer_arms` provides a named test
   as the regression anchor.
+
+## Task 5 — listener `cx_active` gauge (data-path scope; task 5 commit)
+
+### Work summary
+
+Added `cx_active: Arc<envoy_stats::Gauge>` to `Listener` struct and registered
+it at bind time as `listener.<name>.downstream_cx_active`. The accept loop
+increments the gauge on every accepted TCP connection; the per-connection spawned
+task decrements after `h.handle(stream).await` returns (both success and error
+paths, unconditionally, via a cloned `Arc<Gauge>`).
+
+Stat is automatically data-path-scoped: the admin listener at
+`crates/envoy-bin/src/main.rs:324-345` uses `tokio::net::TcpListener` +
+`envoy_admin::serve` directly (not `envoy_listener::Listener::bind`), so
+the gauge is never registered for admin traffic. No `ListenerConfig.count_active`
+flag needed.
+
+Also updated the `0011-admin-stats-prometheus` fixture's
+`allowlist_envoy_rust_only` to include the new
+`envoy_listener_ingress_http_downstream_cx_active` entry (same treatment as
+`downstream_cx_total` in Task 4).
+
+### Deviation from PLAN
+
+**Deviation: SPEC §3 D15.3.b's signpost 7 posture is implemented by simply
+not threading the gauge through any code path the admin listener takes.**
+`envoy-bin::main.rs:324-345` constructs the admin listener via
+`tokio::net::TcpListener` + `envoy_admin::serve` (not via
+`envoy_listener::Listener::bind`), so the `cx_active` gauge is automatically
+scoped to data-path listeners. The PLAN-projected `ListenerConfig.count_active:
+bool` flag is unnecessary and not added. There is also no existing
+`ListenerConfig` type in envoy-listener (confirmed: `Listener::bind` takes
+`cfg: &envoy_config::Listener` directly), which further ratifies the
+deviation.
+
+### Tests landed (2 unit tests in `crates/envoy-listener/src/lib.rs::tests`)
+
+1. `listener_cx_active_increments_on_accept_decrements_on_close` — binds a
+   listener with `HoldHandler` (a new test-only handler that holds each
+   connection open until a `broadcast::Sender` fires), connects 1 client,
+   asserts `cx_active == 1` while held, releases the handler, asserts
+   `cx_active == 0` after settle (~100ms).
+
+2. `listener_cx_active_monotonic_then_decreasing_under_burst` — same pattern
+   with N=5 simultaneous connections; asserts peak `cx_active == 5`, releases
+   all 5, asserts `cx_active == 0`.
+
+`HoldHandler` uses `tokio::sync::broadcast` to coordinate release, avoiding
+a shared `Mutex` or per-connection channels. The broadcast channel is
+created at test scope; `HoldHandler` holds a `Sender` clone and subscribes
+per connection.
+
+Note: The PLAN-suggested `NullHandler` (drops stream immediately) cannot
+hold the connection open long enough to observe the gauge at peak. `HoldHandler`
+is necessary for deterministic gauge-peak assertions.
+
+### LoC delta
+
+- `crates/envoy-listener/src/lib.rs`: +~115 LoC (struct field + rustdoc ~15;
+  bind registration ~6; serve hoist + inc + Arc clone + task epilogue ~12;
+  `HoldHandler` test helper ~20; 2 new tests ~62).
+- `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`: +~7 LoC
+  (1 new allowlist entry with doc comment).
+- Total net-new code+tests: ~122 LoC (PLAN estimated ~80; growth is the
+  `HoldHandler` helper + verbose test bodies with broadcast coordination).
+
+### Carryforward closures
+
+None. This task closes no open carryforwards.
