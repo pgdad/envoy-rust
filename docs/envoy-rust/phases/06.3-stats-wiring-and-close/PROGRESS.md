@@ -949,3 +949,19 @@ checks warn capture from an emission failure.
   0012 row 12 tightened from `wildcard` to `exact: "-"`. BEHAVIOR_CONTRACT.md
   row 12 was already correct (`value-exact`); no doc edit needed. CI validation
   deferred to Task 12 Docker-gated run.
+
+### Task 11 fixup — empty value_exact (bilateral-assertion mismatch)
+
+The initial Task 11 commit (`06bdf14`) populated value_exact with 3 entries
+referencing envoy-rust-only stat names (already in allowlist_envoy_rust_only
+for the Prometheus name-vs-label projection divergence). Bilateral value_exact
+assertion requires both proxies to emit the same name, so the assertion fails
+at runtime with `envoy=None, envoy-rust=Some(N)`.
+
+Fixup: emptied value_exact. The block carries a comment explaining the
+deferral: bilateral value_exact assertions on these counters await a
+StatsTagExtractor-equivalent that projects the dynamic segment back into a
+Prometheus label at scrape time. Until then, value-side verification stays
+at the unit-test level (per-task unit tests in Tasks 4 / 5 / 6 / 7 / 8 / 10).
+
+Fixture 0011 differential test restored to green.

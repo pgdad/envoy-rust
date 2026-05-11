@@ -34,34 +34,19 @@ driver:
     #   - envoy.envoy_overload_actions_reset_high_memory_stream_count (1)
     #     — anomalous double-`envoy_` prefix emitted by upstream Envoy.
     # Sorted alphabetically for diff-readability under future churn.
-    # 06.3 Task 11: conservative value-side assertion set. Only asserts
-    # the 3 counters known to be incremented by the current single-request
-    # `GET /` scenario (direct_response 200). The counters that are
-    # registered but not bumped (3xx/4xx/5xx, access_logs_*, cx_active,
-    # cx_accept_failed) DO appear in the exposition at value 0 because
-    # envoy-stats/src/prometheus.rs emits ALL registered metrics regardless
-    # of value (confirmed: snapshot() is BTreeMap-backed, registration at
-    # startup time). However, this set stays conservative per the narrowed
-    # Task 11 scope — multi-class counter assertions require a multi-request
-    # pre_requests setup that is deferred per the PROGRESS Task 11 deviation
-    # note. Bumped counters only:
-    #   - envoy_http_ingress_http_downstream_rq_total: 1 request fired.
-    #   - envoy_http_ingress_http_downstream_rq_2xx: direct_response 200 → 2xx class.
-    #   - envoy_listener_ingress_http_downstream_cx_total: 1 connection accepted.
-    value_exact:
-      - - envoy_http_ingress_http_downstream_rq_total
-        - 1
-      - - envoy_http_ingress_http_downstream_rq_2xx
-        - 1
-      - - envoy_listener_ingress_http_downstream_cx_total
-        - 1
-    # value_must_be_zero: deferred. The registered-but-not-bumped counters
-    # (downstream_rq_3xx/4xx/5xx, access_logs_total, access_logs_failed,
-    # cx_accept_failed) and the terminal-zero gauges (cx_active) DO appear
-    # in the exposition at 0 (all counters/gauges are registered at startup).
-    # Asserting them here would be correct but is left for a future task
-    # that also extends pre_requests to multi-class scenarios, so the
-    # 0-value assertions gain context from the non-zero sibling assertions.
+    value_exact: []
+    # Bilateral value_exact assertions on per-class HCM counters, listener
+    # cx_total, etc. defer to a later phase that ships a StatsTagExtractor-
+    # equivalent. Upstream Envoy emits these counters under
+    # `envoy_http_downstream_rq_total{envoy_http_conn_manager_prefix="ingress_http"}`
+    # (label-keyed) while envoy-rust emits
+    # `envoy_http_ingress_http_downstream_rq_total` (name-embedded) — see the
+    # `allowlist_envoy_rust_only` block below + BEHAVIOR_CONTRACT.md
+    # "Prometheus exposition shape divergence". When the dynamic segment is
+    # projected back to a label at scrape time, the paired allow-list entries
+    # drop together AND bilateral value_exact assertions become possible.
+    # Until then, value-side verification stays at the unit-test level
+    # (Tasks 4 / 5 / 6 / 7 / 8 / 10 each carry per-stat unit tests).
     value_must_be_zero: []
     value_present_only: []
     allowlist_envoy_only:
