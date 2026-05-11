@@ -278,6 +278,16 @@ async fn handle_one_stream(
                 }
             };
 
+            // 06.3 D15.3.c: per PLAN-write SPEC correction 3, the H2 router-arm
+            // does NOT call write_proxied_response (it builds the downstream
+            // Response inline below). Inline 2-line increments parallel the H1
+            // path. Both fire on the success arm only (the Err arm returned via
+            // finalize_h2_stream above).
+            cluster.upstream_rq_total().inc();
+            if upstream_resp.status / 100 == 5 {
+                cluster.upstream_rq_5xx().inc();
+            }
+
             // Build the downstream response: mirror envoy-http1::router::
             // write_proxied_response's header policy — replace upstream
             // `server` with `server: envoy-rust`; replace or inject `date`
@@ -1261,5 +1271,184 @@ static_resources:
             "line should not contain HTTP/1.1: {}",
             line
         );
+    }
+
+    // ── 06.3 D15.3.c: H2-path upstream_rq_total / upstream_rq_5xx tests ──
+
+    /// 06.3 D15.3.c: H2 proxy path increments `upstream_rq_total` once when
+    /// the upstream returns 200. Uses an H2 upstream returning 200 (mirrors
+    /// `h2_proxy_outcome_dispatches_to_upstream`). The registry is shared so
+    /// the test can re-register the counter to get the same Arc.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_hcm_increments_upstream_rq_total_on_200() {
+        let (upstream_addr, _upstream_handle) = spawn_upstream_h2_server(b"ok").await;
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = {
+            let yaml = format!(
+                r#"
+node: {{ id: x, cluster: y }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: {addr}
+                      port_value: {port}
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_concurrent_streams: 100
+"#,
+                addr = upstream_addr.ip(),
+                port = upstream_addr.port(),
+            );
+            let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
+            Arc::new(
+                envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                    .await
+                    .expect("from_bootstrap"),
+            )
+        };
+
+        // Re-register by name to get the same Arc (idempotent same-kind contract).
+        let rq_total = registry
+            .register_counter("cluster.backend.upstream_rq_total")
+            .expect("counter registers");
+        let rq_5xx = registry
+            .register_counter("cluster.backend.upstream_rq_5xx")
+            .expect("counter registers");
+        assert_eq!(rq_total.value(), 0, "starts at zero");
+        assert_eq!(rq_5xx.value(), 0, "starts at zero");
+
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // Drain body to let the stream complete.
+        let (_parts, mut body) = resp.into_parts();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        // Brief settle so the spawned handle_one_stream task's increment is visible.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 200");
+        assert_eq!(rq_5xx.value(), 0, "upstream_rq_5xx must stay 0 for 200");
+    }
+
+    /// 06.3 D15.3.c: H2 proxy path increments both `upstream_rq_total` and
+    /// `upstream_rq_5xx` when the upstream returns 503. Uses a minimal H1
+    /// upstream (raw TCP) returning 503 to exercise the 5xx conditional,
+    /// wired as an H1-protocol cluster so we can control the response status.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_hcm_increments_upstream_rq_5xx_on_503() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        // Minimal H1 upstream returning 503.
+        let _upstream_handle = tokio::spawn(async move {
+            loop {
+                if let Ok((mut tcp, _)) = upstream_listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = tcp.read(&mut buf).await;
+                    let _ = tcp
+                        .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = tcp.shutdown().await;
+                }
+            }
+        });
+
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = {
+            let yaml = format!(
+                r#"
+node: {{ id: x, cluster: y }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: {addr}
+                      port_value: {port}
+"#,
+                addr = upstream_addr.ip(),
+                port = upstream_addr.port(),
+            );
+            let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
+            Arc::new(
+                envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                    .await
+                    .expect("from_bootstrap"),
+            )
+        };
+
+        let rq_total = registry
+            .register_counter("cluster.backend.upstream_rq_total")
+            .expect("counter registers");
+        let rq_5xx = registry
+            .register_counter("cluster.backend.upstream_rq_5xx")
+            .expect("counter registers");
+        assert_eq!(rq_total.value(), 0, "starts at zero");
+        assert_eq!(rq_5xx.value(), 0, "starts at zero");
+
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status().as_u16(), 503);
+
+        // Drain body.
+        let (_parts, mut body) = resp.into_parts();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        // Brief settle.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 503");
+        assert_eq!(rq_5xx.value(), 1, "upstream_rq_5xx must be 1 after 503");
     }
 }

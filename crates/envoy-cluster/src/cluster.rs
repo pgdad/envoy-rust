@@ -53,6 +53,16 @@ pub struct Cluster {
     /// increments and returns a `ConnGaugeGuard`; the guard's `Drop` impl
     /// decrements, covering both success and error close paths uniformly.
     pub(crate) cx_active: Arc<envoy_stats::Gauge>,
+    /// 06.3 D15.3.c: per-cluster counter incremented once per upstream
+    /// response received (success path only — the 502/503 synth paths do NOT
+    /// increment). Registered at construct time as
+    /// `cluster.<name>.upstream_rq_total`. Exposed via `upstream_rq_total()`.
+    pub(crate) upstream_rq_total: Arc<envoy_stats::Counter>,
+    /// 06.3 D15.3.c: per-cluster counter incremented when the upstream
+    /// response status is 5xx (status / 100 == 5). Registered at construct
+    /// time as `cluster.<name>.upstream_rq_5xx`. Exposed via
+    /// `upstream_rq_5xx()`.
+    pub(crate) upstream_rq_5xx: Arc<envoy_stats::Counter>,
 }
 
 impl Cluster {
@@ -81,6 +91,24 @@ impl Cluster {
     /// (returns a `&` into the `Cluster`'s lifetime).
     pub fn cx_total(&self) -> &Arc<envoy_stats::Counter> {
         &self.cx_total
+    }
+
+    /// 06.3 D15.3.c: shared accessor for the per-cluster upstream-response
+    /// total counter (`cluster.<name>.upstream_rq_total`). Returns the
+    /// cached `Arc<Counter>` registered at `from_bootstrap` time. The
+    /// response-site caller does `cluster.upstream_rq_total().inc()` once
+    /// the upstream response is successfully received. Mirrors `cx_total()`'s
+    /// borrow shape.
+    pub fn upstream_rq_total(&self) -> &Arc<envoy_stats::Counter> {
+        &self.upstream_rq_total
+    }
+
+    /// 06.3 D15.3.c: shared accessor for the per-cluster upstream-5xx
+    /// counter (`cluster.<name>.upstream_rq_5xx`). The response-site caller
+    /// increments conditionally when `upstream_resp.status / 100 == 5`.
+    /// Mirrors `upstream_rq_total()`'s borrow shape.
+    pub fn upstream_rq_5xx(&self) -> &Arc<envoy_stats::Counter> {
+        &self.upstream_rq_5xx
     }
 
     /// 06.3 D15.3.b: increment `cluster.<name>.upstream_cx_active` and
@@ -150,6 +178,20 @@ impl ClusterHandle {
     /// ergonomic reach. See `Cluster::cx_active_guard` for usage contract.
     pub fn cx_active_guard(&self) -> ConnGaugeGuard {
         self.inner.cx_active_guard()
+    }
+
+    /// 06.3 D15.3.c: delegates to `Cluster::upstream_rq_total`. Response-
+    /// site callers hold a `ClusterHandle`; this mirrors the accessor for
+    /// ergonomic reach.
+    pub fn upstream_rq_total(&self) -> &Arc<envoy_stats::Counter> {
+        self.inner.upstream_rq_total()
+    }
+
+    /// 06.3 D15.3.c: delegates to `Cluster::upstream_rq_5xx`. Response-
+    /// site callers hold a `ClusterHandle`; this mirrors the accessor for
+    /// ergonomic reach.
+    pub fn upstream_rq_5xx(&self) -> &Arc<envoy_stats::Counter> {
+        self.inner.upstream_rq_5xx()
     }
 }
 
@@ -378,6 +420,19 @@ pub async fn from_bootstrap(
                 cluster: cfg.name.clone(),
                 message: e.to_string(),
             })?;
+        // 06.3 D15.3.c: register per-cluster upstream-request counters.
+        let upstream_rq_total = registry
+            .register_counter(&format!("cluster.{}.upstream_rq_total", cfg.name))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
+        let upstream_rq_5xx = registry
+            .register_counter(&format!("cluster.{}.upstream_rq_5xx", cfg.name))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
             endpoints,
@@ -385,6 +440,8 @@ pub async fn from_bootstrap(
             upstream_protocol,
             cx_total,
             cx_active,
+            upstream_rq_total,
+            upstream_rq_5xx,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -421,6 +478,12 @@ mod tests {
         let cx_active = registry
             .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
             .expect("gauge registers");
+        let upstream_rq_total = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_total"))
+            .expect("counter registers");
+        let upstream_rq_5xx = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
+            .expect("counter registers");
         ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
@@ -429,6 +492,8 @@ mod tests {
                 upstream_protocol: UpstreamProtocol::default(),
                 cx_total,
                 cx_active,
+                upstream_rq_total,
+                upstream_rq_5xx,
             }),
         }
     }
@@ -710,6 +775,12 @@ admin:
             cx_active: registry
                 .register_gauge("cluster.backend.upstream_cx_active")
                 .expect("gauge registers"),
+            upstream_rq_total: registry
+                .register_counter("cluster.backend.upstream_rq_total")
+                .expect("counter registers"),
+            upstream_rq_5xx: registry
+                .register_counter("cluster.backend.upstream_rq_5xx")
+                .expect("counter registers"),
         };
         assert_eq!(c.name(), "backend");
     }

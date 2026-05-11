@@ -284,3 +284,11 @@ driver:
       # per its current StatsRegistry convention. Will drop together with
       # `upstream_cx_total` when a StatsTagExtractor-equivalent lands.
       - envoy_cluster_backend_upstream_cx_active
+      # 06.3 D15.3.c: per-cluster upstream-response counters. Envoy emits
+      # these as `envoy_cluster_backend_upstream_rq_total` and
+      # `envoy_cluster_backend_upstream_rq_5xx` with label-based cluster
+      # naming; envoy-rust embeds the cluster name in the stat name. Will
+      # drop together with the other cluster counters when a
+      # StatsTagExtractor-equivalent lands.
+      - envoy_cluster_backend_upstream_rq_total
+      - envoy_cluster_backend_upstream_rq_5xx

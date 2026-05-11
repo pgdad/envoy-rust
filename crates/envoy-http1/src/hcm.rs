@@ -446,6 +446,7 @@ async fn serve_connection(
                                     ));
                                     crate::router::write_proxied_response(
                                         &mut downstream,
+                                        &cluster,
                                         upstream_response,
                                         elapsed_ms,
                                         close,

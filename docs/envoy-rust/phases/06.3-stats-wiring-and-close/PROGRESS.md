@@ -556,3 +556,52 @@ comment on the entry makes the holding-pattern explicit.
 ### Carryforward closures
 
 None. This task closes no open carryforwards.
+
+## Task 7 — D15.3.c Upstream-side router counters + H2 inline increments
+
+### What landed
+
+Two new counters registered per cluster in `from_bootstrap`:
+- `cluster.<name>.upstream_rq_total` — incremented once per upstream response received on the success path.
+- `cluster.<name>.upstream_rq_5xx` — incremented conditionally when `upstream_resp.status / 100 == 5`.
+
+**`Cluster` struct** (`crates/envoy-cluster/src/cluster.rs`): added `upstream_rq_total: Arc<Counter>` and `upstream_rq_5xx: Arc<Counter>` fields alongside the existing `cx_total`/`cx_active` fields. Accessors `upstream_rq_total()` / `upstream_rq_5xx()` added on both `Cluster` and `ClusterHandle` mirroring the `cx_total()` pattern.
+
+**`write_proxied_response` signature** (`crates/envoy-http1/src/router.rs`): extended with `cluster: &envoy_cluster::ClusterHandle` as second parameter (after `downstream`, before `upstream_response`). Prologue fires `cluster.upstream_rq_total().inc()` unconditionally; `cluster.upstream_rq_5xx().inc()` fires conditionally on `upstream_resp.status / 100 == 5`.
+
+**H1 HCM call site** (`crates/envoy-http1/src/hcm.rs:~447`): updated to pass `&cluster` (already in scope in the proxy arm).
+
+**H2 inline increments** (`crates/envoy-http2/src/hcm.rs`): per PLAN-write SPEC correction 3, the H2 router-arm does NOT call `write_proxied_response`. Inline 2-line increments (`cluster.upstream_rq_total().inc()` + conditional `cluster.upstream_rq_5xx().inc()`) land immediately after `let upstream_resp = match upstream_resp_result { ... }` resolves to the success arm (around line 280, BEFORE the header-copy loop).
+
+**Fixture 0011** (`tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`): added `envoy_cluster_backend_upstream_rq_total` and `envoy_cluster_backend_upstream_rq_5xx` to `allowlist_envoy_rust_only`, following the Tasks 4-6 holding-pattern precedent.
+
+### Deviations
+
+**`write_proxied_response` parameter order:** `cluster` is the second parameter (immediately after `downstream: &mut W`), before `upstream_response`. This keeps the writer (destination) first and the cluster (stats context) second, matching idiomatic "state object before value" order in the existing API surface.
+
+**H2 test scaffolding decision:** The two H2 tests land in `crates/envoy-http2/src/hcm.rs::tests`, exercising the full proxy path through `handle_one_stream`. This matches the existing `h2_proxy_outcome_dispatches_to_upstream` / `h2_proxy_outcome_dispatches_to_h1_upstream_when_cluster_is_http1` precedent in that module. The test for 200 uses an H2 upstream; the test for 503 uses a minimal H1 upstream (raw TCP write returning 503) wired as an H1-protocol cluster, because `spawn_upstream_h2_server` always returns 200.
+
+**router.rs test helper:** `drive_proxy` is now `async fn` because `mk_test_cluster` must `await` `from_bootstrap`. Direct `Cluster` construction from `envoy-http1` tests is not possible (`pub(crate)` fields). Using `from_bootstrap` via YAML + shared registry is the established cross-crate test pattern.
+
+### Tests landed (4 unit tests)
+
+1. `write_proxied_response_increments_upstream_rq_total_on_200` (in `crates/envoy-http1/src/router.rs::tests`) — drives 200 upstream response; asserts `upstream_rq_total == 1`, `upstream_rq_5xx == 0`.
+
+2. `write_proxied_response_increments_upstream_rq_5xx_on_503` (same module) — drives 503 upstream response; asserts both counters == 1.
+
+3. `h2_hcm_increments_upstream_rq_total_on_200` (in `crates/envoy-http2/src/hcm.rs::tests`) — full H2 proxy round-trip via in-process H2 upstream returning 200; asserts counters after 100ms settle.
+
+4. `h2_hcm_increments_upstream_rq_5xx_on_503` (same module) — full H2 proxy round-trip via raw H1 upstream returning 503; asserts both counters == 1.
+
+### LoC delta
+
+- `crates/envoy-cluster/src/cluster.rs`: +~65 LoC (fields, accessors, registration, test updates).
+- `crates/envoy-http1/src/router.rs`: +~75 LoC (signature, prologue, helper, 2 tests).
+- `crates/envoy-http1/src/hcm.rs`: +1 LoC.
+- `crates/envoy-http2/src/hcm.rs`: +~70 LoC (inline increments + 2 integration tests).
+- `tests/fixtures/0011-admin-stats-prometheus/expectations.yaml`: +8 LoC.
+- Total: ~219 LoC (PLAN estimated ~70; growth is test verbosity + from_bootstrap-based test construction).
+
+### Carryforward closures
+
+None. This task closes no open carryforwards.

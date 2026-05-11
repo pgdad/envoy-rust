@@ -74,6 +74,7 @@ pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 ///    chunked reader, so the downstream side always emits CL-framed in 04.3).
 pub async fn write_proxied_response<W>(
     downstream: &mut W,
+    cluster: &envoy_cluster::ClusterHandle,
     upstream_response: Response,
     elapsed_ms: u128,
     close: bool,
@@ -81,6 +82,12 @@ pub async fn write_proxied_response<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    // 06.3 D15.3.c: per-upstream-response counters. Fires once per call
+    // (which is already gated on receiving a valid upstream_response).
+    cluster.upstream_rq_total().inc();
+    if upstream_response.status / 100 == 5 {
+        cluster.upstream_rq_5xx().inc();
+    }
     let now_date = crate::date::format_imf_fixdate(std::time::SystemTime::now());
     let mut headers: Vec<(String, String)> =
         Vec::with_capacity(upstream_response.headers.len() + 2);
@@ -157,6 +164,7 @@ where
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::sync::Arc;
 
     fn upstream(status: u16, headers: Vec<(&str, &str)>, body: &[u8]) -> Response {
         Response {
@@ -170,11 +178,45 @@ mod tests {
         }
     }
 
-    /// Run write_proxied_response into an in-memory Vec and parse out the
-    /// resulting downstream wire bytes.
+    /// Build a test ClusterHandle via from_bootstrap with a fresh registry.
+    /// Returns `(handle, registry)` so tests can re-register counters to get
+    /// the same Arc the cluster holds (idempotent same-kind contract).
+    async fn mk_test_cluster() -> (
+        envoy_cluster::ClusterHandle,
+        Arc<envoy_stats::StatsRegistry>,
+    ) {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: test
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: test
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 10000 } } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("cluster mgr");
+        let handle = mgr.get("test").expect("cluster present");
+        (handle, registry)
+    }
+
+    /// Run write_proxied_response into an in-memory Vec and return the bytes.
     async fn drive_proxy(upstream_resp: Response, elapsed_ms: u128, close: bool) -> Vec<u8> {
+        let (cluster, _registry) = mk_test_cluster().await;
         let mut buf: Vec<u8> = Vec::new();
-        write_proxied_response(&mut buf, upstream_resp, elapsed_ms, close)
+        write_proxied_response(&mut buf, &cluster, upstream_resp, elapsed_ms, close)
             .await
             .expect("write_proxied_response");
         buf
@@ -281,5 +323,50 @@ mod tests {
         );
         assert!(s.contains("content-length: 5\r\n"), "synthesized CL: {s}");
         assert!(s.ends_with("\r\nhello"), "body: {s}");
+    }
+
+    // ── 06.3 D15.3.c: upstream_rq_total / upstream_rq_5xx counter tests ──
+
+    /// 06.3 D15.3.c: `write_proxied_response` increments `upstream_rq_total`
+    /// on every call (200 status). Verifies the prologue-increment fires
+    /// unconditionally.
+    #[tokio::test]
+    async fn write_proxied_response_increments_upstream_rq_total_on_200() {
+        let (cluster, registry) = mk_test_cluster().await;
+        // Re-register by name to get the same Arc (idempotent same-kind contract).
+        let rq_total = registry
+            .register_counter("cluster.test.upstream_rq_total")
+            .unwrap();
+        let rq_5xx = registry
+            .register_counter("cluster.test.upstream_rq_5xx")
+            .unwrap();
+        let up = upstream(200, vec![("Content-Length", "2")], b"ok");
+        let mut buf: Vec<u8> = Vec::new();
+        write_proxied_response(&mut buf, &cluster, up, 1, false)
+            .await
+            .expect("write");
+        assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 200");
+        assert_eq!(rq_5xx.value(), 0, "upstream_rq_5xx must stay 0 for 200");
+    }
+
+    /// 06.3 D15.3.c: `write_proxied_response` increments both
+    /// `upstream_rq_total` AND `upstream_rq_5xx` when the upstream status
+    /// is 503 (5xx).
+    #[tokio::test]
+    async fn write_proxied_response_increments_upstream_rq_5xx_on_503() {
+        let (cluster, registry) = mk_test_cluster().await;
+        let rq_total = registry
+            .register_counter("cluster.test.upstream_rq_total")
+            .unwrap();
+        let rq_5xx = registry
+            .register_counter("cluster.test.upstream_rq_5xx")
+            .unwrap();
+        let up = upstream(503, vec![("Content-Length", "0")], b"");
+        let mut buf: Vec<u8> = Vec::new();
+        write_proxied_response(&mut buf, &cluster, up, 1, false)
+            .await
+            .expect("write");
+        assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 503");
+        assert_eq!(rq_5xx.value(), 1, "upstream_rq_5xx must be 1 after 503");
     }
 }
