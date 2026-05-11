@@ -18,6 +18,12 @@ use tokio::net::TcpStream;
 ///   `crates/envoy-bin/src/admin.rs::MAX_REQUEST_HEAD` (phase 02.2 I4).
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
+/// 06.3 closes 06.1 REVIEW I1: per-read idle timeout for the admin
+/// handler. Mirrors the HCM at crates/envoy-http1/src/hcm.rs:24. A
+/// connected-but-silent client triggers a clean close within this
+/// budget; the connection task does not hold a JoinSet slot indefinitely.
+const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Drain budget for in-flight admin requests when shutdown fires.
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -53,7 +59,18 @@ impl AdminHandler {
             }
             let cap = MAX_REQUEST_HEAD - buf.len();
             let take = cap.min(scratch.len());
-            let n = stream.read(&mut scratch[..take]).await?;
+            let n = match tokio::time::timeout(IDLE_READ_TIMEOUT, stream.read(&mut scratch[..take]))
+                .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "admin idle read timeout: client did not send request head within 5s",
+                    ));
+                }
+            };
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -384,6 +401,56 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// 06.3 Task 9 — closes 06.1 REVIEW I1: verifies that a silent client
+    /// (no bytes sent after TCP connect) triggers a clean connection close
+    /// within 6s (i.e., the 5s IDLE_READ_TIMEOUT fires before the test's 7s
+    /// hard deadline). Without the timeout the loop blocks on stream.read()
+    /// indefinitely and the test exceeds 7s.
+    #[tokio::test]
+    async fn admin_handler_idle_read_times_out_at_5s() {
+        let (lst, addr) = bind_random().await;
+        let registry = Arc::new(StatsRegistry::new());
+        let cfg = Arc::new(admin_config(addr.port()));
+        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(serve(lst, handler, async move {
+            let _ = rx.await;
+        }));
+        // Give the server a moment to start accepting.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Connect but send nothing.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // The server should close the connection within 5s (IDLE_READ_TIMEOUT).
+        // Allow 7s on the client side as a hard upper bound.
+        let close_result = tokio::time::timeout(std::time::Duration::from_secs(7), async {
+            let mut buf = [0u8; 1];
+            client.read(&mut buf).await
+        })
+        .await;
+
+        match close_result {
+            Ok(Ok(0)) => {
+                // Server closed the connection cleanly (EOF) — expected.
+            }
+            Ok(Ok(_n)) => {
+                // Server sent some bytes (likely a 400 response) before closing — also acceptable.
+                // The key property: the call returned within 7s.
+            }
+            Ok(Err(_e)) => {
+                // Connection reset — server closed abruptly, also acceptable within budget.
+            }
+            Err(_elapsed) => {
+                panic!(
+                    "admin handler did not close silent-client connection within 7s (IDLE_READ_TIMEOUT not firing)"
+                );
+            }
+        }
+
+        let _ = tx.send(());
     }
 
     #[tokio::test]

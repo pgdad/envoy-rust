@@ -657,3 +657,63 @@ increment site visible-by-inspection).
 ### Carryforward closures
 
 None. This task closes no open carryforwards.
+
+## Task 9 — admin handler idle read timeout (closes 06.1 REVIEW I1; task 9 commit)
+
+### What landed
+
+Added `IDLE_READ_TIMEOUT = Duration::from_secs(5)` constant next to the
+existing `MAX_REQUEST_HEAD` constant in `crates/envoy-admin/src/handler.rs`
+(line 27). Wrapped the `stream.read(&mut scratch[..take]).await?` call inside
+`read_request` with `tokio::time::timeout(IDLE_READ_TIMEOUT, ...)`. `Elapsed`
+maps to `std::io::Error::new(ErrorKind::TimedOut, "admin idle read timeout: ...")`,
+which propagates through `handle_inner`'s `read_request` error arm and causes
+a clean connection close (a 400 Bad Request response is attempted, then the
+connection shuts down).
+
+This closes 06.1 REVIEW §3 Important I1: prior to this change a connected-but-
+silent TCP client held the connection task's `JoinSet` slot indefinitely with
+no recourse short of a full shutdown signal. After this change the slot is
+released within 5s of the last (or first) read returning no data.
+
+### 5s budget rationale
+
+The 5s budget exactly mirrors `IDLE_READ_TIMEOUT = Duration::from_secs(5)` at
+`crates/envoy-http1/src/hcm.rs:24` (introduced in phase 06.1 per PLAN note at
+that site). Per the 06.1 REVIEW, the admin handler is a simpler surface (no
+keep-alive, no pipelining, no chunked bodies) but the same human-observable
+"is the client alive?" window applies. Matching HCM's budget exactly avoids
+a two-tier timeout landscape on a small codebase.
+
+### Test design
+
+1 unit test `admin_handler_idle_read_times_out_at_5s` in
+`crates/envoy-admin/src/handler.rs::tests`:
+
+- Binds a free port; spawns `serve` with an oneshot shutdown channel.
+- Connects a TCP client and sends zero bytes.
+- Wraps `client.read(buf)` in `tokio::time::timeout(7s)` as a hard upper bound.
+- Before the fix: the test panics at 7s ("IDLE_READ_TIMEOUT not firing").
+- After the fix: the read returns (EOF / connection reset / 400 bytes) within
+  5s; the test passes in 5.02s.
+
+The test accepts three server-side outcomes (Ok(0), Ok(n), Err) because
+`handle_inner` attempts to write a 400 response before shutting down, so the
+client may observe either bytes or an abrupt reset depending on TCP buffering.
+All three outcomes satisfy the liveness property (connection closed within 7s).
+
+### LoC delta
+
+- `crates/envoy-admin/src/handler.rs`: +~55 LoC (~8 LoC constant + timeout
+  match block at line 59; ~47 LoC test including doc comment).
+- PLAN estimated ~10 LoC + 1 test; actual test is more verbose due to the
+  three-outcome match and the doc comment explaining the test design.
+
+### Carryforward closures
+
+- **06.1 REVIEW I1** — closed substantively at this task.
+  `read_request` now fires `IDLE_READ_TIMEOUT = 5s` per-read. A connected-but-
+  silent client no longer holds the `JoinSet` slot indefinitely. Mirrors the
+  HCM's established 5s idle budget at `crates/envoy-http1/src/hcm.rs:24`.
+  Regression test `admin_handler_idle_read_times_out_at_5s` provides the
+  named anchor.
