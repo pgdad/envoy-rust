@@ -66,6 +66,12 @@ pub async fn start(
     host_gateway: bool,
     tls_pki: Option<&crate::tls::TlsTestPki>,
     expose_admin_port: bool,
+    // 06.2 D4.2.c: bind-mount each (host_path, container_path) pair so the
+    // container's access-log writes surface on the host where the harness
+    // reads them. The bind_mount target file must exist on the host; the
+    // caller pre-creates an empty file before invoking `start`. Empty
+    // slice for fixtures with no access-log surface (pre-06.2 behavior).
+    access_log_mounts: &[(String, String)],
 ) -> Result<UpstreamProxy> {
     let absolute = envoy_yaml_path
         .canonicalize()
@@ -101,6 +107,12 @@ pub async fn start(
         for (host_path, container_path) in pki.container_mounts() {
             request = request.with_copy_to(container_path, host_path);
         }
+    }
+    // 06.2 D4.2.c: bind-mount access-log file paths so the container's
+    // append-mode writes surface on the host where the harness's
+    // `std::fs::read_to_string(path)` call reads them.
+    for (host_path, container_path) in access_log_mounts.iter() {
+        request = request.with_mount(Mount::bind_mount(host_path, container_path));
     }
     let container = request
         .start()
@@ -169,7 +181,7 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path(), false, None, false).await.unwrap();
+        let proxy = start(yaml.path(), false, None, false, &[]).await.unwrap();
         assert!(proxy.host_port() > 0);
         // Validate accept-readiness via the library's own helper.
         let addr: std::net::SocketAddr =

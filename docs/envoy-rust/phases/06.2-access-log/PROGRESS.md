@@ -343,3 +343,43 @@ Lands the differential-harness primitives per 06.2 SPEC §3 D4.2.a + D4.2.b. New
 5. **fmt drift** (per R-9 disclosure requirement): the verbatim PLAN source for both `access_log.rs` (the `SAMPLE_LINE` constant) and `lib.rs` (the `envoy_rust_lines` chain wrap in the dispatch arm) failed the initial `cargo fmt --all -- --check`; `cargo fmt --all` applied to fix; re-verified clean per R-9. Functionally identical.
 
 **LoC:** ~360 LoC in `tests/differential/src/access_log.rs` (rule enum + tokenizer + apply_rule + ISO-8601 validator + assert helper + 4 tests; matches the PLAN's estimate); ~125 LoC added to `tests/differential/src/lib.rs` (`AccessLogPaths` struct + `HeaderRule` enum + `Http1WithAccessLog` variant + `port_key` arm + `run_fixture` dispatch arm + `pub mod access_log;` declaration).
+
+## Task 10 — Fixture 0012 (5 files) + Docker-gated wrapper + BEHAVIOR_CONTRACT.md `Access log field mapping` first-time population
+
+Lands per 06.2 SPEC §3 D4.2.c + D5.2 (folded per signpost recommendation). Five fixture files at `tests/fixtures/0012-access-log-file-sink/` — `envoy.yaml` (Envoy side, bind `0.0.0.0`, admin port 0, `generate_request_id: false`, file access-log at `/tmp/0012-envoy-access.log`); `envoy-rust.yaml` (envoy-rust side, bind `127.0.0.1`, no admin, file access-log at `/tmp/0012-envoy-rust-access.log`); `inputs/payload.bin` (0-byte); `expectations.yaml` (15-rule per-token cascade: 1× `Iso8601Format` + 12× `Exact` + 1× `Wildcard` (User-Agent) + 1× `DurationMs`); `README.md` (per-side divergences + driver shape + cross-references). Docker-gated wrapper at `tests/differential/tests/access_log_file_sink.rs` (matches the `admin_stats_prometheus.rs` shape: `PathBuf` join + `differential::run_fixture(&dir).await.expect("fixture green")`). `docs/envoy-rust/BEHAVIOR_CONTRACT.md` `Access log field mapping` section populated for the first time in the project's history — 14 default-format-token rows with value-exact / name-required-value-may-differ dispositions per parent-06 SPEC §2.2.
+
+**Docker availability locally:** YES. `docker ps` returns the empty container list cleanly. The fixture ran locally and went green on the second attempt (see deviations below).
+
+**Local Docker-gated run:**
+
+```
+running 1 test
+test access_log_file_sink ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s
+```
+
+**Workspace gates:** `cargo build --workspace --all-targets` clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; `cargo fmt --all -- --check` clean; `cargo test -p differential --lib` → `75 passed; 0 failed; 1 ignored` (no regressions; Task 9 baseline unchanged).
+
+**Execution-time deviations from PLAN's verbatim implementation:**
+
+1. **Container↔host filesystem bridge for the Envoy-side access-log file (PLAN-implicit, SPEC-implicit).** The PLAN's Task-10 spec assumed the harness could read the upstream Envoy's `/tmp/0012-envoy-access.log` path on the host directly, but the upstream Envoy runs inside a Docker container under testcontainers (per the existing `tests/differential/src/upstream.rs` shape), so its `/tmp/0012-envoy-access.log` write surfaces inside the container, not on the host. The first local run failed with `read envoy access-log file at /tmp/0012-envoy-access.log: No such file or directory (os error 2)` (the harness's `std::fs::read_to_string(envoy_path)` could not see the container-internal file). Fixed by extending `upstream::start` with an `access_log_mounts: &[(host_path, container_path)]` parameter that adds a `Mount::bind_mount(host, container)` per pair — for Driver::Http1WithAccessLog the harness pre-creates both host-side log files (truncating any prior content per SPEC §6 signpost 7) and bind-mounts the envoy-side path into the container at the same path. The envoy-rust side runs as a subprocess and writes directly to the host path, so no mount is needed for it. This bridge is mechanical / surface-level and resolves a SPEC gap rather than reshaping any architectural decision; consistent with the SPEC §3 D4.2.c statement that the harness reads `the file path lives at /tmp/<fixture-id>-envoy-access.log`. No ADR — the bind-mount surface is already used for envoy.yaml and TLS PEMs at `upstream::start`. ~25 LoC across `upstream.rs` (new param + mount loop) and `lib.rs` (per-driver mount construction + pre-create files).
+
+2. **`%REQ(USER-AGENT)%` rule: `wildcard` (per PLAN's footnote).** The PLAN's expectations.yaml footnote (SPEC §3 D4.2.c line 751: *"may need to be `wildcard` if `drive_http1` adds a default user-agent"*) called the question. Adopted `wildcard` upfront — `drive_http1` (the 04.1 helper) sets `User-Agent` to a default; the wildcard rule accepts either side independently and does not require value equivalence. The first run succeeded with `wildcard` in place; no per-token tightening necessary on first run.
+
+3. **No `wildcard` for User-Agent in the BEHAVIOR_CONTRACT.md row.** The BEHAVIOR_CONTRACT row for `%REQ(USER-AGENT)%` remains marked **value-exact** (the canonical disposition: when both proxies see the same request bytes, both render the same `User-Agent`). The fixture-specific `wildcard` rule in expectations.yaml captures the emitter-side projection difference of `drive_http1` injecting a default, not a contract loosening — per the task spec's note that the dot-tree contract remains authoritative.
+
+**Files created (5 fixture + 1 wrapper + 2 doc/code):**
+- `tests/fixtures/0012-access-log-file-sink/envoy.yaml`
+- `tests/fixtures/0012-access-log-file-sink/envoy-rust.yaml`
+- `tests/fixtures/0012-access-log-file-sink/inputs/payload.bin` (0 bytes)
+- `tests/fixtures/0012-access-log-file-sink/expectations.yaml`
+- `tests/fixtures/0012-access-log-file-sink/README.md`
+- `tests/differential/tests/access_log_file_sink.rs`
+
+**Files modified:**
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (14-row table replaces the `_(empty; populated starting phase 06)_` placeholder; format-reference + closing paragraph)
+- `tests/differential/src/upstream.rs` (+`access_log_mounts` parameter on `start`; bind-mount loop)
+- `tests/differential/src/lib.rs` (+upstream access-log mount construction at `run_fixture`; pre-create host log files for `Driver::Http1WithAccessLog`)
+
+**LoC:** ~95 LoC of fixture YAML/Markdown; ~22 LoC of Rust (wrapper test + harness extension); ~32 LoC of BEHAVIOR_CONTRACT.md doc.

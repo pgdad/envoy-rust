@@ -1,0 +1,41 @@
+driver:
+  kind: http1_with_access_log
+  method: GET
+  path: /
+  host: envoy-rust.test
+  expected_status: 200
+  expected_body:
+    kind: byte_exact
+  expected_headers:
+    rule: set_equal_modulo_allow_list
+  expected_access_log_paths:
+    envoy: /tmp/0012-envoy-access.log
+    envoy_rust: /tmp/0012-envoy-rust-access.log
+  expected_access_log_lines:
+    - - rule: iso8601_format                                        # %START_TIME%
+      - rule: exact
+        value: GET                                                   # %REQ(:METHOD)%
+      - rule: exact
+        value: /                                                     # %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%
+      - rule: exact
+        value: HTTP/1.1                                              # %PROTOCOL%
+      - rule: exact
+        value: "200"                                                 # %RESPONSE_CODE%
+      - rule: exact
+        value: "-"                                                   # %RESPONSE_FLAGS%
+      - rule: exact
+        value: "0"                                                   # %BYTES_RECEIVED%
+      - rule: exact
+        value: "3"                                                   # %BYTES_SENT%
+      - rule: duration_ms                                            # %DURATION%
+      - rule: exact
+        value: "-"                                                   # %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%
+      - rule: exact
+        value: "-"                                                   # %REQ(X-FORWARDED-FOR)%
+      - rule: wildcard                                               # %REQ(USER-AGENT)% (drive_http1 may inject a default)
+      - rule: exact
+        value: "-"                                                   # %REQ(X-REQUEST-ID)%
+      - rule: exact
+        value: envoy-rust.test                                       # %REQ(:AUTHORITY)%
+      - rule: exact
+        value: "-"                                                   # %UPSTREAM_HOST%

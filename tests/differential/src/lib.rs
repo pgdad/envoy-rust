@@ -1370,11 +1370,40 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // (e) Thread tls_pki through to upstream::start. 06.1: also thread
     // `needs_admin_port` so the container exposes ADMIN_CONTAINER_PORT for
     // Driver::AdminScrape fixtures.
+    //
+    // 06.2 D4.2.c: for Driver::Http1WithAccessLog, pre-create both host-side
+    // access-log files (truncating any existing content per signpost 7) and
+    // bind-mount the envoy-side path into the container so the
+    // container-side `path:` write surfaces on the host. The envoy-rust side
+    // runs as a subprocess and writes directly to the host path; only the
+    // upstream Envoy needs the bind-mount.
+    let upstream_access_log_mounts: Vec<(String, String)> = match &expectations.driver {
+        Driver::Http1WithAccessLog {
+            expected_access_log_paths,
+            ..
+        } => {
+            // Truncate (or create) both host-side log files so a previous
+            // run's content does not leak into this run's per-token diff.
+            for p in [
+                &expected_access_log_paths.envoy,
+                &expected_access_log_paths.envoy_rust,
+            ] {
+                std::fs::File::create(p)
+                    .with_context(|| format!("pre-creating host access-log file {p}"))?;
+            }
+            vec![(
+                expected_access_log_paths.envoy.clone(),
+                expected_access_log_paths.envoy.clone(),
+            )]
+        }
+        _ => Vec::new(),
+    };
     let upstream = upstream::start(
         &upstream_path,
         host_uses_host_gateway,
         tls_pki.as_ref(),
         needs_admin_port,
+        &upstream_access_log_mounts,
     )
     .await?;
     let mut subject = subject::start(&subject_path, host_port).await?;
