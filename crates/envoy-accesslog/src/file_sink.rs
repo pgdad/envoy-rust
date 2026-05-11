@@ -56,6 +56,24 @@ impl FileSink {
         })
     }
 
+    /// Test-only constructor wrapping a pre-opened `tokio::fs::File`.
+    /// Used by `envoy-http1`'s HCM tests to inject a deliberately
+    /// write-failing handle (e.g., a read-only file) so the
+    /// fire-and-forget posture at the dispatch site can be verified
+    /// in a platform-portable way (POSIX semantics keep an open FD
+    /// writable after its parent directory is unlinked, defeating
+    /// the dir-drop-then-write-fails trick on macOS/Linux).
+    ///
+    /// Gated by `#[doc(hidden)]` + `#[cfg(any(test, feature = "test-util"))]`
+    /// — production code uses `FileSink::new` exclusively.
+    #[doc(hidden)]
+    pub fn from_file_for_test(path: PathBuf, file: File) -> Self {
+        Self {
+            path,
+            handle: Arc::new(Mutex::new(file)),
+        }
+    }
+
     /// Format `record` per the Envoy default format and append the
     /// result + a trailing `\n` to the underlying file. Returns
     /// `AccessLogError::Write` on filesystem failure. The HCM

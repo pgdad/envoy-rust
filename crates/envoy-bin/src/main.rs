@@ -225,11 +225,14 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     );
                 };
 
-                let hcm_config = std::sync::Arc::new(envoy_http1::HCMConfig::from_config(
-                    hcm_cfg,
-                    std::sync::Arc::clone(&cluster_mgr),
-                    std::sync::Arc::clone(&registry),
-                )?);
+                let hcm_config = std::sync::Arc::new(
+                    envoy_http1::HCMConfig::from_config(
+                        hcm_cfg,
+                        std::sync::Arc::clone(&cluster_mgr),
+                        std::sync::Arc::clone(&registry),
+                    )
+                    .await?,
+                );
 
                 // 05.2 NEW: H1-vs-H2 dispatch on hcm_cfg.codec_type.
                 // - AUTO / HTTP1 → envoy_http1::HCM (existing 04.x path)

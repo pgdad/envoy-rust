@@ -323,7 +323,6 @@ name = "envoy-accesslog"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "envoy-http1",
  "tempfile",
  "thiserror",
  "tokio",
@@ -399,14 +398,17 @@ name = "envoy-http1"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "envoy-accesslog",
  "envoy-cluster",
  "envoy-config",
  "envoy-listener",
  "envoy-stats",
  "httparse",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

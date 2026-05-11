@@ -59,6 +59,20 @@ pub enum Http1Error {
         stat_prefix: String,
         message: String,
     },
+
+    /// 06.2 Task 6: opening one of the per-HCM access-log sinks
+    /// (e.g., a `FileAccessLog` at `path`) failed at config-load time
+    /// — typically a parent directory missing, permission denied, or
+    /// the path resolving to a directory. Wraps the
+    /// `envoy_accesslog::AccessLogError` `Display` rendering so this
+    /// crate doesn't need to publicly re-export `AccessLogError` in
+    /// its error surface (mirrors the 06.1 `StatsRegistration`
+    /// `String`-wrapping precedent — `message: String` rather than
+    /// `source: String` because thiserror treats a field named
+    /// `source` as a nested `std::error::Error` and `String` doesn't
+    /// implement `Error`). Surfaces from `HCMConfig::from_config`.
+    #[error("failed to open access log sink: {message}")]
+    AccessLogOpen { message: String },
 }
 
 impl From<std::io::Error> for Http1Error {

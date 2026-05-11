@@ -296,7 +296,7 @@ mod tests {
 
     /// Build a minimal HCM config with a single VH + single direct_response
     /// route (status 200, body "ok\n"). Used by most tests below.
-    fn synth_h2_hcm_config() -> Arc<Http1HCMConfig> {
+    async fn synth_h2_hcm_config() -> Arc<Http1HCMConfig> {
         let cfg = HttpConnectionManagerConfig {
             stat_prefix: "test".to_string(),
             codec_type: CodecType::HTTP2,
@@ -333,7 +333,9 @@ mod tests {
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).expect("build HCM config"),
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+                .await
+                .expect("build HCM config"),
         )
     }
 
@@ -438,7 +440,7 @@ static_resources:
     /// Build a minimal HCM config whose single route proxies everything to
     /// the "backend" cluster. The caller supplies the ClusterManager so both
     /// H1- and H2-cluster variants can reuse this helper.
-    fn synth_h2_hcm_config_proxy(
+    async fn synth_h2_hcm_config_proxy(
         cluster_mgr: Arc<envoy_cluster::ClusterManager>,
     ) -> Arc<Http1HCMConfig> {
         let cfg = HttpConnectionManagerConfig {
@@ -472,7 +474,9 @@ static_resources:
         };
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).expect("build HCM config"),
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+                .await
+                .expect("build HCM config"),
         )
     }
 
@@ -511,7 +515,7 @@ static_resources:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_handshake_completes_against_in_process_listener() {
-        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config()).await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.expect("handshake");
         tokio::spawn(async move {
@@ -530,7 +534,7 @@ static_resources:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_get_resolves_to_direct_response_synth() {
-        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config()).await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
         tokio::spawn(async move {
@@ -614,7 +618,11 @@ static_resources:
         };
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
-        let config = Arc::new(Http1HCMConfig::from_config(&cfg, cluster_mgr, registry).unwrap());
+        let config = Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+                .await
+                .unwrap(),
+        );
         let (addr, _server) = spawn_h2_hcm(config).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
@@ -648,7 +656,7 @@ static_resources:
         // body "ok\n", verifying that the HCM accepts multiple streams over
         // the same TCP connection (i.e., does not single-shot close after
         // request 1).
-        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config()).await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
         tokio::spawn(async move {
@@ -683,7 +691,7 @@ static_resources:
         // §8.1.2.2) MUST be stripped — defense-in-depth (the h2 codec would
         // also reject them at emission). Verify the strip is observable on
         // the client side.
-        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config()).await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
         tokio::spawn(async move {
@@ -721,7 +729,7 @@ static_resources:
         let cluster_mgr =
             build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
                 .await;
-        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr)).await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
         tokio::spawn(async move {
@@ -755,7 +763,7 @@ static_resources:
         // (clean FIN) within a small budget. Per parent §6 signpost 13: trust
         // the h2 codec to reject malformed handshakes.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config()).await;
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
         let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         tcp.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
             .await
@@ -808,7 +816,8 @@ static_resources:
         let cluster_mgr =
             build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http1)
                 .await;
-        let (listener_addr, _hcm) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr)).await;
+        let (listener_addr, _hcm) =
+            spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;
         let tcp = tokio::net::TcpStream::connect(listener_addr).await.unwrap();
         let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
         tokio::spawn(async move {
@@ -887,6 +896,7 @@ static_resources:
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let config = Arc::new(
             Http1HCMConfig::from_config(&cfg, cluster_mgr, Arc::clone(&registry))
+                .await
                 .expect("HCMConfig builds"),
         );
 

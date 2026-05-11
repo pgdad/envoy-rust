@@ -85,10 +85,18 @@ pub struct HCMConfig {
     /// HCMConfig type-alias per cross-sub-phase rule 2). The increment
     /// site is at the per-request entry path (signpost 5).
     pub stats: Arc<HCMStats>,
+    /// 06.2 NEW: configured access-log sinks. Empty by default;
+    /// non-empty when the listener YAML carries an `access_log:`
+    /// block. The HCM dispatches each per-request record to every
+    /// sink in this vec at a factored join point in
+    /// `serve_connection` (synchronous-after-write per parent-06
+    /// SPEC §6 architectural Rule 4 option (b); emission errors
+    /// logged via `tracing::warn!` and discarded).
+    pub access_log: Vec<Arc<envoy_accesslog::FileSink>>,
 }
 
 impl HCMConfig {
-    pub fn from_config(
+    pub async fn from_config(
         cfg: &HttpConnectionManagerConfig,
         cluster_mgr: Arc<envoy_cluster::ClusterManager>,
         registry: Arc<envoy_stats::StatsRegistry>,
@@ -105,12 +113,33 @@ impl HCMConfig {
                 }
             })?,
         );
+        // 06.2 Task 6: open every configured access-log sink at config-load
+        // time so per-request emission can dispatch via Arc<FileSink>::emit
+        // without re-opening the file. `from_config` is async because
+        // `FileSink::new` is async (tokio::fs::OpenOptions); the envoy-bin
+        // caller and the envoy-http2 test sites are all in async contexts so
+        // promoting this constructor to async is a clean change.
+        let mut access_log_sinks: Vec<Arc<envoy_accesslog::FileSink>> = Vec::new();
+        for entry in &cfg.access_log {
+            match &entry.typed_config {
+                envoy_config::AccessLogTypedConfig::FileAccessLog(file_cfg) => {
+                    let sink =
+                        envoy_accesslog::FileSink::new(std::path::PathBuf::from(&file_cfg.path))
+                            .await
+                            .map_err(|err| Http1Error::AccessLogOpen {
+                                message: err.to_string(),
+                            })?;
+                    access_log_sinks.push(Arc::new(sink));
+                }
+            }
+        }
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
             route_config: Arc::new(clone_route_config(&cfg.route_config)),
             cluster_mgr,
             http2_protocol_options: cfg.http2_protocol_options.clone(),
             stats,
+            access_log: access_log_sinks,
         })
     }
 }
@@ -205,6 +234,14 @@ async fn serve_connection(
             }
         };
 
+        // 06.2 Task 6: capture request-arrival timing immediately after
+        // parse-success. The Instant is for duration measurement
+        // (monotonic); the SystemTime is for `%START_TIME%` rendering
+        // (wall-clock). Both are sampled at request-arrival per Envoy's
+        // %START_TIME% semantic.
+        let req_arrival_instant = std::time::Instant::now();
+        let req_arrival_systime = std::time::SystemTime::now();
+
         // 06.1 D4.c: per-request entry-path counter. Per SPEC §6 signpost 5,
         // the increment fires at the entry of the per-request handler — the
         // first action after request-head parsing succeeds, BEFORE the route
@@ -223,6 +260,14 @@ async fn serve_connection(
         let chunked = req.headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
         });
+
+        // 06.2 Task 6: request-side wire-byte count for
+        // `%BYTES_RECEIVED%`. Per Envoy semantic, header bytes are NOT
+        // counted; only the request body. The HCM has already enforced
+        // Content-Length on this path (chunked-request bodies are
+        // 501-rejected upstream), so `body_len` is the authoritative
+        // bytes-received for the access-log record.
+        let request_body_len: u64 = body_len as u64;
 
         // 5. Build response (handles 400 / 404 / 501 / 200 internally) or
         //    decide to proxy upstream.
@@ -261,9 +306,21 @@ async fn serve_connection(
             remaining -= n;
         }
 
+        // 06.2 Task 6: per-request access-log state. Populated by each
+        // arm of `match outcome { ... }` below before falling through to
+        // the factored dispatch site (per PLAN-write SPEC correction 1;
+        // one dispatch site handles all 5 writer outcomes).
+        let mut response_status_for_log: u16 = 0;
+        let mut response_body_len: u64 = 0;
+        let mut upstream_host_for_log: Option<String> = None;
+        let mut response_headers_for_log: Vec<(String, String)> = Vec::new();
+
         // 8. Dispatch the outcome to the wire.
         match outcome {
             BuildOutcome::Synth(resp) => {
+                response_status_for_log = resp.status;
+                response_body_len = resp.body.len() as u64;
+                response_headers_for_log = resp.headers.clone();
                 Http1Response::write_to(&resp, &mut downstream).await?;
             }
             BuildOutcome::Proxy {
@@ -278,96 +335,156 @@ async fn serve_connection(
                     .expect("validator ensures cluster present");
 
                 let endpoint = match cluster.pick_endpoint() {
-                    Some(ep) => ep,
+                    Some(ep) => Some(ep),
                     None => {
                         tracing::warn!(
                             cluster = %cluster.name(),
                             "no healthy endpoint for cluster — returning 503",
                         );
                         let resp = synth_status(503, close);
+                        response_status_for_log = resp.status;
+                        response_body_len = resp.body.len() as u64;
+                        response_headers_for_log = resp.headers.clone();
                         Http1Response::write_to(&resp, &mut downstream).await?;
-                        if close {
-                            return Ok(());
+                        // Fall through to the access-log dispatch site;
+                        // the post-match close/continue decision honors
+                        // `close` exactly as before.
+                        None
+                    }
+                };
+
+                if let Some(endpoint) = endpoint {
+                    let host_header = find_header(&req.headers, headers::HOST)
+                        .expect(
+                            "build_response rejected missing/empty Host before BuildOutcome::Proxy",
+                        )
+                        .to_owned();
+
+                    // Strip Connection: per SPEC §3 D1 (one-shot upstream connection)
+                    // and Transfer-Encoding: per RFC 7230 §3.3.3 — the outgoing body
+                    // is forced to CL: 0, mirroring the response-side strip in
+                    // `router::write_proxied_response`.
+                    let mut out_headers = req.headers.clone();
+                    out_headers.retain(|(n, _)| {
+                        !n.eq_ignore_ascii_case(headers::CONNECTION)
+                            && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
+                    });
+                    let out_req = Request {
+                        method: req.method.clone(),
+                        path: req.path.clone(),
+                        version: HttpVersion::Http11,
+                        headers: out_headers,
+                        bytes_consumed: 0,
+                        // Chunked-request-body forwarding is a SPEC §4 non-goal.
+                        body: Some(Bytes::new()),
+                    };
+
+                    // 06.2 Task 6: capture the resolved upstream endpoint
+                    // for the access-log `%UPSTREAM_HOST%` token. The
+                    // SocketAddr Display impl produces the canonical
+                    // `addr:port` rendering envoy uses.
+                    upstream_host_for_log = Some(endpoint.to_string());
+
+                    let start = std::time::Instant::now();
+                    let client_result = Client::connect(endpoint, &host_header).await;
+                    match client_result {
+                        Ok(mut client_stream) => {
+                            // 06.1 D4.b: per-cluster `upstream_cx_total`
+                            // counter incremented once per established
+                            // upstream TCP connection. Fires only on the
+                            // success arm (a refused-connect path returns
+                            // 502 without incrementing).
+                            cluster.cx_total().inc();
+
+                            match client_stream.send_request(out_req).await {
+                                Ok(upstream_response) => {
+                                    let elapsed_ms = start.elapsed().as_millis();
+                                    response_status_for_log = upstream_response.status;
+                                    response_body_len = upstream_response.body.len() as u64;
+                                    response_headers_for_log = upstream_response.headers.clone();
+                                    // `write_proxied_response` adds an
+                                    // `x-envoy-upstream-service-time` header
+                                    // to the downstream response. Mirror it
+                                    // into `response_headers_for_log` so
+                                    // `extract_upstream_service_time` can
+                                    // observe the value at the dispatch
+                                    // site (the helper looks at the
+                                    // captured headers, not the live
+                                    // downstream wire output).
+                                    response_headers_for_log.push((
+                                        crate::router::X_ENVOY_UPSTREAM_SERVICE_TIME.to_string(),
+                                        elapsed_ms.to_string(),
+                                    ));
+                                    crate::router::write_proxied_response(
+                                        &mut downstream,
+                                        upstream_response,
+                                        elapsed_ms,
+                                        close,
+                                    )
+                                    .await?;
+                                }
+                                Err(source) => {
+                                    tracing::warn!(
+                                        cluster = %cluster.name(),
+                                        addr = %endpoint,
+                                        error = ?source,
+                                        "upstream request failed — returning 502",
+                                    );
+                                    let resp = synth_status(502, close);
+                                    response_status_for_log = resp.status;
+                                    response_body_len = resp.body.len() as u64;
+                                    response_headers_for_log = resp.headers.clone();
+                                    Http1Response::write_to(&resp, &mut downstream).await?;
+                                }
+                            }
                         }
-                        continue;
-                    }
-                };
-
-                let host_header = find_header(&req.headers, headers::HOST)
-                    .expect("build_response rejected missing/empty Host before BuildOutcome::Proxy")
-                    .to_owned();
-
-                // Strip Connection: per SPEC §3 D1 (one-shot upstream connection)
-                // and Transfer-Encoding: per RFC 7230 §3.3.3 — the outgoing body
-                // is forced to CL: 0, mirroring the response-side strip in
-                // `router::write_proxied_response`.
-                let mut out_headers = req.headers.clone();
-                out_headers.retain(|(n, _)| {
-                    !n.eq_ignore_ascii_case(headers::CONNECTION)
-                        && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
-                });
-                let out_req = Request {
-                    method: req.method.clone(),
-                    path: req.path.clone(),
-                    version: HttpVersion::Http11,
-                    headers: out_headers,
-                    bytes_consumed: 0,
-                    // Chunked-request-body forwarding is a SPEC §4 non-goal.
-                    body: Some(Bytes::new()),
-                };
-
-                let start = std::time::Instant::now();
-                let mut client_stream = match Client::connect(endpoint, &host_header).await {
-                    Ok(s) => {
-                        // 06.1 D4.b: per-cluster `upstream_cx_total`
-                        // counter incremented once per established
-                        // upstream TCP connection. Fires only on the
-                        // success arm (a refused-connect path returns 502
-                        // without incrementing).
-                        cluster.cx_total().inc();
-                        s
-                    }
-                    Err(source) => {
-                        tracing::warn!(
-                            cluster = %cluster.name(),
-                            addr = %endpoint,
-                            error = ?source,
-                            "upstream connect failed — returning 502",
-                        );
-                        let resp = synth_status(502, close);
-                        Http1Response::write_to(&resp, &mut downstream).await?;
-                        if close {
-                            return Ok(());
+                        Err(source) => {
+                            tracing::warn!(
+                                cluster = %cluster.name(),
+                                addr = %endpoint,
+                                error = ?source,
+                                "upstream connect failed — returning 502",
+                            );
+                            let resp = synth_status(502, close);
+                            response_status_for_log = resp.status;
+                            response_body_len = resp.body.len() as u64;
+                            response_headers_for_log = resp.headers.clone();
+                            Http1Response::write_to(&resp, &mut downstream).await?;
                         }
-                        continue;
                     }
-                };
-                let upstream_response = match client_stream.send_request(out_req).await {
-                    Ok(r) => r,
-                    Err(source) => {
-                        tracing::warn!(
-                            cluster = %cluster.name(),
-                            addr = %endpoint,
-                            error = ?source,
-                            "upstream request failed — returning 502",
-                        );
-                        let resp = synth_status(502, close);
-                        Http1Response::write_to(&resp, &mut downstream).await?;
-                        if close {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                };
-                let elapsed_ms = start.elapsed().as_millis();
+                }
+            }
+        }
 
-                crate::router::write_proxied_response(
-                    &mut downstream,
-                    upstream_response,
-                    elapsed_ms,
-                    close,
-                )
-                .await?;
+        // 06.2 Task 6: factored access-log dispatch site. Per PLAN-write
+        // SPEC correction 1, this single site handles all 5 writer
+        // outcomes (synth + 4 proxy paths). Per parent-06 SPEC §6
+        // architectural Rule 4 (fire-and-forget option (b)):
+        // synchronous-after-write; emission errors are logged via
+        // tracing::warn! and discarded.
+        if !config.access_log.is_empty() {
+            let duration = req_arrival_instant.elapsed();
+            let record = envoy_accesslog::AccessLogRecord {
+                start_time: req_arrival_systime,
+                method: req.method.clone(),
+                path: x_envoy_original_path_or_path(&req).to_owned(),
+                protocol: "HTTP/1.1".to_owned(),
+                response_code: response_status_for_log,
+                response_flags: "-".to_owned(), // 06.2 always emits "-"
+                bytes_received: request_body_len,
+                bytes_sent: response_body_len,
+                duration,
+                upstream_service_time: extract_upstream_service_time(&response_headers_for_log),
+                forwarded_for: access_log_header_value(&req.headers, "x-forwarded-for"),
+                user_agent: access_log_header_value(&req.headers, "user-agent"),
+                request_id: access_log_header_value(&req.headers, "x-request-id"),
+                authority: access_log_header_value(&req.headers, "host"),
+                upstream_host: upstream_host_for_log,
+            };
+            for sink in &config.access_log {
+                if let Err(err) = sink.emit(&record).await {
+                    tracing::warn!(error = ?err, "access log emission failed");
+                }
             }
         }
 
@@ -385,6 +502,44 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Erro
         Some(v) => v.parse::<usize>().map_err(|_| Http1Error::MalformedHeader),
         None => Ok(0),
     }
+}
+
+// 06.2 Task 6 — access-log dispatch helpers. Used by the factored
+// dispatch site at the end of `serve_connection`'s per-request loop
+// iteration. Mirrors the field-population shape expected by
+// `AccessLogRecord` + Envoy's default-format substitutions.
+
+/// Resolve `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%`: returns the value
+/// of `x-envoy-original-path` header if present, else the
+/// request-target/path. Case-insensitive lookup per RFC 7230.
+fn x_envoy_original_path_or_path(req: &Request) -> &str {
+    for (name, value) in &req.headers {
+        if name.eq_ignore_ascii_case("x-envoy-original-path") {
+            return value.as_str();
+        }
+    }
+    req.path.as_str()
+}
+
+/// Case-insensitive header-value lookup returning an owned `String`
+/// (the record's `Option<String>` fields require ownership so the
+/// record can cross spawn boundaries cheaply if future code switches
+/// to spawn-based dispatch).
+fn access_log_header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+/// Parse the upstream's `x-envoy-upstream-service-time` response
+/// header (integer milliseconds per envoy-rust's own injection in
+/// `router::write_proxied_response`) into a Duration. Returns None
+/// when the header is absent or the value isn't a parseable u64.
+fn extract_upstream_service_time(headers: &[(String, String)]) -> Option<std::time::Duration> {
+    let v = access_log_header_value(headers, "x-envoy-upstream-service-time")?;
+    let ms: u64 = v.parse().ok()?;
+    Some(std::time::Duration::from_millis(ms))
 }
 
 /// Outcome of the route walk: either a fully-synthesized downstream response
@@ -633,6 +788,10 @@ static_resources:
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
             stats: mk_stats("ingress_http"),
+            // 06.2 Task 6: field added; this helper builds an HCM with
+            // no access-log sinks. The Task-6 access-log tests use
+            // `hcm_config_with_access_log` instead.
+            access_log: vec![],
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -710,6 +869,7 @@ static_resources:
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
             stats: mk_stats("x"),
+            access_log: vec![],
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -749,6 +909,7 @@ static_resources:
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
             stats: mk_stats("x"),
+            access_log: vec![],
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -816,6 +977,7 @@ static_resources:
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
             stats: mk_stats("x"),
+            access_log: vec![],
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -900,6 +1062,7 @@ static_resources:
             cluster_mgr: cluster_mgr_empty().await,
             http2_protocol_options: None,
             stats: mk_stats("test"),
+            access_log: vec![],
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 virtual_hosts: vec![VirtualHost {
@@ -1130,6 +1293,7 @@ static_resources:
             cluster_mgr,
             http2_protocol_options: None,
             stats: mk_stats("ingress_http"),
+            access_log: vec![],
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1412,6 +1576,7 @@ static_resources:
         };
         let hcm_config = Arc::new(
             HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry))
+                .await
                 .expect("HCMConfig builds"),
         );
 
@@ -1429,5 +1594,248 @@ static_resources:
             1,
             "expected exactly one downstream_rq_total increment per HCM-handled request",
         );
+    }
+
+    // ── 06.2 Task 6 access-log dispatch tests ────────────────────────────────
+
+    use std::path::PathBuf;
+    use std::time::Duration as StdDuration;
+    use tempfile::tempdir;
+
+    /// In-process tracing-subscriber test fixture for capturing
+    /// warn! lines per architecture decision 13 (signpost 15 option
+    /// (b)). Records the most recent emission's formatted message.
+    struct WarnCapture {
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl WarnCapture {
+        fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let captured: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_for_layer = Arc::clone(&captured);
+            let layer = tracing_subscriber::fmt::layer().with_writer(
+                move || -> Box<dyn std::io::Write + Send> {
+                    Box::new(CaptureWriter {
+                        captured: Arc::clone(&captured_for_layer),
+                    })
+                },
+            );
+            let subscriber = tracing_subscriber::registry().with(layer);
+            let guard = tracing::subscriber::set_default(subscriber);
+            (Self { captured }, guard)
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    struct CaptureWriter {
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(s) = std::str::from_utf8(buf) {
+                self.captured.lock().unwrap().push(s.to_owned());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build an HCMConfig with a single VH `domains: ["*"]`, a single
+    /// `/`-prefix DirectResponse route returning 200 `ok\n`, and the
+    /// supplied access-log sinks. Used by the Task-6 access-log tests
+    /// so each test controls the sink set explicitly (the production
+    /// `from_config` path is separately exercised below by
+    /// `hcm1_increments_downstream_rq_total_on_request` Task 5 test).
+    async fn hcm_config_with_access_log(
+        sinks: Vec<Arc<envoy_accesslog::FileSink>>,
+    ) -> Arc<HCMConfig> {
+        Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: sinks,
+            route_config: Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            }),
+        })
+    }
+
+    /// Open a FileSink at each path, drive one direct-response request
+    /// through `serve_connection`, drop the sinks (forcing flush at file
+    /// close), and return the per-sink line contents. Helper for the
+    /// Task-6 access-log happy-path tests.
+    async fn serve_one_request_with_access_log(paths: &[PathBuf]) -> Vec<Vec<String>> {
+        let mut sinks: Vec<Arc<envoy_accesslog::FileSink>> = Vec::new();
+        for p in paths {
+            sinks.push(Arc::new(
+                envoy_accesslog::FileSink::new(p.clone())
+                    .await
+                    .expect("open sink"),
+            ));
+        }
+        let config = hcm_config_with_access_log(sinks).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = serve_connection(config, sock).await;
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: envoy-rust.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        drop(client);
+        let _ = server.await;
+
+        // Brief yield so the runtime can finalize the drop-chain on the
+        // FileSink's underlying File handle (matches the pattern in
+        // `file_sink_serializes_concurrent_emissions`).
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+
+        let mut result: Vec<Vec<String>> = Vec::new();
+        for p in paths {
+            let contents = tokio::fs::read_to_string(p).await.unwrap_or_default();
+            let lines: Vec<String> = contents.lines().map(str::to_owned).collect();
+            result.push(lines);
+        }
+        result
+    }
+
+    /// Variant of `serve_one_request_with_access_log` that takes
+    /// pre-constructed sinks (so the caller can deliberately invalidate
+    /// the underlying file between sink open and request serve) and
+    /// returns the `serve_connection` result so the caller can assert
+    /// it remained `Ok` despite the emission failure.
+    async fn serve_one_request_with_pre_constructed_sinks(
+        sinks: &[Arc<envoy_accesslog::FileSink>],
+    ) -> Result<(), Http1Error> {
+        let config = hcm_config_with_access_log(sinks.to_vec()).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(config, sock).await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: envoy-rust.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        drop(client);
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn hcm_with_no_access_log_does_not_touch_filesystem() {
+        let dir = tempdir().expect("tempdir");
+        let path_that_should_not_exist = dir.path().join("nope.log");
+        let lines_per_sink: Vec<Vec<String>> = serve_one_request_with_access_log(&[]).await;
+        assert!(lines_per_sink.is_empty());
+        assert!(
+            !path_that_should_not_exist.exists(),
+            "no file should be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn hcm_with_file_access_log_writes_one_line_per_request() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let lines_per_sink = serve_one_request_with_access_log(std::slice::from_ref(&path)).await;
+        assert_eq!(lines_per_sink.len(), 1);
+        assert_eq!(lines_per_sink[0].len(), 1);
+        let line = &lines_per_sink[0][0];
+        assert!(
+            line.contains("\"GET / HTTP/1.1\" 200 - 0 3 "),
+            "line: {}",
+            line
+        );
+    }
+
+    #[tokio::test]
+    async fn hcm_with_file_access_log_emission_failure_does_not_fail_request() {
+        let (capture, _guard) = WarnCapture::install();
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        // Construct the FileSink with a read-only File handle so
+        // every `emit` attempt fails at `write_all` with
+        // `AccessLogError::Write`. POSIX semantics (the open FD
+        // remains writable after parent-dir unlink on both macOS
+        // and Linux) make the dir-drop trick the PLAN's verbatim
+        // test originally used unreliable; the test-only
+        // `FileSink::from_file_for_test` constructor injects a
+        // deliberately write-failing handle for portable coverage
+        // of the fire-and-forget posture.
+        // First touch the file so an O_RDONLY open succeeds.
+        tokio::fs::File::create(&path)
+            .await
+            .expect("touch file")
+            .sync_all()
+            .await
+            .ok();
+        let ro_file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .await
+            .expect("open read-only");
+        let sink = Arc::new(envoy_accesslog::FileSink::from_file_for_test(
+            path.clone(),
+            ro_file,
+        ));
+        let result = serve_one_request_with_pre_constructed_sinks(&[sink]).await;
+        assert!(
+            result.is_ok(),
+            "request should succeed despite emission failure"
+        );
+        let warn_lines = capture.lines().join("");
+        assert!(
+            warn_lines.contains("access log emission failed")
+                || warn_lines.contains("AccessLogError"),
+            "expected warn line; captured: {}",
+            warn_lines
+        );
+    }
+
+    #[tokio::test]
+    async fn hcm_records_protocol_as_http1_1_on_h1_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let lines_per_sink = serve_one_request_with_access_log(std::slice::from_ref(&path)).await;
+        let line = &lines_per_sink[0][0];
+        assert!(line.contains("HTTP/1.1"), "line: {}", line);
     }
 }
