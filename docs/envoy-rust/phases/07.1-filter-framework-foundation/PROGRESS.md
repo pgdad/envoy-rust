@@ -182,3 +182,93 @@ parameter becomes load-bearing.
   test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
   ```
 - `cargo deny check`: no-op (no new top-level deps).
+
+## Task 3 — `HttpFilterInstance` enum (Router-only) + `RouterTerminus`
+
+### Work summary
+
+Replaces Task 2's placeholder `crates/envoy-filter/src/instance.rs`
+with the real Router-payload variant
+`HttpFilterInstance::Router(RouterTerminus)`. Creates new module
+`crates/envoy-filter/src/router.rs` with `RouterTerminus` struct
+(zero-state; derives `Debug + Clone + Default`; `pub(crate) fn new()`
+constructor; `decode_headers` + `encode_headers` both return
+`Decision::Continue` without mutating req/resp).
+
+Router is the terminus of every filter chain per parent-07 SPEC §6
+Rule 3. The validator at envoy-config (Task 4) enforces Router-at-last
+at config-load time. The iteration semantic — decode walks Router LAST;
+reverse-encode walks Router FIRST — models Envoy's "Router produces the
+response, other filters mutate on encode" shape.
+
+### Tests landed
+
+3 unit tests at `crates/envoy-filter/src/router.rs::tests`:
+- `decode_headers_returns_continue_and_does_not_mutate_request` — full
+  6-field snapshot before/after; verifies no mutation.
+- `encode_headers_returns_continue_and_does_not_mutate_response` — full
+  4-field snapshot before/after; verifies no mutation.
+- `router_terminus_is_clone_and_default` — Default + Clone symmetry.
+
+1 unit test at `crates/envoy-filter/src/instance.rs::tests`:
+- `build_router_succeeds` — verifies the Router arm of
+  `HttpFilterInstance::build` produces the right variant.
+
+Total envoy-filter test count: 5 (Task 1) + 4 (Task 2) + 1 + 3 = 13.
+
+### LoC delta
+
+| File | LoC |
+|---|---|
+| `crates/envoy-filter/src/router.rs` (new) | ~95 (incl. 3 tests) |
+| `crates/envoy-filter/src/instance.rs` (rewrite from placeholder) | ~65 (incl. 1 test) |
+| `crates/envoy-filter/src/lib.rs` (extension) | +2 |
+| PROGRESS.md (Task 3 entry) | ~55 |
+| **Total** | **~217** |
+
+### Deviations from PLAN
+
+**Deviation 1 (PLAN.md:909, 999 — Response import path):** PLAN
+prescribed `use envoy_http1::codec::{Request, Response};` in both
+`router.rs` and `instance.rs`. Disk has `Response` in
+`crates/envoy-http1/src/response.rs`, not `codec.rs`. Used
+`use envoy_http1::{Request, Response};` (crate-root re-exports).
+
+**Deviation 2 (PLAN.md:939-944 — `decode_headers` test Request shape):**
+PLAN's Request literal listed 4 fields; disk has 6
+(`crates/envoy-http1/src/codec.rs:20-46`). Added `version`,
+`bytes_consumed`, and used `Some(Bytes::from_static(...))` for `body`.
+Expanded the 4-tuple snapshot to a 6-tuple and the 4 post-call
+assertions to 6.
+
+**Deviation 3 (PLAN.md:962-966 — `encode_headers` test Response shape):**
+PLAN's Response literal omitted the `reason` field; disk has 4
+(`crates/envoy-http1/src/response.rs:13-19`). Added `reason: None` and
+extended the 3-tuple snapshot to 4 plus the matching extra assertion.
+
+**Deviation 4 (rustfmt — `encode_headers` test `before` tuple):** PLAN
+wrote the `before` 4-tuple on one line. `rustfmt` expanded it to
+multi-line (line-length limit). Applied before final commit to keep
+`cargo fmt --check` clean.
+
+### Test-bucket attestation
+
+- `cargo test -p envoy-filter`: PASS (13 tests).
+  ```
+  test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+- `cargo build --workspace --all-targets`: clean.
+  ```
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s
+  ```
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+  ```
+  Checking envoy-filter v0.1.0 (/Users/esa/git/envoy-rust/crates/envoy-filter)
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.10s
+  ```
+- `cargo fmt --all -- --check`: clean (no output).
+- `cargo test --workspace`: PASS. All suites passing; no failures.
+  ```
+  test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  ```
+- `cargo deny check`: no-op (no new top-level deps).
