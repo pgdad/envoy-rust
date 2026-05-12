@@ -1048,3 +1048,97 @@ authorizes the push, OR (ii) the user pushes manually and the next session
 The local-gate results above substantively verify §7.5 (a)-(e); the CI run
 will re-verify (c) h2spec + (a)+(b) differential under the project's
 standard CI environment.
+
+### State-4 followup — CI evidence captured at state-6 close-out
+
+CI run **<https://github.com/pgdad/envoy-rust/actions/runs/25731958773>**
+at HEAD `e9c18282367bdb4d35d4dd9ce847da0c87bd3571` (the state-5 REVIEW.md
+commit), conclusion `success`, created `2026-05-12T11:38:16Z`, completed
+`2026-05-12T11:40:24Z` (build + test + lint: 2m07s; fuzz: 2m08s). Closes
+REVIEW.md §3 Important I3 (state-4 phase-done gate evidence is local-only
+— no CI run URL) under the disposition recorded at REVIEW.md §4 row I3
+("close before state-6 close-out; acceptable to land alongside state-6 or
+as a standalone state-4-followup commit before state-6"). Mirrors the
+06.1 (`25625271032` HEAD `36fedd8` completed `2026-05-10T09:33:41Z`) and
+06.2 (`25670699370` HEAD `4aba10b` completed `2026-05-11T12:42:59Z`)
+state-4-anchor evidence shape — CI URL + HEAD SHA + completion timestamp
++ per-gate quoted evidence. The push to `origin/main` that fired this CI
+run was authorized by the user upfront at the state-6 close-out session
+entry (the executor session bundled the state-4-followup CI URL capture
+into the state-6 close-out commit per next-prompt.txt's recommended
+bundled path).
+
+Per parent-06 SPEC §1 + 06.3 SPEC §1 acceptance signal (a)-(f), CI
+re-verifies the local evidence captured at Task 12 above (HEAD
+`7cdc1a8`) against the project's standard CI environment:
+
+**(a) + (b) Differential fixture suite + cross-fixture coverage.** The
+build + test + lint job's `test (includes differential harness → Docker)`
+step ran the full workspace test suite against HEAD `e9c1828`. Per-crate
+unit-test buckets all reported `test result: ok. N passed; 0 failed`:
+
+```
+envoy-accesslog        : 14 passed; 0 failed; 0 ignored
+envoy-admin            : 21 passed; 0 failed; 0 ignored
+envoy-bin              : 180 passed; 0 failed; 0 ignored
+envoy-cluster          :  57 passed; 0 failed; 0 ignored
+envoy-config           :  38 passed; 0 failed; 1 ignored
+envoy-http1            :  77 passed; 0 failed; 1 ignored
+envoy-http2            :  20 passed; 0 failed; 0 ignored
+envoy-listener         :  10 passed; 0 failed; 0 ignored
+envoy-stats            :  25 passed; 0 failed; 0 ignored
+envoy-tcp              :  11 passed; 0 failed; 0 ignored
+envoy-tls              :  15 passed; 0 failed; 0 ignored
+differential (lib)     :  77 passed; 0 failed; 1 ignored
+```
+
+12 Docker-gated fixture single-test runs each report `test result: ok.
+1 passed; 0 failed` in the same step (cross-checked against on-disk
+fixture set `0001`-`0012`):
+
+```
+echo                   : finished in 6.02s
+admin_ready            : finished in 0.83s
+tcp_proxy              : finished in 0.97s
+tls_downstream         : finished in 1.04s
+tls_upstream           : finished in 0.83s
+tls_sni                : finished in 2.43s
+http1_direct_response  : finished in 0.82s
+http1_router_upstream  : finished in 2.48s
+http2_direct_response  : finished in 2.63s
+http2_router_upstream  : finished in 2.78s
+admin_stats_prometheus : finished in 3.04s
+access_log_file_sink   : finished in 2.66s
+
+12/12 Docker-gated fixtures GREEN simultaneously
+```
+
+**(c) Conformance.** `test h2spec_pass_rate_gate ... ok` at
+`2026-05-12T11:40:06Z` in the build + test + lint job — h2spec gate
+holds at ≥95% pass per the 05.2 D7 baseline 99.31% (144 passed /
+1 failed / 1 skipped of 146; no H2-framing surface engaged in 06.3
+so the percentage carries through unchanged).
+
+**(d) Fuzz.** `fuzz (parse_bootstrap, 30s)` job ran 238,532 iterations
+on the existing 17-seed corpus (16 pre-06.2 + 1 from 06.2 Task 5);
+fuzz-engine reported `DONE` at `2026-05-12T11:40:17Z` (`cov: 7791
+ft: 16540 corp: 1493/861Kb exec/s: 7694`); zero crashes. No new fuzz
+target landed in 06.3 per architecture decision 20 (the validator's
+reject-path is structural and serde-walk covers it).
+
+**(e) Stable-toolchain gates.** All 5 (`cargo build --workspace
+--all-targets`, `cargo clippy --workspace --all-targets --all-features
+-- -D warnings`, `cargo fmt --all -- --check`, `cargo test --workspace`,
+`cargo deny check`) reported clean in the build + test + lint job;
+exit code 0 across the workflow.
+
+**(f) REVIEW.md verdict.** Landed at state-5 commit `e9c1828` —
+**Approved with M-track follow-ups** (0 Critical / 3 Important / 7 Minor);
+all 3 Important findings dispositioned for state-6 / state-4-followup /
+future-phase carryforward; none triggered §5.2 re-entry at state 3.
+
+State-4 evidence chain is now anchored at a real CI run with SHA +
+timestamp, honoring the 06.1 / 06.2 / 05.3 REVIEW-I3 evidence-discipline
+precedent. The carryforward chain for `state-4 CI URL evidence completeness`
+(05.3 REVIEW I3 → 06.1 closure → 06.2 closure → 06.3 REVIEW I3 → THIS
+state-6 close-out) terminates at this commit.
