@@ -719,3 +719,65 @@ and `envoy-listener`.
 - `cargo deny check`: no-op (envoy-filter is a workspace path-dep, no new top-level Cargo deps).
 
 Docker-gated bilateral attestation deferred to Task 8 (state-4 anchor).
+
+## Task 8 — State-4 phase-done gate evidence (12 fixtures simultaneously green)
+
+### CI evidence anchor
+
+- **CI run URL:** https://github.com/pgdad/envoy-rust/actions/runs/25759067004
+- **Run ID:** `25759067004`
+- **HEAD SHA:** `12360e3dffee2ed7f94c0248c3ed92c6c3aff417` (= Task 1-fixup commit `12360e3`; the post-fixup HEAD).
+- **Workflow:** `ci` (`.github/workflows/ci.yml`).
+- **Trigger:** `push` to `main`.
+- **Conclusion:** `success`.
+- **Created:** `2026-05-12T20:03:48Z`.
+- **Completed:** `2026-05-12T20:05:53Z` (~2m05s wall-clock).
+- **Jobs:**
+  - `build + test + lint`: `success` (started `20:03:51Z`, completed `20:05:52Z`).
+  - `fuzz (parse_bootstrap, 30s)`: `success` (started `20:03:51Z`, completed `20:05:01Z`).
+
+### Predecessor run note (state-4 first attempt — FAILED; Task 1 fixup landed in response)
+
+- **Predecessor run URL:** https://github.com/pgdad/envoy-rust/actions/runs/25758889478
+- **HEAD SHA:** `3e041c5` (Task 7 commit, before the license fixup).
+- **Conclusion:** `failure` at the `cargo deny check` step of `build + test + lint` (other steps clean: fmt / clippy / build / test (all 12 Docker-gated fixtures + h2spec) all succeeded; cargo-deny rejected envoy-filter as unlicensed).
+- **Failure mode:** `error[unlicensed]: envoy-filter = 0.1.0 is unlicensed`. Task 1's `crates/envoy-filter/Cargo.toml` was missing the `license = "Apache-2.0"` field that all 11 other workspace crates carry. Slipped past Tasks 1-7 local verification because the Tasks-1-7 dispatch prompts treated `cargo deny check` as "no-op (no new top-level deps)" and did not capture its actual output — the assumption was wrong: cargo-deny verifies per-crate `[package] license` for ALL workspace members regardless of dep additions.
+- **Fix:** Task 1 fixup commit `12360e3` added `license = "Apache-2.0"` to `crates/envoy-filter/Cargo.toml`. 1-line addition; zero code/test/behavior changes. Local `cargo deny check` clean after the fixup: `advisories ok, bans ok, licenses ok, sources ok`.
+- **Re-run:** the post-fixup CI run `25759067004` (above) succeeded with both jobs `success` and all step buckets clean.
+
+### Test buckets enumerated (per parent SPEC §8 R-1 + 06.3 REVIEW I1 closure)
+
+The CI workflow consolidates all step buckets into 2 jobs (per `.github/workflows/ci.yml`):
+
+**Job 1: `build + test + lint`** — conclusion `success`. Step buckets within this job (all PASS):
+- `cargo fmt --all -- --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — clean.
+- `cargo build --workspace --all-targets` — clean.
+- `cargo test --workspace` (includes the differential harness → Docker for all 12 fixtures + h2spec conformance): PASS.
+  - **All 12 Docker-gated differential fixtures** GREEN simultaneously at the same CI run, in the same test invocation:
+    - `0001-tcp-echo` — PASS.
+    - `0002-...` through `0012-access-log-file-sink` — PASS. (The CI workflow runs the differential harness as part of `cargo test --workspace`; the harness orchestrates all 12 fixtures via testcontainers + Docker; per-fixture green is verified by the harness's test outcome at job level — `build + test + lint` job conclusion `success` requires all fixtures green simultaneously.)
+  - **`tests/conformance/h2spec/`** — `≥95% pass` gate held (run inside `cargo test --workspace`; the conformance harness asserts the pass-rate gate at test exit; gate-fail would have produced a non-success conclusion).
+- `cargo deny check` — clean (the failure mode that surfaced at the predecessor run `25758889478` is closed at the Task 1 fixup; `advisories ok, bans ok, licenses ok, sources ok`).
+
+**Job 2: `fuzz (parse_bootstrap, 30s)`** — conclusion `success`. `cargo fuzz run parse_bootstrap -- -max_total_time=30s` clean for the short-budget CI run; no new crash inputs added to corpus.
+
+### §7.5 phase-done gate disposition
+
+- **(a)** No new differential fixture lands in 07.1 — N/A (regression-equivalence under the existing Router-only chain is the differential surface).
+- **(b)** Pre-existing differential fixtures: **12/12 green simultaneously** in CI run `25759067004` — **PASS**.
+- **(c)** Conformance suites: `h2spec ≥95%` gate held (asserted inside `cargo test --workspace`) — **PASS**.
+- **(d)** Fuzz target: `parse_bootstrap` short-budget CI run clean — **PASS** (Job 2 conclusion `success`).
+- **(e)** Workspace checks: `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo fmt --all -- --check`, `cargo test --workspace`, `cargo deny check` — **all PASS** at this CI run.
+- **(f)** REVIEW.md approved — **PENDING** (state 5; lands at the next session per the BOOTSTRAP_PROMPT §5 state-machine).
+
+5 of 6 gates clear (a + b + c + d + e PASS; f PENDING). The (f) PENDING is the natural state-5 disposition — 07.1's lifecycle advances from state 3 → state-4-reached / state-5-next at Task 9; the next session runs `superpowers:requesting-code-review` per the state-machine.
+
+### Closes 06.3 REVIEW I1 (verification-discipline gap)
+
+The 06.3 REVIEW I1 finding flagged that "workspace-tests-clean does not include Docker-gated bilateral fixture runs" — i.e., the per-task PROGRESS attestation discipline at 06.3 mentioned `cargo test --workspace` but did NOT separately verify that the Docker-gated fixtures stayed green at the in-process backstop level + the Docker-gated CI level simultaneously. 07.1 closes this structurally at Tasks 5/6/7 PROGRESS test-bucket attestation (each Task 5/6/7 PROGRESS entry enumerates workspace-tests-count + clippy + fmt + deny + an explicit in-process-backstop attestation for the H1/H2 surfaces — verified pre-commit per-task) + this Task 8 comprehensive state-4 anchor (which captures the Docker-gated bilateral CI evidence end-to-end). The two-layer attestation discipline (per-task in-process surrogate + state-4 Docker-gated CI anchor) is the structural closure of 06.3 I1.
+
+### Test-bucket attestation (this commit)
+
+No code changes; PROGRESS-only commit. Local re-verification:
+- `cargo deny check` (HEAD `12360e3`): `advisories ok, bans ok, licenses ok, sources ok` — clean.
