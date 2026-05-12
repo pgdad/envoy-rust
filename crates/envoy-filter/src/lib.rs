@@ -10,8 +10,10 @@ pub mod error;
 pub mod instance;
 pub mod pipeline;
 pub mod router;
+pub mod types;
 
 pub use error::FilterError;
 pub use instance::HttpFilterInstance;
 pub use pipeline::{Decision, FilterPipeline};
 pub use router::RouterTerminus;
+pub use types::{FilterRequest, FilterResponse};

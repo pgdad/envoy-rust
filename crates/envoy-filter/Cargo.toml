@@ -9,6 +9,5 @@ bytes = "1"
 thiserror = "2"
 tracing = "0.1"
 envoy-config = { path = "../envoy-config" }
-envoy-http1 = { path = "../envoy-http1" }
 
 [dev-dependencies]

@@ -7,7 +7,7 @@
 use crate::error::FilterError;
 use crate::pipeline::Decision;
 use crate::router::RouterTerminus;
-use envoy_http1::{Request, Response};
+use crate::types::{FilterRequest, FilterResponse};
 
 #[derive(Debug, Clone)]
 pub enum HttpFilterInstance {
@@ -34,13 +34,13 @@ impl HttpFilterInstance {
         }
     }
 
-    pub(crate) fn decode_headers(&mut self, req: &mut Request) -> Decision {
+    pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         match self {
             HttpFilterInstance::Router(r) => r.decode_headers(req),
         }
     }
 
-    pub(crate) fn encode_headers(&mut self, resp: &mut Response) -> Decision {
+    pub(crate) fn encode_headers(&mut self, resp: &mut FilterResponse) -> Decision {
         match self {
             HttpFilterInstance::Router(r) => r.encode_headers(resp),
         }

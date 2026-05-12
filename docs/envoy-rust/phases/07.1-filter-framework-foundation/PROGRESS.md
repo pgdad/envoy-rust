@@ -401,3 +401,112 @@ The pre-Task-5 late-init-with-`mut` posture on the three log-locals (06.3 Task 4
 - `cargo deny check`: pre-existing license-not-encountered warnings on `Unicode-DFS-2016` / `Zlib` (unrelated to this task — same on `main`). No new top-level deps.
 
 Docker-gated bilateral attestation deferred to Task 8 (state-4 anchor); the in-process backstop tests are the surrogate at Task 5.
+
+## Task 5.5 — ADR-0031: `envoy-filter` ↔ `envoy-http1` Cargo cycle resolution
+
+### Work summary
+
+Unplanned task surfaced at Task 6 dispatch time. The parent-07 SPEC §5
+signpost 7 + 07.1 PLAN architecture decision 7 specify the dep stack as
+`envoy-config → envoy-filter → envoy-http1, envoy-http2 → envoy-bin`
+with `envoy-filter` depending on `envoy-http1` for `codec::Request` /
+`Response` value types AND `envoy-http1` / `envoy-http2` depending on
+`envoy-filter` for the framework runtime. The SPEC asserts "no cycles
+because the codec module within envoy-http1 has no dependency on the hcm
+module"; Cargo disagrees — it treats each workspace member as a single
+dependency-graph node and forbids crate-level path-dep cycles. Verified
+empirically at the Task 6 dispatch checkpoint via a minimal two-crate
+test workspace at `/tmp/cargo-cycle-min/` which produced the Cargo error
+`cyclic package dependency: package 'a' depends on itself`. The SPEC at
+line 884 anticipates exactly this pressure ("If a future surface forces
+a wider dependency, the recommended path is to move codec into a smaller
+envoy-codec crate — flagged for whichever future phase first surfaces
+the pressure (out of scope for 07.1)") but punts it as future work;
+Cargo's rules make this resolution in-scope at 07.1 Task 6.
+
+Per D-3.5 (write ADR + proceed) and the user's standing preference to
+not ask mid-phase (auto-memory `feedback_pick_recommendation`), this
+Task 5.5 commit lands ADR-0031 documenting the resolution + the
+structural change to break the cycle. Option (iii) of ADR-0031 chosen:
+re-home filter-visible request/response shapes into `envoy-filter::types`
+as new subset types `FilterRequest` (4 fields: method, path, headers,
+body) and `FilterResponse` (4 fields: status, reason, headers, body —
+identical shape to envoy_http1::Response). `envoy-filter` loses its
+`envoy-http1` `[dependencies]` entry. Task 6 will add `envoy-filter` as
+a dep of `envoy-http1` (the planned direction); the HCM at H1 (Task 6)
+and H2 (Task 7) will convert at the filter-invocation boundary.
+
+### Files modified
+
+- `crates/envoy-filter/src/types.rs` — NEW. `FilterRequest` +
+  `FilterResponse` struct definitions with full ADR-0031 rationale in
+  the module doc-comment.
+- `crates/envoy-filter/src/lib.rs` — declares `pub mod types;` +
+  `pub use types::{FilterRequest, FilterResponse};`.
+- `crates/envoy-filter/src/pipeline.rs` — imports retype from
+  `envoy_http1::{Request, Response}` to `crate::types::{FilterRequest,
+  FilterResponse}`. Signatures + Decision variant retype to use the new
+  types. Test helpers `test_request` / `test_response` simplify (4-field
+  literals; no `version` / `bytes_consumed`).
+- `crates/envoy-filter/src/instance.rs` — same import + signature
+  retype.
+- `crates/envoy-filter/src/router.rs` — same. The
+  `decode_headers_returns_continue_and_does_not_mutate_request` and
+  `encode_headers_returns_continue_and_does_not_mutate_response` tests
+  simplify from per-field cloning to `let before = req.clone();
+  assert_eq!(req, before);` (now possible since `FilterRequest` and
+  `FilterResponse` derive `PartialEq`).
+- `crates/envoy-filter/Cargo.toml` — removes
+  `envoy-http1 = { path = "../envoy-http1" }` from `[dependencies]`.
+- `docs/envoy-rust/DECISIONS.md` — appends ADR-0031 (~80 lines of
+  Context / Options / Decision / Rationale / Consequences / Provenance
+  per the established ADR shape).
+
+### Tests landed
+
+No new tests. The existing 13 `envoy-filter` tests retype to use
+`FilterRequest` / `FilterResponse` instead of
+`envoy_http1::Request` / `envoy_http1::Response`; the two
+no-mutation tests (`router::tests::decode_headers_returns_continue_and_does_not_mutate_request`
++ `..._encode_headers_..._response`) gain a structurally-simpler
+assertion (`assert_eq!(req, before)`) now that `FilterRequest` /
+`FilterResponse` derive `PartialEq`.
+
+Total envoy-filter test count unchanged at 13.
+
+### LoC delta
+
+| File | LoC |
+|---|---|
+| `crates/envoy-filter/src/types.rs` (new) | ~48 |
+| `crates/envoy-filter/src/lib.rs` (extension) | +2 |
+| `crates/envoy-filter/src/pipeline.rs` (retype) | net ~-5 |
+| `crates/envoy-filter/src/instance.rs` (retype) | net 0 |
+| `crates/envoy-filter/src/router.rs` (retype + test simplification) | net ~-20 |
+| `crates/envoy-filter/Cargo.toml` (drop envoy-http1 dep) | -1 |
+| `docs/envoy-rust/DECISIONS.md` (ADR-0031) | +1 entry (~80 lines) |
+| `docs/envoy-rust/phases/07.1-filter-framework-foundation/PROGRESS.md` (this entry) | ~80 |
+| **Total net change** | **~+185** |
+
+### Deviations from PLAN
+
+**Deviation 1 (parent-07 SPEC §5 signpost 7 + 07.1 PLAN architecture decision 7 — Cargo crate-level cycle):** the SPEC's "no cycles" claim relies on module-level granularity that Cargo does not respect. Verified empirically via `/tmp/cargo-cycle-min/`. Resolution per ADR-0031: re-home filter-visible request/response types into `envoy-filter::types` (option (iii) of the ADR; alternatives (i) full extraction, (ii) trait-based generics, (iv) trait-object indirection rejected per ADR rationale).
+
+**Deviation 2 (ADR-0031 number reuse):** ADR-0030's "Consequences" footer pre-projected ADR-0031 as the conditional foundations-grant slot. This ADR repurposes that number for the cycle-resolution — the recommended posture "no foundations grants" continues to hold (no new top-level Cargo deps land); a future foundations-grant ADR (if 07.2 surfaces one) lands at ADR-0032 or beyond per established sequential-no-renumbering ledger discipline.
+
+### Test-bucket attestation
+
+- `cargo build -p envoy-filter`: clean (`Finished dev profile in 6.26s`).
+- `cargo test -p envoy-filter`: PASS — `test result: ok. 13 passed; 0 failed; 0 ignored`.
+- `cargo test --workspace`: PASS — 548 passed, 0 failed, 2 ignored across all suites (workspace-aggregate count summed via `awk` over per-suite `test result: ok.` lines).
+- `cargo build --workspace --all-targets`: clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo deny check`: no-op (no Cargo dep additions; only a removal from envoy-filter; no new top-level deps).
+
+### DECISIONS.md ledger head after this commit
+
+**ADR-0031** (this commit). The conditional foundations-grant slot
+originally projected at ADR-0030's Consequences footer is released —
+a future foundations-grant ADR (if any surfaces in 07.2 execution)
+lands at ADR-0032 or beyond.

@@ -399,7 +399,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "envoy-config",
- "envoy-http1",
  "thiserror",
  "tracing",
 ]

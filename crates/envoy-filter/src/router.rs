@@ -13,7 +13,7 @@
 //! response and other filters mutate it on the encode side".
 
 use crate::pipeline::Decision;
-use envoy_http1::{Request, Response};
+use crate::types::{FilterRequest, FilterResponse};
 
 #[derive(Debug, Clone, Default)]
 pub struct RouterTerminus {
@@ -25,11 +25,11 @@ impl RouterTerminus {
         Self { _private: () }
     }
 
-    pub(crate) fn decode_headers(&mut self, _req: &mut Request) -> Decision {
+    pub(crate) fn decode_headers(&mut self, _req: &mut FilterRequest) -> Decision {
         Decision::Continue
     }
 
-    pub(crate) fn encode_headers(&mut self, _resp: &mut Response) -> Decision {
+    pub(crate) fn encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision {
         Decision::Continue
     }
 }
@@ -42,53 +42,31 @@ mod tests {
     #[test]
     fn decode_headers_returns_continue_and_does_not_mutate_request() {
         let mut router = RouterTerminus::new();
-        let mut req = Request {
+        let mut req = FilterRequest {
             method: "GET".to_string(),
             path: "/".to_string(),
-            version: envoy_http1::codec::HttpVersion::Http11,
             headers: vec![("host".to_string(), "example.com".to_string())],
-            bytes_consumed: 0,
             body: Some(Bytes::from_static(b"hello")),
         };
-        let before = (
-            req.method.clone(),
-            req.path.clone(),
-            req.version,
-            req.headers.clone(),
-            req.bytes_consumed,
-            req.body.clone(),
-        );
+        let before = req.clone();
         let decision = router.decode_headers(&mut req);
         assert!(matches!(decision, Decision::Continue));
-        assert_eq!(req.method, before.0);
-        assert_eq!(req.path, before.1);
-        assert_eq!(req.version, before.2);
-        assert_eq!(req.headers, before.3);
-        assert_eq!(req.bytes_consumed, before.4);
-        assert_eq!(req.body, before.5);
+        assert_eq!(req, before);
     }
 
     #[test]
     fn encode_headers_returns_continue_and_does_not_mutate_response() {
         let mut router = RouterTerminus::new();
-        let mut resp = Response {
+        let mut resp = FilterResponse {
             status: 200,
             reason: None,
             headers: vec![("content-length".to_string(), "5".to_string())],
             body: Bytes::from_static(b"hello"),
         };
-        let before = (
-            resp.status,
-            resp.reason,
-            resp.headers.clone(),
-            resp.body.clone(),
-        );
+        let before = resp.clone();
         let decision = router.encode_headers(&mut resp);
         assert!(matches!(decision, Decision::Continue));
-        assert_eq!(resp.status, before.0);
-        assert_eq!(resp.reason, before.1);
-        assert_eq!(resp.headers, before.2);
-        assert_eq!(resp.body, before.3);
+        assert_eq!(resp, before);
     }
 
     #[test]

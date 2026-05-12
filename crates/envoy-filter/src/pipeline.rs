@@ -2,12 +2,12 @@
 
 use crate::error::FilterError;
 use crate::instance::HttpFilterInstance;
-use envoy_http1::{Request, Response};
+use crate::types::{FilterRequest, FilterResponse};
 
 #[derive(Debug)]
 pub enum Decision {
     Continue,
-    StopAndSend(Response),
+    StopAndSend(FilterResponse),
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +38,7 @@ impl FilterPipeline {
     ///
     /// Per parent-07 SPEC §6 Rule 6: decode walks `filters.iter_mut()`.
     /// First `StopAndSend` short-circuits remaining iteration.
-    pub fn decode_headers(&mut self, req: &mut Request) -> Decision {
+    pub fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         for filter in self.filters.iter_mut() {
             match filter.decode_headers(req) {
                 Decision::Continue => continue,
@@ -55,7 +55,7 @@ impl FilterPipeline {
     /// This matches Envoy v1.33's documented filter-chain semantics where
     /// the Router filter produces the response (so it fires first on encode)
     /// and other filters mutate it on the way out.
-    pub fn encode_headers(&mut self, resp: &mut Response) -> Decision {
+    pub fn encode_headers(&mut self, resp: &mut FilterResponse) -> Decision {
         for filter in self.filters.iter_mut().rev() {
             match filter.encode_headers(resp) {
                 Decision::Continue => continue,
@@ -118,19 +118,17 @@ mod tests {
         assert!(matches!(decision, Decision::Continue));
     }
 
-    fn test_request() -> Request {
-        Request {
+    fn test_request() -> FilterRequest {
+        FilterRequest {
             method: "GET".to_string(),
             path: "/".to_string(),
-            version: envoy_http1::codec::HttpVersion::Http11,
             headers: vec![("host".to_string(), "localhost".to_string())],
-            bytes_consumed: 0,
             body: None,
         }
     }
 
-    fn test_response() -> Response {
-        Response {
+    fn test_response() -> FilterResponse {
+        FilterResponse {
             status: 200,
             reason: None,
             headers: vec![("content-length".to_string(), "0".to_string())],
