@@ -130,6 +130,13 @@ pub struct HCMConfig {
     /// SPEC §6 architectural Rule 4 option (b); emission errors
     /// logged via `tracing::warn!` and discarded).
     pub access_log: Vec<Arc<envoy_accesslog::FileSink>>,
+    /// 07.1 Task 6: per-listener filter pipeline. Arc-shared at
+    /// config-build time. Each per-request scope inside `serve_connection`
+    /// clones into a working `FilterPipeline` via
+    /// `(*config.filter_pipeline).clone()`. At 07.1 the per-request clone
+    /// is effectively a no-op (Router is zero-state); the clone shape is
+    /// structural for 07.2's HeaderMutation per-stream cloning.
+    pub filter_pipeline: Arc<envoy_filter::FilterPipeline>,
 }
 
 impl HCMConfig {
@@ -170,6 +177,14 @@ impl HCMConfig {
                 }
             }
         }
+        // 07.1 Task 6: build the filter pipeline at config-load time.
+        // The envoy-config validator (07.1 Task 4) has already enforced
+        // [1..=N filters with Router-at-terminus]; this build is
+        // defense-in-depth at the framework crate boundary. The `?`
+        // propagates via the `#[from]` impl on `Http1Error::FilterPipeline`.
+        let filter_pipeline = Arc::new(envoy_filter::FilterPipeline::build_from_config(
+            &cfg.http_filters,
+        )?);
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
             route_config: Arc::new(clone_route_config(&cfg.route_config)),
@@ -177,6 +192,7 @@ impl HCMConfig {
             http2_protocol_options: cfg.http2_protocol_options.clone(),
             stats,
             access_log: access_log_sinks,
+            filter_pipeline,
         })
     }
 }
@@ -306,17 +322,60 @@ async fn serve_connection(
         // bytes-received for the access-log record.
         let request_body_len: u64 = body_len as u64;
 
+        // 07.1 Task 6: decode-side filter invocation. Clone the pipeline
+        // per-request (cheap at 07.1; structural for 07.2's HeaderMutation
+        // per-stream cloning per ADR-0031). `req` is shadowed as `mut`
+        // so the boundary conversion can write back the filter-visible
+        // fields after the decode pass.
+        let mut req = req;
+        let mut pipeline = (*config.filter_pipeline).clone();
+
+        // Boundary conversion: construct FilterRequest from the
+        // filter-visible subset of envoy_http1::Request, invoke
+        // decode_headers, write back. The codec-state fields (`version`,
+        // `bytes_consumed`) stay in `req` and are not surfaced to filters.
+        let mut filter_req = envoy_filter::FilterRequest {
+            method: std::mem::take(&mut req.method),
+            path: std::mem::take(&mut req.path),
+            headers: std::mem::take(&mut req.headers),
+            body: req.body.take(),
+        };
+        let decode_decision = pipeline.decode_headers(&mut filter_req);
+        // Write back the (possibly mutated) fields.
+        req.method = filter_req.method;
+        req.path = filter_req.path;
+        req.headers = filter_req.headers;
+        req.body = filter_req.body;
+
         // 5. Build response (handles 400 / 404 / 501 / 200 internally) or
-        //    decide to proxy upstream.
-        let outcome = if chunked {
-            tracing::warn!(
-                method = %req.method,
-                path = %req.path,
-                "request rejected: Transfer-Encoding: chunked not supported (501)"
-            );
-            BuildOutcome::Synth(synth_501(close))
-        } else {
-            build_response(&config, &req, close)
+        //    decide to proxy upstream. 07.1 Task 6: dispatch through
+        //    RequestPath so decode-side `StopAndSend(filter_resp)` can
+        //    short-circuit the writer-arm match. Under the Router-only
+        //    07.1 chain the SynthFromDecode arm is unreachable (Router
+        //    never emits StopAndSend); 07.2's HeaderMutation may.
+        let request_path = match decode_decision {
+            envoy_filter::Decision::Continue => {
+                let outcome = if chunked {
+                    tracing::warn!(
+                        method = %req.method,
+                        path = %req.path,
+                        "request rejected: Transfer-Encoding: chunked not supported (501)"
+                    );
+                    BuildOutcome::Synth(synth_501(close))
+                } else {
+                    build_response(&config, &req, close)
+                };
+                RequestPath::Match(outcome)
+            }
+            envoy_filter::Decision::StopAndSend(filter_resp) => {
+                // Convert FilterResponse → codec-native Response.
+                RequestPath::SynthFromDecode(Response {
+                    status: filter_resp.status,
+                    reason: filter_resp.reason,
+                    headers: filter_resp.headers,
+                    body: filter_resp.body,
+                })
+            }
         };
 
         // 6. Advance the buffer past the consumed request + body.
@@ -355,127 +414,173 @@ async fn serve_connection(
         let mut upstream_host_for_log: Option<String> = None; // stays mut — only proxy arm populates
 
         // 07.1 Task 5: per-arm-populated response value, written to the wire
-        // once below the match (factored unified-site). Task 6 will insert
-        // `pipeline.encode_headers(&mut outgoing)` between this match's
-        // close and the wire write. Rust's flow analysis verifies all 5
-        // writer arms populate `outgoing` before the unified site reads it;
-        // a compile error (E0381) fires if any arm is missed.
-        let outgoing: Response;
+        // once below the match (factored unified-site). 07.1 Task 6 flipped
+        // this from `let outgoing` to `let mut outgoing` because the
+        // encode-side `Decision::StopAndSend(replacement)` branch replaces
+        // `outgoing` entirely with a filter's substitute response. Rust's
+        // flow analysis still verifies every writer arm populates `outgoing`
+        // before the unified site reads it; a compile error (E0381) fires
+        // if any arm is missed.
+        let mut outgoing: Response;
 
-        // 8. Dispatch the outcome to the wire.
-        match outcome {
-            BuildOutcome::Synth(resp) => {
-                outgoing = resp;
-            }
-            BuildOutcome::Proxy {
-                cluster: cluster_name,
-            } => {
-                // The validator (envoy-config Task 2) ensures every cluster
-                // name referenced from a RouteAction::Route exists in the
-                // bootstrap; the .expect() is defense-in-depth.
-                let cluster = config
-                    .cluster_mgr
-                    .get(&cluster_name)
-                    .expect("validator ensures cluster present");
+        // 8. Dispatch the request_path to the wire. 07.1 Task 6 wraps the
+        // Task 5 writer-arm match inside `RequestPath::Match(outcome)`; the
+        // new `SynthFromDecode(resp)` arm short-circuits when a decode-side
+        // filter emitted `StopAndSend` (unreachable under the Router-only
+        // 07.1 chain — Router never emits StopAndSend; the arm lands
+        // structurally for 07.2 HeaderMutation forward-compat).
+        match request_path {
+            RequestPath::Match(outcome) => match outcome {
+                BuildOutcome::Synth(resp) => {
+                    outgoing = resp;
+                }
+                BuildOutcome::Proxy {
+                    cluster: cluster_name,
+                } => {
+                    // The validator (envoy-config Task 2) ensures every cluster
+                    // name referenced from a RouteAction::Route exists in the
+                    // bootstrap; the .expect() is defense-in-depth.
+                    let cluster = config
+                        .cluster_mgr
+                        .get(&cluster_name)
+                        .expect("validator ensures cluster present");
 
-                if let Some(endpoint) = cluster.pick_endpoint() {
-                    let host_header = find_header(&req.headers, headers::HOST)
-                        .expect(
-                            "build_response rejected missing/empty Host before BuildOutcome::Proxy",
-                        )
-                        .to_owned();
+                    if let Some(endpoint) = cluster.pick_endpoint() {
+                        let host_header = find_header(&req.headers, headers::HOST)
+                            .expect(
+                                "build_response rejected missing/empty Host before BuildOutcome::Proxy",
+                            )
+                            .to_owned();
 
-                    // Strip Connection: per SPEC §3 D1 (one-shot upstream connection)
-                    // and Transfer-Encoding: per RFC 7230 §3.3.3 — the outgoing body
-                    // is forced to CL: 0, mirroring the response-side strip in
-                    // `router::write_proxied_response`.
-                    let mut out_headers = req.headers.clone();
-                    out_headers.retain(|(n, _)| {
-                        !n.eq_ignore_ascii_case(headers::CONNECTION)
-                            && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
-                    });
-                    let out_req = Request {
-                        method: req.method.clone(),
-                        path: req.path.clone(),
-                        version: HttpVersion::Http11,
-                        headers: out_headers,
-                        bytes_consumed: 0,
-                        // Chunked-request-body forwarding is a SPEC §4 non-goal.
-                        body: Some(Bytes::new()),
-                    };
+                        // Strip Connection: per SPEC §3 D1 (one-shot upstream connection)
+                        // and Transfer-Encoding: per RFC 7230 §3.3.3 — the outgoing body
+                        // is forced to CL: 0, mirroring the response-side strip in
+                        // `router::write_proxied_response`.
+                        let mut out_headers = req.headers.clone();
+                        out_headers.retain(|(n, _)| {
+                            !n.eq_ignore_ascii_case(headers::CONNECTION)
+                                && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
+                        });
+                        let out_req = Request {
+                            method: req.method.clone(),
+                            path: req.path.clone(),
+                            version: HttpVersion::Http11,
+                            headers: out_headers,
+                            bytes_consumed: 0,
+                            // Chunked-request-body forwarding is a SPEC §4 non-goal.
+                            body: Some(Bytes::new()),
+                        };
 
-                    // 06.2 Task 6: capture the resolved upstream endpoint
-                    // for the access-log `%UPSTREAM_HOST%` token. The
-                    // SocketAddr Display impl produces the canonical
-                    // `addr:port` rendering envoy uses.
-                    upstream_host_for_log = Some(endpoint.to_string());
+                        // 06.2 Task 6: capture the resolved upstream endpoint
+                        // for the access-log `%UPSTREAM_HOST%` token. The
+                        // SocketAddr Display impl produces the canonical
+                        // `addr:port` rendering envoy uses.
+                        upstream_host_for_log = Some(endpoint.to_string());
 
-                    // 06.3 D15.3.b: RAII guard increments
-                    // `cluster.<name>.upstream_cx_active` at the start of the
-                    // proxy arm and decrements via Drop at scope exit, covering
-                    // both success and error close paths uniformly.
-                    let _cx_guard = cluster.cx_active_guard();
+                        // 06.3 D15.3.b: RAII guard increments
+                        // `cluster.<name>.upstream_cx_active` at the start of the
+                        // proxy arm and decrements via Drop at scope exit, covering
+                        // both success and error close paths uniformly.
+                        let _cx_guard = cluster.cx_active_guard();
 
-                    let start = std::time::Instant::now();
-                    let client_result = Client::connect(endpoint, &host_header).await;
-                    match client_result {
-                        Ok(mut client_stream) => {
-                            // 06.1 D4.b: per-cluster `upstream_cx_total`
-                            // counter incremented once per established
-                            // upstream TCP connection. Fires only on the
-                            // success arm (a refused-connect path returns
-                            // 502 without incrementing).
-                            cluster.cx_total().inc();
+                        let start = std::time::Instant::now();
+                        let client_result = Client::connect(endpoint, &host_header).await;
+                        match client_result {
+                            Ok(mut client_stream) => {
+                                // 06.1 D4.b: per-cluster `upstream_cx_total`
+                                // counter incremented once per established
+                                // upstream TCP connection. Fires only on the
+                                // success arm (a refused-connect path returns
+                                // 502 without incrementing).
+                                cluster.cx_total().inc();
 
-                            match client_stream.send_request(out_req).await {
-                                Ok(upstream_response) => {
-                                    let elapsed_ms = start.elapsed().as_millis();
-                                    // 07.1 Task 5: factored — was a direct
-                                    // `crate::router::write_proxied_response`
-                                    // call; now constructs the Response
-                                    // value for the unified wire-write site
-                                    // below the match. The x-envoy-upstream-
-                                    // service-time header is injected by
-                                    // construct_proxied_response and flows
-                                    // into response_headers_for_log via the
-                                    // outgoing.headers.clone() at the
-                                    // unified site below.
-                                    outgoing = crate::router::construct_proxied_response(
-                                        &cluster,
-                                        upstream_response,
-                                        elapsed_ms,
-                                        close,
-                                    );
-                                }
-                                Err(source) => {
-                                    tracing::warn!(
-                                        cluster = %cluster.name(),
-                                        addr = %endpoint,
-                                        error = ?source,
-                                        "upstream request failed — returning 502",
-                                    );
-                                    outgoing = synth_status(502, close);
+                                match client_stream.send_request(out_req).await {
+                                    Ok(upstream_response) => {
+                                        let elapsed_ms = start.elapsed().as_millis();
+                                        // 07.1 Task 5: factored — was a direct
+                                        // `crate::router::write_proxied_response`
+                                        // call; now constructs the Response
+                                        // value for the unified wire-write site
+                                        // below the match. The x-envoy-upstream-
+                                        // service-time header is injected by
+                                        // construct_proxied_response and flows
+                                        // into response_headers_for_log via the
+                                        // outgoing.headers.clone() at the
+                                        // unified site below.
+                                        outgoing = crate::router::construct_proxied_response(
+                                            &cluster,
+                                            upstream_response,
+                                            elapsed_ms,
+                                            close,
+                                        );
+                                    }
+                                    Err(source) => {
+                                        tracing::warn!(
+                                            cluster = %cluster.name(),
+                                            addr = %endpoint,
+                                            error = ?source,
+                                            "upstream request failed — returning 502",
+                                        );
+                                        outgoing = synth_status(502, close);
+                                    }
                                 }
                             }
+                            Err(source) => {
+                                tracing::warn!(
+                                    cluster = %cluster.name(),
+                                    addr = %endpoint,
+                                    error = ?source,
+                                    "upstream connect failed — returning 502",
+                                );
+                                outgoing = synth_status(502, close);
+                            }
                         }
-                        Err(source) => {
-                            tracing::warn!(
-                                cluster = %cluster.name(),
-                                addr = %endpoint,
-                                error = ?source,
-                                "upstream connect failed — returning 502",
-                            );
-                            outgoing = synth_status(502, close);
-                        }
+                    } else {
+                        // No healthy endpoint available for this cluster.
+                        tracing::warn!(
+                            cluster = %cluster.name(),
+                            "no healthy endpoint for cluster — returning 503",
+                        );
+                        outgoing = synth_status(503, close);
                     }
-                } else {
-                    // No healthy endpoint available for this cluster.
-                    tracing::warn!(
-                        cluster = %cluster.name(),
-                        "no healthy endpoint for cluster — returning 503",
-                    );
-                    outgoing = synth_status(503, close);
                 }
+            },
+            RequestPath::SynthFromDecode(resp) => {
+                // 07.1 Task 6: decode-side filter short-circuit. Unreachable
+                // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation.
+                // `upstream_host_for_log` stays None (no proxy attempt).
+                outgoing = resp;
+            }
+        }
+
+        // 07.1 Task 6: encode-side filter invocation. Boundary conversion
+        // `outgoing: Response` ↔ `FilterResponse` per ADR-0031. Iteration
+        // fires once per response regardless of whether decode issued
+        // StopAndSend. Under the Router-only 07.1 chain `Decision::Continue`
+        // is the only reachable branch (Router never emits StopAndSend on
+        // encode); the StopAndSend arm lands structurally for 07.2.
+        let mut filter_resp = envoy_filter::FilterResponse {
+            status: outgoing.status,
+            reason: outgoing.reason,
+            headers: std::mem::take(&mut outgoing.headers),
+            body: std::mem::take(&mut outgoing.body),
+        };
+        match pipeline.encode_headers(&mut filter_resp) {
+            envoy_filter::Decision::Continue => {
+                // Write back the (possibly mutated) fields.
+                outgoing.status = filter_resp.status;
+                outgoing.reason = filter_resp.reason;
+                outgoing.headers = filter_resp.headers;
+                outgoing.body = filter_resp.body;
+            }
+            envoy_filter::Decision::StopAndSend(replacement) => {
+                // Replace outgoing entirely with the filter's substitute response.
+                outgoing = Response {
+                    status: replacement.status,
+                    reason: replacement.reason,
+                    headers: replacement.headers,
+                    body: replacement.body,
+                };
             }
         }
 
@@ -491,8 +596,9 @@ async fn serve_connection(
         let response_body_len: u64 = outgoing.body.len() as u64;
         let response_headers_for_log: Vec<(String, String)> = outgoing.headers.clone();
 
-        // 07.1 Task 5: unified wire-write site. Task 6 inserts
-        // `pipeline.encode_headers(&mut outgoing)` HERE, before the wire write.
+        // 07.1 Task 5: unified wire-write site. 07.1 Task 6 inserted
+        // `pipeline.encode_headers` above (boundary conversion + write-back
+        // / replacement) so the wire-write below sees the post-encode value.
         Http1Response::write_to(&outgoing, &mut downstream).await?;
 
         // 06.3 D15.3.a NEW — per-response-class HCM counters. Increment fires
@@ -617,6 +723,20 @@ fn extract_upstream_service_time(headers: &[(String, String)]) -> Option<std::ti
 pub enum BuildOutcome {
     Synth(Response),
     Proxy { cluster: String },
+}
+
+/// Per-request dispatch path (07.1 Task 6).
+///
+/// `Match` — the request passed through `pipeline.decode_headers` and
+/// hit the writer-arm match via `build_response`.
+///
+/// `SynthFromDecode` — a decode-side filter short-circuited the request
+/// with `StopAndSend`; the response goes directly to the unified
+/// factored site without consulting the writer arms or `build_response`.
+#[allow(dead_code)] // SynthFromDecode unused under 07.1 Router-only chain; 07.2 lights it up.
+enum RequestPath {
+    Match(BuildOutcome),
+    SynthFromDecode(Response),
 }
 
 pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
@@ -847,6 +967,23 @@ static_resources:
         Arc::new(HCMStats::register(&registry, stat_prefix).expect("HCMStats register"))
     }
 
+    /// 07.1 Task 6: helper for tests that build HCMConfig directly.
+    /// Returns an `Arc<FilterPipeline>` with a single Router filter,
+    /// matching every existing fixture's filter-chain shape (the
+    /// envoy-config validator at 07.1 Task 4 enforces Router-at-terminus
+    /// for every production `HttpConnectionManagerConfig`).
+    fn test_router_only_pipeline() -> Arc<envoy_filter::FilterPipeline> {
+        Arc::new(
+            envoy_filter::FilterPipeline::build_from_config(&[envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            }])
+            .expect("single-Router pipeline builds"),
+        )
+    }
+
     /// Build a minimal HCMConfig with a single VH `domains: ["*"]`,
     /// configurable routes.
     async fn hcm_config_single_route(prefix: &str, status: u16, body: &str) -> Arc<HCMConfig> {
@@ -859,6 +996,7 @@ static_resources:
             // no access-log sinks. The Task-6 access-log tests use
             // `hcm_config_with_access_log` instead.
             access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -937,6 +1075,7 @@ static_resources:
             http2_protocol_options: None,
             stats: mk_stats("x"),
             access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -977,6 +1116,7 @@ static_resources:
             http2_protocol_options: None,
             stats: mk_stats("x"),
             access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1045,6 +1185,7 @@ static_resources:
             http2_protocol_options: None,
             stats: mk_stats("x"),
             access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1130,6 +1271,7 @@ static_resources:
             http2_protocol_options: None,
             stats: mk_stats("test"),
             access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 virtual_hosts: vec![VirtualHost {
@@ -1361,6 +1503,7 @@ static_resources:
             http2_protocol_options: None,
             stats: mk_stats("ingress_http"),
             access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1949,6 +2092,7 @@ static_resources:
             http2_protocol_options: None,
             stats: mk_stats("ingress_http"),
             access_log: sinks,
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -2142,6 +2286,7 @@ static_resources:
             http2_protocol_options: None,
             stats,
             access_log: sinks,
+            filter_pipeline: test_router_only_pipeline(),
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -2293,5 +2438,104 @@ static_resources:
             1,
             "access_logs_failed should be 1 (one sink failed)"
         );
+    }
+
+    // ── 07.1 Task 6: H1 HCM filter-chain wiring tests ────────────────────────
+
+    /// Helper for the 07.1 Task 6 tests: a minimal `HttpConnectionManagerConfig`
+    /// with a Router-only `http_filters` list (the existing Task 4 validator
+    /// enforces Router-at-terminus). Tests can mutate `http_filters` (e.g.
+    /// clear to exercise the empty-chain error path) before passing to
+    /// `HCMConfig::from_config`.
+    fn task6_envoy_hcm_config() -> envoy_config::HttpConnectionManagerConfig {
+        envoy_config::HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: envoy_config::CodecType::HTTP1,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            }],
+        }
+    }
+
+    /// 07.1 Task 6: `HCMConfig::from_config` populates the `filter_pipeline`
+    /// Arc by calling `FilterPipeline::build_from_config` with the supplied
+    /// `http_filters` list. Success path: a Router-only chain produces an
+    /// `Arc<FilterPipeline>` that can be cloned (the per-request shape).
+    #[tokio::test]
+    async fn hcm_config_from_config_builds_filter_pipeline() {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = cluster_mgr_empty().await;
+        let envoy_cfg = task6_envoy_hcm_config();
+        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry)
+            .await
+            .expect("HCMConfig::from_config succeeds with single Router");
+        // No public accessor to inspect filters.len(); verify via clone shape.
+        let _cloned: envoy_filter::FilterPipeline = (*hcm_cfg.filter_pipeline).clone();
+    }
+
+    /// 07.1 Task 6: `HCMConfig::from_config` propagates
+    /// `FilterPipeline::build_from_config` failures as
+    /// `Http1Error::FilterPipeline(_)`. Empty-list path: produces
+    /// `FilterError::EmptyChain` (the validator at 07.1 Task 4 catches this
+    /// earlier in production, but the framework boundary is defense-in-depth).
+    #[tokio::test]
+    async fn hcm_config_from_config_errors_on_empty_http_filters() {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = cluster_mgr_empty().await;
+        let mut envoy_cfg = task6_envoy_hcm_config();
+        envoy_cfg.http_filters.clear();
+        let result = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry).await;
+        match result {
+            Err(Http1Error::FilterPipeline(envoy_filter::FilterError::EmptyChain)) => {}
+            other => panic!("expected FilterPipeline(EmptyChain), got {other:?}"),
+        }
+    }
+
+    /// 07.1 Task 6: smoke-test that `HCMConfig::from_config` produces a
+    /// config whose `filter_pipeline` Arc can be cloned and dereferenced.
+    /// The wire-emission regression proof for the Router-only chain is
+    /// anchored at the in-process backstop tests in
+    /// `crates/envoy-bin/tests/http1_*.rs` (Task 5 already attests these
+    /// are green; this unit test is a sanity check at the crate boundary).
+    /// Tests 3-7 from the PLAN (filter-instrumented invocation semantics)
+    /// are deferred to 07.2 Task 5 per signpost 12.
+    #[tokio::test]
+    async fn hcm_config_construction_yields_arc_pipeline_clone_shape() {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = cluster_mgr_empty().await;
+        let envoy_cfg = task6_envoy_hcm_config();
+        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry)
+            .await
+            .expect("HCMConfig::from_config succeeds with single Router");
+        let arc1 = Arc::clone(&hcm_cfg.filter_pipeline);
+        let arc2 = Arc::clone(&hcm_cfg.filter_pipeline);
+        assert!(Arc::strong_count(&arc1) >= 2);
+        assert!(std::ptr::eq(&*arc1, &*arc2));
     }
 }

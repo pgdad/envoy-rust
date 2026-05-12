@@ -9,6 +9,7 @@ license = "Apache-2.0"
 envoy-accesslog = { path = "../envoy-accesslog" }
 envoy-config = { path = "../envoy-config" }
 envoy-cluster = { path = "../envoy-cluster" }
+envoy-filter = { path = "../envoy-filter" }
 envoy-listener = { path = "../envoy-listener" }
 envoy-stats = { path = "../envoy-stats" }
 httparse = "1"

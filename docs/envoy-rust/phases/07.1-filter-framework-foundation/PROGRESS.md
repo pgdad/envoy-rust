@@ -510,3 +510,85 @@ Total envoy-filter test count unchanged at 13.
 originally projected at ADR-0030's Consequences footer is released —
 a future foundations-grant ADR (if any surfaces in 07.2 execution)
 lands at ADR-0032 or beyond.
+
+
+## Task 6 — H1 HCM filter-chain decode/encode invocation
+
+### Work summary
+
+Layers filter invocation onto Task 5's refactor. Adds `envoy-filter` as
+a path-dep of `envoy-http1` (the planned direction per parent-07 SPEC
+§5 signpost 7, now that ADR-0031 broke the reverse direction at
+Task 5.5). Adds `Arc<envoy_filter::FilterPipeline>` field to HCMConfig.
+Adds `HCMConfig::from_config` wiring that calls
+`FilterPipeline::build_from_config` and wraps in `Arc::new`. Adds
+`Http1Error::FilterPipeline(FilterError)` variant via `#[from]`.
+
+Private `RequestPath` enum at hcm.rs module scope captures the
+`Match(BuildOutcome)` (writer-arm path) vs `SynthFromDecode(Response)`
+(decode-side StopAndSend short-circuit) dispatch. Per-request flow per
+parent-07 SPEC §5 signpost 14: parse_request → clone pipeline →
+decode_headers (boundary conversion `envoy_http1::Request` ↔
+`envoy_filter::FilterRequest` per ADR-0031 via `std::mem::take` on
+method/path/headers and `Option::take` on body) → match Decision →
+writer-arm match (or SynthFromDecode short-circuit) → populate `outgoing`
+→ encode_headers (boundary conversion `envoy_http1::Response` ↔
+`envoy_filter::FilterResponse` via mem::take on headers/body) → unified
+wire-write → access-log dispatch.
+
+`outgoing` flipped from `let outgoing: Response;` (Task 5 chose non-mut
+to satisfy clippy `needless_late_init`) to `let mut outgoing: Response;`
+because Task 6's encode-side `Decision::StopAndSend(replacement)` branch
+needs to replace `outgoing` entirely.
+
+3 unit tests at 07.1 scope (HCMConfig::from_config success path,
+Http1Error::FilterPipeline empty-list error path, Arc-clone-shape
+sanity). Tests 3-7 (filter-instrumented invocation semantics — request
+mutation visible to route-match, response mutation visible to wire,
+StopAndSend short-circuit on both sides) deferred to 07.2 Task 5 per
+signpost 12; 07.1's regression-equivalence at state-4 IS the
+no-behavior-regression test under the Router-only chain (proved by the
+in-process backstops at `crates/envoy-bin/tests/http1_*.rs`).
+
+### Tests landed
+
+3 new unit tests at `crates/envoy-http1/src/hcm.rs::tests`:
+- `hcm_config_from_config_builds_filter_pipeline`
+- `hcm_config_from_config_errors_on_empty_http_filters`
+- `hcm_config_construction_yields_arc_pipeline_clone_shape`
+
+### LoC delta
+
+| File | LoC |
+|---|---|
+| `crates/envoy-http1/Cargo.toml` (envoy-filter dep) | +1 |
+| `crates/envoy-http1/src/error.rs` (FilterPipeline variant) | +10 |
+| `crates/envoy-http1/src/hcm.rs` (HCMConfig field + from_config wiring + RequestPath enum + decode invocation + encode invocation + outgoing mut flip + test helper + 3 tests + 8 test fixups) | ~+200 |
+| `docs/envoy-rust/phases/07.1-filter-framework-foundation/PROGRESS.md` (Task 6 entry) | ~85 |
+| **Total** | **~+296** |
+
+### Deviations from PLAN
+
+**Deviation 1 (PLAN.md:1906-1918 — error type name):** PLAN specified `HCMConfigError::FilterPipeline`. Disk has `Http1Error` (not `HCMConfigError`) at `crates/envoy-http1/src/error.rs`. Added `Http1Error::FilterPipeline(envoy_filter::FilterError)` via `#[from]`. `HCMConfig::from_config` signature stays `Result<Self, Http1Error>` (unchanged).
+
+**Deviation 2 (PLAN.md:1993 — RequestPath enum's Response type):** PLAN said `SynthFromDecode(envoy_http1::codec::Response)`. With Task 5.5, `Decision::StopAndSend(FilterResponse)` produces a `FilterResponse`. Convert it to `envoy_http1::Response` at the decode-side site so `RequestPath::SynthFromDecode` carries the codec-native response the unified-site code already expects.
+
+**Deviation 3 (PLAN.md:1888-1894 — direction inversion + 8 test sites):** PLAN assumed `HCMConfig::from_config` would internally build `FilterPipeline::build_from_config(&cfg.http_filters)`. That direction WAS taken (Task 6 wires it), but the 8 direct `HCMConfig { ... }` struct-literal sites in test code (hcm.rs around lines 990, 1071, 1111, 1179, 1264, 1495, 2083, 2276) needed the new `filter_pipeline` field added. A `fn test_router_only_pipeline() -> Arc<envoy_filter::FilterPipeline>` helper in `mod tests` factors the repeated construction (Note: PLAN said 9 sites; disk has 8 — the 9th was implicit in the "plus your new test sites" parenthetical and the new tests use `HCMConfig::from_config` rather than struct literals, so the helper is only consumed at the 8 pre-existing sites).
+
+**Deviation 4 (decode side — boundary conversion shape):** PLAN line 2010 said `pipeline.decode_headers(&mut req)`. With Task 5.5 types, `req` is `envoy_http1::Request` (not `FilterRequest`). The boundary conversion constructs a `FilterRequest` by moving filter-visible fields out via `std::mem::take` on method/path/headers and `Option::take` on body, invokes `pipeline.decode_headers(&mut filter_req)`, then writes back. On `StopAndSend(filter_resp)`, converts to `envoy_http1::Response`. `req` is shadowed to `let mut req = req;` so the write-back can land in the existing binding.
+
+**Deviation 5 (encode side — boundary conversion shape):** PLAN line 2064 said `pipeline.encode_headers(&mut outgoing)`. With Task 5.5 types, `outgoing` is `envoy_http1::Response`. Constructs `FilterResponse`, invokes `encode_headers`, writes back on `Continue` or replaces entirely on `StopAndSend(replacement)`.
+
+**Deviation 6 (Task 5 follow-through):** Task 5 left `let outgoing: Response;` non-mut as a documented Task 6 follow-up; Task 6 flipped this to `let mut outgoing: Response;` because the encode-side `Decision::StopAndSend(replacement)` branch replaces `outgoing` entirely.
+
+### Test-bucket attestation
+
+- `cargo test -p envoy-http1`: PASS — `test result: ok. 63 passed; 0 failed; 0 ignored` (was 60 pre-Task-6; +3 new tests).
+- `cargo test --workspace`: PASS — `passed: 551 failed: 0 ignored: 2` (sum across all per-suite `test result: ok.` lines). One flaky failure of `envoy-bin::backend::tests::http1_echo_backend_drop_terminates_child` observed on first run, passed in isolation and on second `--workspace` run; pre-existing timing/port-conflict flake unrelated to filter wiring.
+- `cargo test -p envoy-bin` (in-process backstops): PASS for all 12 H1/H2/TLS/TCP/admin tests; regression baseline preserved under the Router-only chain.
+- `cargo build --workspace --all-targets`: clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo deny check`: no-op (envoy-filter is a workspace path-dep; no new top-level Cargo deps).
+
+Docker-gated bilateral attestation deferred to Task 8 (state-4 anchor).

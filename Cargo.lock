@@ -411,6 +411,7 @@ dependencies = [
  "envoy-accesslog",
  "envoy-cluster",
  "envoy-config",
+ "envoy-filter",
  "envoy-listener",
  "envoy-stats",
  "httparse",

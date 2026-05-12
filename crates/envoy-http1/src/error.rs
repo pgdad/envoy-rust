@@ -73,6 +73,15 @@ pub enum Http1Error {
     /// implement `Error`). Surfaces from `HCMConfig::from_config`.
     #[error("failed to open access log sink: {message}")]
     AccessLogOpen { message: String },
+
+    /// 07.1 Task 6: `FilterPipeline::build_from_config` rejected the
+    /// http_filters list at `HCMConfig::from_config` time (most likely
+    /// empty list — but the validator at
+    /// `envoy_config::validate_http_filters` (07.1 Task 4) catches this
+    /// earlier at config-load time; this variant is defense-in-depth at
+    /// HCMConfig construction).
+    #[error("filter pipeline build failed: {0}")]
+    FilterPipeline(#[from] envoy_filter::FilterError),
 }
 
 impl From<std::io::Error> for Http1Error {
