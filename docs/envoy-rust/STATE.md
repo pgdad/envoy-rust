@@ -9,12 +9,12 @@
 
 **id:** `07.1`
 **slug:** `07.1-filter-framework-foundation`
-**directory:** `docs/envoy-rust/phases/07.1-filter-framework-foundation/` exists with `SPEC.md` (the 07.1 sub-phase design contract committed at this parent-07 state-2 split commit). `PLAN.md` does not exist (lands at 07.1's own state-2 standalone-PLAN commit per the 04.3 / 05.1 / 05.4 / 06.1 / 06.2 / 06.3 standardized cadence).
-**status:** phase 07.1 lifecycle **state 2 (SPEC.md exists, PLAN.md does not)** — 07.1's SPEC.md landed at the parent-07 state-2 split commit (predecessor of this corrective fixup; the SPEC.md authoring is the parent-07 state-2 commit's split-coordination work per §6.2 step 3 "Redistribute spec content — each sub-phase gets its own `SPEC.md`"). Per the strict state-machine detection rule in `BOOTSTRAP_PROMPT.md` §5 ("SPEC.md exists, PLAN.md does not → superpowers:writing-plans"), 07.1 enters at **state 2** directly. ROADMAP row `07.1` is `status: planned` as of this commit (will flip to `in-progress` at the next STATE-advance commit when 07.1 lifecycle state advances from 2 to 3 per ROADMAP-schema invariant 3 — same shape as phase-04.1's STATE-advance at `c02eea7` and phase-05.1's STATE-advance at `bfabcb6`). `sub-phases: —` (sub-phase rows are flat per the parent-04 / parent-05 / parent-06 precedent — sub-phases of a sub-phase are not projected, and parent-07 SPEC §6.1 explicitly flags nested splits as suspicious requiring systematic-debugging). Parent ROADMAP row `07` is `status: in-progress` with `sub-phases: 07.1, 07.2`. Row `07.2` is `status: planned`. Phase 07.2 begins only after 07.1's state-6 close-out commit per parent-07 SPEC §5 + ADR-0030's "Sub-phase ordering invariant" rationale.
+**directory:** `docs/envoy-rust/phases/07.1-filter-framework-foundation/` exists with `SPEC.md` (the 07.1 sub-phase design contract; ~985 lines; committed at parent-07 state-2 split commit `6db5a01`) + `PLAN.md` (the standalone PLAN.md; ~2800 lines; committed at THIS state-2 standalone-PLAN commit per the 04.3 / 05.1 / 05.4 / 06.1 / 06.2 / 06.3 standardized cadence). `PROGRESS.md` does not yet exist (lands at Task 1's state-3 commit — divergence from the 06.x cadence where PROGRESS preamble landed at state-2). `REVIEW.md` does not yet exist (lands at state 5).
+**status:** phase 07.1 lifecycle **state 3 (PLAN.md exists, implementation incomplete)** — 07.1's PLAN.md landed at this state-2 standalone-PLAN commit (per the 04.3 / 05.1 / 05.4 / 06.1 / 06.2 / 06.3 standardized cadence). Per the state-machine detection rule in `BOOTSTRAP_PROMPT.md` §5 ("PLAN.md exists, implementation incomplete → superpowers:executing-plans or subagent-driven-development"), 07.1 enters state 3 directly. ROADMAP row `07.1` flips `status: planned` → `status: in-progress` AT THIS COMMIT per the §4.1 invariant 3 ("a phase enters `in-progress` only when STATE.md points at it" — STATE.md now points at phase 07.1 with lifecycle state 3 = implementation, mirrors phase-04.1's STATE-advance at `c02eea7` and phase-05.1's STATE-advance at `bfabcb6`). `sub-phases: —` (sub-phase rows are flat per the parent-04 / parent-05 / parent-06 precedent). Parent ROADMAP row `07` is `status: in-progress` with `sub-phases: 07.1, 07.2`. Row `07.2` is `status: planned`. Phase 07.2 begins only after 07.1's state-6 close-out commit per parent-07 SPEC §5 + ADR-0030's "Sub-phase ordering invariant" rationale.
 
-**Parent-07 state-2 split commit (predecessor `6db5a01`):** landed ADR-0030 (the 2-way split decision per parent SPEC §5 + §7); the two sub-phase SPECs at `docs/envoy-rust/phases/07.1-filter-framework-foundation/SPEC.md` and `docs/envoy-rust/phases/07.2-header-mutation-filter/SPEC.md`; two new ROADMAP rows for `07.1` (depends-on `06`) and `07.2` (depends-on `07.1`), both `status: planned`; parent ROADMAP row `07`'s `sub-phases` column update from `—` to `07.1, 07.2` (row 07's `status` stays `in-progress`); STATE.md advance to point at `07.1`. Mirrors phase-05 state-2 commit `f1804a7` shape (which advanced STATE.md from parent state 2 to sub-phase 05.1 state 2 — "sub-phase SPEC.md exists, PLAN.md does not. Next-skill superpowers:writing-plans scoped to sub-phase 05.1") and phase-04 state-2 commit `1d9740d` shape (which advanced STATE.md from parent state 2 to sub-phase 04.1 state 2 — same routing language). DECISIONS.md ledger head advanced `ADR-0029` → `ADR-0030` at that commit.
+**07.1 state-2 standalone PLAN.md commit (this commit):** landed `docs/envoy-rust/phases/07.1-filter-framework-foundation/PLAN.md` — the standalone PLAN decomposing 07.1 SPEC §3's 9 tasks into per-step TDD checklists (~2800 lines; mirrors the 06.1 `505653d` / 06.3 `3a964cc` standalone-PLAN cadence). 14 SPEC §5 signposts locked at PLAN-write time per architecture-decisions table; recommended posture chosen per the user's standing preference (auto-memory `feedback_pick_recommendation`). ROADMAP row 07.1 flipped `planned` → `in-progress`. STATE.md advanced from `07.1` lifecycle state 2 to `07.1` lifecycle state 3 with next-skill `superpowers:subagent-driven-development` per the user's standing preference (auto-memory `feedback_execution_style` — the inline-`executing-plans` fork is NOT presented at state-3 entry). DECISIONS.md unchanged at **ADR-0030**.
 
-**This commit is a fixup to the parent-07 state-2 split commit `6db5a01`.** The `6db5a01` commit incorrectly advanced STATE.md to "07.1 lifecycle state 1 / next-skill `superpowers:brainstorming`", inconsistent with both (a) the phase-04 / phase-05 state-2 precedents cited above, (b) the literal state-machine detection rule in `BOOTSTRAP_PROMPT.md` §5 (directory + SPEC.md exist → state 2), and (c) the 07.1 sub-phase SPEC's own §8 "State-machine signposts for 07.1's own state-2 session" prescription. This fixup corrects STATE.md to point at 07.1 lifecycle state 2 / next-skill `superpowers:writing-plans` to match the precedent + the state-machine + the 07.1 SPEC's own §8 routing. No other artifacts on disk are touched — DECISIONS.md / ROADMAP.md / sub-phase SPEC.md files remain byte-identical to `6db5a01`.
+**Predecessor commit chain.** `0b3bff0` — `phase 07: state-2 STATE.md fixup — advance to 07.1 lifecycle state 2 / writing-plans` (corrected predecessor `6db5a01`'s incorrect STATE.md routing-to-state-1-brainstorm to point at state-2-writing-plans). `6db5a01` — `phase 07: state-2 split decision + sub-phase SPECs (07.1/07.2) [ADR-0030]` (the parent-07 state-2 split commit; landed ADR-0030 + 2 sub-phase SPECs + 2 ROADMAP rows + parent row sub-phases column update; DECISIONS.md ledger head advanced `ADR-0029` → `ADR-0030`). The split-commit shape mirrors phase-05 state-2 commit `f1804a7` and phase-04 state-2 commit `1d9740d`.
 
 **Parent phase 06 (`06-observability`) is DONE as of commit `b918f33` (the phase-06.3 state-6 close-out, which is also the parent-06 close-out per the ROADMAP-schema invariant "parent flips to `done` only after all sub-phases are `done`"; immediate predecessor of this state-1 commit).** Mirrors phase-05's `82c26b8`-shape close-out (where the 05.3 commit also closed parent-05), phase-04's `e626862`-shape close-out (where the 04.3 commit also closed parent-04), and phase-03's `ca81226`-shape close-out (where the 03.2 commit also closed parent-03). ROADMAP rows `06` and `06.3` both flip `in-progress` → `done` at this commit; rows `06.1` and `06.2` were already `done` from their own state-6 commits earlier in the parent-06 execution. The DECISIONS.md ledger head remains **ADR-0029** (parent-06 split decision; landed at the parent-06 state-1+state-2 combined-recovery commit `1f7661a`; no ADRs landed in 06.1 / 06.2 / 06.3 per the recommended no-foundations-grant posture per parent-06 SPEC §7 honored end-to-end across the entire parent-06 execution arc — counter / gauge primitives + StatsRegistry + Prometheus emitter + admin handler + access-log emitter + ISO-8601 + Gregorian helper + concrete `FileSink` + comprehensive stat wiring all hand-rolled per D-3.2's *Stats subsystem* / *Access log formatters and sinks* / *Admin API* "Must be written from scratch" doctrine).
 
@@ -58,14 +58,14 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` line 21, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 2): the next session — operating as the **07.1 state-2 writing-plans session** — invokes **`superpowers:writing-plans`** scoped to 07.1's surface per the 07.1 sub-phase SPEC at `docs/envoy-rust/phases/07.1-filter-framework-foundation/SPEC.md` (landed at the parent-07 state-2 split commit `6db5a01`).
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` line 23, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 3): the next session — operating as the **07.1 state-3 implementation session** — invokes **`superpowers:subagent-driven-development`** scoped to PLAN Task 1 (`crates/envoy-filter/` scaffold + `FilterError` typed-error enum). Per the user's standing preference (auto-memory `feedback_execution_style`), the inline-`executing-plans` fork is NOT presented at state-3 entry — subagent-driven-development is the default.
 
-The 07.1 sub-phase SPEC exists in-tree at this commit per the parent-07 state-2 split coordination shape (matches the parent-04 / parent-05 / parent-06 precedent — each sub-phase's SPEC.md lands at the parent's state-2 split commit; then each sub-phase enters its own lifecycle at **state 2** directly because the literal state-machine detection rule in `BOOTSTRAP_PROMPT.md` §5 is "SPEC.md exists, PLAN.md does not → state 2 / writing-plans"; no separate sub-phase state-1 brainstorm session exists in the precedent chain). The 07.1 state-2 writing-plans session decomposes 07.1 SPEC §3's 9 tasks into per-step TDD checklists for the standalone PLAN.md commit (mirrors 06.1's `505653d` / 06.2 inline-`d65f04e` / 06.3's `3a964cc` standalone-PLAN cadence). The standalone PLAN.md commit is the ONLY artifact of 07.1's state-2 session per the "one state per session" doctrine.
+The 07.1 PLAN.md (`docs/envoy-rust/phases/07.1-filter-framework-foundation/PLAN.md`) lands at this commit alongside the STATE.md advance and the ROADMAP row 07.1 flip. The PLAN materializes the 9-task decomposition per 07.1 SPEC §3 with per-step TDD checklists; the recommended execution order is **1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9** (Tasks 1-3 build the envoy-filter foundation crate; Task 4 relaxes the envoy-config terminal-router validator; Task 5 lands the H1 5-writer-arm pure refactor; Task 6 layers H1 filter-chain invocation; Task 7 mirrors at H2; Tasks 8-9 materialize the state-4 evidence and advance STATE.md). PROGRESS.md is created at Task 1's commit (NOT at this state-2 commit — divergence from the 06.1/06.2/06.3 cadence where Task 1 was the PROGRESS preamble).
 
-After 07.1 state-2 closes, the per-sub-phase cycle continues:
+After 07.1 state-3 implementation closes (Task 7), the per-sub-phase cycle continues:
 
-1. **07.1 state-3** (subagent-driven-development per the user's standing preference; do NOT present the inline-`executing-plans` fork at state-3 entry) → per-task commits landing the envoy-filter crate scaffold, HCM filter-chain wiring, H1 5-writer-arm refactor, H2 finalize_h2_stream refactor, terminal-router validator, 12-fixture regression-equivalence verification, state-4 evidence anchor.
-2. **07.1 state-4** (verification) → CI evidence anchor + STATE advance to state-4-reached / state-5-next.
+1. **07.1 state-3** (subagent-driven-development; CURRENT next session) → per-task commits landing the envoy-filter crate scaffold (Task 1), FilterPipeline + Decision + iteration loop (Task 2), HttpFilterInstance + RouterTerminus (Task 3), envoy-config terminal-router validator (Task 4), H1 5-writer-arm refactor (Task 5), H1 filter-chain invocation (Task 6), H2 finalize_h2_stream refactor + invocation (Task 7).
+2. **07.1 state-4** (verification; Task 8) → CI evidence anchor with 12 fixtures simultaneously green + h2spec ≥95% + parse_bootstrap fuzz clean; Task 9 advances STATE to state-4-reached / state-5-next.
 3. **07.1 state-5** (review) → REVIEW.md.
 4. **07.1 state-6** (close-out) → STATE.md advances to `07.2 state 2` + ROADMAP row `07.1` flips `in-progress` → `done`.
 
@@ -135,46 +135,39 @@ Execution ordering for parent-06: 06.1 → 06.2 → 06.3 (strict, per parent-06 
 - **State-3 execution skill**: per the user's standing preference (auto-memory `feedback_execution_style`), each sub-phase's state-3 execution uses `superpowers:subagent-driven-development`; do not present the inline-`executing-plans` fork at state-3 entry.
 - **Doctrine reminder**: per `BOOTSTRAP_PROMPT.md` §5.1 ("one state per session; do not chain states"), the 07.1 state-2 standalone PLAN.md commit is the ONLY artifact of that session.
 
-Inputs the 07.1 state-2 writing-plans session should read, in order, before launching the planning work:
+Inputs the 07.1 state-3 subagent-driven-development session should read, in order, before dispatching Task 1's subagent:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
-2. `docs/envoy-rust/STATE.md` (this file — to confirm routing + the active-phase pointer + the parent-07 state-2 split summary above + the fixup note recording the STATE.md correction relative to commit `6db5a01`).
-3. `docs/envoy-rust/ROADMAP.md` (row 07 `in-progress` with sub-phases `07.1, 07.2`; row 07.1 `planned` depends-on 06; row 07.2 `planned` depends-on 07.1; row 08 `planned`).
+2. `docs/envoy-rust/STATE.md` (this file — to confirm routing + the active-phase pointer + the 07.1 state-2 standalone PLAN summary above).
+3. `docs/envoy-rust/ROADMAP.md` (row 07 `in-progress` with sub-phases `07.1, 07.2`; row 07.1 NOW `in-progress` depends-on 06; row 07.2 `planned` depends-on 07.1; row 08 `planned`).
 4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0030`).
 5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (13 stat-name rows + 14 access-log field rows + Prometheus exposition shape divergence subsection; no edits anticipated at 07.1 under recommended posture).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-2 routing per line 21).
-7. **`docs/envoy-rust/phases/07.1-filter-framework-foundation/SPEC.md`** — 07.1's sub-phase SPEC; the design contract that the PLAN.md decomposes into per-step TDD checklists. §3 enumerates 9 tasks across deliverables D1.1-D7.1 (refining parent SPEC §3); §5 lists 14 implementation signposts for the planner; §8 names the state-2 writing-plans cadence.
-8. **`docs/envoy-rust/phases/07-filter-chain-framework/SPEC.md` (parent-07 SPEC; 391 lines)** — for cross-sub-phase architectural invariants (§6) and the 2-way split rationale (§5).
-9. `docs/envoy-rust/phases/07.2-header-mutation-filter/SPEC.md` (07.2's sub-phase SPEC; 07.1 planner may consult for the 07.2-projected schema additions to confirm 07.1's terminal-router validator matches what 07.2 will extend at its own Task 2).
-10. `docs/envoy-rust/phases/06.1-stats-and-admin/PLAN.md` (06.1's standalone PLAN.md commit `505653d`; closest precedent for the 9-task-PLAN cadence at scale; 14 tasks / 4126 lines of plan).
-11. `docs/envoy-rust/phases/06.3-stats-wiring-and-close/PLAN.md` (06.3's standalone PLAN.md commit `3a964cc`; closing-sub-phase PLAN precedent).
-12. `BOOTSTRAP_PROMPT.md` §5 state 2 (writing-plans skill routing) + §6.1 (split policy — the 9-task PLAN should fit under the §6.1 gates with healthy headroom; ~1110 LoC projected per 07.1 SPEC §3 fits under the ~1500 LoC gate).
+6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-3 routing per line 23).
+7. **`docs/envoy-rust/phases/07.1-filter-framework-foundation/PLAN.md`** — 07.1's standalone PLAN.md; the per-step TDD checklist landing 9 tasks. **Required reading at the start of each task** — each task section is self-contained and bite-sized per the writing-plans skill cadence.
+8. **`docs/envoy-rust/phases/07.1-filter-framework-foundation/SPEC.md`** — 07.1's sub-phase SPEC; the design contract that the PLAN.md decomposes. Consult §3 for per-task references, §5 for the 14 signpost decisions (locked at PLAN-write time in PLAN's architecture-decisions table).
+9. **`docs/envoy-rust/phases/07-filter-chain-framework/SPEC.md` (parent-07 SPEC; 391 lines)** — for cross-sub-phase architectural invariants (§6) and the 2-way split rationale (§5).
+10. `docs/envoy-rust/phases/07.2-header-mutation-filter/SPEC.md` (07.2's sub-phase SPEC; the 07.1 executor may consult for the 07.2-projected HeaderMutation schema to confirm 07.1's terminal-router validator matches what 07.2 will extend at its own Task 2).
+11. `BOOTSTRAP_PROMPT.md` §5 state 3 (executing-plans skill routing) + §7 (differential test contract).
 
 ## Last commit
 
-Parent-07 state-2 split commit (this commit): `phase 07: state-2 split decision + sub-phase SPECs (07.1/07.2) [ADR-0030]`.
+07.1 state-2 standalone PLAN.md commit (this commit): `phase 07.1: state-2 standalone PLAN.md (9 tasks; ~1110 LoC projected)`.
 
-Doc-only commit; no code changes; no test runs. Touches five files:
+Doc-only commit; no code changes; no test runs. Touches three files:
 
-- `docs/envoy-rust/DECISIONS.md` — appends ADR-0030 (the parent-07 2-way split decision). Mirrors ADR-0013 / ADR-0017 / ADR-0020 / ADR-0022 / ADR-0029 in shape and provenance discipline. Ledger head advances `ADR-0029` → `ADR-0030`.
-- `docs/envoy-rust/phases/07.1-filter-framework-foundation/SPEC.md` (NEW; the 07.1 sub-phase SPEC; ~9-task per-deliverable cadence refining parent SPEC §3 D1.1-D7.1).
-- `docs/envoy-rust/phases/07.2-header-mutation-filter/SPEC.md` (NEW; the 07.2 sub-phase SPEC; ~10-task per-deliverable cadence refining parent SPEC §3 D8.2-D15.2 + parent-07 close-out posture).
-- `docs/envoy-rust/ROADMAP.md` — two new rows for `07.1` (depends-on `06`, `status: planned`, `sub-phases: —`) and `07.2` (depends-on `07.1`, `status: planned`, `sub-phases: —`) inserted after row `07`. Parent row `07`'s `sub-phases` column updates from `—` to `07.1, 07.2` (row 07's `status` stays `in-progress`).
-- `docs/envoy-rust/STATE.md` (this file) — rewrites the Active-phase / Next-expected-skill / Standing-context / Inputs / Last-commit / Last-updated sections; replaces the "Phase-07 state-1 brainstorm summary" block (predecessor commit `7337f2c`) with the "Phase-07 state-2 split decision summary" block above. Preserves the Notes section verbatim per the parent-05 state-2 commit `f1804a7` precedent.
+- `docs/envoy-rust/phases/07.1-filter-framework-foundation/PLAN.md` (NEW; ~2800 lines; the standalone PLAN decomposing 07.1 SPEC §3's 9 tasks into per-step TDD checklists). Mirrors 06.1 `505653d` (4126 lines, 14 tasks) + 06.2 `dc00750` + 06.3 `3a964cc` standalone-PLAN cadence; the 14 SPEC §5 signposts lock at PLAN-write time in the architecture-decisions table per the user's standing preference auto-memory `feedback_pick_recommendation`.
+- `docs/envoy-rust/ROADMAP.md` — flips row `07.1` `status: planned` → `status: in-progress` (single-cell edit per §4.1 invariant 3 + 04.1 `c02eea7` / 05.1 `bfabcb6` precedents). Parent row `07` unchanged (stays `in-progress`).
+- `docs/envoy-rust/STATE.md` (this file) — advances active-phase from `07.1` lifecycle state 2 → `07.1` lifecycle state 3; next-skill `superpowers:writing-plans` → `superpowers:subagent-driven-development` per the user's standing preference auto-memory `feedback_execution_style` (the inline-`executing-plans` fork is NOT presented at state-3 entry). Rewrites Active-phase / Next-expected-skill / Inputs / Last-commit / Last-updated sections; preserves all "Phase-NN rollovers" sections verbatim.
 
-Mirrors phase 05's `f1804a7` state-2 commit shape (`phase 05: state-2 — ADR-0022 + 3 sub-phase SPECs + 3 ROADMAP rows + STATE advance`) and phase 04's `1d9740d` state-2 commit shape (`phase 04: state-2 — ADR-0020 + 3 sub-phase SPECs + 3 ROADMAP rows + STATE advance`). Parent-06's state-2 was combined with state-1 in a single recovery commit `1f7661a` per `BOOTSTRAP_PROMPT.md` §1 Step E systematic-debugging recovery disposition — parent-07's state-2 follows the cleaner pure-state-2 cadence of parent-04 / parent-05.
+DECISIONS.md unchanged at **ADR-0030** (no new ADR projected per 07.1 SPEC §7 + parent-07 SPEC §7's recommended posture). The PLAN's architecture-decisions table records "recommended posture for new ADRs: none in phase 07" verbatim.
 
-The commit title carries the `[ADR-0030]` tag per `BOOTSTRAP_PROMPT.md` §5.3. No `Differential surface` / `Conformance` lines (those belong to state-6 commits per `BOOTSTRAP_PROMPT.md` §5.3; state-2 commits are doc-and-ADR-only).
+The commit title carries no `[ADR-NNNN]` tag per `BOOTSTRAP_PROMPT.md` §5.3 (no ADRs landed at this commit). No `Differential surface` / `Conformance` lines (those belong to state-6 commits; state-2 commits are doc-only).
 
-**Recovery note on the prior partial worktree state.** Entering this session, the worktree carried:
-- An unstaged ADR-0030 append in `DECISIONS.md` (from a prior aborted session that exited before the state-2 commit landed).
-- Two empty sub-phase directories (`docs/envoy-rust/phases/07.1-filter-framework-foundation/` + `docs/envoy-rust/phases/07.2-header-mutation-filter/`) — also from the prior aborted session.
+**Predecessor commit chain (parent-06 close + parent-07 state-1+state-2 + parent-05 close, for cold-start cross-reference):**
 
-The ADR-0030 content was substantively correct (date 2026-05-12; mirrors ADR-0029's structure; correct ledger-head provenance citing ADR-0029 at predecessor `1f7661a`; correct parent-07 SPEC §5 + §6 + §7 references; correct LoC drift calculus; correct 5-option enumeration with the chosen 2-way split rationale) and was kept at this commit. The empty directories were populated with their SPEC.md files at this commit. No `superpowers:systematic-debugging` invocation per `BOOTSTRAP_PROMPT.md` §1 Step E because the partial worktree matched the prescribed state-2 work exactly — a normal recovery cadence rather than a corrupted state.
-
-**Predecessor commit chain (parent-06 close + parent-07 state-1 + parent-05 close, for cold-start cross-reference):**
-
-- `7337f2c` — `phase 07: state-1 brainstorm — parent SPEC.md projecting 2-way split (07.1/07.2)` (parent-07 state-1 close-out; immediate predecessor of this state-2 commit; the doc-only commit landing the parent-07 SPEC.md and advancing STATE.md to phase 07 state 2).
+- `0b3bff0` — `phase 07: state-2 STATE.md fixup — advance to 07.1 lifecycle state 2 / writing-plans` (immediate predecessor; corrected the parent-07 state-2 split commit's STATE.md routing).
+- `6db5a01` — `phase 07: state-2 split decision + sub-phase SPECs (07.1/07.2) [ADR-0030]` (parent-07 state-2 split; landed ADR-0030 + 2 sub-phase SPECs + 2 ROADMAP rows + parent-row sub-phases column update; ledger head advance ADR-0029 → ADR-0030).
+- `7337f2c` — `phase 07: state-1 brainstorm — parent SPEC.md projecting 2-way split (07.1/07.2)` (parent-07 state-1 close-out).
 - `b918f33` — `phase 06.3: comprehensive stats wiring + 05.3 I1 closure + parent-06 close [parent 06 done] [ADR-0029]` (parent-06 close-out).
 - `e9c1828` — `phase 06.3: state 5 REVIEW.md Approved with M-track follow-ups` (06.3 state-5; CI evidence anchor — CI run `25731958773` HEAD `e9c1828`, conclusion `success`, completed `2026-05-12T11:40:24Z`).
 - `42fc726` — `phase 06.3: advance STATE.md to state-4-reached / state-5-next (task 12 follow-up)` (06.3 STATE advance).
@@ -189,81 +182,37 @@ The ADR-0030 content was substantively correct (date 2026-05-12; mirrors ADR-002
 
 ## Last updated
 
-2026-05-12 (STATE.md fixup commit on top of the parent-07 state-2 split
-commit `6db5a01`; corrects STATE.md's active-phase pointer from "07.1
-lifecycle state 1 / next-skill `superpowers:brainstorming`" — which was
-inconsistent with the phase-04 / phase-05 state-2 precedents + the
-literal state-machine detection rule + the 07.1 SPEC §8 prescription
-— to **"07.1 lifecycle state 2 / next-skill `superpowers:writing-plans`"**.
-The fixup touches STATE.md only; DECISIONS.md / ROADMAP.md / sub-phase
-SPEC.md files remain byte-identical to commit `6db5a01`.
-
-Parent-07 state-2 split commit `6db5a01` (predecessor of this fixup)
-landed ADR-0030 + the two sub-phase SPECs + ROADMAP rows for 07.1 +
-07.2 + STATE.md advance. The parent-07 state-2 split decision rationale,
-sub-phase scope summaries, and architectural invariants are codified
-in DECISIONS.md ADR-0030 and the sub-phase SPECs).
-
-Next-skill advances from **`superpowers:writing-plans`** scoped to the
-parent-07 SPEC (the parent-07 state-2 session's scope — its input
-artifact, the parent-07 SPEC) to **`superpowers:writing-plans`** scoped
-to the 07.1 sub-phase SPEC (the next session's scope per `SKILL_ROUTING.md`
-line 21 / `BOOTSTRAP_PROMPT.md` §5 state 2). The 07.1 state-2 writing-plans
-session is fresh per `BOOTSTRAP_PROMPT.md` §5.1 "one state per session" —
-this fixup commit does NOT chain into 07.1 state 2. Note: the skill
-name is the same as the parent-07 state-2 session's, but the scope
-narrows from parent-07 SPEC to 07.1 sub-phase SPEC. The session output
-is 07.1's standalone PLAN.md commit per the 06.x cadence.
-
-ROADMAP changes at this commit: row `07`'s `sub-phases` column flips
-`—` → `07.1, 07.2` (row 07's `status` stays `in-progress`). New rows
-`07.1` (depends-on `06`, `status: planned`, `sub-phases: —`, summary
-"no new fixture; regression-equivalence proven via all 12 existing
-fixtures (0001-0012) green simultaneously at Docker-gated CI; framework
-crate + HCM integration land as the foundation slice") and `07.2`
-(depends-on `07.1`, `status: planned`, `sub-phases: —`, summary
-"fixture 0013-http-filter-header-mutation green; HeaderMutation
-bilaterally verified on decode + encode; parent phase 07 flips done"). 07.1 and 07.2 ship strictly in order (07.1 → 07.2) per
-parent-07 SPEC §5 + ADR-0030's "Sub-phase ordering invariant".
-
-DECISIONS.md ledger head advances **ADR-0029** → **ADR-0030** at this
-commit (the parent-07 2-way split decision; mirrors ADR-0013 /
-ADR-0017 / ADR-0020 / ADR-0022 / ADR-0029 shape). Conditional ADR-0031
-(foundations grant for `async_trait` or similar) and conditional
-ADR-0032 (Cargo.lock cadence ratification, conditional on ADR-0031
-actually landing) projected at parent-07 SPEC §7 are NOT pre-committed;
-numbers stay reserved-available for 07.1 / 07.2 execution-time
-landings per D-3.5 if surfaced as essential, or for later phases if
-unused (mirrors parent-06's conditional-ADR-0030 / ADR-0031 staying
-available — both were not landed during 06.1 / 06.2 / 06.3, and the
-numbers were released for parent-07's split decision to take ADR-0030
-as the next-sequential available number).
+2026-05-12 (07.1 state-2 standalone PLAN.md commit; advances STATE.md
+active-phase pointer from "07.1 lifecycle state 2 / next-skill
+`superpowers:writing-plans`" to "07.1 lifecycle state 3 / next-skill
+`superpowers:subagent-driven-development`"; flips ROADMAP row 07.1 to
+`in-progress`. DECISIONS.md unchanged at ADR-0030. Doc-only commit; no
+code changes; no test runs.
 
 The state-4 phase-done gate evidence anchor for the trailing fixture
 inventory (CI run `25731958773` at HEAD `e9c1828`, conclusion
 `success`, completed `2026-05-12T11:40:24Z`, all six §7.5 gates GREEN —
 12 Docker-gated fixtures `0001-0012` + h2spec ≥95% + `parse_bootstrap`
 fuzz clean + all 5 stable-toolchain gates) carries forward unchanged —
-this state-2 split commit is doc-only and does not modify production
-code, fixtures, or workspace dependencies. Phase 07.1 verifies
-regression-equivalence on the existing 12-fixture inventory at its own
-state-4 gate; phase 07.2 lands the first new fixture
-(`0013-http-filter-header-mutation`).
+this state-2 standalone-PLAN commit is doc-only and does not modify
+production code, fixtures, or workspace dependencies. Phase 07.1
+verifies regression-equivalence on the existing 12-fixture inventory at
+its own state-4 gate (Task 8 of PLAN.md); phase 07.2 lands the first
+new fixture (`0013-http-filter-header-mutation`).
 
-The "Phase-07 state-2 split decision summary" block above (under
-"Next expected skill") was authored at the parent-07 state-2 split
-commit `6db5a01`, replacing the "Phase-07 state-1 brainstorm summary"
-block (which was authored at the parent-07 state-1 close-out commit
-`7337f2c`). The summary block records the ADR-0030 split decision
-rationale, the two sub-phase scope summaries, the 10 cross-sub-phase
-architectural invariants from parent SPEC §6, the DECISIONS.md ledger
-head advance, the BEHAVIOR_CONTRACT.md unchanged status, and the
-recovery-cadence note on the prior partial worktree state. The
-summary block content is unchanged at this fixup commit. Does NOT add
-a "Phase-07 state-2 rollovers" subsection under Notes — state-2 split
-commits carry no REVIEW.md and no review-driven carryforward
-dispositions; the next REVIEW.md disposition that lands carryforwards
-is each sub-phase's state-5 commit (07.1 first, then 07.2).
+Conditional ADR-0031 (foundations grant for `async_trait` or similar)
+and conditional ADR-0032 (Cargo.lock cadence ratification, conditional
+on ADR-0031 actually landing) projected at parent-07 SPEC §7 stay
+reserved-available; recommended posture per parent-07 SPEC §7 + 07.1
+SPEC §7 is no foundations grants in phase 07. The PLAN's
+architecture-decisions table (signpost 17) locks "no new ADRs" at
+PLAN-write time per the user's standing preference auto-memory
+`feedback_pick_recommendation`.
+
+Does NOT add a "Phase-07.1 state-2 rollovers" subsection under Notes —
+state-2 standalone-PLAN commits carry no REVIEW.md and no review-driven
+carryforward dispositions; the next REVIEW.md disposition that lands
+carryforwards is 07.1's own state-5 commit at the end of 07.1 execution.
 
 ## Notes
 
