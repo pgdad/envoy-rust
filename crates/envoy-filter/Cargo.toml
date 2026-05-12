@@ -1,0 +1,14 @@
+[package]
+name = "envoy-filter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+envoy-config = { path = "../envoy-config" }
+envoy-http1 = { path = "../envoy-http1" }
+
+[dev-dependencies]

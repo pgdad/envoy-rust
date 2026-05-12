@@ -394,6 +394,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "envoy-filter"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "envoy-config",
+ "envoy-http1",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "envoy-http1"
 version = "0.0.0"
 dependencies = [
