@@ -592,3 +592,130 @@ in-process backstops at `crates/envoy-bin/tests/http1_*.rs`).
 - `cargo deny check`: no-op (envoy-filter is a workspace path-dep; no new top-level Cargo deps).
 
 Docker-gated bilateral attestation deferred to Task 8 (state-4 anchor).
+
+## Task 7 — H2 HCM `finalize_h2_stream` refactor + filter-chain invocation
+
+### Work summary
+
+Symmetric to Task 6 at H2. Adds `envoy-filter` as a path-dep of
+`envoy-http2`. Adds private `H2RequestPath { Match(BuildOutcome),
+SynthFromDecode(Response) }` enum at module scope per signpost 10 (the
+two HCMs hold separate dispatch types rather than a unified one at the
+framework layer).
+
+`handle_one_stream` wires decode-side filter invocation: after
+`http_to_envoy_request(h2_req)` translates the H2 HEADERS frame to
+`envoy_http1::codec::Request`, clones the pipeline and runs boundary
+conversion (`envoy_http1::codec::Request` ↔ `envoy_filter::FilterRequest`
+via `mem::take`) then `pipeline.decode_headers(&mut filter_req)`. Write-
+back happens before `build_response`. On `Decision::Continue`: dispatch
+to `build_response` per 05.2 D3, wrap in `H2RequestPath::Match`. On
+`Decision::StopAndSend(filter_resp)`: convert FilterResponse → codec-
+native Response, wrap in `H2RequestPath::SynthFromDecode`. The existing
+`match outcome` writer block is wrapped inside
+`H2RequestPath::Match(outcome) => match outcome { ... }` with the new
+`H2RequestPath::SynthFromDecode(r)` arm populating the per-stream
+access-log locals and returning `r`.
+
+`finalize_h2_stream` gains `pipeline: &mut envoy_filter::FilterPipeline`
+parameter (per signpost 6); `resp` parameter changes from `Response` to
+`mut resp: Response`; encode-side filter invocation lands BEFORE
+`send_envoy_response` so the per-class HCM counter site (06.3 D15.3.a)
++ access-log dispatch (06.2) read post-encode response state. The 3
+pre-encode log-local parameters (`response_status_for_log`,
+`response_body_len`, `response_headers_for_log`) are prefixed `_` in
+the signature (silences the parameter-unused warning under `-D warnings`)
+and the function body shadows them with post-encode locals derived from
+`resp` (`resp.status`, `resp.body.len() as u64`, and a
+`Vec<(String, String)>` owned by a local then re-borrowed as
+`&[(String, String)]` to preserve the slice contract for the
+access-log dispatch site).
+
+All 3 callers of `finalize_h2_stream` inside `crates/envoy-http2/src/
+hcm.rs` (2 nested early-returns inside the Proxy arm at the picker-None
+and upstream-dispatch-failure branches, plus the trailing call below
+the writer match) update to pass `&mut pipeline` as the 2nd argument.
+
+### Tests landed
+
+NO new tests at 07.1 scope per signpost 12 recommended posture. The
+existing in-process backstop tests at
+`crates/envoy-bin/tests/http2_direct_response.rs` (05.2 D9) and
+`crates/envoy-bin/tests/http2_router_upstream.rs` (05.3 D11) provide
+the integration-level regression-equivalence proof under the Router-
+only chain. Tests 1-4 (filter-instrumented invocation semantics at H2 —
+request mutation visible to route-match, response mutation visible to
+wire, StopAndSend short-circuit on both sides) deferred to 07.2 Task 5
+per signpost 12.
+
+### LoC delta
+
+Note: `cargo fmt` re-indented the inner `match outcome { ... }` block
+4 spaces deeper after the outer `H2RequestPath::Match(outcome) => match
+outcome { ... }` wrap was inserted. The whitespace-only re-flow accounts
+for the bulk of the diff; the logical edits are localized.
+
+| File | LoC delta |
+|---|---|
+| `crates/envoy-http2/Cargo.toml` (envoy-filter dep) | +1 |
+| `crates/envoy-http2/src/hcm.rs` (H2RequestPath enum + decode boundary + outer match wrap incl. fmt reflow + SynthFromDecode arm + finalize_h2_stream signature + encode boundary + log-local shadowing + 3 caller updates) | +318 / −190 |
+| `docs/envoy-rust/phases/07.1-filter-framework-foundation/PROGRESS.md` (Task 7 entry) | ~+90 |
+| **Total** | **~+410** (whitespace-only reflow dominates) |
+
+### Deviations from PLAN
+
+**Deviation 1 (PLAN.md:2262 — H2RequestPath payload type):** PLAN said
+`SynthFromDecode(envoy_http1::codec::Response)`. With Task 5.5,
+`Decision::StopAndSend(FilterResponse)` produces a `FilterResponse`.
+Converted to codec-native `Response` at the decode-side site so
+`H2RequestPath::SynthFromDecode` carries the codec-native type the
+existing writer-match block already produces.
+
+**Deviation 2 (PLAN.md:2279 — decode boundary):** PLAN said
+`pipeline.decode_headers(&mut envoy_req)`. With Task 5.5 types,
+`envoy_req` is `envoy_http1::codec::Request` (not `FilterRequest`).
+Boundary conversion via `mem::take` + write-back, same shape as Task 6
+at envoy-http1. `envoy_req` is shadowed `let mut envoy_req = ...?;` so
+the write-back lands in the existing binding.
+
+**Deviation 3 (PLAN.md:2321 — encode boundary):** PLAN said
+`pipeline.encode_headers(&mut resp)`. Same boundary-conversion fix as
+Deviation 2 but on the response side, inside `finalize_h2_stream`. The
+`Decision::Continue` arm writes the FilterResponse fields back; the
+`Decision::StopAndSend` arm replaces `resp` entirely.
+
+**Deviation 4 (PLAN.md:2326-2334 — post-encode log-local shadowing
+under `-D warnings`):** The pre-encode log-local parameters
+(`response_status_for_log`, `response_body_len`,
+`response_headers_for_log`) must be shadowed with post-encode values
+so the 06.3 D15.3.a per-class counter site + 06.2 access-log dispatch
+site read post-encode response state. A naive `let response_status_for_log =
+resp.status;` body shadow leaves the SIGNATURE parameter unused,
+triggering `unused_variables` warnings that `-D warnings` upgrades to
+errors. Fix: prefix the 3 parameters with `_` in the signature
+(`_response_status_for_log: u16` etc.) and add fresh `let
+response_status_for_log: u16 = resp.status;` bindings post-encode. The
+slice contract for the access-log dispatch (which expects
+`&[(String, String)]`) is preserved by binding an owned
+`Vec<(String, String)>` then re-borrowing as a slice.
+
+**Deviation 5 (PLAN.md:2218 — Cargo.toml dep transitivity):** PLAN's
+parenthetical "if not already pulled transitively via envoy-http1"
+was misleading. Rust requires a direct `[dependencies]` declaration to
+`use` types from a crate even when a direct dep already depends on the
+target crate. Added
+`envoy-filter = { path = "../envoy-filter" }` to
+`crates/envoy-http2/Cargo.toml` alphabetically between `envoy-config`
+and `envoy-listener`.
+
+### Test-bucket attestation
+
+- `cargo test -p envoy-http2`: PASS — `test result: ok. 38 passed; 0 failed; 1 ignored` (unchanged vs Task 6 baseline; no new tests at 07.1 per signpost 12).
+- `cargo test --workspace`: PASS — `passed: 551 failed: 0 ignored: 2` (sum across all per-suite `test result: ok.` lines; unchanged from Task 6's baseline).
+- `cargo test -p envoy-bin --test http2_direct_response --test http2_router_upstream`: PASS — both in-process H2 backstops pass under the Router-only chain (regression-equivalence proof).
+- `cargo build --workspace --all-targets`: clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- `cargo deny check`: no-op (envoy-filter is a workspace path-dep, no new top-level Cargo deps).
+
+Docker-gated bilateral attestation deferred to Task 8 (state-4 anchor).

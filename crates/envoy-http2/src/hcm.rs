@@ -85,6 +85,24 @@ async fn serve_h2_connection(
     Ok(())
 }
 
+/// Per-stream dispatch path (H2 mirror of envoy-http1's `RequestPath`,
+/// landed at Task 6 via commit `84d68c1`). Per signpost 10 the two HCMs
+/// hold separate types rather than a unified one at the framework layer.
+///
+/// `Match` — the H2 stream's translated request went through
+/// `pipeline.decode_headers` and hit the writer-arm path via
+/// `build_response`.
+///
+/// `SynthFromDecode` — a decode-side filter short-circuited the request
+/// with `StopAndSend`; the response goes directly to `finalize_h2_stream`.
+/// Unreachable under the Router-only 07.1 chain; lit by 07.2's
+/// HeaderMutation.
+#[allow(dead_code)] // SynthFromDecode unused under 07.1 Router-only chain; 07.2 lights it up.
+enum H2RequestPath {
+    Match(BuildOutcome),
+    SynthFromDecode(Response),
+}
+
 async fn handle_one_stream(
     config: Arc<HCMConfig>,
     req: http::Request<h2::RecvStream>,
@@ -120,11 +138,50 @@ async fn handle_one_stream(
     let req_with_body = http::Request::from_parts(parts, body_bytes.freeze());
 
     // Translate H2 request → envoy Request value-type.
-    let envoy_req = http_to_envoy_request(req_with_body)?;
+    let mut envoy_req = http_to_envoy_request(req_with_body)?;
+
+    // 07.1 Task 7: decode-side filter invocation. Clone the pipeline
+    // per-stream (cheap at 07.1; structural for 07.2's HeaderMutation
+    // per-stream cloning per ADR-0031). Boundary conversion
+    // `envoy_http1::codec::Request` ↔ `envoy_filter::FilterRequest` via
+    // `mem::take` + write-back (same shape as Task 6 at envoy-http1).
+    let mut pipeline = (*config.filter_pipeline).clone();
+    let mut filter_req = envoy_filter::FilterRequest {
+        method: std::mem::take(&mut envoy_req.method),
+        path: std::mem::take(&mut envoy_req.path),
+        headers: std::mem::take(&mut envoy_req.headers),
+        body: envoy_req.body.take(),
+    };
+    let decode_decision = pipeline.decode_headers(&mut filter_req);
+    // Write back the (possibly mutated) fields. Codec-state fields
+    // (`version`, `bytes_consumed`) stay on envoy_req unchanged per
+    // ADR-0031.
+    envoy_req.method = filter_req.method;
+    envoy_req.path = filter_req.path;
+    envoy_req.headers = filter_req.headers;
+    envoy_req.body = filter_req.body;
 
     // Hand to the existing 04.x route-walk. close=false because H2 has its
     // own connection lifecycle; the close flag is only meaningful for H1.
-    let outcome = build_response(&config, &envoy_req, /* close = */ false);
+    // On `Continue`: dispatch to `build_response` and wrap in
+    // `H2RequestPath::Match`. On `StopAndSend(filter_resp)`: convert
+    // FilterResponse → codec-native Response, wrap in
+    // `H2RequestPath::SynthFromDecode`.
+    let request_path = match decode_decision {
+        envoy_filter::Decision::Continue => {
+            H2RequestPath::Match(build_response(
+                &config, &envoy_req, /* close = */ false,
+            ))
+        }
+        envoy_filter::Decision::StopAndSend(filter_resp) => {
+            H2RequestPath::SynthFromDecode(Response {
+                status: filter_resp.status,
+                reason: filter_resp.reason,
+                headers: filter_resp.headers,
+                body: filter_resp.body,
+            })
+        }
+    };
 
     // 06.2 Task 7: per-stream access-log state. Populated below as the
     // build/proxy dispatch resolves the final downstream response. The
@@ -136,207 +193,221 @@ async fn handle_one_stream(
     let response_headers_for_log: Vec<(String, String)>;
     let mut upstream_host_for_log_h2: Option<String> = None;
 
-    let resp: Response = match outcome {
-        BuildOutcome::Synth(r) => {
+    let resp: Response = match request_path {
+        H2RequestPath::Match(outcome) => match outcome {
+            BuildOutcome::Synth(r) => {
+                response_status_for_log = r.status;
+                response_body_len = r.body.len() as u64;
+                response_headers_for_log = r.headers.clone();
+                r
+            }
+            BuildOutcome::Proxy {
+                cluster: cluster_name,
+            } => {
+                // SPEC §3 D4 H2-side: symmetric H1-or-H2 dispatch keyed on
+                // cluster.upstream_protocol(). The validator ensures every cluster
+                // name referenced from a RouteAction::Route exists in the
+                // bootstrap; the .expect() is defense-in-depth (mirrors
+                // envoy-http1/src/hcm.rs:215-218).
+                let cluster = config
+                    .cluster_mgr
+                    .get(&cluster_name)
+                    .expect("validator ensures cluster present");
+
+                let endpoint = match cluster.pick_endpoint() {
+                    Some(e) => e,
+                    None => {
+                        tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
+                        let r = synth_h2_502();
+                        response_status_for_log = r.status;
+                        response_body_len = r.body.len() as u64;
+                        response_headers_for_log = r.headers.clone();
+                        // Funnel through the unified send + access-log
+                        // dispatch site at the bottom of handle_one_stream.
+                        return finalize_h2_stream(
+                            &config,
+                            &mut pipeline,
+                            send_response,
+                            r,
+                            req_arrival_instant,
+                            req_arrival_systime,
+                            &envoy_req,
+                            request_body_len,
+                            response_status_for_log,
+                            response_body_len,
+                            &response_headers_for_log,
+                            upstream_host_for_log_h2,
+                        )
+                        .await;
+                    }
+                };
+
+                // 06.2 Task 7: capture the resolved upstream endpoint
+                // for the access-log `%UPSTREAM_HOST%` token.
+                upstream_host_for_log_h2 = Some(endpoint.to_string());
+
+                // Extract Host: from the synthesized envoy_req.
+                // http_to_envoy_request always synthesizes host from
+                // :authority at the bottom of headers (per SPEC §6
+                // signpost 12 + request.rs line 74), so the .expect()
+                // is effectively infallible here.
+                let host_header = envoy_req
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+                    .map(|(_, v)| v.clone())
+                    .expect("http_to_envoy_request always synthesizes Host from :authority");
+
+                // Build the outbound request: strip H1 hop-by-hop headers
+                // (Connection, Transfer-Encoding) mirroring
+                // envoy-http1/src/hcm.rs:244-248.
+                let mut out_headers = envoy_req.headers.clone();
+                out_headers.retain(|(n, _)| {
+                    !n.eq_ignore_ascii_case("connection")
+                        && !n.eq_ignore_ascii_case("transfer-encoding")
+                });
+                let out_req = envoy_http1::codec::Request {
+                    method: envoy_req.method.clone(),
+                    path: envoy_req.path.clone(),
+                    version: envoy_http1::codec::HttpVersion::Http11,
+                    headers: out_headers,
+                    bytes_consumed: 0,
+                    body: envoy_req.body.clone(),
+                };
+
+                // 06.3 D15.3.b: RAII guard increments
+                // `cluster.<name>.upstream_cx_active` before either protocol arm
+                // connects and decrements via Drop at scope exit, covering both
+                // success and error close paths uniformly. A single guard covers
+                // both the H1 and H2 arms of the match below.
+                let _cx_guard = cluster.cx_active_guard();
+
+                let start = Instant::now();
+                let upstream_resp_result = match cluster.upstream_protocol() {
+                    envoy_cluster::UpstreamProtocol::Http1 => {
+                        match envoy_http1::Client::connect(endpoint, &host_header).await {
+                            Ok(mut s) => {
+                                // 06.1 D4.b: per-cluster upstream_cx_total
+                                // increment on successful upstream H1 connect
+                                // (mirrors envoy-http1::serve_connection's
+                                // proxy arm).
+                                cluster.cx_total().inc();
+                                s.send_request(out_req).await.map_err(|e| format!("{e}"))
+                            }
+                            Err(e) => Err(format!("{e}")),
+                        }
+                    }
+                    envoy_cluster::UpstreamProtocol::Http2 => {
+                        match crate::Client::connect(endpoint, &host_header).await {
+                            Ok(mut s) => {
+                                // 06.1 D4.b: per-cluster upstream_cx_total
+                                // increment on successful upstream H2 connect.
+                                cluster.cx_total().inc();
+                                s.send_request(out_req).await.map_err(|e| format!("{e}"))
+                            }
+                            Err(e) => Err(format!("{e}")),
+                        }
+                    }
+                };
+
+                let upstream_resp = match upstream_resp_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
+                        let r = synth_h2_502();
+                        response_status_for_log = r.status;
+                        response_body_len = r.body.len() as u64;
+                        response_headers_for_log = r.headers.clone();
+                        // Funnel through the unified send + access-log
+                        // dispatch site at the bottom of handle_one_stream.
+                        return finalize_h2_stream(
+                            &config,
+                            &mut pipeline,
+                            send_response,
+                            r,
+                            req_arrival_instant,
+                            req_arrival_systime,
+                            &envoy_req,
+                            request_body_len,
+                            response_status_for_log,
+                            response_body_len,
+                            &response_headers_for_log,
+                            upstream_host_for_log_h2,
+                        )
+                        .await;
+                    }
+                };
+
+                // 06.3 D15.3.c: per PLAN-write SPEC correction 3, the H2 router-arm
+                // does NOT call write_proxied_response (it builds the downstream
+                // Response inline below). Inline 2-line increments parallel the H1
+                // path. Both fire on the success arm only (the Err arm returned via
+                // finalize_h2_stream above).
+                cluster.upstream_rq_total().inc();
+                if upstream_resp.status / 100 == 5 {
+                    cluster.upstream_rq_5xx().inc();
+                }
+
+                // Build the downstream response: mirror envoy-http1::router::
+                // write_proxied_response's header policy — replace upstream
+                // `server` with `server: envoy-rust`; replace or inject `date`
+                // with a fresh IMF-fixdate; append x-envoy-upstream-service-time.
+                // The H2 forbidden hop-by-hop headers (connection, transfer-encoding,
+                // etc.) are stripped later by build_http_response in response.rs.
+                let elapsed_ms = start.elapsed().as_millis();
+                let now_date = envoy_http1::date::format_imf_fixdate(SystemTime::now());
+                let mut headers: Vec<(String, String)> =
+                    Vec::with_capacity(upstream_resp.headers.len() + 3);
+                let mut saw_server = false;
+                let mut saw_date = false;
+                for (name, value) in upstream_resp.headers.into_iter() {
+                    let lc = name.to_ascii_lowercase();
+                    if lc == "server" {
+                        saw_server = true;
+                        headers.push(("server".to_string(), "envoy-rust".to_string()));
+                    } else if lc == "date" {
+                        saw_date = true;
+                        headers.push(("date".to_string(), now_date.clone()));
+                    } else {
+                        headers.push((lc, value));
+                    }
+                }
+                if !saw_server {
+                    headers.push(("server".to_string(), "envoy-rust".to_string()));
+                }
+                if !saw_date {
+                    headers.push(("date".to_string(), now_date));
+                }
+                headers.push((
+                    "x-envoy-upstream-service-time".to_string(),
+                    elapsed_ms.to_string(),
+                ));
+                let proxy_resp = Response {
+                    status: upstream_resp.status,
+                    reason: upstream_resp.reason,
+                    headers,
+                    body: upstream_resp.body,
+                };
+                response_status_for_log = proxy_resp.status;
+                response_body_len = proxy_resp.body.len() as u64;
+                response_headers_for_log = proxy_resp.headers.clone();
+                proxy_resp
+            }
+        },
+        H2RequestPath::SynthFromDecode(r) => {
+            // 07.1 Task 7: decode-side filter short-circuit. Unreachable
+            // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation.
+            // `upstream_host_for_log_h2` stays None (no proxy attempt).
             response_status_for_log = r.status;
             response_body_len = r.body.len() as u64;
             response_headers_for_log = r.headers.clone();
             r
         }
-        BuildOutcome::Proxy {
-            cluster: cluster_name,
-        } => {
-            // SPEC §3 D4 H2-side: symmetric H1-or-H2 dispatch keyed on
-            // cluster.upstream_protocol(). The validator ensures every cluster
-            // name referenced from a RouteAction::Route exists in the
-            // bootstrap; the .expect() is defense-in-depth (mirrors
-            // envoy-http1/src/hcm.rs:215-218).
-            let cluster = config
-                .cluster_mgr
-                .get(&cluster_name)
-                .expect("validator ensures cluster present");
-
-            let endpoint = match cluster.pick_endpoint() {
-                Some(e) => e,
-                None => {
-                    tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
-                    let r = synth_h2_502();
-                    response_status_for_log = r.status;
-                    response_body_len = r.body.len() as u64;
-                    response_headers_for_log = r.headers.clone();
-                    // Funnel through the unified send + access-log
-                    // dispatch site at the bottom of handle_one_stream.
-                    return finalize_h2_stream(
-                        &config,
-                        send_response,
-                        r,
-                        req_arrival_instant,
-                        req_arrival_systime,
-                        &envoy_req,
-                        request_body_len,
-                        response_status_for_log,
-                        response_body_len,
-                        &response_headers_for_log,
-                        upstream_host_for_log_h2,
-                    )
-                    .await;
-                }
-            };
-
-            // 06.2 Task 7: capture the resolved upstream endpoint
-            // for the access-log `%UPSTREAM_HOST%` token.
-            upstream_host_for_log_h2 = Some(endpoint.to_string());
-
-            // Extract Host: from the synthesized envoy_req.
-            // http_to_envoy_request always synthesizes host from
-            // :authority at the bottom of headers (per SPEC §6
-            // signpost 12 + request.rs line 74), so the .expect()
-            // is effectively infallible here.
-            let host_header = envoy_req
-                .headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case("host"))
-                .map(|(_, v)| v.clone())
-                .expect("http_to_envoy_request always synthesizes Host from :authority");
-
-            // Build the outbound request: strip H1 hop-by-hop headers
-            // (Connection, Transfer-Encoding) mirroring
-            // envoy-http1/src/hcm.rs:244-248.
-            let mut out_headers = envoy_req.headers.clone();
-            out_headers.retain(|(n, _)| {
-                !n.eq_ignore_ascii_case("connection")
-                    && !n.eq_ignore_ascii_case("transfer-encoding")
-            });
-            let out_req = envoy_http1::codec::Request {
-                method: envoy_req.method.clone(),
-                path: envoy_req.path.clone(),
-                version: envoy_http1::codec::HttpVersion::Http11,
-                headers: out_headers,
-                bytes_consumed: 0,
-                body: envoy_req.body.clone(),
-            };
-
-            // 06.3 D15.3.b: RAII guard increments
-            // `cluster.<name>.upstream_cx_active` before either protocol arm
-            // connects and decrements via Drop at scope exit, covering both
-            // success and error close paths uniformly. A single guard covers
-            // both the H1 and H2 arms of the match below.
-            let _cx_guard = cluster.cx_active_guard();
-
-            let start = Instant::now();
-            let upstream_resp_result = match cluster.upstream_protocol() {
-                envoy_cluster::UpstreamProtocol::Http1 => {
-                    match envoy_http1::Client::connect(endpoint, &host_header).await {
-                        Ok(mut s) => {
-                            // 06.1 D4.b: per-cluster upstream_cx_total
-                            // increment on successful upstream H1 connect
-                            // (mirrors envoy-http1::serve_connection's
-                            // proxy arm).
-                            cluster.cx_total().inc();
-                            s.send_request(out_req).await.map_err(|e| format!("{e}"))
-                        }
-                        Err(e) => Err(format!("{e}")),
-                    }
-                }
-                envoy_cluster::UpstreamProtocol::Http2 => {
-                    match crate::Client::connect(endpoint, &host_header).await {
-                        Ok(mut s) => {
-                            // 06.1 D4.b: per-cluster upstream_cx_total
-                            // increment on successful upstream H2 connect.
-                            cluster.cx_total().inc();
-                            s.send_request(out_req).await.map_err(|e| format!("{e}"))
-                        }
-                        Err(e) => Err(format!("{e}")),
-                    }
-                }
-            };
-
-            let upstream_resp = match upstream_resp_result {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
-                    let r = synth_h2_502();
-                    response_status_for_log = r.status;
-                    response_body_len = r.body.len() as u64;
-                    response_headers_for_log = r.headers.clone();
-                    // Funnel through the unified send + access-log
-                    // dispatch site at the bottom of handle_one_stream.
-                    return finalize_h2_stream(
-                        &config,
-                        send_response,
-                        r,
-                        req_arrival_instant,
-                        req_arrival_systime,
-                        &envoy_req,
-                        request_body_len,
-                        response_status_for_log,
-                        response_body_len,
-                        &response_headers_for_log,
-                        upstream_host_for_log_h2,
-                    )
-                    .await;
-                }
-            };
-
-            // 06.3 D15.3.c: per PLAN-write SPEC correction 3, the H2 router-arm
-            // does NOT call write_proxied_response (it builds the downstream
-            // Response inline below). Inline 2-line increments parallel the H1
-            // path. Both fire on the success arm only (the Err arm returned via
-            // finalize_h2_stream above).
-            cluster.upstream_rq_total().inc();
-            if upstream_resp.status / 100 == 5 {
-                cluster.upstream_rq_5xx().inc();
-            }
-
-            // Build the downstream response: mirror envoy-http1::router::
-            // write_proxied_response's header policy — replace upstream
-            // `server` with `server: envoy-rust`; replace or inject `date`
-            // with a fresh IMF-fixdate; append x-envoy-upstream-service-time.
-            // The H2 forbidden hop-by-hop headers (connection, transfer-encoding,
-            // etc.) are stripped later by build_http_response in response.rs.
-            let elapsed_ms = start.elapsed().as_millis();
-            let now_date = envoy_http1::date::format_imf_fixdate(SystemTime::now());
-            let mut headers: Vec<(String, String)> =
-                Vec::with_capacity(upstream_resp.headers.len() + 3);
-            let mut saw_server = false;
-            let mut saw_date = false;
-            for (name, value) in upstream_resp.headers.into_iter() {
-                let lc = name.to_ascii_lowercase();
-                if lc == "server" {
-                    saw_server = true;
-                    headers.push(("server".to_string(), "envoy-rust".to_string()));
-                } else if lc == "date" {
-                    saw_date = true;
-                    headers.push(("date".to_string(), now_date.clone()));
-                } else {
-                    headers.push((lc, value));
-                }
-            }
-            if !saw_server {
-                headers.push(("server".to_string(), "envoy-rust".to_string()));
-            }
-            if !saw_date {
-                headers.push(("date".to_string(), now_date));
-            }
-            headers.push((
-                "x-envoy-upstream-service-time".to_string(),
-                elapsed_ms.to_string(),
-            ));
-            let proxy_resp = Response {
-                status: upstream_resp.status,
-                reason: upstream_resp.reason,
-                headers,
-                body: upstream_resp.body,
-            };
-            response_status_for_log = proxy_resp.status;
-            response_body_len = proxy_resp.body.len() as u64;
-            response_headers_for_log = proxy_resp.headers.clone();
-            proxy_resp
-        }
     };
 
     finalize_h2_stream(
         &config,
+        &mut pipeline,
         send_response,
         resp,
         req_arrival_instant,
@@ -364,17 +435,63 @@ async fn handle_one_stream(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_h2_stream(
     config: &Arc<HCMConfig>,
+    pipeline: &mut envoy_filter::FilterPipeline,
     send_response: h2::server::SendResponse<Bytes>,
-    resp: Response,
+    mut resp: Response,
     req_arrival_instant: Instant,
     req_arrival_systime: SystemTime,
     envoy_req: &Request,
     request_body_len: u64,
-    response_status_for_log: u16,
-    response_body_len: u64,
-    response_headers_for_log: &[(String, String)],
+    // 07.1 Task 7: the three log-locals below are PRE-encode at call
+    // sites; they are shadowed inside the function body with POST-encode
+    // values derived from `resp` after the encode_headers pass below.
+    // The `_` prefix silences the parameter-unused warning — the
+    // shadowed locals carry the post-encode values into the per-class
+    // counter site + access-log dispatch site.
+    _response_status_for_log: u16,
+    _response_body_len: u64,
+    _response_headers_for_log: &[(String, String)],
     upstream_host_for_log_h2: Option<String>,
 ) -> Result<(), Http2Error> {
+    // 07.1 Task 7: encode-side filter invocation. Boundary conversion
+    // `envoy_http1::codec::Response` ↔ `envoy_filter::FilterResponse`
+    // via `mem::take` + write-back / replace (same shape as Task 6 at
+    // envoy-http1's unified factored site). Under the Router-only 07.1
+    // chain `Decision::Continue` is the only reachable branch; the
+    // StopAndSend arm lands structurally for 07.2 HeaderMutation.
+    let mut filter_resp = envoy_filter::FilterResponse {
+        status: resp.status,
+        reason: resp.reason,
+        headers: std::mem::take(&mut resp.headers),
+        body: std::mem::take(&mut resp.body),
+    };
+    match pipeline.encode_headers(&mut filter_resp) {
+        envoy_filter::Decision::Continue => {
+            resp.status = filter_resp.status;
+            resp.reason = filter_resp.reason;
+            resp.headers = filter_resp.headers;
+            resp.body = filter_resp.body;
+        }
+        envoy_filter::Decision::StopAndSend(replacement) => {
+            resp = Response {
+                status: replacement.status,
+                reason: replacement.reason,
+                headers: replacement.headers,
+                body: replacement.body,
+            };
+        }
+    }
+
+    // 07.1 Task 7: shadow the pre-encode log-locals with post-encode
+    // values so the per-class HCM counter site (06.3) + access-log
+    // dispatch site (06.2) below reflect post-encode response state per
+    // PLAN signpost. The slice contract for the access-log dispatch site
+    // is preserved by binding an owned Vec then re-borrowing as a slice.
+    let response_status_for_log: u16 = resp.status;
+    let response_body_len: u64 = resp.body.len() as u64;
+    let response_headers_for_log_owned: Vec<(String, String)> = resp.headers.clone();
+    let response_headers_for_log: &[(String, String)] = &response_headers_for_log_owned;
+
     let send_result = send_envoy_response(send_response, resp).await;
 
     // 06.3 D15.3.a NEW — symmetric per-response-class HCM counter increment
