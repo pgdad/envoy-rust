@@ -1332,19 +1332,8 @@ fn validate_hcm(
     // http2_protocol_options pattern.
     validate_access_logs(&hcm.access_log)?;
 
-    // http_filters: cardinality + name.
-    match hcm.http_filters.len() {
-        1 => {
-            let f = &hcm.http_filters[0];
-            if f.name != "envoy.filters.http.router" {
-                return Err(crate::ConfigError::UnsupportedHttpFilter {
-                    name: f.name.clone(),
-                });
-            }
-            // typed_config @type is constrained to Router by the schema.
-        }
-        n => return Err(crate::ConfigError::MultipleHttpFilters { count: n }),
-    }
+    // http_filters: cardinality + name + Router-terminal — 07.1 D4.1.
+    validate_http_filters(&hcm.http_filters, listener_name)?;
 
     // route_config: walk virtual_hosts → routes.
     if hcm.route_config.virtual_hosts.is_empty() {
@@ -1428,6 +1417,70 @@ fn validate_hcm(
                 validate_header_matcher(hm)?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Validate the http_filters list of an HCM listener.
+///
+/// Enforces: (a) at least one filter, (b) exactly one Router, (c) Router
+/// at the terminus, (d) name/typed_config consistency on every entry.
+///
+/// At 07.1 the only typed_config variant is `Router`; the
+/// name/typed_config consistency check is currently dead-code-defensive
+/// (the schema's `HttpFilterTypedConfig` enum is closed and serde's
+/// `deny_unknown_fields` rejects unknown variants at parse time). The
+/// check is retained so 07.2's HeaderMutation arm slots in without a
+/// validator rewrite.
+///
+/// Replaces the pre-07.1 cardinality gate at lines 1335-1346 of this
+/// file. Mirrors 05.2's `validate_h2_protocol_options` /
+/// 06.3's `Http2ClusterFromHttp1Listener` listener-name-threaded
+/// validator shape.
+pub(crate) fn validate_http_filters(
+    filters: &[crate::HttpFilter],
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if filters.is_empty() {
+        return Err(crate::ConfigError::EmptyHttpFilters {
+            listener: listener_name.to_string(),
+        });
+    }
+
+    let router_name = "envoy.filters.http.router";
+    let last_index = filters.len() - 1;
+    let mut router_positions: Vec<usize> = Vec::new();
+
+    for (i, f) in filters.iter().enumerate() {
+        match &f.typed_config {
+            crate::HttpFilterTypedConfig::Router(_) => {
+                if f.name != router_name {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                router_positions.push(i);
+            }
+        }
+    }
+
+    if router_positions.len() > 1 {
+        return Err(crate::ConfigError::DuplicateRouterFilter {
+            listener: listener_name.to_string(),
+        });
+    }
+    if router_positions.is_empty() {
+        return Err(crate::ConfigError::RouterNotTerminal {
+            listener: listener_name.to_string(),
+            position: last_index,
+        });
+    }
+    let router_position = router_positions[0];
+    if router_position != last_index {
+        return Err(crate::ConfigError::RouterNotTerminal {
+            listener: listener_name.to_string(),
+            position: router_position,
+        });
     }
     Ok(())
 }
@@ -6267,5 +6320,94 @@ static_resources:
         let mut b: Bootstrap = serde_yaml::from_str(yaml).unwrap();
         validate(&mut b)
             .expect("TCP-proxy listener + H2 cluster must be accepted (gate is HCM-only)");
+    }
+
+    #[test]
+    fn validate_http_filters_accepts_single_router() {
+        let filters = vec![crate::HttpFilter {
+            name: "envoy.filters.http.router".to_string(),
+            typed_config: crate::HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+        }];
+        let result = super::validate_http_filters(&filters, "ingress_http");
+        assert!(result.is_ok(), "single Router passes; got {result:?}");
+    }
+
+    #[test]
+    fn validate_http_filters_rejects_empty_list() {
+        let filters: Vec<crate::HttpFilter> = Vec::new();
+        let err =
+            super::validate_http_filters(&filters, "ingress_http").expect_err("empty list rejects");
+        match err {
+            crate::ConfigError::EmptyHttpFilters { listener } => {
+                assert_eq!(listener, "ingress_http");
+            }
+            other => panic!("expected EmptyHttpFilters, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_http_filters_rejects_duplicate_router() {
+        let router = || crate::HttpFilter {
+            name: "envoy.filters.http.router".to_string(),
+            typed_config: crate::HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+        };
+        let filters = vec![router(), router()];
+        let err = super::validate_http_filters(&filters, "ingress_http")
+            .expect_err("duplicate Router rejects");
+        match err {
+            crate::ConfigError::DuplicateRouterFilter { listener } => {
+                assert_eq!(listener, "ingress_http");
+            }
+            other => panic!("expected DuplicateRouterFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_http_filters_rejects_name_typed_config_mismatch() {
+        let filters = vec![crate::HttpFilter {
+            name: "envoy.filters.http.fault".to_string(),
+            typed_config: crate::HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+        }];
+        let err = super::validate_http_filters(&filters, "ingress_http")
+            .expect_err("name/typed_config mismatch rejects");
+        match err {
+            crate::ConfigError::UnsupportedHttpFilter { name } => {
+                assert_eq!(name, "envoy.filters.http.fault");
+            }
+            other => panic!("expected UnsupportedHttpFilter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_http_filters_listener_name_propagates() {
+        let filters: Vec<crate::HttpFilter> = Vec::new();
+        let err = super::validate_http_filters(&filters, "custom_listener_42")
+            .expect_err("empty list rejects");
+        assert!(format!("{err:?}").contains("custom_listener_42"));
+    }
+
+    #[test]
+    fn validate_http_filters_duplicate_router_takes_precedence_over_router_not_terminal() {
+        let router = || crate::HttpFilter {
+            name: "envoy.filters.http.router".to_string(),
+            typed_config: crate::HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+        };
+        let filters = vec![router(), router(), router()];
+        let err =
+            super::validate_http_filters(&filters, "ingress_http").expect_err("3 Routers rejects");
+        assert!(matches!(
+            err,
+            crate::ConfigError::DuplicateRouterFilter { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_http_filters_accepts_existing_fixture_shape() {
+        let filters = vec![crate::HttpFilter {
+            name: "envoy.filters.http.router".to_string(),
+            typed_config: crate::HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+        }];
+        super::validate_http_filters(&filters, "ingress_http")
+            .expect("pre-07.1 fixture filter-chain shape stays valid");
     }
 }

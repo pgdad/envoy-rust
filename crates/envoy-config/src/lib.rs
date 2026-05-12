@@ -162,10 +162,40 @@ pub enum ConfigError {
         field: &'static str,
         requires: &'static str,
     },
+    /// Superseded by `EmptyHttpFilters` / `RouterNotTerminal` /
+    /// `DuplicateRouterFilter` at 07.1; retained for ledger discipline
+    /// per D-3.5 (typed-error API is grow-only). No code path
+    /// constructs this variant after 07.1 Task 4.
     #[error(
         "unsupported HTTP filter count: {count}; phase 04.x's HCM accepts exactly one filter (the router)"
     )]
     MultipleHttpFilters { count: usize },
+
+    /// 07.1 D4.1: listener's http_filters list is empty.
+    ///
+    /// HCM listeners must declare at least one HTTP filter (the
+    /// `Router` filter — terminus). Empty lists are not legal per the
+    /// terminal-router validator.
+    #[error("HCM listener {listener:?} has empty http_filters list (must contain at least Router)")]
+    EmptyHttpFilters { listener: String },
+
+    /// 07.1 D4.1: listener's Router filter is not at the terminus
+    /// position.
+    ///
+    /// The validator requires Router to be the last entry in
+    /// `http_filters`. Earlier-Router placements trigger this error.
+    #[error(
+        "HCM listener {listener:?}: Router filter is not at the terminus (found at position {position})"
+    )]
+    RouterNotTerminal { listener: String, position: usize },
+
+    /// 07.1 D4.1: listener's http_filters list contains more than one
+    /// Router filter.
+    ///
+    /// The validator requires exactly one Router. Duplicate Routers
+    /// trigger this error.
+    #[error("HCM listener {listener:?}: filter chain contains duplicate Router filter")]
+    DuplicateRouterFilter { listener: String },
 
     /// HeaderMatcher.name was empty. Phase 04.2.
     #[error("HeaderMatcher.name must be non-empty")]

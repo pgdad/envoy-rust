@@ -272,3 +272,67 @@ multi-line (line-length limit). Applied before final commit to keep
   test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
   ```
 - `cargo deny check`: no-op (no new top-level deps).
+
+## Task 4 — `envoy-config` terminal-router validator + 3 new `ConfigError` variants
+
+### Work summary
+
+Replaces the pre-07.1 cardinality gate at `crates/envoy-config/src/bootstrap.rs:1335-1347` (the 13-line `match hcm.http_filters.len()` block) with a single call `validate_http_filters(&hcm.http_filters, listener_name)?`. Adds new free function `validate_http_filters(filters: &[HttpFilter], listener_name: &str) -> Result<(), ConfigError>` enforcing: (a) at least one filter, (b) exactly one Router, (c) Router at terminus, (d) name/typed_config consistency.
+
+Adds 3 new `ConfigError` variants to `crates/envoy-config/src/lib.rs`:
+`EmptyHttpFilters { listener }`, `RouterNotTerminal { listener, position }`, `DuplicateRouterFilter { listener }`. Retains the existing `MultipleHttpFilters` variant per signpost 13 (no longer constructed; doc-comment supersession note added). The pre-existing `UnsupportedHttpFilter` variant continues firing on name/typed_config mismatch.
+
+`validate_hcm` signature unchanged — `listener_name: &str` is already a parameter (since 06.3's Http2ClusterFromHttp1Listener listener-name-threading); no caller updates needed.
+
+### Tests landed
+
+7 new unit tests at `crates/envoy-config/src/bootstrap.rs::tests`:
+- `validate_http_filters_accepts_single_router`
+- `validate_http_filters_rejects_empty_list`
+- `validate_http_filters_rejects_duplicate_router`
+- `validate_http_filters_rejects_name_typed_config_mismatch`
+- `validate_http_filters_listener_name_propagates`
+- `validate_http_filters_duplicate_router_takes_precedence_over_router_not_terminal`
+- `validate_http_filters_accepts_existing_fixture_shape`
+
+Step 8 (amend existing tests) confirmed no-op: `grep -rn MultipleHttpFilters crates/envoy-config/src/` returns only the variant definition in lib.rs. The existing `rejects_unsupported_http_filter` test (bootstrap.rs:3640) continues asserting `UnsupportedHttpFilter` unchanged.
+
+### LoC delta
+
+| File | LoC |
+|---|---|
+| `crates/envoy-config/src/lib.rs` (3 new variants + 1 doc-comment) | +35 |
+| `crates/envoy-config/src/bootstrap.rs` (validate_http_filters function) | +60 |
+| `crates/envoy-config/src/bootstrap.rs` (replace cardinality gate) | -12 +2 |
+| `crates/envoy-config/src/bootstrap.rs` (7 new tests) | ~140 |
+| `docs/envoy-rust/phases/07.1-filter-framework-foundation/PROGRESS.md` | ~55 |
+| **Total** | **~280** |
+
+### Deviations from PLAN
+
+None. `validate_hcm`'s signature already had `listener_name: &str` (confirmed at Step 1, verified at bootstrap.rs:1299-1304). No caller updates were needed. PLAN Step 6 worry was moot as predicted.
+
+### Test-bucket attestation
+
+- `cargo test -p envoy-config validate_http_filters`: PASS (7 tests).
+  ```
+  test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 180 filtered out; finished in 0.00s
+  ```
+- `cargo test -p envoy-config`: PASS.
+  ```
+  test result: ok. 187 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  ```
+- `cargo test --workspace`: PASS.
+  ```
+  Finished `test` profile [unoptimized + debuginfo] target(s) in 0.00s (all suites clean)
+  ```
+- `cargo build --workspace --all-targets`: clean.
+  ```
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.53s
+  ```
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+  ```
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.53s
+  ```
+- `cargo fmt --all -- --check`: clean (no output after applying fmt).
+- `cargo deny check`: no-op (no new top-level deps).
