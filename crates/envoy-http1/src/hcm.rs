@@ -343,44 +343,29 @@ async fn serve_connection(
             remaining -= n;
         }
 
-        // 06.2 Task 6: per-request access-log state. Populated by each
-        // arm of `match outcome { ... }` below before falling through to
-        // the factored dispatch site (per PLAN-write SPEC correction 1;
-        // one dispatch site handles all 5 writer outcomes).
+        // 06.2 Task 6: per-request access-log state. The proxy-success arm
+        // captures the resolved upstream endpoint for the access-log
+        // `%UPSTREAM_HOST%` token; synth and error arms leave it None.
         //
-        // 06.3 Task 4 / 06.2 REVIEW I1: tightened from `let mut x = 0/default`
-        // to `let mut x;` (no default initializer — mirror of H2's stricter
-        // posture at crates/envoy-http2/src/hcm.rs:134). Rust flow analysis
-        // verifies all 5 writer arms populate the 3 vars before the dispatch
-        // site reads them; a compile error fires if any arm is missed.
-        //
-        // Note: `mut` is required (not plain `let x;`) because the Proxy arm
-        // has two structurally-separate paths that each assign these vars
-        // (no-endpoint-503 and the if-let-Some proxy paths). Rust's
-        // flow-analysis correctly sees the paths as non-overlapping at
-        // runtime, but requires `mut` to permit the second assignment site.
-        // H2 avoids this by doing an early `return finalize_h2_stream()` from
-        // the no-endpoint arm, which is why it can use plain `let x;`. The
-        // semantic guarantee (no 0/default sentinel can leak to the dispatch
-        // site) is preserved: any arm that fails to assign produces an
-        // E0381 use-of-possibly-uninitialized-variable compile error.
-        //
-        // `upstream_host_for_log` stays `mut … = None` because only the
-        // proxy-success arm writes it; synth and error arms leave it None.
-        let response_status_for_log: u16;
-        let response_body_len: u64;
-        // `mut` required: the proxy-success arm does `.push()` after initial
-        // assignment to add the x-envoy-upstream-service-time header.
-        let mut response_headers_for_log: Vec<(String, String)>;
+        // 07.1 Task 5: The three other locals (`response_status_for_log`,
+        // `response_body_len`, `response_headers_for_log`) — formerly
+        // populated per-arm and read at the dispatch site — are now derived
+        // once below the writer-arm match from the unified `outgoing:
+        // Response` value (see comment at the unified factored site).
         let mut upstream_host_for_log: Option<String> = None; // stays mut — only proxy arm populates
+
+        // 07.1 Task 5: per-arm-populated response value, written to the wire
+        // once below the match (factored unified-site). Task 6 will insert
+        // `pipeline.encode_headers(&mut outgoing)` between this match's
+        // close and the wire write. Rust's flow analysis verifies all 5
+        // writer arms populate `outgoing` before the unified site reads it;
+        // a compile error (E0381) fires if any arm is missed.
+        let outgoing: Response;
 
         // 8. Dispatch the outcome to the wire.
         match outcome {
             BuildOutcome::Synth(resp) => {
-                response_status_for_log = resp.status;
-                response_body_len = resp.body.len() as u64;
-                response_headers_for_log = resp.headers.clone();
-                Http1Response::write_to(&resp, &mut downstream).await?;
+                outgoing = resp;
             }
             BuildOutcome::Proxy {
                 cluster: cluster_name,
@@ -445,30 +430,22 @@ async fn serve_connection(
                             match client_stream.send_request(out_req).await {
                                 Ok(upstream_response) => {
                                     let elapsed_ms = start.elapsed().as_millis();
-                                    response_status_for_log = upstream_response.status;
-                                    response_body_len = upstream_response.body.len() as u64;
-                                    response_headers_for_log = upstream_response.headers.clone();
-                                    // `write_proxied_response` adds an
-                                    // `x-envoy-upstream-service-time` header
-                                    // to the downstream response. Mirror it
-                                    // into `response_headers_for_log` so
-                                    // `extract_upstream_service_time` can
-                                    // observe the value at the dispatch
-                                    // site (the helper looks at the
-                                    // captured headers, not the live
-                                    // downstream wire output).
-                                    response_headers_for_log.push((
-                                        crate::router::X_ENVOY_UPSTREAM_SERVICE_TIME.to_string(),
-                                        elapsed_ms.to_string(),
-                                    ));
-                                    crate::router::write_proxied_response(
-                                        &mut downstream,
+                                    // 07.1 Task 5: factored — was a direct
+                                    // `crate::router::write_proxied_response`
+                                    // call; now constructs the Response
+                                    // value for the unified wire-write site
+                                    // below the match. The x-envoy-upstream-
+                                    // service-time header is injected by
+                                    // construct_proxied_response and flows
+                                    // into response_headers_for_log via the
+                                    // outgoing.headers.clone() at the
+                                    // unified site below.
+                                    outgoing = crate::router::construct_proxied_response(
                                         &cluster,
                                         upstream_response,
                                         elapsed_ms,
                                         close,
-                                    )
-                                    .await?;
+                                    );
                                 }
                                 Err(source) => {
                                     tracing::warn!(
@@ -477,11 +454,7 @@ async fn serve_connection(
                                         error = ?source,
                                         "upstream request failed — returning 502",
                                     );
-                                    let resp = synth_status(502, close);
-                                    response_status_for_log = resp.status;
-                                    response_body_len = resp.body.len() as u64;
-                                    response_headers_for_log = resp.headers.clone();
-                                    Http1Response::write_to(&resp, &mut downstream).await?;
+                                    outgoing = synth_status(502, close);
                                 }
                             }
                         }
@@ -492,11 +465,7 @@ async fn serve_connection(
                                 error = ?source,
                                 "upstream connect failed — returning 502",
                             );
-                            let resp = synth_status(502, close);
-                            response_status_for_log = resp.status;
-                            response_body_len = resp.body.len() as u64;
-                            response_headers_for_log = resp.headers.clone();
-                            Http1Response::write_to(&resp, &mut downstream).await?;
+                            outgoing = synth_status(502, close);
                         }
                     }
                 } else {
@@ -505,15 +474,26 @@ async fn serve_connection(
                         cluster = %cluster.name(),
                         "no healthy endpoint for cluster — returning 503",
                     );
-                    let resp = synth_status(503, close);
-                    response_status_for_log = resp.status;
-                    response_body_len = resp.body.len() as u64;
-                    response_headers_for_log = resp.headers.clone();
-                    Http1Response::write_to(&resp, &mut downstream).await?;
-                    // Fall through to the access-log + counter dispatch site.
+                    outgoing = synth_status(503, close);
                 }
             }
         }
+
+        // 07.1 Task 5: derive per-arm log/counter locals from `outgoing` for
+        // the access-log + per-class HCM counter dispatch sites below.
+        // Bit-equivalent to the pre-Task-5 per-arm assignments because
+        // (Synth / synth_status arms) `outgoing` IS the resp value the arm
+        // produced, and (Proxy success arm) `outgoing` is the
+        // `construct_proxied_response` output which already includes the
+        // `x-envoy-upstream-service-time` header that the pre-Task-5 code
+        // explicitly pushed into `response_headers_for_log`.
+        let response_status_for_log: u16 = outgoing.status;
+        let response_body_len: u64 = outgoing.body.len() as u64;
+        let response_headers_for_log: Vec<(String, String)> = outgoing.headers.clone();
+
+        // 07.1 Task 5: unified wire-write site. Task 6 inserts
+        // `pipeline.encode_headers(&mut outgoing)` HERE, before the wire write.
+        Http1Response::write_to(&outgoing, &mut downstream).await?;
 
         // 06.3 D15.3.a NEW — per-response-class HCM counters. Increment fires
         // AFTER all 5 writer arms have populated `response_status_for_log`,

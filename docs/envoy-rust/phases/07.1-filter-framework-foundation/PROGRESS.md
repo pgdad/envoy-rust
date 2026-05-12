@@ -336,3 +336,68 @@ None. `validate_hcm`'s signature already had `listener_name: &str` (confirmed at
   ```
 - `cargo fmt --all -- --check`: clean (no output after applying fmt).
 - `cargo deny check`: no-op (no new top-level deps).
+
+## Task 5 — H1 HCM 5-writer-arm refactor (factor wire-write to unified site)
+
+### Work summary
+
+Pure refactor — NO filter invocation yet (Task 6 layers that on top).
+
+`crates/envoy-http1/src/hcm.rs::serve_connection` now declares `let outgoing: Response;` above the writer-arm match. Each of the 5 wire-write sites (1 outer Synth arm + 4 nested paths inside the Proxy arm — see Deviation 4) is converted from inline wire-write to `outgoing = <constructed_response>;`. Below the match, a unified factored site derives the access-log/counter locals (`response_status_for_log`, `response_body_len`, `response_headers_for_log`) from `outgoing` and fires a single `Http1Response::write_to(&outgoing, &mut downstream).await?` call. The 06.3 per-class HCM counter site + 06.2 access-log dispatch site are unchanged downstream of the unified site.
+
+The pre-Task-5 late-init-with-`mut` posture on the three log-locals (06.3 Task 4 / 06.2 REVIEW I1) is preserved in spirit but shifted: `outgoing` carries the compile-time `E0381` regression guarantee (any arm that fails to populate it produces a compile error). The three derived locals are now `let x = …;` initializers at the unified site, which satisfies clippy's `needless_late_init` lint.
+
+`crates/envoy-http1/src/router.rs` factors `construct_proxied_response` out of `write_proxied_response` (same body minus the wire-write step; returns Response value; takes the `close: bool` flag — see Deviation 3). The cluster-side `upstream_rq_total` / `upstream_rq_5xx` increments (06.3 D15.3.c) move into `construct_proxied_response` so they fire once per construction regardless of how the response is subsequently written. `write_proxied_response` retained as a thin wrapper (existing tests and any external callers continue to work unchanged).
+
+### Tests landed
+
+3 new unit tests at `crates/envoy-http1/src/router.rs::tests`:
+- `construct_proxied_response_returns_response_with_status_200`
+- `construct_proxied_response_increments_upstream_rq_total_only_once`
+- `construct_proxied_response_increments_upstream_rq_5xx_on_503`
+
+### LoC delta
+
+| File | LoC delta |
+|---|---|
+| `crates/envoy-http1/src/hcm.rs` (writer-arm refactor + unified site) | +43 / -73 |
+| `crates/envoy-http1/src/router.rs` (construct_proxied_response factoring + wrapper rewrite + 3 new tests) | +111 / -7 |
+| PROGRESS.md (Task 5 entry) | ~85 |
+| **Total** | **~320** |
+
+### Deviations from PLAN
+
+**Deviation 1 (PLAN.md:1693 — `outgoing` type):** PLAN said `let mut outgoing: Http1Response;`. Disk `Http1Response` is a unit namespace struct (response.rs:21); the response value type is `Response` (response.rs:13). Used `let outgoing: Response;` (not `mut` — late-init flow analysis correctly handles 5-arm initialization without `mut`).
+
+**Deviation 2 (PLAN.md:1706, 1793 — `write_to` arity):** PLAN listed `write_to(&resp, &mut downstream, close)`. Disk signature is `write_to(resp: &Response, w: &mut W) -> Result<...>` taking 2 args (response.rs:26). The `close` flag is baked into the `Response` value's Connection header via synth/construct helpers. Final unified call: `Http1Response::write_to(&outgoing, &mut downstream).await?`.
+
+**Deviation 3 (PLAN.md:1632-1636 — `construct_proxied_response` signature):** PLAN omitted the `close: bool` parameter. The existing `write_proxied_response` uses close to set `Connection: close|keep-alive` (router.rs:148-152); bit-equivalent emission requires the factored function take close too. Final signature: `construct_proxied_response(cluster, upstream_response, elapsed_ms, close) -> Response`.
+
+**Deviation 4 (PLAN.md:1561-1564 — "5 sibling writer arms" mental model):** Actual control flow is 1 outer `BuildOutcome::Synth` arm + 4 nested paths inside `BuildOutcome::Proxy` (success / send-fail-502 / connect-fail-502 / no-endpoint-503). The refactor produces 5 `outgoing = …` assignment sites distributed across the nested structure, not 5 sibling match arms.
+
+**Deviation 5 (PLAN.md:1740 — `upstream_host_for_log`):** PLAN said `Some(cluster.upstream_host_string())`. Disk uses `Some(endpoint.to_string())` at hcm.rs (inside `if let Some(endpoint)`). Preserved verbatim — this line is OUTSIDE the writer-arm assignments to `outgoing` and feeds 3 of the 4 proxy nested paths uniformly; the no-endpoint-503 path inherits `None` from the initial declaration. No change to this line needed.
+
+**Deviation 6 (PLAN.md:1574 — test import):** PLAN said `use envoy_http1::codec::Response;`. The new tests live INSIDE `crates/envoy-http1/src/router.rs::tests`; reused existing `use super::*;` + `mk_test_cluster()` / `upstream()` helpers. Also note: existing tests use `Counter::value()` (not `Counter::get()` as PLAN suggested) — the new tests follow the existing convention.
+
+**Deviation 7 (clippy `needless_late_init` on the 3 log-locals):** After the refactor pulls all initialization to one site, clippy flagged the late-init posture on `response_status_for_log` / `response_body_len` / `response_headers_for_log`. Resolved by converting them to `let x: T = …;` initializers at the unified site, and replacing the late-init explanation comment block with a comment on `outgoing` itself (which now carries the 5-arm-init compile-time guarantee). The semantic posture is preserved — any arm that fails to populate `outgoing` produces an E0381.
+
+### Test-bucket attestation (per architecture decision + 06.3 REVIEW I1 closure)
+
+- `cargo test -p envoy-http1`: PASS — 60 tests (3 new on `construct_proxied_response` + 57 pre-existing).
+  ```
+  test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+  ```
+- `cargo test -p envoy-bin` (in-process backstop for fixtures 0001-0012 at `crates/envoy-bin/tests/http1_*.rs` and `http2_*.rs`): PASS — all suites green (see workspace summary).
+- `cargo test --workspace`: PASS — 548 passed, 0 failed, 2 ignored across all crates.
+- `cargo build --workspace --all-targets`: clean.
+  ```
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.49s
+  ```
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+  ```
+  Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.43s
+  ```
+- `cargo fmt --all -- --check`: clean (no output after applying fmt).
+- `cargo deny check`: pre-existing license-not-encountered warnings on `Unicode-DFS-2016` / `Zlib` (unrelated to this task — same on `main`). No new top-level deps.
+
+Docker-gated bilateral attestation deferred to Task 8 (state-4 anchor); the in-process backstop tests are the surrogate at Task 5.

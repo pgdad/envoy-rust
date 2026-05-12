@@ -53,10 +53,22 @@ pub const HCM_EMITTED_HEADERS: &[&str] = &["server", "date"];
 /// latency in milliseconds.
 pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 
-/// Build the synthesized downstream response from the upstream response,
-/// applying the header allow-list policy + injecting `x-envoy-upstream-service-time`
-/// + setting `Connection:` per the captured-pre-drain posture, and write the
-///   wire bytes via Http1Response::write_to.
+/// Construct the synthesized downstream Response value WITHOUT writing it to
+/// the wire. Mirrors the pre-07.1 body of `write_proxied_response` minus the
+/// wire-write call.
+///
+/// Used by the 07.1 Task 5 unified factored wire-write site at
+/// `crates/envoy-http1/src/hcm.rs::serve_connection`: each writer-arm
+/// populates `outgoing: Response` (the proxy-success arm calls this helper);
+/// below the arm match, a single `Http1Response::write_to` fires once. Task 6
+/// will insert `pipeline.encode_headers(&mut outgoing)` between the arm
+/// match's close and the wire write.
+///
+/// 06.3 D15.3.c: increments `cluster.upstream_rq_total` on every call and
+/// `cluster.upstream_rq_5xx` when `upstream_response.status / 100 == 5`. The
+/// counter increment moved here from `write_proxied_response` so it fires
+/// once per response construction regardless of how the response is
+/// subsequently written.
 ///
 /// Per SPEC §6 signpost 7:
 /// 1. Status line forwards verbatim from upstream.
@@ -72,16 +84,12 @@ pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 /// 5. Forward the body bytes preserving the upstream's framing (CL or chunked
 ///    — the body bytes are already decoded into a single Bytes by client.rs's
 ///    chunked reader, so the downstream side always emits CL-framed in 04.3).
-pub async fn write_proxied_response<W>(
-    downstream: &mut W,
+pub fn construct_proxied_response(
     cluster: &envoy_cluster::ClusterHandle,
     upstream_response: Response,
     elapsed_ms: u128,
     close: bool,
-) -> Result<(), Http1Error>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
+) -> Response {
     // 06.3 D15.3.c: per-upstream-response counters. Fires once per call
     // (which is already gated on receiving a valid upstream_response).
     cluster.upstream_rq_total().inc();
@@ -151,12 +159,31 @@ where
         if close { "close" } else { "keep-alive" }.to_string(),
     ));
 
-    let resp = Response {
+    Response {
         status: upstream_response.status,
         reason: upstream_response.reason,
         headers,
         body: upstream_response.body,
-    };
+    }
+}
+
+/// Pre-07.1 helper: construct + write the proxied response in one call.
+///
+/// At Task 5 this becomes a thin wrapper around `construct_proxied_response`
+/// + `Http1Response::write_to`. Retained because pre-existing tests
+///   (`write_proxied_response_increments_upstream_rq_total_on_200` /
+///   `_5xx_on_503` and the wire-output tests above) call it directly.
+pub async fn write_proxied_response<W>(
+    downstream: &mut W,
+    cluster: &envoy_cluster::ClusterHandle,
+    upstream_response: Response,
+    elapsed_ms: u128,
+    close: bool,
+) -> Result<(), Http1Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let resp = construct_proxied_response(cluster, upstream_response, elapsed_ms, close);
     Http1Response::write_to(&resp, downstream).await
 }
 
@@ -368,5 +395,72 @@ static_resources:
             .expect("write");
         assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 503");
         assert_eq!(rq_5xx.value(), 1, "upstream_rq_5xx must be 1 after 503");
+    }
+
+    // ── 07.1 Task 5: construct_proxied_response factored helper tests ──
+
+    /// 07.1 Task 5: `construct_proxied_response` returns a Response with the
+    /// upstream status, the elapsed-ms x-envoy-upstream-service-time header,
+    /// the synthesized content-length, and Connection: keep-alive when
+    /// `close = false`.
+    #[tokio::test]
+    async fn construct_proxied_response_returns_response_with_status_200() {
+        let (cluster, _registry) = mk_test_cluster().await;
+        let up = upstream(200, vec![("content-type", "text/plain")], b"hello");
+        let resp = construct_proxied_response(&cluster, up, 7, false);
+        assert_eq!(resp.status, 200);
+        // x-envoy-upstream-service-time injected with the elapsed_ms value.
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case(X_ENVOY_UPSTREAM_SERVICE_TIME) && v == "7"),
+            "x-envoy-upstream-service-time: 7 must be present"
+        );
+        // content-length injected from body.len() (5 bytes for "hello").
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("content-length") && v == "5"),
+            "content-length: 5 must be present"
+        );
+        // Connection: keep-alive when close = false.
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("connection") && v == "keep-alive"),
+            "connection: keep-alive must be present"
+        );
+    }
+
+    /// 07.1 Task 5: `construct_proxied_response` increments
+    /// `upstream_rq_total` exactly once and leaves `upstream_rq_5xx` at 0
+    /// for a 200 response.
+    #[tokio::test]
+    async fn construct_proxied_response_increments_upstream_rq_total_only_once() {
+        let (cluster, _registry) = mk_test_cluster().await;
+        let up = upstream(200, vec![], b"");
+        let _resp = construct_proxied_response(&cluster, up, 1, false);
+        assert_eq!(cluster.upstream_rq_total().value(), 1);
+        assert_eq!(cluster.upstream_rq_5xx().value(), 0);
+    }
+
+    /// 07.1 Task 5: `construct_proxied_response` increments both
+    /// `upstream_rq_total` AND `upstream_rq_5xx` on 503, and sets
+    /// `Connection: close` when `close = true`.
+    #[tokio::test]
+    async fn construct_proxied_response_increments_upstream_rq_5xx_on_503() {
+        let (cluster, _registry) = mk_test_cluster().await;
+        let up = upstream(503, vec![], b"");
+        let resp = construct_proxied_response(&cluster, up, 5, true);
+        assert_eq!(resp.status, 503);
+        assert_eq!(cluster.upstream_rq_total().value(), 1);
+        assert_eq!(cluster.upstream_rq_5xx().value(), 1);
+        // Connection: close when close = true.
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("connection") && v == "close"),
+            "connection: close must be present"
+        );
     }
 }
