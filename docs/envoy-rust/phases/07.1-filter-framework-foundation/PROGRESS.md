@@ -781,3 +781,47 @@ The 06.3 REVIEW I1 finding flagged that "workspace-tests-clean does not include 
 
 No code changes; PROGRESS-only commit. Local re-verification:
 - `cargo deny check` (HEAD `12360e3`): `advisories ok, bans ok, licenses ok, sources ok` — clean.
+
+## Task 9 — State-4 PROGRESS materialization + STATE.md advance
+
+### Work summary
+
+THIS commit advances `docs/envoy-rust/STATE.md` from `07.1 lifecycle state 3` → `07.1 state-4-reached / state-5-next`. Next-skill `superpowers:requesting-code-review` per `BOOTSTRAP_PROMPT.md` §5 state 5. Mirrors the parent-06 cadence (06.3 STATE-advance commit `42fc726` / 06.2 STATE-advance commit `4262b64`).
+
+STATE.md edits:
+- **Active phase block** — rewritten to describe the state-3 implementation arc + state-4 verification + state-4-reached/state-5-next routing (replaces the prior state-2 standalone-PLAN narrative).
+- **Next expected skill block** — rewritten for the 07.1 state-5 review session running `superpowers:requesting-code-review`. Documents the state-5 → state-6 → 07.2 advance chain.
+- **Predecessor commit chain block** — extended with the 9 task commits + Task 5.5 ADR-0031 commit + Task 1 fixup commit + Task 8 state-4 evidence commit landed in this state-3 arc.
+- **Last commit / Last updated sections** — rewritten for the Task 9 STATE-advance commit shape.
+- **"Phase-07.1 rollovers (preliminary; final disposition pending state-5 REVIEW.md)" subsection** — added under Notes, mirroring the parent-06 cadence. Records 06.3 REVIEW I1 closure + the new Task 1 license-omission verification-discipline gap (closed at the Task 1 fixup; carries forward as a doctrine reminder for 07.2 state-3 dispatch prompts) + the Task 7 finalize_h2_stream 3-dead-parameter design smell (carries forward to state-5 REVIEW for disposition) + a roll-up of code-quality reviewer findings across Tasks 1-7 (all PLAN-specified architectural decisions — awareness-only inputs to state-5).
+
+ROADMAP.md unchanged — row `07.1` stays `status: in-progress` (flips to `done` ONLY at the 07.1 state-6 close-out commit per the closing-sub-phase invariant; parent row `07` stays `in-progress` until 07.2's state-6 commit per the closing-sub-phase rule).
+
+DECISIONS.md unchanged at **ADR-0031** (advanced from ADR-0030 at the Task 5.5 cycle-resolution commit `8161990` earlier in this state-3 arc; no further ADRs at the Task 9 STATE-advance commit).
+
+### Summary of 07.1 substantive surface (state-5 reviewer's quick-read)
+
+- **Crates created:** 1 (`crates/envoy-filter/`; 5 modules: `error.rs` + `pipeline.rs` + `instance.rs` + `router.rs` + `types.rs` from Task 5.5; 13 unit tests; sole-dep-owner of HTTP filter-chain iteration per parent-07 SPEC §3 D1.1).
+- **Crates modified:** 3 (`envoy-config`, `envoy-http1`, `envoy-http2`).
+- **Workspace members added:** 1 (`crates/envoy-filter`; alphabetically inserted between `envoy-config` and `envoy-http1` in the workspace root `Cargo.toml`).
+- **Cargo deps added:** 0 top-level (only workspace-internal path-deps: `envoy-filter` to `envoy-http1` deps at Task 6 + `envoy-filter` to `envoy-http2` deps at Task 7; reverse direction `envoy-http1` was REMOVED from `envoy-filter`'s deps at the Task 5.5 cycle-resolution commit).
+- **`ConfigError` variants added:** 3 (`EmptyHttpFilters`, `RouterNotTerminal { listener, position }`, `DuplicateRouterFilter`); 1 retained-but-unconstructed (`MultipleHttpFilters` — doc-comment notes supersession per signpost 13).
+- **`Http1Error` variants added:** 1 (`FilterPipeline(envoy_filter::FilterError)` via `#[from]`).
+- **`FilterError` variants:** 4 (`EmptyChain`, `RouterNotTerminal { actual, position, expected }`, `DuplicateRouter { position }`, `UnsupportedFilterType { position, name }`).
+- **HCM wiring sites:** 2 (envoy-http1 + envoy-http2 each gain `Arc<FilterPipeline>` field on `HCMConfig`, decode-side invocation with boundary conversion at the request-entry point, encode-side invocation with boundary conversion before the wire write).
+- **H1 5-writer-arm refactor:** factored at Task 5 (pre-Task-6 invariant); the 5 wire-write sites collapse to a unified site below the writer-arm match.
+- **`finalize_h2_stream` refactor:** at Task 7; gains `pipeline: &mut FilterPipeline` parameter; encode-side invocation before `send_envoy_response`; 3 pre-encode log-local parameters underscore-prefixed (design smell flagged for state-5 REVIEW disposition).
+- **Unit tests added:** 27 across the 07.1 surface (5 Task 1 + 4 Task 2 + 4 Task 3 + 7 Task 4 + 3 Task 5 + 3 Task 6 + 0 Task 7 + 1 implicit `build_router_succeeds` test at Task 3 instance.rs).
+- **Workspace tests:** 551 passed / 0 failed / 2 ignored at HEAD `78d5394` (= Task 8's state-4 anchor commit).
+- **CI evidence anchor:** CI run `25759067004` at HEAD `12360e3` (post-Task-1-fixup), conclusion `success`, completed `2026-05-12T20:05:53Z` (~2m05s wall-clock). Both jobs `success`: `build + test + lint` (workspace fmt + clippy + build + test [including 12 Docker-gated fixtures + h2spec] + cargo deny check) + `fuzz (parse_bootstrap, 30s)`.
+- **DECISIONS.md changes:** 1 ADR landed (ADR-0031 — `envoy-filter ↔ envoy-http1` cycle resolution; landed at Task 5.5 commit `8161990`; advanced ledger head from ADR-0030 → ADR-0031).
+- **BEHAVIOR_CONTRACT.md changes:** 0 (no new stat-name or access-log-field rows; the 13-stat + 14-field state from parent-06 close carries through unchanged).
+- **Differential surface:** regression-equivalence under the existing Router-only chain (all 12 pre-existing fixtures green simultaneously — no new fixture in 07.1; 07.2 lands fixture 0013).
+
+### §7.5 phase-done gate disposition reference
+
+Task 8 commit `78d5394` is the comprehensive state-4 anchor. Gate disposition: (a) N/A (no new fixture); (b) PASS (12/12 green simultaneously); (c) PASS (h2spec ≥95%); (d) PASS (parse_bootstrap fuzz clean); (e) PASS (workspace fmt/clippy/build/test/deny clean); (f) PENDING (REVIEW.md lands at state 5 / next session). 5/6 gates clear; (f) is the natural state-5 disposition.
+
+### Test-bucket attestation (this commit)
+
+No code changes; doc-only commit (STATE.md + PROGRESS.md). No test runs; no clippy/fmt/deny runs needed — the state-4 evidence anchor at Task 8 `78d5394` is the test-bucket attestation for the 07.1 state-3 arc.
