@@ -7,5 +7,9 @@
 //! already-buffered request/response shape established by 04.1 + 05.2.
 
 pub mod error;
+pub mod instance;
+pub mod pipeline;
 
 pub use error::FilterError;
+pub use instance::HttpFilterInstance;
+pub use pipeline::{Decision, FilterPipeline};
