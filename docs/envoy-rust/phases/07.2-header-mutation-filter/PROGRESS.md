@@ -1196,3 +1196,211 @@ advisories ok, bans ok, licenses ok, sources ok
 No new top-level Cargo dependencies. The `license-not-encountered` warnings are pre-existing
 (unmatched allowlist entries in `deny.toml` — identical to Tasks 1-5 attestations). No
 `Cargo.toml` files were modified by Task 6.
+
+---
+
+## Task 7 — `http1-echo-server` helper header-echo verify
+
+**Verify-only; zero code change.** PLAN signpost 10 established Task 7 as a pre-state check:
+verify that `build_echo_body` in `tests/helpers/http1-echo-server/src/main.rs` already echoes
+request headers sorted-by-lowercase-name into the response body per 07.2 SPEC §6 signpost 10.
+No own commit per the PLAN's Task 7 disposition — this note folds into Task 8's commit.
+
+### Verification result
+
+Inspected `tests/helpers/http1-echo-server/src/main.rs` `build_echo_body` (lines 210-244):
+
+```rust
+let mut sorted_headers: Vec<(String, String)> = req
+    .headers
+    .iter()
+    .map(|(n, v)| (n.to_ascii_lowercase(), v.clone()))
+    .collect();
+sorted_headers.sort_by(|a, b| a.0.cmp(&b.0));
+for (n, v) in &sorted_headers {
+    out.push_str("  ");
+    out.push_str(n);
+    out.push_str(": ");
+    out.push_str(v);
+    out.push('\n');
+}
+```
+
+The function lowercases header names then sorts alphabetically — exactly the shape SPEC §6
+signpost 10 specifies. **Zero code change required.**
+
+The helper's 5 existing tests pass (including `accepts_and_echoes_request` which asserts the
+sorted-header body shape directly with `expected_body =
+"method: GET\npath: /\nheaders:\n  content-length: 0\n  host: x.test\nbody: \n"`).
+
+### LoC delta
+
+```
+(zero — verify-only task)
+```
+
+No commit. Task 7's PROGRESS note folds into Task 8's commit per the PLAN's Task 7 disposition.
+
+---
+
+## Task 8 — Fixture `0013-http-filter-header-mutation` + Docker-gated wrapper
+
+**State-3 commit.** Creates the differential fixture `tests/fixtures/0013-http-filter-header-mutation/`
+(5 files: `envoy.yaml`, `envoy-rust.yaml`, `inputs/payload.bin` (0-byte), `expectations.yaml`,
+`README.md`) and the Docker-gated wrapper `tests/differential/tests/http_filter_header_mutation.rs`.
+The fixture drives a GET / through an HCM with `http_filters: [HeaderMutation, Router]` proxying to
+a host-side `http1-echo-server` backend; bilaterally asserts the decode-side stamp
+(`x-filter-stamp: phase-07`, echoed into the body by the backend) and the encode-side stamp
+(`x-filter-response-stamp: phase-07`, on the response headers). Also folds in Task 7's verify-only
+PROGRESS note.
+
+### Work summary
+
+**`tests/fixtures/0013-http-filter-header-mutation/envoy.yaml`** (new file): reference Envoy config.
+Mirrors fixture 0008's `envoy.yaml` shape + the HeaderMutation filter. Node id
+`envoy-rust-phase-07.2-fixture-0013`. Includes `generate_request_id: false` and
+`request_headers_to_remove` (the same 6 headers as fixture 0008) to strip Envoy-injected request
+headers. `http_filters: [HeaderMutation (request+response stamps), Router]`. STRICT_DNS cluster
+with `dns_lookup_family: V4_ONLY`.
+
+**`tests/fixtures/0013-http-filter-header-mutation/envoy-rust.yaml`** (new file): envoy-rust config.
+Mirrors fixture 0008's `envoy-rust.yaml` shape — no `request_headers_to_remove`, no
+`generate_request_id`, no `admin` block, binds `127.0.0.1`. Same `http_filters` chain. STRICT_DNS
+cluster without `dns_lookup_family`.
+
+**`tests/fixtures/0013-http-filter-header-mutation/inputs/payload.bin`** (new file, 0 bytes): GET
+request carries no body; the 0-byte file satisfies the harness's `inputs/` convention.
+
+**`tests/fixtures/0013-http-filter-header-mutation/expectations.yaml`** (new file): mirrors fixture
+0008's actual shape exactly (PLAN-write SPEC correction 4). Driver `kind: http1`, method `get`,
+path `/`, host `envoy-rust.test`, `expected_status: 200`, `expected_body: { kind: byte_exact, body:
+"..." }`, `expected_headers: set_equal_modulo_allow_list`. Top-level `equivalence: { response_status:
+exact, response_body: { kind: byte_exact } }`.
+
+**`tests/fixtures/0013-http-filter-header-mutation/README.md`** (new file): fixture documentation
+per PLAN Step 5 verbatim template.
+
+**`tests/differential/tests/http_filter_header_mutation.rs`** (new file): Docker-gated wrapper.
+Mirrors `http1_router_upstream.rs` shape exactly. No `#[ignore]` (Docker-gating is handled by the
+harness's `run_fixture`). `#[tokio::test]`.
+
+### TDD step trace
+
+1. **Steps 1-6 (fixture + wrapper files created):** All 6 files written per PLAN's Step 1-6.
+2. **Step 7 (Docker-gated local run):**
+
+```
+cargo test -p differential --test http_filter_header_mutation -- --nocapture 2>&1 | tail -60
+```
+
+Output:
+```
+   Compiling differential v0.0.0 (/Users/esa/git/envoy-rust/tests/differential)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.36s
+     Running tests/http_filter_header_mutation.rs (target/debug/deps/http_filter_header_mutation-a98ebdb573f58d70)
+
+running 1 test
+[INFO] node registered node.id=envoy-rust-phase-07.2-fixture-0013 node.cluster=envoy-rust-phase-07.2
+[INFO] envoy-rust listening (http_connection_manager) addr=127.0.0.1:58522 stat_prefix=ingress_http1 codec_type=HTTP1
+test http_filter_header_mutation_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.64s
+```
+
+**GREEN on first run — 1 passed, 0 failed.** Both the per-proxy `expected_body.body` assertion
+AND the cross-proxy `equivalence.response_body` byte_exact check passed on the first attempt.
+
+**`expected_body.body` was NOT corrected from the prediction.** The predicted string
+`"method: GET\npath: /\nheaders:\n  host: envoy-rust.test\n  x-filter-stamp: phase-07\nbody: \n"`
+matched the actual harness output exactly. Derivation confirmed: `drive_http1` sends only
+`Host: envoy-rust.test` and `Connection: close` (no `content-length`); the HeaderMutation filter
+appends `x-filter-stamp: phase-07`; the backend receives `{host, x-filter-stamp}` and echoes them
+sorted alphabetically (`h` < `x`).
+
+3. **Step 8 (workspace gate):** All 5 commands clean (see attestation below).
+
+### LoC delta
+
+```
+tests/fixtures/0013-http-filter-header-mutation/envoy.yaml         +62 lines (new file)
+tests/fixtures/0013-http-filter-header-mutation/envoy-rust.yaml    +47 lines (new file)
+tests/fixtures/0013-http-filter-header-mutation/inputs/payload.bin   0 lines (0-byte new file)
+tests/fixtures/0013-http-filter-header-mutation/expectations.yaml  +14 lines (new file)
+tests/fixtures/0013-http-filter-header-mutation/README.md          +51 lines (new file)
+tests/differential/tests/http_filter_header_mutation.rs            +20 lines (new file)
+docs/envoy-rust/phases/07.2-header-mutation-filter/PROGRESS.md    +~130 lines (Task 7+8 notes)
+Total: ~324 insertions, 0 deletions
+```
+
+PLAN budget for Task 8: ~290 LoC. Actual ~324 LoC — the ~34-line overage is the PROGRESS note
+(Task 7 verify-only note folded in per PLAN disposition + the Task 8 Docker-run attestation).
+
+### Deviations from PLAN
+
+None. The PLAN's predicted `expected_body.body` was correct on the first Docker run — no
+empirical correction pass was needed. Fixture files mirror the PLAN's verbatim content. Wrapper
+mirrors `http1_router_upstream.rs` exactly.
+
+### Test-bucket attestation
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.28s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.39s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+All test suites passed (0 failed). Key crate counts: `envoy-config` 207 tests; `envoy-filter`
+32 tests; `envoy-http1` 68 tests; `envoy-http2` 42 tests (1 ignored); `differential` crate
+77+ tests (1 ignored) — the new `http_filter_header_mutation_fixture` test is included in
+the `differential` suite run and passes. No flakes observed.
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies. The `license-not-encountered` warnings are pre-existing
+(unmatched allowlist entries in `deny.toml` — identical to Tasks 1-6 attestations). No
+`Cargo.toml` files were modified by Task 8.
