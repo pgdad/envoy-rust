@@ -1544,3 +1544,54 @@ advisories ok, bans ok, licenses ok, sources ok
 No new top-level Cargo dependencies (no `Cargo.toml` files modified by Task 9 — all required
 dev-deps were already present). The `license-not-encountered` warnings are pre-existing
 (unmatched allowlist entries in `deny.toml` — identical to Tasks 1-8 attestations).
+
+---
+
+## Task 10 — state-4 phase-done gate evidence (13 fixtures simultaneously green)
+
+**Docs-only commit.** Materializes the §7.5 phase-done gate evidence at HEAD `20a393d`
+(the Task 9 commit). All gates GREEN per CI run `25887571566`
+(`https://github.com/pgdad/envoy-rust/actions/runs/25887571566`,
+conclusion `success`, completed `2026-05-14T21:49:18Z`). Both CI jobs green:
+
+- **`build + test + lint`** ✅ — ran `cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings`, `cargo build --workspace --all-targets`,
+  `cargo test --workspace`, and `cargo deny check` — all clean.
+- **`fuzz (parse_bootstrap, 30s)`** ✅ — `cargo +nightly fuzz run parse_bootstrap --
+  -max_total_time=30` ran clean (no crash; ~110k+ iterations; the Task 6
+  `hcm_header_mutation_filter.yaml` seed is in the corpus and was exercised).
+
+### Phase-done gate summary
+
+- **workspace tests:** `cargo test --workspace` — PASS (601 tests passed across 57 test binaries,
+  0 failed; HEAD `20a393d`)
+- **Docker-gated fixtures (13 total, 0001-0013):** all green simultaneously per CI run
+  `25887571566` (`https://github.com/pgdad/envoy-rust/actions/runs/25887571566`,
+  conclusion `success`, completed `2026-05-14T21:49:18Z`, HEAD `20a393d`).
+  All 13 fixtures passed as `... ok`:
+  - `echo_fixture` (0001)
+  - `tcp_proxy_fixture` (0002)
+  - `tls_downstream_fixture` (0003)
+  - `tls_upstream_fixture` (0004)
+  - `tls_sni_fixture` (0005)
+  - `http1_direct_response_fixture` (0006)
+  - `admin_ready_fixture` (0007)
+  - `http1_router_upstream_fixture` (0008)
+  - `http2_direct_response_fixture` (0009)
+  - `http2_router_upstream` (0010)
+  - `admin_stats_prometheus` (0011)
+  - `access_log_file_sink` (0012)
+  - `http_filter_header_mutation_fixture` (0013)
+- **h2spec conformance:** 99.31% (≥95% gate held; `h2spec_pass_rate_gate` PASS; 05.2 baseline
+  99.31% carried forward unchanged; `known-failures.txt` unchanged — 07.2 engages no H2-framing
+  surfaces)
+- **`parse_bootstrap` fuzz:** clean (short-budget CI run, `-max_total_time=30`; the Task 6
+  `hcm_header_mutation_filter.yaml` seed exercised; no crash)
+- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`:** clean
+- **`cargo fmt --all -- --check`:** clean
+- **`cargo deny check`:** clean
+- **`cargo build --workspace --all-targets`:** clean
+
+All §7.5 phase-done gates GREEN. STATE.md advances to `07.2 state-4-reached / state-5-next`;
+the next session is the 07.2 state-5 REVIEW.md session invoking
+`superpowers:requesting-code-review`.

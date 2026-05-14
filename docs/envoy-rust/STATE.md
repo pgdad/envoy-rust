@@ -10,7 +10,7 @@
 **id:** `07.2`
 **slug:** `07.2-header-mutation-filter`
 **directory:** `docs/envoy-rust/phases/07.2-header-mutation-filter/` holds `SPEC.md` (the 07.2 sub-phase design contract; ~1100 lines; landed at the parent-07 state-2 split commit `6db5a01` alongside the 07.1 SPEC) + `PLAN.md` (the standalone implementation plan; 10 tasks; ~1600 LoC projected; landed at THIS state-2 commit) + `PROGRESS.md` (CREATED at THIS state-2 commit with the Task 1 preamble per the `dc00750` 06.2 cadence — 8 PLAN-write SPEC corrections + 16 architecture-decision lock-ins; per-task narrative appends from Task 1 onward). `REVIEW.md` does not exist yet (lands at state 5). Sibling directory `docs/envoy-rust/phases/07.1-filter-framework-foundation/` holds the full closed-out artifact set — `SPEC.md` + `PLAN.md` + `PROGRESS.md` + `REVIEW.md` (verdict **Approved with M-track follow-ups** — 0 Critical / 1 Important / 3 Minor). Parent directory `docs/envoy-rust/phases/07-filter-chain-framework/` continues to hold the parent SPEC unedited per D-3.4 / D-3.5.
-**status:** sub-phase 07.2 lifecycle **state 3 (SPEC.md + PLAN.md exist; implementation incomplete)** — ROADMAP row `07.2` flipped `status: planned` → `status: in-progress` at THIS state-2 PLAN-write commit per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3 (a phase enters `in-progress` only when STATE.md points at it AND its PLAN.md has landed). ROADMAP row `07` remains `status: in-progress` (flips to `done` only at the closing sub-phase 07.2's state-6 commit per the ROADMAP-schema invariant "parent flips to `done` only after all sub-phases are `done`"); ROADMAP row `07.1` remains `status: done`. The next session — operating as the **sub-phase-07.2 state-3 executor** — invokes **`superpowers:subagent-driven-development`** scoped to `docs/envoy-rust/phases/07.2-header-mutation-filter/PLAN.md` (per the user's standing preference auto-memory `feedback_execution_style`), dispatching Task 1 (the `envoy-config` HeaderMutation schema additions) to the first subagent.
+**status:** sub-phase 07.2 lifecycle **state 4-reached / state-5-next (implementation complete + verified; REVIEW.md pending)** — Tasks 1-10 all landed; the §7.5 phase-done gate is GREEN per CI run `25887571566` (`https://github.com/pgdad/envoy-rust/actions/runs/25887571566`, conclusion `success`, completed `2026-05-14T21:49:18Z`, HEAD `20a393d`): all 13 Docker-gated fixtures green simultaneously, h2spec ≥95% gate held (99.31% baseline), `parse_bootstrap` fuzz clean, workspace tests 601 passed / 0 failed across 57 binaries, `cargo clippy` / `cargo fmt` / `cargo deny check` / `cargo build` all clean. ROADMAP row `07.2` remains `status: in-progress` (flips to `done` only at the state-6 close-out commit); ROADMAP row `07` remains `status: in-progress` (flips to `done` only at the closing sub-phase 07.2's state-6 commit per the ROADMAP-schema invariant "parent flips to `done` only after all sub-phases are `done`"); ROADMAP row `07.1` remains `status: done`. The next session is the **07.2 state-5 session**, which invokes **`superpowers:requesting-code-review`** scoped to the 07.2 surface (reviewed range `c7dea4c..HEAD`).
 
 **Phase 07.1 (`07.1-filter-framework-foundation`) is DONE as of this commit.** The filter-framework foundation slice landed end-to-end: new workspace member `crates/envoy-filter/` (5 modules — `error.rs` + `pipeline.rs` + `instance.rs` + `router.rs` + `types.rs`; 13 unit tests; `#![forbid(unsafe_code)]` per D-3.8; `license = "Apache-2.0"`; sole-dep-owner of HTTP filter-chain iteration; zero new top-level Cargo deps — workspace-internal path-deps only) + `FilterPipeline` with `Decision::{Continue, StopAndSend(FilterResponse)}` and declaration-order decode / reverse-declaration-order encode iteration per parent-07 SPEC §6 Rule 6 + `HttpFilterInstance::Router(RouterTerminus)` Router-only enum (HeaderMutation lands in 07.2) + H1 HCM filter-chain wiring at `crates/envoy-http1/src/hcm.rs::serve_connection` (Task 5 5-writer-arm pure refactor → Task 6 decode/encode invocation with boundary conversion `envoy_http1::Request` ↔ `FilterRequest` via `std::mem::take` + write-back) + H2 HCM filter-chain wiring at `crates/envoy-http2/src/hcm.rs` (Task 7 symmetric refactor — `finalize_h2_stream` gains `pipeline: &mut FilterPipeline`; encode-side invocation before `send_envoy_response`) + envoy-config terminal-router validator `validate_http_filters` (Task 4; 3 new `ConfigError` variants — `EmptyHttpFilters` / `RouterNotTerminal` / `DuplicateRouterFilter`; existing `MultipleHttpFilters` retained per signpost 13; 7 unit tests). **No new fixture in 07.1** — the differential surface is regression-equivalence under the existing Router-only chain (all 12 Docker-gated fixtures `0001-tcp-echo` through `0012-access-log-file-sink` GREEN simultaneously at the state-4 anchor commit `78d5394` / CI run `25759067004` HEAD `12360e3`, conclusion `success`, completed `2026-05-12T20:05:53Z`; h2spec ≥95% carry-forward from the 05.2 baseline 99.31%; `parse_bootstrap` fuzz clean; workspace tests 551 passed / 0 failed / 2 ignored). Landed in 11 substantive commits (`586de82` Task 1 → `e43820e` Task 2 → `2002f4e` Task 3 → `111237a` Task 4 → `b9dfa29` Task 5 → `8161990` Task 5.5 → `84d68c1` Task 6 → `3e041c5` Task 7 → `12360e3` Task 1 fixup → `78d5394` Task 8 → `5e9fe1a` Task 9) between base `8259275` (the 07.1 state-2 standalone PLAN.md commit) and head `5e9fe1a` (the state-4 PROGRESS materialization + STATE-advance commit), plus the state-5 REVIEW.md commit `5408abb`, plus this state-6 close-out commit. **ADR-0031** landed in 07.1 at Task 5.5 (`8161990`) — an in-execution cycle-resolution ADR per D-3.5 (the `envoy-filter` ↔ `envoy-http1` Cargo cycle that parent-07 SPEC §5 signpost 7 anticipated only at module-level; Cargo treats whole crates as units, so the "no cycles" reasoning did not survive at the crate-graph level; ADR-0031 re-homes filter-visible request/response shapes into `envoy-filter::types` as `FilterRequest` + `FilterResponse` subset types and removes the `envoy-http1` path-dep from `envoy-filter`). No other ADRs landed — the no-foundations-grants posture per parent-07 SPEC §6 Rule 5 was honored end-to-end (no new top-level Cargo deps). Phase 07.1 `REVIEW.md` (landed at `5408abb`) verdict is **Approved with M-track follow-ups** — 0 Critical / 1 Important (I1 Task 7 `finalize_h2_stream` 3-dead-parameter design smell — carry forward to 07.2 Task 5) / 3 Minor (M1 unused `tracing` dep / M2 three unconstructed `FilterError` variants / M3 ADR-0031 cascade narration polish) — see "Phase-07.1 rollovers" below for the carryforward disposition.
 
@@ -56,199 +56,79 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 23-26, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 3): the next session — operating as the **sub-phase-07.2 state-3 executor** — invokes **`superpowers:subagent-driven-development`** scoped to `docs/envoy-rust/phases/07.2-header-mutation-filter/PLAN.md` (per the user's standing preference auto-memory `feedback_execution_style` — do NOT present the inline-`executing-plans` fork at state-3 entry). The PLAN.md (landed at THIS state-2 commit) decomposes the 07.2 SPEC §3 deliverables D8.2-D15.2 into **10 numbered tasks**, recommended execution order `1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10`, each its own state-3 commit under TDD per `superpowers:test-driven-development`, appending to PROGRESS.md on each task completion. The executor reads the PLAN's per-task step lists, public-surface signatures, and architecture-decisions table; the PLAN already locks all 16 architecture decisions per `feedback_pick_recommendation` so the executor does not re-litigate.
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 23-26, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 5): the next session — operating as the **sub-phase-07.2 state-5 reviewer** — invokes **`superpowers:requesting-code-review`** scoped to the 07.2 surface. Reviewed range: **`c7dea4c..HEAD`** (the 07.2 state-2 PLAN-write commit through the Task 10 state-4-verification commit). The 07.2 implementation arc landed in 9 substantive task commits (`77e91ae` Task 1 → `20a393d` Task 9) plus the state-2 PLAN commit `c7dea4c` and the state-4-reached / state-5-next STATE advance commit (this commit). All tasks complete; REVIEW.md does not yet exist (lands at state 5).
 
-**Split-gate evaluation at PLAN-write (recorded for the executor's cross-reference):** 10 tasks (well under the §6.1 ~25-task gate); ~1600 LoC projected (production ~440; tests ~740; fixture/doc ~410) — ~+7% over the ~1500-LoC soft gate, concentrated in test + fixture material. Per parent-07 SPEC §5 + ADR-0030 (reject nested splits of a split-produced sub-phase) + the 06.x accept-drift precedent, the PLAN accepts the drift and does NOT nest-split. In-execution release valve if a task inflates past ~10 sub-steps: per-step commit splitting recorded in PROGRESS (e.g. Task 5a/5b/5c), NOT a phase-level nest-split.
+**Carryforward closures confirmed at 07.2 execution:**
 
-**Two 07.1-REVIEW carryforward obligations folded into the 07.2 PLAN** (see "Phase-07.1 rollovers" below for the full ledger):
+- **07.1 REVIEW I1 CLOSED** — Task 5 (Step group A): `finalize_h2_stream` 3-dead-parameter cleanup. The 3 underscore-prefixed parameters (`_response_status_for_log`, `_response_body_len`, `_response_headers_for_log`) removed from `finalize_h2_stream`'s signature; all 3 callers updated; ~22 line net removal; behavior-neutral.
+- **07.1 REVIEW M1 CLOSED** — Task 3: unused `tracing` dep removed from `envoy-filter`'s `Cargo.toml`.
+- **07.1 REVIEW M2 partially closed** — Task 3: `UnsupportedFilterType` is now constructable via the `map_entry` defense-in-depth check in `build_from_config`. `RouterNotTerminal` / `DuplicateRouter` stay defense-in-depth-only (not reachable under the terminal-router validator gate — per original REVIEW M2 disposition).
 
-1. **I1 — `finalize_h2_stream` 3-dead-parameter design smell.** Folded into **07.2 Task 5 (Step group A)** as the named structural prerequisite — Option B mechanical cleanup: remove the 3 underscore-prefixed parameters (`_response_status_for_log`, `_response_body_len`, `_response_headers_for_log`) from `finalize_h2_stream`'s signature; all 3 callers stop computing the pre-encode trio; the function's existing post-encode shadow locals (`crates/envoy-http2/src/hcm.rs:490-493`) already derive everything from `resp`. ~12 line net removal; behavior-neutral.
-2. **`cargo deny check` doctrine reminder.** The PLAN's Conventions section + every code-changing task's final step **explicitly require `cargo deny check` output to be quoted in the per-task PROGRESS attestation** (NOT "assumed no-op") — the 07.1 state-4 CI predecessor run `25758889478` failed at `cargo deny check` because a "no-op" assumption masked the per-crate `[package] license` field check. Folded into the PLAN's architecture-decision table (signpost 7) + every task's "Workspace-wide checks" step.
+**No new ADRs landed.** DECISIONS.md ledger head stays **ADR-0031** (landed at the 07.1 Task 5.5 cycle-resolution commit `8161990`); ADR-0032 stays reserved-available. No new top-level Cargo deps landed in 07.2 (the `test-util` Cargo feature on `envoy-filter` is a feature flag, not a new dep; no foundations grants).
 
-The per-sub-phase cycle continues for 07.2:
+**Per `BOOTSTRAP_PROMPT.md` §5.1 ("one state per session"):** the state-5 session lands REVIEW.md; the state-6 close-out (which ALSO closes parent-07) is a separate session. The state-6 commit flips ROADMAP rows `07.2` AND `07` from `in-progress` → `done` per the closing-sub-phase invariant; its commit title mirrors the `b918f33` / `82c26b8` / `e626862` parent-close shape: `phase 07.2: envoy.filters.http.header_mutation + fixture 0013 [parent 07 done] [ADR-0030, ADR-0031]`.
 
-1. **07.2 state-3** (subagent-driven-development; THIS session's successor) → per-task commits landing the `envoy-config` HeaderMutation schema + validator, the `HeaderMutationFilter` runtime + `HttpFilterInstance::HeaderMutation` variant + decode/encode semantics, the H1+H2 HCM filter-chain integration tests (with the I1 `finalize_h2_stream` cleanup folded into Task 5) + the `test-util` Cargo feature on `envoy-filter`, the fuzz corpus seed, the `http1-echo-server` helper verify, the new differential fixture `0013-http-filter-header-mutation` + Docker-gated wrapper, the in-process backstop, and the state-4 verification.
-2. **07.2 state-4** → CI evidence anchor with 13 fixtures simultaneously green (the existing 12 plus fixture 0013 bilaterally green) + h2spec ≥95% + `parse_bootstrap` fuzz clean (Task 10 materializes this).
-3. **07.2 state-5** (review) → REVIEW.md.
-4. **07.2 state-6** (close-out) — also the **parent-07 close-out** per the closing-sub-phase invariant. STATE.md advances to point at `08 state 1` (next-skill `superpowers:brainstorming`); ROADMAP row `07.2` flips `in-progress` → `done`; ROADMAP row `07` ALSO flips `in-progress` → `done`. Commit title `phase 07.2: envoy.filters.http.header_mutation + fixture 0013 [parent 07 done] [ADR-0030, ADR-0031]`. Mirrors phase-02's `f04e21a`-shape close-out, phase-03's `ca81226`-shape close-out, phase-04's `e626862`-shape close-out, phase-05's `82c26b8`-shape close-out, and phase-06's `b918f33`-shape close-out.
+**Standing context for the 07.2 state-5 reviewer:**
 
-The DECISIONS.md ledger head is **ADR-0031** as of this commit (landed at the 07.1 Task 5.5 cycle-resolution commit `8161990`; advanced from ADR-0030; unchanged at this state-6 close-out per D-3.5 append-only — no new ADR lands at a docs-only close-out commit). Phase 07's next-available ADR is **ADR-0032**, reserved-available for 07.2 execution-time landings per D-3.5 if surfaced as essential, or for later phases if unused. The recommended posture per parent-07 SPEC §6 Rule 5 + 07.2 SPEC §7 remains **no foundations grants** in phase 07 — 07.1 honored it end-to-end (the sole ADR-0031 is an architectural cycle fix, not a foundations grant; zero new top-level Cargo deps).
+- **13 Docker-gated fixtures (0001-0013) are GREEN simultaneously** per CI run `25887571566` (HEAD `20a393d`, conclusion `success`, completed `2026-05-14T21:49:18Z`). The new fixture `0013-http-filter-header-mutation` asserts bilateral equivalence: both Envoy and envoy-rust append `x-filter-stamp: phase-07` (decode-side; echoed into the body by the `http1-echo-server` backend) and `x-filter-response-stamp: phase-07` (encode-side; on the response headers).
+- **`h2spec` conformance suite** holds at the **≥95% pass** gate (05.2 baseline 99.31%; `h2spec_pass_rate_gate` PASS). `known-failures.txt` unchanged — 07.2 engages no H2-framing surfaces.
+- **BEHAVIOR_CONTRACT.md** unchanged (13 stat-name rows + 14 access-log field rows + the "06.1 Prometheus exposition shape divergence" subsection). 07.2 SPEC §2 projected no new sections under recommended posture (HeaderMutation is deterministic on both proxies — identical config → byte-identical mutations); no empirical divergence surfaced in 07.2.
+- **DECISIONS.md** unchanged at **ADR-0031** — no ADR lands at a state-4 verification commit per the standalone-PLAN precedent.
 
-Final parent-06 sub-phase set (at parent-06 close commit `b918f33`):
-
-- **06.1 `stats-and-admin`** — DONE at commit `55fe62d`. No ADRs landed (recommended posture honored). Lit up the `envoy-stats` + `envoy-admin` foundation crates end-to-end; phase-01 admin migration; representative stats wiring at listener / cluster / HCM seams; fixture `0011-admin-stats-prometheus`; first-time population of BEHAVIOR_CONTRACT.md `Stat-name mapping` initial entries (3 rows for the representative stat subset). REVIEW.md verdict **Approved with M-track follow-ups** — 0 Critical / 2 Important / 6 Minor. Closed phase-05.3 REVIEW I3 (placeholder CI URL evidence-discipline regression) structurally.
-- **06.2 `access-log`** — DONE at commit `389ef96`. No ADRs landed (recommended posture honored). Lit up the `envoy-accesslog` foundation crate (hand-rolled default-format emitter + ISO-8601 + Gregorian helper + concrete `FileSink` + `Sink` trait deferred per option (c)); HCM access-log dispatch on H1 + H2 with single factored join points; envoy-config schema additions (file-sink-only validator gate); differential harness extension (`Driver::Http1WithAccessLog` + per-token `AccessLogLineRule` + hand-rolled tokenizer); fixture `0012-access-log-file-sink`; first-time population of BEHAVIOR_CONTRACT.md `Access log field mapping` (14 default-format token rows). REVIEW.md verdict **Approved with M-track follow-ups** — 0 Critical / 2 Important / 5 Minor.
-- **06.3 `stats-wiring-and-close`** — DONE at commit `b918f33`. No ADRs landed (recommended posture honored). Lit up the comprehensive Envoy stat tree at HCM / router / listener / cluster seams (per-response-class HCM counters; connection-lifetime gauges + `ConnGaugeGuard` RAII; upstream-rq counters; access-log line counter + sibling failed-emission counter via `Counter::add(N)` at queue-enter time per Rule 4; listener accept-failure counter); landed the parse-time `Http2ClusterFromHttp1Listener` validator gate closing 05.3 REVIEW I1 substantively; extended `BodyRule::PrometheusExposition` with `value_exact` / `value_must_be_zero` / `value_present_only` schema fields + fixture 0011's `expectations.yaml`; extended BEHAVIOR_CONTRACT.md `Stat-name mapping` with 10 new rows. Closed 5 cross-phase carryforwards (05.3 REVIEW I1; 06.1 REVIEW I1; 06.2 REVIEW I1; 06.2 REVIEW I2; 06.2 REVIEW M3). REVIEW.md verdict **Approved with M-track follow-ups** — 0 Critical / 3 Important (I1 verification-discipline gap; I2 PLAN scope-narrowing; I3 state-4 CI URL closed at the state-6 commit) / 7 Minor.
-
-Execution ordering for parent-06: 06.1 → 06.2 → 06.3 (strict, per parent-06 SPEC §5 + ADR-0029). Unlike parent-05 where the 05.4 fixture-hardening sibling executed between 05.1 and 05.2 (lex-vs-execution-order disconnect), parent-06's lex order matched execution order one-to-one.
-
-**Phase-07 state-2 split decision summary** (codified in ADR-0030 landed at this commit; the two sub-phase SPECs are also landed at this commit):
-
-- **ADR-0030 (parent-07 split decision)** lands at this commit. Decomposes parent-07 into two sub-phases per the parent SPEC §5 + §7 + §10 projection. 2-way split mirrors phase-02's ADR-0013 + phase-03's ADR-0017 2-way precedents (this is the third 2-way split in the project; phases 02 / 03 / 07 split 2-way, phases 04 / 05 / 06 split 3-way). Combined LoC ~1700 over the §6.1 ~1500 LoC gate (~+13%; ~+36% after the parent-04.3 ~+20% drift envelope); task count ~19 within the 25-task cap. The H1 5-writer-arm refactor is the load-bearing complexity contributor (mechanically simple per arm but highly cross-cutting). Single-phase shipment historically risks a §6.2-anti-pattern mid-execution re-split — strictly worse than splitting at state 2.
-
-- **Sub-phase 07.1 — `07.1-filter-framework-foundation`** (~900 LoC, ~9 tasks; depends on `06`):
-  - New workspace member `crates/envoy-filter/` (sole-dep-owner of HTTP filter-chain dispatch logic; `HttpFilterInstance` enum Router-only at 07.1; `FilterPipeline` struct holding `Vec<HttpFilterInstance>`; `Decision::{Continue, StopAndSend(Response)}` enum from day one for forward-compat — no 07.x filter emits StopAndSend in MVP; `FilterError` typed-error; `build_from_config` constructor; `decode_headers` + `encode_headers` non-async iteration methods; depends on `envoy-config` + `envoy-http1::codec` only; `#![forbid(unsafe_code)]` per D-3.8).
-  - HCM filter-chain wiring at H1 (`crates/envoy-http1/src/hcm.rs::serve_connection` decode-side invocation immediately after `parse_request` returns Ok and before `build_response`; encode-side invocation at the unified factored site after the writer-arm match populates the response value but before the wire write — requires the load-bearing 5-writer-arm refactor at `crates/envoy-http1/src/hcm.rs:378-516`).
-  - HCM filter-chain wiring at H2 (symmetric `finalize_h2_stream` refactor at `crates/envoy-http2/src/hcm.rs`; decode-side invocation in `handle_one_stream` after `http_to_envoy_request` translation; encode-side invocation in `finalize_h2_stream` before `send_envoy_response`).
-  - Terminal-router validator at `crates/envoy-config/src/bootstrap.rs::validate_hcm` (relaxes the existing `MultipleHttpFilters` cardinality gate at lines 1335-1347 from `len != 1` to `len >= 1 AND Router-last AND no-duplicate-Router`; new `ConfigError` variants `EmptyHttpFilters { listener: String }`, `RouterNotTerminal { listener: String, position: usize }`, `DuplicateRouterFilter { listener: String }`).
-  - **No new fixture** — the framework is regression-equivalent under the existing Router-only chain; the state-4 phase-done gate verifies all 12 existing fixtures `0001-tcp-echo` through `0012-access-log-file-sink` stay green simultaneously at the Docker-gated CI level, proving the framework wiring introduces no wire-behavior regression.
-  - Recommended posture: no new foundations grants (synchronous non-async iteration avoids `async_trait`; manipulates only `Vec<(String, String)>` + `Bytes` primitives).
-  - See `docs/envoy-rust/phases/07.1-filter-framework-foundation/SPEC.md` for the full per-task PLAN-ready cadence (9 tasks, ~1110 LoC projected including test code).
-
-- **Sub-phase 07.2 — `07.2-header-mutation-filter`** (~800 LoC, ~10 tasks; depends on `07.1`):
-  - Extends `HttpFilterInstance` with `HeaderMutation(HeaderMutationFilter)` variant + `HeaderMutationFilter` runtime struct holding `request_mutations: Vec<RuntimeHeaderMutation>` + `response_mutations: Vec<RuntimeHeaderMutation>` (with `RuntimeHeaderMutation { key: String /* lowercased once at build time */, value: String, action: RuntimeAppendAction }`).
-  - envoy-config schema additions at `crates/envoy-config/src/bootstrap.rs:442-447` (`HttpFilterTypedConfig::HeaderMutation(HeaderMutationConfig)` variant; new structs `HeaderMutationConfig` / `Mutations` / `HeaderMutationEntry` / `HeaderValueOption` / `HeaderValue` / `AppendAction`; all with `#[serde(deny_unknown_fields)]`).
-  - `AppendAction` MVP variants `APPEND_IF_EXISTS_OR_ADD` + `OVERWRITE_IF_EXISTS_OR_ADD`. Other variants (`ADD_IF_ABSENT`, `OVERWRITE_IF_EXISTS`) parse at schema level but validator-reject via new `ConfigError::UnsupportedHeaderMutationAppendAction` variant + new `EmptyHeaderMutationKey` + `InvalidHeaderMutationKey` variants.
-  - Fuzz corpus extension (`hcm_header_mutation_filter.yaml` seed at `crates/envoy-config/fuzz/corpus/parse_bootstrap/`; `.gitignore` allow-list entry; `fuzz_corpus_seeds_parse_or_reject_cleanly` test extension).
-  - New differential fixture `tests/fixtures/0013-http-filter-header-mutation/` (5 files: `envoy.yaml` with HCM `http_filters: [HeaderMutation, Router]` chain appending `x-filter-stamp: phase-07` on request_mutations + `x-filter-response-stamp: phase-07` on response_mutations, single route to an Http1EchoBackend cluster; `envoy-rust.yaml` identical modulo per-side STRICT_DNS / dns_lookup_family pattern from fixture 0008; `inputs/payload.bin` 0-byte placeholder; `expectations.yaml` asserting bilateral equivalence on response status + body + headers; `README.md` explaining the surface) + Docker-gated `tests/differential/tests/http_filter_header_mutation.rs` + in-process backstop at `crates/envoy-bin/tests/http_filter_header_mutation.rs`.
-  - Parent-07 state-6 close-out at 07.2's state-6 commit (closing sub-phase flips parent ROADMAP row `07` from `in-progress` to `done` per the ROADMAP-schema invariant); mirrors phase-02's `f04e21a`-shape close-out, phase-03's `ca81226`-shape close-out, phase-04's `e626862`-shape close-out, phase-05's `82c26b8`-shape close-out, and phase-06's `b918f33`-shape close-out.
-  - See `docs/envoy-rust/phases/07.2-header-mutation-filter/SPEC.md` for the full per-task PLAN-ready cadence (10 tasks, ~1600 LoC projected including test code + fixture YAML).
-
-- **Cross-sub-phase architectural invariants** (parent SPEC §6; 10 rules summarized — full text in parent SPEC):
-  - Rule 1: `envoy-filter` is the sole workspace dep on filter-chain dispatch logic.
-  - Rule 2: `envoy-filter` exports iteration primitives only; HCM consumers invoke.
-  - Rule 3: `Router` is always the last entry in the filter chain.
-  - Rule 4: Filter chain runs once per H1 keep-alive request and once per H2 stream.
-  - Rule 5: Synchronous (non-async) iteration on both decode and encode sides.
-  - Rule 6: Iteration order is declaration order on decode, reverse declaration order on encode.
-  - Rule 7: `decode_headers` runs BEFORE route-match.
-  - Rule 8: `encode_headers` runs AFTER the writer arm but BEFORE the wire write.
-  - Rule 9: Phase 07 does NOT engage filter-state or dynamic-metadata machinery.
-  - Rule 10: Crate dep graph stack `envoy-config → envoy-filter → envoy-http1, envoy-http2 → envoy-bin`. No cycles.
-
-- **DECISIONS.md ledger head advance** at this commit: `ADR-0029` → `ADR-0030`. ADR-0030 (parent-07 split decision) is the only ADR at this commit. Conditional ADR-0031 (foundations grant for `async_trait` or similar) + ADR-0032 (Cargo.lock cadence ratification) NOT pre-committed; numbers stay reserved-available for execution-time landings.
-
-- **BEHAVIOR_CONTRACT.md** unchanged at this commit. Parent SPEC §2 + 07.1 SPEC §2 + 07.2 SPEC §2 all project no new BEHAVIOR_CONTRACT.md sections under recommended posture; sub-phase task-time edits land if empirical divergence surfaces.
-
-- **Pre-existing scratch in worktree at parent-07 state-2 entry** (recovered cleanly at this commit): the prior aborted session left an unstaged `DECISIONS.md` ADR-0030 append + two empty sub-phase directories. The ADR-0030 content was substantively correct (mirrors ADR-0029's shape; correct date, ledger-head provenance, options enumeration, decision, rationale, and consequences) and was kept at this commit; the empty directories are populated with their SPEC.md files at this commit. No `superpowers:systematic-debugging` invocation was needed per `BOOTSTRAP_PROMPT.md` §1 Step E because the partial worktree state matched the prescribed state-2 work exactly; the disposition is documented here for future-session cross-reference (and to close out the unexpected-state observation for the historical record).
-
-**Standing context for the 07.2 state-3 subagent-driven-development session:**
-
-- **12 Docker-gated fixtures (0001-0012) are GREEN simultaneously** as of the 07.1 state-4 anchor (CI run `25759067004`, HEAD `12360e3`, conclusion `success`, completed `2026-05-12T20:05:53Z`). 07.2 adds fixture `0013-http-filter-header-mutation` (Task 8) and the state-4 gate (Task 10) verifies all **13** green simultaneously in one CI run. The HeaderMutation schema + filter runtime + validator extension introduce no behavioral change on any existing fixture (each declares only `[Router]` in `http_filters`).
-- **`h2spec` conformance suite** continues at the **≥95% pass** gate (05.2 baseline 99.31%). 07.2's HeaderMutation filter manipulates only request/response headers; H2-framing surfaces are untouched — `known-failures.txt` unchanged.
-- **BEHAVIOR_CONTRACT.md** has 13 stat-name rows + 14 access-log field rows + the "06.1 Prometheus exposition shape divergence" subsection. 07.2 SPEC §2 projects **no new BEHAVIOR_CONTRACT.md sections** under the recommended posture (HeaderMutation is deterministic on both proxies — identical config → byte-identical `(key, value)` mutations). A new row/subsection lands only if a 07.2 task surfaces an empirical divergence.
-- **The 07.1-landed surfaces 07.2 extends** — `crates/envoy-filter/` (`HttpFilterInstance` Router-only enum + `FilterPipeline` + `Decision::{Continue, StopAndSend}` + `FilterError` + `FilterRequest`/`FilterResponse` value types per ADR-0031 + `RouterTerminus`); `crates/envoy-config/src/bootstrap.rs` (`HttpFilterTypedConfig::Router` enum + `validate_http_filters` terminal-router validator); `crates/envoy-http1/src/hcm.rs` + `crates/envoy-http2/src/hcm.rs` (the H1/H2 HCM filter-chain wiring — `HCMConfig.filter_pipeline` + decode/encode invocation sites). 07.2 **extends** these, not greenfield-scaffolds. The PLAN's per-task steps quote the exact 07.1-landed signatures.
-- **8 PLAN-write SPEC corrections** are recorded in PROGRESS.md's Task 1 preamble + the PLAN's "PLAN-write SPEC corrections" section — the 07.2 SPEC landed at `6db5a01` (before the 07.1 execution arc) and 8 details drifted: `header_mutation.rs` uses `FilterRequest`/`FilterResponse` (ADR-0031); the StopAndSend test stub is a `test-util` Cargo feature (cross-crate `#[cfg(test)]` does not work); the "deferred test stubs" are net-new tests; fixture 0013 `expectations.yaml` mirrors fixture 0008's shape; `is_valid_rfc7230_token` landed inline; `ConfigError` lives in `lib.rs`; schema types use the existing `Debug/Deserialize/PartialEq` derive convention; the in-process backstop follows the `0008` precedent (no `serve_ephemeral` helper).
-- **REVIEW carryforward inventory** (relevant items for 07.2 execution — full ledger in "Phase-07.1 rollovers" below):
-  - **07.1 REVIEW I1** (`finalize_h2_stream` 3-dead-parameter cleanup) — folded into **07.2 PLAN Task 5 (Step group A)** as the named structural prerequisite.
-  - **07.1 REVIEW M1** (unused `tracing` dep in `envoy-filter`) — closes at **07.2 PLAN Task 3** (dep removal).
-  - **07.1 REVIEW M2** (`UnsupportedFilterType` unconstructed) — partially closes at **07.2 PLAN Task 3** (`map_entry`'s defense-in-depth check constructs it; `RouterNotTerminal`/`DuplicateRouter` stay defense-in-depth-only).
-  - **06.3 REVIEW I1** discipline (per-task PROGRESS test-bucket attestation incl. Docker-gated runs) — the 07.2 PLAN's Conventions + every code-changing task's final step enforce it; **`cargo deny check` output MUST be quoted in every per-task PROGRESS attestation** (07.1-REVIEW doctrine reminder).
-  - **04.1 REVIEW M5/M9** (Cargo.lock cadence ADR) — carries forward unchanged; 07.2 introduces no new top-level Cargo deps.
-  - **Other carryforwards** (06.3 I2; 06.2 M1/M2/M4/M5; 06.1 I2/M1/M4 to phase 08; 05.3 I2; 05.2 I1/I2/I3; 02.2 M1) — out of scope for 07.2; carry forward unchanged.
-- **No new ADRs projected.** DECISIONS.md ledger head stays **ADR-0031**; ADR-0032 stays reserved-available for 07.2 execution-time landings per D-3.5 if surfaced as essential. The `test-util` Cargo feature is within the SPEC §6 signpost 2 offered option space — not ADR-worthy.
-- **Doctrine reminder**: per `BOOTSTRAP_PROMPT.md` §5.1 ("one state per session; do not chain states"), the state-3 session lands the per-task commits and reaches state-4 (Task 10's state-4 verification + STATE advance); the state-5 REVIEW.md and state-6 close-out are separate sessions.
-
-Inputs the 07.2 state-3 subagent-driven-development session should read, in order, before dispatching Task 1's subagent:
+Inputs the 07.2 state-5 reviewing session should read, in order:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
-2. `docs/envoy-rust/STATE.md` (this file — confirm routing + the active-phase pointer + the standing context above).
-3. `docs/envoy-rust/ROADMAP.md` (row 07 `in-progress` with sub-phases `07.1, 07.2`; row 07.1 `done`; row 07.2 NOW `in-progress` depends-on 07.1; row 08 `planned`).
+2. `docs/envoy-rust/STATE.md` (this file — confirm routing + the state-4-reached / state-5-next status).
+3. `docs/envoy-rust/ROADMAP.md` (row 07 `in-progress`; row 07.1 `done`; row 07.2 `in-progress`).
 4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0031`).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (13 stat-name rows + 14 access-log field rows + Prometheus exposition shape divergence subsection; no edits anticipated at 07.2 under recommended posture).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-3 routing).
-7. **`docs/envoy-rust/phases/07.2-header-mutation-filter/PLAN.md`** — the standalone PLAN.md; per-step TDD checklists for 10 tasks + the architecture-decisions table + the 8 PLAN-write SPEC corrections. **Required reading at the start of each task** — each task section is self-contained.
-8. **`docs/envoy-rust/phases/07.2-header-mutation-filter/PROGRESS.md`** — the per-task narrative log; the Task 1 preamble carries the SPEC corrections + decision lock-ins; append a per-task section at each task commit.
-9. **`docs/envoy-rust/phases/07.2-header-mutation-filter/SPEC.md`** — the 07.2 sub-phase SPEC; the design contract the PLAN.md decomposes. Consult §3 for per-task references, §6 for the 10 implementation signposts (locked in the PLAN's architecture-decisions table).
-10. **`docs/envoy-rust/phases/07-filter-chain-framework/SPEC.md`** (parent-07 SPEC) — cross-sub-phase architectural invariants (§6 Rules 1-10).
-11. **`docs/envoy-rust/phases/07.1-filter-framework-foundation/`** — `SPEC.md` + `PLAN.md` + `REVIEW.md`: 07.2 builds directly on the 07.1-landed `envoy-filter` crate + H1/H2 HCM wiring; the REVIEW.md §3-§8 is the authoritative source for the I1/M1/M2 carryforwards.
-12. `BOOTSTRAP_PROMPT.md` §5 state 3 (subagent-driven-development skill routing) + §5.1 (one state per session) + §7 (differential test contract).
+5. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-5 routing).
+6. **`docs/envoy-rust/phases/07.2-header-mutation-filter/SPEC.md`** — the design contract. Consult §3 for per-task deliverables, §6 for the 10 implementation signposts, §7 for recommended posture, §8 for the evidence-quoting rule (R-1).
+7. **`docs/envoy-rust/phases/07.2-header-mutation-filter/PLAN.md`** — the standalone PLAN.md (10 tasks; architecture-decisions table; 8 PLAN-write SPEC corrections). Cross-reference per-task step lists against the PROGRESS.md narratives.
+8. **`docs/envoy-rust/phases/07.2-header-mutation-filter/PROGRESS.md`** — the per-task narrative log (now fully materialized with all 10 task narratives including the Task 10 state-4 evidence section). The Task 1 preamble records the 8 SPEC corrections + 16 architecture-decision lock-ins; Tasks 1-9 record substantive code changes; Task 10 records the §7.5 phase-done gate evidence.
+9. **`docs/envoy-rust/phases/07.1-filter-framework-foundation/REVIEW.md`** — the I1/M1/M2 carryforward closures are confirmed above; the reviewer verifies closure at the 07.2 task commits.
+10. `docs/envoy-rust/phases/07-filter-chain-framework/SPEC.md` (parent-07 SPEC) — cross-sub-phase architectural invariants (§6 Rules 1-10).
+11. `BOOTSTRAP_PROMPT.md` §5 state 5 (requesting-code-review skill routing) + §5.1 (one state per session) + §7 (differential test contract).
 
 ## Last commit
 
-07.2 state-2 standalone PLAN.md commit (this commit): `phase 07.2: state-2 standalone PLAN.md`.
+07.2 state-4-reached / state-5-next STATE advance commit (this commit): `phase 07.2: task 10 — state-4 verification (13 fixtures simultaneously green)`.
 
-Docs-only commit per the standalone-PLAN.md cadence (mirrors `8259275` 07.1 / `dc00750` 06.2 / `3a964cc` 06.3) — no code changes, no test runs, no `§7.5` gate run. Touches 2 files created + 2 files modified:
+Docs-only commit touching 2 files:
 
-- **CREATE** `docs/envoy-rust/phases/07.2-header-mutation-filter/PLAN.md` — the standalone implementation plan. 10 numbered tasks (recommended execution order `1 → 2 → … → 10`), ~1600 LoC projected (production ~440; tests ~740; fixture/doc ~410). Split-gate evaluation: 10 tasks well under the §6.1 ~25-task gate; ~1600 LoC ~+7% over the ~1500-LoC soft gate, concentrated in test + fixture material — accept the drift, do NOT nest-split (parent-07 SPEC §5 + ADR-0030 reject nested splits of a split-produced sub-phase; 06.x accept-drift precedent). The PLAN carries 8 PLAN-write SPEC corrections + a 16-row architecture-decisions table + the parallelization notes + a per-task self-review.
-- **CREATE** `docs/envoy-rust/phases/07.2-header-mutation-filter/PROGRESS.md` — the PROGRESS skeleton with the Task 1 preamble (the 8 SPEC corrections + the architecture-decision lock-ins + the split-gate evaluation) per the `dc00750` 06.2 cadence. Per-task narrative appends from Task 1 onward.
-- **MODIFY** `docs/envoy-rust/ROADMAP.md` — flips row `07.2` `status: planned` → `status: in-progress` (single-cell edit; per §4.1 invariant 3 — a phase enters `in-progress` only when STATE.md points at it AND its PLAN.md has landed). Parent ROADMAP row `07` STAYS `in-progress` (flips to `done` only at 07.2's state-6 commit per the schema invariant). Row `07.1` STAYS `done`.
-- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances active phase from `07.2` lifecycle state 2 (SPEC.md only) to `07.2` lifecycle state 3 (SPEC + PLAN exist; implementation incomplete). Next-skill advances from `superpowers:writing-plans` to `superpowers:subagent-driven-development` scoped to the new PLAN.md (per the user's standing preference `feedback_execution_style`). Rewrites the Active-phase / Next-expected-skill / Last-commit / Last-updated sections; rewrites the standing context from PLAN-writer perspective to executor perspective. Preserves all "Phase-NN rollovers" sections verbatim, including "Phase-07.1 rollovers (from REVIEW.md §1-§8)".
+- **MODIFY** `docs/envoy-rust/phases/07.2-header-mutation-filter/PROGRESS.md` — appends the Task 10 state-4 phase-done gate evidence section (§7.5 gate summary: 13 Docker-gated fixtures simultaneously green per CI run `25887571566`, h2spec ≥95% gate held at 99.31% baseline, `parse_bootstrap` fuzz clean, workspace tests 601 passed / 0 failed across 57 binaries, `cargo clippy` / `cargo fmt` / `cargo deny check` / `cargo build` all clean).
+- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances active-phase status from `07.2 state 3 (implementation incomplete)` to `07.2 state 4-reached / state-5-next (implementation complete + verified; REVIEW.md pending)`; rewrites Next-expected-skill to `superpowers:requesting-code-review` scoped to the 07.2 surface (reviewed range `c7dea4c..HEAD`); rewrites Last-commit + Last-updated. Preserves all "Phase-NN rollovers" sections and "Phase 07.1/06.x DONE" narrative blocks verbatim.
 
-No code changes, no fixture changes, no workspace-dep changes. `DECISIONS.md`, `BEHAVIOR_CONTRACT.md`, `ENVOY_TARGET.md`, `rust-toolchain.toml`, `Cargo.toml`, `Cargo.lock`, `deny.toml`, the production `crates/`, the `tests/` tree, the 07.2 `SPEC.md`, and the 07.1 phase artifacts are all unchanged.
+No code changes, no fixture changes, no workspace-dep changes. `DECISIONS.md` unchanged at **ADR-0031** — no ADR lands at a state-4 docs-only commit per the D-3.5 append-only discipline. ADR-0032 stays reserved-available.
 
-DECISIONS.md unchanged at **ADR-0031** (D-3.5 append-only — no new ADR lands at a state-2 PLAN-write commit per the `8259275` / `dc00750` standalone-PLAN precedent; the recommended no-foundations-grants posture per parent-07 SPEC §6 Rule 5 + 07.2 SPEC §7 holds). ADR-0032 stays reserved-available for 07.2 execution-time landings per D-3.5 if surfaced as essential.
+**The CI evidence anchor** is CI run `25887571566` at HEAD `20a393d` (the Task 9 in-process backstop commit, the immediate predecessor of this commit). This mirrors the 07.1 cadence where Task 8 (`78d5394`) was the state-4 evidence anchor at CI HEAD `12360e3`, and Task 9 (`5e9fe1a`) was the docs-only STATE-advance commit.
 
-The state-2 commit message carries no `Differential surface:` / `Conformance:` lines per `BOOTSTRAP_PROMPT.md` §5.3 (those belong to state-6 commits; state-2 commits are docs-only). The §7.5 phase-done gate is NOT exercised at the state-2 commit — verification lands at PLAN Task 10 (state-4).
+**Predecessor commits (07.2 execution arc + 07.1/07 ancestry, newest first):**
 
-**Verification at this commit:** none — docs-only. The state-4 phase-done gate (13 fixtures simultaneously green + h2spec ≥95% + `parse_bootstrap` fuzz clean + workspace gates) is materialized at the 07.2 PLAN's Task 10.
-
-**Predecessor commits (in reverse chronological order, parent-07 state-1+state-2 + 07.1 execution arc + 07.1 close-out):**
-
-- `3abcc8c` — `phase 07.1: envoy-filter foundation + FilterPipeline iteration + H1/H2 HCM filter-chain wiring + terminal-router validator [ADR-0031]` (07.1 state-6 phase-done close-out; the immediate predecessor of THIS state-2 commit — flipped ROADMAP row `07.1` to `done`, advanced STATE.md to `07.2 state 2`).
+- `20a393d` — `phase 07.2: task 9 — in-process backstop (http_filter_header_mutation)` (Task 9; the CI evidence anchor — HEAD in CI run `25887571566`).
+- Prior task commits `77e91ae` (Task 1) → `…` → `20a393d` (Task 9): 9 substantive task commits landing the `envoy-config` HeaderMutation schema + validator, `HeaderMutationFilter` runtime + decode/encode semantics, H1+H2 HCM integration tests + `test-util` feature + 07.1 REVIEW I1 cleanup, fuzz corpus seed, fixture 0013 + Docker-gated wrapper, and in-process backstop.
+- `c7dea4c` — `phase 07.2: state-2 standalone PLAN.md` (07.2 state-2 PLAN-write commit; base of the 07.2 reviewed range).
+- `3abcc8c` — `phase 07.1: envoy-filter foundation + FilterPipeline iteration + H1/H2 HCM filter-chain wiring + terminal-router validator [ADR-0031]` (07.1 state-6 phase-done close-out).
 - `5408abb` — `phase 07.1: state 5 REVIEW.md Approved with M-track follow-ups` (07.1 state-5 close-out; verdict 0 Critical / 1 Important / 3 Minor).
 - `5e9fe1a` — `phase 07.1: task 9 — state-4 PROGRESS materialization + STATE.md advance to state-5-next` (07.1 state-4-reached / state-5-next STATE advance).
 - `78d5394` — `phase 07.1: task 8 — state-4 verification (12 fixtures simultaneously green)` (07.1 state-4 phase-done gate evidence anchor; CI run `25759067004` at HEAD `12360e3`, conclusion `success`, completed `2026-05-12T20:05:53Z`).
-- `12360e3` — `phase 07.1: task 1 fixup — add Apache-2.0 license to envoy-filter (cargo deny check)` (in-execution recovery from the state-4 CI predecessor run `25758889478` `cargo deny check` failure; 1-line addition).
-- `3e041c5` — `phase 07.1: task 7 — H2 HCM finalize_h2_stream refactor + filter-chain invocation` (H2 symmetric wiring; H2RequestPath enum; pipeline parameter threading through finalize_h2_stream; 3 callers updated).
-- `84d68c1` — `phase 07.1: task 6 — H1 HCM filter-chain decode/encode invocation` (H1 filter invocation layered on Task 5's refactor; HCMConfig.filter_pipeline field; Http1Error::FilterPipeline variant via #[from]; RequestPath enum; boundary conversion via mem::take + write-back).
-- `8161990` — `phase 07.1: task 5.5 — ADR-0031 + envoy-filter ↔ envoy-http1 cycle resolution` (unplanned task — parent-07 SPEC §5 signpost 7's "no cycles" claim relied on module-level granularity that Cargo doesn't respect; resolution by re-homing FilterRequest + FilterResponse into envoy-filter::types and removing envoy-http1 from envoy-filter's deps; DECISIONS.md ledger head advance ADR-0030 → ADR-0031).
-- `b9dfa29` — `phase 07.1: task 5 — H1 HCM 5-writer-arm refactor (factor wire-write to unified site)` (load-bearing pure refactor; `let outgoing: Response;` declaration; 5 wire-write sites factored to unified site; `construct_proxied_response` factored from `write_proxied_response`).
-- `111237a` — `phase 07.1: task 4 — envoy-config terminal-router validator + 3 new ConfigError variants` (validate_http_filters free function; EmptyHttpFilters + RouterNotTerminal + DuplicateRouterFilter variants; existing MultipleHttpFilters retained per signpost 13; 7 unit tests).
-- `2002f4e` — `phase 07.1: task 3 — HttpFilterInstance Router-only + RouterTerminus` (placeholder instance.rs from Task 2 replaced with real Router-payload variant; new router.rs module; 4 unit tests; total 13 envoy-filter).
-- `e43820e` — `phase 07.1: task 2 — FilterPipeline + Decision + iteration loop skeleton` (FilterPipeline struct + Decision enum + decode/encode iteration; placeholder HttpFilterInstance::Router zero-state stub).
-- `586de82` — `phase 07.1: task 1 — envoy-filter crate scaffold + FilterError typed-error enum` (new workspace member `crates/envoy-filter/`; FilterError enum with 4 variants; 5 unit tests; PROGRESS.md created).
-- `8259275` — `phase 07.1: state-2 standalone PLAN.md (9 tasks; ~1110 LoC projected)` (07.1 state-2 close-out; the design contract this state-3 arc executed).
-- `0b3bff0` — `phase 07: state-2 STATE.md fixup — advance to 07.1 lifecycle state 2 / writing-plans` (corrected the parent-07 state-2 split commit's STATE.md routing).
-- `6db5a01` — `phase 07: state-2 split decision + sub-phase SPECs (07.1/07.2) [ADR-0030]` (parent-07 state-2 split; landed ADR-0030 + both sub-phase SPECs (07.1 AND 07.2) + 2 ROADMAP rows + parent-row sub-phases column update; ledger head advance ADR-0029 → ADR-0030).
-- `7337f2c` — `phase 07: state-1 brainstorm — parent SPEC.md projecting 2-way split (07.1/07.2)` (parent-07 state-1 close-out).
-- `b918f33` — `phase 06.3: comprehensive stats wiring + 05.3 I1 closure + parent-06 close [parent 06 done] [ADR-0029]` (parent-06 close-out).
-- `55fe62d` / `389ef96` — parent-06 NON-closing-sub-phase state-6 close-out precedents (06.1 / 06.2 close-outs) — the commit-shape template for THIS commit (sub-phase done; STATE advance to next sibling sub-phase at lifecycle state 2; parent stays `in-progress` until the closing sub-phase closes).
 
 ## Last updated
 
-2026-05-14 (07.2 state-2 standalone PLAN.md commit — lands
-`docs/envoy-rust/phases/07.2-header-mutation-filter/PLAN.md` (10 tasks;
-~1600 LoC projected) + the `PROGRESS.md` skeleton with the Task 1
-preamble per the `dc00750` 06.2 cadence; flips ROADMAP row `07.2`
-`status: planned` → `status: in-progress` per §4.1 invariant 3; and
-advances STATE.md (this file) from `07.2` lifecycle state 2 (SPEC.md
-only) to lifecycle state 3 (SPEC + PLAN exist; implementation
-incomplete) with next-skill `superpowers:subagent-driven-development`
-scoped to the new PLAN.md per the user's standing preference
-`feedback_execution_style`. Mirrors the `8259275` (07.1) / `dc00750`
-(06.2) standalone-PLAN state-2 commit shape — docs-only; one state per
-session per `BOOTSTRAP_PROMPT.md` §5.1.
-
-The PLAN decomposes the 07.2 SPEC §3 deliverables D8.2-D15.2 into 10
-tasks: Task 1-2 `envoy-config` HeaderMutation schema + validator; Task
-3-4 `HeaderMutationFilter` runtime + builder + decode/encode semantics;
-Task 5 H1+H2 HCM filter-chain integration tests + the `test-util` Cargo
-feature + the 07.1 REVIEW I1 `finalize_h2_stream` cleanup (Step group
-A, named owner); Task 6 fuzz corpus seed; Task 7 `http1-echo-server`
-helper verify; Task 8 fixture `0013-http-filter-header-mutation` +
-Docker-gated wrapper; Task 9 in-process backstop; Task 10 state-4
-verification. Split-gate evaluation: 10 tasks well under the ~25-task
-gate; ~1600 LoC ~+7% over the ~1500-LoC soft gate (test/fixture-
-concentrated; production ~440 LoC) — accept the drift, do NOT
-nest-split per parent-07 SPEC §5 + ADR-0030 + the 06.x precedent.
-
-The PROGRESS.md Task 1 preamble records 8 PLAN-write SPEC corrections
-(the 07.2 SPEC landed at `6db5a01` before the 07.1 execution arc):
-`header_mutation.rs` uses `FilterRequest`/`FilterResponse` per ADR-0031;
-the StopAndSend test stub is a `test-util` Cargo feature (cross-crate
-`#[cfg(test)]` does not work); the "deferred test stubs" are net-new
-tests; fixture 0013 `expectations.yaml` mirrors fixture 0008's shape;
-`is_valid_rfc7230_token` landed inline (no helper to reuse);
-`ConfigError` lives in `lib.rs`; schema types use the existing
-`Debug/Deserialize/PartialEq` derive convention; the in-process
-backstop follows the `0008` precedent. Plus the 16 architecture-
-decision lock-ins per `feedback_pick_recommendation`. The two 07.1
-REVIEW carryforward obligations are folded in: I1 (`finalize_h2_stream`
-3-dead-parameter cleanup) → Task 5 Step group A (named owner); the
-`cargo deny check`-output-quoting doctrine reminder → the PLAN's
-Conventions + every code-changing task's final step. 07.1 REVIEW M1
-(unused `tracing` dep) closes at Task 3; M2 (`UnsupportedFilterType`
-constructable) partially closes at Task 3.
-
-DECISIONS.md ledger head remains **ADR-0031** — no ADR lands at a
-state-2 PLAN-write commit per the standalone-PLAN precedent + the
-recommended no-foundations-grants posture; ADR-0032 stays
-reserved-available. **No code changes at this commit** — docs-only;
-the §7.5 gate is NOT exercised at state-2 (it lands at PLAN Task 10).
-Preserves all prior "Phase-NN rollovers" sections verbatim, including
-"Phase-07.1 rollovers (from REVIEW.md §1-§8)". Predecessor: `3abcc8c`
-(07.1 state-6 phase-done close-out commit, 2026-05-14).)
+2026-05-14 (07.2 state-4-reached / state-5-next STATE advance commit —
+materializes the §7.5 phase-done gate evidence into PROGRESS.md (Task
+10 section: CI run `25887571566`, conclusion `success`, completed
+`2026-05-14T21:49:18Z`, HEAD `20a393d`; all 13 Docker-gated fixtures
+simultaneously green; h2spec ≥95% gate held at 99.31% baseline;
+`parse_bootstrap` fuzz clean; workspace tests 601 passed / 0 failed
+across 57 binaries; `cargo clippy` / `cargo fmt` / `cargo deny check` /
+`cargo build` all clean) and advances STATE.md (this file) from `07.2`
+lifecycle state 3 (implementation incomplete) to state 4-reached /
+state-5-next (implementation complete + verified; REVIEW.md pending)
+with next-skill `superpowers:requesting-code-review` scoped to the 07.2
+surface (reviewed range `c7dea4c..HEAD`). Docs-only; 2 files modified
+(PROGRESS.md + STATE.md); one state per session per
+`BOOTSTRAP_PROMPT.md` §5.1. DECISIONS.md unchanged at ADR-0031.
+Preserves all prior "Phase-NN rollovers" sections verbatim.)
 
 ## Notes
 
