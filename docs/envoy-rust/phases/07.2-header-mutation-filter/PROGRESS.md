@@ -1057,3 +1057,142 @@ Four issues identified by the code quality reviewer; all applied as a single `--
 `cargo test -p envoy-http1 hcm`: 39 passed, 0 ignored.
 `cargo test --workspace`: 75+ passed across all crates (2 known-flaky `tcp_proxy_backend_*`
 port-readiness failures on first run; 0 failures on second run).
+
+---
+
+## Task 6 — Fuzz corpus seed for HeaderMutation HCM
+
+**State-3 commit.** Adds the minimal positive-case HCM fuzz corpus seed exercising the
+`HeaderMutation` schema arm + Task 2 validator. Three file changes: the seed YAML created,
+a `.gitignore` allow-list entry added, and the seed name appended to the
+`fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array in `bootstrap.rs`. TDD order
+was followed: test array extended first (RED — file-not-found panic), seed file created,
+`.gitignore` entry added, test turned GREEN.
+
+### Work summary
+
+- **`crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_header_mutation_filter.yaml`** (new
+  file): a 47-line minimal positive-case HCM bootstrap with a `[HeaderMutation, Router]`
+  http_filters chain. Exercises both `request_mutations` (stamp `x-filter-stamp: phase-07`
+  with `APPEND_IF_EXISTS_OR_ADD`) and `response_mutations` (stamp `x-filter-response-stamp:
+  phase-07` with `APPEND_IF_EXISTS_OR_ADD`). Route is `direct_response { status: 200, body:
+  { inline_string: "ok\n" } }` — no upstream cluster required.
+
+- **`crates/envoy-config/fuzz/.gitignore`**: added `!corpus/parse_bootstrap/hcm_header_mutation_filter.yaml`
+  after the existing `!corpus/parse_bootstrap/hcm_access_log_file.yaml` allow-list entry.
+
+- **`crates/envoy-config/src/bootstrap.rs`**: appended
+  `"fuzz/corpus/parse_bootstrap/hcm_header_mutation_filter.yaml"` to the SUCCESS array
+  (seeds expected to parse + validate successfully) in `fuzz_corpus_seeds_parse_or_reject_cleanly`,
+  after `"fuzz/corpus/parse_bootstrap/hcm_access_log_file.yaml"`.
+
+### TDD step trace
+
+1. **Step 1 (write failing test):** Appended `"fuzz/corpus/parse_bootstrap/hcm_header_mutation_filter.yaml"`
+   to the SUCCESS array in `bootstrap.rs`. Test array at line 2686.
+2. **Step 2 (RED confirmed):** `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly`
+   — FAILED: `panic: read .../hcm_header_mutation_filter.yaml: No such file or directory (os error 2)`.
+3. **Step 3 (seed file created):** Created the seed YAML (see deviation note below re: schema
+   corrections vs. PLAN). Two correction iterations required before the schema validated cleanly.
+4. **Step 4 (`.gitignore` entry added):** Added the allow-list entry after `hcm_access_log_file.yaml`.
+5. **Step 5 (GREEN confirmed):** `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly`
+   — 1 passed, 0 failed.
+6. **Step 6 (`git check-ignore`):** `git check-ignore crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_header_mutation_filter.yaml; echo "exit: $?"` → `exit: 1` (NOT ignored — allow-list entry working correctly).
+7. **Step 7 (fuzz smoke — RAN):** Nightly toolchain available (`nightly-aarch64-apple-darwin`).
+   `cd crates/envoy-config/fuzz && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=15`:
+   ran 221,825 iterations in 16 seconds; `#221825 DONE cov: 11844 ft: 32067 corp: 3208/1690Kb`
+   — no crash, no panic. Coverage increased by 1 (`cov: 11843 → 11844`) after the seed discovery,
+   confirming the new seed exercises a new code path.
+8. **Step 8 (workspace gate):** All 5 commands clean (see attestation below).
+
+### LoC delta
+
+```
+crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_header_mutation_filter.yaml  +47 lines (new file)
+crates/envoy-config/fuzz/.gitignore                                                 +1 line
+crates/envoy-config/src/bootstrap.rs                                                +1 line
+Total: +49 insertions, 0 deletions (net ~49 LoC added)
+```
+
+PLAN budget for Task 6: ~52 LoC. Actual ~49 LoC — within acceptable range.
+
+### Deviations from PLAN
+
+1. **PLAN's seed YAML used `direct_response: { status: 200 }` without the required `body`
+   field; also omitted the required `codec_type` field.** The PLAN's Step 3 YAML was written
+   against Envoy's upstream schema (where `body` is optional and `codec_type` has a default),
+   but the envoy-rust schema has both as required fields (no `#[serde(default)]` on either).
+   This was discovered through two RED→GREEN correction iterations:
+   - First correction: added `body: { inline_string: "ok\n" }` to the `direct_response`
+     block (required by `DirectResponse.body: DataSource` with no default).
+   - Second correction: added `codec_type: HTTP1` to the HCM typed_config block (required
+     by `HttpConnectionManagerConfig.codec_type: CodecType` with no default).
+   Both corrections match the existing corpus seeds (`hcm_direct_response_happy.yaml`,
+   `hcm_access_log_file.yaml`). The seed's semantic intent — minimal positive case exercising
+   the new `HeaderMutation` schema arm — is fully preserved; only schema-required fields were
+   added. No PLAN-level design decision is affected.
+
+### Test-bucket attestation
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.39s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.96s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+All test suites passed (0 failed). Test counts: `envoy-config` 207 tests; `envoy-filter`
+32 tests; `envoy-http1` 68 tests; `envoy-http2` 42 tests (1 `#[ignore]`d); `differential`
+crate 77 tests (1 `#[ignore]`d). No flakes observed on this run. The new
+`fuzz_corpus_seeds_parse_or_reject_cleanly` test walker now covers 13 SUCCESS seeds
+(previously 12) + 3 REJECT seeds + the `minimal.yaml` baseline.
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies. The `license-not-encountered` warnings are pre-existing
+(unmatched allowlist entries in `deny.toml` — identical to Tasks 1-5 attestations). No
+`Cargo.toml` files were modified by Task 6.

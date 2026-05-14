@@ -16,5 +16,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/cluster_http2_protocol_options.yaml
 !corpus/parse_bootstrap/admin_with_stats_route.yaml
 !corpus/parse_bootstrap/hcm_access_log_file.yaml
+!corpus/parse_bootstrap/hcm_header_mutation_filter.yaml
 artifacts/
 target/

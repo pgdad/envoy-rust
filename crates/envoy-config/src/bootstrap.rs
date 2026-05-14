@@ -2684,6 +2684,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/strict_dns_cluster.yaml",
             "fuzz/corpus/parse_bootstrap/admin_with_stats_route.yaml",
             "fuzz/corpus/parse_bootstrap/hcm_access_log_file.yaml",
+            "fuzz/corpus/parse_bootstrap/hcm_header_mutation_filter.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
