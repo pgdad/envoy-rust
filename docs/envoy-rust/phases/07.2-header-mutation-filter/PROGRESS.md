@@ -607,3 +607,175 @@ Two further Minors from the review are deliberately carried forward to Task 4:
 - **Minor #5 (Task-4 carry):** The Task-4 implementer should verify whether `decode_headers` /
   `encode_headers` need `&mut self` or only `&self` (the fields are read-only after build; `&self`
   may suffice and would be cleaner).
+
+---
+
+## Task 4 — `HeaderMutationFilter::decode_headers` + `encode_headers` semantics
+
+**State-3 commit.** Replaces the Task-3 `decode_headers` / `encode_headers` stubs with the real
+append/overwrite iteration semantics; adds the `apply_mutations` free function; replaces the 2
+Task-3 stub tests with the 14-test semantics inventory; removes the 2 struct-level
+`#[allow(dead_code)]` attributes from `HeaderMutationFilter` and `RuntimeHeaderMutation` (fields
+now read by `apply_mutations` in non-test code). Single file changed:
+`crates/envoy-filter/src/header_mutation.rs`.
+
+### Work summary
+
+- **`crates/envoy-filter/src/header_mutation.rs`**:
+  - **Removed:** 2 struct-level `#[allow(dead_code)]` attributes on `HeaderMutationFilter` and
+    `RuntimeHeaderMutation` (committed to Task 4 by the Task 3 review-fix note). Fields are now
+    read by `apply_mutations` in non-test code; no dead-code lint fires.
+  - **Replaced:** Task-3 stub `decode_headers` (ignored `_req`) with the real body:
+    `apply_mutations(&mut req.headers, &self.request_mutations); Decision::Continue`.
+  - **Replaced:** Task-3 stub `encode_headers` (ignored `_resp`) with the real body:
+    `apply_mutations(&mut resp.headers, &self.response_mutations); Decision::Continue`.
+  - **Added:** `apply_mutations(headers, mutations)` free function after `map_entry`. Iterates
+    `mutations` in slice (= YAML declaration) order per signpost 8. `Append` pushes; `Overwrite`
+    does a case-insensitive `retain` scan then pushes. `mutation.key` is already lowercased at
+    build time; the scan calls `k.to_ascii_lowercase()` on each existing entry.
+  - **Deleted:** `decode_headers_stub_returns_continue_at_task_3` and
+    `encode_headers_stub_returns_continue_at_task_3` test functions (replaced by the 14-test
+    semantics inventory below).
+  - **Added:** 3 test helpers (`req_with`, `resp_with`, `owned`) and 14 semantics tests (see below).
+
+- **Task-3 carry-forward resolutions:**
+  - **Minor #4 resolved:** All 14 semantics tests assert on `req.headers` / `resp.headers`
+    contents via `assert_eq!(..., owned(&[...]))`, not just the `Decision` return value.
+  - **Minor #5 resolved:** `decode_headers` / `encode_headers` keep `&mut self` as the PLAN's
+    Step 3 specifies. `&mut self` is required for interface consistency with the `HttpFilterInstance`
+    enum dispatch (the 07.1-landed `Router` arm uses `&mut self`; `FilterPipeline` dispatches all
+    filter instances through this uniform signature). `&self` would be technically sufficient for
+    `HeaderMutationFilter` alone, but would break the shared dispatch interface. Not an ADR-worthy
+    decision; no change made.
+
+### Tests landed
+
+**14 new semantics tests** in `header_mutation::tests` (replaces the 2 Task-3 stub tests):
+
+1. `append_on_absent_key_adds_entry` — Append on empty headers → `[("x-foo", "bar")]`.
+2. `append_on_present_key_adds_duplicate` — Append on existing key → 2-entry list (original + new).
+3. `overwrite_on_absent_key_adds_entry` — Overwrite on empty headers → `[("x-foo", "bar")]`.
+4. `overwrite_on_present_key_replaces_with_exactly_one_entry` — Overwrite on existing key → exactly
+   1 entry (old removed, new pushed).
+5. `overwrite_is_case_insensitive_on_the_existing_entry` — Existing `"X-Foo"` matched and removed
+   by Overwrite of `"x-foo"` (case-fold via `to_ascii_lowercase()`).
+6. `multiple_append_entries_apply_in_declaration_order` — 3-entry Append list; asserts
+   `[x-a:1, x-b:2, x-a:3]` (slice order preserved).
+7. `multiple_overwrite_entries_last_for_a_key_wins` — Two Overwrite entries for same key; asserts
+   last value `"second"` survives.
+8. `mix_of_append_and_overwrite_applies_in_order` — Append x-a:1, Append x-a:2, Overwrite x-a:final
+   → Overwrite removes both prior x-a entries, pushes one; unrelated x-keep header preserved.
+9. `empty_mutations_is_no_op_on_decode` — Empty mutation list leaves headers unchanged.
+10. `empty_mutations_is_no_op_on_encode` — Empty mutation list leaves response headers unchanged.
+11. `decode_headers_returns_continue_after_applying` — Non-empty Append still returns `Decision::Continue`.
+12. `encode_headers_returns_continue_after_applying` — Non-empty Append on response still returns
+    `Decision::Continue`.
+13. `round_trip_via_filter_pipeline_decode` — `[HeaderMutation, Router]` pipeline; decode walks
+    declaration order; `x-foo: bar` present in request headers after `pipeline.decode_headers`.
+14. `iteration_order_on_encode_via_filter_pipeline` — `[HeaderMutation, Router]` pipeline; encode
+    walks reverse order; `x-resp: stamp` present in response headers after `pipeline.encode_headers`.
+
+**3 test helpers** added: `req_with`, `resp_with`, `owned`.
+
+**2 Task-3 stub tests deleted:** `decode_headers_stub_returns_continue_at_task_3`,
+`encode_headers_stub_returns_continue_at_task_3`.
+
+Net test change: +14 - 2 = +12 tests. `envoy-filter` total: 32 tests (13 pre-existing + 5
+Task-3 build tests + 14 Task-4 semantics tests).
+
+### LoC delta
+
+```
+crates/envoy-filter/src/header_mutation.rs   +146 lines, -55 lines (net +91)
+```
+
+PLAN budget for Task 4: ~185 LoC. Actual +91 LoC net — below budget. The difference is that the
+PLAN's budget included the full file rewrite context; the net delta (additions minus deletions)
+reflects the real code changes: +19 LoC semantics (method bodies + `apply_mutations`), +127 LoC
+tests (14 tests + 3 helpers), -55 LoC (2 stub tests + 2 `#[allow(dead_code)]` attributes +
+`_req`/`_resp` stub bodies).
+
+### Deviations from PLAN
+
+1. **Steps 1+3 implemented simultaneously.** The PLAN's TDD sequence calls for Step 1 (write
+   failing tests with stub bodies still in place) → Step 2 (confirm RED) → Step 3 (replace stub
+   bodies). Because the final file is written in a single pass as one atomic edit, the RED
+   intermediate state was not captured as a separate snapshot. The 14 tests were written first in
+   the test module (with the real implementation written immediately after, as a single file
+   write). All tests pass GREEN on the first `cargo test` invocation. No semantic deviation — the
+   TDD discipline (tests articulate semantics before implementation) was followed in conception
+   order; the commit-state order was merged.
+
+2. **`cargo fmt` reformatted two assertions in the PLAN's pipeline tests.** In
+   `round_trip_via_filter_pipeline_decode`, `assert!(matches!(pipeline.decode_headers(...),
+   Decision::Continue))` was expanded to 4-line form. In
+   `iteration_order_on_encode_via_filter_pipeline`, `assert!(resp.headers.iter().any(...))` was
+   reformatted to `assert!(resp.headers.iter().any(...))` with internal indentation adjusted.
+   No semantic changes.
+
+### Test-bucket attestation
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.76s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.37s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+32 tests in `envoy-filter` (13 pre-existing + 5 Task-3 build tests + 14 Task-4 semantics tests),
+all PASS. The `differential` crate's `http1_echo_backend_drop_terminates_child`,
+`http1_echo_backend_spawns_and_echoes`, `tcp_proxy_backend_drop_terminates_child`,
+`tcp_proxy_backend_spawns_and_echoes`, and `run_fixture_dispatches_http1_backend_on_template_marker`
+tests flaked on the first run (pre-existing port-readiness race — documented in Task 1, 2, and 3
+attestations); the second run was clean (all suites passed, 0 failed).
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies. The `license-not-encountered` warnings are pre-existing
+(unmatched allowlist entries in `deny.toml` — identical to Tasks 1, 2, and 3's attestations).
+The 2 `#[allow(dead_code)]` struct-level attributes removed from `header_mutation.rs` introduced
+no new `cargo deny` concerns.

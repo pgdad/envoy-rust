@@ -14,10 +14,6 @@ use crate::types::{FilterRequest, FilterResponse};
 /// signpost 3 the lists are held directly (`Vec<RuntimeHeaderMutation>`),
 /// not `Arc`-wrapped — the per-request `FilterPipeline` clone copies them;
 /// cheap for 07.2's 2-4-entry fixture.
-// Fields are only read in `#[cfg(test)]` code at Task 3; the real readers
-// land at Task 4's decode_headers / encode_headers implementations, which
-// removes this attribute.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HeaderMutationFilter {
     request_mutations: Vec<RuntimeHeaderMutation>,
@@ -28,9 +24,6 @@ pub struct HeaderMutationFilter {
 /// runtime hot path does no per-request case folding for Append, and the
 /// Overwrite search compares against `to_ascii_lowercase()` of each existing
 /// entry. Per 07.2 SPEC §6 signpost 4.
-// Fields are only read in `#[cfg(test)]` code at Task 3; consumed by Task 4's
-// apply_mutations implementation, which removes this attribute.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct RuntimeHeaderMutation {
     key: String,
@@ -73,13 +66,13 @@ impl HeaderMutationFilter {
         })
     }
 
-    /// Task 3 stub — returns `Continue`. Real semantics land at Task 4.
-    pub(crate) fn decode_headers(&mut self, _req: &mut FilterRequest) -> Decision {
+    pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
+        apply_mutations(&mut req.headers, &self.request_mutations);
         Decision::Continue
     }
 
-    /// Task 3 stub — returns `Continue`. Real semantics land at Task 4.
-    pub(crate) fn encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision {
+    pub(crate) fn encode_headers(&mut self, resp: &mut FilterResponse) -> Decision {
+        apply_mutations(&mut resp.headers, &self.response_mutations);
         Decision::Continue
     }
 }
@@ -114,6 +107,26 @@ fn map_entry(
     })
 }
 
+/// Apply a mutation list to a header vector in slice (= YAML declaration)
+/// order. Per 07.2 SPEC §6 signpost 8: last Append appends last; for a given
+/// key the last Overwrite wins (each Overwrite removes prior same-key entries).
+fn apply_mutations(headers: &mut Vec<(String, String)>, mutations: &[RuntimeHeaderMutation]) {
+    for mutation in mutations {
+        match mutation.action {
+            RuntimeAppendAction::Append => {
+                // RFC 7230 §3.2.2: duplicate field names are permitted.
+                headers.push((mutation.key.clone(), mutation.value.clone()));
+            }
+            RuntimeAppendAction::Overwrite => {
+                // `mutation.key` is already lowercased at build time; case-fold
+                // each existing entry's name for the removal scan.
+                headers.retain(|(k, _v)| k.to_ascii_lowercase() != mutation.key);
+                headers.push((mutation.key.clone(), mutation.value.clone()));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +157,37 @@ mod tests {
                 response_mutations,
             },
         }
+    }
+
+    fn req_with(headers: Vec<(&str, &str)>) -> FilterRequest {
+        FilterRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: None,
+        }
+    }
+
+    fn resp_with(headers: Vec<(&str, &str)>) -> FilterResponse {
+        FilterResponse {
+            status: 200,
+            reason: None,
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: bytes::Bytes::new(),
+        }
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -210,43 +254,218 @@ mod tests {
     }
 
     #[test]
-    fn decode_headers_stub_returns_continue_at_task_3() {
-        // Task 3 stubs decode/encode as Continue; Task 4 lands the real
-        // mutation semantics. This test is REPLACED at Task 4.
-        let mut filter = HeaderMutationFilter::build_from_config(&cfg(
-            vec![entry("x-a", "v", AppendAction::AppendIfExistsOrAdd)],
+    fn append_on_absent_key_adds_entry() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![entry("x-foo", "bar", AppendAction::AppendIfExistsOrAdd)],
             vec![],
         ))
         .unwrap();
-        let mut req = FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![],
-            body: None,
-        };
-        assert!(matches!(
-            filter.decode_headers(&mut req),
-            Decision::Continue
-        ));
+        let mut req = req_with(vec![]);
+        assert!(matches!(f.decode_headers(&mut req), Decision::Continue));
+        assert_eq!(req.headers, owned(&[("x-foo", "bar")]));
     }
 
     #[test]
-    fn encode_headers_stub_returns_continue_at_task_3() {
-        // Replaced at Task 4.
-        let mut filter = HeaderMutationFilter::build_from_config(&cfg(
+    fn append_on_present_key_adds_duplicate() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![entry("x-foo", "bar", AppendAction::AppendIfExistsOrAdd)],
+            vec![],
+        ))
+        .unwrap();
+        let mut req = req_with(vec![("x-foo", "original")]);
+        f.decode_headers(&mut req);
+        assert_eq!(
+            req.headers,
+            owned(&[("x-foo", "original"), ("x-foo", "bar")])
+        );
+    }
+
+    #[test]
+    fn overwrite_on_absent_key_adds_entry() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![entry("x-foo", "bar", AppendAction::OverwriteIfExistsOrAdd)],
+            vec![],
+        ))
+        .unwrap();
+        let mut req = req_with(vec![]);
+        f.decode_headers(&mut req);
+        assert_eq!(req.headers, owned(&[("x-foo", "bar")]));
+    }
+
+    #[test]
+    fn overwrite_on_present_key_replaces_with_exactly_one_entry() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![entry("x-foo", "bar", AppendAction::OverwriteIfExistsOrAdd)],
+            vec![],
+        ))
+        .unwrap();
+        let mut req = req_with(vec![("x-foo", "original")]);
+        f.decode_headers(&mut req);
+        assert_eq!(req.headers, owned(&[("x-foo", "bar")]));
+    }
+
+    #[test]
+    fn overwrite_is_case_insensitive_on_the_existing_entry() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![entry("x-foo", "bar", AppendAction::OverwriteIfExistsOrAdd)],
+            vec![],
+        ))
+        .unwrap();
+        // existing entry has mixed-case name; Overwrite case-folds the match.
+        let mut req = req_with(vec![("X-Foo", "original")]);
+        f.decode_headers(&mut req);
+        assert_eq!(req.headers, owned(&[("x-foo", "bar")]));
+    }
+
+    #[test]
+    fn multiple_append_entries_apply_in_declaration_order() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![
+                entry("x-a", "1", AppendAction::AppendIfExistsOrAdd),
+                entry("x-b", "2", AppendAction::AppendIfExistsOrAdd),
+                entry("x-a", "3", AppendAction::AppendIfExistsOrAdd),
+            ],
+            vec![],
+        ))
+        .unwrap();
+        let mut req = req_with(vec![]);
+        f.decode_headers(&mut req);
+        assert_eq!(
+            req.headers,
+            owned(&[("x-a", "1"), ("x-b", "2"), ("x-a", "3")])
+        );
+    }
+
+    #[test]
+    fn multiple_overwrite_entries_last_for_a_key_wins() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![
+                entry("x-a", "first", AppendAction::OverwriteIfExistsOrAdd),
+                entry("x-a", "second", AppendAction::OverwriteIfExistsOrAdd),
+            ],
+            vec![],
+        ))
+        .unwrap();
+        let mut req = req_with(vec![]);
+        f.decode_headers(&mut req);
+        assert_eq!(req.headers, owned(&[("x-a", "second")]));
+    }
+
+    #[test]
+    fn mix_of_append_and_overwrite_applies_in_order() {
+        // Append x-a:1, Append x-a:2, Overwrite x-a:final → Overwrite removes
+        // both prior x-a entries, pushes one.
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![
+                entry("x-a", "1", AppendAction::AppendIfExistsOrAdd),
+                entry("x-a", "2", AppendAction::AppendIfExistsOrAdd),
+                entry("x-a", "final", AppendAction::OverwriteIfExistsOrAdd),
+            ],
+            vec![],
+        ))
+        .unwrap();
+        let mut req = req_with(vec![("x-keep", "kept")]);
+        f.decode_headers(&mut req);
+        assert_eq!(req.headers, owned(&[("x-keep", "kept"), ("x-a", "final")]));
+    }
+
+    #[test]
+    fn empty_mutations_is_no_op_on_decode() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(vec![], vec![])).unwrap();
+        let mut req = req_with(vec![("host", "example.com")]);
+        let before = req.headers.clone();
+        f.decode_headers(&mut req);
+        assert_eq!(req.headers, before);
+    }
+
+    #[test]
+    fn empty_mutations_is_no_op_on_encode() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(vec![], vec![])).unwrap();
+        let mut resp = resp_with(vec![("content-length", "0")]);
+        let before = resp.headers.clone();
+        f.encode_headers(&mut resp);
+        assert_eq!(resp.headers, before);
+    }
+
+    #[test]
+    fn decode_headers_returns_continue_after_applying() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
+            vec![entry("x-a", "v", AppendAction::AppendIfExistsOrAdd)],
+            vec![],
+        ))
+        .unwrap();
+        let mut req = req_with(vec![]);
+        assert!(matches!(f.decode_headers(&mut req), Decision::Continue));
+    }
+
+    #[test]
+    fn encode_headers_returns_continue_after_applying() {
+        let mut f = HeaderMutationFilter::build_from_config(&cfg(
             vec![],
             vec![entry("x-a", "v", AppendAction::AppendIfExistsOrAdd)],
         ))
         .unwrap();
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = resp_with(vec![]);
+        assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
+    }
+
+    #[test]
+    fn round_trip_via_filter_pipeline_decode() {
+        // Build a real [HeaderMutation, Router] pipeline; decode_headers walks
+        // declaration order; the request carries the stamp afterward.
+        let filters = vec![
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.header_mutation".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::HeaderMutation(cfg(
+                    vec![entry("x-foo", "bar", AppendAction::AppendIfExistsOrAdd)],
+                    vec![],
+                )),
+            },
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            },
+        ];
+        let mut pipeline = crate::FilterPipeline::build_from_config(&filters).unwrap();
+        let mut req = req_with(vec![("host", "example.com")]);
         assert!(matches!(
-            filter.encode_headers(&mut resp),
+            pipeline.decode_headers(&mut req),
             Decision::Continue
         ));
+        assert!(req.headers.iter().any(|(k, v)| k == "x-foo" && v == "bar"));
+    }
+
+    #[test]
+    fn iteration_order_on_encode_via_filter_pipeline() {
+        // Reverse-iteration on encode reaches HeaderMutation after Router's
+        // no-op. The response carries the response-side stamp afterward.
+        let filters = vec![
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.header_mutation".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::HeaderMutation(cfg(
+                    vec![],
+                    vec![entry("x-resp", "stamp", AppendAction::AppendIfExistsOrAdd)],
+                )),
+            },
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            },
+        ];
+        let mut pipeline = crate::FilterPipeline::build_from_config(&filters).unwrap();
+        let mut resp = resp_with(vec![("content-length", "0")]);
+        assert!(matches!(
+            pipeline.encode_headers(&mut resp),
+            Decision::Continue
+        ));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "x-resp" && v == "stamp")
+        );
     }
 }
