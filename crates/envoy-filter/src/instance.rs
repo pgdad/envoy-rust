@@ -25,11 +25,18 @@ impl HttpFilterInstance {
     /// `FilterPipeline::build_from_config`, not here).
     pub(crate) fn build(
         hf: &envoy_config::HttpFilter,
-        _position: usize,
+        position: usize,
     ) -> Result<Self, FilterError> {
         match &hf.typed_config {
             envoy_config::HttpFilterTypedConfig::Router(_cfg) => {
                 Ok(HttpFilterInstance::Router(RouterTerminus::new()))
+            }
+            // Task 3 replaces this stub with HeaderMutationFilter::build_from_config.
+            envoy_config::HttpFilterTypedConfig::HeaderMutation(_cfg) => {
+                Err(FilterError::UnsupportedFilterType {
+                    position,
+                    name: hf.name.clone(),
+                })
             }
         }
     }

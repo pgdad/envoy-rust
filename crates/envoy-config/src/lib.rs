@@ -8,16 +8,18 @@ pub mod bootstrap;
 pub mod matcher;
 
 pub use bootstrap::{
-    AccessLog, AccessLogTypedConfig, Address, Admin, Bootstrap, CertificateValidationContext,
-    Cluster, ClusterType, CodecType, CommonTlsContext, DataSource, DirectResponse, DnsLookupFamily,
-    DownstreamTlsContext, Endpoint, ExplicitHttpConfig, FileAccessLog, FilterChain,
-    FilterChainMatch, HeaderMatcher, HeaderMatcherMode, Http1ProtocolOptions, Http2ProtocolOptions,
-    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpProtocolOptions,
-    Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalityLbEndpoints, NetworkFilter,
-    Node, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
-    SafeRegex, SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
-    TlsCertificate, TransportSocket, TransportSocketTypedConfig, TypedConfig,
-    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost,
+    AccessLog, AccessLogTypedConfig, Address, Admin, AppendAction, Bootstrap,
+    CertificateValidationContext, Cluster, ClusterType, CodecType, CommonTlsContext, DataSource,
+    DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint, ExplicitHttpConfig,
+    FileAccessLog, FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode,
+    HeaderMutationConfig, HeaderMutationEntry, HeaderValue, HeaderValueOption,
+    Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
+    HttpFilterTypedConfig, HttpProtocolOptions, Int64Range, LbEndpoint, LbPolicy, Listener,
+    LoadAssignment, LocalityLbEndpoints, Mutations, NetworkFilter, Node, Route, RouteAction,
+    RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, SafeRegex, SocketAddress,
+    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, TlsCertificate,
+    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
+    UpstreamTlsContext, VirtualHost,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.

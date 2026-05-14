@@ -444,6 +444,11 @@ pub struct HttpFilter {
 pub enum HttpFilterTypedConfig {
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router")]
     Router(RouterConfig),
+
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation"
+    )]
+    HeaderMutation(HeaderMutationConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -451,6 +456,65 @@ pub enum HttpFilterTypedConfig {
 #[derive(Debug, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {}
+
+/// `envoy.extensions.filters.http.header_mutation.v3.HeaderMutation` config.
+/// The HeaderMutation filter appends/overwrites request and response headers.
+/// Phase 07.2.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderMutationConfig {
+    pub mutations: Mutations,
+}
+
+/// The request-side and response-side mutation lists. Both default to empty
+/// (`mutations: {}` is legal — a no-op filter).
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Mutations {
+    #[serde(default)]
+    pub request_mutations: Vec<HeaderMutationEntry>,
+    #[serde(default)]
+    pub response_mutations: Vec<HeaderMutationEntry>,
+}
+
+/// One mutation entry. Envoy's proto is a `oneof` (append / remove); 07.2
+/// supports only `append`. `#[serde(deny_unknown_fields)]` rejects `remove`
+/// (and any other oneof arm) at parse time.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderMutationEntry {
+    pub append: HeaderValueOption,
+}
+
+/// `HeaderValueOption` — a header key/value plus the append action.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderValueOption {
+    pub header: HeaderValue,
+    pub append_action: AppendAction,
+}
+
+/// `HeaderValue` — the literal header key + value.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderValue {
+    pub key: String,
+    pub value: String,
+}
+
+/// `AppendAction` — Envoy's wire form uses SCREAMING_SNAKE_CASE. 07.2 supports
+/// `APPEND_IF_EXISTS_OR_ADD` + `OVERWRITE_IF_EXISTS_OR_ADD` at runtime; the two
+/// unsupported variants parse at the schema level so serde does not emit a
+/// generic "unknown variant" error — the Task 2 validator rejects them with the
+/// typed `ConfigError::UnsupportedHeaderMutationAppendAction` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AppendAction {
+    AppendIfExistsOrAdd,
+    OverwriteIfExistsOrAdd,
+    AddIfAbsent,
+    OverwriteIfExists,
+}
 
 /// HTTP/2 protocol-level tuning knobs, listener-side. Subset of Envoy's
 /// `envoy.config.core.v3.Http2ProtocolOptions`. Phase 05.2 ships 4 optional
@@ -1460,6 +1524,9 @@ pub(crate) fn validate_http_filters(
                     });
                 }
                 router_positions.push(i);
+            }
+            crate::HttpFilterTypedConfig::HeaderMutation(_) => {
+                // Task 2 adds full validation; accepted here as a non-terminal filter.
             }
         }
     }
@@ -6409,5 +6476,152 @@ static_resources:
         }];
         super::validate_http_filters(&filters, "ingress_http")
             .expect("pre-07.1 fixture filter-chain shape stays valid");
+    }
+
+    mod header_mutation_schema_tests {
+        use crate::{AppendAction, HeaderMutationConfig};
+
+        fn parse(yaml: &str) -> Result<HeaderMutationConfig, serde_yaml::Error> {
+            serde_yaml::from_str(yaml)
+        }
+
+        #[test]
+        fn minimal_request_only_mutations_parse() {
+            let cfg = parse(
+                "mutations:\n  request_mutations:\n    - append:\n        header:\n          key: x-foo\n          value: bar\n        append_action: APPEND_IF_EXISTS_OR_ADD\n",
+            )
+            .expect("request-only parses");
+            assert_eq!(cfg.mutations.request_mutations.len(), 1);
+            assert_eq!(cfg.mutations.response_mutations.len(), 0);
+            let e = &cfg.mutations.request_mutations[0];
+            assert_eq!(e.append.header.key, "x-foo");
+            assert_eq!(e.append.header.value, "bar");
+            assert_eq!(e.append.append_action, AppendAction::AppendIfExistsOrAdd);
+        }
+
+        #[test]
+        fn minimal_response_only_mutations_parse() {
+            let cfg = parse(
+                "mutations:\n  response_mutations:\n    - append:\n        header:\n          key: x-resp\n          value: stamp\n        append_action: OVERWRITE_IF_EXISTS_OR_ADD\n",
+            )
+            .expect("response-only parses");
+            assert_eq!(cfg.mutations.request_mutations.len(), 0);
+            assert_eq!(cfg.mutations.response_mutations.len(), 1);
+            assert_eq!(
+                cfg.mutations.response_mutations[0].append.append_action,
+                AppendAction::OverwriteIfExistsOrAdd
+            );
+        }
+
+        #[test]
+        fn both_request_and_response_mutations_parse() {
+            let cfg = parse(
+                "mutations:\n  request_mutations:\n    - append:\n        header:\n          key: x-req\n          value: a\n        append_action: APPEND_IF_EXISTS_OR_ADD\n  response_mutations:\n    - append:\n        header:\n          key: x-resp\n          value: b\n        append_action: APPEND_IF_EXISTS_OR_ADD\n",
+            )
+            .expect("both parse");
+            assert_eq!(cfg.mutations.request_mutations.len(), 1);
+            assert_eq!(cfg.mutations.response_mutations.len(), 1);
+            assert_eq!(
+                cfg.mutations.request_mutations[0].append.header.key,
+                "x-req"
+            );
+            assert_eq!(
+                cfg.mutations.response_mutations[0].append.header.key,
+                "x-resp"
+            );
+        }
+
+        #[test]
+        fn empty_mutations_parse_via_serde_default() {
+            let cfg = parse("mutations: {}\n").expect("empty mutations parse");
+            assert_eq!(cfg.mutations.request_mutations, Vec::new());
+            assert_eq!(cfg.mutations.response_mutations, Vec::new());
+        }
+
+        #[test]
+        fn multiple_entries_parse() {
+            let cfg = parse(
+                "mutations:\n  request_mutations:\n    - append:\n        header: { key: x-a, value: '1' }\n        append_action: APPEND_IF_EXISTS_OR_ADD\n    - append:\n        header: { key: x-b, value: '2' }\n        append_action: APPEND_IF_EXISTS_OR_ADD\n    - append:\n        header: { key: x-c, value: '3' }\n        append_action: APPEND_IF_EXISTS_OR_ADD\n",
+            )
+            .expect("3 entries parse");
+            assert_eq!(cfg.mutations.request_mutations.len(), 3);
+        }
+
+        #[test]
+        fn both_supported_append_actions_parse() {
+            for (yaml_val, expect) in [
+                ("APPEND_IF_EXISTS_OR_ADD", AppendAction::AppendIfExistsOrAdd),
+                (
+                    "OVERWRITE_IF_EXISTS_OR_ADD",
+                    AppendAction::OverwriteIfExistsOrAdd,
+                ),
+            ] {
+                let cfg = parse(&format!(
+                    "mutations:\n  request_mutations:\n    - append:\n        header: {{ key: k, value: v }}\n        append_action: {yaml_val}\n"
+                ))
+                .expect("supported action parses");
+                assert_eq!(
+                    cfg.mutations.request_mutations[0].append.append_action,
+                    expect
+                );
+            }
+        }
+
+        #[test]
+        fn unsupported_append_actions_parse_at_schema_level() {
+            // ADD_IF_ABSENT / OVERWRITE_IF_EXISTS parse at the schema layer; the
+            // Task 2 validator rejects them. Present in the enum so serde does not
+            // emit a generic "unknown variant" error.
+            for (yaml_val, expect) in [
+                ("ADD_IF_ABSENT", AppendAction::AddIfAbsent),
+                ("OVERWRITE_IF_EXISTS", AppendAction::OverwriteIfExists),
+            ] {
+                let cfg = parse(&format!(
+                    "mutations:\n  request_mutations:\n    - append:\n        header: {{ key: k, value: v }}\n        append_action: {yaml_val}\n"
+                ))
+                .expect("unsupported action still parses at schema level");
+                assert_eq!(
+                    cfg.mutations.request_mutations[0].append.append_action,
+                    expect
+                );
+            }
+        }
+
+        #[test]
+        fn unknown_field_rejects() {
+            let err = parse("mutations:\n  request_mutations: []\n  bogus_key: 1\n")
+                .expect_err("unknown field rejects");
+            assert!(format!("{err}").contains("bogus_key") || format!("{err}").contains("unknown"));
+        }
+
+        #[test]
+        fn missing_mutations_field_rejects() {
+            parse("not_mutations: {}\n").expect_err("missing `mutations` rejects");
+        }
+
+        #[test]
+        fn missing_key_field_rejects() {
+            parse(
+                "mutations:\n  request_mutations:\n    - append:\n        header: { value: v }\n        append_action: APPEND_IF_EXISTS_OR_ADD\n",
+            )
+            .expect_err("missing header.key rejects");
+        }
+
+        #[test]
+        fn missing_value_field_rejects() {
+            parse(
+                "mutations:\n  request_mutations:\n    - append:\n        header: { key: k }\n        append_action: APPEND_IF_EXISTS_OR_ADD\n",
+            )
+            .expect_err("missing header.value rejects");
+        }
+
+        #[test]
+        fn unknown_at_type_url_rejects_on_http_filter() {
+            // The tagged-enum on an unknown @type tag rejects.
+            let err: Result<crate::HttpFilterTypedConfig, _> = serde_yaml::from_str(
+                "\"@type\": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation.unknown\n",
+            );
+            err.expect_err("unknown @type rejects");
+        }
     }
 }

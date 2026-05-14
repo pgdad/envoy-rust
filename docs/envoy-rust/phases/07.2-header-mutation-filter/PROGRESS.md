@@ -94,4 +94,171 @@ separate (~2900 lines). State-4 re-checkpoint at Task 10.
 
 ---
 
-<!-- Task 1 implementation narrative appends here at Task 1's state-3 commit. -->
+## Task 1 — `envoy-config` schema additions for HeaderMutation
+
+**State-3 commit.** Lands the `HttpFilterTypedConfig::HeaderMutation` enum variant,
+5 supporting structs, and the `AppendAction` enum in `bootstrap.rs`; extends the
+`pub use bootstrap::{...}` re-export list in `lib.rs`; and lands a 12-test
+`header_mutation_schema_tests` module. TDD order was followed: tests written first
+(RED — compile error `cannot find type HeaderMutationConfig`), schema types added,
+tests turned GREEN.
+
+### Work summary
+
+- **`crates/envoy-config/src/bootstrap.rs`**: extended `HttpFilterTypedConfig` with
+  a `HeaderMutation(HeaderMutationConfig)` variant (keeping the existing
+  `#[serde(tag = "@type", deny_unknown_fields)]`); added `HeaderMutationConfig`,
+  `Mutations`, `HeaderMutationEntry`, `HeaderValueOption`, `HeaderValue` (each with
+  `#[derive(Debug, Deserialize, PartialEq)]` + `#[serde(deny_unknown_fields)]`), and
+  `AppendAction` (`#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]` +
+  `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]`). Added the
+  `header_mutation_schema_tests` nested module (12 tests). Also added a
+  `HeaderMutation` match arm to the `validate_http_filters` match (Task 2 fills in
+  validation; the arm is a pass-through with comment at Task 1 scope). Also added a
+  stub arm to `crates/envoy-filter/src/instance.rs` (see deviation note below).
+
+- **`crates/envoy-config/src/lib.rs`**: extended `pub use bootstrap::{...}` with
+  `AppendAction, HeaderMutationConfig, HeaderMutationEntry, HeaderValue,
+  HeaderValueOption, Mutations` (6 new names, alphabetized into the existing list).
+
+### Tests landed (12 tests in `bootstrap::tests::header_mutation_schema_tests`)
+
+1. `minimal_request_only_mutations_parse` — parses a single request mutation; asserts key/value/action.
+2. `minimal_response_only_mutations_parse` — parses a single response mutation; asserts action.
+3. `both_request_and_response_mutations_parse` — parses both sides simultaneously.
+4. `empty_mutations_parse_via_serde_default` — `mutations: {}` yields empty Vecs via `#[serde(default)]`.
+5. `multiple_entries_parse` — 3 request entries; asserts len.
+6. `both_supported_append_actions_parse` — `APPEND_IF_EXISTS_OR_ADD` + `OVERWRITE_IF_EXISTS_OR_ADD`.
+7. `unsupported_append_actions_parse_at_schema_level` — `ADD_IF_ABSENT` + `OVERWRITE_IF_EXISTS` parse at schema; Task 2 validator rejects them.
+8. `unknown_field_rejects` — `bogus_key` in `mutations` triggers `deny_unknown_fields`.
+9. `missing_mutations_field_rejects` — top-level key other than `mutations` rejected.
+10. `missing_key_field_rejects` — `header` with only `value` (no `key`) rejected.
+11. `missing_value_field_rejects` — `header` with only `key` (no `value`) rejected.
+12. `unknown_at_type_url_rejects_on_http_filter` — an unknown `@type` suffix on the tagged enum rejects.
+
+Test module LoC: ~90 lines. Schema types LoC: ~75 lines. `lib.rs` re-export edit: ~12 lines.
+
+### LoC delta
+
+```
+crates/envoy-config/src/bootstrap.rs  +207 lines
+crates/envoy-config/src/lib.rs          +12 lines (net; reformat of existing re-export list)
+crates/envoy-filter/src/instance.rs     +7 lines (deviation stub — see below)
+Total: +226 insertions, -10 deletions (net ~216 LoC added)
+```
+
+PLAN budget for Task 1: ~200 LoC. Actual ~216 LoC net — within acceptable range.
+
+### Deviations from PLAN
+
+1. **`crates/envoy-filter/src/instance.rs` touched at Task 1 (not Task 3).**
+   Adding `HttpFilterTypedConfig::HeaderMutation` to `envoy-config` immediately broke
+   the exhaustive `match &hf.typed_config` in `envoy-filter/src/instance.rs::build()`.
+   The workspace would not compile without a new arm. Added a stub arm returning
+   `Err(FilterError::UnsupportedFilterType { position, name })` with a comment
+   "Task 3 replaces this stub". This is a forward-compatible stub — Task 3 replaces it
+   with `HeaderMutationFilter::build_from_config`. This also partially addresses 07.1
+   REVIEW M2 (`UnsupportedFilterType` becomes first-constructable here; full close at
+   Task 3 as planned).
+
+2. **PLAN's test module used `use crate::{AppendAction, HeaderMutationConfig, Mutations}`
+   but `Mutations` is unused in the test body** (accessed only via `cfg.mutations`
+   field, not as a direct type constructor). Removed `Mutations` from the import to
+   satisfy `cargo clippy -- -D warnings` (unused import lint). The 12 test assertions
+   are unaffected.
+
+3. **`cargo fmt` reformatted `unknown_field_rejects`** — the multi-line
+   `parse("...", ).expect_err("...")` call was collapsed to a single-line chain
+   `parse("...").expect_err("...")`. Accepted — no semantic change.
+
+### Test-bucket attestation
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.44s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.17s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+All 55 test suites passed (0 failed). The `differential` crate's
+`tcp_proxy_backend_*` tests flaked once with "Connection refused" on first run (a
+pre-existing port-readiness race unrelated to Task 1 changes); the second and third
+runs were clean. 12 new tests in `envoy-config`.
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies. The `license-not-encountered` warnings are
+pre-existing (unmatched allowlist entries in `deny.toml` — not new from Task 1).
+
+### Review fixes (post-commit code-quality pass)
+
+Three fixes applied to commit `c4fd17f` (amended in-place; not yet pushed):
+
+1. **Important — `_position` rename** (`crates/envoy-filter/src/instance.rs`, `build`
+   function signature): the parameter was declared `_position: usize` (underscore signals
+   "intentionally unused") but was actively used in the `HeaderMutation` stub arm as
+   `position: _position`. Renamed to `position: usize` throughout; the struct shorthand
+   `position` (field init shorthand) replaces the explicit `position: _position` binding.
+   The `_cfg` bindings in the match arms remain underscore-prefixed — they are genuinely
+   unused and correctly annotated.
+
+2. **Minor — redundant `#[cfg(test)]` removed** (`crates/envoy-config/src/bootstrap.rs`,
+   `header_mutation_schema_tests` module): the inner module was nested inside the outer
+   `#[cfg(test)] mod tests { ... }` block and carried its own redundant `#[cfg(test)]`
+   attribute. Removed the inner attribute to match the sibling `validate_http_filters_tests`
+   module, which carries no such attribute.
+
+3. **Minor — strengthened assertion in `both_request_and_response_mutations_parse`**
+   (`crates/envoy-config/src/bootstrap.rs`): the test previously asserted only that both
+   mutation lists had length 1. Added key-equality assertions
+   (`request_mutations[0].append.header.key == "x-req"` and
+   `response_mutations[0].append.header.key == "x-resp"`) so a request/response mix-up
+   would be caught. Keys confirmed against the test YAML embedded in the same test.
+
+Minor #3 from the reviewer's full list (raw-string test literals) was deliberately NOT
+changed — those literals are PLAN-verbatim encoding and the reviewer agreed they were not
+worth changing at this stage.
