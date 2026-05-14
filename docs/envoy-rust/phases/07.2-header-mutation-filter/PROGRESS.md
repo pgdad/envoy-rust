@@ -1404,3 +1404,143 @@ advisories ok, bans ok, licenses ok, sources ok
 No new top-level Cargo dependencies. The `license-not-encountered` warnings are pre-existing
 (unmatched allowlist entries in `deny.toml` — identical to Tasks 1-6 attestations). No
 `Cargo.toml` files were modified by Task 8.
+
+---
+
+## Task 9 — In-process backstop `crates/envoy-bin/tests/http_filter_header_mutation.rs`
+
+**State-3 commit.** Creates the no-Docker in-process integration backstop for the Docker-gated
+fixture `0013-http-filter-header-mutation`. Spawns an in-process HTTP/1.1 echo upstream (echoes
+received request headers into the response body as sorted `name: value\n` lines), spawns
+`envoy-bin` as a subprocess against a `format!`-YAML HCM config with `http_filters:
+[HeaderMutation, Router]`, drives a `GET /`, and asserts both the encode-side stamp
+(`x-filter-response-stamp: phase-07` on response headers) and the decode-side stamp
+(`x-filter-stamp: phase-07` echoed in the response body, proving the mutation reached the
+backend). Follows the `crates/envoy-bin/tests/http1_router_upstream.rs` (04.3) precedent per
+PLAN-write SPEC correction 8.
+
+### Work summary
+
+- **`crates/envoy-bin/tests/http_filter_header_mutation.rs`** (new file, 283 lines):
+  - `reserve_port()` — TOCTOU port reservation (mirrors `http1_router_upstream.rs`).
+  - `wait_ready(addr, budget)` — exponential-backoff poll until the listener accepts.
+  - `spawn_echo_upstream()` — in-process tokio async upstream that accepts one connection,
+    reads until `\r\n\r\n`, parses headers via `httparse`, emits them sorted by lowercase
+    name into the body as `headers:\n  name: value\n` lines (differs from `http1_router_upstream.rs`'s
+    fixed-`"hello"` response — required so the decode-side stamp is observable in the body).
+  - `header_mutation_stamps_request_and_response()` — the single `#[tokio::test(flavor =
+    "multi_thread")]` test: spawns upstream, reserves listener port, writes `format!`'d YAML to
+    `tempfile::tempdir()`, spawns `envoy-bin` via `tokio::process::Command::new(env!(
+    "CARGO_BIN_EXE_envoy-bin"))`, waits for readiness, drives `GET / HTTP/1.1`, reads response,
+    asserts (1) `x-filter-response-stamp: phase-07` in response headers and (2) `x-filter-stamp:
+    phase-07` substring in response body, then tears down the child process.
+
+**`crates/envoy-bin/Cargo.toml` — NO CHANGE.** `anyhow` and `httparse` are in `[dependencies]`
+(available to test code); `tempfile` and `tokio` are in `[dev-dependencies]` and `[dependencies]`
+respectively. All required dev-deps were already present — confirmed against disk per Step 2.
+
+### Test landed
+
+1. `header_mutation_stamps_request_and_response` — 1 `#[tokio::test(flavor = "multi_thread")]`
+   test. Asserts:
+   - **Encode-side stamp:** `x-filter-response-stamp: phase-07` present in response headers
+     (the `HeaderMutation::encode_headers` path).
+   - **Decode-side stamp:** `x-filter-stamp: phase-07` substring present in response body
+     (echoed by the in-process upstream, proving the mutation reached the backend via
+     `HeaderMutation::decode_headers`).
+
+### LoC delta
+
+```
+crates/envoy-bin/tests/http_filter_header_mutation.rs  +283 lines (new file)
+docs/envoy-rust/phases/07.2-header-mutation-filter/PROGRESS.md  +~60 lines (this note)
+Total: ~343 insertions, 0 deletions
+```
+
+PLAN budget for Task 9: ~150 LoC. Actual 283 lines (file length) — the file includes the full
+module doc comment, the 3 helper functions, and the test function. Net additions are 283 new lines
+(previously non-existent file). The overage vs. the ~150 LoC budget is primarily the verbose
+assertions with diagnostic messages and the response-reading loop (~75 lines), both of which follow
+the `http1_router_upstream.rs` precedent's patterns verbatim.
+
+### Deviations from PLAN
+
+1. **`cargo fmt` expanded `eprintln!` to multi-line form.** The PLAN's verbatim file content
+   has `eprintln!("envoy-bin stderr:\n{}", String::from_utf8_lossy(&stderr_buf));` on a single line.
+   `cargo fmt` expanded it to 4-line form (the argument list is too long for the column limit).
+   Applied as a pre-commit fmt fix. No semantic change.
+
+### Test-bucket attestation
+
+**`cargo test -p envoy-bin --test http_filter_header_mutation`**
+```
+running 1 test
+test header_mutation_stamps_request_and_response ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+```
+
+Both assertions confirmed GREEN:
+- Encode-side stamp: `x-filter-response-stamp: phase-07` present in response headers — PASS.
+- Decode-side stamp: `x-filter-stamp: phase-07` echoed in response body — PASS.
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.62s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.94s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+All test suites passed (0 failed). 601 tests total across all crates (all `test result: ok`,
+0 FAILED). No flakes observed on this run. The new `header_mutation_stamps_request_and_response`
+test is the 1-test suite in `crates/envoy-bin`'s `http_filter_header_mutation` integration target.
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies (no `Cargo.toml` files modified by Task 9 — all required
+dev-deps were already present). The `license-not-encountered` warnings are pre-existing
+(unmatched allowlist entries in `deny.toml` — identical to Tasks 1-8 attestations).
