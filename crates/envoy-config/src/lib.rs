@@ -262,6 +262,36 @@ pub enum ConfigError {
         "listener '{listener}' has codec_type HTTP1 (or AUTO) but routes to cluster '{cluster}' whose typed_extension_protocol_options selects HTTP/2 upstream; H1-listener × H2-cluster dispatch is deferred per ADR-0028"
     )]
     Http2ClusterFromHttp1Listener { listener: String, cluster: String },
+
+    /// 07.2: HeaderMutation entry uses an `append_action` outside the
+    /// supported subset (`APPEND_IF_EXISTS_OR_ADD` / `OVERWRITE_IF_EXISTS_OR_ADD`).
+    /// `ADD_IF_ABSENT` / `OVERWRITE_IF_EXISTS` parse at the schema level but are
+    /// rejected here. `position` is the entry index within its mutations list.
+    #[error(
+        "HCM listener {listener:?}: HeaderMutation entry at position {position} uses unsupported append_action {action}"
+    )]
+    UnsupportedHeaderMutationAppendAction {
+        listener: String,
+        position: usize,
+        action: String,
+    },
+
+    /// 07.2: HeaderMutation entry has an empty `header.key`.
+    #[error(
+        "HCM listener {listener:?}: HeaderMutation entry at position {position} has an empty header key"
+    )]
+    EmptyHeaderMutationKey { listener: String, position: usize },
+
+    /// 07.2: HeaderMutation entry's `header.key` contains a byte outside the
+    /// RFC 7230 §3.2.6 token set.
+    #[error(
+        "HCM listener {listener:?}: HeaderMutation entry at position {position} has an invalid token in header key {key:?}"
+    )]
+    InvalidHeaderMutationKey {
+        listener: String,
+        position: usize,
+        key: String,
+    },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

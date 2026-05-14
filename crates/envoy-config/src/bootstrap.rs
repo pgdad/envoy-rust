@@ -1525,8 +1525,14 @@ pub(crate) fn validate_http_filters(
                 }
                 router_positions.push(i);
             }
-            crate::HttpFilterTypedConfig::HeaderMutation(_) => {
-                // Task 2 adds full validation; accepted here as a non-terminal filter.
+            crate::HttpFilterTypedConfig::HeaderMutation(cfg) => {
+                if f.name != "envoy.filters.http.header_mutation" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_header_mutation_entries(&cfg.mutations.request_mutations, listener_name)?;
+                validate_header_mutation_entries(&cfg.mutations.response_mutations, listener_name)?;
             }
         }
     }
@@ -1550,6 +1556,63 @@ pub(crate) fn validate_http_filters(
         });
     }
     Ok(())
+}
+
+/// Validate one HeaderMutation mutations list (request_mutations or
+/// response_mutations). Per-entry: non-empty `header.key` + RFC 7230 token
+/// set + `append_action` in the supported subset. `position` in each error is
+/// the entry index within `entries`. Phase 07.2.
+fn validate_header_mutation_entries(
+    entries: &[crate::HeaderMutationEntry],
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    for (entry_idx, entry) in entries.iter().enumerate() {
+        let key = &entry.append.header.key;
+        if key.is_empty() {
+            return Err(crate::ConfigError::EmptyHeaderMutationKey {
+                listener: listener_name.to_string(),
+                position: entry_idx,
+            });
+        }
+        if !is_valid_rfc7230_token(key) {
+            return Err(crate::ConfigError::InvalidHeaderMutationKey {
+                listener: listener_name.to_string(),
+                position: entry_idx,
+                key: key.clone(),
+            });
+        }
+        match entry.append.append_action {
+            crate::AppendAction::AppendIfExistsOrAdd
+            | crate::AppendAction::OverwriteIfExistsOrAdd => {
+                // supported.
+            }
+            crate::AppendAction::AddIfAbsent => {
+                return Err(crate::ConfigError::UnsupportedHeaderMutationAppendAction {
+                    listener: listener_name.to_string(),
+                    position: entry_idx,
+                    action: "ADD_IF_ABSENT".to_string(),
+                });
+            }
+            crate::AppendAction::OverwriteIfExists => {
+                return Err(crate::ConfigError::UnsupportedHeaderMutationAppendAction {
+                    listener: listener_name.to_string(),
+                    position: entry_idx,
+                    action: "OVERWRITE_IF_EXISTS".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// RFC 7230 §3.2.6 `token` validation: a header field name is a non-empty
+/// sequence of `tchar`. No existing helper in `envoy-config` covers this
+/// (the 04.2 HeaderMatcher work does case-insensitive name *matching*, not
+/// token-set *validation*) — landed inline here per 07.2 SPEC §6 signpost 1.
+fn is_valid_rfc7230_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 /// 06.2 Task 5 — validate an HCM's `access_log` Vec.
@@ -6622,6 +6685,205 @@ static_resources:
                 "\"@type\": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation.unknown\n",
             );
             err.expect_err("unknown @type rejects");
+        }
+    }
+
+    mod header_mutation_validator_tests {
+        use crate::{
+            AppendAction, HeaderMutationConfig, HeaderMutationEntry, HeaderValue,
+            HeaderValueOption, HttpFilter, HttpFilterTypedConfig, Mutations, RouterConfig,
+        };
+
+        fn entry(key: &str, value: &str, action: AppendAction) -> HeaderMutationEntry {
+            HeaderMutationEntry {
+                append: HeaderValueOption {
+                    header: HeaderValue {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    },
+                    append_action: action,
+                },
+            }
+        }
+
+        fn header_mutation_filter(
+            request_mutations: Vec<HeaderMutationEntry>,
+            response_mutations: Vec<HeaderMutationEntry>,
+        ) -> HttpFilter {
+            HttpFilter {
+                name: "envoy.filters.http.header_mutation".to_string(),
+                typed_config: HttpFilterTypedConfig::HeaderMutation(HeaderMutationConfig {
+                    mutations: Mutations {
+                        request_mutations,
+                        response_mutations,
+                    },
+                }),
+            }
+        }
+
+        fn router_filter() -> HttpFilter {
+            HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }
+        }
+
+        #[test]
+        fn header_mutation_with_all_supported_entries_passes() {
+            let filters = vec![
+                header_mutation_filter(
+                    vec![
+                        entry("x-a", "1", AppendAction::AppendIfExistsOrAdd),
+                        entry("x-b", "2", AppendAction::OverwriteIfExistsOrAdd),
+                    ],
+                    vec![
+                        entry("x-c", "3", AppendAction::AppendIfExistsOrAdd),
+                        entry("x-d", "4", AppendAction::OverwriteIfExistsOrAdd),
+                    ],
+                ),
+                router_filter(),
+            ];
+            super::validate_http_filters(&filters, "ingress_http").expect("supported entries pass");
+        }
+
+        #[test]
+        fn empty_key_rejects() {
+            let filters = vec![
+                header_mutation_filter(
+                    vec![entry("", "v", AppendAction::AppendIfExistsOrAdd)],
+                    vec![],
+                ),
+                router_filter(),
+            ];
+            match super::validate_http_filters(&filters, "ingress_http")
+                .expect_err("empty key rejects")
+            {
+                crate::ConfigError::EmptyHeaderMutationKey { listener, position } => {
+                    assert_eq!(listener, "ingress_http");
+                    assert_eq!(position, 0);
+                }
+                other => panic!("expected EmptyHeaderMutationKey, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn invalid_token_in_key_rejects() {
+            let filters = vec![
+                header_mutation_filter(
+                    vec![entry("x bad", "v", AppendAction::AppendIfExistsOrAdd)],
+                    vec![],
+                ),
+                router_filter(),
+            ];
+            match super::validate_http_filters(&filters, "ingress_http")
+                .expect_err("invalid token rejects")
+            {
+                crate::ConfigError::InvalidHeaderMutationKey {
+                    listener,
+                    position,
+                    key,
+                } => {
+                    assert_eq!(listener, "ingress_http");
+                    assert_eq!(position, 0);
+                    assert_eq!(key, "x bad");
+                }
+                other => panic!("expected InvalidHeaderMutationKey, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn add_if_absent_rejects() {
+            let filters = vec![
+                header_mutation_filter(vec![entry("x-a", "v", AppendAction::AddIfAbsent)], vec![]),
+                router_filter(),
+            ];
+            match super::validate_http_filters(&filters, "ingress_http")
+                .expect_err("ADD_IF_ABSENT rejects")
+            {
+                crate::ConfigError::UnsupportedHeaderMutationAppendAction {
+                    listener,
+                    position,
+                    action,
+                } => {
+                    assert_eq!(listener, "ingress_http");
+                    assert_eq!(position, 0);
+                    assert_eq!(action, "ADD_IF_ABSENT");
+                }
+                other => panic!("expected UnsupportedHeaderMutationAppendAction, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn overwrite_if_exists_rejects() {
+            let filters = vec![
+                header_mutation_filter(
+                    vec![],
+                    vec![entry("x-a", "v", AppendAction::OverwriteIfExists)],
+                ),
+                router_filter(),
+            ];
+            match super::validate_http_filters(&filters, "ingress_http")
+                .expect_err("OVERWRITE_IF_EXISTS rejects")
+            {
+                crate::ConfigError::UnsupportedHeaderMutationAppendAction { action, .. } => {
+                    assert_eq!(action, "OVERWRITE_IF_EXISTS");
+                }
+                other => panic!("expected UnsupportedHeaderMutationAppendAction, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn router_not_terminal_still_rejects_under_header_mutation_chain() {
+            // [Router, HeaderMutation] — Router first; the 07.1 Task 4 validator
+            // still fires RouterNotTerminal.
+            let filters = vec![
+                router_filter(),
+                header_mutation_filter(
+                    vec![entry("x-a", "v", AppendAction::AppendIfExistsOrAdd)],
+                    vec![],
+                ),
+            ];
+            match super::validate_http_filters(&filters, "ingress_http")
+                .expect_err("Router-not-terminal rejects")
+            {
+                crate::ConfigError::RouterNotTerminal { position, .. } => {
+                    assert_eq!(position, 0)
+                }
+                other => panic!("expected RouterNotTerminal, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn duplicate_router_rejects_under_header_mutation_chain() {
+            let filters = vec![
+                header_mutation_filter(
+                    vec![entry("x-a", "v", AppendAction::AppendIfExistsOrAdd)],
+                    vec![],
+                ),
+                router_filter(),
+                router_filter(),
+            ];
+            match super::validate_http_filters(&filters, "ingress_http")
+                .expect_err("duplicate Router rejects")
+            {
+                crate::ConfigError::DuplicateRouterFilter { .. } => {}
+                other => panic!("expected DuplicateRouterFilter, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn name_typed_config_mismatch_rejects() {
+            let mut f = header_mutation_filter(vec![], vec![]);
+            f.name = "envoy.filters.http.fault".to_string();
+            let filters = vec![f, router_filter()];
+            match super::validate_http_filters(&filters, "ingress_http")
+                .expect_err("name/typed_config mismatch rejects")
+            {
+                crate::ConfigError::UnsupportedHttpFilter { name } => {
+                    assert_eq!(name, "envoy.filters.http.fault");
+                }
+                other => panic!("expected UnsupportedHttpFilter, got {other:?}"),
+            }
         }
     }
 }

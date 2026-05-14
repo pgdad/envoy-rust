@@ -262,3 +262,144 @@ Three fixes applied to commit `c4fd17f` (amended in-place; not yet pushed):
 Minor #3 from the reviewer's full list (raw-string test literals) was deliberately NOT
 changed — those literals are PLAN-verbatim encoding and the reviewer agreed they were not
 worth changing at this stage.
+
+---
+
+## Task 2 — `envoy-config` validator extension + 3 new `ConfigError` variants
+
+**State-3 commit.** Replaces the Task-1 pass-through `HeaderMutation` arm in
+`validate_http_filters` with the real validating arm; adds two free functions
+(`validate_header_mutation_entries`, `is_valid_rfc7230_token`) in `bootstrap.rs`;
+appends 3 `ConfigError` variants to `lib.rs`; and lands an 8-test
+`header_mutation_validator_tests` module. TDD order was followed: tests written first
+(RED — compile error, 4 missing `ConfigError` variants), `ConfigError` variants added to
+`lib.rs`, validator + helpers added to `bootstrap.rs`, tests turned GREEN (8/8 PASS).
+
+### Work summary
+
+- **`crates/envoy-config/src/lib.rs`**: appended 3 `ConfigError` variants after
+  `Http2ClusterFromHttp1Listener`:
+  - `UnsupportedHeaderMutationAppendAction { listener, position, action }` — fires for
+    `ADD_IF_ABSENT` or `OVERWRITE_IF_EXISTS` (parse but are rejected by the validator).
+  - `EmptyHeaderMutationKey { listener, position }` — fires when `header.key` is `""`.
+  - `InvalidHeaderMutationKey { listener, position, key }` — fires when `header.key`
+    fails RFC 7230 §3.2.6 token validation.
+
+- **`crates/envoy-config/src/bootstrap.rs`**:
+  - Replaced the Task-1 no-op `HeaderMutation` arm in `validate_http_filters` with the
+    real arm: name-mismatch check + calls to `validate_header_mutation_entries` for both
+    `request_mutations` and `response_mutations`.
+  - Added `validate_header_mutation_entries(entries, listener_name)` — iterates entries,
+    checks non-empty key, RFC 7230 token validity, and supported `append_action` subset.
+  - Added `is_valid_rfc7230_token(s)` — RFC 7230 §3.2.6 `tchar` validation landed inline
+    per PLAN-write SPEC correction 5 (no existing token-set validator in `envoy-config`).
+  - Added `mod header_mutation_validator_tests` with 8 tests inside `#[cfg(test)] mod tests`.
+
+### Tests landed (8 tests in `bootstrap::tests::header_mutation_validator_tests`)
+
+1. `header_mutation_with_all_supported_entries_passes` — all 4 supported action variants
+   (2 request + 2 response) pass the validator.
+2. `empty_key_rejects` — `header.key = ""` triggers `EmptyHeaderMutationKey`.
+3. `invalid_token_in_key_rejects` — `"x bad"` (space) triggers `InvalidHeaderMutationKey`.
+4. `add_if_absent_rejects` — `ADD_IF_ABSENT` triggers `UnsupportedHeaderMutationAppendAction`
+   with `action = "ADD_IF_ABSENT"`.
+5. `overwrite_if_exists_rejects` — `OVERWRITE_IF_EXISTS` (in response mutations) triggers
+   `UnsupportedHeaderMutationAppendAction` with `action = "OVERWRITE_IF_EXISTS"`.
+6. `router_not_terminal_still_rejects_under_header_mutation_chain` — `[Router, HeaderMutation]`
+   ordering still fires `RouterNotTerminal` (07.1 Task 4 validator unchanged).
+7. `duplicate_router_rejects_under_header_mutation_chain` — `[HeaderMutation, Router, Router]`
+   still fires `DuplicateRouterFilter`.
+8. `name_typed_config_mismatch_rejects` — a `HeaderMutation` typed_config paired with
+   `name = "envoy.filters.http.fault"` fires `UnsupportedHttpFilter`.
+
+Test module LoC: ~160 lines. Validator + helpers LoC: ~70 lines. `lib.rs` variants: ~28 lines.
+
+Task 1's 12 `header_mutation_schema_tests` confirmed still PASS (12/12) after Task 2 changes.
+
+### LoC delta
+
+```
+crates/envoy-config/src/bootstrap.rs  +266 lines, -2 lines (net +264)
+crates/envoy-config/src/lib.rs          +30 lines, -0 lines (net +30)
+Total: +294 insertions, -2 deletions (net ~292 LoC added)
+```
+
+PLAN budget for Task 2: ~170 LoC. Actual ~292 LoC net — overage concentrated entirely in the
+test module (~160 LoC vs. ~60 LoC budgeted). The 8 test functions expanded to full match-arm
+coverage (3 struct fields each) under `cargo fmt`'s formatting, which added lines. Production
+code (validator + helpers + `ConfigError` variants) is ~100 LoC — within +25% of the ~80 LoC
+PLAN estimate.
+
+### Deviations from PLAN
+
+1. **`cargo fmt` reformatted PLAN-verbatim code blocks.** The PLAN's Step 4 code blocks used
+   inline struct initializers (`HeaderValue { key: k.to_string(), value: v.to_string() }` on one
+   line) and multi-line `validate_header_mutation_entries(...)` calls. `cargo fmt` expanded struct
+   initializers to multi-line form and collapsed `validate_header_mutation_entries(...)` calls to
+   single lines. Also reformatted the `EmptyHeaderMutationKey` `#[error(...)]` attribute and
+   the `InvalidHeaderMutationKey` struct fields in `lib.rs`. No semantic changes — formatting only.
+   The test module's `use crate::{...}` import line was also re-wrapped to fit the column limit.
+
+### Test-bucket attestation
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.30s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.09s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+All test suites passed (0 failed) on the second run. The `differential` crate's
+`http1_echo_backend_drop_terminates_child` and `http1_echo_backend_spawns_and_echoes`
+tests flaked on the first run with "http1-echo-server never became accept-ready" (the
+pre-existing port-readiness race documented at Task 1); the second run was clean (77 passed,
+0 failed in the differential crate; 8 new tests in `envoy-config::bootstrap::tests::header_mutation_validator_tests`).
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies. The `license-not-encountered` warnings are pre-existing
+(unmatched allowlist entries in `deny.toml` — identical to Task 1's attestation).
