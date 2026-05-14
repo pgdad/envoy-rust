@@ -5,6 +5,15 @@ edition = "2024"
 publish = false
 license = "Apache-2.0"
 
+[features]
+# Exposes test-only HttpFilterInstance variants (TestStopAndSendOnDecode /
+# TestStopAndSendOnEncode) + FilterPipeline::test_from_instances so the
+# downstream envoy-http1 / envoy-http2 HCM test suites can exercise the
+# framework's StopAndSend short-circuit paths. NOT enabled in production
+# builds. (#[cfg(test)] would not be cross-crate-visible — see 07.2 PLAN
+# correction 2.)
+test-util = []
+
 [dependencies]
 bytes = "1"
 thiserror = "2"

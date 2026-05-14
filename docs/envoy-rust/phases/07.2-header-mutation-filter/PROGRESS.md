@@ -779,3 +779,281 @@ No new top-level Cargo dependencies. The `license-not-encountered` warnings are 
 (unmatched allowlist entries in `deny.toml` — identical to Tasks 1, 2, and 3's attestations).
 The 2 `#[allow(dead_code)]` struct-level attributes removed from `header_mutation.rs` introduced
 no new `cargo deny` concerns.
+
+---
+
+## Task 5 — H1+H2 HCM filter-chain integration tests + `finalize_h2_stream` cleanup [07.1 REVIEW I1]
+
+**State-3 commit.** Four step groups: **A** = 07.1 REVIEW I1 `finalize_h2_stream` 3-dead-parameter
+cleanup (the named structural prerequisite); **B** = `test-util` Cargo feature on `envoy-filter`;
+**C** = 5 H1 HCM filter-chain integration tests; **D** = 4 H2 HCM filter-chain integration tests.
+
+### Work summary
+
+**Group A — 07.1 REVIEW I1: `finalize_h2_stream` 3-dead-parameter cleanup**
+
+- **`crates/envoy-http2/src/hcm.rs`** (`finalize_h2_stream` signature): removed
+  `_response_status_for_log: u16`, `_response_body_len: u64`, and
+  `_response_headers_for_log: &[(String, String)]` from the function signature (lines 436-455 per
+  PLAN guidance; actual function at lines 425-444 post-Tasks-1-4 shifts). The function body already
+  derived everything from `resp` post-encode via the shadow locals at lines 490-493; the parameters
+  were unused-and-discarded, hence the `_` prefix.
+
+- **`crates/envoy-http2/src/hcm.rs`** (3 call sites in `handle_one_stream`): removed the
+  3 pre-encode local computations (`response_status_for_log = r.status` / `response_body_len =
+  r.body.len() as u64` / `response_headers_for_log = r.headers.clone()`) from all 4 arms that
+  assigned them (call-site 1: no-healthy-endpoint → 502; call-site 2: upstream-dispatch-error →
+  502; the Proxy arm success path; the SynthFromDecode arm) and removed the 3 args from all 3
+  explicit `finalize_h2_stream` calls. The `let response_status_for_log: u16; let response_body_len:
+  u64; let response_headers_for_log: Vec<...>;` declarations at the top of the match block were
+  also removed.
+
+- Updated the comment at the post-encode shadow-local derivation site to drop the "shadow the
+  pre-encode log-locals" framing — it now reads "derive the post-encode log-locals from `resp`".
+  `#[allow(clippy::too_many_arguments)]` retained (9 params → still >7).
+
+- **Net removal: ~22 lines** (4 removed params + comment block from signature; 12 removed
+  pre-encode local computations across 4 arms; 9 removed call-site args across 3 calls; 3 removed
+  `let` declarations). Behavior is completely unchanged — the function body's post-encode shadow
+  locals already served all readers; the caller-side pre-encode values were never read.
+
+- **Verification (Step A3):** `cargo test -p envoy-http2` — all 38 tests (including all 13+1
+  pre-existing H2 hcm tests) GREEN before any Group B/C/D code was added. Zero behavior impact
+  confirmed.
+
+**07.1 REVIEW I1 — CLOSED.**
+
+**Group B — `test-util` Cargo feature on `envoy-filter`**
+
+- **`crates/envoy-filter/Cargo.toml`**: added `[features] test-util = []` with an explanatory
+  comment per correction 2 (the `#[cfg(test)]` variant is not cross-crate-visible; `test-util`
+  feature is the SPEC's own documented alternative).
+
+- **`crates/envoy-filter/src/instance.rs`**: added `#[cfg(feature = "test-util")]`
+  `TestStopAndSendOnDecode(FilterResponse)` and `TestStopAndSendOnEncode(FilterResponse)` variants
+  to `HttpFilterInstance`; added cfg-gated match arms to `decode_headers` and `encode_headers`;
+  added a cfg-gated `impl HttpFilterInstance` block with `test_stop_and_send_on_decode`,
+  `test_stop_and_send_on_encode`, and `test_router` constructors.
+
+  **Deviation from PLAN (minor):** `RouterTerminus::new()` is `pub(crate)` — not externally
+  visible. The PLAN's test code calls `envoy_filter::HttpFilterInstance::Router(envoy_filter::
+  RouterTerminus::new())`. Added a `test_router()` constructor alongside the two StopAndSend
+  constructors under the same `#[cfg(feature = "test-util")]` impl block. The H1/H2 tests use
+  `envoy_filter::HttpFilterInstance::test_router()` instead of the direct variant construction.
+  This is the same pattern as the StopAndSend constructors — strictly additive.
+
+- **`crates/envoy-filter/src/pipeline.rs`**: added `#[cfg(feature = "test-util")]`
+  `FilterPipeline::test_from_instances(filters: Vec<HttpFilterInstance>) -> Self` constructor after
+  `build_from_config`.
+
+- **`crates/envoy-http1/Cargo.toml`**: added `[dev-dependencies] envoy-filter = { path =
+  "../envoy-filter", features = ["test-util"] }`.
+
+- **`crates/envoy-http2/Cargo.toml`**: same dev-dependency feature line.
+
+**Group C — 5 H1 HCM filter-chain integration tests**
+
+Added to `crates/envoy-http1/src/hcm.rs` `#[cfg(test)] mod tests`:
+
+Two new helpers:
+- `hcm_config_with_pipeline(pipeline, prefix, route_status, route_body)` — inlines a struct
+  literal (HCMConfig does not derive Clone) mirroring `hcm_config_single_route`'s body, swapping
+  `filter_pipeline`. PLAN's fallback instruction ("if `HCMConfig` does not derive `Clone`, inline
+  the full struct literal") applied.
+- `header_mutation_pipeline(request_mutations, response_mutations)` — builds a `[HeaderMutation,
+  Router]` FilterPipeline from `(key, value, AppendAction)` triples.
+- `hcm_config_header_matched_route(pipeline)` — HCMConfig with a HeaderMatcher route on
+  `x-test-path-override = "/bar"` → 200 "matched\n". Mirrors
+  `single_header_matcher_route_selected_when_match`.
+- `hcm_config_with_access_log_and_pipeline(pipeline, log_path)` — HCMConfig with a FileSink
+  at `log_path` and the caller's pipeline. Mirrors `hcm_config_with_access_log`.
+
+5 new tests (all GREEN on first run):
+1. `h1_decode_headers_fires_before_route_match` — decode mutation fires before route-match.
+2. `h1_encode_headers_fires_after_writer_arm_before_wire_write` — encode mutation stamp on wire.
+3. `h1_stop_and_send_at_decode_skips_route_match` — decode StopAndSend short-circuits route.
+4. `h1_stop_and_send_at_encode_substitutes_wire_response` — encode StopAndSend replaces response.
+5. `h1_access_log_reflects_post_encode_headers` — access log dispatches after encode_headers.
+
+**Group D — 4 H2 HCM filter-chain integration tests**
+
+Added to `crates/envoy-http2/src/hcm.rs` `#[cfg(test)] mod tests`:
+- Added `AppendAction` to the test module's `use envoy_config::{...}` import.
+
+Two new helpers:
+- `synth_h2_hcm_config_with_header_mutation(request_mutations, response_mutations, ...)` — builds
+  a full `Http1HCMConfig` via `from_config` with `[HeaderMutation, Router]` http_filters.
+- `synth_h2_hcm_config_with_pipeline(pipeline)` — inlines a struct literal (Http1HCMConfig does
+  not derive Clone) with the caller's pipeline over a `direct_response 200 "route\n"` route.
+  Uses `use envoy_http1::{HCMConfig, HCMStats}` for the struct and stats construction.
+
+4 new tests (all GREEN on first run):
+1. `h2_decode_headers_fires_before_route_match` — decode mutation reaches request-processing.
+2. `h2_encode_headers_fires_before_send_envoy_response` — encode stamp present on wire response.
+3. `h2_stop_and_send_at_decode_skips_route_match` — decode StopAndSend 503, body "stopped\n".
+4. `h2_stop_and_send_at_encode_substitutes_wire_response` — encode StopAndSend 418, body "teapot\n".
+
+### Tests landed (9 new integration tests)
+
+**H1 (5 tests, `crates/envoy-http1/src/hcm.rs`):**
+1. `h1_decode_headers_fires_before_route_match`
+2. `h1_encode_headers_fires_after_writer_arm_before_wire_write`
+3. `h1_stop_and_send_at_decode_skips_route_match`
+4. `h1_stop_and_send_at_encode_substitutes_wire_response`
+5. `h1_access_log_reflects_post_encode_headers`
+
+**H2 (4 tests, `crates/envoy-http2/src/hcm.rs`):**
+6. `h2_decode_headers_fires_before_route_match`
+7. `h2_encode_headers_fires_before_send_envoy_response`
+8. `h2_stop_and_send_at_decode_skips_route_match`
+9. `h2_stop_and_send_at_encode_substitutes_wire_response`
+
+Tests 1, 2, 6, 7 use the real `HeaderMutationFilter`. Tests 3, 4, 5, 8, 9 use the `test-util`
+StopAndSend stubs. Helpers added: 4 H1 helpers (~90 LoC) + 2 H2 helpers (~70 LoC).
+
+Pre-existing tests confirmed GREEN after all changes:
+- `envoy-http2`: 38 tests (17 hcm + 21 other; 1 `#[ignore]`d) — all GREEN.
+- `envoy-http1`: 39 hcm tests (34 pre-existing + 5 new) — all GREEN.
+
+### LoC delta
+
+```
+crates/envoy-filter/Cargo.toml       +9  lines
+crates/envoy-filter/src/instance.rs  +45 lines, -4 lines (net +41)
+crates/envoy-filter/src/pipeline.rs  +8  lines
+crates/envoy-http1/Cargo.toml        +1  line
+crates/envoy-http1/src/hcm.rs        +308 lines (net; all new helpers + tests)
+crates/envoy-http2/Cargo.toml        +1  line
+crates/envoy-http2/src/hcm.rs        +325 lines, -53 lines (net +272; I1 cleanup ~-22 lines, helpers + tests ~+294 lines)
+Total: +644 insertions, -53 deletions (net ~591 LoC added)
+```
+
+PLAN budget for Task 5: ~300 LoC. Actual ~591 LoC net — overage concentrated in the helpers
+(~160 LoC for 6 helpers) and the Group D struct-literal helper (`synth_h2_hcm_config_with_pipeline`
+inlines the full `HCMConfig` struct since `Http1HCMConfig` doesn't derive `Clone`) expanding the
+budget; the PLAN assumed `.clone()` would suffice. The test bodies are verbatim or `cargo fmt`
+reformatted from the PLAN.
+
+### Deviations from PLAN
+
+1. **`RouterTerminus::new()` is `pub(crate)` — not externally accessible.** The PLAN's test
+   code used `envoy_filter::HttpFilterInstance::Router(envoy_filter::RouterTerminus::new())`.
+   Added a `test_router()` constructor to the `#[cfg(feature = "test-util")]` impl block in
+   `instance.rs`. All test sites use `envoy_filter::HttpFilterInstance::test_router()` instead.
+
+2. **`HCMConfig` / `Http1HCMConfig` do not derive `Clone`.** The PLAN's
+   `hcm_config_with_pipeline` and `synth_h2_hcm_config_with_pipeline` were written assuming
+   `.clone()` would work. Both helpers inline full struct literals per the PLAN's own fallback
+   instruction ("if `HCMConfig` does not derive `Clone`, inline the full struct literal").
+
+3. **`cargo fmt` reformatted all PLAN-verbatim assert statements.** Long `assert!(...)` and
+   `assert_eq!(...)` calls were expanded to multi-line form by `rustfmt`. No semantic changes.
+
+4. **`synth_h2_hcm_config_with_pipeline` uses `use envoy_http1::{HCMConfig, HCMStats}` inline.**
+   The H2 test module imports `Http1HCMConfig` as an alias from `envoy_http1::HCMConfig`; the
+   helper needed to construct `HCMStats` directly. An inline `use` statement resolves the alias
+   ambiguity cleanly.
+
+5. **The `AppendAction_Route` import in the H2 test module was already present.** Only `AppendAction`
+   was missing from the imports; added it to the existing `use envoy_config::{...}` block.
+
+### Test-bucket attestation
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.13s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.78s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+All test suites passed (0 failed). Notable counts: `envoy-http1` 68 tests; `envoy-http2` 42 tests
+(1 `#[ignore]`d); `envoy-filter` 32 tests; `envoy-config` 20 tests. No flakes observed on this run.
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies (3 `Cargo.toml` files touched: `envoy-filter` gains
+`[features] test-util = []`; `envoy-http1` + `envoy-http2` each gain one `[dev-dependencies]`
+feature line for `envoy-filter`). The `license-not-encountered` warnings are pre-existing
+(unmatched allowlist entries in `deny.toml` — identical to Tasks 1-4 attestations).
+
+### Review fixes (post-commit code-quality pass)
+
+Four issues identified by the code quality reviewer; all applied as a single `--amend` to `8dc4d2f`:
+
+1. **[Important] Stale `finalize_h2_stream` comment** (`crates/envoy-http2/src/hcm.rs`, comment
+   preceding the `response_status_for_log / 100` match). The comment said
+   `response_status_for_log` was a "parameter threaded through `finalize_h2_stream` from each H2
+   writer arm" — which was accurate before Group A (I1 cleanup) removed the parameter. Updated to
+   accurately describe it as a local derived post-encode from `resp`, mirroring the phrasing of the
+   updated comment block at the derivation site above.
+
+2. **[Important] `h2_decode_headers_fires_before_route_match` overclaimed** (`crates/envoy-http2/src/hcm.rs`).
+   **Preferred fix taken** (preferred over rename/fallback because the H2 `RouteMatch.headers` field
+   is structurally identical to H1 and `HeaderMatcher`/`HeaderMatcherMode` were already in
+   `envoy-config`; the extension was small and clean — ~70 LoC total for a new helper +
+   strengthened test body). Added `synth_h2_hcm_config_header_mutation_matched_route()` which builds
+   a single route with `HeaderMatcher { name: "x-h2-decode", ExactMatch("seen") }`. The decode
+   mutation adds `x-h2-decode: seen`; the test now asserts both 200 status AND `"matched\n"` body —
+   genuinely discriminating "mutation ran before route-match" from "mutation skipped". Added
+   `HeaderMatcher, HeaderMatcherMode` to the test module's `use envoy_config::{...}` import.
+
+3. **[Minor] Inaccurate comment in `h1_decode_headers_fires_before_route_match`**
+   (`crates/envoy-http1/src/hcm.rs`). Comment said "The catch-all route returns 404-shaped
+   'default\n'" and "NOT match `/bar` by prefix" — both wrong. Rewritten to accurately describe the
+   single route that matches prefix `/` AND requires header `x-test-path-override: /bar`; no
+   catch-all route exists; the 200 "matched\n" response proves decode ran before route-match.
+
+4. **[Minor] Clarifying comment on intentional route-body difference**
+   (`crates/envoy-http2/src/hcm.rs`, `synth_h2_hcm_config_with_pipeline`). Added a one-line
+   inline comment on `"route\n"` noting the body intentionally differs from `synth_h2_hcm_config`'s
+   `"ok\n"` because tests using this helper assert the stub response body, not the route body.
+
+**Post-fix workspace gate:** build clean, clippy clean, fmt clean, deny clean.
+`cargo test -p envoy-http2 hcm`: 17 passed, 1 ignored.
+`cargo test -p envoy-http1 hcm`: 39 passed, 0 ignored.
+`cargo test --workspace`: 75+ passed across all crates (2 known-flaky `tcp_proxy_backend_*`
+port-readiness failures on first run; 0 failures on second run).

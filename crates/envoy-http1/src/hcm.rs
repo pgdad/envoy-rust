@@ -2538,4 +2538,313 @@ static_resources:
         assert!(Arc::strong_count(&arc1) >= 2);
         assert!(std::ptr::eq(&*arc1, &*arc2));
     }
+
+    // ── 07.2 Task 5 (Group C): H1 HCM filter-chain integration tests ─────────
+
+    /// Build an HCMConfig with a caller-supplied filter pipeline + a single
+    /// prefix route. `route_status` / `route_body` define the direct_response
+    /// the route serves. Used by the 07.2 filter-chain integration tests.
+    ///
+    /// HCMConfig does not derive Clone, so this inlines the struct literal
+    /// (mirroring `hcm_config_single_route`'s body, swapping `filter_pipeline`).
+    async fn hcm_config_with_pipeline(
+        pipeline: Arc<envoy_filter::FilterPipeline>,
+        prefix: &str,
+        route_status: u16,
+        route_body: &str,
+    ) -> Arc<HCMConfig> {
+        Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![],
+            filter_pipeline: pipeline,
+            route_config: Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some(prefix.to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: route_status,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some(route_body.to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            }),
+        })
+    }
+
+    /// Build an `Arc<FilterPipeline>` with `[HeaderMutation(request+response
+    /// mutations), Router]`.
+    fn header_mutation_pipeline(
+        request_mutations: Vec<(&str, &str, envoy_config::AppendAction)>,
+        response_mutations: Vec<(&str, &str, envoy_config::AppendAction)>,
+    ) -> Arc<envoy_filter::FilterPipeline> {
+        let mk = |v: Vec<(&str, &str, envoy_config::AppendAction)>| {
+            v.into_iter()
+                .map(|(k, val, action)| envoy_config::HeaderMutationEntry {
+                    append: envoy_config::HeaderValueOption {
+                        header: envoy_config::HeaderValue {
+                            key: k.to_string(),
+                            value: val.to_string(),
+                        },
+                        append_action: action,
+                    },
+                })
+                .collect()
+        };
+        let filters = vec![
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.header_mutation".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::HeaderMutation(
+                    envoy_config::HeaderMutationConfig {
+                        mutations: envoy_config::Mutations {
+                            request_mutations: mk(request_mutations),
+                            response_mutations: mk(response_mutations),
+                        },
+                    },
+                ),
+            },
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            },
+        ];
+        Arc::new(envoy_filter::FilterPipeline::build_from_config(&filters).unwrap())
+    }
+
+    /// Build an HCMConfig whose single route matches on the header
+    /// `x-test-path-override` with an exact-match value of `/bar` →
+    /// direct_response 200 "matched\n". Used by
+    /// `h1_decode_headers_fires_before_route_match`.
+    ///
+    /// Mirrors the `single_header_matcher_route_selected_when_match` test's
+    /// config-build shape; swaps in the caller's pipeline.
+    async fn hcm_config_header_matched_route(
+        pipeline: Arc<envoy_filter::FilterPipeline>,
+    ) -> Arc<HCMConfig> {
+        let matcher_route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/".to_string()),
+                path: None,
+                headers: vec![envoy_config::HeaderMatcher {
+                    name: "x-test-path-override".to_string(),
+                    mode: envoy_config::HeaderMatcherMode::ExactMatch("/bar".to_string()),
+                    invert_match: false,
+                }],
+            },
+            action: RouteAction::DirectResponse(DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("matched\n".to_string()),
+                },
+            }),
+        };
+        Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![],
+            filter_pipeline: pipeline,
+            route_config: Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![matcher_route],
+                }],
+            }),
+        })
+    }
+
+    /// Build an HCMConfig with a single VH `domains: ["*"]`, a single
+    /// `/`-prefix DirectResponse route returning 200 `ok\n`, and a FileSink
+    /// at `log_path`, using the caller's filter pipeline.
+    ///
+    /// Mirrors `hcm_config_with_access_log`, swapping in the caller's pipeline.
+    async fn hcm_config_with_access_log_and_pipeline(
+        pipeline: Arc<envoy_filter::FilterPipeline>,
+        log_path: &std::path::Path,
+    ) -> Arc<HCMConfig> {
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.to_path_buf())
+                .await
+                .expect("open FileSink"),
+        );
+        Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: pipeline,
+            route_config: Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn h1_decode_headers_fires_before_route_match() {
+        // HeaderMutation adds `x-test-path-override: /bar` on decode. The
+        // single route matches any path prefix `/` but also requires the header
+        // `x-test-path-override: /bar` (exact match) → direct_response 200
+        // "matched\n". There is no catch-all route. Driving `GET /foo` returns
+        // 200 "matched\n" only if decode_headers ran before route-match (adding
+        // the required header); if decode were skipped the header would be absent,
+        // no route would match, and the router would 404.
+        let pipeline = header_mutation_pipeline(
+            vec![(
+                "x-test-path-override",
+                "/bar",
+                envoy_config::AppendAction::OverwriteIfExistsOrAdd,
+            )],
+            vec![],
+        );
+        // Build an HCMConfig whose route matches on header x-test-path-override.
+        let config = hcm_config_header_matched_route(pipeline).await;
+        let req = b"GET /foo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = String::from_utf8(drive(config, req).await).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 200 "),
+            "decode mutation drove route match: {resp}"
+        );
+        assert!(resp.ends_with("matched\n"), "matched route body: {resp}");
+    }
+
+    #[tokio::test]
+    async fn h1_encode_headers_fires_after_writer_arm_before_wire_write() {
+        // HeaderMutation adds `x-test-encode: ok` on encode. direct_response
+        // route. The wire output's headers carry x-test-encode.
+        let pipeline = header_mutation_pipeline(
+            vec![],
+            vec![(
+                "x-test-encode",
+                "ok",
+                envoy_config::AppendAction::AppendIfExistsOrAdd,
+            )],
+        );
+        let config = hcm_config_with_pipeline(pipeline, "/", 200, "body\n").await;
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = String::from_utf8(drive(config, req).await).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 "), "status: {resp}");
+        assert!(
+            resp.to_ascii_lowercase().contains("x-test-encode: ok\r\n"),
+            "encode-side stamp on wire: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn h1_stop_and_send_at_decode_skips_route_match() {
+        // test-util stub: a filter that StopAndSend(503 "stopped\n") on decode,
+        // placed before Router. The route is direct_response 200 "route\n" —
+        // it must NOT be reached.
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 503,
+            reason: None,
+            headers: vec![("content-length".to_string(), "8".to_string())],
+            body: Bytes::from_static(b"stopped\n"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let config = hcm_config_with_pipeline(pipeline, "/", 200, "route\n").await;
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = String::from_utf8(drive(config, req).await).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 503 "),
+            "decode StopAndSend short-circuits: {resp}"
+        );
+        assert!(
+            resp.ends_with("stopped\n"),
+            "synth body, not route body: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn h1_stop_and_send_at_encode_substitutes_wire_response() {
+        // test-util stub: a filter that StopAndSend(418 "teapot\n") on encode.
+        // The route's direct_response 200 is built, then encode-side StopAndSend
+        // replaces it on the wire.
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 418,
+            reason: None,
+            headers: vec![("content-length".to_string(), "7".to_string())],
+            body: Bytes::from_static(b"teapot\n"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let config = hcm_config_with_pipeline(pipeline, "/", 200, "route\n").await;
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = String::from_utf8(drive(config, req).await).unwrap();
+        assert!(
+            resp.starts_with("HTTP/1.1 418 "),
+            "encode StopAndSend substitutes: {resp}"
+        );
+        assert!(resp.ends_with("teapot\n"), "substituted body: {resp}");
+    }
+
+    #[tokio::test]
+    async fn h1_access_log_reflects_post_encode_headers() {
+        // HCMConfig with a file access_log + HeaderMutation response_mutations.
+        // Drive a request; the access log line + the per-class HCM counter see
+        // the post-encode response state. Assert the access log captured a
+        // 200 line (the encode-side mutation does not change status, but this
+        // exercises the access-log dispatch site running after encode_headers).
+        let pipeline = header_mutation_pipeline(
+            vec![],
+            vec![(
+                "x-test",
+                "ok",
+                envoy_config::AppendAction::AppendIfExistsOrAdd,
+            )],
+        );
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let config = hcm_config_with_access_log_and_pipeline(pipeline, &log_path).await;
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        // Brief yield so the FileSink flush reaches disk.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            logged.contains(" 200 "),
+            "access log captured post-encode status: {logged:?}"
+        );
+    }
 }

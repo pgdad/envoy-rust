@@ -27,4 +27,5 @@ envoy-stats = { path = "../envoy-stats" }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 envoy-accesslog = { path = "../envoy-accesslog", features = ["test-util"] }
+envoy-filter = { path = "../envoy-filter", features = ["test-util"] }
 tempfile = "3"

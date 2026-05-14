@@ -34,6 +34,14 @@ impl FilterPipeline {
         Ok(Self { filters: out })
     }
 
+    /// Test-only: build a `FilterPipeline` directly from a list of
+    /// `HttpFilterInstance`s, bypassing config parsing. Used by the H1/H2 HCM
+    /// integration tests to inject the `test-util` StopAndSend stubs.
+    #[cfg(feature = "test-util")]
+    pub fn test_from_instances(filters: Vec<HttpFilterInstance>) -> Self {
+        Self { filters }
+    }
+
     /// Iterate the filter chain in **declaration order** on the decode side.
     ///
     /// Per parent-07 SPEC §6 Rule 6: decode walks `filters.iter_mut()`.

@@ -188,19 +188,11 @@ async fn handle_one_stream(
     // `upstream_host_for_log_h2` variable is `None` on synth + picker-None
     // paths and is set to the resolved endpoint on the successful proxy
     // path before any upstream IO is attempted.
-    let response_status_for_log: u16;
-    let response_body_len: u64;
-    let response_headers_for_log: Vec<(String, String)>;
     let mut upstream_host_for_log_h2: Option<String> = None;
 
     let resp: Response = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
-            BuildOutcome::Synth(r) => {
-                response_status_for_log = r.status;
-                response_body_len = r.body.len() as u64;
-                response_headers_for_log = r.headers.clone();
-                r
-            }
+            BuildOutcome::Synth(r) => r,
             BuildOutcome::Proxy {
                 cluster: cluster_name,
             } => {
@@ -219,9 +211,6 @@ async fn handle_one_stream(
                     None => {
                         tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
                         let r = synth_h2_502();
-                        response_status_for_log = r.status;
-                        response_body_len = r.body.len() as u64;
-                        response_headers_for_log = r.headers.clone();
                         // Funnel through the unified send + access-log
                         // dispatch site at the bottom of handle_one_stream.
                         return finalize_h2_stream(
@@ -233,9 +222,6 @@ async fn handle_one_stream(
                             req_arrival_systime,
                             &envoy_req,
                             request_body_len,
-                            response_status_for_log,
-                            response_body_len,
-                            &response_headers_for_log,
                             upstream_host_for_log_h2,
                         )
                         .await;
@@ -315,9 +301,6 @@ async fn handle_one_stream(
                     Err(e) => {
                         tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
                         let r = synth_h2_502();
-                        response_status_for_log = r.status;
-                        response_body_len = r.body.len() as u64;
-                        response_headers_for_log = r.headers.clone();
                         // Funnel through the unified send + access-log
                         // dispatch site at the bottom of handle_one_stream.
                         return finalize_h2_stream(
@@ -329,9 +312,6 @@ async fn handle_one_stream(
                             req_arrival_systime,
                             &envoy_req,
                             request_body_len,
-                            response_status_for_log,
-                            response_body_len,
-                            &response_headers_for_log,
                             upstream_host_for_log_h2,
                         )
                         .await;
@@ -382,25 +362,18 @@ async fn handle_one_stream(
                     "x-envoy-upstream-service-time".to_string(),
                     elapsed_ms.to_string(),
                 ));
-                let proxy_resp = Response {
+                Response {
                     status: upstream_resp.status,
                     reason: upstream_resp.reason,
                     headers,
                     body: upstream_resp.body,
-                };
-                response_status_for_log = proxy_resp.status;
-                response_body_len = proxy_resp.body.len() as u64;
-                response_headers_for_log = proxy_resp.headers.clone();
-                proxy_resp
+                }
             }
         },
         H2RequestPath::SynthFromDecode(r) => {
             // 07.1 Task 7: decode-side filter short-circuit. Unreachable
             // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation.
             // `upstream_host_for_log_h2` stays None (no proxy attempt).
-            response_status_for_log = r.status;
-            response_body_len = r.body.len() as u64;
-            response_headers_for_log = r.headers.clone();
             r
         }
     };
@@ -414,9 +387,6 @@ async fn handle_one_stream(
         req_arrival_systime,
         &envoy_req,
         request_body_len,
-        response_status_for_log,
-        response_body_len,
-        &response_headers_for_log,
         upstream_host_for_log_h2,
     )
     .await
@@ -442,15 +412,6 @@ async fn finalize_h2_stream(
     req_arrival_systime: SystemTime,
     envoy_req: &Request,
     request_body_len: u64,
-    // 07.1 Task 7: the three log-locals below are PRE-encode at call
-    // sites; they are shadowed inside the function body with POST-encode
-    // values derived from `resp` after the encode_headers pass below.
-    // The `_` prefix silences the parameter-unused warning — the
-    // shadowed locals carry the post-encode values into the per-class
-    // counter site + access-log dispatch site.
-    _response_status_for_log: u16,
-    _response_body_len: u64,
-    _response_headers_for_log: &[(String, String)],
     upstream_host_for_log_h2: Option<String>,
 ) -> Result<(), Http2Error> {
     // 07.1 Task 7: encode-side filter invocation. Boundary conversion
@@ -482,11 +443,11 @@ async fn finalize_h2_stream(
         }
     }
 
-    // 07.1 Task 7: shadow the pre-encode log-locals with post-encode
-    // values so the per-class HCM counter site (06.3) + access-log
-    // dispatch site (06.2) below reflect post-encode response state per
-    // PLAN signpost. The slice contract for the access-log dispatch site
-    // is preserved by binding an owned Vec then re-borrowing as a slice.
+    // 07.1 Task 7 (I1 cleaned): derive the post-encode log-locals from
+    // `resp` so the per-class HCM counter site (06.3) + access-log
+    // dispatch site (06.2) below reflect post-encode response state.
+    // The slice contract for the access-log dispatch site is preserved by
+    // binding an owned Vec then re-borrowing as a slice.
     let response_status_for_log: u16 = resp.status;
     let response_body_len: u64 = resp.body.len() as u64;
     let response_headers_for_log_owned: Vec<(String, String)> = resp.headers.clone();
@@ -495,8 +456,9 @@ async fn finalize_h2_stream(
     let send_result = send_envoy_response(send_response, resp).await;
 
     // 06.3 D15.3.a NEW — symmetric per-response-class HCM counter increment
-    // on the H2 path. Uses the `response_status_for_log` parameter already
-    // threaded through finalize_h2_stream from each H2 writer arm. The
+    // on the H2 path. `response_status_for_log` is a local derived post-encode
+    // from `resp` (see the comment block above); it reflects whichever branch
+    // (Continue or StopAndSend) determined the final response. The
     // `envoy_http2::HCMConfig` type alias makes `config.stats.downstream_rq_Nxx`
     // resolve via the envoy_http1::HCMStats struct.
     match response_status_for_log / 100 {
@@ -608,9 +570,9 @@ fn synth_h2_502() -> Response {
 mod tests {
     use super::*;
     use envoy_config::{
-        CodecType, DataSource, DirectResponse, HttpConnectionManagerConfig, HttpFilter,
-        HttpFilterTypedConfig, Route, RouteAction, RouteAction_Route, RouteConfiguration,
-        RouteMatch, RouterConfig, VirtualHost,
+        AppendAction, CodecType, DataSource, DirectResponse, HeaderMatcher, HeaderMatcherMode,
+        HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, Route, RouteAction,
+        RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, VirtualHost,
     };
     use envoy_http1::HCMConfig as Http1HCMConfig;
     use envoy_listener::ConnectionHandler;
@@ -1577,5 +1539,352 @@ static_resources:
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 503");
         assert_eq!(rq_5xx.value(), 1, "upstream_rq_5xx must be 1 after 503");
+    }
+
+    // ── 07.2 Task 5 (Group D): H2 HCM filter-chain integration tests ─────────
+
+    /// Build an H2 HCMConfig with `http_filters: [HeaderMutation, Router]` over
+    /// a single direct_response route. `request_mutations` / `response_mutations`
+    /// are `(key, value, AppendAction)` triples.
+    async fn synth_h2_hcm_config_with_header_mutation(
+        request_mutations: Vec<(&str, &str, AppendAction)>,
+        response_mutations: Vec<(&str, &str, AppendAction)>,
+        route_status: u16,
+        route_body: &str,
+    ) -> Arc<Http1HCMConfig> {
+        use envoy_config::{
+            HeaderMutationConfig, HeaderMutationEntry, HeaderValue, HeaderValueOption, Mutations,
+        };
+        let mk = |v: Vec<(&str, &str, AppendAction)>| -> Vec<HeaderMutationEntry> {
+            v.into_iter()
+                .map(|(k, val, action)| HeaderMutationEntry {
+                    append: HeaderValueOption {
+                        header: HeaderValue {
+                            key: k.to_string(),
+                            value: val.to_string(),
+                        },
+                        append_action: action,
+                    },
+                })
+                .collect()
+        };
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: route_status,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some(route_body.to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![
+                HttpFilter {
+                    name: "envoy.filters.http.header_mutation".to_string(),
+                    typed_config: HttpFilterTypedConfig::HeaderMutation(HeaderMutationConfig {
+                        mutations: Mutations {
+                            request_mutations: mk(request_mutations),
+                            response_mutations: mk(response_mutations),
+                        },
+                    }),
+                },
+                HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+                },
+            ],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+                .await
+                .expect("build HCM config"),
+        )
+    }
+
+    /// Build an H2 HCMConfig with a HeaderMutation filter that adds
+    /// `x-h2-decode: seen` on decode, and a single route that matches on that
+    /// header (exact-match `"seen"`) → direct_response 200 `"matched\n"`.
+    ///
+    /// Used by `h2_decode_headers_fires_before_route_match` to discriminate
+    /// "decode ran before route-match" from "decode was skipped": without the
+    /// mutation the header is absent and no route matches (router → 404).
+    async fn synth_h2_hcm_config_header_mutation_matched_route() -> Arc<Http1HCMConfig> {
+        use envoy_config::{
+            HeaderMutationConfig, HeaderMutationEntry, HeaderValue, HeaderValueOption, Mutations,
+        };
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![HeaderMatcher {
+                                name: "x-h2-decode".to_string(),
+                                mode: HeaderMatcherMode::ExactMatch("seen".to_string()),
+                                invert_match: false,
+                            }],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("matched\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![
+                HttpFilter {
+                    name: "envoy.filters.http.header_mutation".to_string(),
+                    typed_config: HttpFilterTypedConfig::HeaderMutation(HeaderMutationConfig {
+                        mutations: Mutations {
+                            request_mutations: vec![HeaderMutationEntry {
+                                append: HeaderValueOption {
+                                    header: HeaderValue {
+                                        key: "x-h2-decode".to_string(),
+                                        value: "seen".to_string(),
+                                    },
+                                    append_action: AppendAction::AppendIfExistsOrAdd,
+                                },
+                            }],
+                            response_mutations: vec![],
+                        },
+                    }),
+                },
+                HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+                },
+            ],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+                .await
+                .expect("build HCM config"),
+        )
+    }
+
+    /// Build an H2 HCMConfig (direct_response 200 "route\n" route) whose
+    /// filter pipeline is the caller-supplied test-util pipeline.
+    ///
+    /// Http1HCMConfig does not derive Clone, so this inlines the struct literal
+    /// (mirroring `synth_h2_hcm_config`'s body, swapping `filter_pipeline`).
+    async fn synth_h2_hcm_config_with_pipeline(
+        pipeline: Arc<envoy_filter::FilterPipeline>,
+    ) -> Arc<Http1HCMConfig> {
+        use envoy_http1::{HCMConfig, HCMStats};
+        Arc::new(HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: Arc::new(envoy_cluster::ClusterManager::empty()),
+            http2_protocol_options: None,
+            stats: Arc::new(
+                HCMStats::register(&envoy_stats::StatsRegistry::new(), "test")
+                    .expect("HCMStats register"),
+            ),
+            access_log: vec![],
+            filter_pipeline: pipeline,
+            route_config: Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                // "route\n" intentionally differs from synth_h2_hcm_config's
+                                // "ok\n": tests using this helper assert the stub response body
+                                // (StopAndSend), not the route body, so the distinction is benign.
+                                inline_string: Some("route\n".to_string()),
+                            },
+                        }),
+                    }],
+                }],
+            }),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_decode_headers_fires_before_route_match() {
+        // HeaderMutation adds `x-h2-decode: seen` on decode. The single route
+        // requires that exact header via a HeaderMatcher — it only matches when
+        // decode_headers ran before route-match. Without the decode mutation the
+        // header is absent and no route matches, so the router would return a
+        // non-200. A 200 "matched\n" response proves the mutation ran first.
+        // Mirrors `h1_decode_headers_fires_before_route_match`.
+        let config = synth_h2_hcm_config_header_mutation_matched_route().await;
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/foo")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "decode mutation added x-h2-decode:seen, driving the header-matched route (decode ran before route-match)"
+        );
+        let mut body = resp.into_body();
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = body.data().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(
+            &buf[..],
+            b"matched\n",
+            "route body confirms the header-matched route fired"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_encode_headers_fires_before_send_envoy_response() {
+        // HeaderMutation adds x-h2-encode:ok on encode; the wire response
+        // carries it.
+        let config = synth_h2_hcm_config_with_header_mutation(
+            vec![],
+            vec![("x-h2-encode", "ok", AppendAction::AppendIfExistsOrAdd)],
+            200,
+            "ok\n",
+        )
+        .await;
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            resp.headers().get("x-h2-encode").map(|v| v.as_bytes()),
+            Some(b"ok".as_slice()),
+            "encode-side stamp on the H2 wire response"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_stop_and_send_at_decode_skips_route_match() {
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 503,
+            reason: None,
+            headers: vec![("content-length".to_string(), "8".to_string())],
+            body: bytes::Bytes::from_static(b"stopped\n"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_decode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let config = synth_h2_hcm_config_with_pipeline(pipeline).await;
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "decode StopAndSend short-circuits route-match"
+        );
+        let mut body = resp.into_body();
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = body.data().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(&buf[..], b"stopped\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_stop_and_send_at_encode_substitutes_wire_response() {
+        let stop_resp = envoy_filter::FilterResponse {
+            status: 418,
+            reason: None,
+            headers: vec![("content-length".to_string(), "7".to_string())],
+            body: bytes::Bytes::from_static(b"teapot\n"),
+        };
+        let pipeline = Arc::new(envoy_filter::FilterPipeline::test_from_instances(vec![
+            envoy_filter::HttpFilterInstance::test_stop_and_send_on_encode(stop_resp),
+            envoy_filter::HttpFilterInstance::test_router(),
+        ]));
+        let config = synth_h2_hcm_config_with_pipeline(pipeline).await;
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            418,
+            "encode StopAndSend substitutes the H2 response"
+        );
+        let mut body = resp.into_body();
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = body.data().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(&buf[..], b"teapot\n");
     }
 }
