@@ -1,10 +1,11 @@
 //! `HttpFilterInstance` — the per-instance variant enum.
 //!
-//! At 07.1 the only variant is `Router` (holding `RouterTerminus`).
-//! Phase 07.2 adds `HeaderMutation(HeaderMutationFilter)` per parent-07
-//! SPEC §3 D8.2-D15.2.
+//! Two variants are present: `Router(RouterTerminus)` (landed at 07.1) and
+//! `HeaderMutation(HeaderMutationFilter)` (landed at 07.2 per parent-07
+//! SPEC §3 D8.2-D15.2).
 
 use crate::error::FilterError;
+use crate::header_mutation::HeaderMutationFilter;
 use crate::pipeline::Decision;
 use crate::router::RouterTerminus;
 use crate::types::{FilterRequest, FilterResponse};
@@ -12,6 +13,7 @@ use crate::types::{FilterRequest, FilterResponse};
 #[derive(Debug, Clone)]
 pub enum HttpFilterInstance {
     Router(RouterTerminus),
+    HeaderMutation(HeaderMutationFilter),
 }
 
 impl HttpFilterInstance {
@@ -25,31 +27,29 @@ impl HttpFilterInstance {
     /// `FilterPipeline::build_from_config`, not here).
     pub(crate) fn build(
         hf: &envoy_config::HttpFilter,
-        position: usize,
+        _position: usize,
     ) -> Result<Self, FilterError> {
         match &hf.typed_config {
             envoy_config::HttpFilterTypedConfig::Router(_cfg) => {
                 Ok(HttpFilterInstance::Router(RouterTerminus::new()))
             }
-            // Task 3 replaces this stub with HeaderMutationFilter::build_from_config.
-            envoy_config::HttpFilterTypedConfig::HeaderMutation(_cfg) => {
-                Err(FilterError::UnsupportedFilterType {
-                    position,
-                    name: hf.name.clone(),
-                })
-            }
+            envoy_config::HttpFilterTypedConfig::HeaderMutation(cfg) => Ok(
+                HttpFilterInstance::HeaderMutation(HeaderMutationFilter::build_from_config(cfg)?),
+            ),
         }
     }
 
     pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         match self {
             HttpFilterInstance::Router(r) => r.decode_headers(req),
+            HttpFilterInstance::HeaderMutation(f) => f.decode_headers(req),
         }
     }
 
     pub(crate) fn encode_headers(&mut self, resp: &mut FilterResponse) -> Decision {
         match self {
             HttpFilterInstance::Router(r) => r.encode_headers(resp),
+            HttpFilterInstance::HeaderMutation(f) => f.encode_headers(resp),
         }
     }
 }

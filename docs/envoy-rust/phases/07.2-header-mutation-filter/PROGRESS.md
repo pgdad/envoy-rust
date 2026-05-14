@@ -403,3 +403,207 @@ advisories ok, bans ok, licenses ok, sources ok
 
 No new top-level Cargo dependencies. The `license-not-encountered` warnings are pre-existing
 (unmatched allowlist entries in `deny.toml` — identical to Task 1's attestation).
+
+---
+
+## Task 3 — `HeaderMutationFilter` runtime types + builder + `instance.rs` arm [07.1 REVIEW M1, M2]
+
+**State-3 commit.** Creates `crates/envoy-filter/src/header_mutation.rs` with the
+`HeaderMutationFilter` struct, `RuntimeHeaderMutation`, `RuntimeAppendAction`, `build_from_config`,
+`map_entry`, and stub `decode_headers` / `encode_headers` (returning `Decision::Continue`); wires
+`pub mod header_mutation;` + `pub use header_mutation::HeaderMutationFilter;` into `lib.rs`;
+replaces the Task-1 stub arm in `instance.rs::build()` with the real
+`HeaderMutationFilter::build_from_config`-backed arm and adds the `HeaderMutation(HeaderMutationFilter)`
+variant + `decode_headers` / `encode_headers` arms; removes the unused `tracing = "0.1"` dep from
+`Cargo.toml` (closes 07.1 REVIEW M1). TDD order was followed: tests written first (RED — compile
+errors `HeaderMutationFilter` / `RuntimeAppendAction` not found), implementation added, all 7 new
+tests turned GREEN (20 total in `envoy-filter`).
+
+### Work summary
+
+- **`crates/envoy-filter/src/header_mutation.rs`** (new file): 7 test functions in
+  `#[cfg(test)] mod tests`, runtime types (`HeaderMutationFilter`, `RuntimeHeaderMutation`,
+  `RuntimeAppendAction`), `build_from_config`, `map_entry` (defense-in-depth re-check for
+  unsupported `AppendAction` variants), and stub `decode_headers` / `encode_headers`. Key
+  design choices: `request_mutations` / `response_mutations` fields carry `#[allow(dead_code)]`
+  (stubs; real use lands at Task 4); `RuntimeHeaderMutation` fields likewise annotated. Keys
+  lowercased at build time per signpost 4.
+
+- **`crates/envoy-filter/src/lib.rs`**: added `pub mod header_mutation;` (alphabetically after
+  `pub mod error;`) + `pub use header_mutation::HeaderMutationFilter;`.
+
+- **`crates/envoy-filter/src/instance.rs`**: added `use crate::header_mutation::HeaderMutationFilter;`;
+  added `HeaderMutation(HeaderMutationFilter)` to the `HttpFilterInstance` enum; replaced the Task-1
+  stub arm (`Err(FilterError::UnsupportedFilterType {...})`) with the real arm (`Ok(HttpFilterInstance::
+  HeaderMutation(HeaderMutationFilter::build_from_config(cfg)?))`); added `HeaderMutation(f) =>
+  f.decode_headers(req)` and `HeaderMutation(f) => f.encode_headers(resp)` arms.
+
+- **`crates/envoy-filter/Cargo.toml`**: removed `tracing = "0.1"` from `[dependencies]`. After
+  removal: `bytes = "1"` + `thiserror = "2"` + `envoy-config = { path = "../envoy-config" }`.
+  Verified with `grep -rn 'tracing' crates/envoy-filter/src/` — no hits.
+
+### Tests landed (7 new tests in `header_mutation::tests`)
+
+1. `build_from_config_on_empty_mutations_returns_empty_filter` — empty config yields empty
+   `request_mutations` and `response_mutations` Vecs.
+2. `build_from_config_on_single_append_entry_lowercases_key_and_keeps_value` — `"X-Foo"`
+   is lowercased to `"x-foo"` at build time; value `"Bar"` preserved verbatim; action maps to
+   `RuntimeAppendAction::Append`.
+3. `build_from_config_on_single_overwrite_entry_maps_action` — `OverwriteIfExistsOrAdd` maps
+   to `RuntimeAppendAction::Overwrite`.
+4. `build_from_config_on_unsupported_append_action_returns_err` — `AddIfAbsent` triggers
+   `FilterError::UnsupportedFilterType` at the framework boundary (defense-in-depth).
+5. `http_filter_instance_build_on_header_mutation_produces_header_mutation_variant` — the real
+   `instance.rs::build()` arm produces `HttpFilterInstance::HeaderMutation(_)`.
+6. `decode_headers_stub_returns_continue_at_task_3` — Task 3 stub returns `Decision::Continue`
+   (replaced at Task 4).
+7. `encode_headers_stub_returns_continue_at_task_3` — Task 3 stub returns `Decision::Continue`
+   (replaced at Task 4).
+
+Test module LoC: ~80 lines. Runtime types + builder + stubs LoC: ~90 lines. `lib.rs` edit: ~3 lines.
+`instance.rs` edits: ~15 lines. `Cargo.toml` edit: ~1 line removal.
+
+### LoC delta
+
+```
+crates/envoy-filter/src/header_mutation.rs   +248 lines (new file)
+crates/envoy-filter/src/lib.rs                 +2 lines
+crates/envoy-filter/src/instance.rs           +10 lines, -7 lines (net +3)
+crates/envoy-filter/Cargo.toml                  -1 line (tracing dep removed)
+Total: ~+252 insertions, -8 deletions (net ~244 LoC added)
+```
+
+PLAN budget for Task 3: ~210 LoC. Actual ~244 LoC net — overage of ~34 LoC concentrated in the
+test module (`#[allow(dead_code)]` comments + `cargo fmt` multi-line expansions of struct
+initializers and `matches!` assertions).
+
+### Deviations from PLAN
+
+1. **`#[allow(dead_code)]` added to `HeaderMutationFilter` and `RuntimeHeaderMutation` fields.**
+   The PLAN's Task 3 code block did not include these attributes. At Task 3, `request_mutations`,
+   `response_mutations`, `key`, `value`, and `action` are set but never read from non-test code
+   (the stubs `decode_headers`/`encode_headers` ignore them; the real use is at Task 4). Without
+   `#[allow(dead_code)]`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+   fails with `fields ... are never read`. Per the PLAN's workspace-gate requirement (all 5
+   commands clean), the attributes were added with comments noting they are consumed at Task 4.
+   Not an ADR-worthy decision; aligns with the PLAN's `D-3.2` stub posture.
+
+2. **`instance.rs::build` parameter renamed `_position` (re-restoration).** The Task 1
+   deviation (PROGRESS Task 1, deviation 1) had renamed the parameter to `position` (non-underscore)
+   because the stub arm used it. With the stub replaced by the real arm (which does not use the
+   position parameter — `map_entry` hardcodes `position: 0`), the parameter is unused again.
+   Renamed back to `_position` to satisfy `cargo clippy -- -D warnings`. Consistent with the
+   PLAN's note "(The `_position` parameter stays `_position`)".
+
+3. **`cargo fmt` reformatted PLAN-verbatim code blocks.** Multi-line expansion of
+   `Ok(Self { request_mutations, response_mutations })` → multi-line struct form;
+   single-line `matches!(...)` calls for `Overwrite`, `HeaderMutation(_)`, `Continue`
+   (×2) → multi-line form. The `entry()` helper's inline `HeaderValue {...}` expanded
+   to multi-line; `Mutations { ... }` in `cfg()` likewise. No semantic changes.
+
+### 07.1 REVIEW carryforward status
+
+**07.1 REVIEW M1 — CLOSED.** The unused `tracing = "0.1"` dependency has been removed from
+`crates/envoy-filter/Cargo.toml`. `grep -rn 'tracing' crates/envoy-filter/src/` returns no
+hits. `cargo deny check` is clean (quoted in attestation below).
+
+**07.1 REVIEW M2 — PARTIALLY CLOSED.** `FilterError::UnsupportedFilterType` is now constructed
+by `map_entry` in `header_mutation.rs` (defense-in-depth check for `AddIfAbsent` /
+`OverwriteIfExists`). The other two unconstructed variants — `RouterNotTerminal` and
+`DuplicateRouter` — remain defense-in-depth-only (the `envoy-config` validator is the
+real operator-facing catch for those; no Task 3 code constructs them). Full close deferred
+to when a test explicitly exercises those error paths (if ever needed).
+
+### Test-bucket attestation
+
+All 5 workspace gate commands run and clean:
+
+**`cargo build --workspace --all-targets`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.65s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`**
+```
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.88s
+```
+
+**`cargo fmt --all -- --check`**
+```
+(no output — clean)
+```
+
+**`cargo test --workspace`**
+All test suites passed (0 failed). 20 tests in `envoy-filter` (13 pre-existing + 7 new
+`header_mutation` tests). No flakes observed on this run.
+
+**`cargo deny check`**
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+No new top-level Cargo dependencies (one removed: `tracing = "0.1"`). The `license-not-encountered`
+warnings are pre-existing (unmatched allowlist entries in `deny.toml` — identical to Tasks 1 and 2's
+attestations). Removing `tracing` introduced no new `cargo deny` concerns.
+
+### Review fixes (post-commit code-quality pass)
+
+Applied to commit `42ce300` (amended in-place; not yet pushed):
+
+1. **Important — `position: 0` clarifying comment** (`crates/envoy-filter/src/header_mutation.rs`,
+   `map_entry` function): `position: 0` was hardcoded in the `FilterError::UnsupportedFilterType`
+   construction with no explanation. Added a 4-line comment immediately above the field explaining
+   that `0` is a placeholder: `map_entry` runs inside `build_from_config` and has no access to the
+   filter-chain position; the operator-facing position is carried by the `envoy-config` validator's
+   typed errors (the primary catch); this is the defense-in-depth re-check at the framework boundary.
+
+2. **Important — struct-level `#[allow(dead_code)]`** (`crates/envoy-filter/src/header_mutation.rs`):
+   five separate `#[allow(dead_code)]` attributes on individual fields of `HeaderMutationFilter` (2
+   fields) and `RuntimeHeaderMutation` (3 fields) were replaced with a single `#[allow(dead_code)]`
+   on each struct declaration (2 attributes total instead of 5). The explanatory comment (fields only
+   read in `#[cfg(test)]` code at Task 3; real readers land at Task 4, which removes the attribute)
+   was adapted to sit at struct level instead of per-field.
+
+3. **Minor — `instance.rs` module-doc polish** (`crates/envoy-filter/src/instance.rs`, lines 1-5):
+   the module doc still read "At 07.1 the only variant is `Router`..." as if `HeaderMutation` were
+   future work. Revised to accurately describe the current state: both `Router(RouterTerminus)` (07.1)
+   and `HeaderMutation(HeaderMutationFilter)` (07.2) variants are present.
+
+Two further Minors from the review are deliberately carried forward to Task 4:
+
+- **Minor #4 (Task-4 carry):** The Task-4 implementer should replace the `decode_headers_stub_*`
+  and `encode_headers_stub_*` tests with assertions on real mutation effects (not just
+  `Decision::Continue`) once the stubs are replaced with the actual semantics.
+- **Minor #5 (Task-4 carry):** The Task-4 implementer should verify whether `decode_headers` /
+  `encode_headers` need `&mut self` or only `&self` (the fields are read-only after build; `&self`
+  may suffice and would be cleaner).
