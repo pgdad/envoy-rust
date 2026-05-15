@@ -283,7 +283,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 3 — D4: Dispatch enum + AdminEndpoint::dispatch refactor
 
-**Commit:** `90b5390` — `phase 08.1: task 3 — Dispatch enum + AdminEndpoint::dispatch refactor`
+**Commit:** `7188e7f` — `phase 08.1: task 3 — Dispatch enum + AdminEndpoint::dispatch refactor`
 **LoC delta:** +45 production, +89 tests, 0 doc. Net +129 insertions, 17 deletions (per `git diff --stat`).
 
 ### Work summary
