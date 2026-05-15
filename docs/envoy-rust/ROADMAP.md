@@ -49,7 +49,7 @@ Phases 00–08 ship *in order*: each adds a primitive the next relies on. Splitt
 | 07 | Filter chain framework: iteration protocol, per-route config, extension registry | 06 | done | 07.1, 07.2 | framework fixtures green; trivial pluggable filter covers all iteration states |
 | 07.1 | `envoy-filter` foundation + HCM filter-chain wiring (H1 5-writer-arm refactor + H2 finalize_h2_stream refactor) + terminal-router validator | 06 | done | — | no new fixture; regression-equivalence proven via all 12 existing fixtures (0001-0012) green simultaneously at Docker-gated CI; framework crate + HCM integration land as the foundation slice |
 | 07.2 | `envoy.filters.http.header_mutation` filter + fixture 0013 + parent-07 close-out | 07.1 | done | — | fixture 0013-http-filter-header-mutation green; HeaderMutation bilaterally verified on decode + encode; parent phase 07 flips done |
-| 08 | Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain | 07 | planned | — | admin + drain fixtures green |
+| 08 | Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain | 07 | in-progress | — | admin + drain fixtures green |
 
 ---
 

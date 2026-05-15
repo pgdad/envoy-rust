@@ -8,9 +8,9 @@
 ## Active phase
 
 **id:** `08`
-**slug:** _not yet assigned_ — the phase-08 slug + `docs/envoy-rust/phases/08-<slug>/` directory are created by the phase-08 state-1 brainstorm session, NOT at this parent-07 close-out commit.
-**directory:** does not exist yet. ROADMAP row `08` is `status: planned`; per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3 a phase directory is created only when the phase enters `in-progress`. The phase-08 state-1 session creates `docs/envoy-rust/phases/08-<slug>/` + its empty `SPEC.md` as the first concrete file-system act of starting phase 08.
-**status:** phase 08 lifecycle **state 1 (phase in ROADMAP with `status: planned`; directory does not exist yet)**. Phase 08 is the last MVP-trunk phase (`BOOTSTRAP_PROMPT.md` §8 row 08): *"Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain"*. The next session is the **phase-08 state-1 session**, which invokes **`superpowers:brainstorming`** scoped to phase 08's row-08 charter, creates `docs/envoy-rust/phases/08-<slug>/`, and lands the phase-08 `SPEC.md`. With this commit the MVP trunk stands **00→07 all `done`**; phase 08 closes the MVP trunk before the `BOOTSTRAP_PROMPT.md` §9 feature-family expansion begins.
+**slug:** `08-admin-api-and-drain` — assigned at this state-1 brainstorm commit per the recommended natural-choice in the previous-session next-prompt (mirrors the row-08 charter; preserves the project's `NN-<slug>` pattern).
+**directory:** exists at `docs/envoy-rust/phases/08-admin-api-and-drain/` — created at this commit as the first concrete file-system act of starting phase 08 per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3. Contains `SPEC.md` (405 lines, 10 sections).
+**status:** phase 08 lifecycle **state 2 (SPEC.md exists; PLAN.md does not)**. Phase 08 is the last MVP-trunk phase (`BOOTSTRAP_PROMPT.md` §8 row 08): *"Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain"*. The next session is the **phase-08 state-2 session**, which invokes **`superpowers:writing-plans`** scoped to the phase-08 `SPEC.md`, evaluates the §6.1 split gate (per SPEC §6.1 — projected ~21-23 tasks / ~1500-1800 LoC, close to the threshold), and lands either a single `PLAN.md` at this directory OR a parent-08 split (08.1 / 08.2) with sibling SPECs derived from this one. With phase 08's state-6 close-out the MVP trunk stands **00→08 all `done`** and the `BOOTSTRAP_PROMPT.md` §9 feature-family expansion begins (phases 09+).
 
 **Parent phase 07 (`07-filter-chain-framework`) is DONE as of this commit (the phase-07.2 state-6 close-out, which is also the parent-07 close-out per the ROADMAP-schema invariant "parent flips to `done` only after all sub-phases are `done`").** Mirrors phase-06's `b918f33`-shape close-out (where the 06.3 commit also closed parent-06), phase-05's `82c26b8`-shape close-out, phase-04's `e626862`-shape close-out, phase-03's `ca81226`-shape close-out, and phase-02's `f04e21a`-shape close-out. ROADMAP rows `07` and `07.2` both flip `in-progress` → `done` at this commit; row `07.1` was already `done` from its own state-6 commit `3abcc8c`. The parent-07 arc landed the **filter chain framework** end-to-end across two sub-phases:
 
@@ -62,74 +62,80 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 12-16, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 1): the next session — operating as the **phase-08 state-1 session** — invokes **`superpowers:brainstorming`** scoped to phase 08's `BOOTSTRAP_PROMPT.md` §8 row-08 charter: *"Minimum admin API (config_dump, stats, clusters, listeners, ready, server_info) + graceful drain"*. The session's concrete acts: create `docs/envoy-rust/phases/08-<slug>/` (the slug is chosen at brainstorm time — e.g. `08-admin-api-and-drain`) as the first file-system act of starting phase 08, run the brainstorm, and land the phase-08 `SPEC.md`. Per `BOOTSTRAP_PROMPT.md` §5.1 the state-1 session lands `SPEC.md` and ends; the session after that writes `PLAN.md` per `superpowers:writing-plans` (state 2).
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 17-22, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 2): the next session — operating as the **phase-08 state-2 session** — invokes **`superpowers:writing-plans`** scoped to `docs/envoy-rust/phases/08-admin-api-and-drain/SPEC.md`. The session's concrete acts: read the phase-08 SPEC end-to-end; evaluate the §6.1 split gate against the projected ~21-23 tasks / ~1500-1800 LoC surface (per SPEC §6.1); land EITHER a standalone PLAN.md at `docs/envoy-rust/phases/08-admin-api-and-drain/PLAN.md` (single-phase posture) OR a parent-08 split commit creating `docs/envoy-rust/phases/08.1-<subtitle>/SPEC.md` + `docs/envoy-rust/phases/08.2-<subtitle>/SPEC.md` with ADR-0032 documenting the split (per the SPEC §6.1 recommended split shape: 08.1 endpoint surface + carryforward closures + fixture 0014; 08.2 drain machinery + fixture 0015 + parent-08 close-out). Per `BOOTSTRAP_PROMPT.md` §5.1 the state-2 session lands its output and ends; the session after that begins state 3 (execution).
 
-Phase 08 is the **last MVP-trunk phase**. With parent-07 closed at this commit, the MVP trunk stands **00→07 all `done`**; phase 08 (admin API + graceful drain) closes the trunk, after which the project transitions to the `BOOTSTRAP_PROMPT.md` §9 feature-family expansion (phases 09+).
+Phase 08 is the **last MVP-trunk phase**. With this state-1 SPEC landing, ROADMAP row `08` flips `planned` → `in-progress`. Phase 08's state-6 close-out (several sessions out) closes the trunk; the project then transitions to the `BOOTSTRAP_PROMPT.md` §9 feature-family expansion (phases 09+).
 
-**Standing context for the phase-08 state-1 session:**
+**Standing context for the phase-08 state-2 session:**
 
-- **13 Docker-gated fixtures (`0001-tcp-echo` through `0013-http-filter-header-mutation`) are GREEN simultaneously** per CI run `25887571566` (HEAD `20a393d`, conclusion `success`, completed `2026-05-14T21:49:18Z`). The differential harness, all 13 fixtures, and the h2spec conformance suite are the regression baseline phase 08 must keep green.
-- **`h2spec` conformance suite** holds at the **≥95% pass** gate (05.2 baseline 99.31%; `h2spec_pass_rate_gate` PASS). `known-failures.txt` unchanged.
-- **DECISIONS.md** ledger head is **ADR-0031**. ADR-0032 is the next available number; phase 08's split decision (if it splits) or any foundations grant takes the next sequential number at landing time.
-- **BEHAVIOR_CONTRACT.md** unchanged (13 stat-name rows + 14 access-log field rows + the "06.1 Prometheus exposition shape divergence" subsection). Phase 08's admin-API surface (config_dump, clusters, listeners, server_info) will likely extend the contract; new rows/subsections land at the task where empirical evidence demands them.
-- **The admin handler already exists** at `crates/envoy-admin/` (landed in 06.1; HCM-backed admin listener handling `/ready` + `/stats` + `/stats/prometheus` over HTTP/1.1). Phase 08 expands it to the full minimum endpoint surface. **Several carryforwards are explicitly addressed to phase 08** — see "Phase-06.1 rollovers" below: **06.1 REVIEW I2** (`serialize_response` 5-header dedupe), **06.1 REVIEW M1** (`resp.reason.unwrap_or("OK")`), **06.1 REVIEW M4** (`DRAIN_BUDGET` constant duplication). The phase-08 brainstorm should consider folding these as Task-1 preamble items.
+- **13 Docker-gated fixtures (`0001-tcp-echo` through `0013-http-filter-header-mutation`) are GREEN simultaneously** per CI run `25887571566` (HEAD `20a393d`, conclusion `success`, completed `2026-05-14T21:49:18Z`). The differential harness, all 13 fixtures, and the h2spec conformance suite are the regression baseline phase 08 must keep green; the state-4 evidence anchor extends to all 15 fixtures (0001-0015) at state-6.
+- **`h2spec` conformance suite** holds at the **≥95% pass** gate (05.2 baseline 99.31%; `h2spec_pass_rate_gate` PASS). `known-failures.txt` unchanged. Phase 08 engages no H2-framing surfaces.
+- **DECISIONS.md** ledger head is **ADR-0031**. ADR-0032 is the next available number; phase 08's split decision (if it splits at state-2) is the most likely landing site per SPEC §7 conditional ADR-0032. Conditional ADR-0033 (foundations grant for `/config_dump`) stays reserved-available; SPEC §5.3 + §7 ratify the no-foundations-grants posture.
+- **BEHAVIOR_CONTRACT.md** unchanged at this state-1 commit. Phase 08 will extend it with: (a) new top-level subsection "Admin endpoint body shapes" (7 rows); (b) Header allow-list extension note on dedupe; (c) Stat-name mapping extension (3 new rows — `server.live`, `server.state`, `listener_manager.total_listeners_active`); (d) new top-level subsection "Admin-action effect equivalence". Per SPEC §2.
+- **`DrainState` placement decided at SPEC time** as `crates/envoy-listener/src/drain.rs`, re-exported from `envoy-admin::DrainState`, per SPEC §5.1. The natural `envoy-admin::DrainState` placement would create a Cargo cycle (envoy-admin already depends on envoy-listener::ConnectionHandler); the resolution mirrors the M4 `DRAIN_BUDGET` hoist + the 05.3 / 07.1 cycle-resolution doctrine. No new ADR required.
+- **The admin handler already exists** at `crates/envoy-admin/` (landed in 06.1; HCM-backed admin listener handling `/ready` + `/stats` + `/stats/prometheus` over HTTP/1.1; idle read timeout closed in 06.3). Phase 08 expands it to the 7-endpoint MVP minimum surface (+4 new endpoints: `/server_info`, `/clusters`, `/listeners`, `/config_dump`; +3 POST action endpoints: `/drain_listeners`, `/healthcheck/fail`, `/healthcheck/ok`) and adds `DrainState`-based endpoint-triggered graceful drain. Three 06.1 carryforwards (REVIEW I2 / M1 / M4) close as Task-1 preamble per SPEC §3 D1/D2/D3.
 
-Inputs the phase-08 state-1 brainstorm session should read, in order:
+Inputs the phase-08 state-2 PLAN-write session should read, in order:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
-2. `docs/envoy-rust/STATE.md` (this file — confirm the active-phase pointer at `08` state 1 + the carryforward inventory in the "Notes" section).
-3. `docs/envoy-rust/ROADMAP.md` (rows `00`-`07` all `done`; row `08` `planned`).
+2. `docs/envoy-rust/STATE.md` (this file — confirm the active-phase pointer at `08` state 2 + the carryforward inventory in the "Notes" section + the "Phase-08 state-1 brainstorm" subsection at the bottom of "Notes").
+3. `docs/envoy-rust/ROADMAP.md` (rows `00`-`07` all `done`; row `08` `in-progress`).
 4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0031`).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence rules — phase 08's admin surface will extend it).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-1 routing).
-7. `BOOTSTRAP_PROMPT.md` §8 row 08 (the phase-08 charter) + §5 state 1 (brainstorming skill routing) + §5.1 (one state per session) + §6 (phase splitting policy — phase 08 may split).
-8. `docs/envoy-rust/phases/06.1-stats-and-admin/REVIEW.md` + `docs/envoy-rust/phases/06.1-stats-and-admin/SPEC.md` — the admin-foundation surface phase 08 extends; the carryforwards I2 / M1 / M4 are addressed to phase 08.
-9. The "Phase-06.1 rollovers" + "Phase-06.3 rollovers" + "Phase-07.2 rollovers" subsections in this file's "Notes" section — the live carryforward inventory.
+5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence rules — phase 08 will extend per SPEC §2).
+6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-2 routing + §6.1 split-gate handling).
+7. `BOOTSTRAP_PROMPT.md` §8 row 08 (the phase-08 charter) + §5 state 2 (writing-plans routing) + §5.1 (one state per session) + §6 (phase splitting policy — the state-2 split gate; SPEC §6.1 projects the gate as close-to-threshold).
+8. **`docs/envoy-rust/phases/08-admin-api-and-drain/SPEC.md` (this state-1's output) — the primary input.** Read end-to-end; the SPEC enumerates 17 deliverables (D1-D17) across carryforward closures, 7 admin endpoints, drain machinery, stats wiring, harness extensions, and 2 fixtures.
+9. `docs/envoy-rust/phases/06.1-stats-and-admin/REVIEW.md` + `docs/envoy-rust/phases/06.1-stats-and-admin/SPEC.md` — the admin-foundation surface phase 08 extends; the carryforwards I2 / M1 / M4 land as Task-1 preamble.
+10. The "Phase-06.1 rollovers" + "Phase-06.3 rollovers" + "Phase-07.2 rollovers" + "Phase-08 state-1 brainstorm" subsections in this file's "Notes" section — the live carryforward inventory + state-1 brainstorm decisions.
 
 ## Last commit
 
-07.2 state-6 phase-done close-out commit (this commit; ALSO the parent-07 close-out): `phase 07.2: envoy.filters.http.header_mutation + fixture 0013 [parent 07 done] [ADR-0030, ADR-0031]`.
+Phase-08 state-1 brainstorm close-out commit (this commit): `phase 08: state-1 SPEC.md (admin API + endpoint-triggered drain)`.
 
-Docs-only commit touching 2 files:
+Docs-only commit touching 3 files:
 
-- **MODIFY** `docs/envoy-rust/ROADMAP.md` — flips row `07.2` `in-progress` → `done` (this sub-phase done) and row `07` `in-progress` → `done` (parent flipped per the closing-sub-phase invariant — all sub-phases now `done`; row `07.1` was already `done`).
-- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances the active phase from `07.2` (lifecycle state 5-complete) to `08` (lifecycle state 1); rewrites the "Active phase" block, replacing the 07.1-DONE + 07.2-status narrative blocks with the parent-07 close-out summary; rewrites "Next expected skill" to `superpowers:brainstorming` scoped to phase 08's row-08 charter; adds the "Phase-07.2 rollovers" subsection recording REVIEW.md's 3 Minor findings + the 3 closed 07.1 carryforwards; rewrites "Last commit" + "Last updated". Preserves all prior "Phase-NN rollovers" sections and the "Notes" ADR-numbering subsections verbatim.
+- **CREATE** `docs/envoy-rust/phases/08-admin-api-and-drain/SPEC.md` (405 lines, 10 sections) — the state-1 brainstorm output. Enumerates 17 deliverables (D1-D17) across 06.1 carryforward closures (D1/D2/D3), admin endpoint surface (D4-D10; 7 endpoints), drain machinery (D11-D13), stats wiring (D14), harness extensions (D15/D16), and 2 new fixtures (D17.1/.2 = `0014-admin-config-dump-server-info` + `0015-admin-drain-listeners`) plus fuzz-corpus seeds (D17.3) and in-process backstops (D17.4). Settles `DrainState` placement at `crates/envoy-listener/src/drain.rs` (re-exported from `envoy-admin`) per the project's cycle-resolution doctrine.
+- **MODIFY** `docs/envoy-rust/ROADMAP.md` — flips row `08` `planned` → `in-progress` (a phase enters `in-progress` when STATE.md points at it AND its directory is created — both true at this commit per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3).
+- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances active phase from `08` state 1 to `08` state 2; assigns slug `08-admin-api-and-drain`; rewrites "Active phase" + "Next expected skill" (now `superpowers:writing-plans` scoped to the phase-08 SPEC); adds "Phase-08 state-1 brainstorm" subsection at the end of "Notes" recording the brainstorm decisions (drain scope = endpoint-triggered; structural approach = expand `envoy-admin` in place; `DrainState` placement decision; conditional ADR-0032/0033 slots); rewrites "Last commit" + "Last updated". Preserves all prior "Phase-NN rollovers" sections and the "Notes" ADR-numbering subsections verbatim.
 
-No code changes, no fixture changes, no workspace-dep changes. `DECISIONS.md` unchanged at **ADR-0031** — no ADR lands at a docs-only state-6 close-out per D-3.5 append-only discipline (no conditional ADRs landed in 07.2; the no-foundations-grants posture was honored end-to-end). `BEHAVIOR_CONTRACT.md` unchanged — no empirical divergence surfaced in 07.2 (HeaderMutation is deterministic on both proxies — identical config → byte-identical mutations). ADR-0032 stays reserved-available.
+No code changes, no fixture changes, no Cargo.toml changes. **`DECISIONS.md` unchanged at `ADR-0031`** — no ADR lands at a docs-only state-1 close-out per D-3.5 append-only discipline. The conditional ADR-0032 (split decision) is the most likely landing site at state 2; conditional ADR-0033 (foundations grant for `/config_dump`) stays reserved-available — recommended posture per SPEC §5.3 + §7 is no-foundations-grants. **`BEHAVIOR_CONTRACT.md` unchanged** — phase 08's planned extensions land at the deliverable-tasks where empirical evidence demands them, not at the SPEC commit.
 
-**The CI evidence anchor** for parent-07 close remains CI run `25887571566` at HEAD `20a393d` (the 07.2 Task 9 commit) — the §7.5 phase-done gate was exercised GREEN there; this docs-only close-out carries no code for CI to verify. Per the 07.1 precedent (state-5 `5408abb` + state-6 `3abcc8c` pushed later, not at landing), the accumulated docs-only commits (`f921fdd` Task 10, `ab01755` state-5 REVIEW.md, this state-6 close-out) ride to `origin` at phase 08's first code commit / CI gate; `origin/main` is at `20a393d`.
+**The CI evidence anchor** continues from CI run `25887571566` at HEAD `20a393d` (the 07.2 Task 9 commit) — phase 08 has not yet executed any code, so no new CI evidence exists. Per the established precedent, accumulated docs-only state commits (`f921fdd` 07.2 Task 10, `ab01755` 07.2 state-5 REVIEW.md, `1d52156` 07.2 state-6 close-out, this state-1 SPEC commit) ride to `origin` at phase 08's first code commit / CI gate; `origin/main` remains at `20a393d`.
 
-**Predecessor commits (07.2 execution arc + 07.1/07 ancestry, newest first):**
+**Predecessor commits (newest first):**
 
-- `ab01755` — `phase 07.2: state 5 REVIEW.md Approved with M-track follow-ups` (07.2 state-5 close-out; verdict 0 Critical / 0 Important / 3 Minor; touched only `REVIEW.md`).
+- `1d52156` — `phase 07.2: envoy.filters.http.header_mutation + fixture 0013 [parent 07 done] [ADR-0030, ADR-0031]` (07.2 state-6 phase-done close-out + parent-07 close-out; docs-only; immediate predecessor).
+- `ab01755` — `phase 07.2: state 5 REVIEW.md Approved with M-track follow-ups` (07.2 state-5 close-out; verdict 0 Critical / 0 Important / 3 Minor).
 - `f921fdd` — `phase 07.2: task 10 — state-4 verification (13 fixtures simultaneously green)` (07.2 state-4-reached / state-5-next STATE advance; docs-only).
-- `20a393d` — `phase 07.2: task 9 — in-process backstop (http_filter_header_mutation)` (Task 9; the CI evidence anchor — HEAD in CI run `25887571566`; `origin/main`).
-- Prior task commits `77e91ae` (Task 1) → `20a393d` (Task 9): 9 substantive task commits over the state-2 standalone PLAN base.
-- `c7dea4c` — `phase 07.2: state-2 standalone PLAN.md` (07.2 state-2 PLAN-write commit; base of the 07.2 reviewed range).
+- `20a393d` — `phase 07.2: task 9 — in-process backstop (http_filter_header_mutation)` (the CI evidence anchor — HEAD in CI run `25887571566`; `origin/main`).
+- `c7dea4c` — `phase 07.2: state-2 standalone PLAN.md` (07.2 state-2 PLAN-write commit).
 - `3abcc8c` — `phase 07.1: envoy-filter foundation + FilterPipeline iteration + H1/H2 HCM filter-chain wiring + terminal-router validator [ADR-0031]` (07.1 state-6 phase-done close-out).
-- `5408abb` — `phase 07.1: state 5 REVIEW.md Approved with M-track follow-ups` (07.1 state-5 close-out).
-- `6db5a01` — parent-07 state-2 split commit + ADR-0030 (created BOTH sub-phase SPECs).
-- `b918f33` — parent-06 close-out (the closing-sub-phase + parent-close-in-one-commit shape this commit mirrors).
+- `6db5a01` — parent-07 state-2 split commit + ADR-0030.
+- `b918f33` — parent-06 close-out.
 
 ## Last updated
 
-2026-05-14 (07.2 state-6 phase-done close-out commit — ALSO the
-parent-07 close-out per the closing-sub-phase invariant. Flips ROADMAP
-rows `07.2` and `07` `in-progress` → `done` (row `07.1` was already
-`done`); rewrites STATE.md's "Active phase" block from `07.2`
-lifecycle state 5-complete to `08` lifecycle state 1, replacing the
-07.1-DONE + 07.2-status narrative blocks with the parent-07 close-out
-summary; rewrites "Next expected skill" to `superpowers:brainstorming`
-scoped to phase 08's `BOOTSTRAP_PROMPT.md` §8 row-08 charter (minimum
-admin API + graceful drain); adds the "Phase-07.2 rollovers"
-subsection recording REVIEW.md's 3 Minor findings (M1 / M2 / M3) and
-the 3 closed 07.1 carryforwards (I1 / M1 / M2); rewrites "Last commit"
-+ "Last updated". Docs-only; 2 files modified (ROADMAP.md + STATE.md);
-one state per session per `BOOTSTRAP_PROMPT.md` §5.1. DECISIONS.md
-unchanged at ADR-0031; BEHAVIOR_CONTRACT.md unchanged. Preserves all
-prior "Phase-NN rollovers" sections and "Notes" ADR-numbering
-subsections verbatim. With this commit the MVP trunk stands 00→07 all
-`done`; phase 08 is the last MVP-trunk phase.)
+2026-05-15 (phase-08 state-1 brainstorm close-out commit. Creates
+`docs/envoy-rust/phases/08-admin-api-and-drain/` + lands SPEC.md (405
+lines, 10 sections); assigns slug `08-admin-api-and-drain`. Flips
+ROADMAP row `08` `planned` → `in-progress` (entry to `in-progress`
+per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3 — directory created + STATE
+points at it). Advances STATE.md "Active phase" block from `08` state
+1 to `08` state 2; rewrites "Next expected skill" to
+`superpowers:writing-plans` scoped to the phase-08 SPEC + §6.1
+split-gate evaluation; adds the "Phase-08 state-1 brainstorm"
+subsection at the end of "Notes" recording the brainstorm decisions
+(drain scope = endpoint-triggered drain; structural approach =
+expand `envoy-admin` in place; `DrainState` placement at
+`envoy-listener` per Cargo-cycle resolution; conditional ADR-0032
+split slot + conditional ADR-0033 foundations-grant slot reserved);
+rewrites "Last commit" + "Last updated". Docs-only; 3 files modified
+(SPEC.md created + ROADMAP.md + STATE.md); one state per session
+per `BOOTSTRAP_PROMPT.md` §5.1. DECISIONS.md unchanged at ADR-0031;
+BEHAVIOR_CONTRACT.md unchanged. Preserves all prior "Phase-NN
+rollovers" sections and "Notes" ADR-numbering subsections verbatim.
+Phase 08 is the last MVP-trunk phase; state-6 close-out closes the
+trunk and transitions to the §9 feature-family expansion.)
 
 ## Notes
 
@@ -682,3 +688,21 @@ Brainstorm session decisions (this commit), all per the user's standing preferen
 - **PLAN.md cadence:** standalone pre-Task-1 commit per the 04.3 (`c02eea7`) / 05.1 (`f23d08f`) standardized posture.
 - **Verification gate:** §7.5's six gates with the substantive new requirement being all 5 affected Docker-gated fixtures (0003/0004/0005/0006/0008) GREEN simultaneously + the 3 unaffected (0001/0002/0007) staying green. Substantively closes phase-04.3 REVIEW C-1.
 - **Carryforward closures projected at 05.4 state-6:** Phase-04.3 REVIEW C-1 — closed substantively at this sub-phase's state-4 verification commit. Phase-04.1 REVIEW M-claim — unblocked by the fixture-mask removal but stays deferred per the 04.3 disposition. No new I3-style or A-style closures.
+
+### Phase-08 state-1 brainstorm
+
+Brainstorm session decisions (this commit), all per the user's standing preference auto-memory `feedback_pick_recommendation` ("always pick the recommended option; do not ask") plus one explicit user-confirmed scope question on graceful-drain machinery:
+
+- **Slug:** `08-admin-api-and-drain` — recommended natural-choice per the previous session's next-prompt; mirrors row-08 charter; preserves the `NN-<slug>` pattern.
+- **Drain scope (the one explicit user-confirmed scope question):** **endpoint-triggered drain**. Adds `/drain_listeners` + `/healthcheck/fail` + `/healthcheck/ok` admin endpoints that trigger the EXISTING per-listener `DRAIN_BUDGET = 5s` drain machinery; wires `/server_info` + `/ready` to report `LIVE` / `DRAINING` state via a new shared `Arc<DrainState>`. Out of scope (deferred): `drain_time_s` config consumption, `Connection: close` injection on in-flight responses, full timed drain sequence. Rejected alternatives: full drain sequence (materially larger; likely forces split into 08.1/08.2 by surface scope); minimal report-only (drain fixture can't meaningfully assert behavior).
+- **Structural approach:** option (a) — expand `crates/envoy-admin/` in place + a small shared `DrainState`. Rejected: dedicated `envoy-drain` crate (YAGNI for one type); generalized admin-router abstraction (premature for fixed 7-endpoint surface).
+- **`DrainState` placement decided at SPEC time:** lives at `crates/envoy-listener/src/drain.rs`, re-exported from `envoy-admin::DrainState`. The natural `envoy-admin` placement creates a Cargo cycle (envoy-admin already depends on envoy-listener::ConnectionHandler); the resolution mirrors the M4 `DRAIN_BUDGET` hoist + the 05.3 (`envoy-http1` ↔ `envoy-http2`) + 07.1 (`envoy-filter` ↔ `envoy-http1`) cycle-resolution doctrine. **No new ADR required** — the resolution posture is doctrine-clear by precedent; the SPEC documents the decision directly per D-3.5 (an ADR is for novel decisions, not for applying an established pattern).
+- **Endpoint surface (7 new endpoints):** `/server_info` (GET, JSON), `/clusters` (GET, text), `/listeners` (GET, text), `/config_dump` (GET, JSON), `/drain_listeners` (POST, empty), `/healthcheck/fail` (POST, empty), `/healthcheck/ok` (POST, empty). `/ready` + `/stats` + `/stats/prometheus` (06.1) retained. Method-strict per-endpoint allowlist; query-string honoring out-of-scope. `dispatch(method, path)` widens to a 3-variant enum (`Endpoint` / `NotFound` / `MethodNotAllowed { allow }`); closes 06.1 M1 as a side-effect.
+- **06.1 carryforward closures (Task-1 preamble — D1/D2/D3):** REVIEW I2 (`serialize_response` case-insensitive header dedupe), REVIEW M1 (`reason_for_status` helper), REVIEW M4 (`DRAIN_BUDGET` consolidated to `envoy-listener`). All three named to phase 08 by the 06.1 + 06.2 + 06.3 + 07.2 "Phase-06.1 rollovers" subsections.
+- **ADR projection:** **NO new ADRs projected to land.** Recommended posture: `serde_json` (already permitted) handles `/config_dump` + `/server_info` JSON serialization; `tokio::sync::Notify` (already used; part of `tokio`) handles drain notification; `AtomicU8` handles `DrainStage`. Two conditional ADR slots stay reserved-available: **ADR-0032** (split decision; most likely landing site at state 2 if §6.1 split-gate fires per SPEC §6.1 projection ~21-23 tasks / ~1500-1800 LoC), **ADR-0033** (foundations grant for `/config_dump` — recommended posture is no-grant; would land only if `prost-reflect` or similar surfaces as a materially-worse-than-foundation result at state 3).
+- **`config_dump` shape:** static bootstrap config only. envoy-rust has no xDS yet (§9 family, post-08); xDS-derived `ConfigDump` entries (`ClustersConfigDump`, `ListenersConfigDump`, etc.) defer to the xDS family. envoy-rust emits one `BootstrapConfigDump` entry; Envoy emits that PLUS xDS entries; the latter land on `allowlist_envoy_only_keys` of the new harness `BodyRule::JsonShape`. The `Bootstrap` struct gains `Serialize` derives (mechanical, no new dep).
+- **Fixtures (2 new):** `0014-admin-config-dump-server-info` (reuses fixture 0008's bootstrap shape — HCM + STRICT_DNS + 1 listener; admin scrape × 4 endpoints) + `0015-admin-drain-listeners` (reuses fixture 0007's bootstrap shape — HCM + direct_response; drain-sequence assertion with `pre_admin_actions` + `post_admin_assertions` harness extensions).
+- **PLAN.md cadence:** **the state-2 PLAN-write session decides single-phase vs split** per the §6.1 split-gate evaluation. SPEC §6.1 projects ~21-23 tasks / ~1500-1800 LoC — at or near the split threshold. **Recommended split shape (if gate fires):** 08.1 — admin endpoint surface + carryforward closures + fixture 0014 + harness extensions (~1000 LoC; D1-D8 + D14 + D15 + D17.1 + partial D17.3 + partial D17.4); 08.2 — drain machinery + fixture 0015 + parent-08 close-out (~800 LoC; D9 + D10 + D11 + D12 + D13 + D16 + D17.2 + partial D17.3 + partial D17.4). Mirrors 06/07's foundation-then-integration split shape.
+- **Phase-00 I3 deferral continues:** endpoint-triggered drain exercises drain via `POST /drain_listeners`, NOT via signal. SIGKILL→SIGTERM of the harness subject subprocess stays deferred; `nix` crate still off the permitted-foundations list; phase 08 does not engage signal-based termination.
+- **Verification gate:** `BOOTSTRAP_PROMPT.md` §7.5's six gates with the substantive new requirement being all **15 Docker-gated fixtures (0001-0015) GREEN simultaneously** at the state-4 CI run (extending the 07.2 baseline of 13 with 0014 + 0015). h2spec ≥95% gate continues to hold at parent-05 baseline (no H2-framing surfaces engaged).
+- **Carryforward closures projected at phase-08 state-6:** 06.1 REVIEW I2 + M1 + M4 — closed at Task-1 preamble (D1/D2/D3). No new I3-style or A-style closures projected; phase 08 lands clean.
