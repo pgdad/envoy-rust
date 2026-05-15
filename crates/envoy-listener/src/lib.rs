@@ -12,6 +12,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Drain budget — the maximum time `Listener::serve` waits for in-flight
+/// connections to complete after the drain signal fires. Hoisted to module
+/// level at phase 08.1 D3 (closes 06.1 REVIEW M4); re-exported from
+/// `envoy-admin` via the existing crate dep.
+pub const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
 /// In-crate `BoxFuture` alias. Phase 02.2 deliberately avoids depending on
 /// `futures::future::BoxFuture` because `futures` is not on the D-3.2
 /// permitted-foundations list. If a later phase brings `futures` in under its
@@ -162,8 +168,6 @@ impl Listener {
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), ListenerError> {
-        const DRAIN_BUDGET: Duration = Duration::from_secs(5);
-
         let listener = self.listener;
         let handler = self.handler;
         // 06.1 D4.a: hoist the per-listener counter out of `self` so the
@@ -776,5 +780,23 @@ filter_chains:
             .expect("serve resolves within 6s")
             .expect("join")
             .expect("serve ok");
+    }
+}
+
+#[cfg(test)]
+mod drain_budget_constant_tests {
+    use std::time::Duration;
+
+    #[test]
+    fn drain_budget_is_pub_const_at_module_level() {
+        // Compile-time tautology: if DRAIN_BUDGET is NOT a pub-const at module
+        // level, this fails to compile.
+        const _CHECK: Duration = crate::DRAIN_BUDGET;
+        assert_eq!(crate::DRAIN_BUDGET, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn drain_budget_value_is_5_seconds() {
+        assert_eq!(crate::DRAIN_BUDGET, Duration::from_secs(5));
     }
 }

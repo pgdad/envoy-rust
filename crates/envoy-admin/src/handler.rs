@@ -6,7 +6,7 @@ use crate::config::AdminConfig;
 use crate::endpoint::{AdminEndpoint, render_404, render_405};
 use crate::error::AdminError;
 use bytes::BytesMut;
-use envoy_listener::{BoxFuture, ConnectionHandler};
+use envoy_listener::{BoxFuture, ConnectionHandler, DRAIN_BUDGET};
 use envoy_stats::StatsRegistry;
 use std::future::Future;
 use std::sync::Arc;
@@ -37,9 +37,6 @@ const MAX_REQUEST_HEAD: usize = 8 * 1024;
 /// connected-but-silent client triggers a clean close within this
 /// budget; the connection task does not hold a JoinSet slot indefinitely.
 const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Drain budget for in-flight admin requests when shutdown fires.
-const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct AdminHandler {
     config: Arc<AdminConfig>,
@@ -637,5 +634,17 @@ mod serialize_response_dedupe_and_reason_tests {
         let wire = serialize(200, Some("Custom"), vec![], b"".to_vec());
         let first_line = wire.lines().next().unwrap();
         assert_eq!(first_line, "HTTP/1.1 200 Custom");
+    }
+}
+
+#[cfg(test)]
+mod drain_budget_lockstep_tests {
+    use std::time::Duration;
+
+    #[test]
+    fn admin_uses_listener_drain_budget() {
+        // Compile-time tautology: if envoy-admin does not import
+        // envoy_listener::DRAIN_BUDGET, this fails to compile.
+        assert_eq!(envoy_listener::DRAIN_BUDGET, Duration::from_secs(5));
     }
 }

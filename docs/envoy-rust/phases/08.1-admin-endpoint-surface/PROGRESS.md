@@ -160,6 +160,127 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 2 — D3: DRAIN_BUDGET module-level hoist
+
+**Commit:** `063d12a` — `phase 08.1: task 2 — DRAIN_BUDGET module-level hoist (closes 06.1 M4)`
+**LoC delta:** +6 production, +20 tests, 0 doc. Net +26.
+
+### Work summary
+
+Hoisted the duplicated `DRAIN_BUDGET` constant. Introduced a single `pub const DRAIN_BUDGET: Duration = Duration::from_secs(5);` at module level in `crates/envoy-listener/src/lib.rs` (was local-fn-scoped inside `Listener::serve`); deleted the parallel module-level declaration in `crates/envoy-admin/src/handler.rs` and replaced it with an import via the existing `envoy-listener` crate dep. Three downstream use sites in `envoy-listener` and two in `envoy-admin` need no change — the identifier still resolves. Closes 06.1 REVIEW M4.
+
+### Tests landed
+
+- `envoy_listener::drain_budget_constant_tests::drain_budget_is_pub_const_at_module_level`
+- `envoy_listener::drain_budget_constant_tests::drain_budget_value_is_5_seconds`
+- `envoy_admin::handler::drain_budget_lockstep_tests::admin_uses_listener_drain_budget`
+
+3 new tests across the two crates. Test modules placed as **sibling** `#[cfg(test)] mod` blocks at file end, matching the Task 1 placement choice (per Task 1 narrative's deviation discipline).
+
+### Deviations from PLAN
+
+1. **PLAN said handler.rs line 28; disk reality was line 42 post-Task-1.** The `const DRAIN_BUDGET` and its doc comment shifted down after Task 1 inserted `reason_for_status` and `MAX_REQUEST_HEAD`. The const declaration matched verbatim; only the line number changed. Deleted correctly.
+2. **Used unqualified `Duration` (not `std::time::Duration`) in the hoisted pub const.** `use std::time::Duration;` is already at module level in `crates/envoy-listener/src/lib.rs` (line 13); using the unqualified form matches the file's prevailing style (all other `Duration` references in the file are unqualified). The PLAN noted this as a "pick whichever is more idiomatic" choice.
+3. **Sibling vs. nested test-module placement.** Both test modules are placed as standalone sibling `#[cfg(test)] mod` blocks at file end (not nested inside the existing `#[cfg(test)] mod tests`), matching the Task 1 placement discipline recorded in that task's deviation narrative.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-listener v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-listener)
+   Compiling envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+   Compiling envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+   Compiling envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+   Compiling http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.50s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-listener v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-listener)
+    Checking envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+    Checking envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Checking http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.48s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test handler::drain_budget_lockstep_tests::admin_uses_listener_drain_budget ... ok
+test handler::serialize_response_dedupe_and_reason_tests::default_headers_present_when_caller_omits ... ok
+test handler::serialize_response_dedupe_and_reason_tests::dedupe_is_case_insensitive ... ok
+test handler::serialize_response_dedupe_and_reason_tests::dedupe_preserves_caller_provided_server ... ok
+test handler::serialize_response_dedupe_and_reason_tests::dedupe_preserves_caller_provided_cache_control ... ok
+test handler::serialize_response_dedupe_and_reason_tests::explicit_reason_overrides_helper ... ok
+test handler::serialize_response_dedupe_and_reason_tests::reason_503_renders_service_unavailable_without_explicit_reason ... ok
+test handler::serialize_response_dedupe_and_reason_tests::reason_for_status_covers_listed_codes ... ok
+test handler::tests::handler_serves_ready_in_process ... ok
+test handler::tests::handler_response_carries_server_header ... ok
+test handler::tests::handler_returns_404_for_unknown_path ... ok
+test handler::tests::handler_response_carries_admin_headers ... ok
+test handler::tests::handler_serves_stats_prometheus_in_process ... ok
+test handler::tests::handler_returns_405_for_post_method ... ok
+test handler::tests::admin_handler_idle_read_times_out_at_5s ... ok
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+test drain_budget_constant_tests::drain_budget_is_pub_const_at_module_level ... ok
+test drain_budget_constant_tests::drain_budget_value_is_5_seconds ... ok
+test tests::serves_aborts_stragglers_past_drain_budget ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s
+```
+
+(envoy-admin tail: 28 = 27 pre-existing + 1 new. envoy-listener tail: 12 = 10 pre-existing + 2 new. Full `cargo test --workspace` is green across all crates.)
+
+`cargo deny check`:
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues introduced by 08.1 Task 2, which adds no new top-level deps.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:
