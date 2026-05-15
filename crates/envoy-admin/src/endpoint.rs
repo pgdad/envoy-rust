@@ -21,6 +21,18 @@ pub enum AdminEndpoint {
     StatsPrometheus,
 }
 
+/// Method-aware dispatch result. Introduced at phase 08.1 D4 to give every
+/// endpoint a structurally-declared 405-method-allowlist surface (closes 06.1
+/// REVIEW M1 structurally). 08.2 POST endpoints plug in additively via new
+/// `AdminEndpoint` variants whose `allowed_method` returns `"POST"`; no
+/// further refactor of `Dispatch` is needed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Dispatch {
+    Endpoint(AdminEndpoint),
+    NotFound,
+    MethodNotAllowed { allow: &'static str },
+}
+
 impl AdminEndpoint {
     /// Exact-match URL path lookup. Returns `None` for unknown paths
     /// (caller produces 404). Case-sensitive per Envoy v1.33.
@@ -30,6 +42,36 @@ impl AdminEndpoint {
             "/stats" => Some(AdminEndpoint::Stats),
             "/stats/prometheus" => Some(AdminEndpoint::StatsPrometheus),
             _ => None,
+        }
+    }
+
+    /// The HTTP method this endpoint accepts. 08.1's 4 new GET endpoints
+    /// (ConfigDump, ServerInfo, Clusters, Listeners) declare `"GET"` here;
+    /// 08.2's POST endpoints will declare `"POST"`.
+    pub fn allowed_method(&self) -> &'static str {
+        match self {
+            AdminEndpoint::Ready => "GET",
+            AdminEndpoint::Stats => "GET",
+            AdminEndpoint::StatsPrometheus => "GET",
+            // Tasks 6-9 add: ConfigDump | ServerInfo | Clusters | Listeners => "GET",
+        }
+    }
+
+    /// Method-aware dispatch. Returns:
+    /// - `Endpoint(e)` on a method+path match,
+    /// - `NotFound` on an unknown path (regardless of method),
+    /// - `MethodNotAllowed { allow }` on a known path with the wrong method.
+    pub fn dispatch(method: &str, path: &str) -> Dispatch {
+        match AdminEndpoint::from_path(path) {
+            None => Dispatch::NotFound,
+            Some(endpoint) => {
+                let allow = endpoint.allowed_method();
+                if method == allow {
+                    Dispatch::Endpoint(endpoint)
+                } else {
+                    Dispatch::MethodNotAllowed { allow }
+                }
+            }
         }
     }
 
@@ -123,16 +165,24 @@ pub(crate) fn render_404() -> envoy_http1::Response {
     }
 }
 
-/// Render a 405 for non-GET methods. Used by `AdminHandler::handle_inner`.
-pub(crate) fn render_405() -> envoy_http1::Response {
-    let body = Bytes::from_static(b"admin endpoints are GET-only\n");
+/// Render a 405 for method-not-allowed responses. Used by
+/// `AdminHandler::handle_inner` via `Dispatch::MethodNotAllowed { allow }`.
+///
+/// Phase 08.1 D4 widens the previously-fixed `Allow:` header value to a
+/// per-endpoint dynamic value sourced from the `Dispatch::MethodNotAllowed`
+/// arm. The body is regenerated dynamically too — closes 06.1 REVIEW M1
+/// structurally: every endpoint variant declares its own allowed method.
+pub(crate) fn render_405(allow: &'static str) -> envoy_http1::Response {
+    let body = Bytes::from(format!("Method not allowed. Allow: {allow}\n"));
     envoy_http1::Response {
         status: 405,
-        reason: Some("Method Not Allowed"),
+        // Task 1's reason_for_status renders "Method Not Allowed" when reason
+        // is None; leaving it None lets the helper supply the canonical text.
+        reason: None,
         headers: vec![
             ("content-type".to_string(), "text/plain".to_string()),
             ("content-length".to_string(), body.len().to_string()),
-            ("allow".to_string(), "GET".to_string()),
+            ("allow".to_string(), allow.to_string()),
         ],
         body,
     }
@@ -251,8 +301,92 @@ mod tests {
 
     #[test]
     fn render_405_carries_allow_get_header() {
-        let r = render_405();
+        let r = render_405("GET");
         assert_eq!(r.status, 405);
         assert!(r.headers.iter().any(|(k, v)| k == "allow" && v == "GET"));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::{AdminEndpoint, Dispatch};
+
+    #[test]
+    fn get_known_path_returns_endpoint() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/ready"),
+            Dispatch::Endpoint(AdminEndpoint::Ready)
+        ));
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/stats"),
+            Dispatch::Endpoint(AdminEndpoint::Stats)
+        ));
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/stats/prometheus"),
+            Dispatch::Endpoint(AdminEndpoint::StatsPrometheus)
+        ));
+    }
+
+    #[test]
+    fn unknown_path_returns_not_found_regardless_of_method() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/nope"),
+            Dispatch::NotFound
+        ));
+        assert!(matches!(
+            AdminEndpoint::dispatch("POST", "/nope"),
+            Dispatch::NotFound
+        ));
+        assert!(matches!(
+            AdminEndpoint::dispatch("DELETE", "/"),
+            Dispatch::NotFound
+        ));
+    }
+
+    #[test]
+    fn known_path_wrong_method_returns_method_not_allowed_with_get_in_allow() {
+        match AdminEndpoint::dispatch("POST", "/ready") {
+            Dispatch::MethodNotAllowed { allow } => assert_eq!(allow, "GET"),
+            other => panic!("expected MethodNotAllowed; got {other:?}"),
+        }
+        match AdminEndpoint::dispatch("PUT", "/stats") {
+            Dispatch::MethodNotAllowed { allow } => assert_eq!(allow, "GET"),
+            other => panic!("expected MethodNotAllowed; got {other:?}"),
+        }
+        match AdminEndpoint::dispatch("DELETE", "/stats/prometheus") {
+            Dispatch::MethodNotAllowed { allow } => assert_eq!(allow, "GET"),
+            other => panic!("expected MethodNotAllowed; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn method_match_is_case_sensitive_exact() {
+        // Envoy's admin API treats HTTP method names case-sensitively (uppercase
+        // canonical per RFC 7230). Mixed-case methods are NOT recognized.
+        assert!(matches!(
+            AdminEndpoint::dispatch("get", "/ready"),
+            Dispatch::MethodNotAllowed { .. }
+        ));
+        assert!(matches!(
+            AdminEndpoint::dispatch("Get", "/ready"),
+            Dispatch::MethodNotAllowed { .. }
+        ));
+    }
+
+    #[test]
+    fn each_endpoint_declares_its_allowed_method() {
+        // Compile-time tautology: if any variant fails to declare ALLOWED, this
+        // fails to compile.
+        assert_eq!(AdminEndpoint::Ready.allowed_method(), "GET");
+        assert_eq!(AdminEndpoint::Stats.allowed_method(), "GET");
+        assert_eq!(AdminEndpoint::StatsPrometheus.allowed_method(), "GET");
+    }
+
+    #[test]
+    fn dispatch_is_disjoint_from_from_path() {
+        // from_path is retained as a thin convenience but does NOT route through
+        // dispatch. Direct unit test that both surfaces remain available.
+        assert!(AdminEndpoint::from_path("/ready").is_some());
+        assert!(AdminEndpoint::from_path("/nope").is_none());
     }
 }

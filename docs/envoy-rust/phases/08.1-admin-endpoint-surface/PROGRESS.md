@@ -281,6 +281,121 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 3 — D4: Dispatch enum + AdminEndpoint::dispatch refactor
+
+**Commit:** `90b5390` — `phase 08.1: task 3 — Dispatch enum + AdminEndpoint::dispatch refactor`
+**LoC delta:** +45 production, +89 tests, 0 doc. Net +129 insertions, 17 deletions (per `git diff --stat`).
+
+### Work summary
+
+Introduced the `pub enum Dispatch { Endpoint(AdminEndpoint), NotFound, MethodNotAllowed { allow: &'static str } }` enum and two new `AdminEndpoint` methods (`allowed_method(&self) -> &'static str`, `dispatch(method: &str, path: &str) -> Dispatch`) in `crates/envoy-admin/src/endpoint.rs`. Widened `render_405()` to take an `allow: &'static str` parameter and emit a dynamic body (`"Method not allowed. Allow: {allow}\n"`) plus a per-call `Allow:` header value; the body shape change is PLAN-permitted (Step 4 note). Migrated `AdminHandler::handle_inner` at `crates/envoy-admin/src/handler.rs` from a hand-rolled `if method != "GET" { render_405() } else { match from_path(...) }` shape to a single `match AdminEndpoint::dispatch(&method, &path) { ... }` covering all three arms. Closes 06.1 REVIEW M1 structurally: every endpoint variant now declares its 405 allow-list surface via `allowed_method`; 08.2's POST endpoints plug in additively without touching `Dispatch`.
+
+### Tests landed
+
+- `endpoint::dispatch_tests::get_known_path_returns_endpoint`
+- `endpoint::dispatch_tests::unknown_path_returns_not_found_regardless_of_method`
+- `endpoint::dispatch_tests::known_path_wrong_method_returns_method_not_allowed_with_get_in_allow`
+- `endpoint::dispatch_tests::method_match_is_case_sensitive_exact`
+- `endpoint::dispatch_tests::each_endpoint_declares_its_allowed_method`
+- `endpoint::dispatch_tests::dispatch_is_disjoint_from_from_path`
+
+6 new tests in `crates/envoy-admin/src/endpoint.rs` (sibling `#[cfg(test)] mod dispatch_tests` after the existing `mod tests`). Also updated 1 pre-existing test in-place: `endpoint::tests::render_405_carries_allow_get_header` now calls `render_405("GET")` to match the widened signature.
+
+### Deviations from PLAN
+
+1. **Sibling vs. nested test-module placement.** PLAN Step 1 snippet says "Add this module inside `#[cfg(test)] mod tests`". Placed `dispatch_tests` as a **sibling** `#[cfg(test)] mod` block at file end instead, matching the Task 1+2 placement discipline already recorded in those tasks' deviation narratives. Behavior-equivalent; the `use super::{AdminEndpoint, Dispatch};` line at module head resolves identically from the sibling site.
+2. **`render_405` body shape — adopted PLAN's new dynamic shape.** PLAN Step 4 was explicit that the executor adapts body shape; the previous body (`"admin endpoints are GET-only\n"`, `content-type: text/plain`, `content-length`, `allow: GET` static) becomes dynamic (`"Method not allowed. Allow: {allow}\n"`, `content-type: text/plain`, `content-length` matching `body.len()`, `allow: {allow}`). Kept `content-length` to match `render_404`'s sibling pattern (PLAN-permitted; cleaner with the file's prevailing style than dropping it). Set `reason: None` to let Task 1's `reason_for_status` supply the canonical `"Method Not Allowed"`.
+3. **PLAN line-number references drift.** PLAN said `pub enum AdminEndpoint` "lines 8-22"; disk reality at HEAD `5904cf9` is lines 7-22. PLAN said `handle_inner` "around line 139"; disk reality is line 169 (Tasks 1+2 shifted offsets). No behavior change.
+4. **`render_405` body string adapted to `Bytes::from(format!(...))`.** PLAN's snippet showed `body: format!(...).into_bytes()` returning `Vec<u8>`. The actual `envoy_http1::Response.body` is `bytes::Bytes` (verified at `crates/envoy-http1/src/response.rs:18`); used `Bytes::from(format!(...))` which is the idiomatic conversion path. Same wire output.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+   Compiling http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.84s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-listener v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-listener)
+    Checking envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+    Checking envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.21s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test endpoint::dispatch_tests::each_endpoint_declares_its_allowed_method ... ok
+test endpoint::dispatch_tests::dispatch_is_disjoint_from_from_path ... ok
+test endpoint::dispatch_tests::get_known_path_returns_endpoint ... ok
+test endpoint::dispatch_tests::known_path_wrong_method_returns_method_not_allowed_with_get_in_allow ... ok
+test endpoint::dispatch_tests::method_match_is_case_sensitive_exact ... ok
+test endpoint::dispatch_tests::unknown_path_returns_not_found_regardless_of_method ... ok
+test endpoint::tests::render_405_carries_allow_get_header ... ok
+test handler::drain_budget_lockstep_tests::admin_uses_listener_drain_budget ... ok
+test handler::tests::handler_returns_405_for_post_method ... ok
+test handler::tests::handler_returns_404_for_unknown_path ... ok
+test handler::tests::handler_serves_ready_in_process ... ok
+test handler::tests::handler_serves_stats_prometheus_in_process ... ok
+test handler::tests::admin_handler_idle_read_times_out_at_5s ... ok
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+```
+
+(envoy-admin tail: 34 = 28 pre-existing + 6 new dispatch tests. Full `cargo test --workspace` green across all crates; clean run produces no `FAILED` lines. Two transient port-binding flakes were observed in `differential::backend::tests` on parallel-load passes — `tcp_proxy_backend_spawns_and_echoes` / `tcp_proxy_backend_drop_terminates_child` on pass 1, `http1_echo_backend_spawns_and_echoes` on pass 2 — all rerun cleanly in isolation; pre-existing harness race, unrelated to dispatch refactor. Carry-forward; not engaged by Task 3.)
+
+`cargo deny check`:
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues introduced by 08.1 Task 3, which adds no new top-level deps.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:

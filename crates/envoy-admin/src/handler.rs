@@ -3,7 +3,7 @@
 //! request closes the connection (no HTTP/1.1 keep-alive in 06.1).
 
 use crate::config::AdminConfig;
-use crate::endpoint::{AdminEndpoint, render_404, render_405};
+use crate::endpoint::{AdminEndpoint, Dispatch, render_404, render_405};
 use crate::error::AdminError;
 use bytes::BytesMut;
 use envoy_listener::{BoxFuture, ConnectionHandler, DRAIN_BUDGET};
@@ -171,16 +171,11 @@ impl AdminHandler {
         mut stream: TcpStream,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let resp = match Self::read_request(&mut stream).await {
-            Ok((method, path)) => {
-                if method != "GET" {
-                    render_405()
-                } else {
-                    match AdminEndpoint::from_path(&path) {
-                        Some(ep) => ep.render(&registry),
-                        None => render_404(),
-                    }
-                }
-            }
+            Ok((method, path)) => match AdminEndpoint::dispatch(&method, &path) {
+                Dispatch::Endpoint(ep) => ep.render(&registry),
+                Dispatch::MethodNotAllowed { allow } => render_405(allow),
+                Dispatch::NotFound => render_404(),
+            },
             Err(e) => {
                 tracing::warn!(error = %e, "admin: failed to read request head");
                 // Best-effort 400 with no body; the connection is likely already broken.
