@@ -3,9 +3,9 @@
 //! `#[serde(deny_unknown_fields)]` except `Node`, which is deliberately open
 //! (SPEC §D1 inline comment).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bootstrap {
     #[serde(default)]
@@ -22,13 +22,13 @@ pub struct Bootstrap {
 // silently ignores the rest. When xDS (§9 family) lands, Node is either moved
 // or tightened under a new ADR that names the fields then semantically
 // load-bearing. (See SPEC §6 signpost 8.)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
     pub cluster: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Admin {
     pub address: Address,
@@ -42,7 +42,7 @@ pub struct Admin {
     pub access_log_path: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticResources {
     #[serde(default)]
@@ -51,7 +51,7 @@ pub struct StaticResources {
     pub clusters: Vec<Cluster>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Cluster {
     pub name: String,
@@ -82,7 +82,7 @@ pub struct Cluster {
     pub typed_extension_protocol_options: Option<TypedExtensionProtocolOptions>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ClusterType {
     /// Static cluster type — endpoints' `address` fields are literal IPs
@@ -105,7 +105,7 @@ pub enum ClusterType {
 /// only — envoy-rust's `tokio::net::lookup_host` resolution path returns
 /// the system-stack default and does NOT filter by family at runtime.
 /// Whichever later phase needs the runtime filter lands it then.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum DnsLookupFamily {
     V4Only,
@@ -113,13 +113,13 @@ pub enum DnsLookupFamily {
     Auto,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum LbPolicy {
     RoundRobin,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LoadAssignment {
     pub cluster_name: String,
@@ -131,7 +131,7 @@ pub struct LoadAssignment {
 /// The single recognized key is the upstreams.http.v3.HttpProtocolOptions
 /// extension; the validator additionally rejects unknown @type URLs and
 /// mutually-exclusive explicit_http_config arms.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TypedExtensionProtocolOptions {
     #[serde(rename = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions")]
@@ -140,7 +140,7 @@ pub struct TypedExtensionProtocolOptions {
 
 /// The upstreams.http.v3.HttpProtocolOptions typed-extension. Carries the
 /// `@type` URL (validated literal) + the `explicit_http_config` oneof.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpProtocolOptions {
     #[serde(rename = "@type")]
@@ -153,7 +153,7 @@ pub struct HttpProtocolOptions {
 /// http2_protocol_options (H2 arm; reuses 05.2 D2.b's Http2ProtocolOptions
 /// unchanged). The validator (`validate` fn) enforces mutual
 /// exclusion via ConfigError::MutuallyExclusiveExplicitHttpConfig.
-#[derive(Debug, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ExplicitHttpConfig {
     #[serde(default)]
@@ -165,29 +165,29 @@ pub struct ExplicitHttpConfig {
 /// H1 arm of ExplicitHttpConfig. Empty in 05.3; future fields like
 /// chunk_encoding / allow_chunked_length / enable_trailers defer per
 /// SPEC §4 to whichever phase first needs cluster-side H1 protocol-tuning.
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Http1ProtocolOptions {}
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalityLbEndpoints {
     pub lb_endpoints: Vec<LbEndpoint>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LbEndpoint {
     pub endpoint: Endpoint,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     pub address: Address,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
     #[allow(dead_code)]
@@ -205,20 +205,20 @@ pub struct Listener {
     pub listener_filters: Vec<serde_yaml::Value>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Address {
     pub socket_address: SocketAddress,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SocketAddress {
     pub address: String,
     pub port_value: u16,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FilterChain {
     #[serde(default)]
@@ -232,7 +232,7 @@ pub struct FilterChain {
 /// connection routes to; for phase 03.2, only `server_names` (TLS SNI) is
 /// supported. Empty / missing `server_names` is the catch-all (validator
 /// enforces "at most one catch-all per listener").
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FilterChainMatch {
     /// SNI values this filter chain matches. Empty Vec = catch-all. The
@@ -242,7 +242,7 @@ pub struct FilterChainMatch {
     pub server_names: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkFilter {
     pub name: String,
@@ -250,7 +250,7 @@ pub struct NetworkFilter {
     pub typed_config: Option<TypedConfig>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "@type", deny_unknown_fields)]
 pub enum TypedConfig {
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy")]
@@ -270,7 +270,7 @@ pub enum TypedConfig {
 /// extension-specific payload via a `@type`-tagged enum. Future
 /// observability-family phases extend `AccessLogTypedConfig` rather than
 /// reshaping `AccessLog`.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AccessLog {
     pub name: String,
@@ -283,7 +283,7 @@ pub struct AccessLog {
 /// OpenTelemetry loggers without reshaping the schema. Unknown `@type`
 /// URLs are rejected by serde at deserialization time (surfaces as
 /// `ConfigError::Yaml`); see `rejects_hcm_with_unsupported_access_log_type_url`.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "@type", deny_unknown_fields)]
 pub enum AccessLogTypedConfig {
     #[serde(rename = "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog")]
@@ -295,13 +295,13 @@ pub enum AccessLogTypedConfig {
 /// `json_format`, …) is OUT of scope per parent-06 SPEC §4 + 06.2 SPEC §4
 /// (the emitter uses the default Envoy v3 format string). Empty paths
 /// are rejected by the validator (`ConfigError::InvalidAccessLogPath`).
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileAccessLog {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TcpProxyConfig {
     /// Required by Envoy for access-log attribution; accepted by envoy-rust and
@@ -311,7 +311,7 @@ pub struct TcpProxyConfig {
     pub cluster: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransportSocket {
     /// Phase 03 accepts only `"envoy.transport_sockets.tls"`; the validator
@@ -320,7 +320,7 @@ pub struct TransportSocket {
     pub typed_config: TransportSocketTypedConfig,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "@type", deny_unknown_fields)]
 pub enum TransportSocketTypedConfig {
     #[serde(
@@ -333,13 +333,13 @@ pub enum TransportSocketTypedConfig {
     Upstream(UpstreamTlsContext),
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DownstreamTlsContext {
     pub common_tls_context: CommonTlsContext,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamTlsContext {
     pub common_tls_context: CommonTlsContext,
@@ -349,7 +349,7 @@ pub struct UpstreamTlsContext {
     pub sni: String,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CommonTlsContext {
     #[serde(default)]
@@ -358,14 +358,14 @@ pub struct CommonTlsContext {
     pub validation_context: Option<CertificateValidationContext>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsCertificate {
     pub certificate_chain: DataSource,
     pub private_key: DataSource,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CertificateValidationContext {
     pub trusted_ca: DataSource,
@@ -379,7 +379,7 @@ pub struct CertificateValidationContext {
 /// "exactly one of {filename, inline_string} is `Some`" invariant — and any
 /// per-callsite restriction (e.g. TLS still requires `filename`) — is enforced
 /// by the validator (Task 2 of phase 04.1), not by serde.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DataSource {
     #[serde(default)]
@@ -393,7 +393,7 @@ pub struct DataSource {
 /// route_config, http_filters. Upstream Envoy's HCM has dozens more fields
 /// (access_log, tracing, http_protocol_options, idle_timeout, ...); all
 /// deferred per SPEC §4.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConnectionManagerConfig {
     pub stat_prefix: String,
@@ -423,7 +423,7 @@ pub struct HttpConnectionManagerConfig {
 /// HCM codec_type. Phase 04.1 wire-supports HTTP1 only (Task 10's HCM rejects
 /// the others at construction time); AUTO/HTTP2/HTTP3 parse but do not yet
 /// dispatch.
-#[derive(Debug, Deserialize, PartialEq, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[allow(non_camel_case_types)]
 pub enum CodecType {
     AUTO,
@@ -432,14 +432,14 @@ pub enum CodecType {
     HTTP3,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HttpFilter {
     pub name: String,
     pub typed_config: HttpFilterTypedConfig,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "@type", deny_unknown_fields)]
 pub enum HttpFilterTypedConfig {
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router")]
@@ -453,14 +453,14 @@ pub enum HttpFilterTypedConfig {
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
 /// dynamic_stats, start_child_span, ...); all deferred per SPEC §4.
-#[derive(Debug, Deserialize, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {}
 
 /// `envoy.extensions.filters.http.header_mutation.v3.HeaderMutation` config.
 /// The HeaderMutation filter appends/overwrites request and response headers.
 /// Phase 07.2.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderMutationConfig {
     pub mutations: Mutations,
@@ -468,7 +468,7 @@ pub struct HeaderMutationConfig {
 
 /// The request-side and response-side mutation lists. Both default to empty
 /// (`mutations: {}` is legal — a no-op filter).
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Mutations {
     #[serde(default)]
@@ -480,14 +480,14 @@ pub struct Mutations {
 /// One mutation entry. Envoy's proto is a `oneof` (append / remove); 07.2
 /// supports only `append`. `#[serde(deny_unknown_fields)]` rejects `remove`
 /// (and any other oneof arm) at parse time.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderMutationEntry {
     pub append: HeaderValueOption,
 }
 
 /// `HeaderValueOption` — a header key/value plus the append action.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderValueOption {
     pub header: HeaderValue,
@@ -495,7 +495,7 @@ pub struct HeaderValueOption {
 }
 
 /// `HeaderValue` — the literal header key + value.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderValue {
     pub key: String,
@@ -507,7 +507,7 @@ pub struct HeaderValue {
 /// unsupported variants parse at the schema level so serde does not emit a
 /// generic "unknown variant" error — the Task 2 validator rejects them with the
 /// typed `ConfigError::UnsupportedHeaderMutationAppendAction` variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AppendAction {
     AppendIfExistsOrAdd,
@@ -524,7 +524,7 @@ pub enum AppendAction {
 /// default to RFC-conformant values via the `h2` crate and defer until a
 /// fixture or h2spec test forces them. Validator-checked range constraints
 /// per RFC 7540 §6.5.2 / §6.9.1 / §6.9.2 land in `validate_hcm`.
-#[derive(Debug, Default, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Http2ProtocolOptions {
     /// SETTINGS_MAX_CONCURRENT_STREAMS. h2-crate default: 100. No upper bound
@@ -548,14 +548,14 @@ pub struct Http2ProtocolOptions {
     pub max_frame_size: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfiguration {
     pub name: String,
     pub virtual_hosts: Vec<VirtualHost>,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VirtualHost {
     pub name: String,
@@ -591,7 +591,7 @@ pub enum RouteAction {
 /// 04.3 NEW (under SPEC §3 D2). Names the cluster to forward the matched
 /// request to. Future route-action knobs (timeout, retries, weighted clusters,
 /// host-rewrite, header manipulations) are deferred (SPEC §4 non-goals).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[allow(non_camel_case_types)]
 pub struct RouteAction_Route {
@@ -685,7 +685,41 @@ impl<'de> serde::Deserialize<'de> for Route {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+impl serde::Serialize for Route {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("match", &self.r#match)?;
+        match &self.action {
+            RouteAction::DirectResponse(dr) => map.serialize_entry("direct_response", dr)?,
+            RouteAction::Route(ar) => map.serialize_entry("route", ar)?,
+        }
+        map.end()
+    }
+}
+
+impl serde::Serialize for RouteAction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // RouteAction is an internal discriminator; when serialized inline
+        // as part of Route, Route::serialize emits the field key directly.
+        // This impl covers any direct serialization use.
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            RouteAction::DirectResponse(dr) => map.serialize_entry("direct_response", dr)?,
+            RouteAction::Route(ar) => map.serialize_entry("route", ar)?,
+        }
+        map.end()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
     #[serde(default)]
@@ -696,7 +730,7 @@ pub struct RouteMatch {
     pub headers: Vec<HeaderMatcher>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DirectResponse {
     pub status: u16,
@@ -705,7 +739,7 @@ pub struct DirectResponse {
 
 /// Half-open i64 range. Validator rejects start >= end with
 /// ConfigError::InvalidInt64Range. Phase 04.2.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Int64Range {
     pub start: i64,
@@ -792,6 +826,18 @@ impl<'de> serde::Deserialize<'de> for SafeRegex {
             }
         }
         deserializer.deserialize_map(V)
+    }
+}
+
+impl serde::Serialize for SafeRegex {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("regex", &self.regex)?;
+        map.end()
     }
 }
 
@@ -929,6 +975,28 @@ impl<'de> serde::Deserialize<'de> for StringMatcher {
             }
         }
         deserializer.deserialize_map(V)
+    }
+}
+
+impl serde::Serialize for StringMatcher {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        // 2 entries: 1 for mode key + 1 for ignore_case (always emitted per
+        // lock-in #8: Serialize mirrors the YAML input verbatim; bool fields
+        // emit unconditionally regardless of value).
+        let mut map = serializer.serialize_map(Some(2))?;
+        match &self.mode {
+            StringMatcherMode::Exact(v) => map.serialize_entry("exact", v)?,
+            StringMatcherMode::Prefix(v) => map.serialize_entry("prefix", v)?,
+            StringMatcherMode::Suffix(v) => map.serialize_entry("suffix", v)?,
+            StringMatcherMode::SafeRegex(sr) => map.serialize_entry("safe_regex", sr)?,
+            StringMatcherMode::Contains(v) => map.serialize_entry("contains", v)?,
+        }
+        map.serialize_entry("ignore_case", &self.ignore_case)?;
+        map.end()
     }
 }
 
@@ -1098,6 +1166,31 @@ impl<'de> serde::Deserialize<'de> for HeaderMatcher {
             }
         }
         deserializer.deserialize_map(V)
+    }
+}
+
+impl serde::Serialize for HeaderMatcher {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        // 3 entries: name + mode key + invert_match (always emitted per
+        // lock-in #8: Serialize mirrors the YAML input verbatim; bool fields
+        // emit unconditionally regardless of value).
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("name", &self.name)?;
+        match &self.mode {
+            HeaderMatcherMode::ExactMatch(v) => map.serialize_entry("exact_match", v)?,
+            HeaderMatcherMode::PrefixMatch(v) => map.serialize_entry("prefix_match", v)?,
+            HeaderMatcherMode::SuffixMatch(v) => map.serialize_entry("suffix_match", v)?,
+            HeaderMatcherMode::SafeRegexMatch(sr) => map.serialize_entry("safe_regex_match", sr)?,
+            HeaderMatcherMode::RangeMatch(r) => map.serialize_entry("range_match", r)?,
+            HeaderMatcherMode::PresentMatch(b) => map.serialize_entry("present_match", b)?,
+            HeaderMatcherMode::StringMatch(sm) => map.serialize_entry("string_match", sm)?,
+        }
+        map.serialize_entry("invert_match", &self.invert_match)?;
+        map.end()
     }
 }
 
@@ -6886,5 +6979,60 @@ static_resources:
                 other => panic!("expected UnsupportedHttpFilter, got {other:?}"),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serialize roundtrip tests (Task 4 — sibling module per Tasks 1/2/3 cadence)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod serialize_roundtrip_tests {
+    use crate::bootstrap::Bootstrap;
+
+    /// Pre-D6 sanity check per 08.1 SPEC §6.4.
+    ///
+    /// Takes fixture 0008's `envoy-rust.yaml` — the most varied bootstrap shape
+    /// in-tree at 08.1 time (HCM, STRICT_DNS cluster, 1 listener, http_filters,
+    /// multi-route) — parses via serde_yaml, serializes via serde_json, deserializes
+    /// via serde_json, and asserts structural equality.
+    #[test]
+    fn fixture_0008_bootstrap_roundtrips_yaml_to_json() {
+        let raw = std::fs::read_to_string(
+            "../../tests/fixtures/0008-http1-router-upstream/envoy-rust.yaml",
+        )
+        .expect("fixture 0008 envoy-rust.yaml readable from envoy-config crate dir");
+        // Fixture uses {{PORT}}, {{BACKEND_HOST}}, {{HTTP1_BACKEND_PORT}} as
+        // template variables; substitute static values so serde_yaml can parse
+        // port_value as u16 and address as a string.
+        // template values are arbitrary — the test asserts struct-level roundtrip
+        // equality, not the chosen substitution values.
+        let yaml = raw
+            .replace("{{PORT}}", "10000")
+            .replace("{{BACKEND_HOST}}", "127.0.0.1")
+            .replace("{{HTTP1_BACKEND_PORT}}", "10001");
+        // YAML -> struct
+        let parsed: Bootstrap = serde_yaml::from_str(&yaml).expect("YAML parses");
+        // struct -> JSON
+        let json = serde_json::to_string_pretty(&parsed).expect("Bootstrap serializes to JSON");
+        // JSON -> struct
+        let reparsed: Bootstrap =
+            serde_json::from_str(&json).expect("JSON round-trips back to Bootstrap");
+        // Coarse-grained idempotency check: re-serialize and compare strings.
+        let json2 = serde_json::to_string_pretty(&reparsed).expect("re-serializes");
+        assert_eq!(
+            json, json2,
+            "JSON serialization is idempotent after roundtrip"
+        );
+    }
+
+    #[test]
+    fn minimal_bootstrap_serializes_to_json() {
+        let yaml =
+            "node:\n  id: t\n  cluster: t\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let parsed: Bootstrap = serde_yaml::from_str(yaml).expect("minimal parses");
+        let json = serde_json::to_string(&parsed).expect("minimal serializes");
+        assert!(json.contains("\"node\""));
+        assert!(json.contains("\"static_resources\""));
     }
 }

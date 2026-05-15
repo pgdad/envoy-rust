@@ -396,6 +396,189 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 4 — Bootstrap Serialize derive cascade + roundtrip sanity check
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 4 — Bootstrap Serialize derive cascade + roundtrip sanity check`
+**LoC delta:** +158 production (cascade + hand-rolled Serialize impls + Cargo.toml), +44 tests, 0 doc. Net +212 insertions, 54 deletions (per `git diff --stat`).
+
+### Work summary
+
+Added `Serialize` to every `#[derive(...)]` line reachable from `Bootstrap` in `crates/envoy-config/src/bootstrap.rs` (49 derive-line edits) and widened the `use serde::Deserialize;` import to `use serde::{Deserialize, Serialize};`. Added `serde_json = "1"` to `crates/envoy-config/Cargo.toml` (required for the roundtrip test and for Task 6's `/config_dump` endpoint). Added five hand-rolled `impl serde::Serialize` blocks for types that have hand-rolled `Deserialize` impls and no `Deserialize` derive: `Route`, `RouteAction`, `SafeRegex`, `StringMatcher`, and `HeaderMatcher`. Added a sibling `#[cfg(test)] mod serialize_roundtrip_tests` block with two tests: a fixture-0008 roundtrip sanity check and a minimal-bootstrap smoke test. Post-review amend corrected conditional bool emission in `StringMatcher::serialize` and `HeaderMatcher::serialize` to emit `ignore_case` and `invert_match` unconditionally (PLAN lock-in #8); also renamed the roundtrip test and added a template-values comment (two cosmetic Minor findings absorbed).
+
+### Tests landed
+
+- `bootstrap::serialize_roundtrip_tests::fixture_0008_bootstrap_roundtrips_yaml_to_json`
+- `bootstrap::serialize_roundtrip_tests::minimal_bootstrap_serializes_to_json`
+
+2 new tests in `crates/envoy-config/src/bootstrap.rs` (sibling `#[cfg(test)] mod serialize_roundtrip_tests` at file end, matching Tasks 1/2/3 placement cadence).
+
+### Deviations from PLAN
+
+1. **Full derive-line inventory (auditable record of the mechanical cascade).** The grep produced 49 derive lines with `Deserialize` (not 25-32 as estimated in the PLAN — the file grew considerably since the PLAN estimate was written). Each was transformed by inserting `Serialize` immediately before `Deserialize`. Before→after for each line number (post-edit):
+
+   | Line | Before | After |
+   |------|--------|-------|
+   | 8 | `#[derive(Debug, Deserialize)]` | `#[derive(Debug, Serialize, Deserialize)]` |
+   | 25 | `#[derive(Debug, Deserialize)]` | `#[derive(Debug, Serialize, Deserialize)]` |
+   | 31 | `#[derive(Debug, Deserialize)]` | `#[derive(Debug, Serialize, Deserialize)]` |
+   | 45 | `#[derive(Debug, Default, Deserialize)]` | `#[derive(Debug, Default, Serialize, Deserialize)]` |
+   | 54 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 85 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 108 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 116 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 122 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 134 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 143 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 156 | `#[derive(Debug, Deserialize, PartialEq, Default)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]` |
+   | 168 | `#[derive(Debug, Default, Deserialize, PartialEq)]` | `#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]` |
+   | 172 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 178 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 184 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 190 | `#[derive(Debug, Deserialize)]` | `#[derive(Debug, Serialize, Deserialize)]` |
+   | 208 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 214 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 221 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 235 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 245 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 253 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 273 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 286 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 298 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 304 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 314 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 323 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 336 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 342 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 352 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 361 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 368 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 382 | `#[derive(Debug, Clone, Deserialize, PartialEq)]` | `#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]` |
+   | 396 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 426 | `#[derive(Debug, Deserialize, PartialEq, Clone, Copy)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]` |
+   | 435 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 442 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 456 | `#[derive(Debug, Deserialize, PartialEq, Default)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]` |
+   | 463 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 471 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 483 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 490 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 498 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 510 | `#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]` | `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]` |
+   | 527 | `#[derive(Debug, Default, Deserialize, PartialEq, Clone)]` | `#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Clone)]` |
+   | 551 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 558 | `#[derive(Debug, Deserialize, PartialEq)]` | `#[derive(Debug, Serialize, Deserialize, PartialEq)]` |
+   | 594 | `#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]` | `#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]` |
+
+2. **Five types required hand-rolled `impl serde::Serialize` blocks (not in PLAN).** The PLAN's cascade description assumed all types used `#[derive(Deserialize)]`. In reality, five types use hand-rolled `Deserialize` impls to handle field-name oneof discrimination, which means they also needed hand-rolled `Serialize` impls. These are:
+   - `SafeRegex` — serializes only `regex: String`; `compiled: Option<Arc<regex::Regex>>` is skip-serialized (the compiled form is transient; `regex` is the sole serializable field).
+   - `StringMatcher` — serializes the mode key (`exact`/`prefix`/`suffix`/`safe_regex`/`contains`) and `ignore_case` (always emitted per lock-in #8; see deviation 8 below).
+   - `Route` — serializes `match` + either `direct_response` or `route` depending on the `RouteAction` variant.
+   - `RouteAction` — serializes as a single-key map matching the `Deserialize` field-name oneof shape.
+   - `HeaderMatcher` — serializes `name`, the mode key, and `invert_match` (always emitted per lock-in #8; see deviation 8 below).
+
+3. **Fixture 0008 uses `{{PORT}}`, `{{BACKEND_HOST}}`, and `{{HTTP1_BACKEND_PORT}}` template variables.** The PLAN said "parse via serde_yaml" on the fixture file, but all `envoy-rust.yaml` fixtures use template placeholders that serde_yaml interprets as YAML mappings (not scalars), causing parse failures. The test substitutes `{{PORT}}` → `10000`, `{{BACKEND_HOST}}` → `127.0.0.1`, and `{{HTTP1_BACKEND_PORT}}` → `10001` before passing to serde_yaml. This is not a serde roundtrip issue per SPEC §5.3 — it's a test setup concern. The substitution matches how the existing integration harness resolves templates.
+
+4. **Sibling vs. nested test-module placement.** Placed `serialize_roundtrip_tests` as a standalone sibling `#[cfg(test)] mod` block at file end, consistent with Tasks 1/2/3 cadence.
+
+5. **`serde_json` added to `crates/envoy-config/Cargo.toml`.** The PLAN noted it should be added if not present (it was not present). Added as `serde_json = "1"` matching the workspace's existing serde_json 1.0.149 in `Cargo.lock`.
+
+6. **PLAN derive-line count estimate off.** PLAN estimated ~25-32 derive lines; actual count is 49. The file grew considerably from Task 1–3 landings and prior phases. No behavior impact.
+
+7. **clippy `doc_lazy_continuation` lint on test doc comment.** Initial doc comment used `+ http_filters + multi-route` phrasing which clippy's `doc_lazy_continuation` lint misread as a list continuation item without indentation. Rewrote the comment to use em-dash and parenthetical grouping to avoid the lint.
+
+8. **Post-review amend: conditional bool emission fixed (Important finding, PLAN lock-in #8).** A code-quality review of the substantive commit caught that `StringMatcher::serialize` and `HeaderMatcher::serialize` emitted `ignore_case` and `invert_match` conditionally (only when `true`), citing a `// matches serde's #[serde(skip_serializing_if = "is_false")] convention` comment. This violated PLAN lock-in #8 ("Serialize emits the literal value, default or not"). The substantive commit was amended to emit both fields unconditionally — fixed-count map lengths (`Some(2)` for `StringMatcher`, `Some(3)` for `HeaderMatcher`), `map.serialize_entry(field, &self.field)?` without guards, and the `skip_serializing_if`-citing comments removed. The roundtrip test remains green because the struct-equality assertion is unaffected by JSON verbosity. Two Minor findings were also absorbed cosmetically: the test `fixture_0008_bootstrap_roundtrips_yaml_to_json_to_yaml` was renamed to `fixture_0008_bootstrap_roundtrips_yaml_to_json` (the `_to_yaml` suffix was misleading — the test goes YAML→struct→JSON→struct→JSON and asserts JSON equality), and a one-line comment was added above the `.replace()` calls noting that template substitution values are arbitrary. All 5 gates re-run and green post-amend.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-config v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-config)
+   Compiling envoy-listener v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-listener)
+   Compiling envoy-cluster v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-cluster)
+   Compiling envoy-filter v0.1.0 (/Users/esa/git/envoy-rust/crates/envoy-filter)
+   Compiling envoy-tls v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tls)
+   Compiling envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+   Compiling envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+   Compiling envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+   Compiling http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.92s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-config v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-config)
+    Checking envoy-cluster v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-cluster)
+    Checking envoy-listener v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-listener)
+    Checking envoy-filter v0.1.0 (/Users/esa/git/envoy-rust/crates/envoy-filter)
+    Checking envoy-tls v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tls)
+    Checking envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+    Checking envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Checking http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.40s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test bootstrap::serialize_roundtrip_tests::fixture_0008_bootstrap_roundtrips_yaml_to_json ... ok
+test bootstrap::serialize_roundtrip_tests::minimal_bootstrap_serializes_to_json ... ok
+test bootstrap::tests::fuzz_corpus_seeds_parse_or_reject_cleanly ... ok
+
+test result: ok. 209 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+(envoy-config tail: 209 = 207 pre-existing + 2 new. Full `cargo test --workspace` green across all crates; no `FAILED` lines on a clean run. The pre-existing `differential` port-binding transient flakes may appear on busy systems; they rerun cleanly in isolation and are unrelated to Task 4 — same pattern noted in Task 3 deviation narrative.)
+
+`cargo deny check`:
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. `serde_json` is already a transitive dep with MIT license — adding it as a direct dep to `envoy-config` adds no new license categories.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:
