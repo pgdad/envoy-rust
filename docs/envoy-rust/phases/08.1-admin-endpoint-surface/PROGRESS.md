@@ -162,7 +162,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 2 — D3: DRAIN_BUDGET module-level hoist
 
-**Commit:** `063d12a` — `phase 08.1: task 2 — DRAIN_BUDGET module-level hoist (closes 06.1 M4)`
+**Commit:** `c6368f4` — `phase 08.1: task 2 — DRAIN_BUDGET module-level hoist (closes 06.1 M4)`
 **LoC delta:** +6 production, +20 tests, 0 doc. Net +26.
 
 ### Work summary
