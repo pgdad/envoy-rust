@@ -398,7 +398,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 4 — Bootstrap Serialize derive cascade + roundtrip sanity check
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 4 — Bootstrap Serialize derive cascade + roundtrip sanity check`
+**Commit:** `ec12450` — `phase 08.1: task 4 — Bootstrap Serialize derive cascade + roundtrip sanity check`
 **LoC delta:** +158 production (cascade + hand-rolled Serialize impls + Cargo.toml), +44 tests, 0 doc. Net +212 insertions, 54 deletions (per `git diff --stat`).
 
 ### Work summary
