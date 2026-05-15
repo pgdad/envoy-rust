@@ -581,7 +581,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 5 — D13a: AdminHandler::new widening + envoy-bin wiring + format_iso8601 wrapper
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 5 — AdminHandler::new widen + envoy-bin wiring + format_iso8601 pub wrapper`
+**Commit:** `1a05eaa` — `phase 08.1: task 5 — AdminHandler::new widen + envoy-bin wiring + format_iso8601 pub wrapper`
 **LoC delta:** +189 production+test handler.rs, +35 production+test accesslog/lib.rs, +1 envoy-admin/Cargo.toml dep block (3 new entries), +1 envoy-bin/Cargo.toml dep, +30 envoy-bin/src/main.rs, +4 Cargo.lock. Net +276 insertions, 10 deletions (per `git diff --stat`). Of the handler.rs delta: ~64 lines production (struct field cascade + widened constructor + new imports + 6-arg call-site reshape in 7 tests), ~85 lines new test block (`admin_handler_new_6arg_tests`), ~40 lines test-helper functions (`dummy_bootstrap`/`dummy_cluster_manager` in the `tests` module). Of the accesslog/lib.rs delta: ~15 lines production (`pub fn format_iso8601` + doc), ~20 lines new test block (`public_format_iso8601_tests`).
 
 ### Work summary
