@@ -13,6 +13,20 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Maps HTTP status codes to their RFC 7231 reason phrase. Used as the fallback
+/// when `Response.reason` is `None`. Phase 08.1 D2 (closes 06.1 REVIEW M1).
+fn reason_for_status(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
+}
+
 /// Maximum total bytes accepted for the request head (request line + headers
 /// + final CRLF). Mirrors the existing 8KiB cap from
 ///   `crates/envoy-bin/src/admin.rs::MAX_REQUEST_HEAD` (phase 02.2 I4).
@@ -112,7 +126,9 @@ impl AdminHandler {
     /// - `connection: close` (06.1 has no keep-alive)
     fn serialize_response(resp: &envoy_http1::Response) -> BytesMut {
         let mut out = BytesMut::with_capacity(384 + resp.body.len());
-        let reason = resp.reason.unwrap_or("OK");
+        let reason = resp
+            .reason
+            .unwrap_or_else(|| reason_for_status(resp.status));
         let head = format!("HTTP/1.1 {status} {reason}\r\n", status = resp.status);
         out.extend_from_slice(head.as_bytes());
         for (name, value) in &resp.headers {
@@ -122,14 +138,31 @@ impl AdminHandler {
             out.extend_from_slice(b"\r\n");
         }
         // Standard admin-response headers (preserved verbatim from pre-migration
-        // shape per SPEC §3 D3 — "non-negotiable mirroring").
-        out.extend_from_slice(b"cache-control: no-cache, max-age=0\r\n");
-        out.extend_from_slice(b"x-content-type-options: nosniff\r\n");
-        out.extend_from_slice(b"server: envoy-rust\r\n");
-        let date = envoy_http1::date::format_imf_fixdate(std::time::SystemTime::now());
-        let date_line = format!("date: {date}\r\n");
-        out.extend_from_slice(date_line.as_bytes());
-        // Always close the connection (06.1 has no keep-alive).
+        // shape per SPEC §3 D3 — "non-negotiable mirroring"). Phase 08.1 D1
+        // (closes 06.1 REVIEW I2): each default is emitted only if the caller
+        // has not already supplied a header with the same name (case-insensitive
+        // ASCII compare); the caller-supplied value wins.
+        let has_header = |name: &str| {
+            resp.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(name))
+        };
+        if !has_header("cache-control") {
+            out.extend_from_slice(b"cache-control: no-cache, max-age=0\r\n");
+        }
+        if !has_header("x-content-type-options") {
+            out.extend_from_slice(b"x-content-type-options: nosniff\r\n");
+        }
+        if !has_header("server") {
+            out.extend_from_slice(b"server: envoy-rust\r\n");
+        }
+        if !has_header("date") {
+            let date = envoy_http1::date::format_imf_fixdate(std::time::SystemTime::now());
+            let date_line = format!("date: {date}\r\n");
+            out.extend_from_slice(date_line.as_bytes());
+        }
+        // Always close the connection (06.1 has no keep-alive). Not in the D1
+        // dedupe set: 06.1's no-keep-alive posture is non-negotiable.
         out.extend_from_slice(b"connection: close\r\n");
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&resp.body);
@@ -491,5 +524,118 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod serialize_response_dedupe_and_reason_tests {
+    use super::AdminHandler;
+    use bytes::BytesMut;
+
+    fn serialize(
+        status: u16,
+        reason: Option<&'static str>,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> String {
+        let resp = envoy_http1::Response {
+            status,
+            reason,
+            headers,
+            body: bytes::Bytes::from(body),
+        };
+        let bytes: BytesMut = AdminHandler::serialize_response(&resp);
+        String::from_utf8(bytes.to_vec()).expect("ASCII response")
+    }
+
+    #[test]
+    fn dedupe_preserves_caller_provided_cache_control() {
+        let wire = serialize(
+            200,
+            None,
+            vec![("Cache-Control".into(), "public, max-age=60".into())],
+            b"OK".to_vec(),
+        );
+        let lower = wire.to_lowercase();
+        let count = lower.matches("cache-control:").count();
+        assert_eq!(
+            count, 1,
+            "exactly one cache-control header; got wire:\n{wire}"
+        );
+        assert!(
+            wire.to_lowercase()
+                .contains("cache-control: public, max-age=60")
+        );
+    }
+
+    #[test]
+    fn dedupe_preserves_caller_provided_server() {
+        let wire = serialize(
+            200,
+            None,
+            vec![("server".into(), "custom-server".into())],
+            b"OK".to_vec(),
+        );
+        let lower = wire.to_lowercase();
+        let count = lower.matches("server:").count();
+        assert_eq!(count, 1);
+        assert!(lower.contains("server: custom-server"));
+    }
+
+    #[test]
+    fn dedupe_is_case_insensitive() {
+        let wire = serialize(
+            200,
+            None,
+            vec![("X-Content-Type-Options".into(), "myvalue".into())],
+            b"OK".to_vec(),
+        );
+        let lower = wire.to_lowercase();
+        let count = lower.matches("x-content-type-options:").count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn default_headers_present_when_caller_omits() {
+        let wire = serialize(200, None, vec![], b"OK".to_vec());
+        let lower = wire.to_lowercase();
+        assert!(lower.contains("cache-control: no-cache, max-age=0"));
+        assert!(lower.contains("x-content-type-options: nosniff"));
+        assert!(lower.contains("server: envoy-rust"));
+        assert!(lower.contains("date: "));
+    }
+
+    #[test]
+    fn reason_503_renders_service_unavailable_without_explicit_reason() {
+        let wire = serialize(503, None, vec![], b"".to_vec());
+        let first_line = wire.lines().next().expect("status line");
+        assert_eq!(first_line, "HTTP/1.1 503 Service Unavailable");
+    }
+
+    #[test]
+    fn reason_for_status_covers_listed_codes() {
+        let cases = [
+            (200, "OK"),
+            (400, "Bad Request"),
+            (404, "Not Found"),
+            (405, "Method Not Allowed"),
+            (500, "Internal Server Error"),
+            (503, "Service Unavailable"),
+        ];
+        for (code, expect) in cases {
+            let wire = serialize(code, None, vec![], b"".to_vec());
+            let first_line = wire.lines().next().unwrap();
+            assert!(
+                first_line.ends_with(expect),
+                "{code} reason: got `{first_line}`, want suffix `{expect}`"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_reason_overrides_helper() {
+        let wire = serialize(200, Some("Custom"), vec![], b"".to_vec());
+        let first_line = wire.lines().next().unwrap();
+        assert_eq!(first_line, "HTTP/1.1 200 Custom");
     }
 }

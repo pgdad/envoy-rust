@@ -72,7 +72,91 @@ The SIGKILL→SIGTERM `nix` deferral stays in place — 08.1 is a docs-and-endpo
 
 Each substantive task (Tasks 1-13 in PLAN.md numbering) appends its own `## Task N — <subject>` section here at the task's commit. Task 14 (state-4 verification + STATE-advance) appends the 6-gate evidence anchor.
 
-_(empty; populated by the state-3 execution arc)_
+## Task 1 — D1+D2: serialize_response dedupe + reason_for_status
+
+**Commit:** `161f280` — `phase 08.1: task 1 — serialize_response dedupe + reason_for_status (closes 06.1 I2, M1)`
+**LoC delta:** +43 production, +112 tests, +7 doc. Net +162.
+
+### Work summary
+
+Added a module-level `reason_for_status(u16) -> &'static str` helper at `crates/envoy-admin/src/handler.rs` covering 200/400/404/405/500/503, and rewired `AdminHandler::serialize_response`'s status-line construction to use it as the fallback when `resp.reason` is `None`. Rewrote the default-header emission block with case-insensitive dedupe (via a `has_header` closure that calls `eq_ignore_ascii_case`) over the 4 standard admin headers (`cache-control`, `x-content-type-options`, `server`, `date`); the always-emitted `connection: close` line is intentionally outside the dedupe set per the 06.1 no-keep-alive posture. Closes 06.1 REVIEW I2 (case-insensitive dedupe) and M1 (reason-phrase helper); appended a Phase 08.1 D1 dedupe note to the BEHAVIOR_CONTRACT.md header allow-list section.
+
+### Tests landed
+
+- `serialize_response_dedupe_and_reason_tests::dedupe_preserves_caller_provided_cache_control`
+- `serialize_response_dedupe_and_reason_tests::dedupe_preserves_caller_provided_server`
+- `serialize_response_dedupe_and_reason_tests::dedupe_is_case_insensitive`
+- `serialize_response_dedupe_and_reason_tests::default_headers_present_when_caller_omits`
+- `serialize_response_dedupe_and_reason_tests::reason_503_renders_service_unavailable_without_explicit_reason`
+- `serialize_response_dedupe_and_reason_tests::reason_for_status_covers_listed_codes`
+- `serialize_response_dedupe_and_reason_tests::explicit_reason_overrides_helper`
+
+7 new tests in `crates/envoy-admin/src/handler.rs` (sibling `#[cfg(test)] mod` after the existing `mod tests`).
+
+### Deviations from PLAN
+
+1. **Test helper signature adapted to `envoy_http1::Response`'s actual shape.** PLAN's snippet typed the test helper as `reason: Option<&str>` and `body: Vec<u8>`, then assembled `Response { reason: reason.map(|s| s.to_string()), body, .. }`. The actual `Response` at HEAD `7dbd984` defines `reason: Option<&'static str>` and `body: bytes::Bytes` (see `crates/envoy-http1/src/response.rs:15-18`). Adapted: helper takes `reason: Option<&'static str>` (every call site passes a `'static` literal so this is sound) and `body: Vec<u8>`, then constructs the `Response` with `reason` passed through verbatim and `body: bytes::Bytes::from(body)`. The 7 test assertions are unchanged — only the helper plumbing adapts to disk reality (per PLAN's "helper shapes are tooling-only" guidance).
+2. **`unwrap_or_else` not `as_deref().unwrap_or_else`.** Because `Response.reason` is `Option<&'static str>` (not `Option<String>`), `as_deref()` is unnecessary; the fallback is written as `resp.reason.unwrap_or_else(|| reason_for_status(resp.status))`.
+3. **Connection-header note added.** The PLAN's snippet describes "4 standard defaults"; the existing 06.1 code emits 5 headers including `connection: close`. The dedupe applies to the 4 named in the PLAN; `connection: close` continues to emit unconditionally with a clarifying comment ("06.1 has no keep-alive; not in the D1 dedupe set"). Matches the PLAN-time guidance to "keep emitting it (do not remove)".
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 21.83s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.82s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test handler::serialize_response_dedupe_and_reason_tests::default_headers_present_when_caller_omits ... ok
+test handler::serialize_response_dedupe_and_reason_tests::explicit_reason_overrides_helper ... ok
+test handler::serialize_response_dedupe_and_reason_tests::reason_503_renders_service_unavailable_without_explicit_reason ... ok
+test handler::serialize_response_dedupe_and_reason_tests::reason_for_status_covers_listed_codes ... ok
+test handler::tests::handler_response_carries_server_header ... ok
+test handler::tests::handler_returns_404_for_unknown_path ... ok
+test handler::tests::handler_returns_405_for_post_method ... ok
+test handler::tests::handler_serves_ready_in_process ... ok
+test handler::tests::handler_serves_stats_prometheus_in_process ... ok
+test handler::tests::handler_response_carries_admin_headers ... ok
+test handler::tests::admin_handler_idle_read_times_out_at_5s ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+```
+
+(envoy-admin tail above: 27 = 20 pre-existing + 7 new. Full `cargo test --workspace` is green across all crates; the workspace-wide aggregate ends with several `Doc-tests` blocks reporting `0 passed`, which is the no-doctests-in-this-crate norm. No `FAILED` lines on a clean run.)
+
+`cargo deny check`:
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues introduced by 08.1 Task 1, which adds no new top-level deps.)
 
 ---
 
