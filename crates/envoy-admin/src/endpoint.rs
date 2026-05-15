@@ -3,6 +3,7 @@
 
 use bytes::{Bytes, BytesMut};
 use envoy_stats::StatsRegistry;
+use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminEndpoint {
@@ -19,6 +20,13 @@ pub enum AdminEndpoint {
     /// `GET /stats/prometheus` — returns 200 with body in Prometheus
     /// text-exposition format per envoy_stats::prometheus::write_exposition.
     StatsPrometheus,
+
+    /// `GET /config_dump` — returns 200 with body
+    /// `{ "configs": [BootstrapConfigDump] }` rendered as pretty JSON. Phase
+    /// 08.1 D6. xDS-derived ConfigDump entries (Clusters/Listeners/Routes/
+    /// Secrets) are deferred to the xDS family and explicitly land on
+    /// `allowlist_envoy_only` per BEHAVIOR_CONTRACT.
+    ConfigDump,
 }
 
 /// Method-aware dispatch result. Introduced at phase 08.1 D4 to give every
@@ -41,6 +49,7 @@ impl AdminEndpoint {
             "/ready" => Some(AdminEndpoint::Ready),
             "/stats" => Some(AdminEndpoint::Stats),
             "/stats/prometheus" => Some(AdminEndpoint::StatsPrometheus),
+            "/config_dump" => Some(AdminEndpoint::ConfigDump),
             _ => None,
         }
     }
@@ -50,10 +59,11 @@ impl AdminEndpoint {
     /// 08.2's POST endpoints will declare `"POST"`.
     pub fn allowed_method(&self) -> &'static str {
         match self {
-            AdminEndpoint::Ready => "GET",
-            AdminEndpoint::Stats => "GET",
-            AdminEndpoint::StatsPrometheus => "GET",
-            // Tasks 6-9 add: ConfigDump | ServerInfo | Clusters | Listeners => "GET",
+            AdminEndpoint::Ready
+            | AdminEndpoint::Stats
+            | AdminEndpoint::StatsPrometheus
+            | AdminEndpoint::ConfigDump => "GET",
+            // Tasks 7-9 add: ServerInfo | Clusters | Listeners => "GET",
         }
     }
 
@@ -77,11 +87,35 @@ impl AdminEndpoint {
 
     /// Render the response for this endpoint. Reads the registry only on
     /// the `Stats` / `StatsPrometheus` arms; `Ready` ignores the registry.
+    ///
+    /// Phase 08.1 D6: this is the registry-only render path retained for the
+    /// 06.1 endpoints. New endpoints introduced in 08.1 (ConfigDump and the
+    /// Tasks 7-9 cohort) need handler-scoped state and dispatch through
+    /// [`AdminEndpoint::render_with`] instead. Calling `render` on `ConfigDump`
+    /// is a programming error — the dispatch path in `handler.rs` routes
+    /// `ConfigDump` through `render_with` exclusively.
     pub fn render(&self, registry: &StatsRegistry) -> envoy_http1::Response {
         match self {
             AdminEndpoint::Ready => Self::render_ready(),
             AdminEndpoint::Stats => Self::render_stats(registry),
             AdminEndpoint::StatsPrometheus => Self::render_stats_prometheus(registry),
+            AdminEndpoint::ConfigDump => unreachable!(
+                "ConfigDump requires handler-scoped state; dispatch via AdminEndpoint::render_with"
+            ),
+        }
+    }
+
+    /// Phase 08.1 D6 introduces `render_with(&AdminHandler)` to reach
+    /// handler-scoped state (`Arc<Bootstrap>`, `ClusterManager`,
+    /// `start_instant`, `command_line_options`). The existing
+    /// [`AdminEndpoint::render`] carries forward for `/ready`, `/stats`, and
+    /// `/stats/prometheus`; new endpoints add explicit arms here. Tasks 7/8/9
+    /// add `ServerInfo`, `Clusters`, `Listeners`.
+    pub fn render_with(&self, handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+        match self {
+            AdminEndpoint::ConfigDump => render_config_dump(handler),
+            // 06.1 endpoints carry forward through the registry-only path.
+            _ => self.render(handler.registry()),
         }
     }
 
@@ -147,6 +181,55 @@ impl AdminEndpoint {
             ],
             body,
         }
+    }
+}
+
+/// Phase 08.1 D6: top-level body envelope for `/config_dump`. Mirrors upstream
+/// Envoy's `envoy.admin.v3.ConfigDump` shape: a `configs` array of
+/// per-resource-type entries. The body type is lifetime-parameterized so the
+/// renderer can borrow `&Bootstrap` from the `Arc<Bootstrap>` cached on the
+/// handler (avoiding a `Bootstrap`-wide `Clone` cascade — PLAN lock-in #1).
+#[derive(Serialize)]
+pub(crate) struct ConfigDumpBody<'a> {
+    pub configs: Vec<ConfigDumpEntry<'a>>,
+}
+
+/// Phase 08.1 D6: one entry in the `/config_dump` `configs` array. Serializes
+/// the `@type` tag externally per upstream Envoy's `google.protobuf.Any` JSON
+/// projection convention. envoy-rust emits exactly one `Bootstrap` entry in
+/// 08.1; xDS-derived entries (`ClustersConfigDump`, `ListenersConfigDump`,
+/// `RoutesConfigDump`, `SecretsConfigDump`) are deferred to the xDS family
+/// and land on `allowlist_envoy_only` per BEHAVIOR_CONTRACT §"Admin endpoint
+/// body shapes".
+#[derive(Serialize)]
+#[serde(tag = "@type")]
+pub(crate) enum ConfigDumpEntry<'a> {
+    #[serde(rename = "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump")]
+    Bootstrap {
+        bootstrap: &'a envoy_config::Bootstrap,
+        last_updated: String,
+    },
+}
+
+/// Phase 08.1 D6: render `/config_dump` as pretty JSON. Borrows the cached
+/// `Bootstrap` from the handler; the `last_updated` timestamp is the wall
+/// clock at render time formatted via [`envoy_accesslog::format_iso8601`].
+pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+    let body = ConfigDumpBody {
+        configs: vec![ConfigDumpEntry::Bootstrap {
+            bootstrap: handler.bootstrap(),
+            last_updated: envoy_accesslog::format_iso8601(std::time::SystemTime::now()),
+        }],
+    };
+    let body_bytes = serde_json::to_vec_pretty(&body)
+        .expect("ConfigDumpBody serializes (all subtypes derive Serialize per Task 4)");
+    envoy_http1::Response {
+        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
+        // leave `reason: None` per PLAN lock-in #7.
+        status: 200,
+        reason: None,
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: Bytes::from(body_bytes),
     }
 }
 
@@ -308,6 +391,118 @@ mod tests {
 }
 
 #[cfg(test)]
+mod config_dump_tests {
+    //! Phase 08.1 Task 6 — D6: `/config_dump` endpoint coverage. Six tests:
+    //! two dispatch-shape tests (GET routes to `ConfigDump`; POST returns 405)
+    //! and four body-shape tests (200 + `application/json`; valid JSON with a
+    //! top-level `configs` array; one `BootstrapConfigDump` entry; the
+    //! `bootstrap` subtree carries the parsed `node.id`).
+
+    use super::{AdminEndpoint, Dispatch};
+    use crate::config::AdminConfig;
+    use crate::handler::AdminHandler;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn handler_with_bootstrap(yaml: &str) -> AdminHandler {
+        let bootstrap: Bootstrap = serde_yaml::from_str(yaml).expect("yaml parses");
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        AdminHandler::new(
+            cfg,
+            Arc::new(StatsRegistry::new()),
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+        )
+    }
+
+    const TINY_BOOTSTRAP: &str =
+        "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+
+    #[test]
+    fn config_dump_path_dispatches_on_get() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/config_dump"),
+            Dispatch::Endpoint(AdminEndpoint::ConfigDump)
+        ));
+    }
+
+    #[test]
+    fn config_dump_405_on_post() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("POST", "/config_dump"),
+            Dispatch::MethodNotAllowed { allow: "GET" }
+        ));
+    }
+
+    #[test]
+    fn config_dump_renders_200_with_application_json() {
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
+        let resp = AdminEndpoint::ConfigDump.render_with(&handler);
+        assert_eq!(resp.status, 200);
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ct, Some("application/json"));
+    }
+
+    #[test]
+    fn config_dump_body_is_valid_json_with_configs_array() {
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
+        let resp = AdminEndpoint::ConfigDump.render_with(&handler);
+        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
+        let value: serde_json::Value = serde_json::from_str(body_str).expect("valid JSON");
+        assert!(value.get("configs").and_then(|c| c.as_array()).is_some());
+    }
+
+    #[test]
+    fn config_dump_body_has_bootstrap_config_dump_entry() {
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
+        let resp = AdminEndpoint::ConfigDump.render_with(&handler);
+        let body_str = std::str::from_utf8(&resp.body).unwrap();
+        let value: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(configs.len(), 1);
+        let entry = &configs[0];
+        assert_eq!(
+            entry.get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.BootstrapConfigDump")
+        );
+        assert!(entry.get("bootstrap").is_some());
+        assert!(entry.get("last_updated").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[test]
+    fn config_dump_bootstrap_subtree_carries_node_id() {
+        let yaml = "node:\n  id: my-node-id\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::ConfigDump.render_with(&handler);
+        let body_str = std::str::from_utf8(&resp.body).unwrap();
+        let value: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        let node_id = value
+            .pointer("/configs/0/bootstrap/node/id")
+            .and_then(|v| v.as_str());
+        assert_eq!(node_id, Some("my-node-id"));
+    }
+}
+
+#[cfg(test)]
 mod dispatch_tests {
     use super::{AdminEndpoint, Dispatch};
 
@@ -380,6 +575,7 @@ mod dispatch_tests {
         assert_eq!(AdminEndpoint::Ready.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::Stats.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::StatsPrometheus.allowed_method(), "GET");
+        assert_eq!(AdminEndpoint::ConfigDump.allowed_method(), "GET");
     }
 
     #[test]

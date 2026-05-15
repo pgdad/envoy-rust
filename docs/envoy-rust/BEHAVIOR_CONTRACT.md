@@ -119,6 +119,22 @@ value wins.
 
 ---
 
+## Admin endpoint body shapes
+
+> **To be filled per-phase as needed.**
+>
+> Authored per phase 08.1 SPEC §2.1. One row per admin endpoint with the body
+> kind + per-endpoint equivalence disposition. Tasks 6/7/8/9 of phase 08.1
+> populate `/config_dump`, `/server_info`, `/clusters`, `/listeners`
+> respectively. Future POST-bearing admin surfaces (08.2 family) and any
+> later admin endpoints append rows here with the same columns.
+
+| Endpoint | Method | Body kind | Equivalence disposition |
+|---|---|---|---|
+| `/config_dump` | GET | JSON object | Top-level shape `{ "configs": [...] }`. envoy-rust emits exactly one entry: `{ "@type": "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump", "bootstrap": <static-bootstrap-as-JSON>, "last_updated": <ISO-8601 timestamp> }`. Envoy may emit additional entries for xDS-derived configs; those land on `allowlist_envoy_only`. `bootstrap.static_resources` content value-exact-after-roundtrip (modulo serde renamings; the harness's `JsonShape::required_subtree` covers this). `last_updated` name-required-value-may-differ (wall-clock non-determinism). |
+
+---
+
 ## Access log field mapping
 
 > **To be filled per-phase as needed.**

@@ -46,10 +46,10 @@ pub struct AdminHandler {
     config: Arc<AdminConfig>,
     registry: Arc<StatsRegistry>,
     /// Phase 08.1 D13a: parsed `Bootstrap` cached at process startup. Routed
-    /// to the `/config_dump` renderer (Task 7) which serializes the bootstrap
+    /// to the `/config_dump` renderer (Task 6) which serializes the bootstrap
     /// as JSON; kept as an `Arc` so the handler can be `Send + Sync` without
-    /// cloning the (potentially large) bootstrap on every request.
-    #[allow(dead_code)] // wired for Tasks 6-9; consumers land in those tasks
+    /// cloning the (potentially large) bootstrap on every request. Read by
+    /// `render_config_dump` via the `bootstrap()` accessor (Task 6).
     bootstrap: Arc<Bootstrap>,
     /// Phase 08.1 D13a: cluster manager handle for the `/clusters` renderer
     /// (Task 8). `Arc` shape mirrors `bootstrap` for the same Send+Sync reason.
@@ -99,6 +99,42 @@ impl AdminHandler {
     /// read `config.access_log_path`); 06.1 has no consumers.
     pub fn config(&self) -> &AdminConfig {
         &self.config
+    }
+
+    /// Phase 08.1 D6 accessor (PLAN lock-in #2). Crate-internal because the
+    /// endpoint renderers are the only legitimate consumers. Returns the
+    /// `Bootstrap` directly (deref through the `Arc`) so `render_config_dump`
+    /// can borrow it into `ConfigDumpEntry::Bootstrap { bootstrap: &..., .. }`
+    /// without a `Bootstrap`-wide `Clone` cascade (lock-in #1).
+    pub(crate) fn bootstrap(&self) -> &Bootstrap {
+        &self.bootstrap
+    }
+
+    /// Phase 08.1 D6 accessor (PLAN lock-in #2). Returns the registry so the
+    /// `render_with` fallback path can dispatch 06.1 endpoints unchanged.
+    pub(crate) fn registry(&self) -> &StatsRegistry {
+        &self.registry
+    }
+
+    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Reserved for Task 8's
+    /// `/clusters` renderer. Currently unused.
+    #[allow(dead_code)] // wired for Task 8
+    pub(crate) fn cluster_manager(&self) -> &ClusterManager {
+        &self.cluster_manager
+    }
+
+    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Reserved for Task 7's
+    /// `/server_info` uptime computation. Currently unused.
+    #[allow(dead_code)] // wired for Task 7
+    pub(crate) fn start_instant(&self) -> Instant {
+        self.start_instant
+    }
+
+    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Reserved for Task 7's
+    /// `/server_info` renderer. Currently unused.
+    #[allow(dead_code)] // wired for Task 7
+    pub(crate) fn command_line_options(&self) -> &BTreeMap<String, serde_yaml::Value> {
+        &self.command_line_options
     }
 
     /// Read at most `MAX_REQUEST_HEAD` bytes until CRLF-CRLF; parse via
@@ -212,13 +248,19 @@ impl AdminHandler {
         out
     }
 
+    /// Phase 08.1 D6: widened from `(registry, stream)` to `(handler, stream)`.
+    /// Dispatching `Dispatch::Endpoint` now calls
+    /// [`AdminEndpoint::render_with`] so handler-scoped state
+    /// (`Arc<Bootstrap>`, `ClusterManager`, etc.) is reachable from the
+    /// renderers introduced in Tasks 6/7/8/9. The 06.1 endpoints transparently
+    /// fall through to the registry-only path inside `render_with`.
     async fn handle_inner(
-        registry: Arc<StatsRegistry>,
+        handler: Arc<Self>,
         mut stream: TcpStream,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let resp = match Self::read_request(&mut stream).await {
             Ok((method, path)) => match AdminEndpoint::dispatch(&method, &path) {
-                Dispatch::Endpoint(ep) => ep.render(&registry),
+                Dispatch::Endpoint(ep) => ep.render_with(&handler),
                 Dispatch::MethodNotAllowed { allow } => render_405(allow),
                 Dispatch::NotFound => render_404(),
             },
@@ -241,12 +283,32 @@ impl AdminHandler {
 }
 
 impl ConnectionHandler for AdminHandler {
+    /// Phase 08.1 D6 reshape: the trait surface only hands us `&self`, but
+    /// `handle_inner` now needs an `Arc<Self>` so the new
+    /// [`AdminEndpoint::render_with`] dispatch path can reach handler-scoped
+    /// state. We rebuild an owning handle by cloning each internal `Arc`
+    /// field (cheap — `Arc::clone` is a refcount bump) and constructing a
+    /// fresh `AdminHandler`. `start_instant: Instant` is `Copy`;
+    /// `command_line_options` clones the `BTreeMap` (small in 08.1 — single
+    /// `config_path` entry per `envoy-bin/src/main.rs`).
+    ///
+    /// The 06.1 production path used `Arc::clone(&self.registry)` here for
+    /// the same reason; we extend that pattern to the four new handles. The
+    /// `serve` accept loop continues to dispatch through this trait method
+    /// unchanged (see commit `1d546bc` for the pre-08.1-Task-6 baseline).
     fn handle(
         &self,
         downstream: TcpStream,
     ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        let registry = Arc::clone(&self.registry);
-        Box::pin(Self::handle_inner(registry, downstream))
+        let cloned = Arc::new(AdminHandler {
+            config: Arc::clone(&self.config),
+            registry: Arc::clone(&self.registry),
+            bootstrap: Arc::clone(&self.bootstrap),
+            cluster_manager: Arc::clone(&self.cluster_manager),
+            start_instant: self.start_instant,
+            command_line_options: self.command_line_options.clone(),
+        });
+        Box::pin(Self::handle_inner(cloned, downstream))
     }
 }
 

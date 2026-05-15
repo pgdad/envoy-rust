@@ -660,6 +660,92 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 6 — D6: /config_dump endpoint + BEHAVIOR_CONTRACT row
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 6 — /config_dump endpoint + BEHAVIOR_CONTRACT row`
+**LoC delta:** +204 endpoint.rs (~50 production: variant + render_with + render_config_dump + body types + doc updates; ~120 test for the new `config_dump_tests` module + 1-line update to `each_endpoint_declares_its_allowed_method`), +76/-13 handler.rs (~50 production: 5 new accessors + widened `handle_inner` signature to `(Arc<Self>, stream)` + reshaped `ConnectionHandler::handle` to clone Arc fields + reconstruct `Arc<Self>` mirroring envoy-tcp's pattern, removed `#[allow(dead_code)]` on `bootstrap`), +2 envoy-admin/Cargo.toml (`serde = { version = "1", features = ["derive"] }` + `serde_json = "1"`), +2 Cargo.lock, +20 docs/envoy-rust/BEHAVIOR_CONTRACT.md (new "Admin endpoint body shapes" subsection with `/config_dump` row), +PROGRESS.md narrative. Net +273 insertions, 11 deletions.
+
+### Work summary
+
+Landed `/config_dump` GET endpoint at `crates/envoy-admin/src/endpoint.rs`: added `AdminEndpoint::ConfigDump` variant, extended `from_path` and `allowed_method` (collapsed via `|`-pattern to 4 GET variants), added `pub fn render_with(&self, &AdminHandler)` as the new dispatch method (the existing `render(&StatsRegistry)` carries forward for the 06.1 endpoints via the catch-all `_` arm), and added `render_config_dump` + lifetime-parameterized `ConfigDumpBody<'a>` / `ConfigDumpEntry<'a>` body types per PLAN lock-in #1 (borrowed-reference shape — avoids the `Clone` cascade on `Bootstrap`). At `crates/envoy-admin/src/handler.rs`: added five `pub(crate)` accessors (`bootstrap()`, `registry()`, `cluster_manager()`, `start_instant()`, `command_line_options()`) per PLAN lock-in #2, removed `#[allow(dead_code)]` on the `bootstrap` field (per lock-in #3 — leaves the other three in place for Tasks 7/8/9), widened `handle_inner` from `(Arc<StatsRegistry>, stream)` to `(Arc<Self>, stream)` and rerouted dispatch through `render_with(&handler)`, and reshaped the `ConnectionHandler::handle(&self, ...)` impl to clone the internal Arcs + reconstruct an `Arc<Self>` per accept (mirroring envoy-tcp's existing pattern for the same `&self` → `'static future` lifetime mismatch). Added `serde = { version = "1", features = ["derive"] }` and `serde_json = "1"` to `crates/envoy-admin/Cargo.toml` (both already transitive deps; matches envoy-config's pin per Task 4). Created the new "Admin endpoint body shapes" subsection in `docs/envoy-rust/BEHAVIOR_CONTRACT.md` between "Stat-name mapping" and "Access log field mapping", with the first row covering `/config_dump`.
+
+### Tests landed
+
+- `endpoint::config_dump_tests::config_dump_path_dispatches_on_get` (production crate `envoy-admin`)
+- `endpoint::config_dump_tests::config_dump_405_on_post` (production crate `envoy-admin`)
+- `endpoint::config_dump_tests::config_dump_renders_200_with_application_json` (production crate `envoy-admin`)
+- `endpoint::config_dump_tests::config_dump_body_is_valid_json_with_configs_array` (production crate `envoy-admin`)
+- `endpoint::config_dump_tests::config_dump_body_has_bootstrap_config_dump_entry` (production crate `envoy-admin`)
+- `endpoint::config_dump_tests::config_dump_bootstrap_subtree_carries_node_id` (production crate `envoy-admin`)
+
+6 new tests total, all in a new sibling `#[cfg(test)] mod config_dump_tests` block at the end of `endpoint.rs` (placed before the existing `dispatch_tests` block). `envoy-admin` test bucket: 41 passed (was 35 pre-task; +6 new). All existing tests stay green. The `each_endpoint_declares_its_allowed_method` test in `dispatch_tests` was extended with a 4th `assert_eq!` for `ConfigDump` (one-line additive change).
+
+TDD discipline: tests written first, watched fail with the expected error shapes (`E0433 cannot find module or crate serde_json`; `cannot find variant ConfigDump`; `no method named render_with`), then implementation added; re-ran tests to confirm 6/6 green.
+
+### Deviations from PLAN
+
+1. **PLAN test stub used out-of-date `Address::SocketAddress(...)` enum-variant shape.** The PLAN's Step 1 test stub constructed `envoy_config::Address::SocketAddress(envoy_config::SocketAddress { protocol: Default::default(), address: "127.0.0.1".to_string(), port_value: 0, })`. On disk, `envoy_config::Address` is a struct (`Address { socket_address: SocketAddress { ... } }`) and `SocketAddress` has no `protocol` field — only `address` and `port_value`. Re-anchored the test helper to use the actual on-disk struct shape (matches the existing `handler.rs::tests::admin_config` helper). No semantic divergence; the `AdminConfig::from_envoy_config` call returns the same value either way. This drift mirrors the project's general pattern of PLAN stubs being written against a hypothesized API and re-anchored at execution time.
+
+2. **`render` arm for `ConfigDump` is `unreachable!()` not a real implementation.** The PLAN suggested `ConfigDump` go through `render_with` exclusively. To keep the existing `render(&StatsRegistry)` API exhaustive (and prevent silently dispatching `ConfigDump` through a state-less path), the new variant's arm in `render` panics with a clear message. The `render_with` catch-all only delegates to `render` for the 06.1 endpoints (`Ready`/`Stats`/`StatsPrometheus`); `ConfigDump` is matched explicitly first. This makes the contract enforceable at runtime with a clear panic message rather than silently producing a wrong response.
+
+3. **`handle_inner` signature widened to `(Arc<Self>, TcpStream)` instead of just changing the dispatch arm.** The PLAN's Step 4 said simply: "Change the dispatch arm to call `render_with(&self)`". The signature change is the structural prerequisite — the existing `handle_inner` only carried `Arc<StatsRegistry>`; calling `render_with(&handler)` requires `&AdminHandler` in scope. Threaded `Arc<Self>` through both `handle_inner` and the `ConnectionHandler::handle` shim. The shim now clones each internal Arc field + the `BTreeMap` (small in 08.1: typically a single `config_path` entry per `envoy-bin/src/main.rs`) and reconstructs a fresh `AdminHandler` wrapped in `Arc::new`, mirroring `envoy-tcp::TcpProxy`'s identical workaround for the trait's `&self` → `'static future` lifetime gap. The pattern is documented inline in both `handle()` and the `handle_inner` doc-comment.
+
+4. **`config_dump_tests` placed BEFORE `dispatch_tests` (sibling-module placement).** Per the standing reminder from Task 1's review, sibling-vs-nested placement is recorded as a Deviation even when unsurprising. The new `config_dump_tests` block is a top-level sibling `#[cfg(test)] mod` placed after the existing `tests` block and before `dispatch_tests`. Three sibling test modules now coexist in `endpoint.rs`: `tests` (06.1 endpoint coverage), `config_dump_tests` (08.1 D6 coverage), `dispatch_tests` (08.1 D4 coverage). Sibling placement is consistent with Tasks 1/2/3/4/5 cadence.
+
+5. **`serde` declared as a direct dep alongside `serde_json` in `envoy-admin/Cargo.toml`.** The PLAN's Step 5 only mentioned `serde_json = "1"`. The new `ConfigDumpBody` / `ConfigDumpEntry` types use `#[derive(Serialize)]`, which requires the `serde` crate be in scope with the `derive` feature — `serde_json` alone does not pull this in transitively for derive purposes. Added `serde = { version = "1", features = ["derive"] }` matching `envoy-config/Cargo.toml`'s pin. Both crates were already transitive deps; Cargo.lock just gains them in envoy-admin's deps list (no new license categories).
+
+6. **PLAN line-number drift carry-forward.** The PLAN referenced "current size ~390 lines" for endpoint.rs and "current size ~835 lines" for handler.rs. On-disk pre-task: endpoint.rs was 393 lines, handler.rs was 836 lines. Re-anchored against the symbols (`from_path`, `allowed_method`, `dispatch`, `handle_inner`, `ConnectionHandler::handle`); declarations match verbatim, only the line offsets shifted ≤1.
+
+7. **Five new `pub(crate)` accessors added on `AdminHandler` (not just `bootstrap()`).** Per PLAN lock-in #2, accessors are the discipline. Added all five up-front (`bootstrap`, `registry`, `cluster_manager`, `start_instant`, `command_line_options`) so Tasks 7/8/9 don't need to revisit `handler.rs` for new accessors. The four not-yet-consumed accessors (everything except `bootstrap` and `registry`) carry `#[allow(dead_code)]` with inline comments naming the consumer task. The `registry()` accessor is the first time the field is exposed via a method (was previously cloned via `Arc::clone(&self.registry)` directly inside `handle()`); the new shape is consistent with the rest.
+
+8. **One `cargo fmt` reformatting pass applied.** The first version of `render_config_dump`'s `headers: vec![( ... )]` literal violated rustfmt's single-line collapse rule for short tuple-vec literals. `cargo fmt --all` collapsed it to a single-line form. Mechanical reformatting; no behavioral impact.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.37s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.76s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test endpoint::config_dump_tests::config_dump_405_on_post ... ok
+test endpoint::config_dump_tests::config_dump_path_dispatches_on_get ... ok
+test endpoint::config_dump_tests::config_dump_body_is_valid_json_with_configs_array ... ok
+test endpoint::config_dump_tests::config_dump_renders_200_with_application_json ... ok
+test endpoint::config_dump_tests::config_dump_bootstrap_subtree_carries_node_id ... ok
+test endpoint::config_dump_tests::config_dump_body_has_bootstrap_config_dump_entry ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+```
+
+(envoy-admin tail: 41 = 35 pre-existing + 6 new. Full `cargo test --workspace` green except for the same pre-existing port-binding transient flake in `differential::backend::tests::http1_echo_backend_*` observed at Tasks 3/4/5 — passes cleanly when re-run in isolation: `cargo test -p differential --lib backend::tests` → `10 passed; 0 failed`. No new regressions across the workspace's ~55 binary/test buckets.)
+
+`cargo deny check`:
+```
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. `serde` and `serde_json` were already transitive deps with MIT/Apache-2.0 dual-licenses; promoting them to direct deps of `envoy-admin` adds no new license categories.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:
