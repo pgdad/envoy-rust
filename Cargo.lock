@@ -334,11 +334,14 @@ name = "envoy-admin"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "envoy-accesslog",
+ "envoy-cluster",
  "envoy-config",
  "envoy-http1",
  "envoy-listener",
  "envoy-stats",
  "httparse",
+ "serde_yaml",
  "thiserror",
  "tokio",
  "tracing",
@@ -365,6 +368,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tokio-rustls",

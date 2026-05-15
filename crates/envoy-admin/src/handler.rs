@@ -6,10 +6,14 @@ use crate::config::AdminConfig;
 use crate::endpoint::{AdminEndpoint, Dispatch, render_404, render_405};
 use crate::error::AdminError;
 use bytes::BytesMut;
+use envoy_cluster::ClusterManager;
+use envoy_config::Bootstrap;
 use envoy_listener::{BoxFuture, ConnectionHandler, DRAIN_BUDGET};
 use envoy_stats::StatsRegistry;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -41,11 +45,53 @@ const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 pub struct AdminHandler {
     config: Arc<AdminConfig>,
     registry: Arc<StatsRegistry>,
+    /// Phase 08.1 D13a: parsed `Bootstrap` cached at process startup. Routed
+    /// to the `/config_dump` renderer (Task 7) which serializes the bootstrap
+    /// as JSON; kept as an `Arc` so the handler can be `Send + Sync` without
+    /// cloning the (potentially large) bootstrap on every request.
+    #[allow(dead_code)] // wired for Tasks 6-9; consumers land in those tasks
+    bootstrap: Arc<Bootstrap>,
+    /// Phase 08.1 D13a: cluster manager handle for the `/clusters` renderer
+    /// (Task 8). `Arc` shape mirrors `bootstrap` for the same Send+Sync reason.
+    #[allow(dead_code)] // wired for Tasks 6-9
+    cluster_manager: Arc<ClusterManager>,
+    /// Phase 08.1 D13a: process-start `Instant` captured at construction. The
+    /// `/server_info` renderer (Task 6) computes uptime as
+    /// `Instant::now().duration_since(start_instant)`. Held by value (not
+    /// `Arc`) because `Instant` is `Copy`.
+    #[allow(dead_code)] // wired for Tasks 6-9
+    start_instant: Instant,
+    /// Phase 08.1 D13a: command-line options surfaced in `/server_info`
+    /// (Task 6). Built once at construction time per architecture lock-in
+    /// #7 (see PROGRESS Task 1 preamble) — not built lazily at first render.
+    /// Currently `envoy-bin` populates this with `{"config_path":
+    /// Value::String(<-c value>)}`.
+    #[allow(dead_code)] // wired for Tasks 6-9
+    command_line_options: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl AdminHandler {
-    pub fn new(config: Arc<AdminConfig>, registry: Arc<StatsRegistry>) -> Self {
-        Self { config, registry }
+    /// Phase 08.1 D13a: widened from the 2-arg `(config, registry)` shape to
+    /// a 6-arg shape that captures the four additional handles Tasks 6-9 need
+    /// at render time. The 7th `Arc<DrainState>` parameter is added in 08.2
+    /// D13b. SPEC §3 D13a called this "5-arg"; PLAN lock-in #7 refines that
+    /// to 6-arg by capturing `command_line_options` at construction time.
+    pub fn new(
+        config: Arc<AdminConfig>,
+        registry: Arc<StatsRegistry>,
+        bootstrap: Arc<Bootstrap>,
+        cluster_manager: Arc<ClusterManager>,
+        start_instant: Instant,
+        command_line_options: BTreeMap<String, serde_yaml::Value>,
+    ) -> Self {
+        Self {
+            config,
+            registry,
+            bootstrap,
+            cluster_manager,
+            start_instant,
+            command_line_options,
+        }
     }
 
     /// Accessor for the bound `AdminConfig`. Currently primarily useful for
@@ -293,6 +339,24 @@ mod tests {
         .unwrap()
     }
 
+    /// Phase 08.1 Task 5 test-helper: a minimal `Bootstrap` for `AdminHandler::
+    /// new`'s 6-arg shape. The pre-task call sites only need `AdminHandler`
+    /// constructed; they do not exercise bootstrap-rendering surfaces (those
+    /// belong to Tasks 6/7). The YAML below is the smallest shape that
+    /// `serde_yaml::from_str::<Bootstrap>` accepts.
+    fn dummy_bootstrap() -> Arc<Bootstrap> {
+        let yaml =
+            "node:\n  id: t\n  cluster: t\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        Arc::new(serde_yaml::from_str::<Bootstrap>(yaml).unwrap())
+    }
+
+    /// Phase 08.1 Task 5 test-helper: a zero-cluster `ClusterManager` for
+    /// `AdminHandler::new`'s 6-arg shape. The pre-task call sites do not
+    /// exercise cluster-rendering surfaces.
+    fn dummy_cluster_manager() -> Arc<ClusterManager> {
+        Arc::new(ClusterManager::empty())
+    }
+
     async fn bind_random() -> (tokio::net::TcpListener, SocketAddr) {
         let lst = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = lst.local_addr().unwrap();
@@ -313,7 +377,14 @@ mod tests {
         let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
         let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let handler = Arc::new(AdminHandler::new(
+            cfg,
+            registry,
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+        ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -340,7 +411,14 @@ mod tests {
             .unwrap();
         c.add(3);
         let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(cfg, Arc::clone(&registry)));
+        let handler = Arc::new(AdminHandler::new(
+            cfg,
+            Arc::clone(&registry),
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+        ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -363,7 +441,14 @@ mod tests {
         let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
         let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let handler = Arc::new(AdminHandler::new(
+            cfg,
+            registry,
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+        ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -385,7 +470,14 @@ mod tests {
         let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
         let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let handler = Arc::new(AdminHandler::new(
+            cfg,
+            registry,
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+        ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -408,7 +500,14 @@ mod tests {
         let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
         let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let handler = Arc::new(AdminHandler::new(
+            cfg,
+            registry,
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+        ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -438,7 +537,14 @@ mod tests {
         let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
         let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let handler = Arc::new(AdminHandler::new(
+            cfg,
+            registry,
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+        ));
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -483,7 +589,14 @@ mod tests {
         let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
         let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(cfg, registry));
+        let handler = Arc::new(AdminHandler::new(
+            cfg,
+            registry,
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+        ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -641,5 +754,82 @@ mod drain_budget_lockstep_tests {
         // Compile-time tautology: if envoy-admin does not import
         // envoy_listener::DRAIN_BUDGET, this fails to compile.
         assert_eq!(envoy_listener::DRAIN_BUDGET, Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod admin_handler_new_6arg_tests {
+    //! Phase 08.1 D13a: `AdminHandler::new` widens from a 2-arg
+    //! `(config, registry)` shape to a 6-arg shape that captures the four
+    //! additional handles that Tasks 6/7/8/9 (`/server_info`, `/config_dump`,
+    //! `/clusters`, `/stats` JSON timestamps) need at render time: an
+    //! `Arc<Bootstrap>` for serialization, an `Arc<ClusterManager>` for the
+    //! cluster surface, an `Instant` startup mark for uptime computation, and
+    //! a `BTreeMap<String, serde_yaml::Value>` of command-line options.
+    //!
+    //! SPEC §3 D13a called this widening "5-arg"; the PLAN refined that to
+    //! 6-arg by lock-in #7 (`command_line_options` is built once at
+    //! construction time, not lazily at first render). Recorded as PROGRESS
+    //! deviation #2 for this task.
+
+    use super::AdminHandler;
+    use crate::config::AdminConfig;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn dummy_admin_config() -> Arc<AdminConfig> {
+        Arc::new(
+            AdminConfig::from_envoy_config(&Admin {
+                address: Address {
+                    socket_address: SocketAddress {
+                        address: "127.0.0.1".to_string(),
+                        port_value: 0,
+                    },
+                },
+                access_log_path: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn dummy_bootstrap() -> Arc<Bootstrap> {
+        let yaml =
+            "node:\n  id: t\n  cluster: t\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        Arc::new(serde_yaml::from_str::<Bootstrap>(yaml).unwrap())
+    }
+
+    fn dummy_cluster_manager() -> Arc<ClusterManager> {
+        Arc::new(ClusterManager::empty())
+    }
+
+    #[test]
+    fn admin_handler_new_accepts_six_args_and_constructs() {
+        // The body of the test is intentionally minimal: the constructor
+        // must accept all six handles and produce a usable `AdminHandler`.
+        // The 7th-parameter `Arc<DrainState>` widening is deferred to 08.2
+        // D13b. Detailed field-routing tests live with the consumer tasks
+        // (6/7/8/9), which render the handles into their endpoints.
+        let cfg = dummy_admin_config();
+        let registry = Arc::new(StatsRegistry::new());
+        let bootstrap = dummy_bootstrap();
+        let cluster_manager = dummy_cluster_manager();
+        let start_instant = Instant::now();
+        let command_line_options: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+
+        let handler = AdminHandler::new(
+            cfg,
+            registry,
+            bootstrap,
+            cluster_manager,
+            start_instant,
+            command_line_options,
+        );
+
+        // Sanity: the existing `config()` accessor still works post-widening.
+        assert_eq!(handler.config().address.port(), 0);
     }
 }

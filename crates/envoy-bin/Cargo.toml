@@ -21,6 +21,7 @@ envoy-stats = { path = "../envoy-stats" }
 envoy-tcp = { path = "../envoy-tcp" }
 envoy-tls = { path = "../envoy-tls" }
 httparse = "1"
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync", "process"] }
 tokio-util = { version = "0.7", features = ["default"] }
 tracing = "0.1"

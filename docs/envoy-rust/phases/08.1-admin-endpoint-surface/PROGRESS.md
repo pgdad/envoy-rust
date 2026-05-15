@@ -579,6 +579,87 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 5 — D13a: AdminHandler::new widening + envoy-bin wiring + format_iso8601 wrapper
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 5 — AdminHandler::new widen + envoy-bin wiring + format_iso8601 pub wrapper`
+**LoC delta:** +189 production+test handler.rs, +35 production+test accesslog/lib.rs, +1 envoy-admin/Cargo.toml dep block (3 new entries), +1 envoy-bin/Cargo.toml dep, +30 envoy-bin/src/main.rs, +4 Cargo.lock. Net +276 insertions, 10 deletions (per `git diff --stat`). Of the handler.rs delta: ~64 lines production (struct field cascade + widened constructor + new imports + 6-arg call-site reshape in 7 tests), ~85 lines new test block (`admin_handler_new_6arg_tests`), ~40 lines test-helper functions (`dummy_bootstrap`/`dummy_cluster_manager` in the `tests` module). Of the accesslog/lib.rs delta: ~15 lines production (`pub fn format_iso8601` + doc), ~20 lines new test block (`public_format_iso8601_tests`).
+
+### Work summary
+
+Widened `AdminHandler::new` at `crates/envoy-admin/src/handler.rs` from the 2-arg `(config, registry)` shape to a 6-arg shape: added four new struct fields (`bootstrap: Arc<Bootstrap>`, `cluster_manager: Arc<ClusterManager>`, `start_instant: Instant`, `command_line_options: BTreeMap<String, serde_yaml::Value>`) carrying the handles Tasks 6–9 (`/server_info`, `/config_dump`, `/clusters`, `/stats` JSON) need at render time. Added `envoy-accesslog`, `envoy-cluster`, and `serde_yaml = "0.9"` to `crates/envoy-admin/Cargo.toml` per PLAN-write SPEC correction 2 (visibility promotion + dep) and lock-in #7 (`command_line_options` built once at construction). Added `pub fn format_iso8601(t: SystemTime) -> String` at `crates/envoy-accesslog/src/lib.rs` as an allocating wrapper around the internal `pub(crate) default_format::format_iso8601` `&mut String` writer. Threaded `Arc<Bootstrap>`, `Arc<ClusterManager>`, `Instant::now()`, and a `BTreeMap` populated with `{"config_path": Value::String(<-c value>)}` through `crates/envoy-bin/src/main.rs` (the production call site lives in `main.rs`, not `admin.rs` — there is no `crates/envoy-bin/src/admin.rs`; recorded as deviation #3). Updated the 7 in-file `AdminHandler::new(...)` test call sites in `handler.rs` to use new `dummy_bootstrap()` / `dummy_cluster_manager()` test helpers + `Instant::now()` + `BTreeMap::new()` per the PLAN Step 6 pattern.
+
+### Tests landed
+
+- `public_format_iso8601_tests::epoch_zero_renders_canonical_shape` (production crate `envoy-accesslog`)
+- `public_format_iso8601_tests::known_date_renders_correctly` (production crate `envoy-accesslog`)
+- `handler::admin_handler_new_6arg_tests::admin_handler_new_accepts_six_args_and_constructs` (production crate `envoy-admin`)
+
+3 new tests total. `envoy-accesslog` test bucket: 16 passed (was 14 pre-task; +2 new). `envoy-admin` test bucket: 35 passed (was 34 pre-task; +1 new). All existing tests continue to pass.
+
+TDD discipline: tests written first, watched fail with the expected error shapes (`E0432 cannot find function format_iso8601 in crate envoy_accesslog`; `E0061 unexpected argument #5/#6` + `E0433 cannot find module serde_yaml`), then implementation added; re-ran tests to confirm green.
+
+### Deviations from PLAN
+
+1. **PLAN line-number drift (carry-forward from Tasks 2–4).** The PLAN listed the 7 in-file `AdminHandler::new(...)` test call sites at lines 291, 318, 341, 363, 386, 416, 461 in handler.rs. Post-Task 4, the actual line numbers were 362, 389, 412, 434, 457, 487, 532 — a ~71-line forward drift caused by Task 1's `serialize_response_dedupe_and_reason_tests` (~110 lines) and Task 4's untouched-here `Serialize` cascade (no handler.rs edits, but shared crate context). Re-anchored against `grep -n "AdminHandler::new("`; declaration matches verbatim, only line offsets shifted. No behavioral impact.
+
+2. **PLAN-write SPEC correction lock-in: `_5arg_tests` → `_6arg_tests` test-module rename.** The PLAN's Step 1 listed `admin_handler_new_5arg_tests`, but PLAN lock-in #7 + PLAN-write SPEC correction #4 require the constructor be 6-arg (not 5). The test module name was promoted to `admin_handler_new_6arg_tests` to match the actual arity, and the inner test `admin_handler_new_accepts_six_args_and_constructs` was named in plural form to match. This is a cosmetic naming alignment, not a scope change.
+
+3. **Production call site lives in `main.rs`, not a separate `admin.rs`.** The PLAN listed both `crates/envoy-bin/src/admin.rs` (twice) and `crates/envoy-bin/src/main.rs` as possible production sites. The current disk state has no `crates/envoy-bin/src/admin.rs` — admin construction is inlined in `main.rs::run` at the post-listener-walk block (the PLAN even noted: "or `main.rs` — verify against disk"). All envoy-bin edits land in `main.rs`. The historical `admin.rs` was the pre-08.1-Task-1 location of `AdminHandler` and `MAX_REQUEST_HEAD`, both since moved to `envoy-admin`.
+
+4. **`bootstrap` widened from `Bootstrap` to `Arc<Bootstrap>` in `main.rs::run`.** The PLAN said "construct `Arc<Bootstrap>` from the parsed config". I implemented this as `let bootstrap = Arc::new(envoy_config::parse_bootstrap(&yaml)?);` (changing the local from `Bootstrap` to `Arc<Bootstrap>` once at parse time, then cloning into the admin handler) rather than constructing a separate `Arc::new(bootstrap.clone())` at the admin call site. The Arc wrap is cleaner because (a) all subsequent field accesses go through Deref auto-coercion (verified compile-clean), (b) the production code already treats `bootstrap` as a read-only borrow target, (c) it avoids an extra clone of the (potentially large) bootstrap struct. The one call-site that takes a `&Bootstrap` parameter (`envoy_cluster::from_bootstrap`) coerces `&Arc<Bootstrap>` → `&Bootstrap` via Arc's `Deref` impl in function-arg position. Documented inline.
+
+5. **Sibling test-module placement.** `admin_handler_new_6arg_tests` and `public_format_iso8601_tests` were placed as top-level sibling `#[cfg(test)] mod` blocks at the end of `handler.rs` and `lib.rs` respectively, NOT nested inside the existing `tests` modules. Consistent with Tasks 1/2/3/4 cadence. Recorded per the Task 1 review's standing reminder ("record this in Deviations even if unsurprising").
+
+6. **Four `#[allow(dead_code)]` annotations on the new `AdminHandler` fields.** `bootstrap`, `cluster_manager`, `start_instant`, and `command_line_options` are wired in Task 5 but only read by consumers landing in Tasks 6/7/8/9. Without `#[allow(dead_code)]`, clippy's default-on `dead_code` warning (escalated to deny by `-D warnings`) would block the build. Each annotation carries an inline comment naming the consumer task. The annotations come off naturally as each consumer task lands (an accessor is added, the field is read).
+
+7. **`envoy-bin/Cargo.toml` also gained `serde_yaml = "0.9"`** because `main.rs` now constructs `serde_yaml::Value::String(...)` directly to populate `command_line_options`. The PLAN listed `envoy-admin/Cargo.toml`'s dep additions but did not call out the envoy-bin dep; it falls out of the requirement to construct the map at the call site rather than inside `AdminHandler::new`. `serde_yaml` is already on the D-3.2 permitted-foundations list (used by `envoy-config` and `envoy-listener` at the same `0.9` pin); no new license category.
+
+8. **`fmt --check` initially flagged one long-line in the new helper.** The `dummy_bootstrap()` YAML literal exceeded the 100-column width on the `let yaml = "..."` line; `cargo fmt --all` split it across two lines (assignment on one, string on the next). Mechanical reformatting; recorded for completeness.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+```
+
+(Clean incremental rebuild after all gates; the initial full-rebuild post-Cargo.toml edits compiled all four crates touched — `envoy-accesslog`, `envoy-admin`, `envoy-bin`, plus the transitive `envoy-http1`/`envoy-http2`/`http1-echo-server`/`http2-echo-server` — in ~27s on a cold target.)
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.85s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test handler::admin_handler_new_6arg_tests::admin_handler_new_accepts_six_args_and_constructs ... ok
+test public_format_iso8601_tests::epoch_zero_renders_canonical_shape ... ok
+test public_format_iso8601_tests::known_date_renders_correctly ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+```
+
+(envoy-admin tail: 35 = 34 pre-existing + 1 new. envoy-accesslog tail: 16 = 14 pre-existing + 2 new. Full `cargo test --workspace` green; no `FAILED` lines across any of the workspace's ~55 binary/test buckets. Same pre-existing `differential` port-binding transient flake posture as Tasks 3/4; rerun cleanly in isolation.)
+
+`cargo deny check`:
+```
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. `serde_yaml` and `envoy-accesslog` were already transitive deps with Apache-2.0 / MIT licenses; promoting them to direct deps of `envoy-admin` adds no new license categories. The `envoy-bin/Cargo.toml`'s new `serde_yaml = "0.9"` likewise re-uses an existing transitive.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:

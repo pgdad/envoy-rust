@@ -12,9 +12,12 @@ path = "src/lib.rs"
 [dependencies]
 bytes = "1"
 httparse = "1"
+serde_yaml = "0.9"
 thiserror = "2"
 tokio = { version = "1", features = ["net", "io-util", "macros", "sync", "time"] }
 tracing = "0.1"
+envoy-accesslog = { path = "../envoy-accesslog" }
+envoy-cluster = { path = "../envoy-cluster" }
 envoy-config = { path = "../envoy-config" }
 envoy-http1 = { path = "../envoy-http1" }
 envoy-listener = { path = "../envoy-listener" }

@@ -48,7 +48,26 @@ fn install_tracing() {
 async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("reading config at {}", config_path.display()))?;
-    let bootstrap = envoy_config::parse_bootstrap(&yaml)?;
+    let bootstrap = std::sync::Arc::new(envoy_config::parse_bootstrap(&yaml)?);
+
+    // Phase 08.1 D13a: capture the process-start `Instant` once at startup
+    // so the admin `/server_info` renderer (Task 6) can compute uptime as
+    // `Instant::now().duration_since(start_instant)`. Mirrors the pre-task
+    // shape: a single value built once, cloned (here, copied) into the
+    // admin handler at construction.
+    let start_instant = std::time::Instant::now();
+
+    // Phase 08.1 D13a: build the admin `command_line_options` map once at
+    // startup per architecture lock-in #7. Currently `envoy-bin` only knows
+    // about the `-c` / `--config-path` flag; the map carries a single entry
+    // `{"config_path": Value::String(<-c value>)}`. Future flags (e.g.,
+    // `--mode`, `--log-level`) extend this map.
+    let mut command_line_options: std::collections::BTreeMap<String, serde_yaml::Value> =
+        std::collections::BTreeMap::new();
+    command_line_options.insert(
+        "config_path".to_string(),
+        serde_yaml::Value::String(config_path.display().to_string()),
+    );
 
     // Per SPEC §6 signpost 4: rustls's aws-lc-rs default provider must be
     // installed once per process before any TLS-touching code runs. The
@@ -86,6 +105,11 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // envoy-config validator (admin-only configs); the manager is empty in
     // that case and `tcp_proxy` filters reference clusters by name, which
     // the validator already verified exist (`ConfigError::UnknownCluster`).
+    // Phase 08.1 D13a: `bootstrap` is `Arc<Bootstrap>` (was `Bootstrap` before
+    // Task 5). `envoy_cluster::from_bootstrap` takes `&Bootstrap`; `&bootstrap`
+    // coerces via Arc's `Deref` impl in function-arg position. Field accesses
+    // below (`bootstrap.node`, `bootstrap.static_resources.*`, `bootstrap.admin`)
+    // similarly auto-deref.
     let cluster_mgr = std::sync::Arc::new(
         envoy_cluster::from_bootstrap(&bootstrap, std::sync::Arc::clone(&registry))
             .await
@@ -334,6 +358,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         let admin_handler = std::sync::Arc::new(envoy_admin::AdminHandler::new(
             std::sync::Arc::clone(&admin_config),
             std::sync::Arc::clone(&registry),
+            std::sync::Arc::clone(&bootstrap),
+            std::sync::Arc::clone(&cluster_mgr),
+            start_instant,
+            command_line_options.clone(),
         ));
         let shutdown = token.clone();
         set.spawn(async move {

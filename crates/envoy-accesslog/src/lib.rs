@@ -22,3 +22,43 @@ mod sink;
 pub use error::AccessLogError;
 pub use file_sink::FileSink;
 pub use record::AccessLogRecord;
+
+use std::time::SystemTime;
+
+/// Public wrapper around the internal `default_format::format_iso8601`
+/// `&mut String`-writer. Returns a freshly-allocated `String` in the canonical
+/// 24-byte `YYYY-MM-DDTHH:MM:SS.sssZ` shape.
+///
+/// Phase 08.1 D13a: surfaces the ISO-8601 emitter for cross-crate consumers
+/// (`envoy-admin` uses this for `server_info`'s `uptime_current_epoch` and for
+/// the `/stats` JSON timestamps). The internal `pub(crate) fn` writer
+/// (`&mut String, SystemTime`) stays internal-only — only this allocating
+/// wrapper is public.
+pub fn format_iso8601(t: SystemTime) -> String {
+    let mut s = String::new();
+    default_format::format_iso8601(&mut s, t);
+    s
+}
+
+#[cfg(test)]
+mod public_format_iso8601_tests {
+    use super::format_iso8601;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn epoch_zero_renders_canonical_shape() {
+        let s = format_iso8601(UNIX_EPOCH);
+        assert_eq!(s, "1970-01-01T00:00:00.000Z");
+        assert_eq!(s.len(), 24, "canonical 24-byte shape");
+    }
+
+    #[test]
+    fn known_date_renders_correctly() {
+        // 2024-02-29T12:34:56.789Z — leap day boundary; mirrors the
+        // internal-test golden case at `default_format::tests::
+        // format_iso8601_known_date`.
+        let t = UNIX_EPOCH + Duration::from_millis(1_709_210_096_789);
+        let s = format_iso8601(t);
+        assert_eq!(s, "2024-02-29T12:34:56.789Z");
+    }
+}
