@@ -74,7 +74,7 @@ Each substantive task (Tasks 1-13 in PLAN.md numbering) appends its own `## Task
 
 ## Task 1 — D1+D2: serialize_response dedupe + reason_for_status
 
-**Commit:** `161f280` — `phase 08.1: task 1 — serialize_response dedupe + reason_for_status (closes 06.1 I2, M1)`
+**Commit:** `d43d97a` — `phase 08.1: task 1 — serialize_response dedupe + reason_for_status (closes 06.1 I2, M1)`
 **LoC delta:** +43 production, +112 tests, +7 doc. Net +162.
 
 ### Work summary
