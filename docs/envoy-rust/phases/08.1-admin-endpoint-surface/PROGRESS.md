@@ -1115,7 +1115,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 11 — D17.1 — Fixture `0014-admin-config-dump-server-info` + Docker-gated wrapper
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 11 — fixture 0014-admin-config-dump-server-info + Docker-gated wrapper`
+**Commit:** `6ee1ad7` — `phase 08.1: task 11 — fixture 0014 + Driver::AdminScrape Vec<sub-case> widening`
 **LoC delta:** +~330 production (`tests/differential/src/lib.rs`: `AdminScrapeCase` struct + `Driver::AdminScrape` widening to `Vec<AdminScrapeCase>`; multi-scrape dispatch loop; `JsonShape` strictness wiring — `value_may_differ_keys` + per-side `allowlist_*_keys` + `required_subtree.expected` + shared-key value-equality; `TextLines` strictness wiring — per-side `allowlist_*_lines` + Task 11 NEW per-side `allowlist_*_line_prefixes` family; `Box<BodyRule>` on `Http1WithAccessLog` to land clippy's `large_enum_variant` after the `Driver::AdminScrape` shrink; `check_content_type` parameter-tolerance for the bare-vs-charset divergence; diagnostic `DIFFERENTIAL_DUMP_ADMIN` env-var dump; doc-comment refresh on `BodyRule::{JsonShape,TextLines}` + `JsonSubtreeRule`), +~150 tests (1 Docker-gated wrapper + 1 new `driver_admin_scrape_parses_with_multiple_scrapes` + 7 new strictness-wiring unit tests in `body_rule_extension_tests` + 2 pre-existing test adaptations + Task 11 NEW `text_lines_envoy_only_line_prefix_*` × 2), +~430 fixture/doc (fixture 0014's 4 files at 419 LoC + fixture 0011's expectations.yaml re-indent migration). Net +~910 insertions, ~440 deletions (the bulk of fixture 0011's "deletions" are line-level re-indentation under the new `scrapes:` parent — no semantic delta).
 
 ### Work summary
