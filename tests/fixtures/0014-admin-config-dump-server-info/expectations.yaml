@@ -131,13 +131,17 @@ driver:
           - "backend::high_priority::max_retries::3"
           - "backend::added_via_api::false"
         # Address-BEARING per-endpoint counter lines. Each line starts
-        # with `backend::<bridge-ip>:<HTTP1_BACKEND_PORT>::` (the bridge
-        # IP is Docker Desktop's `192.168.65.254`; the port is the
-        # kernel-ephemeral port spawned for the http1-echo-server backend).
-        # The bridge-IP is stable across fixture runs on a given host;
-        # the port is not.
+        # with `backend::<bridge-ip>:<HTTP1_BACKEND_PORT>::` where the
+        # bridge IP depends on the Docker host:
+        #   - macOS Docker Desktop: `192.168.65.254` (gvisor bridge).
+        #   - Linux Docker (CI ubuntu-latest): `172.17.0.1` (docker0).
+        # The kernel-ephemeral port is the http1-echo-server backend
+        # port and varies per fixture run; the bridge IP is stable for
+        # a given host. Both prefixes are listed so the same fixture
+        # passes on either platform (Task 14 deviation #1).
         allowlist_envoy_only_line_prefixes:
           - "backend::192.168.65.254:"
+          - "backend::172.17.0.1:"
         allowlist_envoy_rust_only_line_prefixes: []
 
     # ---------------------------------------------------------------------
