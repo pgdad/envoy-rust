@@ -1251,6 +1251,126 @@ All 14 Docker-gated fixtures simultaneously green (`cargo test -p differential`,
 
 ---
 
+## Task 12 — D17.3a — Fuzz corpus seed admin_multi_endpoint_bootstrap.yaml
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 12 — fuzz corpus seed (admin_multi_endpoint_bootstrap.yaml)`
+**LoC delta:** +41 fixture (the new seed YAML), +1 fixture (`.gitignore` allow-line), +1 test (`bootstrap.rs` SUCCESS-array entry), +~95 doc (this PROGRESS narrative). Net +~138 insertions, 0 deletions. No production code change.
+
+### Work summary
+
+Landed a new fuzz-corpus seed at `crates/envoy-config/fuzz/corpus/parse_bootstrap/admin_multi_endpoint_bootstrap.yaml` exercising the admin + multi-cluster shape (single listener with empty `filter_chains`, two STRICT_DNS clusters each with one DNS-named endpoint, plus the admin listener). Added the matching `.gitignore` allow-line and appended the seed's path to the `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array. No new test function landed — Task 12 EXTENDS test data, not test logic. The seed broadens libFuzzer's structural coverage of the parse_bootstrap target into bootstrap shapes that pair the admin listener with multiple clusters (the existing `admin_with_stats_route.yaml` covers admin + one listener + zero clusters; the new seed covers admin + one listener + two clusters).
+
+### Tests landed
+
+- None. Task 12 extends the existing `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (was 13 entries; now 14). The new seed becomes test data, not a new test function. The `envoy-config` lib bucket count is unchanged at 209.
+
+### Deviations from PLAN
+
+1. **PLAN sketch's `connect_timeout: 1s` removed.** The `Cluster` struct (`crates/envoy-config/src/bootstrap.rs:54-83`) uses `#[serde(deny_unknown_fields)]` and has no `connect_timeout` field — the PLAN's sketch as-written would yield an "unknown field" serde error. The field is omitted from the seed; the parser does not model connect timeouts at the phase-01 surface.
+
+2. **PLAN sketch's `endpoints: []` replaced with one populated locality + lb_endpoint per cluster.** The validator at `bootstrap.rs:1215-1225` returns `ConfigError::EmptyClusterEndpoints` when `total_endpoints == 0`. The PLAN's empty-endpoints form would fail parse-time validation. Each cluster now carries a single `lb_endpoints` entry with a DNS-named address (`backend-a.local:7001` / `backend-b.local:7002`) to satisfy the non-empty-endpoints invariant while preserving the STRICT_DNS intent. Matches the schema convention seen in `strict_dns_cluster.yaml`.
+
+3. **PLAN sketch's `lb_policy` was missing — added `ROUND_ROBIN` to each cluster.** The `Cluster` struct's `lb_policy` field is non-optional (`bootstrap.rs:60`, no `#[serde(default)]`). Without it, the parser yields a "missing field" serde error. `ROUND_ROBIN` is the only `LbPolicy` variant currently defined (`bootstrap.rs:118-120`) and matches every other existing seed.
+
+4. **PLAN sketch's second listener (`listener_1`) removed.** The validator at `bootstrap.rs:1198-1202` caps listeners at 1 (`ConfigError::TooManyListeners`) per phase 01. The PLAN's "multi-listener" framing is not satisfiable as a SUCCESS-array seed. Reinterpreted "multi-endpoint" in the seed name as referring to the admin-endpoint surface (the same axis Task 11's fixture 0014 scrapes — `/config_dump` + `/server_info` + `/clusters` + `/listeners`) and to multi-cluster, both of which the parser accepts. The remaining single listener `listener_0` retains `filter_chains: []` (allowed — no validator rejects empty filter chains at this layer; the corresponding cluster-side endpoint validation already covers reachability invariants).
+
+5. **PLAN's `cd crates/envoy-config && cargo fuzz run ...` snippet adjusted to `cd crates/envoy-config/fuzz && cargo +nightly fuzz run ...`.** Per ADR-0010 the fuzz subcrate is workspace-excluded and `cargo-fuzz` requires its own `Cargo.toml` directory; the invocation must execute from `crates/envoy-config/fuzz/`. Nightly toolchain prefix `+nightly` is required (cargo-fuzz instrumentation depends on nightly-only flags).
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+   Compiling http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 25.75s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Checking http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.95s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test result: ok. 209 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s   # envoy-config lib (unchanged count; Task 12 extends test data, not test logic)
+test result: ok. 94 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.77s   # differential lib (unchanged from Task 11)
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s   # envoy-admin lib (unchanged)
+test result: ok. 1 passed; 0 failed; 0 ignored; ... (14 differential integration buckets — all green simultaneously, unchanged from Task 11)
+... (all other workspace buckets green; full log via `cargo test --workspace`)
+```
+
+Bucket-level: SUCCESS-array test (`bootstrap::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`) now exercises 14 SUCCESS seeds (was 13). Test bucket count is unchanged (test extends data, not logic).
+
+`cargo deny check`:
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. Task 12 introduces NO new top-level Cargo deps — it is a fixture-only + 1-test-data-line + 1-gitignore-line change. Cargo deny check quoted explicitly per 07.1-REVIEW doctrine reminder + project precedent.)
+
+### Short-budget fuzz run
+
+`cd crates/envoy-config/fuzz && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`:
+```
+#368049	REDUCE cov: 12210 ft: 33665 corp: 3277/1780Kb lim: 4096 exec/s: 12268 rss: 578Mb L: 95/4089 MS: 2 InsertByte-EraseBytes-
+#368115	REDUCE cov: 12210 ft: 33665 corp: 3277/1780Kb lim: 4096 exec/s: 12270 rss: 578Mb L: 47/4089 MS: 1 EraseBytes-
+#368186	REDUCE cov: 12210 ft: 33665 corp: 3277/1780Kb lim: 4096 exec/s: 12272 rss: 578Mb L: 988/4089 MS: 1 EraseBytes-
+#368607	NEW    cov: 12211 ft: 33673 corp: 3278/1782Kb lim: 4096 exec/s: 12286 rss: 578Mb L: 2015/4089 MS: 1 InsertByte-
+#368898	NEW    cov: 12211 ft: 33678 corp: 3279/1786Kb lim: 4096 exec/s: 12296 rss: 578Mb L: 3877/4089 MS: 1 ChangeBit-
+#370923	DONE   cov: 12211 ft: 33678 corp: 3279/1786Kb lim: 4096 exec/s: 11965 rss: 578Mb
+###### Recommended dictionary. ######
+"\013\000\000\000\000\000\000\000" # Uses: 26509
+"\001\200" # Uses: 2116
+"\377b" # Uses: 419
+###### End of recommended dictionary. ######
+Done 370923 runs in 31 second(s)
+```
+
+0 crashes in 31 seconds (370 923 runs). Coverage ended at 12 211 PCs / 33 678 features / corp 3 279 / 1786 KiB. The new seed contributed structural variation in the admin+multi-cluster region of the input space; libFuzzer's persistent corpus (`crates/envoy-config/fuzz/corpus/parse_bootstrap/`, untracked beyond the curated allow-list) absorbed mutations off the new seed plus the existing 13 seeds without incident.
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:

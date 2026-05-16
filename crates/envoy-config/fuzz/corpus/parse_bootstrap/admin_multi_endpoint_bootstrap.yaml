@@ -1,0 +1,41 @@
+node:
+  id: fuzz-multi-endpoint
+  cluster: fuzz-cluster
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains: []
+  clusters:
+    - name: cluster_a
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: cluster_a
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend-a.local
+                      port_value: 7001
+    - name: cluster_b
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: cluster_b
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend-b.local
+                      port_value: 7002
