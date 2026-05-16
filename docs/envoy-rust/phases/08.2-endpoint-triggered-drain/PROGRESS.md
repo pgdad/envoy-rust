@@ -85,3 +85,99 @@ Per `BOOTSTRAP_PROMPT.md` §5 state 3 + STATE.md's advance at this commit: next 
 ---
 
 *End of Task 1 preamble. Task 1 narrative appends below at the first state-3 commit (the D11 DrainState foundation task). Subsequent tasks (2-11) each append their per-task narrative + the 5-gate test-bucket attestation including verbatim `cargo deny check` output per the 07.1-REVIEW doctrine reminder.*
+
+---
+
+## Task 1 (D11 — DrainState foundation)
+
+### Work summary
+
+Landed the shared drain-state primitive at `crates/envoy-listener/src/drain.rs`: `DrainStage` enum (`Live=0`, `HealthcheckFailing=1`, `Draining=2` — `#[repr(u8)]` discriminant load-bearing per parent-08 SPEC §2.3 + 08.2 SPEC §2.2, matches the future `server.state` gauge value at Task 2) + `DrainStage::from_u8` round-trip helper + `DrainState` struct over `AtomicU8 + tokio::sync::Notify` + 5 public methods (`new`, `current`, `fail_healthcheck`, `ok_healthcheck`, `drain`, `drain_signal`) + a `Default` impl that forwards to `new()`. Every mutator uses `compare_exchange` (not unconditional `store`) so the sticky-`Draining` and idempotent self-loop semantics fall out for free; `drain()` calls `notify.notify_waiters()` exactly once on the first successful CAS via two sequenced CAS attempts (`Live → Draining` then `HealthcheckFailing → Draining` only if the first failed) — repeat `drain()` calls fail both CASes silently and do NOT re-notify. `drain_signal()` returns a `Pin<Box<dyn Future<Output = ()> + Send + '_>>` and short-circuits to `std::future::ready(())` when state is already `Draining` (no waiter registration on the already-drained path; idempotent + re-entrant).
+
+Registered the module in `crates/envoy-listener/src/lib.rs` (insertion between the existing crate-root module doc-comment and the first `use std::net::SocketAddr;`) with `pub mod drain;` + `pub use drain::{DrainStage, DrainState};`. Added `pub use envoy_listener::{DrainStage, DrainState};` to `crates/envoy-admin/src/lib.rs` so admin call sites at later tasks read as `use envoy_admin::DrainState;` per parent-08 SPEC §5.1's Cargo-cycle resolution doctrine (placement note + 05.3 / 07.1 / D3 precedent documented in the module doc-comment at the top of `drain.rs`).
+
+NO gauge wiring at this task per PLAN architecture-decision lock-in #3 — the SPEC §6.4 split is foundation-first / stats-second. `DrainState::new()` takes no arguments here; Task 2 widens it to take `&Arc<envoy_stats::StatsRegistry>` for the `server.live` / `server.state` / `listener_manager.total_listeners_active` registration call.
+
+### Tests landed (6)
+
+All 6 colocated in `drain::tests` at the bottom of `crates/envoy-listener/src/drain.rs`:
+
+1. **`new_returns_live`** — fresh `DrainState::new()` reads `DrainStage::Live`.
+2. **`drain_flips_to_draining_and_notifies_waiters_once`** (multi-thread tokio) — registers two waiters via `drain_signal()`, calls `drain()` once, asserts both waiters complete within 1s AND a NEW post-drain `drain_signal()` is immediately ready (already-`Draining` early-return path).
+3. **`fail_healthcheck_flips_to_healthcheck_failing`** — `Live → HealthcheckFailing` CAS transition.
+4. **`ok_healthcheck_restores_to_live`** — `HealthcheckFailing → Live` CAS transition.
+5. **`ok_healthcheck_after_drain_is_noop_sticky`** — sticky-drain per parent-08 SPEC §5.6: `ok_healthcheck()` after `drain()` leaves state at `Draining`.
+6. **`repeat_drain_calls_are_idempotent`** (multi-thread tokio) — second + third `drain()` calls do not panic and leave state at `Draining`; a waiter registered AFTER any `drain()` call completes immediately.
+
+Red phase (Step 2) verified: pre-implementation `cargo test -p envoy-listener --lib drain::tests` produced 17 errors (`E0432: unresolved imports \`drain::DrainStage\`, \`drain::DrainState\`` at `lib.rs:12` from the module-registration line + 16 × `E0433: cannot find type \`DrainState\` / \`DrainStage\` in this scope` across the six test bodies). Green phase (Step 4) verified: `test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.06s`.
+
+### Per-task deviations from PLAN
+
+**Zero structural deviations.** The `Box::pin` shape for `drain_signal()` (vs. the unsafe pin-projection sketch that appeared earlier in PLAN.md) is what PLAN.md lines 623-634 explicitly directed the implementer to use — this is a PLAN-followed-the-explicit-`Box::pin`-direction, not a deviation. The `#![forbid(unsafe_code)]` crate-root attribute (`crates/envoy-listener/src/lib.rs:1`) makes that the only viable shape regardless. The `std::task::{Context, Poll}` imports that appeared in PLAN's unsafe pin-projection sketch were correspondingly NOT included here (they would be unused with the `Box::pin` shape) — this is consistent with PLAN's authored direction and is documented here for completeness.
+
+**One incidental fmt adjustment**: the initial append of `pub use envoy_listener::{DrainStage, DrainState};` to `crates/envoy-admin/src/lib.rs` placed the re-export at the bottom (per the task text directive "append after that line"), but `cargo fmt` requires the `pub use` block to be alphabetically ordered — moved the re-export from line 19 to line 17 (between `pub use endpoint::AdminEndpoint;` and `pub use error::AdminError;`) so the block sorts as `AdminConfig`, `AdminEndpoint`, `envoy_listener::{…}`, `AdminError`, `handler::{…}`. Functionally identical; recorded here so the deviation is documented.
+
+### LoC delta
+
+| File | Production lines | Test lines |
+|---|---|---|
+| `crates/envoy-listener/src/drain.rs` (new) | 202 (module doc-comment + `DrainStage` enum + `DrainState` struct + 5 methods + `Default` impl) | 106 (6 unit tests in `mod tests`) |
+| `crates/envoy-listener/src/lib.rs` | +3 (blank line + `pub mod drain;` + `pub use drain::{DrainStage, DrainState};`) | 0 |
+| `crates/envoy-admin/src/lib.rs` | +1 (`pub use envoy_listener::{DrainStage, DrainState};`) | 0 |
+| **Totals** | **+206** | **+106** |
+
+Total delta: **+312 LoC** (drain.rs 308 lines + 4 re-export lines). Within the ~50-LoC envelope projected by PLAN.md §Task 1 for the production-side surface (the gap is in the docstring-heavy module header + per-method doc-comments; raw code is ~80 lines).
+
+Workspace `envoy-listener` unit-test bucket grew from 12 → 18 tests (delta +6, exactly the 6 new tests in `drain::tests`).
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean compile across all 8 workspace crates, zero warnings).
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 crates compiled).
+
+**Gate 4 — `cargo test --workspace`:** PASS (exit 0; every per-bucket `test result:` line reads `ok. N passed; 0 failed`; total workspace test count delta is exactly +6 in the `envoy-listener` lib bucket which grew from 12 → 18 tests — the new `drain::tests::{new_returns_live, fail_healthcheck_flips_to_healthcheck_failing, ok_healthcheck_restores_to_live, ok_healthcheck_after_drain_is_noop_sticky, drain_flips_to_draining_and_notifies_waiters_once, repeat_drain_calls_are_idempotent}`).
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing across the project (the `deny.toml` allow-list is broader than the workspace's transitive dependency tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Identical posture to 08.1 / 07.x / 06.x precedent. Quoted verbatim per the 07.1-REVIEW doctrine (no "assumed no-op" handwave).
+
+### Differential surface delta
+
+**None.** Task 1 lands the `DrainState` foundation only — no admin endpoint surface change, no listener-serve signature change, no gauge registration, no fixture. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence. The new differential fixture (0015) lands at Task 8; the state-4 CI re-run lands at Task 11.

@@ -14,5 +14,6 @@ pub mod handler;
 
 pub use config::AdminConfig;
 pub use endpoint::AdminEndpoint;
+pub use envoy_listener::{DrainStage, DrainState};
 pub use error::AdminError;
 pub use handler::{AdminHandler, serve};

@@ -8,6 +8,9 @@
 //! `futures` or `async-trait` (neither on the D-3.2 permitted-foundations
 //! list); see SPEC §6 signposts 2 and 3.
 
+pub mod drain;
+pub use drain::{DrainStage, DrainState};
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
