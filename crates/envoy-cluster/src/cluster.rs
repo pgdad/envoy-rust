@@ -211,6 +211,21 @@ impl ClusterManager {
         })
     }
 
+    /// Iterate over all clusters as `ClusterHandle`s in deterministic by-name
+    /// order. Phase 08.1 D7 consumer: `envoy-admin`'s `/clusters` endpoint walks
+    /// every cluster to emit the per-cluster plain-text stanza. The renderer
+    /// requires deterministic ordering for differential equivalence — the
+    /// internal representation is a `HashMap` whose iteration order is
+    /// non-deterministic, so the accessor sorts by cluster name before
+    /// yielding.
+    pub fn clusters(&self) -> impl Iterator<Item = ClusterHandle> + '_ {
+        let mut entries: Vec<(&String, &Arc<Cluster>)> = self.clusters.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries.into_iter().map(|(_, arc)| ClusterHandle {
+            inner: Arc::clone(arc),
+        })
+    }
+
     /// Build an empty `ClusterManager` carrying zero clusters. Used by
     /// downstream test fixtures (envoy-http2 Task 9) where the HCM under
     /// test only takes `RouteAction::DirectResponse` paths and never invokes
@@ -1395,5 +1410,16 @@ admin:
             3,
             "expected one increment per simulated successful upstream connect",
         );
+    }
+}
+
+#[cfg(test)]
+mod clusters_accessor_tests {
+    use crate::ClusterManager;
+
+    #[test]
+    fn empty_cluster_manager_yields_no_clusters() {
+        let cm = ClusterManager::empty();
+        assert_eq!(cm.clusters().count(), 0);
     }
 }

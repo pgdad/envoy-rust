@@ -36,6 +36,16 @@ pub enum AdminEndpoint {
     /// 08.2's D5e patches the value-binding source from this constant to a
     /// `DrainState`-derived match.
     ServerInfo,
+
+    /// `GET /clusters` — returns 200 `text/plain` with two lines per cluster
+    /// in name-deterministic order: `<name>::observability_name::<name>` and
+    /// `<name>::default_priority::endpoints`. Phase 08.1 D7. Per architecture
+    /// decision lock-in #10 (PROGRESS Task 1 preamble), the 08.1 emission is
+    /// limited to those two lines per cluster; upstream Envoy's per-endpoint
+    /// numeric counters (success/error/timeout) are deferred and absorbed by
+    /// `allowlist_envoy_only_lines` at fixture 0014. See BEHAVIOR_CONTRACT §
+    /// "Admin endpoint body shapes".
+    Clusters,
 }
 
 /// Method-aware dispatch result. Introduced at phase 08.1 D4 to give every
@@ -60,6 +70,7 @@ impl AdminEndpoint {
             "/stats/prometheus" => Some(AdminEndpoint::StatsPrometheus),
             "/config_dump" => Some(AdminEndpoint::ConfigDump),
             "/server_info" => Some(AdminEndpoint::ServerInfo),
+            "/clusters" => Some(AdminEndpoint::Clusters),
             _ => None,
         }
     }
@@ -73,8 +84,9 @@ impl AdminEndpoint {
             | AdminEndpoint::Stats
             | AdminEndpoint::StatsPrometheus
             | AdminEndpoint::ConfigDump
-            | AdminEndpoint::ServerInfo => "GET",
-            // Tasks 8-9 add: Clusters | Listeners => "GET",
+            | AdminEndpoint::ServerInfo
+            | AdminEndpoint::Clusters => "GET",
+            // Task 9 adds: Listeners => "GET",
         }
     }
 
@@ -116,6 +128,9 @@ impl AdminEndpoint {
             AdminEndpoint::ServerInfo => unreachable!(
                 "ServerInfo requires handler-scoped state; dispatch via AdminEndpoint::render_with"
             ),
+            AdminEndpoint::Clusters => unreachable!(
+                "Clusters requires handler-scoped state; dispatch via AdminEndpoint::render_with"
+            ),
         }
     }
 
@@ -129,6 +144,7 @@ impl AdminEndpoint {
         match self {
             AdminEndpoint::ConfigDump => render_config_dump(handler),
             AdminEndpoint::ServerInfo => render_server_info(handler),
+            AdminEndpoint::Clusters => render_clusters(handler),
             // 06.1 endpoints carry forward through the registry-only path.
             _ => self.render(handler.registry()),
         }
@@ -307,6 +323,38 @@ pub(crate) fn render_server_info(handler: &crate::handler::AdminHandler) -> envo
     }
 }
 
+/// Phase 08.1 D7: render `/clusters` as plain text per Envoy v1.33's
+/// `/clusters` default format. Emits two lines per cluster:
+///
+///   `<name>::observability_name::<name>`
+///   `<name>::default_priority::endpoints`
+///
+/// Per architecture-decision lock-in #10 (PROGRESS Task 1 preamble), 08.1
+/// emits ONLY these two lines per cluster — the per-endpoint numeric-counter
+/// lines (success/error/timeout) that upstream Envoy adds are deferred and
+/// absorbed by the fixture's `allowlist_envoy_only_lines` at fixture 0014.
+///
+/// Cluster output order is deterministic by name (sorted in
+/// [`envoy_cluster::ClusterManager::clusters`]).
+pub(crate) fn render_clusters(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for cluster in handler.cluster_manager().clusters() {
+        let name = cluster.name();
+        let _ = writeln!(&mut body, "{name}::observability_name::{name}");
+        let _ = writeln!(&mut body, "{name}::default_priority::endpoints");
+    }
+    envoy_http1::Response {
+        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
+        // leave `reason: None` per PLAN lock-in #7 (consistent with
+        // `render_config_dump` + `render_server_info`).
+        status: 200,
+        reason: None,
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        body: Bytes::from(body),
+    }
+}
+
 /// Render a 404 for unknown admin paths. Used by `AdminHandler::handle_inner`
 /// when `from_path` returns `None`.
 pub(crate) fn render_404() -> envoy_http1::Response {
@@ -378,7 +426,10 @@ mod tests {
 
     #[test]
     fn from_path_unknown_returns_none() {
-        assert_eq!(AdminEndpoint::from_path("/clusters"), None);
+        // Task 8 promoted `/clusters` from "unknown" → `AdminEndpoint::Clusters`;
+        // `/listeners` remains unknown until Task 9 lands. The empty-path and
+        // `/` cases stay unknown.
+        assert_eq!(AdminEndpoint::from_path("/listeners"), None);
         assert_eq!(AdminEndpoint::from_path(""), None);
         assert_eq!(AdminEndpoint::from_path("/"), None);
     }
@@ -686,6 +737,58 @@ mod server_info_tests {
 }
 
 #[cfg(test)]
+mod clusters_tests {
+    //! Phase 08.1 Task 8 — D7: `/clusters` endpoint coverage. Four tests:
+    //! two dispatch-shape tests (GET routes to `Clusters`; POST returns 405)
+    //! and two body-shape tests (200 + `text/plain`; empty cluster set
+    //! renders an empty body).
+
+    use super::config_dump_tests::handler_with_bootstrap;
+    use super::{AdminEndpoint, Dispatch};
+
+    #[test]
+    fn clusters_path_dispatches_on_get() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/clusters"),
+            Dispatch::Endpoint(AdminEndpoint::Clusters)
+        ));
+    }
+
+    #[test]
+    fn clusters_405_on_post() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("POST", "/clusters"),
+            Dispatch::MethodNotAllowed { allow: "GET" }
+        ));
+    }
+
+    #[test]
+    fn clusters_renders_200_with_text_plain() {
+        let yaml =
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::Clusters.render_with(&handler);
+        assert_eq!(resp.status, 200);
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str());
+        assert!(ct.unwrap_or("").starts_with("text/plain"));
+    }
+
+    #[test]
+    fn clusters_body_is_empty_for_zero_clusters() {
+        let yaml =
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::Clusters.render_with(&handler);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert_eq!(body, "", "empty cluster set renders empty body");
+    }
+}
+
+#[cfg(test)]
 mod dispatch_tests {
     use super::{AdminEndpoint, Dispatch};
 
@@ -702,6 +805,22 @@ mod dispatch_tests {
         assert!(matches!(
             AdminEndpoint::dispatch("GET", "/stats/prometheus"),
             Dispatch::Endpoint(AdminEndpoint::StatsPrometheus)
+        ));
+        // Task 8 opportunistic close of Task 7 review M1: extend coverage to all
+        // 6 dispatchable endpoints. Tasks 6/7/8 added `ConfigDump`/`ServerInfo`/
+        // `Clusters`; this expansion guards against any future variant being
+        // added to `from_path` without a corresponding dispatch-test row.
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/config_dump"),
+            Dispatch::Endpoint(AdminEndpoint::ConfigDump)
+        ));
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/server_info"),
+            Dispatch::Endpoint(AdminEndpoint::ServerInfo)
+        ));
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/clusters"),
+            Dispatch::Endpoint(AdminEndpoint::Clusters)
         ));
     }
 
@@ -760,6 +879,7 @@ mod dispatch_tests {
         assert_eq!(AdminEndpoint::StatsPrometheus.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::ConfigDump.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::ServerInfo.allowed_method(), "GET");
+        assert_eq!(AdminEndpoint::Clusters.allowed_method(), "GET");
     }
 
     #[test]

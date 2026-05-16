@@ -836,6 +836,101 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 8 — D7: /clusters endpoint + ClusterManager::clusters() accessor + BEHAVIOR_CONTRACT row
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 8 — /clusters endpoint + ClusterManager::clusters() + BEHAVIOR_CONTRACT row`
+**LoC delta:** +26/-0 crates/envoy-cluster/src/cluster.rs (~10 production: `ClusterManager::clusters()` accessor returning `impl Iterator<Item = ClusterHandle> + '_` with deterministic by-name sort over the internal `HashMap`; ~7 test for the new `clusters_accessor_tests` sibling module). +123/-3 crates/envoy-admin/src/endpoint.rs (~65 production: `Clusters` variant on `AdminEndpoint` + `/clusters` `from_path` arm + extended `allowed_method` `|`-chain to include `Clusters` + `render` `unreachable!` arm + `render_with` explicit `Clusters` arm + `render_clusters` free fn emitting two lines per cluster in `<name>::observability_name::<name>` + `<name>::default_priority::endpoints` shape + doc updates; ~58 test for the new `clusters_tests` sibling module + 1-line `each_endpoint_declares_its_allowed_method` extension + 6-endpoint expansion of `get_known_path_returns_endpoint` covering all dispatchable endpoints; plus 1 small adjustment to the legacy `from_path_unknown_returns_none` test which previously asserted `/clusters` → `None` and was updated to use `/listeners` as the still-unknown probe). +4/-4 crates/envoy-admin/src/handler.rs (removed the field-level + accessor-level `#[allow(dead_code)] // wired for Task 8` annotations on `cluster_manager` — the last `#[allow(dead_code)]` pair on the AdminHandler accessor set is now gone — and refreshed the doc-comments on both surfaces to past-tense / consumer-named wording). +1/-0 docs/envoy-rust/BEHAVIOR_CONTRACT.md (new `/clusters` row in the "Admin endpoint body shapes" table). +PROGRESS.md narrative. Net +154 insertions, 7 deletions.
+
+### Work summary
+
+Landed `/clusters` GET endpoint at `crates/envoy-admin/src/endpoint.rs`: added `AdminEndpoint::Clusters` variant (6th total), extended `from_path` and `allowed_method` (the `|`-pattern in `allowed_method` now covers all 6 GET variants; trailing `// Task 9 adds: Listeners => "GET",` comment retained to telegraph the upcoming task), added explicit `AdminEndpoint::Clusters => render_clusters(handler)` arm to `render_with` ahead of the catch-all, added an `unreachable!` arm in the registry-only `render` path mirroring the Task 6 `ConfigDump` + Task 7 `ServerInfo` precedent, and added `render_clusters` free fn placed between `render_server_info` and `render_404` (PLAN-recommended placement). The renderer borrows `&AdminHandler`, walks `handler.cluster_manager().clusters()` (which sorts by-name internally per the accessor's contract), and emits two lines per cluster via `writeln!`. At `crates/envoy-cluster/src/cluster.rs`: added `pub fn clusters(&self) -> impl Iterator<Item = ClusterHandle> + '_` that collects the `HashMap` entries into a `Vec`, sorts by name, and yields `ClusterHandle`s on the `into_iter().map(..)` chain — explicit sort because the internal repr is `HashMap` (PLAN guessed `BTreeMap`), and the architecture lock-in #10 demands deterministic by-name order. At `crates/envoy-admin/src/handler.rs`: removed the field-level and accessor-level `#[allow(dead_code)] // wired for Task 8` annotations on `cluster_manager` (the last `#[allow(dead_code)]` pair on AdminHandler — Task 7 already removed the start_instant + command_line_options pairs); refreshed the doc-comments to consumer-named wording ("Read by `render_clusters` via the `cluster_manager()` accessor (Task 8)" / "Consumed by Task 8's `/clusters` renderer ..."). Added the new `/clusters` row to BEHAVIOR_CONTRACT.md's "Admin endpoint body shapes" table.
+
+### Tests landed
+
+- `cluster::clusters_accessor_tests::empty_cluster_manager_yields_no_clusters` (production crate `envoy-cluster`)
+- `endpoint::clusters_tests::clusters_path_dispatches_on_get` (production crate `envoy-admin`)
+- `endpoint::clusters_tests::clusters_405_on_post` (production crate `envoy-admin`)
+- `endpoint::clusters_tests::clusters_renders_200_with_text_plain` (production crate `envoy-admin`)
+- `endpoint::clusters_tests::clusters_body_is_empty_for_zero_clusters` (production crate `envoy-admin`)
+
+5 new tests total: 1 in `envoy-cluster` (sibling `clusters_accessor_tests`) + 4 in `envoy-admin` (sibling `clusters_tests` placed AFTER `server_info_tests` and BEFORE `dispatch_tests`). `envoy-admin` test bucket: 52 passed (was 48 post-Task-7; +4 new). `envoy-cluster` test bucket: 22 passed (was 21 pre-task; +1 new). All existing tests stay green.
+
+The `each_endpoint_declares_its_allowed_method` test in `dispatch_tests` was extended with a 6th `assert_eq!` for `Clusters` (one-line additive change). The `get_known_path_returns_endpoint` test in `dispatch_tests` was expanded from 3 endpoint arms (Ready/Stats/StatsPrometheus) to 6 endpoint arms (added ConfigDump/ServerInfo/Clusters) — opportunistic close of Task 7 code-quality review M1 per the prompt.
+
+TDD discipline: tests written first, watched fail with the expected error shapes (`E0599: method clusters not found for ClusterManager`, `E0599: no variant Clusters found for AdminEndpoint`), then implementation added; iterated once on a `from_path_unknown_returns_none` regression (existing legacy test asserted `/clusters` → `None`, which became false once we added the `Clusters` variant) — fixed by switching that probe path to `/listeners` (still unknown until Task 9); re-ran tests to confirm 5/5 new tests green plus all legacy buckets green.
+
+### Deviations from PLAN
+
+1. **`ClusterManager`'s internal repr is `HashMap<String, Arc<Cluster>>`, not `BTreeMap<String, Cluster>` as the PLAN stub guessed.** Anticipated by the prompt ("disk is `HashMap<String, Arc<Cluster>>`"). The accessor sorts explicitly via `Vec::sort_by` after collecting `iter()` entries so the deterministic by-name order required by architecture-decision lock-in #10 is maintained at the accessor layer rather than at the consumer. The `ClusterHandle` is constructed by `Arc::clone`-ing the cached `Arc<Cluster>` — same shape as `ClusterManager::get`. No `BTreeMap` migration is needed at this phase; the consumer (Task 8 `/clusters` renderer) only iterates and never lookups by ordering.
+
+2. **`render` arm for `Clusters` is `unreachable!()` mirroring Task 6's `ConfigDump` + Task 7's `ServerInfo` arms.** PLAN-explicit ("mirroring Task 6/7's `unreachable!()` precedent"). Documents the structural invariant that `render_with` is the only legitimate path for state-bearing endpoints.
+
+3. **Sibling-module test placement.** `clusters_accessor_tests` placed AFTER the existing `mod tests` block in `cluster.rs` (matching the file's existing single-module convention; minimal disturbance). `clusters_tests` placed AFTER `server_info_tests` and BEFORE `dispatch_tests` in `endpoint.rs` (matching the increasing-task-number cadence; consistent with Tasks 6 and 7 placements). Both are sibling rather than nested modules per the standing 08.1 convention. Recorded as a Deviation per Task 1's review reminder even though it's the expected placement.
+
+4. **Opportunistic close of Task 7 code-quality review M1: `get_known_path_returns_endpoint` extended from 3 endpoint arms to 6.** Per the prompt's explicit naming as an opportunistic close. The expanded test covers Ready/Stats/StatsPrometheus + the 08.1-added ConfigDump/ServerInfo/Clusters (Task 9 will add Listeners). Future task-9 implementer adds a 7th `assert!(matches!(...))` arm; no further refactor needed.
+
+5. **`from_path_unknown_returns_none` test updated: `/clusters` probe replaced with `/listeners`.** Pre-task this test asserted `/clusters` → `None` (which was true when Task 5 last touched the file). Once Task 8 adds the `Clusters` variant, `/clusters` resolves to `Some(AdminEndpoint::Clusters)`. Switched to `/listeners` (still unknown until Task 9) as the unknown-path probe; the empty-path and `/` cases are retained. Minimal, surgical correction.
+
+6. **`#[allow(dead_code)]` pair on `cluster_manager` removed in this commit (last pair on AdminHandler accessor set).** Per the prompt's explicit obligation. The doc-comment on the field was also refreshed from "Phase 08.1 D13a: cluster manager handle for the `/clusters` renderer (Task 8)..." to add a sentence "Read by `render_clusters` via the `cluster_manager()` accessor (Task 8).", and the accessor's doc-comment was rewritten from "Reserved for Task 8's `/clusters` renderer. Currently unused." to "Consumed by Task 8's `/clusters` renderer; borrowed into the renderer to walk all clusters in deterministic by-name order." — past-tense / consumer-named per the prompt's "judgment" guidance.
+
+7. **`render_clusters` doc-comment carries the architecture lock-in #10 note inline.** The PLAN stub's body comment naming "lock-in #10" was preserved verbatim so future readers tracing why per-endpoint counter lines are omitted at 08.1 find the architectural context at the renderer (closes the question without needing to follow a SPEC link).
+
+8. **`TINY_BOOTSTRAP` was NOT hoisted to `pub(super)` in this task (opportunistic close M2 of Task 7 review left in place).** The prompt explicitly marked this as "not required". The PLAN-stub test bodies inline the YAML literal twice and that was the path of least drift; revisiting the hoist is a future-task cleanup if Task 9's `/listeners` tests would benefit from sharing.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-cluster v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-cluster)
+   Compiling envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+   Compiling envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+   Compiling envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+   Compiling http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.69s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-cluster v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-cluster)
+    Checking envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+    Checking envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.91s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+     Running unittests src/lib.rs (target/debug/deps/envoy_admin-4c2e520e2a6223dc)
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+     Running unittests src/lib.rs (target/debug/deps/envoy_cluster-97dbad6faa16a2eb)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+```
+
+(envoy-admin tail: 52 = 48 pre-task + 4 new. envoy-cluster tail: 22 = 21 pre-task + 1 new. Full `cargo test --workspace` green across all buckets — no port-binding flakes resurfaced this run; the differential `http1_echo_backend_*` flake noted at prior tasks did NOT recur.)
+
+`cargo deny check`:
+```
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. Task 8 introduces no new direct deps — `bytes`, `envoy-cluster`, and `envoy-http1` are already direct deps of `envoy-admin` from earlier tasks.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:

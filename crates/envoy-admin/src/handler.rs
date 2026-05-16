@@ -53,7 +53,7 @@ pub struct AdminHandler {
     bootstrap: Arc<Bootstrap>,
     /// Phase 08.1 D13a: cluster manager handle for the `/clusters` renderer
     /// (Task 8). `Arc` shape mirrors `bootstrap` for the same Send+Sync reason.
-    #[allow(dead_code)] // wired for Task 8
+    /// Read by `render_clusters` via the `cluster_manager()` accessor (Task 8).
     cluster_manager: Arc<ClusterManager>,
     /// Phase 08.1 D13a: process-start `Instant` captured at construction. The
     /// `/server_info` renderer (Task 7) computes uptime as
@@ -114,9 +114,9 @@ impl AdminHandler {
         &self.registry
     }
 
-    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Reserved for Task 8's
-    /// `/clusters` renderer. Currently unused.
-    #[allow(dead_code)] // wired for Task 8
+    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Consumed by Task 8's
+    /// `/clusters` renderer; borrowed into the renderer to walk all clusters
+    /// in deterministic by-name order.
     pub(crate) fn cluster_manager(&self) -> &ClusterManager {
         &self.cluster_manager
     }
