@@ -931,6 +931,98 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 9 — D8: /listeners endpoint + BEHAVIOR_CONTRACT row + opportunistic closes
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 9 — /listeners endpoint + BEHAVIOR_CONTRACT row`
+**LoC delta:** +205/-27 crates/envoy-admin/src/endpoint.rs (~55 production: `Listeners` variant on `AdminEndpoint` + `/listeners` `from_path` arm + extended `allowed_method` `|`-chain to include `Listeners` and removed the trailing `// Task 9 adds: Listeners => "GET",` placeholder + `render` `unreachable!` arm for `Listeners` + `render_with` explicit `Listeners` arm + `render_listeners` free fn that walks `handler.bootstrap().static_resources.listeners.iter()`, maps to `(name, "<addr>:<port>")` tuples via direct field access through the `Address` struct's `socket_address` field, sorts by name, and emits one `"<name>::<addr>:<port>"` line per listener; ~123 test for the new `listeners_tests` sibling module — 6 tests including a `TWO_LISTENERS_BOOTSTRAP` literal with `zebra` declared BEFORE `alpha` exercising both populated-body emission and sorted-by-name determinism; ~10 test for the 7th-arm extensions to `get_known_path_returns_endpoint` (Listeners) and `each_endpoint_declares_its_allowed_method` (Listeners); the legacy `from_path_unknown_returns_none` test's `/listeners` probe re-targeted to `/nope` since `/listeners` is now a known endpoint; the previously-inlined empty-bootstrap YAML literal in `server_info_tests` and `clusters_tests` replaced with `super::config_dump_tests::TINY_BOOTSTRAP` after hoisting the `const TINY_BOOTSTRAP` to `pub(super)` — closes Task 7 review M2 carryforward). +1/-0 docs/envoy-rust/BEHAVIOR_CONTRACT.md (new `/listeners` row in the "Admin endpoint body shapes" table). +PROGRESS.md narrative. Net +206 insertions, 27 deletions.
+
+### Work summary
+
+Landed `/listeners` GET endpoint at `crates/envoy-admin/src/endpoint.rs`: added `AdminEndpoint::Listeners` variant (7th and final 08.1 GET variant — the enum now carries all 7 GET-only endpoints `Ready / Stats / StatsPrometheus / ConfigDump / ServerInfo / Clusters / Listeners`), extended `from_path` and `allowed_method` (the `|`-pattern in `allowed_method` now exhaustively covers all 7 GET variants and the placeholder comment is gone), added explicit `AdminEndpoint::Listeners => render_listeners(handler)` arm to `render_with` ahead of the catch-all, added an `unreachable!` arm in the registry-only `render` path mirroring the Task 6/7/8 precedent (4-of-7 `render` arms are now `unreachable!` — refactor deferred per the prompt), and added `render_listeners` free fn placed between `render_clusters` and `render_404`. The renderer borrows `&AdminHandler`, walks `handler.bootstrap().static_resources.listeners.iter()`, builds `(name, "<addr>:<port>")` tuples via direct field access on the `Address` struct (single `socket_address: SocketAddress` field — `SocketAddress` carries `address: String` and `port_value: u16`), sorts the tuple `Vec` by name with `Vec::sort_by`, and `writeln!`s into the body string. Hoisted `config_dump_tests::TINY_BOOTSTRAP` to `pub(super) const` so `server_info_tests`, `clusters_tests`, and the new `listeners_tests` share one source for the minimal empty-listener/empty-cluster bootstrap YAML — closes Task 7 review M2 carryforward (Task 8 explicitly deferred to Task 9). Re-targeted the legacy `from_path_unknown_returns_none` test's `/listeners` probe to `/nope` (and refreshed its comment) since `/listeners` is now a known endpoint. Extended `get_known_path_returns_endpoint` from 6 → 7 arms and `each_endpoint_declares_its_allowed_method` from 6 → 7 arms (one new `assert!`/`assert_eq!` each). Added the new `/listeners` row to BEHAVIOR_CONTRACT.md's "Admin endpoint body shapes" table.
+
+### Tests landed
+
+- `endpoint::listeners_tests::listeners_path_dispatches_on_get` (production crate `envoy-admin`)
+- `endpoint::listeners_tests::listeners_405_on_post` (production crate `envoy-admin`)
+- `endpoint::listeners_tests::listeners_renders_200_with_text_plain` (production crate `envoy-admin`)
+- `endpoint::listeners_tests::listeners_body_is_empty_for_zero_listeners` (production crate `envoy-admin`)
+- `endpoint::listeners_tests::listeners_body_emits_name_address_port_per_listener` (production crate `envoy-admin`)
+- `endpoint::listeners_tests::listeners_body_is_sorted_by_name` (production crate `envoy-admin`)
+
+6 new tests total, all in `envoy-admin` (sibling `listeners_tests` placed AFTER `clusters_tests` and BEFORE `dispatch_tests`, matching the increasing-task-number cadence consistent with Tasks 6/7/8 placements). `envoy-admin` test bucket: 58 passed (was 52 post-Task-8; +6 new). All existing tests stay green; the re-targeted `from_path_unknown_returns_none` probe (`/listeners` → `/nope`) continues to pass, and the 7th-arm extensions to `get_known_path_returns_endpoint` + `each_endpoint_declares_its_allowed_method` also pass.
+
+TDD discipline: tests written first (sibling `listeners_tests` + dispatch-tests extensions), watched fail with the expected `E0599: no variant or associated item named Listeners found for enum AdminEndpoint` (3 callsites in `listeners_tests` + 1 in `dispatch_tests` `get_known_path_returns_endpoint` + 1 in `dispatch_tests` `each_endpoint_declares_its_allowed_method` — exactly the variant-not-found shape predicted by the Task 8 precedent), then implementation added (variant + `from_path` arm + `allowed_method` extension + `render` `unreachable!` arm + `render_with` arm + `render_listeners` fn), re-ran tests to confirm 6/6 new tests green plus all 52 legacy tests still green (58 total).
+
+### Deviations from PLAN
+
+1. **`envoy_config::Address` is a STRUCT, not an enum.** Anticipated by the prompt (the PLAN-stub guessed `Address::SocketAddress(sa)` enum-variant shape — disk-truth at `crates/envoy-config/src/bootstrap.rs:208-212` is `struct Address { socket_address: SocketAddress }`). Renderer uses direct field access `l.address.socket_address.address` (String) and `l.address.socket_address.port_value` (u16); no `match` on `Address`. This is the load-bearing deviation the prompt flagged.
+
+2. **`TINY_BOOTSTRAP` hoisted to `pub(super)` and consumed by both pre-existing sibling test modules.** Per the prompt's explicit Task 9 obligation. After the hoist, the inlined `"node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n"` literal in `server_info_tests` (4 sites: `server_info_renders_200_with_application_json`, `server_info_body_has_required_keys`, `server_info_state_is_live_at_phase_08_1`, `server_info_uptime_is_non_negative`) and `clusters_tests` (2 sites: `clusters_renders_200_with_text_plain`, `clusters_body_is_empty_for_zero_clusters`) was replaced with `super::config_dump_tests::TINY_BOOTSTRAP`. The new `listeners_tests` consumes it too for the 200 + empty-body cases. The `server_info_node_subtree_carries_id` test retains its own inlined YAML because it uses a different `node.id` value (`my-id` vs `t`). Closes Task 7 review M2 carryforward; the Task 8 narrative explicitly noted this hoist was deferred to Task 9.
+
+3. **`from_path_unknown_returns_none` probe re-targeted from `/listeners` → `/nope`.** Per the prompt's explicit Task 9 obligation (test would regress once `/listeners` becomes known). The probe path was changed to `/nope` (genuinely unknown across both 08.1 and 08.2 endpoint surfaces) and the test's comment was refreshed to note Task 9 closed the 08.1 endpoint surface — all 7 GET-only variants are now known. The empty-path and `/` cases stay unknown and are preserved.
+
+4. **`get_known_path_returns_endpoint` extended from 6 → 7 arms (added `/listeners` → `Listeners`).** Per the prompt's mandatory Task 9 inclusion. One-line additive `assert!(matches!(...))` extension; consistent with Task 8's expansion from 3 → 6 arms.
+
+5. **`each_endpoint_declares_its_allowed_method` extended from 6 → 7 arms (added `Listeners.allowed_method() == "GET"`).** Per the prompt's mandatory Task 9 inclusion. One-line additive `assert_eq!` extension.
+
+6. **`render` arm for `Listeners` is `unreachable!()` mirroring Task 6/7/8 arms.** PLAN-explicit. Documents the structural invariant that `render_with` is the only legitimate path for state-bearing endpoints. The Task 9 commit leaves the registry-only `render` path with 4-of-7 `unreachable!` arms — refactor (e.g. splitting `render` and `render_with` into separate types, or making `Listeners`/`Clusters`/`ServerInfo`/`ConfigDump` not implement `render` at all) is explicitly deferred per the prompt's "DEFERRED" guidance. Carryforward to REVIEW or a future task.
+
+7. **`render_listeners` placement.** Placed AFTER `render_clusters` and BEFORE `render_404`, matching the PLAN-recommended placement and the Tasks 6/7/8 cadence (each new state-bearing renderer was appended in increasing-task-number order ahead of the 404/405 helpers). Recorded as a Deviation per Task 1's review reminder even though it's the expected placement.
+
+8. **`render_listeners` body construction uses a `Vec<(String, String)>` + `Vec::sort_by` approach** rather than the `BTreeMap` insertion-order approach the `/clusters` renderer relies on (`/clusters` reads from `ClusterManager::clusters()` which sorts at the accessor layer). `static_resources.listeners` is a `Vec<Listener>` on the parsed `Bootstrap` — declaration order is preserved by `serde_yaml` so the renderer is the natural place to enforce the deterministic by-name order. The two-listener `zebra` / `alpha` test (`listeners_body_is_sorted_by_name`) exercises this directly; a future task that introduces an `xDS`-derived listener set would either add a similar accessor-level sort or extend the renderer.
+
+9. **`Bytes::from(body_string)` wrap pattern** matches Tasks 6/7/8's `render_config_dump` / `render_server_info` / `render_clusters` precedent (build the body as a Rust `String` via `writeln!`, then wrap into `bytes::Bytes` for the `Response.body` field). No `BytesMut` needed for plain text; PLAN-explicit.
+
+10. **`TWO_LISTENERS_BOOTSTRAP` is a private `const` inside `listeners_tests`** (not hoisted to `pub(super)` or moved to `config_dump_tests`). Only consumed by two tests within `listeners_tests` itself; no cross-module reuse anticipated at this phase. Mirrors Task 7's posture of keeping test-specific YAML literals local to their consuming module.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.64s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-cluster v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-cluster)
+    Checking envoy-http1 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http1)
+    Checking envoy-tcp v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http2 v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking http2-echo-server v0.0.0 (/Users/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.00s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+     Running unittests src/lib.rs (target/debug/deps/envoy_admin-36014a9343649dbc)
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+     Running unittests src/lib.rs (target/debug/deps/envoy_cluster-97dbad6faa16a2eb)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+
+(envoy-admin tail: 58 = 52 pre-task + 6 new. envoy-cluster tail: 22, unchanged from Task 8. Full `cargo test --workspace` green across all buckets — no port-binding flakes resurfaced this run; the differential `http1_echo_backend_*` flake noted at prior tasks did NOT recur.)
+
+`cargo deny check`:
+```
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. Task 9 introduces no new direct deps — `bytes`, `envoy-config`, and `envoy-http1` are already direct deps of `envoy-admin` from earlier tasks; the renderer composes plain `String` + `bytes::Bytes` exclusively.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:

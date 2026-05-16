@@ -46,6 +46,13 @@ pub enum AdminEndpoint {
     /// `allowlist_envoy_only_lines` at fixture 0014. See BEHAVIOR_CONTRACT §
     /// "Admin endpoint body shapes".
     Clusters,
+
+    /// `GET /listeners` — returns 200 `text/plain` with one line per listener
+    /// in name-deterministic order: `<listener_name>::<address>:<port>`.
+    /// Phase 08.1 D8. Reads from `handler.bootstrap().static_resources.listeners`
+    /// — the 08.1 listener set is statically declared (xDS-derived listeners
+    /// land in §9 family). See BEHAVIOR_CONTRACT § "Admin endpoint body shapes".
+    Listeners,
 }
 
 /// Method-aware dispatch result. Introduced at phase 08.1 D4 to give every
@@ -71,6 +78,7 @@ impl AdminEndpoint {
             "/config_dump" => Some(AdminEndpoint::ConfigDump),
             "/server_info" => Some(AdminEndpoint::ServerInfo),
             "/clusters" => Some(AdminEndpoint::Clusters),
+            "/listeners" => Some(AdminEndpoint::Listeners),
             _ => None,
         }
     }
@@ -85,8 +93,8 @@ impl AdminEndpoint {
             | AdminEndpoint::StatsPrometheus
             | AdminEndpoint::ConfigDump
             | AdminEndpoint::ServerInfo
-            | AdminEndpoint::Clusters => "GET",
-            // Task 9 adds: Listeners => "GET",
+            | AdminEndpoint::Clusters
+            | AdminEndpoint::Listeners => "GET",
         }
     }
 
@@ -131,6 +139,9 @@ impl AdminEndpoint {
             AdminEndpoint::Clusters => unreachable!(
                 "Clusters requires handler-scoped state; dispatch via AdminEndpoint::render_with"
             ),
+            AdminEndpoint::Listeners => unreachable!(
+                "Listeners requires handler-scoped state; dispatch via AdminEndpoint::render_with"
+            ),
         }
     }
 
@@ -145,6 +156,7 @@ impl AdminEndpoint {
             AdminEndpoint::ConfigDump => render_config_dump(handler),
             AdminEndpoint::ServerInfo => render_server_info(handler),
             AdminEndpoint::Clusters => render_clusters(handler),
+            AdminEndpoint::Listeners => render_listeners(handler),
             // 06.1 endpoints carry forward through the registry-only path.
             _ => self.render(handler.registry()),
         }
@@ -355,6 +367,53 @@ pub(crate) fn render_clusters(handler: &crate::handler::AdminHandler) -> envoy_h
     }
 }
 
+/// Phase 08.1 D8: render `/listeners` as plain text. Emits one line per
+/// listener in name-deterministic order:
+///
+///   `<listener_name>::<address>:<port>`
+///
+/// The 08.1 listener set is statically declared in the parsed `Bootstrap`
+/// (xDS-derived listeners absent until §9 family). Sort key is the
+/// `Listener.name` field; this is enforced at the renderer rather than at the
+/// `Bootstrap` parse layer because `static_resources.listeners` is a `Vec`
+/// that preserves declaration order. Deterministic ordering is required by
+/// BEHAVIOR_CONTRACT's `/listeners` row + architecture-decision lock-in #11.
+pub(crate) fn render_listeners(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+    use std::fmt::Write as _;
+    // Address is a struct (single `socket_address` field), not an enum —
+    // direct field access, no `match`. SocketAddress carries `address: String`
+    // + `port_value: u16`.
+    let mut lines: Vec<(String, String)> = handler
+        .bootstrap()
+        .static_resources
+        .listeners
+        .iter()
+        .map(|l| {
+            (
+                l.name.clone(),
+                format!(
+                    "{}:{}",
+                    l.address.socket_address.address, l.address.socket_address.port_value
+                ),
+            )
+        })
+        .collect();
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut body = String::new();
+    for (name, addr) in &lines {
+        let _ = writeln!(&mut body, "{name}::{addr}");
+    }
+    envoy_http1::Response {
+        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
+        // leave `reason: None` per PLAN lock-in #7 (consistent with
+        // `render_config_dump` + `render_server_info` + `render_clusters`).
+        status: 200,
+        reason: None,
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        body: Bytes::from(body),
+    }
+}
+
 /// Render a 404 for unknown admin paths. Used by `AdminHandler::handle_inner`
 /// when `from_path` returns `None`.
 pub(crate) fn render_404() -> envoy_http1::Response {
@@ -426,10 +485,11 @@ mod tests {
 
     #[test]
     fn from_path_unknown_returns_none() {
-        // Task 8 promoted `/clusters` from "unknown" → `AdminEndpoint::Clusters`;
-        // `/listeners` remains unknown until Task 9 lands. The empty-path and
-        // `/` cases stay unknown.
-        assert_eq!(AdminEndpoint::from_path("/listeners"), None);
+        // Task 9 promoted `/listeners` from "unknown" → `AdminEndpoint::Listeners`,
+        // closing the 08.1 endpoint surface (all 7 GET-only variants now known).
+        // Re-target the unknown-path probe to `/nope` (genuinely unknown across
+        // 08.1 and 08.2). The empty-path and `/` cases stay unknown.
+        assert_eq!(AdminEndpoint::from_path("/nope"), None);
         assert_eq!(AdminEndpoint::from_path(""), None);
         assert_eq!(AdminEndpoint::from_path("/"), None);
     }
@@ -555,7 +615,11 @@ mod config_dump_tests {
         )
     }
 
-    const TINY_BOOTSTRAP: &str =
+    /// Phase 08.1 Task 9: hoisted to `pub(super)` so sibling test modules
+    /// (`server_info_tests`, `clusters_tests`, `listeners_tests`) share one
+    /// source for the minimal valid bootstrap YAML. Pre-Task-9 each sibling
+    /// inlined the same literal; closes Task 7 review M2 carryforward.
+    pub(super) const TINY_BOOTSTRAP: &str =
         "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
 
     #[test]
@@ -635,7 +699,7 @@ mod server_info_tests {
     //! `state == "LIVE"` constant per SPEC §5.4; `node` subtree carries the
     //! parsed `node.id`; uptime is non-negative).
 
-    use super::config_dump_tests::handler_with_bootstrap; // reuse Task 6 helper
+    use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap}; // reuse Task 6 helper + hoisted YAML literal
     use super::{AdminEndpoint, Dispatch};
 
     #[test]
@@ -656,9 +720,7 @@ mod server_info_tests {
 
     #[test]
     fn server_info_renders_200_with_application_json() {
-        let yaml =
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
-        let handler = handler_with_bootstrap(yaml);
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
         let resp = AdminEndpoint::ServerInfo.render_with(&handler);
         assert_eq!(resp.status, 200);
         let ct = resp
@@ -671,9 +733,7 @@ mod server_info_tests {
 
     #[test]
     fn server_info_body_has_required_keys() {
-        let yaml =
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
-        let handler = handler_with_bootstrap(yaml);
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
         let resp = AdminEndpoint::ServerInfo.render_with(&handler);
         let body_str = std::str::from_utf8(&resp.body).unwrap();
         let value: serde_json::Value = serde_json::from_str(body_str).unwrap();
@@ -695,9 +755,7 @@ mod server_info_tests {
     fn server_info_state_is_live_at_phase_08_1() {
         // SPEC §5.4: 08.1 emits the constant "LIVE". 08.2's D5e patches the
         // value-binding source from this constant to a DrainState-derived match.
-        let yaml =
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
-        let handler = handler_with_bootstrap(yaml);
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
         let resp = AdminEndpoint::ServerInfo.render_with(&handler);
         let value: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&resp.body).unwrap()).unwrap();
@@ -719,9 +777,7 @@ mod server_info_tests {
 
     #[test]
     fn server_info_uptime_is_non_negative() {
-        let yaml =
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
-        let handler = handler_with_bootstrap(yaml);
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
         let resp = AdminEndpoint::ServerInfo.render_with(&handler);
         let value: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&resp.body).unwrap()).unwrap();
@@ -743,7 +799,7 @@ mod clusters_tests {
     //! and two body-shape tests (200 + `text/plain`; empty cluster set
     //! renders an empty body).
 
-    use super::config_dump_tests::handler_with_bootstrap;
+    use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap};
     use super::{AdminEndpoint, Dispatch};
 
     #[test]
@@ -764,9 +820,7 @@ mod clusters_tests {
 
     #[test]
     fn clusters_renders_200_with_text_plain() {
-        let yaml =
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
-        let handler = handler_with_bootstrap(yaml);
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
         let resp = AdminEndpoint::Clusters.render_with(&handler);
         assert_eq!(resp.status, 200);
         let ct = resp
@@ -779,12 +833,130 @@ mod clusters_tests {
 
     #[test]
     fn clusters_body_is_empty_for_zero_clusters() {
-        let yaml =
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
-        let handler = handler_with_bootstrap(yaml);
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
         let resp = AdminEndpoint::Clusters.render_with(&handler);
         let body = std::str::from_utf8(&resp.body).unwrap();
         assert_eq!(body, "", "empty cluster set renders empty body");
+    }
+}
+
+#[cfg(test)]
+mod listeners_tests {
+    //! Phase 08.1 Task 9 — D8: `/listeners` endpoint coverage. Six tests:
+    //! two dispatch-shape tests (GET routes to `Listeners`; POST returns 405)
+    //! and four body-shape tests (200 + `text/plain`; empty listener set
+    //! renders empty body; non-empty bootstrap emits one
+    //! `<name>::<addr>:<port>` line per listener; output is deterministic
+    //! by-name regardless of declaration order).
+
+    use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap};
+    use super::{AdminEndpoint, Dispatch};
+
+    /// Two-listener bootstrap with `zebra` declared BEFORE `alpha`. Used to
+    /// exercise both the populated-body emission and the sorted-by-name
+    /// determinism asserted by BEHAVIOR_CONTRACT and architecture lock-in
+    /// #11. Each listener carries a single trivial TCP-proxy filter chain so
+    /// the bootstrap parses cleanly through `envoy-config`.
+    const TWO_LISTENERS_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+static_resources:
+  listeners:
+  - name: zebra
+    address:
+      socket_address:
+        address: 127.0.0.1
+        port_value: 9001
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          \"@type\": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: z
+          cluster: c
+  - name: alpha
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          \"@type\": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: a
+          cluster: c
+  clusters: []
+";
+
+    #[test]
+    fn listeners_path_dispatches_on_get() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/listeners"),
+            Dispatch::Endpoint(AdminEndpoint::Listeners)
+        ));
+    }
+
+    #[test]
+    fn listeners_405_on_post() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("POST", "/listeners"),
+            Dispatch::MethodNotAllowed { allow: "GET" }
+        ));
+    }
+
+    #[test]
+    fn listeners_renders_200_with_text_plain() {
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
+        let resp = AdminEndpoint::Listeners.render_with(&handler);
+        assert_eq!(resp.status, 200);
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str());
+        assert!(ct.unwrap_or("").starts_with("text/plain"));
+    }
+
+    #[test]
+    fn listeners_body_is_empty_for_zero_listeners() {
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
+        let resp = AdminEndpoint::Listeners.render_with(&handler);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert_eq!(body, "", "empty listener set renders empty body");
+    }
+
+    #[test]
+    fn listeners_body_emits_name_address_port_per_listener() {
+        let handler = handler_with_bootstrap(TWO_LISTENERS_BOOTSTRAP);
+        let resp = AdminEndpoint::Listeners.render_with(&handler);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        // Both listeners present with their `<name>::<addr>:<port>` shape.
+        assert!(
+            body.contains("alpha::0.0.0.0:8080\n"),
+            "missing alpha line; body was: {body:?}"
+        );
+        assert!(
+            body.contains("zebra::127.0.0.1:9001\n"),
+            "missing zebra line; body was: {body:?}"
+        );
+    }
+
+    #[test]
+    fn listeners_body_is_sorted_by_name() {
+        // TWO_LISTENERS_BOOTSTRAP declares zebra BEFORE alpha. Renderer must
+        // sort by name (deterministic per BEHAVIOR_CONTRACT + architecture
+        // lock-in #11) so `alpha` appears first in the body.
+        let handler = handler_with_bootstrap(TWO_LISTENERS_BOOTSTRAP);
+        let resp = AdminEndpoint::Listeners.render_with(&handler);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        let alpha_pos = body.find("alpha::").expect("alpha line present");
+        let zebra_pos = body.find("zebra::").expect("zebra line present");
+        assert!(
+            alpha_pos < zebra_pos,
+            "alpha should sort before zebra; body was: {body:?}"
+        );
     }
 }
 
@@ -821,6 +993,11 @@ mod dispatch_tests {
         assert!(matches!(
             AdminEndpoint::dispatch("GET", "/clusters"),
             Dispatch::Endpoint(AdminEndpoint::Clusters)
+        ));
+        // Task 9 adds the 7th and final 08.1 GET variant.
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/listeners"),
+            Dispatch::Endpoint(AdminEndpoint::Listeners)
         ));
     }
 
@@ -880,6 +1057,7 @@ mod dispatch_tests {
         assert_eq!(AdminEndpoint::ConfigDump.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::ServerInfo.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::Clusters.allowed_method(), "GET");
+        assert_eq!(AdminEndpoint::Listeners.allowed_method(), "GET");
     }
 
     #[test]
