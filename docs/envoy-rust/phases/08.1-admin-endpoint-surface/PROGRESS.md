@@ -662,7 +662,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 6 — D6: /config_dump endpoint + BEHAVIOR_CONTRACT row
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 6 — /config_dump endpoint + BEHAVIOR_CONTRACT row`
+**Commit:** `24f8382` — `phase 08.1: task 6 — /config_dump endpoint + BEHAVIOR_CONTRACT row`
 **LoC delta:** +204 endpoint.rs (~50 production: variant + render_with + render_config_dump + body types + doc updates; ~120 test for the new `config_dump_tests` module + 1-line update to `each_endpoint_declares_its_allowed_method`), +76/-13 handler.rs (~50 production: 5 new accessors + widened `handle_inner` signature to `(Arc<Self>, stream)` + reshaped `ConnectionHandler::handle` to clone Arc fields + reconstruct `Arc<Self>` mirroring envoy-tcp's pattern, removed `#[allow(dead_code)]` on `bootstrap`), +2 envoy-admin/Cargo.toml (`serde = { version = "1", features = ["derive"] }` + `serde_json = "1"`), +2 Cargo.lock, +20 docs/envoy-rust/BEHAVIOR_CONTRACT.md (new "Admin endpoint body shapes" subsection with `/config_dump` row), +PROGRESS.md narrative. Net +273 insertions, 11 deletions.
 
 ### Work summary
