@@ -1025,7 +1025,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 10 — D15: BodyRule::JsonShape + BodyRule::TextLines harness extensions
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 10 — BodyRule::JsonShape + BodyRule::TextLines harness extensions`
+**Commit:** `9cf8831` — `phase 08.1: task 10 — BodyRule::JsonShape + BodyRule::TextLines harness extensions`
 **LoC delta:** +1 dep (`tests/differential/Cargo.toml`), +302 in `tests/differential/src/lib.rs` (~180 production: two new struct-form `BodyRule` variants `JsonShape` + `TextLines` with `#[serde(default)]`-per-field bodies, the helper struct `JsonSubtreeRule` carrying `path: String` + `expected: serde_yaml::Value`, the `walk_pointer` dotted-path free fn, and the two new match arms on `assert_body_rule` for `BodyRule::JsonShape` and `BodyRule::TextLines`; ~120 tests: new sibling `#[cfg(test)] mod body_rule_extension_tests` block at the file's end with 7 unit tests). Net +303 insertions, 0 deletions.
 
 ### Work summary
