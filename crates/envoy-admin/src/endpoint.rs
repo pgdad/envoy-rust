@@ -53,6 +53,29 @@ pub enum AdminEndpoint {
     /// — the 08.1 listener set is statically declared (xDS-derived listeners
     /// land in §9 family). See BEHAVIOR_CONTRACT § "Admin endpoint body shapes".
     Listeners,
+
+    /// Phase 08.2 D9: `POST /drain_listeners` — invokes `DrainState::drain()`
+    /// and returns 200 OK with an empty body. Effect-only endpoint: the
+    /// listener accept loops observe the `drain_signal()` notify and start
+    /// draining within tens of microseconds. Sticky per parent-08 SPEC §5.6
+    /// — repeat POSTs are idempotent (the CAS at `DrainState::drain` fails
+    /// silently against an already-`Draining` state).
+    DrainListeners,
+
+    /// Phase 08.2 D10a: `POST /healthcheck/fail` — invokes
+    /// `DrainState::fail_healthcheck()` and returns 200 OK with an empty
+    /// body. Flips `/ready` to 503 (per parent-08 SPEC §5.5 wire-state
+    /// mapping). `/server_info.state` stays `"LIVE"` (server-state is
+    /// independent of healthcheck-failure).
+    HealthcheckFail,
+
+    /// Phase 08.2 D10b: `POST /healthcheck/ok` — invokes
+    /// `DrainState::ok_healthcheck()` and returns 200 OK with an empty body.
+    /// Restores `HealthcheckFailing → Live`. Sticky-drain: a POST to
+    /// `/healthcheck/ok` AFTER `/drain_listeners` does NOT un-drain (the
+    /// `HealthcheckFailing → Live` `compare_exchange` fails silently against
+    /// the `Draining` state).
+    HealthcheckOk,
 }
 
 /// Method-aware dispatch result. Introduced at phase 08.1 D4 to give every
@@ -79,6 +102,11 @@ impl AdminEndpoint {
             "/server_info" => Some(AdminEndpoint::ServerInfo),
             "/clusters" => Some(AdminEndpoint::Clusters),
             "/listeners" => Some(AdminEndpoint::Listeners),
+            // 08.2 D9 / D10 — three POST endpoints. Method-arm filtering
+            // happens in `dispatch`; `from_path` resolves the path only.
+            "/drain_listeners" => Some(AdminEndpoint::DrainListeners),
+            "/healthcheck/fail" => Some(AdminEndpoint::HealthcheckFail),
+            "/healthcheck/ok" => Some(AdminEndpoint::HealthcheckOk),
             _ => None,
         }
     }
@@ -95,6 +123,10 @@ impl AdminEndpoint {
             | AdminEndpoint::ServerInfo
             | AdminEndpoint::Clusters
             | AdminEndpoint::Listeners => "GET",
+            // 08.2 D9 / D10 — effect-only POST endpoints.
+            AdminEndpoint::DrainListeners
+            | AdminEndpoint::HealthcheckFail
+            | AdminEndpoint::HealthcheckOk => "POST",
         }
     }
 
@@ -142,6 +174,19 @@ impl AdminEndpoint {
             AdminEndpoint::Listeners => unreachable!(
                 "Listeners requires handler-scoped state; dispatch via AdminEndpoint::render_with"
             ),
+            // 08.2 D9 / D10 — POST endpoints need DrainState, which the
+            // registry-only render path does not carry. The dispatch path in
+            // `handler.rs` routes these variants through `render_with` (Task 4
+            // wires `handler.drain()`); reaching here is a programming error.
+            AdminEndpoint::DrainListeners => unreachable!(
+                "DrainListeners requires DrainState; dispatch via AdminEndpoint::render_with"
+            ),
+            AdminEndpoint::HealthcheckFail => unreachable!(
+                "HealthcheckFail requires DrainState; dispatch via AdminEndpoint::render_with"
+            ),
+            AdminEndpoint::HealthcheckOk => unreachable!(
+                "HealthcheckOk requires DrainState; dispatch via AdminEndpoint::render_with"
+            ),
         }
     }
 
@@ -157,6 +202,20 @@ impl AdminEndpoint {
             AdminEndpoint::ServerInfo => render_server_info(handler),
             AdminEndpoint::Clusters => render_clusters(handler),
             AdminEndpoint::Listeners => render_listeners(handler),
+            // 08.2 D9 / D10 — the three POST endpoints need an
+            // `Arc<DrainState>` accessor on `AdminHandler`. Task 4 (D13b)
+            // widens `AdminHandler::new` from 6-arg to 7-arg and exposes a
+            // `handler.drain()` accessor; until then the dispatch arms are
+            // gated with `todo!()`. The 9 Task-3 unit tests in
+            // `drain_admin_tests` exercise the render fns directly via
+            // `render_drain_listeners(&drain)` etc. so the side effect +
+            // response shape are verified independent of this dispatch path.
+            // Per PROGRESS Task-3 architecture-decision deviation #1.
+            AdminEndpoint::DrainListeners => todo!(
+                "Task 4 (D13b) wires handler.drain() accessor; until then dispatch returns todo!()"
+            ),
+            AdminEndpoint::HealthcheckFail => todo!("Task 4 wires handler.drain() accessor"),
+            AdminEndpoint::HealthcheckOk => todo!("Task 4 wires handler.drain() accessor"),
             // 06.1 endpoints carry forward through the registry-only path.
             _ => self.render(handler.registry()),
         }
@@ -411,6 +470,63 @@ pub(crate) fn render_listeners(handler: &crate::handler::AdminHandler) -> envoy_
         reason: None,
         headers: vec![("content-type".to_string(), "text/plain".to_string())],
         body: Bytes::from(body),
+    }
+}
+
+/// Phase 08.2 D9: `/drain_listeners` POST endpoint. Invokes `DrainState::drain()`
+/// and returns 200 OK with an empty body. Side effect: triggers the
+/// `drain_signal()` notify; the listener accept loops observe and start
+/// draining within tens of microseconds. Sticky — repeat POSTs are idempotent
+/// (per parent-08 SPEC §5.6 + 08.2 SPEC §3 D11 sticky-drain).
+///
+/// `#[allow(dead_code)]` at Task 3: the `render_with` dispatch arm is gated
+/// with `todo!()` until Task 4 (D13b) wires the `handler.drain()` accessor,
+/// so this fn is reachable only from the colocated unit tests until then.
+/// Task 4 removes the allow.
+#[allow(dead_code)]
+pub(crate) fn render_drain_listeners(drain: &envoy_listener::DrainState) -> envoy_http1::Response {
+    drain.drain();
+    empty_200_ok()
+}
+
+/// Phase 08.2 D10a: `/healthcheck/fail` POST endpoint. Invokes
+/// `DrainState::fail_healthcheck()` and returns 200 OK empty body.
+///
+/// `#[allow(dead_code)]` at Task 3 — removed by Task 4 (see
+/// `render_drain_listeners` doc-comment for the rationale).
+#[allow(dead_code)]
+pub(crate) fn render_healthcheck_fail(drain: &envoy_listener::DrainState) -> envoy_http1::Response {
+    drain.fail_healthcheck();
+    empty_200_ok()
+}
+
+/// Phase 08.2 D10b: `/healthcheck/ok` POST endpoint. Invokes
+/// `DrainState::ok_healthcheck()` and returns 200 OK empty body. Sticky-drain:
+/// if state is already `Draining`, this is a no-op (the underlying
+/// `compare_exchange` from `HealthcheckFailing → Live` fails silently; state
+/// stays `Draining`).
+///
+/// `#[allow(dead_code)]` at Task 3 — removed by Task 4 (see
+/// `render_drain_listeners` doc-comment for the rationale).
+#[allow(dead_code)]
+pub(crate) fn render_healthcheck_ok(drain: &envoy_listener::DrainState) -> envoy_http1::Response {
+    drain.ok_healthcheck();
+    empty_200_ok()
+}
+
+/// Shared 200 OK empty-body response shape for the 3 D9/D10 POST endpoints.
+/// `content-length: 0` per the established admin response convention; no
+/// `content-type` (no body — content-type is moot per RFC 7231 §3.1.1.5).
+///
+/// `#[allow(dead_code)]` at Task 3 — call sites in `render_with` are gated
+/// with `todo!()` until Task 4 wires the dispatch. Task 4 removes the allow.
+#[allow(dead_code)]
+fn empty_200_ok() -> envoy_http1::Response {
+    envoy_http1::Response {
+        status: 200,
+        reason: Some("OK"),
+        headers: vec![("content-length".to_string(), "0".to_string())],
+        body: Bytes::new(),
     }
 }
 
@@ -1066,5 +1182,112 @@ mod dispatch_tests {
         // dispatch. Direct unit test that both surfaces remain available.
         assert!(AdminEndpoint::from_path("/ready").is_some());
         assert!(AdminEndpoint::from_path("/nope").is_none());
+    }
+}
+
+#[cfg(test)]
+mod drain_admin_tests {
+    //! Phase 08.2 Task 3 — D9 + D10: three POST admin endpoints
+    //! (`/drain_listeners`, `/healthcheck/fail`, `/healthcheck/ok`). Nine
+    //! tests: 4 dispatch-shape tests (per-path POST routing + GET-405 for
+    //! `/drain_listeners`); 3 render-side-effect tests (each render fn
+    //! returns 200 OK empty body AND flips the underlying `DrainState`);
+    //! 1 sticky-drain regression test (`/healthcheck/ok` AFTER `/drain_listeners`
+    //! is a no-op — state stays `Draining`); 1 allowed-method declaration
+    //! tautology covering all 3 variants.
+
+    use super::{
+        AdminEndpoint, Dispatch, render_drain_listeners, render_healthcheck_fail,
+        render_healthcheck_ok,
+    };
+
+    #[test]
+    fn drain_listeners_path_dispatches_on_post() {
+        let dispatch = AdminEndpoint::dispatch("POST", "/drain_listeners");
+        assert!(matches!(
+            dispatch,
+            Dispatch::Endpoint(AdminEndpoint::DrainListeners)
+        ));
+    }
+
+    #[test]
+    fn drain_listeners_405_on_get() {
+        let dispatch = AdminEndpoint::dispatch("GET", "/drain_listeners");
+        assert!(matches!(
+            dispatch,
+            Dispatch::MethodNotAllowed { allow: "POST" }
+        ));
+    }
+
+    #[test]
+    fn healthcheck_fail_path_dispatches_on_post() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("POST", "/healthcheck/fail"),
+            Dispatch::Endpoint(AdminEndpoint::HealthcheckFail)
+        ));
+    }
+
+    #[test]
+    fn healthcheck_ok_path_dispatches_on_post() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("POST", "/healthcheck/ok"),
+            Dispatch::Endpoint(AdminEndpoint::HealthcheckOk)
+        ));
+    }
+
+    #[test]
+    fn drain_listeners_render_returns_200_empty_body_and_invokes_drain() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let drain = envoy_listener::DrainState::new(&registry);
+        let resp = render_drain_listeners(&drain);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.reason, Some("OK"));
+        assert!(resp.body.is_empty(), "200 OK body must be empty");
+        assert_eq!(drain.current(), envoy_listener::DrainStage::Draining);
+    }
+
+    #[test]
+    fn healthcheck_fail_render_returns_200_empty_body_and_flips_state() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let drain = envoy_listener::DrainState::new(&registry);
+        let resp = render_healthcheck_fail(&drain);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.is_empty());
+        assert_eq!(
+            drain.current(),
+            envoy_listener::DrainStage::HealthcheckFailing
+        );
+    }
+
+    #[test]
+    fn healthcheck_ok_render_returns_200_empty_body_and_restores_live() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let drain = envoy_listener::DrainState::new(&registry);
+        drain.fail_healthcheck();
+        let resp = render_healthcheck_ok(&drain);
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.is_empty());
+        assert_eq!(drain.current(), envoy_listener::DrainStage::Live);
+    }
+
+    #[test]
+    fn healthcheck_ok_after_drain_is_noop_via_render_fn() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let drain = envoy_listener::DrainState::new(&registry);
+        drain.drain();
+        let resp = render_healthcheck_ok(&drain);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            drain.current(),
+            envoy_listener::DrainStage::Draining,
+            "sticky drain: ok_healthcheck after drain must NOT un-drain"
+        );
+    }
+
+    #[test]
+    fn each_drain_endpoint_declares_post_allowed_method() {
+        assert_eq!(AdminEndpoint::DrainListeners.allowed_method(), "POST");
+        assert_eq!(AdminEndpoint::HealthcheckFail.allowed_method(), "POST");
+        assert_eq!(AdminEndpoint::HealthcheckOk.allowed_method(), "POST");
     }
 }

@@ -370,3 +370,109 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 **None at the differential / fixture surface.** Gauges register but no fixture asserts their values yet — fixture 0015 at Task 8 (the new differential fixture for `/drain_listeners`) is the first to assert `server.state = 2` post-drain. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
 
 The `BEHAVIOR_CONTRACT.md` "Stat-name mapping" section gains 3 new rows under a new `**08.2 entries (drain machinery):**` subheading inserted between the existing `**06.3 entries:**` table and the `**06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**` callout — mirrors the per-phase subheading cadence the 06.1 → 06.3 entries already established.
+
+---
+
+## Task 3 (D9 + D10 — three POST admin endpoints)
+
+### Work summary
+
+Adds 3 new variants to `AdminEndpoint` (`DrainListeners`, `HealthcheckFail`, `HealthcheckOk`) each declaring `allowed_method() = "POST"`; extends `AdminEndpoint::from_path` with their 3 path arms (`/drain_listeners`, `/healthcheck/fail`, `/healthcheck/ok`); extends `AdminEndpoint::render` with 3 new `unreachable!()` arms (the registry-only render path carries no `DrainState`); extends `AdminEndpoint::render_with` with 3 new `todo!()` arms — gated until Task 4 (D13b) widens `AdminHandler::new` from 6-arg to 7-arg and exposes the `handler.drain()` accessor. Lands 3 new render fns at module scope (`render_drain_listeners` / `render_healthcheck_fail` / `render_healthcheck_ok`) + a shared `empty_200_ok()` helper returning `Response { status: 200, reason: Some("OK"), headers: [("content-length", "0")], body: Bytes::new() }`. Each render fn takes `drain: &envoy_listener::DrainState` and invokes the corresponding `DrainState` method before producing the 200 OK empty body.
+
+The 9 colocated unit tests at `crates/envoy-admin/src/endpoint.rs::drain_admin_tests` exercise the render fns directly via `render_drain_listeners(&drain)` etc. — they construct a fresh `DrainState::new(&Arc::new(StatsRegistry::new()))` in-test, invoke the render fn, and assert (response shape AND post-call `drain.current()`). This bilateral verification deliberately bypasses the still-`todo!()`-gated `render_with` dispatch arm, so the side effect + response shape are fully verified at Task 3 even though the end-to-end dispatch surface lights up only at Task 4.
+
+Appends 3 new rows to `docs/envoy-rust/BEHAVIOR_CONTRACT.md`'s "Admin endpoint body shapes" table (one per POST endpoint) and patches the existing `/server_info` row note to acknowledge the D5e value-source rebind: replaces the prior parenthetical `(08.1 emits the constant "LIVE"; 08.2 extends to LIVE / DRAINING)` with the explicit `Live | HealthcheckFailing → "LIVE"`, `Draining → "DRAINING"` mapping prose per the SPEC text in PLAN.md Task 3 Step 3.
+
+### Tests landed (9)
+
+All 9 colocated in a new `endpoint::drain_admin_tests` module appended at the bottom of `crates/envoy-admin/src/endpoint.rs` (mirrors the per-phase / per-task subsidiary `#[cfg(test)] mod _tests` pattern already established by `config_dump_tests` / `server_info_tests` / `clusters_tests` / `listeners_tests`):
+
+1. **`drain_listeners_path_dispatches_on_post`** — `dispatch("POST", "/drain_listeners")` resolves to `Dispatch::Endpoint(AdminEndpoint::DrainListeners)`.
+2. **`drain_listeners_405_on_get`** — `dispatch("GET", "/drain_listeners")` resolves to `Dispatch::MethodNotAllowed { allow: "POST" }`.
+3. **`healthcheck_fail_path_dispatches_on_post`** — same shape for `/healthcheck/fail`.
+4. **`healthcheck_ok_path_dispatches_on_post`** — same shape for `/healthcheck/ok`.
+5. **`drain_listeners_render_returns_200_empty_body_and_invokes_drain`** — `render_drain_listeners(&drain)` returns status 200 / reason `Some("OK")` / empty body AND leaves `drain.current() == DrainStage::Draining`.
+6. **`healthcheck_fail_render_returns_200_empty_body_and_flips_state`** — same shape; post-call state `HealthcheckFailing`.
+7. **`healthcheck_ok_render_returns_200_empty_body_and_restores_live`** — starts from a pre-failed drain (calls `fail_healthcheck()` first); `render_healthcheck_ok(&drain)` restores `Live`.
+8. **`healthcheck_ok_after_drain_is_noop_via_render_fn`** — sticky-drain regression at the render-fn boundary: pre-drained state stays `Draining` after `render_healthcheck_ok`.
+9. **`each_drain_endpoint_declares_post_allowed_method`** — compile-time tautology for the three new arms in `allowed_method()`.
+
+Red phase (Step 2) verified pre-implementation: `cargo test -p envoy-admin --lib drain_admin_tests` produced 7 `E0599` errors (3 × `no variant or associated item named DrainListeners`; 2 × `... HealthcheckFail`; 2 × `... HealthcheckOk`) + matching `E0432: unresolved imports super::render_drain_listeners, super::render_healthcheck_fail, super::render_healthcheck_ok`. Green phase (Step 4) verified post-implementation: `test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s`.
+
+### Per-task deviations from PLAN
+
+1. **Architecture-decision deviation #1 (anticipated by the SPEC + PLAN): `render_with` arms gated with `todo!()` until Task 4.** PLAN.md Task 3 NOTE block (lines 1068-1092) explicitly authorizes this split — the alternative ("widen `AdminHandler::new` to 7-arg at Task 3") would conflate Task 3's enum + render-fn surface with Task 4's `envoy-bin` wiring. The PLAN recommendation is to land the render fns at Task 3 + leave `render_with` arms gated; this PROGRESS records the cleanly-followed path. The `todo!()` strings explicitly reference Task 4 (D13b) per the SPEC sketch.
+
+2. **`#[allow(dead_code)]` on the 3 render fns + the `empty_200_ok()` helper.** Required to keep `cargo clippy -D warnings` green: the render fns are reachable only from the colocated unit tests at Task 3 (the production-side call sites in `render_with` are `todo!()`-gated). Each allow is scoped per-decl + carries an inline doc-comment referencing Task 4's removal of the allow. Mirrors the Task 2 precedent for `Listener::listener_manager_active` field + accessor decoration (`PROGRESS.md:304`).
+
+3. **fmt-driven single-line signatures on the 3 render fns.** Initial implementation wrote `pub(crate) fn render_drain_listeners(\n    drain: &envoy_listener::DrainState,\n) -> envoy_http1::Response {` per the SPEC snippet; `cargo fmt --all` collapsed each to a single-line `pub(crate) fn render_drain_listeners(drain: &envoy_listener::DrainState) -> envoy_http1::Response {` (the body fits rustfmt's max width). Functionally identical; recorded per the Task 1 precedent of documenting incidental fmt adjustments.
+
+4. **Module name `drain_admin_tests` (not `tests`).** The SPEC snippet at PLAN.md Step 1 reads "Append (the 9 new tests cover dispatch + render + side-effect)" without naming a target module. Appending the 9 tests to the existing `mod tests` would have crowded the 06.1-era unit-test module; per the Task 6/7/8/9 precedent already in this file (every 08.1 task per-endpoint test cohort lives in its own subsidiary `#[cfg(test)] mod <task>_tests`), the new tests live in a dedicated module. Module-scope `use super::{...}` imports the 3 render fns + `AdminEndpoint` + `Dispatch`.
+
+5. **BEHAVIOR_CONTRACT.md `/server_info` row patch: verbatim-replaceable.** The on-disk text at line 143 matched the SPEC's pre-patch snippet verbatim (modulo trailing whitespace) — the replacement landed in a single `Edit` invocation with zero adaptation. (Confirmed prior to the patch by direct read.)
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `crates/envoy-admin/src/endpoint.rs` | +223 | 0 |
+| `docs/envoy-rust/BEHAVIOR_CONTRACT.md` | +4 | -1 |
+| **Total source + doc:** | **+227** | **-1** |
+
+Test-count delta: `envoy-admin` lib bucket grew **58 → 67** (+9, exactly the 9 new tests in `drain_admin_tests`); workspace total grew by the same +9 (no other crate touched).
+
+No new top-level Cargo deps. `envoy_listener` / `envoy_stats` / `bytes` / `envoy_http1` were all already on `envoy-admin`'s `[dependencies]` list since the 08.1 Task 6 / 7 / 8 / 9 cohort. Crate root still carries `#![forbid(unsafe_code)]`; zero new unsafe blocks.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff after one `cargo fmt --all` apply during implementation — the multi-line `pub(crate) fn render_*` signatures collapsed to single-line shape per rustfmt's preferred form for fitting widths).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean compile across all 8 workspace crates, zero warnings). The 4 `#[allow(dead_code)]` annotations on the 3 render fns + `empty_200_ok()` helper are required at Task 3 (the `render_with` dispatch arms are `todo!()`-gated until Task 4 lands `handler.drain()`).
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 crates + 2 helper bin crates compiled).
+
+**Gate 4 — `cargo test --workspace`:** PASS (exit 0; every per-bucket `test result:` line reads `ok. N passed; 0 failed`; the `envoy-admin` lib bucket grew from 58 → 67 tests — the 9 new `endpoint::drain_admin_tests::{drain_listeners_path_dispatches_on_post, drain_listeners_405_on_get, healthcheck_fail_path_dispatches_on_post, healthcheck_ok_path_dispatches_on_post, drain_listeners_render_returns_200_empty_body_and_invokes_drain, healthcheck_fail_render_returns_200_empty_body_and_flips_state, healthcheck_ok_render_returns_200_empty_body_and_restores_live, healthcheck_ok_after_drain_is_noop_via_render_fn, each_drain_endpoint_declares_post_allowed_method}`). Focused re-run: `cargo test -p envoy-admin --lib drain_admin_tests` reads `9 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out`. (Note: a first workspace-test run flaked on `differential::backend::tests::tcp_proxy_backend_{spawns_and_echoes,drop_terminates_child}` with port-collision-style `Connection refused`; both tests passed on isolated re-run AND on a subsequent full-workspace re-run with 94/94 differential pass — the failures are a pre-existing port-allocation flake in the parallel-test execution environment, unrelated to Task 3's changes which only touch `crates/envoy-admin` and a docs file. The clean 94/94 workspace re-run is the authoritative gate signal.)
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per 07.1-REVIEW doctrine.
+
+### Differential surface delta
+
+**None at the differential / fixture surface.** Task 3 introduces the 3 POST endpoint variants + render fns but the `render_with` dispatch is still `todo!()`-gated (Task 4 lands `handler.drain()`), so no live HTTP wire surface changes yet. Fixture 0015 at Task 8 is the first differential surface to exercise the endpoints end-to-end. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior on already-shipped endpoints); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
+
+The `BEHAVIOR_CONTRACT.md` "Admin endpoint body shapes" table gains 3 new rows (one per POST endpoint) + the existing `/server_info` row note patched to acknowledge the D5e value-source rebind that Task 5 lands. Per the PLAN architecture-decision lock-in #24 (body-shape rows land at Task 3); the Admin-action effect equivalence subsection lands at Task 8.
