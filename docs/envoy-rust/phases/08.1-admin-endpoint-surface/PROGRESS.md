@@ -1023,6 +1023,96 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 10 — D15: BodyRule::JsonShape + BodyRule::TextLines harness extensions
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 10 — BodyRule::JsonShape + BodyRule::TextLines harness extensions`
+**LoC delta:** +1 dep (`tests/differential/Cargo.toml`), +302 in `tests/differential/src/lib.rs` (~180 production: two new struct-form `BodyRule` variants `JsonShape` + `TextLines` with `#[serde(default)]`-per-field bodies, the helper struct `JsonSubtreeRule` carrying `path: String` + `expected: serde_yaml::Value`, the `walk_pointer` dotted-path free fn, and the two new match arms on `assert_body_rule` for `BodyRule::JsonShape` and `BodyRule::TextLines`; ~120 tests: new sibling `#[cfg(test)] mod body_rule_extension_tests` block at the file's end with 7 unit tests). Net +303 insertions, 0 deletions.
+
+### Work summary
+
+Landed the two new `BodyRule` struct-form variants for the `/config_dump` (JSON-shape) and `/clusters` + `/listeners` (line-oriented text) diff territory, plus the helper struct + the dotted-path walker fn + the two new dispatch arms on `assert_body_rule`. Both variants reuse the established `tag = "kind"`-internally-tagged serde shape that 06.1 Task 12's `BodyRule::PrometheusExposition` established (per architecture-decision lock-in #12). `BodyRule::JsonShape` parses both bodies as JSON via `serde_json::from_slice`, asserts they are JSON objects, fail-strict-checks `required_keys` on BOTH sides, and (optionally) walks `required_subtree.path` on both sides via `walk_pointer` then JSON-string-compares the addressed sub-values. `BodyRule::TextLines` decodes both bodies as UTF-8 via `std::str::from_utf8`, builds a `BTreeSet<&str>` per side via `.lines().collect()`, fail-strict-checks `required_lines` (exact match) and `required_line_prefixes` (at-least-one-line-prefixes) on BOTH sides. The allowlist-* and `value_may_differ_keys` fields are accepted at the schema level so fixture YAML can declare them now, but DO NOT participate in fail logic at Task 10 — strictness is intentionally deferred to Task 11 per PLAN line 2231/2301 ("the executor adapts"). Sibling `mod body_rule_extension_tests` placed AFTER the existing `mod tests` block — same per-task end-of-file placement convention Tasks 6/7/8/9 used for their new sibling test modules (e.g. `listeners_tests` placed after `clusters_tests`).
+
+### Tests landed
+
+- `body_rule_extension_tests::json_shape_required_keys_pass_when_all_present` (crate `differential`)
+- `body_rule_extension_tests::json_shape_required_keys_fail_when_missing` (crate `differential`)
+- `body_rule_extension_tests::json_shape_envoy_only_key_allowed` (crate `differential`)
+- `body_rule_extension_tests::json_shape_required_subtree_value_exact` (crate `differential`)
+- `body_rule_extension_tests::text_lines_required_lines_pass_when_present` (crate `differential`)
+- `body_rule_extension_tests::text_lines_envoy_only_lines_allowed` (crate `differential`)
+- `body_rule_extension_tests::text_lines_required_prefix_matches` (crate `differential`)
+
+7 new tests total, all in `differential` crate. Crate test bucket: 84 (was 77 post-Task-9-no-op-on-this-crate; +7 new).
+
+TDD discipline: 7 tests written FIRST, watched fail with the expected compile errors `error[E0432]: unresolved import super::JsonSubtreeRule` + `error[E0599]: no variant named JsonShape found for enum BodyRule` + `error[E0599]: no variant named TextLines found for enum BodyRule` (the exact variant-not-found shape predicted by the controller's TDD step). Implementation landed (BodyRule extension + JsonSubtreeRule struct + walk_pointer fn + two new dispatch arms + serde_json dep + JsonSubtreeRule PartialEq/Eq derive), re-ran tests to confirm 7/7 new tests green plus all 77 legacy `differential` tests still green (84 total). Full `cargo test --workspace` green.
+
+### Deviations from PLAN
+
+1. **Package name: PLAN-stub used `-p envoy-rust-differential`; actual is `-p differential`** per `tests/differential/Cargo.toml:2`. Used `cargo test -p differential body_rule_extension_tests`. Pre-flagged by the controller.
+
+2. **Dispatch shape: PLAN-stub assumed `rule.assert_equivalent(envoy, rust)` method; actual is free fn `assert_body_rule(rule, envoy, rust)`**. Extended the existing free fn at `tests/differential/src/lib.rs:2111` with two new match arms instead of adding a method wrapper — minimal surface, matches the existing 06.1 / 06.3 `PrometheusExposition` precedent. `assert_body_rule` kept private (`fn`, not `pub fn`); sibling-`mod`-in-same-file scope reaches it via `use super::{BodyRule, JsonSubtreeRule, assert_body_rule};`. Pre-flagged by the controller.
+
+3. **Tests adapted to free-fn shape: changed all 7 tests from `rule.assert_equivalent(...)` to `assert_body_rule(&rule, ...)`**. Pre-flagged by the controller.
+
+4. **`JsonSubtreeRule` is a struct (not a tuple): test 4 instantiates `Some(JsonSubtreeRule { path: ..., expected: ... })`** not the tuple shape the PLAN-stub used at lines 2086-2098. Adapted to the architecture-decision lock-in #12 struct form. Pre-flagged by the controller.
+
+5. **`Eq` derive RETAINED on `BodyRule`** — the controller's drift-verified-ground-truth-#4 predicted the `Eq` drop, but verification against on-disk `/Users/esa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_yaml-0.9.34+deprecated/src/value/mod.rs:673` shows `impl Eq for Value {}` is explicitly provided (manually, alongside the auto-derived `PartialEq`). So `BodyRule::JsonShape { required_subtree: Option<JsonSubtreeRule>, ... }` propagates `Eq` cleanly when `JsonSubtreeRule` derives `Eq` too. Picked the simpler / cleaner option per `feedback_pick_recommendation`: kept the original `#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]` on `BodyRule` and added `#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]` to `JsonSubtreeRule`. No cascade drops on `Driver` / `Equivalence` / `Expectations` were needed. The doc-comment on `BodyRule` was updated to document this finding so a future Task-11 author doesn't re-litigate it.
+
+6. **`serde_json = "1"` added to `tests/differential/Cargo.toml` direct deps**. D-3.2 permitted-foundations (not a foundations grant); no ADR needed. Pre-flagged by the controller.
+
+7. **Strictness pick: `required_keys` / `required_subtree` / `required_lines` / `required_line_prefixes` are fail-strict assertions; the `allowlist_envoy_only_keys` / `allowlist_envoy_rust_only_keys` / `value_may_differ_keys` / `allowlist_envoy_only_lines` / `allowlist_envoy_rust_only_lines` fields are accepted at the schema level (so fixture 0014 YAML can declare them now) but do NOT participate in fail logic at Task 10.** Defers to Task 11 / phase-end REVIEW per PLAN line 2231/2301 ("the executor adapts to the desired strictness level"). The five no-op fields are pattern-bound via `_` in the match arms with comments naming the deferral. Pre-flagged by the controller.
+
+8. **Test module placement at line ~3389 AFTER `mod tests`'s closing `}` at line 3381.** Mirrors the per-task end-of-file placement convention Tasks 6/7/8/9 used (e.g. Task 9's `listeners_tests` placed after `clusters_tests`). Pre-flagged by the controller.
+
+9. **Doc-comments added on `BodyRule` (existing, extended), `JsonShape` variant, `TextLines` variant, `JsonSubtreeRule` struct, and `walk_pointer` fn** narrating the SPEC-tie + the Task 11 strictness-deferral disposition. Mirrors the doc-comment density established by `PrometheusExposition` at 06.1 / 06.3.
+
+10. **`walk_pointer` uses `.with_context(|| format!(..))` (lazy)** instead of the PLAN-stub-pseudocode's `.context(format!(..))` (eager) — clippy-clean per `or_fun_call` lint posture; matches the workspace convention.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling differential v0.0.0 (/Users/esa/git/envoy-rust/tests/differential)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.98s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking differential v0.0.0 (/Users/esa/git/envoy-rust/tests/differential)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 24.73s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+     Running unittests src/lib.rs (target/debug/deps/differential-c77ccb82d4505bf6)
+test result: ok. 84 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.82s
+     Running unittests src/lib.rs (target/debug/deps/envoy_admin-36014a9343649dbc)
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+     Running unittests src/lib.rs (target/debug/deps/envoy_cluster-97dbad6faa16a2eb)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+```
+
+(`differential` bucket: 84 = 77 pre-task + 7 new. `envoy-admin` bucket: 58, unchanged from Task 9 — Task 10 is a `tests/differential/`-only change. Full `cargo test --workspace` green across all buckets. One transient `backend::tests::tcp_proxy_backend_spawns_and_echoes` port-binding flake observed on the first workspace-wide run; passed on isolated re-run and on the second workspace-wide run. The same flake was noted at Tasks 7/8/9 — pre-existing, unrelated to this task's diff.)
+
+`cargo deny check`:
+```
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. Task 10 adds `serde_json = "1"` to `tests/differential/Cargo.toml`'s `[dependencies]` section — `serde_json` is D-3.2 permitted-foundations and is already transitively present in the workspace dep tree from earlier tasks; `cargo deny check` remains clean. No new top-level Cargo deps land per architecture-decision lock-in #17.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:

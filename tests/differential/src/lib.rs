@@ -185,6 +185,15 @@ pub enum StatusRule {
 /// `response_body: byte_exact`; under the new shape they read
 /// `response_body: { kind: byte_exact }`. All 10 fixtures were updated in
 /// the same commit; no other fixture grammar change ships with 06.1.
+///
+/// 08.1 Task 10 (D15) extended this enum with `JsonShape` + `TextLines`
+/// struct-form variants for the `/config_dump` + `/clusters` + `/listeners`
+/// admin-endpoint diff territory. `JsonShape::required_subtree` carries a
+/// `serde_yaml::Value` (via `JsonSubtreeRule`); `serde_yaml::Value` does
+/// implement `Eq` (per `serde_yaml` 0.9.34+deprecated source), so the
+/// existing `#[derive(... PartialEq, Eq)]` on `BodyRule` is retained
+/// unchanged — no cascade drops on `Driver` / `Equivalence` / `Expectations`
+/// are needed.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BodyRule {
@@ -218,6 +227,96 @@ pub enum BodyRule {
         #[serde(default)]
         value_present_only: Vec<String>,
     },
+    /// 08.1 Task 10 (D15): parse BOTH bodies as JSON objects and assert
+    /// schema-level invariants without requiring byte-for-byte equality.
+    /// Used by `/config_dump` and similar JSON-emitting admin endpoints
+    /// where Envoy's emission carries fields envoy-rust does not (and
+    /// vice versa). `required_keys` are fail-strict on BOTH sides;
+    /// `required_subtree` walks a dotted path through both bodies and
+    /// asserts JSON-string equality of the addressed sub-value. The
+    /// `allowlist_envoy_only_keys`, `allowlist_envoy_rust_only_keys`, and
+    /// `value_may_differ_keys` fields are accepted at the schema level
+    /// so fixtures can declare them now, but do NOT participate in fail
+    /// logic at Task 10 — strictness is intentionally deferred to Task 11
+    /// (fixture 0014 will surface what envoy ↔ envoy-rust diff shape the
+    /// `/config_dump` payload actually exhibits, and the strictness model
+    /// will tighten then per PLAN line 2231/2301 guidance).
+    JsonShape {
+        #[serde(default)]
+        required_keys: Vec<String>,
+        #[serde(default)]
+        required_subtree: Option<JsonSubtreeRule>,
+        #[serde(default)]
+        allowlist_envoy_only_keys: Vec<String>,
+        #[serde(default)]
+        allowlist_envoy_rust_only_keys: Vec<String>,
+        #[serde(default)]
+        value_may_differ_keys: Vec<String>,
+    },
+    /// 08.1 Task 10 (D15): treat both bodies as UTF-8 text and assert
+    /// per-line invariants. Used by `/clusters` and `/listeners` and other
+    /// line-oriented admin endpoints. `required_lines` must each appear
+    /// verbatim on BOTH sides; `required_line_prefixes` must each be the
+    /// prefix of at least one line on BOTH sides (covers per-listener
+    /// stat lines like `listener_0::counter_<varying-suffix>`). The
+    /// `allowlist_envoy_only_lines` / `allowlist_envoy_rust_only_lines`
+    /// fields are accepted at the schema level but do NOT participate in
+    /// fail logic at Task 10 — same Task 11 strictness-deferral disposition
+    /// as `JsonShape`.
+    TextLines {
+        #[serde(default)]
+        required_lines: Vec<String>,
+        #[serde(default)]
+        required_line_prefixes: Vec<String>,
+        #[serde(default)]
+        allowlist_envoy_only_lines: Vec<String>,
+        #[serde(default)]
+        allowlist_envoy_rust_only_lines: Vec<String>,
+    },
+}
+
+/// 08.1 Task 10 (D15) helper for `BodyRule::JsonShape::required_subtree`.
+///
+/// `path` is a dotted-segment selector walked via `walk_pointer`; each
+/// segment is interpreted as an `usize` array index if it parses as one,
+/// else as an object key. Example: `configs.0.bootstrap.node.id` selects
+/// the `id` field of the `node` object on the first element of the
+/// `configs` array of a `/config_dump`-shaped payload.
+///
+/// `expected` is a `serde_yaml::Value` (so fixture YAML can declare the
+/// expected sub-value in YAML-native form) and is compared via
+/// `serde_json::to_string` against the addressed sub-value rendered the
+/// same way. `PartialEq` + `Eq` are derived — `serde_yaml::Value` does
+/// implement `Eq` (per `serde_yaml` 0.9.34+deprecated source), so the
+/// `BodyRule::JsonShape` enclosing `#[derive(PartialEq, Eq)]` propagates
+/// cleanly through `Option<JsonSubtreeRule>`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct JsonSubtreeRule {
+    /// Dotted-path key, e.g. `configs.0.bootstrap.node.id`.
+    pub path: String,
+    pub expected: serde_yaml::Value,
+}
+
+/// 08.1 Task 10 (D15) helper: walk a dotted-path selector through a
+/// `serde_json::Value`. Each segment becomes an `usize` array index if it
+/// parses as one, else an object key. Returns a borrow of the addressed
+/// sub-value or an `anyhow::Error` naming the offending segment if the
+/// path does not resolve.
+fn walk_pointer<'a>(
+    value: &'a serde_json::Value,
+    dotted_path: &str,
+) -> Result<&'a serde_json::Value> {
+    let mut cur = value;
+    for seg in dotted_path.split('.') {
+        cur = if let Ok(idx) = seg.parse::<usize>() {
+            cur.get(idx)
+                .with_context(|| format!("array index out of range: {seg}"))?
+        } else {
+            cur.get(seg)
+                .with_context(|| format!("key not found: {seg}"))?
+        };
+    }
+    Ok(cur)
 }
 
 /// 06.1 D6.b: parse a Prometheus text-exposition body into the set of metric
@@ -2193,6 +2292,95 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
             }
             Ok(())
         }
+        // 08.1 Task 10 (D15): JSON-shape assertions. Parse both bodies as
+        // JSON objects; assert required_keys present on BOTH sides + an
+        // optional required_subtree dotted-path walk with JSON-string
+        // equality on the addressed sub-value. The allowlist_* and
+        // value_may_differ_keys fields are accepted at the schema level
+        // but DO NOT participate in fail logic at Task 10 (strictness
+        // intentionally deferred to Task 11 per PLAN line 2231/2301).
+        BodyRule::JsonShape {
+            required_keys,
+            required_subtree,
+            allowlist_envoy_only_keys: _,
+            allowlist_envoy_rust_only_keys: _,
+            value_may_differ_keys: _,
+        } => {
+            let envoy_json: serde_json::Value = serde_json::from_slice(envoy_body)
+                .context("envoy body is not valid JSON for BodyRule::JsonShape")?;
+            let rust_json: serde_json::Value = serde_json::from_slice(rust_body)
+                .context("envoy-rust body is not valid JSON for BodyRule::JsonShape")?;
+            let envoy_obj = envoy_json
+                .as_object()
+                .context("envoy body is not a JSON object for BodyRule::JsonShape")?;
+            let rust_obj = rust_json
+                .as_object()
+                .context("envoy-rust body is not a JSON object for BodyRule::JsonShape")?;
+            for key in required_keys {
+                if !envoy_obj.contains_key(key) {
+                    bail!("required_keys: {key:?} missing on envoy side");
+                }
+                if !rust_obj.contains_key(key) {
+                    bail!("required_keys: {key:?} missing on envoy-rust side");
+                }
+            }
+            if let Some(subtree) = required_subtree {
+                let envoy_sub = walk_pointer(&envoy_json, &subtree.path)
+                    .with_context(|| format!("envoy required_subtree path {:?}", subtree.path))?;
+                let rust_sub = walk_pointer(&rust_json, &subtree.path).with_context(|| {
+                    format!("envoy-rust required_subtree path {:?}", subtree.path)
+                })?;
+                let envoy_str = serde_json::to_string(envoy_sub)
+                    .context("rendering envoy required_subtree sub-value as JSON")?;
+                let rust_str = serde_json::to_string(rust_sub)
+                    .context("rendering envoy-rust required_subtree sub-value as JSON")?;
+                if envoy_str != rust_str {
+                    bail!(
+                        "required_subtree {:?} mismatch:\n  envoy:      {envoy_str}\n  envoy-rust: {rust_str}",
+                        subtree.path,
+                    );
+                }
+            }
+            Ok(())
+        }
+        // 08.1 Task 10 (D15): line-oriented text assertions. Treat both
+        // bodies as UTF-8 text, split on \n via `str::lines`, and assert
+        // required_lines + required_line_prefixes on BOTH sides. The
+        // allowlist_* fields are accepted at the schema level but DO NOT
+        // participate in fail logic at Task 10 (same Task 11 deferral as
+        // JsonShape).
+        BodyRule::TextLines {
+            required_lines,
+            required_line_prefixes,
+            allowlist_envoy_only_lines: _,
+            allowlist_envoy_rust_only_lines: _,
+        } => {
+            let envoy_text = std::str::from_utf8(envoy_body)
+                .context("envoy body is not valid UTF-8 for BodyRule::TextLines")?;
+            let rust_text = std::str::from_utf8(rust_body)
+                .context("envoy-rust body is not valid UTF-8 for BodyRule::TextLines")?;
+            let envoy_lines: std::collections::BTreeSet<&str> = envoy_text.lines().collect();
+            let rust_lines: std::collections::BTreeSet<&str> = rust_text.lines().collect();
+            for line in required_lines {
+                if !envoy_lines.contains(line.as_str()) {
+                    bail!("required_lines: {line:?} missing on envoy side");
+                }
+                if !rust_lines.contains(line.as_str()) {
+                    bail!("required_lines: {line:?} missing on envoy-rust side");
+                }
+            }
+            for prefix in required_line_prefixes {
+                if !envoy_lines.iter().any(|l| l.starts_with(prefix.as_str())) {
+                    bail!("required_line_prefixes: no line starts with {prefix:?} on envoy side");
+                }
+                if !rust_lines.iter().any(|l| l.starts_with(prefix.as_str())) {
+                    bail!(
+                        "required_line_prefixes: no line starts with {prefix:?} on envoy-rust side"
+                    );
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3377,5 +3565,119 @@ expected_body_rule:
             msg.contains("value_exact mismatch"),
             "expected value_exact mismatch, got: {msg}"
         );
+    }
+}
+
+/// 08.1 Task 10 (D15): tests for the two new `BodyRule` variants
+/// `JsonShape` + `TextLines`, plus the `JsonSubtreeRule` helper struct
+/// and the `walk_pointer` dotted-path helper. Sibling `#[cfg(test)]` block
+/// placed AFTER the existing `mod tests` per the per-task placement
+/// convention (Tasks 6-9 each appended new test modules at the file's end).
+#[cfg(test)]
+mod body_rule_extension_tests {
+    use super::{BodyRule, JsonSubtreeRule, assert_body_rule};
+
+    #[test]
+    fn json_shape_required_keys_pass_when_all_present() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec!["a".into(), "b".into(), "c".into()],
+            required_subtree: None,
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec!["a".into(), "b".into(), "c".into()],
+        };
+        let envoy = br#"{"a":1,"b":"two","c":[3]}"#;
+        let rust = br#"{"a":9,"b":"different","c":[42,42]}"#;
+        assert_body_rule(&rule, envoy, rust).expect("required keys present on both sides");
+    }
+
+    #[test]
+    fn json_shape_required_keys_fail_when_missing() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec!["a".into(), "b".into(), "c".into()],
+            required_subtree: None,
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec![],
+        };
+        // Both bodies are missing `b`.
+        let envoy = br#"{"a":1,"c":3}"#;
+        let rust = br#"{"a":1,"c":3}"#;
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('b'), "expected `b` mentioned, got: {msg}");
+    }
+
+    #[test]
+    fn json_shape_envoy_only_key_allowed() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec!["a".into()],
+            required_subtree: None,
+            allowlist_envoy_only_keys: vec!["envoy_only".into()],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec!["a".into()],
+        };
+        let envoy = br#"{"a":1,"envoy_only":"value"}"#;
+        let rust = br#"{"a":1}"#;
+        assert_body_rule(&rule, envoy, rust).expect("envoy-only key on allowlist passes");
+    }
+
+    #[test]
+    fn json_shape_required_subtree_value_exact() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: Some(JsonSubtreeRule {
+                path: "node.id".into(),
+                expected: serde_yaml::Value::String("x".into()),
+            }),
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec![],
+        };
+        let envoy = br#"{"node":{"id":"x","other":1}}"#;
+        let rust = br#"{"node":{"id":"x","other":99}}"#;
+        assert_body_rule(&rule, envoy, rust).expect("required_subtree matches on both sides");
+    }
+
+    #[test]
+    fn text_lines_required_lines_pass_when_present() {
+        let rule = BodyRule::TextLines {
+            required_lines: vec!["foo".into(), "bar".into()],
+            required_line_prefixes: vec![],
+            allowlist_envoy_only_lines: vec![],
+            allowlist_envoy_rust_only_lines: vec![],
+        };
+        let envoy = b"foo\nbar\n";
+        let rust = b"bar\nfoo\n";
+        assert_body_rule(&rule, envoy, rust).expect("required lines present on both sides");
+    }
+
+    #[test]
+    fn text_lines_envoy_only_lines_allowed() {
+        let rule = BodyRule::TextLines {
+            required_lines: vec!["foo".into()],
+            required_line_prefixes: vec![],
+            allowlist_envoy_only_lines: vec!["envoy_only_extra".into()],
+            allowlist_envoy_rust_only_lines: vec![],
+        };
+        let envoy = b"foo\nenvoy_only_extra\n";
+        let rust = b"foo\n";
+        assert_body_rule(&rule, envoy, rust).expect("envoy-only line on allowlist passes");
+    }
+
+    #[test]
+    fn text_lines_required_prefix_matches() {
+        let rule = BodyRule::TextLines {
+            required_lines: vec![],
+            required_line_prefixes: vec![
+                "listener_0::counter_".into(),
+                "listener_1::counter_".into(),
+            ],
+            allowlist_envoy_only_lines: vec![],
+            allowlist_envoy_rust_only_lines: vec![],
+        };
+        let envoy = b"listener_0::counter_X\nlistener_1::counter_Y\n";
+        let rust = b"listener_0::counter_A\nlistener_1::counter_B\n";
+        assert_body_rule(&rule, envoy, rust).expect("required line prefixes match on both sides");
     }
 }
