@@ -96,18 +96,36 @@ pub struct Listener {
     /// count of currently-active data-plane listeners. Registered
     /// idempotently inside `Listener::bind` (same-name re-registration
     /// returns the existing `Arc`, so every `Listener` instance shares one
-    /// gauge across the process). RAII inc/dec wiring at `Listener::serve`
-    /// entry/exit lands at Task 6 (D12); Task 2 only registers + stores
-    /// the field. Echo + admin listeners use `tokio::net::TcpListener`
-    /// directly (not `Listener::bind`) and are therefore naturally excluded
-    /// from this gauge per architecture-decision lock-in #12.
-    ///
-    /// `#[allow(dead_code)]` is scoped to this field at Task 2 because the
-    /// field is registered + stored but not yet consumed; Task 6 (D12)
-    /// removes the allow when it hoists the gauge into the RAII guard at
-    /// `serve` entry/exit.
-    #[allow(dead_code)]
+    /// gauge across the process). Hoisted into the
+    /// `ListenerManagerActiveGuard` RAII guard at `Listener::serve` entry
+    /// at Task 6 (D12); the guard's `Drop` decrements after the post-loop
+    /// drain-wait completes. Echo + admin listeners use
+    /// `tokio::net::TcpListener` directly (not `Listener::bind`) and are
+    /// therefore naturally excluded from this gauge per
+    /// architecture-decision lock-in #12.
     listener_manager_active: Arc<envoy_stats::Gauge>,
+}
+
+/// 08.2 Task 6 (D12): RAII guard that increments
+/// `listener_manager.total_listeners_active` at construction and decrements
+/// at Drop. Constructed at the top of `Listener::serve` so its Drop fires
+/// after the post-loop drain-wait block (Rust drop-order is reverse
+/// declaration order; the guard, declared first inside `serve`, drops
+/// last). Mirrors the existing 06.3 `cx_active` per-connection guard
+/// pattern but at the per-listener granularity.
+struct ListenerManagerActiveGuard(Arc<envoy_stats::Gauge>);
+
+impl ListenerManagerActiveGuard {
+    fn new(gauge: Arc<envoy_stats::Gauge>) -> Self {
+        gauge.inc();
+        Self(gauge)
+    }
+}
+
+impl Drop for ListenerManagerActiveGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
 }
 
 impl std::fmt::Debug for Listener {
@@ -187,19 +205,30 @@ impl Listener {
     /// before `self.listener` is consumed by `serve`. `pub(crate)` because
     /// no external consumer should touch this gauge directly — the inc/dec
     /// wiring is internal to `Listener::serve`.
-    ///
-    /// `#[allow(dead_code)]` is scoped to this method at Task 2 because the
-    /// accessor exists for Task 6's RAII guard but is not yet called; Task 6
-    /// removes the allow when it consumes the accessor.
-    #[allow(dead_code)]
     pub(crate) fn listener_manager_active(&self) -> &Arc<envoy_stats::Gauge> {
         &self.listener_manager_active
     }
 
-    /// Accept loop with shutdown-gated graceful drain. On `shutdown`, stop
-    /// accepting and wait up to `DRAIN_BUDGET = 5s` for in-flight connections
-    /// to complete. If the drain budget expires, abort stragglers and return
+    /// Accept loop with shutdown-gated graceful drain. On either `shutdown`
+    /// or `drain.drain_signal()` firing, stop accepting and wait up to
+    /// `DRAIN_BUDGET = 5s` for in-flight connections to complete. If the
+    /// drain budget expires, abort stragglers and return
     /// `ListenerError::DrainTimeout`.
+    ///
+    /// 08.2 Task 6 (D12): widened from 1-arg `(shutdown)` to 2-arg
+    /// `(shutdown, drain: Arc<DrainState>)`. Either signal triggers the
+    /// same drain code path (drop the listener; await stragglers within
+    /// DRAIN_BUDGET). Each iteration of the loop re-anchors a fresh
+    /// `drain.drain_signal()` future (a `Notified` snapshot is taken
+    /// inside `drain_signal()` before the state load per Task 1 fixup's
+    /// TOCTOU fix — already-Draining short-circuits to a ready future).
+    ///
+    /// 08.2 Task 6 (D12): also installs a
+    /// `ListenerManagerActiveGuard` at function entry that increments
+    /// `listener_manager.total_listeners_active`; the guard's Drop
+    /// decrements after the post-loop drain-wait completes (RAII drop
+    /// order is reverse declaration order — the guard is declared first
+    /// inside `serve`, so it drops last after stragglers complete).
     ///
     /// SPEC §6 signpost 5: errors from individual `handle` calls are logged
     /// at `warn!` and dropped; the listener stays up. Asymmetric errors in
@@ -209,7 +238,13 @@ impl Listener {
     pub async fn serve(
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+        drain: Arc<DrainState>,
     ) -> Result<(), ListenerError> {
+        // 08.2 Task 6 (D12): RAII guard MUST be the first local so its Drop
+        // fires LAST (after the post-loop drain-wait block + stragglers
+        // join). Construction increments the gauge; Drop decrements.
+        let _lm_guard = ListenerManagerActiveGuard::new(Arc::clone(self.listener_manager_active()));
+
         let listener = self.listener;
         let handler = self.handler;
         // 06.1 D4.a: hoist the per-listener counter out of `self` so the
@@ -230,6 +265,17 @@ impl Listener {
             tokio::select! {
                 _ = &mut shutdown => {
                     tracing::info!("listener shutdown signal received; draining");
+                    drop(listener);
+                    break;
+                }
+                // 08.2 Task 6 (D12): drain-signal arm. Either this or the
+                // shutdown arm triggers the same drain code path. Each loop
+                // iteration constructs a fresh `drain_signal()` future; if
+                // state is already `Draining`, the future returns ready
+                // immediately (drain is sticky + idempotent — see
+                // `DrainState::drain_signal` for the TOCTOU-safe shape).
+                _ = drain.drain_signal() => {
+                    tracing::info!("listener drain signal received; draining");
                     drop(listener);
                     break;
                 }
@@ -330,17 +376,22 @@ mod tests {
     async fn serves_accepts_and_dispatches_to_handler() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
-        let listener = Listener::bind(&cfg, h, mk_registry())
+        let registry = mk_registry();
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
             .await
             .expect("bind ok");
         let addr = listener.local_addr().expect("local_addr");
 
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             listener
-                .serve(async move {
-                    let _ = rx.await;
-                })
+                .serve(
+                    async move {
+                        let _ = rx.await;
+                    },
+                    drain,
+                )
                 .await
                 .expect("serve ok")
         });
@@ -364,14 +415,21 @@ mod tests {
     async fn serves_honors_shutdown_signal() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
-        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind");
+        let registry = mk_registry();
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind");
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = oneshot::channel::<()>();
         let start = std::time::Instant::now();
         let server = tokio::spawn(async move {
             listener
-                .serve(async move {
-                    let _ = rx.await;
-                })
+                .serve(
+                    async move {
+                        let _ = rx.await;
+                    },
+                    drain,
+                )
                 .await
                 .expect("serve")
         });
@@ -394,14 +452,21 @@ mod tests {
     async fn serves_drains_in_flight_connection_within_budget() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
-        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind");
+        let registry = mk_registry();
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             listener
-                .serve(async move {
-                    let _ = rx.await;
-                })
+                .serve(
+                    async move {
+                        let _ = rx.await;
+                    },
+                    drain,
+                )
                 .await
                 .expect("serve")
         });
@@ -447,14 +512,21 @@ mod tests {
     async fn serves_aborts_stragglers_past_drain_budget() {
         let cfg = mk_listener_cfg("127.0.0.1", 0);
         let h: Arc<dyn ConnectionHandler> = Arc::new(StalledHandler);
-        let listener = Listener::bind(&cfg, h, mk_registry()).await.expect("bind");
+        let registry = mk_registry();
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             listener
-                .serve(async move {
-                    let _ = rx.await;
-                })
+                .serve(
+                    async move {
+                        let _ = rx.await;
+                    },
+                    drain,
+                )
                 .await
         });
 
@@ -660,10 +732,14 @@ filter_chains:
             .expect("gauge registers");
         assert_eq!(cx_active.value(), 0, "gauge starts at zero");
 
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(listener.serve(async move {
-            let _ = rx.await;
-        }));
+        let server = tokio::spawn(listener.serve(
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
 
         // Open 1 connection; HoldHandler keeps it live until we release.
         let _stream = tokio::net::TcpStream::connect(addr)
@@ -717,10 +793,14 @@ filter_chains:
             .expect("gauge registers");
         assert_eq!(cx_active.value(), 0, "gauge starts at zero");
 
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(listener.serve(async move {
-            let _ = rx.await;
-        }));
+        let server = tokio::spawn(listener.serve(
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
 
         // Open 5 connections concurrently; HoldHandler keeps them live.
         let mut streams = Vec::with_capacity(5);
@@ -792,10 +872,14 @@ filter_chains:
             "counter starts at zero after bind"
         );
 
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(listener.serve(async move {
-            let _ = rx.await;
-        }));
+        let server = tokio::spawn(listener.serve(
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
 
         // Drive N=3 successful connections; counter must remain 0 (increment
         // is gated to the Err arm, not the Ok arm).
@@ -846,10 +930,14 @@ filter_chains:
             .expect("counter registers");
         assert_eq!(cx_total.value(), 0, "counter starts at zero");
 
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(listener.serve(async move {
-            let _ = rx.await;
-        }));
+        let server = tokio::spawn(listener.serve(
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
 
         // Open and immediately close 3 TCP connections; each accept
         // increments the counter exactly once per signpost 5.
@@ -872,6 +960,112 @@ filter_chains:
             .expect("serve resolves within 6s")
             .expect("join")
             .expect("serve ok");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Task 6 (D12): `Listener::serve` 2-arg widening (shutdown, drain)
+    // + RAII inc/dec of `listener_manager.total_listeners_active`.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Task 6 (D12): `Listener::serve` exits via the new `drain.drain_signal()`
+    /// select arm even when the shutdown future never resolves. Drives serve
+    /// with `std::future::pending::<()>()` as the shutdown arm (the only way
+    /// out is the drain arm), then fires `drain.drain()` from the main task
+    /// and asserts the serve handle resolves within `DRAIN_BUDGET + ε`.
+    ///
+    /// Also asserts the RAII guard's Drop fires after serve returns:
+    /// `listener_manager.total_listeners_active` gauge must read `0`
+    /// post-serve (the inc-on-construct/dec-on-Drop guard wraps the full
+    /// serve body including the post-loop drain-wait block, so the gauge
+    /// returns to zero by the time the serve task's `JoinHandle` resolves).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serve_returns_when_drain_signal_fires() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
+        let registry = mk_registry();
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind ok");
+        let drain = Arc::new(DrainState::new(&registry));
+
+        let serve_handle =
+            tokio::spawn(listener.serve(std::future::pending::<()>(), Arc::clone(&drain)));
+
+        // Brief yield so serve enters its `tokio::select!` (and the
+        // first iteration's `drain_signal()` snapshot is anchored).
+        // The select arm is poll-driven; a small sleep gives the spawned
+        // task time to schedule and reach the select.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Fire the drain signal — serve's second select arm must observe
+        // it, drop the listener, and fall through to the post-loop
+        // drain-wait block (no in-flight connections, so it completes
+        // immediately).
+        drain.drain();
+
+        tokio::time::timeout(
+            DRAIN_BUDGET + std::time::Duration::from_millis(500),
+            serve_handle,
+        )
+        .await
+        .expect("serve must return within DRAIN_BUDGET + 500ms of drain signal")
+        .expect("serve task join")
+        .expect("serve returns Ok");
+
+        // RAII guard's Drop must have decremented the gauge to 0.
+        let snapshot: std::collections::BTreeMap<_, _> = registry.snapshot().into_iter().collect();
+        let handle = snapshot
+            .get("listener_manager.total_listeners_active")
+            .expect("listener_manager.total_listeners_active gauge must be registered");
+        match handle {
+            envoy_stats::StatHandle::Gauge(g) => assert_eq!(
+                g.value(),
+                0,
+                "gauge must return to 0 after serve exits (RAII Drop fired)",
+            ),
+            _ => panic!("listener_manager.total_listeners_active is not a gauge"),
+        }
+    }
+
+    /// Task 6 (D12): mirror of `serves_honors_shutdown_signal` against the
+    /// new 2-arg `Listener::serve(shutdown, drain)` signature — verifies the
+    /// shutdown arm still resolves the loop even with an unfired drain
+    /// observed concurrently. Signature-update churn coverage: the new arm
+    /// is additive (does NOT replace the shutdown arm), so the shutdown
+    /// path must remain functional verbatim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn serves_honors_shutdown_signal_with_drain_param() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
+        let registry = mk_registry();
+        let listener = Listener::bind(&cfg, h, Arc::clone(&registry))
+            .await
+            .expect("bind");
+        let drain = Arc::new(DrainState::new(&registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        let start = std::time::Instant::now();
+        let server = tokio::spawn(async move {
+            listener
+                .serve(
+                    async move {
+                        let _ = rx.await;
+                    },
+                    drain,
+                )
+                .await
+                .expect("serve")
+        });
+
+        tx.send(()).expect("signal");
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .expect("serve resolves within 2s of empty shutdown")
+            .expect("join");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "serve took too long: {:?}",
+            start.elapsed(),
+        );
     }
 }
 

@@ -242,9 +242,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
                 tracing::info!(addr = %bind_addr, cluster = %tp_cfg.cluster, "envoy-rust listening (tcp_proxy)");
                 let shutdown = token.clone();
+                let drain_for_listener = std::sync::Arc::clone(&drain);
                 set.spawn(async move {
                     listener
-                        .serve(async move { shutdown.cancelled().await })
+                        .serve(
+                            async move { shutdown.cancelled().await },
+                            drain_for_listener,
+                        )
                         .await
                         .map_err(|e| anyhow::anyhow!(e))
                 });
@@ -340,9 +344,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     "envoy-rust listening (http_connection_manager)",
                 );
                 let shutdown = token.clone();
+                let drain_for_listener = std::sync::Arc::clone(&drain);
                 set.spawn(async move {
                     listener
-                        .serve(async move { shutdown.cancelled().await })
+                        .serve(
+                            async move { shutdown.cancelled().await },
+                            drain_for_listener,
+                        )
                         .await
                         .map_err(|e| anyhow::anyhow!(e))
                 });

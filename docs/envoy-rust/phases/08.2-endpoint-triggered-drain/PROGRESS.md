@@ -678,3 +678,116 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 **None at the differential / fixture surface.** Task 5 lands the wire-state mapping (per parent-08 SPEC §5.5) BUT no shipped fixture (0001-0014) POSTs to `/drain_listeners` or `/healthcheck/fail`, so every fixture observes `DrainStage::Live` for its `/server_info.state` (→ "LIVE", unchanged) and `/ready` (→ 200 OK "LIVE\n", unchanged) reads. Fixture 0011 (06.1 admin stats) stays GREEN: it scrapes `/stats` + `/stats/prometheus`, both of which are unaffected by Task 5 (no DrainState read on those paths). Fixture 0014 (08.1 admin config_dump) stays GREEN: it scrapes `/config_dump` (untouched by Task 5) + `/server_info` (state stays "LIVE" because no drain POST landed) + `/clusters` + `/listeners` + `/ready` (200 LIVE under default `Live` stage). Fixture 0015 at Task 8 is the first differential surface to exercise the new 503 path. The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
 
 Regression-equivalence on fixtures 0001-0014 preserved by construction: the bilateral `state == "LIVE"` and `/ready == 200 LIVE` assertions remain true because both upstream Envoy AND envoy-rust observe `DrainStage::Live` throughout each fixture's scrape window (no fixture issues a drain POST).
+
+## Task 6 (D12 — `Listener::serve` 2-arg widening + `listener_manager.total_listeners_active` RAII guard)
+
+### Work summary
+
+Widens `Listener::serve` from 1-arg `(shutdown)` to 2-arg `(shutdown, drain: Arc<DrainState>)`. Adds a second `tokio::select!` arm `_ = drain.drain_signal() => { … }` positioned between the existing shutdown arm and the accept arm; either signal triggers the same drain code path (`drop(listener); break;` → fall through to the post-loop drain-wait + `DRAIN_BUDGET` timeout block). The `tokio::pin!(shutdown)` placement is preserved verbatim (the shutdown arm reads `&mut shutdown`); the new arm reconstructs `drain.drain_signal()` on each loop iteration, which is correct per Task 1 fixup's TOCTOU fix: `DrainState::drain_signal` anchors its `Notified` snapshot BEFORE the state load, and an already-`Draining` state short-circuits to `std::future::ready(())` so the arm fires on the very next iteration. Only the log message between the two arms differs (`"listener shutdown signal received; draining"` vs `"listener drain signal received; draining"`).
+
+Adds a `ListenerManagerActiveGuard(Arc<envoy_stats::Gauge>)` RAII helper at module scope (above `impl std::fmt::Debug for Listener`). `ListenerManagerActiveGuard::new(gauge)` calls `gauge.inc()` then stores the `Arc`; `impl Drop` calls `self.0.dec()`. Inside `Listener::serve`, the guard is constructed FIRST (`let _lm_guard = ListenerManagerActiveGuard::new(Arc::clone(self.listener_manager_active()));`) so its Drop fires LAST per Rust's reverse-declaration drop order — that places the dec AFTER the post-loop drain-wait + DRAIN_BUDGET timeout block, so the gauge returns to 0 only once stragglers have joined (or been aborted). Mirrors the 06.3 `cx_active` per-connection guard pattern at per-listener granularity.
+
+Removes the 2 `#[allow(dead_code)]` annotations Task 2 added: one on the `listener_manager_active` field at `crates/envoy-listener/src/lib.rs:109` (pre-Task-6); one on the `pub(crate) fn listener_manager_active()` accessor at `crates/envoy-listener/src/lib.rs:194` (pre-Task-6). Both annotations carried inline doc-comments at Task 2 explicitly naming Task 6 as the removal point ("Task 6 (D12) removes the allow when it hoists the gauge into the RAII guard at `serve` entry/exit"). The production-side `ListenerManagerActiveGuard::new` call now consumes both the accessor and the field's Arc, so leaving the annotations would itself trip `clippy::useless_attribute` under `-D warnings`.
+
+Threads `Arc::clone(&drain)` into both data-plane `Listener::serve(...)` call sites in `crates/envoy-bin/src/main.rs`: the tcp_proxy arm at `main.rs:244-253` (was `main.rs:234-240` pre-Task-6, shifted +1 by the surrounding edit) and the HCM arm at `main.rs:343-353` (was `main.rs:333-338`). At each site the existing `let shutdown = token.clone();` is followed by a new `let drain_for_listener = std::sync::Arc::clone(&drain);` rebind so the `Arc<DrainState>` moves into the `set.spawn(async move { … })` closure alongside `shutdown` (the closure can't capture `drain` by reference; the source-level rename to `drain_for_listener` makes the move explicit and avoids shadowing the outer `drain` binding still in scope for the admin-handler construction at `main.rs:368-377`). The echo path at `main.rs:181-189` uses `echo::serve` directly + the admin path at `main.rs:368-389` uses `envoy_admin::serve` directly — both naturally excluded from drain observation per parent-08 SPEC §5.5 + 08.2 PLAN architecture-decision lock-in #12.
+
+Updates all 8 existing in-file `Listener::serve(...)` test call sites in `crates/envoy-listener/src/lib.rs::tests` to the new 2-arg signature: `serves_accepts_and_dispatches_to_handler`, `serves_honors_shutdown_signal`, `serves_drains_in_flight_connection_within_budget`, `serves_aborts_stragglers_past_drain_budget`, `listener_cx_active_increments_on_accept_decrements_on_close`, `listener_cx_active_monotonic_then_decreasing_under_burst`, `listener_cx_accept_failed_increments_on_accept_error`, and `listener_increments_cx_total_on_accept`. Each test that already had a `registry: Arc<StatsRegistry>` in scope (for `Listener::bind` / counter+gauge re-registration) clones it once via `Arc::clone(&registry)` and constructs `let drain = Arc::new(DrainState::new(&registry));` immediately before the `tokio::spawn(listener.serve(…, drain))` call. Tests that previously moved `mk_registry()` directly into `Listener::bind` were widened to bind the value to a local `registry` first then pass `Arc::clone(&registry)` to `bind` (3 sites required this adjustment; the 5 cx_* tests already used `Arc::clone(&registry)`).
+
+### Tests landed (2)
+
+Both colocated in the existing `tests` module at the bottom of `crates/envoy-listener/src/lib.rs`, positioned immediately before the `drain_budget_constant_tests` module-level boundary (the canonical "new tests live at the bottom of the existing module" precedent from Tasks 2/3/4/5 in this phase + 06.1/06.3 cohort tests in this same file).
+
+1. **`serve_returns_when_drain_signal_fires`** (multi-thread tokio test) — Binds a `Listener` on `127.0.0.1:0` with `EchoHandler`, constructs a fresh `Arc<DrainState>` against the same registry, spawns `listener.serve(std::future::pending::<()>(), Arc::clone(&drain))` (the shutdown future NEVER resolves, so the only way `serve` can exit is via the drain arm), yields 100ms so the spawned task reaches its `tokio::select!` and anchors the first `drain_signal()` snapshot, then calls `drain.drain()` from the main task. Asserts (a) `tokio::time::timeout(DRAIN_BUDGET + 500ms, serve_handle)` resolves — verifying the new select arm fired and the drain code path ran to completion within budget — and (b) post-serve `snapshot.get("listener_manager.total_listeners_active")` returns `Some(StatHandle::Gauge(g))` with `g.value() == 0`, verifying the RAII guard's `Drop` decremented the gauge after the post-loop drain-wait block completed. The `Some(...)` assertion uses `.expect("listener_manager.total_listeners_active gauge must be registered")` rather than a silent `if let Some(...)` per the deviation #1 hardening below.
+2. **`serves_honors_shutdown_signal_with_drain_param`** — Mirror of the existing `serves_honors_shutdown_signal` shape against the new 2-arg signature. Constructs a fresh `Arc<DrainState>` carrying no fired drain, spawns `listener.serve(rx_await_shutdown, drain)`, fires shutdown immediately via `tx.send(())`, asserts serve resolves within 2s. Verifies the shutdown arm remains functional verbatim alongside the new drain arm — the select arms are additive, not exclusive.
+
+Red phase (Step 2) verified pre-implementation: `cargo test -p envoy-listener --lib` produced **10 × E0061** (`this method takes 1 argument but 2 arguments were supplied`) — 8 from the existing test-call-site updates above plus 2 from the new tests. Both new tests cited `pub async fn serve` (1-arg) at `lib.rs:209` as the method definition; both also flagged the unexpected `Arc<DrainState>` 2nd argument with the canonical `help: remove the extra argument` suggestion. The full red-phase build error count was a clean 10 (no E0599 / no E0277 / no other downstream type errors), confirming the pre-impl shape needs ONLY the signature widening + the RAII guard hoist to turn green. Green phase (Step 4) verified post-implementation: `cargo test -p envoy-listener --lib` reads `test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s` (28 → 30, +2 exactly the new tests).
+
+### Per-task deviations from PLAN
+
+1. **`serve_returns_when_drain_signal_fires` post-serve gauge assertion uses `.expect("…")` + `assert_eq!` instead of the PLAN-snippet `if let Some(...)`.** The PLAN's worked example (Step 1) used `if let Some(stat) = snapshot.get("…") { match stat { StatHandle::Gauge(g) => assert_eq!(g.value(), 0, …), _ => panic!(…) } }`. The critical-execution-notes section flagged this as a soft assertion — if the gauge were silently missing, the test would pass without observing the post-drop state. Hardened at `crates/envoy-listener/src/lib.rs:1019-1029` to `let handle = snapshot.get(...).expect("listener_manager.total_listeners_active gauge must be registered");` followed by the same `match handle { StatHandle::Gauge(g) => assert_eq!(…), _ => panic!(…) }`. Functionally a strict superset of the PLAN assertion: the gauge-registered invariant is now load-bearing on the test outcome rather than silently bypassed.
+
+2. **`serve_returns_when_drain_signal_fires` uses a 100ms sleep to "let serve reach its select".** The PLAN prescribed this directly (Step 1 verbatim: "yield 100ms so serve registers as drain_signal waiter"). The critical-execution-notes section flagged this as flake-prone vs Task 1's `Barrier` rendezvous pattern. Considered alternatives:
+   - **Barrier**: The serve body owns its `tokio::select!` privately — the spawned task would need to participate in the barrier BEFORE the select, but serve's body is opaque to the test (any in-serve barrier would require widening serve's signature again or wrapping the `EchoHandler::handle` to trip the barrier on first invocation; widening serve is out of scope for Task 6, and wrapping `handle` would change WHAT signals "serve is in select" — `handle` only fires AFTER accept, which is reached AFTER select).
+   - **`tokio::task::yield_now()` loop**: Same problem — no observable "serve is at select" surface from the outside.
+   - **Status quo**: The 100ms is a generous budget for spawning + reaching the select on macOS/Linux x86_64/arm64 dev machines + CI. The DRAIN_BUDGET + 500ms outer timeout (5500ms total) is the test's actual deadline; the 100ms internal sleep is well within the slack. If CI flakes here, the most cost-effective fix is bumping the sleep to 250ms-500ms (still well within 5500ms slack). Recorded under deviations rather than altering the PLAN prescription, per the doctrine ("the 100ms sleep is a known flake-prone pattern; if you found a deterministic alternative, document"). No deterministic alternative found that doesn't require widening `Listener::serve`'s public surface — deferred to a future hardening pass if real CI flake data emerges.
+
+3. **The new RAII guard lives at module scope (above `impl Listener`), not inside `impl Listener`.** Rust doesn't allow nested `impl Drop` blocks inside an outer `impl`; the helper struct + its Drop must live at module scope. Placed at `crates/envoy-listener/src/lib.rs:109-129` — immediately after the `Listener` struct declaration and before `impl std::fmt::Debug for Listener` so a reader scanning the file sees the field declaration → guard helper → Debug impl → main impl in source order. The `struct ListenerManagerActiveGuard(Arc<envoy_stats::Gauge>);` is private (no `pub`) — only `Listener::serve` constructs one, mirroring 06.3's `ConnGaugeGuard` (similarly private at the per-connection level).
+
+4. **Both envoy-bin call sites rebind `drain` to `drain_for_listener` before the `set.spawn(async move { … })` move.** The bare `Arc::clone(&drain)` could have been inlined inside the closure as a positional arg to `.serve(…, Arc::clone(&drain))`, BUT the surrounding `async move { listener.serve(…).await.map_err(…) }` closure captures `listener` and `shutdown` by move — adding the `Arc::clone(&drain)` inline would mean the clone happens INSIDE the moved closure (the inner `&drain` would be a move-captured reference, which is `&Arc<DrainState>` not `&'static Arc<DrainState>`; the compiler rejects this as a borrow that outlives the outer scope). The cleanest fix is to clone OUTSIDE the closure into a fresh local (`drain_for_listener`) and move THAT into the closure. Naming the rebind `drain_for_listener` rather than reusing `drain` makes the move semantics explicit and avoids shadowing the outer `drain` binding still in scope for the admin-handler construction at `main.rs:368-377` (which also needs `Arc::clone(&drain)`).
+
+5. **No new ADRs (per the PLAN architecture-decision lock-in #1: 08.2 ships zero new ADRs).** The RAII guard pattern is a direct mirror of 06.3's `ConnGaugeGuard` — no new design freedom is being claimed at Task 6. The 2-arg widening of `Listener::serve` was authorized at parent-08 SPEC §5.5 / 08.2 SPEC §3 D12 and walked through in the 08.2 PLAN's architecture-decision section (Task 6 spec, "D12 — Listener::serve 2-arg widening"). The ledger head stays **ADR-0032**.
+
+### Confirmations
+
+- **The 2 `#[allow(dead_code)]` annotations on `Listener::listener_manager_active` field + accessor were REMOVED.** Confirmed by:
+  - The field declaration at `crates/envoy-listener/src/lib.rs:106` now reads `listener_manager_active: Arc<envoy_stats::Gauge>,` with NO `#[allow(dead_code)]` immediately above.
+  - The accessor at `crates/envoy-listener/src/lib.rs:194-196` now reads `pub(crate) fn listener_manager_active(&self) -> &Arc<envoy_stats::Gauge> { &self.listener_manager_active }` with NO `#[allow(dead_code)]` immediately above.
+  - Gate 2 (clippy with `-D warnings`) is GREEN — clippy would flag a useless `#[allow(dead_code)]` on a now-consumed item as `clippy::useless_attribute`; the clean clippy verdict is structural evidence the annotations were both removed AND no longer needed.
+- **All existing in-file `Listener::serve(...)` test call sites updated to 2-arg.** 8 call sites total — enumerated above under "Work summary" final paragraph. Verified by `grep -c "\.serve(" crates/envoy-listener/src/lib.rs` → 10 matches (8 updated test sites + the 2 new tests' `.serve(...)` calls). Zero remaining 1-arg `.serve(...)` calls anywhere in the crate; the build would not compile otherwise (the unused `drain` arg would not trigger a type error, but every test site that needs the new arg was widened).
+- **Both envoy-bin `listener.serve(...)` call sites updated to 2-arg.** tcp_proxy arm at `crates/envoy-bin/src/main.rs:244-253` (was 234-240 pre-Task-6) + HCM arm at `crates/envoy-bin/src/main.rs:343-353` (was 333-338 pre-Task-6). Both now pass `drain_for_listener: Arc<DrainState>` as the new 2nd arg. Verified by Gate 3 (`cargo build --workspace --all-targets`) GREEN — envoy-bin would not compile otherwise.
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `crates/envoy-listener/src/lib.rs` | +241 | -47 |
+| `crates/envoy-bin/src/main.rs` | +10 | -2 |
+| **Total source:** | **+251** | **-49** |
+
+Test-count delta: `envoy-listener` lib bucket grew **28 → 30** (+2, exactly the 2 new tests in `tests` module); no other crate touched. Workspace total grew by the same +2.
+
+No new top-level Cargo deps. `DrainState` was already re-exported from `envoy-listener::lib` at Task 1 (`pub use drain::{DrainStage, DrainState}`) and consumed in-file at this crate's `tests` module via the existing `use super::*;`. `envoy_listener::DrainState` is already on envoy-bin's existing dep graph (Task 4 added the `Arc::new(envoy_listener::DrainState::new(&registry))` startup construction). Crate root `crates/envoy-listener/src/lib.rs` still carries `#![forbid(unsafe_code)]`; zero new unsafe blocks.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff). One iteration: initial draft of the `serve_returns_when_drain_signal_fires` `tokio::time::timeout(DRAIN_BUDGET + Duration::from_millis(500), serve_handle)` call exceeded the 100-col line limit (rustfmt rewrote it to break across three lines); `cargo fmt --all` applied the reformat in-place, no semantic change.
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean across all 8 workspace crates, zero warnings, zero errors). The 2 `#[allow(dead_code)]` removals were a hard prerequisite — leaving them would have tripped `clippy::useless_attribute` since the field + accessor are now consumed by `ListenerManagerActiveGuard::new`.
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 workspace crates + 2 helper bin crates compiled — `envoy-listener` rebuilt because of the widened serve signature + RAII guard + new test call shape; `envoy-bin` rebuilt because of the 2 updated call sites + the new `drain_for_listener` rebind; all downstream test compilation succeeded).
+
+**Gate 4 — `cargo test --workspace`:** PASS — every per-bucket `test result:` line reads `ok. N passed; 0 failed`; the `envoy-listener` lib bucket grew from 28 → 30 tests (the 2 new `tests::{serve_returns_when_drain_signal_fires, serves_honors_shutdown_signal_with_drain_param}`). Focused re-run: `cargo test -p envoy-listener --lib` reads `30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.06s`. No flakes observed on the single authoritative workspace run — the 100ms sleep in `serve_returns_when_drain_signal_fires` did not flake on this run; should it flake on CI, the deviation #2 note above recommends bumping to 250-500ms (still within the DRAIN_BUDGET + 500ms outer 5500ms deadline).
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per 07.1-REVIEW doctrine.
+
+### Differential surface delta
+
+**None at the differential / fixture surface.** Task 6 wires the wire-level drain observation into the data-plane listener accept loop, but no shipped fixture (0001-0014) POSTs to `/drain_listeners` — the `drain.drain_signal()` arm in `Listener::serve` is reachable only after the admin POST handler fires `handler.drain().drain()`. Fixture 0015 at Task 8 is the first differential surface to drive a POST `/drain_listeners` against a live envoy-rust + observe both the listener's `serve` returning (graceful drain) and the `listener_manager.total_listeners_active` gauge decrementing to 0. The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
+
+Regression-equivalence on fixtures 0001-0014 preserved by construction: the bilateral `Listener::serve(shutdown, drain)` continues to honor the shutdown arm verbatim (verified by `serves_honors_shutdown_signal` AND the new `serves_honors_shutdown_signal_with_drain_param` test); no fixture issues a drain POST, so the new drain arm never fires within any fixture's scrape window. The `listener_manager.total_listeners_active` gauge increments to 1 (or 2 if a fixture spawns both a tcp_proxy and HCM listener, though no shipped fixture does) at envoy-rust startup and stays at 1 through the entire fixture run — Task 7 (D16 admin scrape extension) will surface the gauge in `/stats` + `/stats/prometheus` so the value is observable, but no current fixture asserts on it. The first differential-fixture surface asserting on the gauge value's drop-to-0 post-drain lands at Task 8 (fixture 0015).
