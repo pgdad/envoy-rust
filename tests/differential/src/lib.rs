@@ -91,7 +91,16 @@ pub enum Driver {
         path: String,
         host: String,
         expected_status: u16,
-        expected_body: BodyRule,
+        // 08.1 Task 11: `BodyRule` grew at Task 10 (added two new struct-form
+        // variants with 5 + 4 `Vec<String>` allow-list fields), and Task 11
+        // shrunk the sibling `Driver::AdminScrape` variant (the inline
+        // `path` / `expected_status` / `expected_content_type` / `expected_body_rule`
+        // tuple moved into `AdminScrapeCase` carried via `Vec<AdminScrapeCase>`).
+        // Together these tip `Driver` past clippy's `large_enum_variant`
+        // threshold (Http1WithAccessLog is now ~285 bytes larger than the
+        // second-largest variant). Boxing the body rule here is the
+        // minimal-surface fix the clippy hint itself suggests.
+        expected_body: Box<BodyRule>,
         expected_headers: HeaderRule,
         #[serde(default)]
         extra_headers: Vec<(String, String)>,
@@ -114,19 +123,43 @@ pub enum Driver {
     },
     /// 06.1 D6.a: drive a sequence of HCM-side `PreRequest`s (so the registry
     /// has counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
-    /// Relaxed-ordered counter writes become visible), then scrape the admin
-    /// listener at `path` and assert on the response. The
-    /// `expected_body_rule` reuses the harness-level `BodyRule` enum so
-    /// `BodyRule::PrometheusExposition` can drive metric-name-set equality
-    /// modulo per-fixture allow-lists.
+    /// Relaxed-ordered counter writes become visible), then perform one or
+    /// more admin-listener scrapes and assert on each response. The
+    /// per-sub-case `expected_body_rule` reuses the harness-level `BodyRule`
+    /// enum so `BodyRule::PrometheusExposition` can drive metric-name-set
+    /// equality modulo per-fixture allow-lists, while
+    /// `BodyRule::JsonShape` + `BodyRule::TextLines` cover the 08.1
+    /// `/config_dump` + `/server_info` + `/clusters` + `/listeners` family.
+    ///
+    /// 08.1 Task 11: widened from a SINGLE per-invocation `path` /
+    /// `expected_*` tuple to a `Vec<AdminScrapeCase>` so fixture 0014 can
+    /// scrape 4 admin endpoints in one fixture without adding a new
+    /// `Driver` variant (architecture-decision lock-in #13). Fixture 0011
+    /// migrated in lockstep to a single-element `scrapes:` list with no
+    /// semantic change.
     AdminScrape {
         #[serde(default)]
         pre_requests: Vec<PreRequest>,
-        path: String,
-        expected_status: u16,
-        expected_content_type: String,
-        expected_body_rule: BodyRule,
+        scrapes: Vec<AdminScrapeCase>,
     },
+}
+
+/// 08.1 Task 11: one admin-listener sub-case inside `Driver::AdminScrape`.
+/// The `path` + `expected_*` tuple was previously inline on the variant
+/// (06.1 single-scrape shape); fixture 0014 needs 4 sub-cases against the
+/// same proxy invocation, so the per-sub-case tuple moves into a dedicated
+/// struct that `Driver::AdminScrape` carries as `Vec<AdminScrapeCase>`.
+///
+/// `expected_content_type` is matched case-insensitively by
+/// `check_content_type` (e.g. envoy ↔ envoy-rust may format media-type
+/// parameters differently; the harness elides the difference).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdminScrapeCase {
+    pub path: String,
+    pub expected_status: u16,
+    pub expected_content_type: String,
+    pub expected_body_rule: BodyRule,
 }
 
 /// 06.1 D6.a: minimal HTTP/1.1 request shape used by `Driver::AdminScrape` to
@@ -227,20 +260,33 @@ pub enum BodyRule {
         #[serde(default)]
         value_present_only: Vec<String>,
     },
-    /// 08.1 Task 10 (D15): parse BOTH bodies as JSON objects and assert
-    /// schema-level invariants without requiring byte-for-byte equality.
-    /// Used by `/config_dump` and similar JSON-emitting admin endpoints
-    /// where Envoy's emission carries fields envoy-rust does not (and
-    /// vice versa). `required_keys` are fail-strict on BOTH sides;
-    /// `required_subtree` walks a dotted path through both bodies and
-    /// asserts JSON-string equality of the addressed sub-value. The
-    /// `allowlist_envoy_only_keys`, `allowlist_envoy_rust_only_keys`, and
-    /// `value_may_differ_keys` fields are accepted at the schema level
-    /// so fixtures can declare them now, but do NOT participate in fail
-    /// logic at Task 10 — strictness is intentionally deferred to Task 11
-    /// (fixture 0014 will surface what envoy ↔ envoy-rust diff shape the
-    /// `/config_dump` payload actually exhibits, and the strictness model
-    /// will tighten then per PLAN line 2231/2301 guidance).
+    /// 08.1 Task 10 (D15) + Task 11 strictness wiring: parse BOTH bodies
+    /// as JSON objects and assert schema-level invariants without
+    /// requiring byte-for-byte equality. Used by `/config_dump` +
+    /// `/server_info` and similar JSON-emitting admin endpoints where
+    /// Envoy's emission carries fields envoy-rust does not (and vice
+    /// versa).
+    ///
+    /// Fail strictness (Task 11):
+    /// - `required_keys`: every key MUST appear on the top-level JSON
+    ///   object on BOTH sides.
+    /// - `required_subtree`: walk `path` (dotted-segment selector) on
+    ///   both bodies AND assert `envoy_sub == expected` AND
+    ///   `rust_sub == expected` (after JSON-string normalization). The
+    ///   `envoy_sub == rust_sub` cross-side consistency check follows
+    ///   from transitivity (both equal the same expected).
+    /// - Top-level keys present on only the envoy side that are NOT in
+    ///   `allowlist_envoy_only_keys` AND NOT in `value_may_differ_keys`
+    ///   MUST also appear on the envoy-rust side; symmetrically for
+    ///   rust-only keys vs `allowlist_envoy_rust_only_keys`.
+    /// - Top-level keys present on BOTH sides and NOT in
+    ///   `value_may_differ_keys` MUST serialize equal (the addressed
+    ///   sub-values rendered via `serde_json::to_string`).
+    ///
+    /// All allow-lists are top-level-keys-only — nested keys are
+    /// expressed via `required_subtree.path`. This is sufficient for
+    /// 08.1's admin-endpoint diff territory; if a future endpoint needs
+    /// per-nested-key control, extend the strictness model at that point.
     JsonShape {
         #[serde(default)]
         required_keys: Vec<String>,
@@ -253,16 +299,29 @@ pub enum BodyRule {
         #[serde(default)]
         value_may_differ_keys: Vec<String>,
     },
-    /// 08.1 Task 10 (D15): treat both bodies as UTF-8 text and assert
-    /// per-line invariants. Used by `/clusters` and `/listeners` and other
-    /// line-oriented admin endpoints. `required_lines` must each appear
-    /// verbatim on BOTH sides; `required_line_prefixes` must each be the
-    /// prefix of at least one line on BOTH sides (covers per-listener
-    /// stat lines like `listener_0::counter_<varying-suffix>`). The
-    /// `allowlist_envoy_only_lines` / `allowlist_envoy_rust_only_lines`
-    /// fields are accepted at the schema level but do NOT participate in
-    /// fail logic at Task 10 — same Task 11 strictness-deferral disposition
-    /// as `JsonShape`.
+    /// 08.1 Task 10 (D15) + Task 11 strictness wiring: treat both bodies
+    /// as UTF-8 text and assert per-line invariants. Used by `/clusters`
+    /// and `/listeners` and other line-oriented admin endpoints.
+    ///
+    /// Fail strictness (Task 11):
+    /// - `required_lines`: every entry MUST appear verbatim on BOTH
+    ///   sides.
+    /// - `required_line_prefixes`: every entry MUST be the prefix of at
+    ///   least one line on BOTH sides (covers varying-suffix lines
+    ///   like `listener_0::counter_<dynamic>`).
+    /// - Lines present on only the envoy side that are NOT in
+    ///   `allowlist_envoy_only_lines` AND that do NOT start with any
+    ///   prefix in `allowlist_envoy_only_line_prefixes` MUST also
+    ///   appear on the envoy-rust side; symmetrically for rust-only
+    ///   lines.
+    ///
+    /// The `*_line_prefixes` allow-list family (Task 11 NEW) absorbs
+    /// address-bearing per-side lines whose suffix varies per fixture
+    /// run (e.g. fixture 0014's `/clusters` per-endpoint counter lines
+    /// like `backend::192.168.65.254:<ephemeral>::cx_active::0`, or
+    /// `/listeners` `ingress_http::<addr>:<port>` per-side line shape).
+    /// A line is allow-listed if it appears verbatim in the exact-line
+    /// allow-list OR starts with any entry in the prefix allow-list.
     TextLines {
         #[serde(default)]
         required_lines: Vec<String>,
@@ -272,10 +331,19 @@ pub enum BodyRule {
         allowlist_envoy_only_lines: Vec<String>,
         #[serde(default)]
         allowlist_envoy_rust_only_lines: Vec<String>,
+        /// 08.1 Task 11 NEW: per-side line-prefix allow-list. Absorbs
+        /// address-bearing varying-suffix lines that cannot be enumerated
+        /// verbatim because the port/IP/timestamp segment shifts per
+        /// fixture run.
+        #[serde(default)]
+        allowlist_envoy_only_line_prefixes: Vec<String>,
+        #[serde(default)]
+        allowlist_envoy_rust_only_line_prefixes: Vec<String>,
     },
 }
 
-/// 08.1 Task 10 (D15) helper for `BodyRule::JsonShape::required_subtree`.
+/// 08.1 Task 10 (D15) + Task 11 strictness wiring: helper for
+/// `BodyRule::JsonShape::required_subtree`.
 ///
 /// `path` is a dotted-segment selector walked via `walk_pointer`; each
 /// segment is interpreted as an `usize` array index if it parses as one,
@@ -284,9 +352,15 @@ pub enum BodyRule {
 /// `configs` array of a `/config_dump`-shaped payload.
 ///
 /// `expected` is a `serde_yaml::Value` (so fixture YAML can declare the
-/// expected sub-value in YAML-native form) and is compared via
-/// `serde_json::to_string` against the addressed sub-value rendered the
-/// same way. `PartialEq` + `Eq` are derived — `serde_yaml::Value` does
+/// expected sub-value in YAML-native form) and is converted to a
+/// `serde_json::Value` at assertion time (`serde_json::to_value` on the
+/// `serde_yaml::Value`) so it can be JSON-string-compared against the
+/// addressed sub-value on each side.
+///
+/// Task 11 strictness wiring: BOTH `envoy_sub` and `rust_sub` are asserted
+/// equal to `expected` (Task 10 only checked `envoy_sub == rust_sub`,
+/// which would silently accept a bilateral drift away from the documented
+/// shape). `PartialEq` + `Eq` are derived — `serde_yaml::Value` does
 /// implement `Eq` (per `serde_yaml` 0.9.34+deprecated source), so the
 /// `BodyRule::JsonShape` enclosing `#[derive(PartialEq, Eq)]` propagates
 /// cleanly through `Option<JsonSubtreeRule>`.
@@ -1248,8 +1322,12 @@ pub async fn drive_admin_scrape(
     // counter writes are visible to the scrape's read. Do NOT shorten — the
     // exact figure is the documented worst-case Relaxed-ordering visibility
     // window for Counter::inc on x86_64+ARM under the std::sync::atomic
-    // happens-before relations the registry relies on.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // happens-before relations the registry relies on. Guarded on
+    // `pre_requests.is_empty()` so subsequent sub-cases (which pass `&[]`)
+    // hit the admin listener directly without re-paying the 50ms budget.
+    if !pre_requests.is_empty() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     drive_http1(admin_addr, &Http1Method::Get, path, "admin.local", &[])
         .await
@@ -2099,17 +2177,20 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 .context("diff_headers (set_equal_modulo_allow_list)")?;
             }
         }
-        // 06.1 D6.a: HCM pre-requests then admin scrape. Drives both proxies,
-        // applies expected_status / expected_content_type / expected_body_rule
-        // assertions on each side. Body-rule equivalence (Prometheus exposition
-        // metric-name set modulo allow-lists) is enforced by `assert_body_rule`.
+        // 06.1 D6.a / 08.1 Task 11: HCM pre-requests then 1..N admin
+        // scrapes. Drives both proxies, applies per-sub-case
+        // expected_status / expected_content_type / expected_body_rule
+        // assertions on each side. Body-rule equivalence is enforced by
+        // `assert_body_rule` per sub-case.
         Driver::AdminScrape {
             pre_requests,
-            path,
-            expected_status,
-            expected_content_type,
-            expected_body_rule,
+            scrapes,
         } => {
+            if scrapes.is_empty() {
+                bail!(
+                    "Driver::AdminScrape requires at least one sub-case (`scrapes:` must be non-empty)"
+                );
+            }
             let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Driver::AdminScrape requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
@@ -2140,44 +2221,98 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             let mut subject_hcm = std::collections::BTreeMap::new();
             subject_hcm.insert("PORT".to_string(), subject_addr);
 
-            let upstream_resp =
-                drive_admin_scrape(pre_requests, upstream_admin_addr, &upstream_hcm, path)
-                    .await
-                    .context("upstream envoy admin scrape")?;
-            let subject_resp =
-                drive_admin_scrape(pre_requests, subject_admin_addr, &subject_hcm, path)
-                    .await
-                    .context("envoy-rust admin scrape")?;
+            // Pre-requests run ONCE per fixture (not per sub-case). The
+            // 50ms registry-visibility sleep inside `drive_admin_scrape`
+            // also runs at most once because it is now guarded on
+            // `pre_requests.is_empty()` and we pass `&[]` to subsequent
+            // sub-case calls.
+            let mut pre = pre_requests.as_slice();
+            let mut results = Vec::with_capacity(scrapes.len());
+            for case in scrapes {
+                let upstream_resp =
+                    drive_admin_scrape(pre, upstream_admin_addr, &upstream_hcm, &case.path)
+                        .await
+                        .with_context(|| format!("upstream envoy admin scrape: {}", case.path))?;
+                let subject_resp =
+                    drive_admin_scrape(pre, subject_admin_addr, &subject_hcm, &case.path)
+                        .await
+                        .with_context(|| format!("envoy-rust admin scrape: {}", case.path))?;
+                // pre-requests + the 50ms registry-visibility sleep belong
+                // to the first sub-case only. Subsequent sub-cases hit the
+                // admin listener directly.
+                pre = &[];
+                results.push((case, upstream_resp, subject_resp));
+            }
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
 
-            // expected_status: each side independently equals it.
-            if upstream_resp.status != *expected_status {
-                bail!(
-                    "upstream admin status {} != expected {}",
-                    upstream_resp.status,
-                    expected_status,
-                );
+            // 08.1 Task 11 diagnostic: set `DIFFERENTIAL_DUMP_ADMIN=1`
+            // to dump ALL sub-cases' bodies (both sides + content-type)
+            // BEFORE any assertion fires. Used during empirical allow-list
+            // seeding (SPEC §6 signpost 12) to capture both proxies'
+            // outputs in a single failing run rather than iterating
+            // assertion-by-assertion. Leave-on disposition matches the
+            // dispatch-level diagnostics established by 04.x's
+            // RUST_LOG-controlled tracing layer.
+            if std::env::var("DIFFERENTIAL_DUMP_ADMIN").is_ok() {
+                for (case, upstream_resp, subject_resp) in &results {
+                    eprintln!(
+                        "=== {} ===\n--- ENVOY ({}, ct={:?}) ---\n{}\n--- ENVOY-RUST ({}, ct={:?}) ---\n{}\n=== /{} ===",
+                        case.path,
+                        upstream_resp.status,
+                        upstream_resp
+                            .headers
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or(""),
+                        String::from_utf8_lossy(&upstream_resp.body),
+                        subject_resp.status,
+                        subject_resp
+                            .headers
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or(""),
+                        String::from_utf8_lossy(&subject_resp.body),
+                        case.path,
+                    );
+                }
             }
-            if subject_resp.status != *expected_status {
-                bail!(
-                    "subject admin status {} != expected {}",
-                    subject_resp.status,
-                    expected_status,
-                );
+            for (case, upstream_resp, subject_resp) in &results {
+                // expected_status: each side independently equals it.
+                if upstream_resp.status != case.expected_status {
+                    bail!(
+                        "upstream admin status {} != expected {} (path={})",
+                        upstream_resp.status,
+                        case.expected_status,
+                        case.path,
+                    );
+                }
+                if subject_resp.status != case.expected_status {
+                    bail!(
+                        "subject admin status {} != expected {} (path={})",
+                        subject_resp.status,
+                        case.expected_status,
+                        case.path,
+                    );
+                }
+
+                // expected_content_type: each side independently has a
+                // `content-type:` header whose (case-insensitive) value matches.
+                check_content_type(&upstream_resp.headers, &case.expected_content_type)
+                    .with_context(|| format!("upstream admin content-type: {}", case.path))?;
+                check_content_type(&subject_resp.headers, &case.expected_content_type)
+                    .with_context(|| format!("envoy-rust admin content-type: {}", case.path))?;
+
+                // Body rule: dispatch on BodyRule variant.
+                assert_body_rule(
+                    &case.expected_body_rule,
+                    &upstream_resp.body,
+                    &subject_resp.body,
+                )
+                .with_context(|| format!("admin body rule: {}", case.path))?;
             }
-
-            // expected_content_type: each side independently has a
-            // `content-type:` header whose (case-insensitive) value matches.
-            check_content_type(&upstream_resp.headers, expected_content_type)
-                .context("upstream admin content-type")?;
-            check_content_type(&subject_resp.headers, expected_content_type)
-                .context("envoy-rust admin content-type")?;
-
-            // Body rule: dispatch on BodyRule variant. ByteExact compares
-            // bytes; PrometheusExposition compares metric-name sets modulo
-            // per-fixture allow-lists.
-            assert_body_rule(expected_body_rule, &upstream_resp.body, &subject_resp.body)?;
         }
     }
 
@@ -2188,6 +2323,18 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
 /// 06.1 D6.a: assert that the headers carry a `content-type:` whose
 /// (case-insensitive) value equals `expected`. Bails with a descriptive error
 /// if the header is missing or mismatched.
+///
+/// 08.1 Task 11: matches BOTH the bare-media-type-only form (`text/plain`)
+/// AND the parameter-bearing form (`text/plain; charset=UTF-8`) when the
+/// expected value is the bare form. This accommodates fixture 0014's
+/// `/clusters` + `/listeners` envoy ↔ envoy-rust divergence: upstream
+/// Envoy v1.33 emits `text/plain; charset=UTF-8`; envoy-rust emits the
+/// bare `text/plain` (per the renderers in `crates/envoy-admin/src/endpoint.rs`,
+/// Tasks 8 + 9 — content-type pin is intentional, BEHAVIOR_CONTRACT.md
+/// will absorb the charset-parameter variance at the row-level in a
+/// follow-on phase). When `expected` carries explicit parameters (e.g.
+/// fixture 0011's `text/plain; charset=UTF-8` for `/stats/prometheus`),
+/// the actual value MUST carry the same parameter shape — strict match.
 fn check_content_type(headers: &[(String, String)], expected: &str) -> Result<()> {
     let actual = headers
         .iter()
@@ -2196,8 +2343,18 @@ fn check_content_type(headers: &[(String, String)], expected: &str) -> Result<()
         .ok_or_else(|| {
             anyhow::anyhow!("response is missing the `content-type` header (expected {expected:?})")
         })?;
-    if !actual.eq_ignore_ascii_case(expected) {
-        bail!("content-type {actual:?} != expected {expected:?}");
+    // If `expected` has no parameter, allow the actual to optionally carry
+    // any parameter suffix (e.g. `; charset=UTF-8`). Otherwise strict match.
+    let expected_has_param = expected.contains(';');
+    if expected_has_param {
+        if !actual.eq_ignore_ascii_case(expected) {
+            bail!("content-type {actual:?} != expected {expected:?}");
+        }
+    } else {
+        let actual_media = actual.split(';').next().unwrap_or(actual).trim();
+        if !actual_media.eq_ignore_ascii_case(expected) {
+            bail!("content-type {actual:?} (bare {actual_media:?}) != expected {expected:?}");
+        }
     }
     Ok(())
 }
@@ -2292,19 +2449,22 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
             }
             Ok(())
         }
-        // 08.1 Task 10 (D15): JSON-shape assertions. Parse both bodies as
-        // JSON objects; assert required_keys present on BOTH sides + an
-        // optional required_subtree dotted-path walk with JSON-string
-        // equality on the addressed sub-value. The allowlist_* and
-        // value_may_differ_keys fields are accepted at the schema level
-        // but DO NOT participate in fail logic at Task 10 (strictness
-        // intentionally deferred to Task 11 per PLAN line 2231/2301).
+        // 08.1 Task 10 (D15) + Task 11 strictness wiring: JSON-shape
+        // assertions. Parse both bodies as JSON objects; assert:
+        //   - required_keys present on BOTH sides (top-level)
+        //   - required_subtree.expected == envoy_sub AND == rust_sub
+        //     (Task 11: `expected` was a schema-level no-op at Task 10)
+        //   - envoy-only top-level keys NOT in `allowlist_envoy_only_keys`
+        //     AND NOT in `value_may_differ_keys` MUST appear on the
+        //     envoy-rust side (and symmetrically)
+        //   - top-level keys present on BOTH sides and NOT in
+        //     `value_may_differ_keys` MUST serialize equal.
         BodyRule::JsonShape {
             required_keys,
             required_subtree,
-            allowlist_envoy_only_keys: _,
-            allowlist_envoy_rust_only_keys: _,
-            value_may_differ_keys: _,
+            allowlist_envoy_only_keys,
+            allowlist_envoy_rust_only_keys,
+            value_may_differ_keys,
         } => {
             let envoy_json: serde_json::Value = serde_json::from_slice(envoy_body)
                 .context("envoy body is not valid JSON for BodyRule::JsonShape")?;
@@ -2330,30 +2490,105 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
                 let rust_sub = walk_pointer(&rust_json, &subtree.path).with_context(|| {
                     format!("envoy-rust required_subtree path {:?}", subtree.path)
                 })?;
+                // 08.1 Task 11: also assert against `expected` (Task 10
+                // accepted the field but never consulted it). Compare
+                // via the canonical serde_json string form so both YAML-
+                // native scalars and JSON-native values normalize the
+                // same way.
+                let expected_json: serde_json::Value =
+                    serde_json::to_value(&subtree.expected).context(
+                        "converting required_subtree.expected (serde_yaml::Value) to serde_json::Value",
+                    )?;
+                let expected_str = serde_json::to_string(&expected_json)
+                    .context("rendering required_subtree.expected as JSON")?;
                 let envoy_str = serde_json::to_string(envoy_sub)
                     .context("rendering envoy required_subtree sub-value as JSON")?;
                 let rust_str = serde_json::to_string(rust_sub)
                     .context("rendering envoy-rust required_subtree sub-value as JSON")?;
-                if envoy_str != rust_str {
+                if envoy_str != expected_str {
                     bail!(
-                        "required_subtree {:?} mismatch:\n  envoy:      {envoy_str}\n  envoy-rust: {rust_str}",
+                        "required_subtree {:?} envoy != expected:\n  envoy:    {envoy_str}\n  expected: {expected_str}",
                         subtree.path,
+                    );
+                }
+                if rust_str != expected_str {
+                    bail!(
+                        "required_subtree {:?} envoy-rust != expected:\n  envoy-rust: {rust_str}\n  expected:   {expected_str}",
+                        subtree.path,
+                    );
+                }
+            }
+
+            // 08.1 Task 11: top-level key-set diff between envoy and
+            // envoy-rust, modulo the per-side allow-lists + the bilateral
+            // `value_may_differ_keys` (which acts as a key-presence-and-
+            // value-drift allowance on both sides simultaneously).
+            let allow_envoy: std::collections::BTreeSet<&str> = allowlist_envoy_only_keys
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let allow_rust: std::collections::BTreeSet<&str> = allowlist_envoy_rust_only_keys
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let may_differ: std::collections::BTreeSet<&str> =
+                value_may_differ_keys.iter().map(String::as_str).collect();
+            let envoy_keys: std::collections::BTreeSet<&str> =
+                envoy_obj.keys().map(String::as_str).collect();
+            let rust_keys: std::collections::BTreeSet<&str> =
+                rust_obj.keys().map(String::as_str).collect();
+            let envoy_only: Vec<&str> = envoy_keys
+                .difference(&rust_keys)
+                .copied()
+                .filter(|k| !allow_envoy.contains(*k) && !may_differ.contains(*k))
+                .collect();
+            let rust_only: Vec<&str> = rust_keys
+                .difference(&envoy_keys)
+                .copied()
+                .filter(|k| !allow_rust.contains(*k) && !may_differ.contains(*k))
+                .collect();
+            if !envoy_only.is_empty() || !rust_only.is_empty() {
+                bail!(
+                    "json_shape top-level keys diverged after allow-lists:\n  envoy-only:      {envoy_only:?}\n  envoy-rust-only: {rust_only:?}",
+                );
+            }
+
+            // 08.1 Task 11: for keys present on BOTH sides AND not on
+            // `value_may_differ_keys`, serialize-equal check.
+            let shared: Vec<&str> = envoy_keys.intersection(&rust_keys).copied().collect();
+            for key in shared {
+                if may_differ.contains(key) {
+                    continue;
+                }
+                let envoy_val = &envoy_obj[key];
+                let rust_val = &rust_obj[key];
+                let envoy_s = serde_json::to_string(envoy_val)
+                    .with_context(|| format!("rendering envoy[{key:?}] as JSON"))?;
+                let rust_s = serde_json::to_string(rust_val)
+                    .with_context(|| format!("rendering envoy-rust[{key:?}] as JSON"))?;
+                if envoy_s != rust_s {
+                    bail!(
+                        "json_shape shared key {key:?} value differs (not in value_may_differ_keys):\n  envoy:      {envoy_s}\n  envoy-rust: {rust_s}",
                     );
                 }
             }
             Ok(())
         }
-        // 08.1 Task 10 (D15): line-oriented text assertions. Treat both
-        // bodies as UTF-8 text, split on \n via `str::lines`, and assert
-        // required_lines + required_line_prefixes on BOTH sides. The
-        // allowlist_* fields are accepted at the schema level but DO NOT
-        // participate in fail logic at Task 10 (same Task 11 deferral as
-        // JsonShape).
+        // 08.1 Task 10 (D15) + Task 11 strictness wiring: line-oriented
+        // text assertions. Treat both bodies as UTF-8 text, split on \n
+        // via `str::lines`, and assert:
+        //   - required_lines on BOTH sides (exact line match)
+        //   - required_line_prefixes on BOTH sides (at least one line
+        //     starts with each prefix)
+        //   - envoy-only lines NOT in `allowlist_envoy_only_lines` MUST
+        //     appear on the envoy-rust side; symmetrically for rust-only.
         BodyRule::TextLines {
             required_lines,
             required_line_prefixes,
-            allowlist_envoy_only_lines: _,
-            allowlist_envoy_rust_only_lines: _,
+            allowlist_envoy_only_lines,
+            allowlist_envoy_rust_only_lines,
+            allowlist_envoy_only_line_prefixes,
+            allowlist_envoy_rust_only_line_prefixes,
         } => {
             let envoy_text = std::str::from_utf8(envoy_body)
                 .context("envoy body is not valid UTF-8 for BodyRule::TextLines")?;
@@ -2378,6 +2613,45 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
                         "required_line_prefixes: no line starts with {prefix:?} on envoy-rust side"
                     );
                 }
+            }
+            // 08.1 Task 11: line-set diff between envoy and envoy-rust,
+            // modulo the per-side allow-lists (exact-line + prefix-line).
+            let allow_envoy: std::collections::BTreeSet<&str> = allowlist_envoy_only_lines
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let allow_rust: std::collections::BTreeSet<&str> = allowlist_envoy_rust_only_lines
+                .iter()
+                .map(String::as_str)
+                .collect();
+            // 08.1 Task 11 NEW: per-side line-prefix allow-lists.
+            let allow_envoy_prefix: Vec<&str> = allowlist_envoy_only_line_prefixes
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let allow_rust_prefix: Vec<&str> = allowlist_envoy_rust_only_line_prefixes
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let envoy_only: Vec<&str> = envoy_lines
+                .difference(&rust_lines)
+                .copied()
+                .filter(|l| {
+                    !allow_envoy.contains(*l)
+                        && !allow_envoy_prefix.iter().any(|p| l.starts_with(p))
+                })
+                .collect();
+            let rust_only: Vec<&str> = rust_lines
+                .difference(&envoy_lines)
+                .copied()
+                .filter(|l| {
+                    !allow_rust.contains(*l) && !allow_rust_prefix.iter().any(|p| l.starts_with(p))
+                })
+                .collect();
+            if !envoy_only.is_empty() || !rust_only.is_empty() {
+                bail!(
+                    "text_lines diverged after allow-lists:\n  envoy-only:      {envoy_only:?}\n  envoy-rust-only: {rust_only:?}",
+                );
             }
             Ok(())
         }
@@ -3405,29 +3679,32 @@ allowlist_envoy_rust_only:
 
     #[test]
     fn driver_admin_scrape_parses_with_default_pre_requests() {
+        // 08.1 Task 11: Driver::AdminScrape widened to take a list of
+        // sub-cases under `scrapes: [...]` (architecture-decision lock-in
+        // #13 forbids a new Driver variant; fixture 0014 needs to scrape
+        // 4 admin endpoints in one fixture).
         let yaml = r#"
 kind: admin_scrape
-path: /stats/prometheus
-expected_status: 200
-expected_content_type: text/plain
-expected_body_rule:
-  kind: prometheus_exposition
+scrapes:
+  - path: /stats/prometheus
+    expected_status: 200
+    expected_content_type: text/plain
+    expected_body_rule:
+      kind: prometheus_exposition
 "#;
         let d: Driver = serde_yaml::from_str(yaml).expect("parses");
         match d {
             Driver::AdminScrape {
                 pre_requests,
-                path,
-                expected_status,
-                expected_content_type,
-                expected_body_rule,
+                scrapes,
             } => {
                 assert!(pre_requests.is_empty());
-                assert_eq!(path, "/stats/prometheus");
-                assert_eq!(expected_status, 200);
-                assert_eq!(expected_content_type, "text/plain");
+                assert_eq!(scrapes.len(), 1);
+                assert_eq!(scrapes[0].path, "/stats/prometheus");
+                assert_eq!(scrapes[0].expected_status, 200);
+                assert_eq!(scrapes[0].expected_content_type, "text/plain");
                 assert!(matches!(
-                    expected_body_rule,
+                    scrapes[0].expected_body_rule,
                     BodyRule::PrometheusExposition { .. }
                 ));
             }
@@ -3444,20 +3721,71 @@ pre_requests:
     path: /
     host: x.test
     port_key: PORT
-path: /stats/prometheus
-expected_status: 200
-expected_content_type: text/plain; version=0.0.4
-expected_body_rule:
-  kind: prometheus_exposition
-  allowlist_envoy_only: []
-  allowlist_envoy_rust_only: []
+scrapes:
+  - path: /stats/prometheus
+    expected_status: 200
+    expected_content_type: text/plain; version=0.0.4
+    expected_body_rule:
+      kind: prometheus_exposition
+      allowlist_envoy_only: []
+      allowlist_envoy_rust_only: []
 "#;
         let d: Driver = serde_yaml::from_str(yaml).expect("parses");
         match d {
-            Driver::AdminScrape { pre_requests, .. } => {
+            Driver::AdminScrape {
+                pre_requests,
+                scrapes,
+            } => {
                 assert_eq!(pre_requests.len(), 1);
                 assert_eq!(pre_requests[0].method, "GET");
                 assert_eq!(pre_requests[0].port_key, "PORT");
+                assert_eq!(scrapes.len(), 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn driver_admin_scrape_parses_with_multiple_scrapes() {
+        // 08.1 Task 11: fixture 0014 drives 4 admin scrapes in one
+        // expectation. Validate Vec<AdminScrapeCase> deserializes with
+        // distinct body-rule kinds per sub-case (the realistic shape:
+        // `/config_dump` is json_shape; `/clusters` is text_lines; etc).
+        let yaml = r#"
+kind: admin_scrape
+pre_requests: []
+scrapes:
+  - path: /config_dump
+    expected_status: 200
+    expected_content_type: application/json
+    expected_body_rule:
+      kind: json_shape
+      required_keys: ["configs"]
+  - path: /clusters
+    expected_status: 200
+    expected_content_type: text/plain
+    expected_body_rule:
+      kind: text_lines
+      required_lines: ["backend::observability_name::backend"]
+"#;
+        let d: Driver = serde_yaml::from_str(yaml).expect("parses");
+        match d {
+            Driver::AdminScrape {
+                pre_requests,
+                scrapes,
+            } => {
+                assert!(pre_requests.is_empty());
+                assert_eq!(scrapes.len(), 2);
+                assert_eq!(scrapes[0].path, "/config_dump");
+                assert!(matches!(
+                    scrapes[0].expected_body_rule,
+                    BodyRule::JsonShape { .. }
+                ));
+                assert_eq!(scrapes[1].path, "/clusters");
+                assert!(matches!(
+                    scrapes[1].expected_body_rule,
+                    BodyRule::TextLines { .. }
+                ));
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -3624,6 +3952,12 @@ mod body_rule_extension_tests {
 
     #[test]
     fn json_shape_required_subtree_value_exact() {
+        // Task 11 strictness wiring: required_subtree asserts the
+        // dotted-path sub-value equals `expected` on BOTH sides. Use
+        // identical top-level objects so the Task-11 shared-key
+        // value-equality check passes too (the asymmetric "other":1 vs
+        // "other":99 shape that Task 10 tolerated is now diff-strict
+        // unless the top-level key sits in value_may_differ_keys).
         let rule = BodyRule::JsonShape {
             required_keys: vec![],
             required_subtree: Some(JsonSubtreeRule {
@@ -3634,8 +3968,8 @@ mod body_rule_extension_tests {
             allowlist_envoy_rust_only_keys: vec![],
             value_may_differ_keys: vec![],
         };
-        let envoy = br#"{"node":{"id":"x","other":1}}"#;
-        let rust = br#"{"node":{"id":"x","other":99}}"#;
+        let envoy = br#"{"node":{"id":"x"}}"#;
+        let rust = br#"{"node":{"id":"x"}}"#;
         assert_body_rule(&rule, envoy, rust).expect("required_subtree matches on both sides");
     }
 
@@ -3646,6 +3980,8 @@ mod body_rule_extension_tests {
             required_line_prefixes: vec![],
             allowlist_envoy_only_lines: vec![],
             allowlist_envoy_rust_only_lines: vec![],
+            allowlist_envoy_only_line_prefixes: vec![],
+            allowlist_envoy_rust_only_line_prefixes: vec![],
         };
         let envoy = b"foo\nbar\n";
         let rust = b"bar\nfoo\n";
@@ -3659,6 +3995,8 @@ mod body_rule_extension_tests {
             required_line_prefixes: vec![],
             allowlist_envoy_only_lines: vec!["envoy_only_extra".into()],
             allowlist_envoy_rust_only_lines: vec![],
+            allowlist_envoy_only_line_prefixes: vec![],
+            allowlist_envoy_rust_only_line_prefixes: vec![],
         };
         let envoy = b"foo\nenvoy_only_extra\n";
         let rust = b"foo\n";
@@ -3667,17 +4005,239 @@ mod body_rule_extension_tests {
 
     #[test]
     fn text_lines_required_prefix_matches() {
+        // Task 11 strictness wiring: lines that diverge between envoy
+        // and envoy-rust (outside the per-side allow-lists) are now
+        // diff-strict. The varying-suffix counter shape this test
+        // demonstrates needs the per-side allow-lists to cover the
+        // varying-suffix lines explicitly (each side's suffix lands in
+        // the other side's allow-list as an envoy-only / rust-only line).
         let rule = BodyRule::TextLines {
             required_lines: vec![],
             required_line_prefixes: vec![
                 "listener_0::counter_".into(),
                 "listener_1::counter_".into(),
             ],
-            allowlist_envoy_only_lines: vec![],
-            allowlist_envoy_rust_only_lines: vec![],
+            allowlist_envoy_only_lines: vec![
+                "listener_0::counter_X".into(),
+                "listener_1::counter_Y".into(),
+            ],
+            allowlist_envoy_rust_only_lines: vec![
+                "listener_0::counter_A".into(),
+                "listener_1::counter_B".into(),
+            ],
+            allowlist_envoy_only_line_prefixes: vec![],
+            allowlist_envoy_rust_only_line_prefixes: vec![],
         };
         let envoy = b"listener_0::counter_X\nlistener_1::counter_Y\n";
         let rust = b"listener_0::counter_A\nlistener_1::counter_B\n";
         assert_body_rule(&rule, envoy, rust).expect("required line prefixes match on both sides");
+    }
+
+    // -------------------------------------------------------------------
+    // 08.1 Task 11 strictness-wiring tests (Task 10 minor-findings #1, #2,
+    // #3 close). The fields below were accepted at the schema level in
+    // Task 10 but did NOT participate in fail logic; Task 11 wires them.
+    // -------------------------------------------------------------------
+
+    /// Task 10 left a coverage gap: `JsonSubtreeRule.expected` was accepted
+    /// but never consulted. Task 11 wires it: the dispatch arm asserts
+    /// `envoy_sub == expected` AND `rust_sub == expected` (in addition to
+    /// the existing `envoy_sub == rust_sub`). This test flips the expected
+    /// value to confirm the assertion now fails.
+    #[test]
+    fn json_shape_required_subtree_fails_when_expected_value_mismatches() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: Some(JsonSubtreeRule {
+                path: "node.id".into(),
+                // Both bodies report id="x"; expected says "y" — must fail.
+                expected: serde_yaml::Value::String("y".into()),
+            }),
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec![],
+        };
+        let envoy = br#"{"node":{"id":"x"}}"#;
+        let rust = br#"{"node":{"id":"x"}}"#;
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("required_subtree") && msg.contains("expected"),
+            "expected required_subtree-expected mismatch, got: {msg}"
+        );
+    }
+
+    /// Task 11 strictness wiring: an envoy-side key NOT on
+    /// `allowlist_envoy_only_keys` AND NOT on `value_may_differ_keys`
+    /// MUST cause failure when absent on the envoy-rust side.
+    #[test]
+    fn json_shape_fails_on_envoy_only_key_outside_allowlist() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: None,
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec![],
+        };
+        let envoy = br#"{"a":1,"unexpected_envoy_only":42}"#;
+        let rust = br#"{"a":1}"#;
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected_envoy_only"),
+            "expected `unexpected_envoy_only` mentioned, got: {msg}"
+        );
+    }
+
+    /// Task 11 strictness wiring: an envoy-rust-side key NOT on
+    /// `allowlist_envoy_rust_only_keys` MUST cause failure when absent
+    /// on the envoy side.
+    #[test]
+    fn json_shape_fails_on_rust_only_key_outside_allowlist() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: None,
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec![],
+        };
+        let envoy = br#"{"a":1}"#;
+        let rust = br#"{"a":1,"unexpected_rust_only":42}"#;
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected_rust_only"),
+            "expected `unexpected_rust_only` mentioned, got: {msg}"
+        );
+    }
+
+    /// Task 11 strictness wiring: keys appearing on BOTH sides and NOT
+    /// listed in `value_may_differ_keys` MUST serialize equal.
+    #[test]
+    fn json_shape_fails_when_shared_key_values_differ_outside_may_differ() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: None,
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec![],
+        };
+        let envoy = br#"{"shared":"envoy-value"}"#;
+        let rust = br#"{"shared":"rust-value"}"#;
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shared") && msg.contains("value"),
+            "expected shared-key value diff, got: {msg}"
+        );
+    }
+
+    /// Task 11 strictness wiring: when a shared key IS listed in
+    /// `value_may_differ_keys`, value drift is silently accepted.
+    #[test]
+    fn json_shape_passes_when_value_diff_inside_may_differ() {
+        let rule = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: None,
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec!["last_updated".into()],
+        };
+        let envoy = br#"{"last_updated":"2026-05-16T00:00:00Z"}"#;
+        let rust = br#"{"last_updated":"2026-05-16T00:00:01Z"}"#;
+        assert_body_rule(&rule, envoy, rust).expect("value_may_differ_keys covers drift");
+    }
+
+    /// Task 11 strictness wiring: an envoy-side line NOT on
+    /// `allowlist_envoy_only_lines` MUST cause failure when absent on
+    /// the envoy-rust side.
+    #[test]
+    fn text_lines_fails_on_envoy_only_line_outside_allowlist() {
+        let rule = BodyRule::TextLines {
+            required_lines: vec![],
+            required_line_prefixes: vec![],
+            allowlist_envoy_only_lines: vec![],
+            allowlist_envoy_rust_only_lines: vec![],
+            allowlist_envoy_only_line_prefixes: vec![],
+            allowlist_envoy_rust_only_line_prefixes: vec![],
+        };
+        let envoy = b"foo\nunexpected_envoy_only_line\n";
+        let rust = b"foo\n";
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected_envoy_only_line"),
+            "expected envoy-only line in diff, got: {msg}"
+        );
+    }
+
+    /// Task 11 strictness wiring: an envoy-rust-side line NOT on
+    /// `allowlist_envoy_rust_only_lines` MUST cause failure when absent
+    /// on the envoy side.
+    #[test]
+    fn text_lines_fails_on_rust_only_line_outside_allowlist() {
+        let rule = BodyRule::TextLines {
+            required_lines: vec![],
+            required_line_prefixes: vec![],
+            allowlist_envoy_only_lines: vec![],
+            allowlist_envoy_rust_only_lines: vec![],
+            allowlist_envoy_only_line_prefixes: vec![],
+            allowlist_envoy_rust_only_line_prefixes: vec![],
+        };
+        let envoy = b"foo\n";
+        let rust = b"foo\nunexpected_rust_only_line\n";
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected_rust_only_line"),
+            "expected rust-only line in diff, got: {msg}"
+        );
+    }
+
+    /// Task 11 NEW: `allowlist_envoy_only_line_prefixes` absorbs varying-
+    /// suffix per-side lines whose port/IP/timestamp segment shifts per
+    /// fixture run (e.g. fixture 0014's `/clusters` per-endpoint counter
+    /// lines like `backend::<ip>:<ephemeral>::cx_active::0`).
+    #[test]
+    fn text_lines_envoy_only_line_prefix_absorbs_varying_suffix() {
+        let rule = BodyRule::TextLines {
+            required_lines: vec![],
+            required_line_prefixes: vec![],
+            allowlist_envoy_only_lines: vec![],
+            allowlist_envoy_rust_only_lines: vec![],
+            allowlist_envoy_only_line_prefixes: vec!["backend::192.168.65.254:".into()],
+            allowlist_envoy_rust_only_line_prefixes: vec![],
+        };
+        let envoy = b"foo\nbackend::192.168.65.254:63570::cx_active::0\nbackend::192.168.65.254:63570::rq_total::0\n";
+        let rust = b"foo\n";
+        assert_body_rule(&rule, envoy, rust)
+            .expect("envoy-only lines starting with prefix are allow-listed");
+    }
+
+    /// Task 11 NEW: the prefix-allow-list does NOT shadow other lines —
+    /// lines NOT starting with any prefix AND NOT in the exact list still
+    /// fail.
+    #[test]
+    fn text_lines_envoy_only_line_prefix_does_not_shadow_other_lines() {
+        let rule = BodyRule::TextLines {
+            required_lines: vec![],
+            required_line_prefixes: vec![],
+            allowlist_envoy_only_lines: vec![],
+            allowlist_envoy_rust_only_lines: vec![],
+            allowlist_envoy_only_line_prefixes: vec!["backend::192.168.65.254:".into()],
+            allowlist_envoy_rust_only_line_prefixes: vec![],
+        };
+        let envoy = b"backend::192.168.65.254:63570::cx_active::0\nbackend::added_via_api::false\n";
+        let rust = b"";
+        let err = assert_body_rule(&rule, envoy, rust).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("added_via_api"),
+            "expected non-prefix line in diff, got: {msg}"
+        );
+        assert!(
+            !msg.contains("cx_active"),
+            "prefix-allow-listed line should NOT appear in diff, got: {msg}"
+        );
     }
 }

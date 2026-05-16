@@ -1,0 +1,167 @@
+# Phase 08.1 fixture 0014 — admin /config_dump + /server_info + /clusters +
+# /listeners scrape (D17.1). Drives the new Driver::AdminScrape multi-case
+# shape (08.1 Task 11) — 4 sub-cases against a single bilateral proxy
+# invocation. No pre_requests (no data-plane traffic; admin only).
+#
+# Per-side allow-lists below were seeded empirically from the first
+# Docker-gated run's diff output (SPEC §6 signpost 12 pattern, mirroring
+# fixture 0011's 204-entry seeding for /stats/prometheus). Each allow-list
+# entry maps to a documented BEHAVIOR_CONTRACT disposition; see README.md
+# "Empirical allow-list seeding".
+
+driver:
+  kind: admin_scrape
+  pre_requests: []
+  scrapes:
+    # ---------------------------------------------------------------------
+    # /config_dump (D6 — Task 6)
+    # ---------------------------------------------------------------------
+    # Both proxies emit ONLY `configs` at the top level (single-key
+    # object). The `configs` array content differs substantially per
+    # side: envoy emits Envoy's full protobuf-canonical bootstrap
+    # projection (with fields like `user_agent_name`,
+    # `user_agent_build_version`, `extensions`, `enabled_features`,
+    # `disabled_features`, ...); envoy-rust emits the parsed-bootstrap
+    # projection from Task 4's Serialize cascade (the subset envoy-rust's
+    # `envoy-config::Bootstrap` cascade serializes). The required_subtree
+    # check on `configs.0.@type` locks down the envelope tag —
+    # `BootstrapConfigDump` — across both sides; the `configs` content
+    # divergence is captured via `value_may_differ_keys`.
+    - path: /config_dump
+      expected_status: 200
+      expected_content_type: "application/json"
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["configs"]
+        required_subtree:
+          path: "configs.0.@type"
+          expected: "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump"
+        value_may_differ_keys: ["configs"]
+        allowlist_envoy_only_keys: []
+        allowlist_envoy_rust_only_keys: []
+
+    # ---------------------------------------------------------------------
+    # /server_info (D5 — Task 7)
+    # ---------------------------------------------------------------------
+    # Field-naming divergence: upstream Envoy emits protobuf-canonical
+    # `uptime_current_epoch` / `uptime_all_epochs` (Duration-string values
+    # like `"2s"`); envoy-rust emits `uptime_current_epoch_seconds` /
+    # `uptime_all_epochs_seconds` (plain u64 counts) per the
+    # BEHAVIOR_CONTRACT.md `/server_info` row + Task 7's renderer. Both
+    # sides emit the SAME uptime semantics; the field-name split is
+    # captured via the per-side `allowlist_*_only_keys` below.
+    # Resolution defers to a follow-on phase that wires a Duration-string
+    # projection on envoy-rust's side (out of Task 11 scope).
+    - path: /server_info
+      expected_status: 200
+      expected_content_type: "application/json"
+      expected_body_rule:
+        kind: json_shape
+        required_keys:
+          - state
+          - version
+          - node
+          - hot_restart_version
+          - command_line_options
+        required_subtree:
+          path: "state"
+          expected: "LIVE"
+        # Each side emits its own implementation-identifying values:
+        #   - envoy: build SHA / version-triple / boringssl.
+        #   - envoy-rust: `envoy-rust <pkg-version>`.
+        # envoy emits hot_restart_version `"11.120"`; envoy-rust emits
+        # `"disabled"` (no hot-restart support). command_line_options
+        # sets diverge per side. envoy's `node` carries extensions /
+        # build-metadata envoy-rust does not.
+        value_may_differ_keys:
+          - version
+          - hot_restart_version
+          - command_line_options
+          - node
+        # Upstream-Envoy-only field names (Duration-string uptime form).
+        allowlist_envoy_only_keys:
+          - uptime_current_epoch
+          - uptime_all_epochs
+        # envoy-rust-only field names (seconds-u64 uptime form).
+        allowlist_envoy_rust_only_keys:
+          - uptime_current_epoch_seconds
+          - uptime_all_epochs_seconds
+
+    # ---------------------------------------------------------------------
+    # /clusters (D7 — Task 8)
+    # ---------------------------------------------------------------------
+    # envoy-rust at 08.1 emits the minimum 2 lines per cluster (lock-in
+    # #10): `<name>::observability_name::<name>` +
+    # `<name>::default_priority::endpoints`. Upstream Envoy v1.33 emits
+    # ~28 lines per cluster: observability_name + 4 default_priority
+    # circuit-breaker counters + 4 high_priority counters +
+    # added_via_api + ~18 per-endpoint counter/metadata lines
+    # (cx/rq/host/health_flags/weight/region/zone/canary/priority/
+    # success_rate) addressed by the resolved endpoint IP+port (which
+    # is a kernel-ephemeral address `192.168.65.254:<HTTP1_BACKEND_PORT>`
+    # that varies per fixture run).
+    #
+    # required_lines: only the observability_name line is bilateral.
+    # The envoy-rust `default_priority::endpoints` line is rust-only
+    # (envoy does NOT emit that exact line). The address-bearing
+    # per-endpoint counter lines are absorbed via the
+    # `allowlist_envoy_only_line_prefixes` family (08.1 Task 11 NEW)
+    # because their port suffix shifts per run. Resolution for upgrading
+    # envoy-rust's `/clusters` rendering to match upstream Envoy's
+    # richness defers to a later phase (lock-in #10).
+    - path: /clusters
+      expected_status: 200
+      expected_content_type: "text/plain"
+      expected_body_rule:
+        kind: text_lines
+        required_lines:
+          - "backend::observability_name::backend"
+        # envoy-rust emits this line; envoy does not.
+        allowlist_envoy_rust_only_lines:
+          - "backend::default_priority::endpoints"
+        # Address-INVARIANT envoy-only lines.
+        allowlist_envoy_only_lines:
+          - "backend::default_priority::max_connections::1024"
+          - "backend::default_priority::max_pending_requests::1024"
+          - "backend::default_priority::max_requests::1024"
+          - "backend::default_priority::max_retries::3"
+          - "backend::high_priority::max_connections::1024"
+          - "backend::high_priority::max_pending_requests::1024"
+          - "backend::high_priority::max_requests::1024"
+          - "backend::high_priority::max_retries::3"
+          - "backend::added_via_api::false"
+        # Address-BEARING per-endpoint counter lines. Each line starts
+        # with `backend::<bridge-ip>:<HTTP1_BACKEND_PORT>::` (the bridge
+        # IP is Docker Desktop's `192.168.65.254`; the port is the
+        # kernel-ephemeral port spawned for the http1-echo-server backend).
+        # The bridge-IP is stable across fixture runs on a given host;
+        # the port is not.
+        allowlist_envoy_only_line_prefixes:
+          - "backend::192.168.65.254:"
+        allowlist_envoy_rust_only_line_prefixes: []
+
+    # ---------------------------------------------------------------------
+    # /listeners (D8 — Task 9)
+    # ---------------------------------------------------------------------
+    # Both proxies emit exactly one line per listener:
+    # `<name>::<address>:<port>`. envoy binds `0.0.0.0:10000`
+    # (container-mapped — the upstream Envoy container listens on the
+    # container-internal port `10000`); envoy-rust binds
+    # `127.0.0.1:<kernel-ephemeral>` (host-local). Match on prefix on
+    # both sides; the per-side address+port shape lands in the per-side
+    # `allowlist_*_line_prefixes` (08.1 Task 11 NEW).
+    - path: /listeners
+      expected_status: 200
+      expected_content_type: "text/plain"
+      expected_body_rule:
+        kind: text_lines
+        required_lines: []
+        required_line_prefixes:
+          - "ingress_http::"
+        allowlist_envoy_only_lines: []
+        allowlist_envoy_rust_only_lines: []
+        # Per-side address+port line shapes.
+        allowlist_envoy_only_line_prefixes:
+          - "ingress_http::0.0.0.0:"
+        allowlist_envoy_rust_only_line_prefixes:
+          - "ingress_http::127.0.0.1:"
