@@ -1253,7 +1253,7 @@ All 14 Docker-gated fixtures simultaneously green (`cargo test -p differential`,
 
 ## Task 12 — D17.3a — Fuzz corpus seed admin_multi_endpoint_bootstrap.yaml
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 12 — fuzz corpus seed (admin_multi_endpoint_bootstrap.yaml)`
+**Commit:** `7711915` — `phase 08.1: task 12 — fuzz corpus seed (admin_multi_endpoint_bootstrap.yaml)`
 **LoC delta:** +41 fixture (the new seed YAML), +1 fixture (`.gitignore` allow-line), +1 test (`bootstrap.rs` SUCCESS-array entry), +~95 doc (this PROGRESS narrative). Net +~138 insertions, 0 deletions. No production code change.
 
 ### Work summary
