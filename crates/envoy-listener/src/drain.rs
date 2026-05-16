@@ -38,6 +38,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::Notify;
 
@@ -83,18 +84,43 @@ pub struct DrainState {
     /// per parent-08 SPEC §6.6 — multi-consumer, zero-copy, cheap to clone
     /// via `Arc`.
     notify: Notify,
+    /// Task 2 (D14): `server.live` gauge. `1` ONLY when
+    /// `current() == Live`; `0` otherwise (per 08.2 SPEC §2.2 —
+    /// HealthcheckFailing AND Draining both emit `0`). Updated inline at
+    /// every `*_healthcheck` / `drain` CAS-success site; never polled.
+    server_live: Arc<envoy_stats::Gauge>,
+    /// Task 2 (D14): `server.state` gauge. Discriminant of `DrainStage`
+    /// (`Live = 0`, `HealthcheckFailing = 1`, `Draining = 2`). The
+    /// `#[repr(u8)]` on `DrainStage` makes the discriminant load-bearing;
+    /// gauge values are projected via `stage as i64`. Updated at the same
+    /// CAS-success sites as `server_live` (one source of truth).
+    server_state: Arc<envoy_stats::Gauge>,
 }
 
 impl DrainState {
     /// Construct a fresh `DrainState` in the `Live` stage with no pending
-    /// waiters. Task 2 widens this constructor to take
-    /// `&Arc<envoy_stats::StatsRegistry>` for gauge registration; at Task 1
-    /// the registry parameter is NOT yet accepted (PLAN architecture-
-    /// decision lock-in #3 — foundation first; stats wiring second).
-    pub fn new() -> Self {
+    /// waiters. Registers the `server.live` and `server.state` gauges
+    /// against `registry` and stores both as `Arc<Gauge>` fields for inline
+    /// updates at every state-transition CAS-success site (one source of
+    /// truth — never polled).
+    ///
+    /// Initial gauge values match the initial `DrainStage::Live` state:
+    /// `server.live = 1` and `server.state = 0` (per 08.2 SPEC §2.2).
+    pub fn new(registry: &Arc<envoy_stats::StatsRegistry>) -> Self {
+        let server_live = registry
+            .register_gauge("server.live")
+            .expect("server.live gauge registration");
+        let server_state = registry
+            .register_gauge("server.state")
+            .expect("server.state gauge registration");
+        // Initial values match the initial DrainStage::Live state.
+        server_live.set(1);
+        server_state.set(DrainStage::Live as i64);
         Self {
             state: AtomicU8::new(DrainStage::Live as u8),
             notify: Notify::new(),
+            server_live,
+            server_state,
         }
     }
 
@@ -113,7 +139,7 @@ impl DrainState {
     /// `HealthcheckFailing`). Does NOT call `notify_waiters` — only
     /// `drain()` does.
     pub fn fail_healthcheck(&self) {
-        let _ = self.state.compare_exchange(
+        let cas = self.state.compare_exchange(
             DrainStage::Live as u8,
             DrainStage::HealthcheckFailing as u8,
             Ordering::AcqRel,
@@ -121,6 +147,13 @@ impl DrainState {
         );
         // Sticky `Draining` and self-loop `HealthcheckFailing` both fail
         // the CAS silently — that's the desired idempotent behavior.
+        if cas.is_ok() {
+            // Task 2 (D14): `server.live = 0` when `current() != Live`
+            // (08.2 SPEC §2.2). `server.state` carries the
+            // HealthcheckFailing discriminant.
+            self.server_live.set(0);
+            self.server_state.set(DrainStage::HealthcheckFailing as i64);
+        }
     }
 
     /// Transition `HealthcheckFailing → Live` (`compare_exchange`). All
@@ -129,13 +162,18 @@ impl DrainState {
     /// drain semantic at parent-08 SPEC §5.6: `ok_healthcheck()` AFTER
     /// `drain()` MUST NOT un-drain.
     pub fn ok_healthcheck(&self) {
-        let _ = self.state.compare_exchange(
+        let cas = self.state.compare_exchange(
             DrainStage::HealthcheckFailing as u8,
             DrainStage::Live as u8,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
         // Sticky `Draining` and self-loop `Live` both fail the CAS silently.
+        if cas.is_ok() {
+            // Task 2 (D14): restore Live values.
+            self.server_live.set(1);
+            self.server_state.set(DrainStage::Live as i64);
+        }
     }
 
     /// Sticky transition `* → Draining`. Calls `notify_waiters` EXACTLY
@@ -166,6 +204,11 @@ impl DrainState {
             Err(0) // Sentinel — we already succeeded via `from_live`.
         };
         if from_live.is_ok() || from_hc.is_ok() {
+            // Task 2 (D14): gauges update BEFORE `notify_waiters` so a
+            // just-woken waiter that reads the registry sees the
+            // post-drain values.
+            self.server_live.set(0);
+            self.server_state.set(DrainStage::Draining as i64);
             // Wake all currently-registered `drain_signal()` waiters.
             // Future calls to `drain_signal()` see the already-Draining
             // branch in that method and return an immediately-ready
@@ -206,11 +249,8 @@ impl DrainState {
     }
 }
 
-impl Default for DrainState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Task 2 (D14): the `Default` impl from Task 1 is REMOVED — `DrainState::new`
+// now requires `&Arc<StatsRegistry>`, which `Default` cannot synthesize.
 
 #[cfg(test)]
 mod tests {
@@ -218,10 +258,19 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Test 1 of 9: a fresh `DrainState::new()` starts at `DrainStage::Live`.
+    /// Construct an `Arc<StatsRegistry>` for tests that don't need to assert
+    /// gauge values, only that `DrainState::new(&registry)` accepts a registry.
+    /// Task 2 widening: `DrainState::new` now takes `&Arc<StatsRegistry>` for
+    /// gauge registration.
+    fn mk_registry() -> Arc<envoy_stats::StatsRegistry> {
+        Arc::new(envoy_stats::StatsRegistry::new())
+    }
+
+    /// Test 1 of 9: a fresh `DrainState::new(&registry)` starts at
+    /// `DrainStage::Live`.
     #[test]
     fn new_returns_live() {
-        let drain = DrainState::new();
+        let drain = DrainState::new(&mk_registry());
         assert_eq!(drain.current(), DrainStage::Live);
     }
 
@@ -234,7 +283,7 @@ mod tests {
     async fn drain_flips_to_draining_and_notifies_waiters_once() {
         use tokio::sync::Barrier;
 
-        let drain = Arc::new(DrainState::new());
+        let drain = Arc::new(DrainState::new(&mk_registry()));
         let barrier = Arc::new(Barrier::new(3));
 
         // Spawn two waiters; each constructs `drain_signal()`, signals at the
@@ -282,7 +331,7 @@ mod tests {
     /// `HealthcheckFailing`.
     #[test]
     fn fail_healthcheck_flips_to_healthcheck_failing() {
-        let drain = DrainState::new();
+        let drain = DrainState::new(&mk_registry());
         assert_eq!(drain.current(), DrainStage::Live);
         drain.fail_healthcheck();
         assert_eq!(drain.current(), DrainStage::HealthcheckFailing);
@@ -292,7 +341,7 @@ mod tests {
     /// `Live`.
     #[test]
     fn ok_healthcheck_restores_to_live() {
-        let drain = DrainState::new();
+        let drain = DrainState::new(&mk_registry());
         drain.fail_healthcheck();
         assert_eq!(drain.current(), DrainStage::HealthcheckFailing);
         drain.ok_healthcheck();
@@ -303,7 +352,7 @@ mod tests {
     /// drain semantic per parent-08 SPEC §5.6).
     #[test]
     fn ok_healthcheck_after_drain_is_noop_sticky() {
-        let drain = DrainState::new();
+        let drain = DrainState::new(&mk_registry());
         drain.drain();
         assert_eq!(drain.current(), DrainStage::Draining);
         drain.ok_healthcheck();
@@ -318,7 +367,7 @@ mod tests {
     /// notify_waiters; state stays `Draining`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn repeat_drain_calls_are_idempotent() {
-        let drain = Arc::new(DrainState::new());
+        let drain = Arc::new(DrainState::new(&mk_registry()));
         drain.drain();
         assert_eq!(drain.current(), DrainStage::Draining);
 
@@ -352,7 +401,7 @@ mod tests {
     async fn drain_signal_is_race_free_with_concurrent_drain() {
         use tokio::sync::Barrier;
 
-        let drain = Arc::new(DrainState::new());
+        let drain = Arc::new(DrainState::new(&mk_registry()));
         // Barrier of 2: the spawned task signals it has called `drain_signal()`
         // (anchoring the notify snapshot); the main task then fires `drain()`.
         let barrier = Arc::new(Barrier::new(2));
@@ -391,7 +440,7 @@ mod tests {
     async fn drain_from_healthcheck_failing_notifies_waiters_once() {
         use tokio::sync::Barrier;
 
-        let drain = Arc::new(DrainState::new());
+        let drain = Arc::new(DrainState::new(&mk_registry()));
         drain.fail_healthcheck();
         assert_eq!(drain.current(), DrainStage::HealthcheckFailing);
 
@@ -421,7 +470,7 @@ mod tests {
     /// Draining (CAS expected-value mismatch).
     #[test]
     fn fail_healthcheck_after_drain_is_noop_sticky() {
-        let drain = DrainState::new();
+        let drain = DrainState::new(&mk_registry());
         drain.drain();
         assert_eq!(drain.current(), DrainStage::Draining);
         drain.fail_healthcheck();
@@ -430,5 +479,100 @@ mod tests {
             DrainStage::Draining,
             "fail_healthcheck after drain must NOT downgrade out of Draining (sticky)"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Task 2 (D14 — gauge wiring): 5 new tests.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Test 10 of 14: `DrainState::new(&registry)` registers `server.live`
+    /// against the supplied registry.
+    #[test]
+    fn new_registers_server_live_gauge() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let _drain = DrainState::new(&registry);
+        let snapshot: std::collections::BTreeMap<_, _> = registry.snapshot().into_iter().collect();
+        assert!(
+            snapshot.contains_key("server.live"),
+            "server.live gauge missing; snapshot keys: {:?}",
+            snapshot.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Test 11 of 14: `DrainState::new(&registry)` registers `server.state`
+    /// against the supplied registry.
+    #[test]
+    fn new_registers_server_state_gauge() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let _drain = DrainState::new(&registry);
+        let snapshot: std::collections::BTreeMap<_, _> = registry.snapshot().into_iter().collect();
+        assert!(snapshot.contains_key("server.state"));
+    }
+
+    /// Test 12 of 14: a fresh `DrainState` has `server.live = 1` and
+    /// `server.state = 0` (Live discriminant). Initial-value invariant per
+    /// 08.2 SPEC §2.2.
+    #[test]
+    fn new_initial_gauge_values_are_live() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let _drain = DrainState::new(&registry);
+        let snapshot: std::collections::BTreeMap<_, _> = registry.snapshot().into_iter().collect();
+        match snapshot.get("server.live").expect("server.live missing") {
+            envoy_stats::StatHandle::Gauge(g) => assert_eq!(g.value(), 1),
+            _ => panic!("server.live is not a gauge"),
+        }
+        match snapshot.get("server.state").expect("server.state missing") {
+            envoy_stats::StatHandle::Gauge(g) => assert_eq!(g.value(), 0),
+            _ => panic!("server.state is not a gauge"),
+        }
+    }
+
+    /// Test 13 of 14: `drain()` flips `server.live = 0` and
+    /// `server.state = 2` (Draining discriminant) at the CAS-success site,
+    /// BEFORE `notify_waiters()` fires (so a just-woken waiter that reads
+    /// the gauge sees the post-drain value).
+    #[test]
+    fn drain_updates_server_live_to_zero_and_server_state_to_two() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let drain = DrainState::new(&registry);
+        drain.drain();
+        let snapshot: std::collections::BTreeMap<_, _> = registry.snapshot().into_iter().collect();
+        match snapshot.get("server.live").unwrap() {
+            envoy_stats::StatHandle::Gauge(g) => assert_eq!(g.value(), 0),
+            _ => unreachable!(),
+        }
+        match snapshot.get("server.state").unwrap() {
+            envoy_stats::StatHandle::Gauge(g) => assert_eq!(g.value(), 2),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Test 14 of 14: `fail_healthcheck()` flips `server.live = 0` and
+    /// `server.state = 1` (HealthcheckFailing discriminant) at the
+    /// CAS-success site.
+    ///
+    /// Per 08.2 SPEC §2.2: `server.live` emits `1` ONLY when
+    /// `current() == Live`; HealthcheckFailing AND Draining both emit `0`.
+    /// (This corrects PLAN.md's first-draft test name
+    /// `fail_healthcheck_keeps_server_live_at_one` — see PLAN.md line 989
+    /// for the in-PLAN self-correction.)
+    #[test]
+    fn fail_healthcheck_sets_server_live_to_zero_and_server_state_to_one() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let drain = DrainState::new(&registry);
+        drain.fail_healthcheck();
+        let snapshot: std::collections::BTreeMap<_, _> = registry.snapshot().into_iter().collect();
+        match snapshot.get("server.live").unwrap() {
+            envoy_stats::StatHandle::Gauge(g) => assert_eq!(
+                g.value(),
+                0,
+                "server.live MUST be 0 when current() != Live (HealthcheckFailing case)"
+            ),
+            _ => unreachable!(),
+        }
+        match snapshot.get("server.state").unwrap() {
+            envoy_stats::StatHandle::Gauge(g) => assert_eq!(g.value(), 1),
+            _ => unreachable!(),
+        }
     }
 }

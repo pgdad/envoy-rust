@@ -92,6 +92,14 @@ value wins.
 | `cluster.<name>.upstream_rq_total` | value-exact | Counter; one increment per upstream response received (NOT per upstream connect attempt). H1: fires at `write_proxied_response` function prologue; H2: fires inline at the post-dispatch success site in `finalize_h2_stream`. Synth-502 paths (envoy-rust-side 502 on connect-fail) do NOT increment — these are not upstream responses. Both proxies emit one increment per `upstream_resp` received. |
 | `cluster.<name>.upstream_rq_5xx` | value-exact | Counter; conditional sibling of `upstream_rq_total`, increments when `upstream_resp.status / 100 == 5`. Synth-502 paths bypass for the same reason as `upstream_rq_total`. |
 
+**08.2 entries (drain machinery):**
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `server.live` | value-exact | Gauge; `1` when `DrainState::current() == Live`; `0` otherwise (HealthcheckFailing and Draining both emit `0`). Updated inline at the `DrainState::{fail_healthcheck, ok_healthcheck, drain}` CAS-success sites (one source of truth — NOT polled). Initial value `1` at process start. Both proxies emit on every snapshot. |
+| `server.state` | value-exact (Live=0 baseline; Draining=2 post-drain) | Gauge; discriminant of `DrainStage` (`Live=0`, `HealthcheckFailing=1`, `Draining=2`). The `#[repr(u8)]` on `DrainStage` makes the discriminant load-bearing for the gauge value. Updated inline at the same CAS-success sites as `server.live` (one source of truth). Initial value `0` at process start. Fixture 0015 asserts the post-drain value `2`. |
+| `listener_manager.total_listeners_active` | value-exact | Gauge; count of currently-active data-plane listeners (HCM + tcp_proxy paths going through `envoy_listener::Listener::bind`/`serve`). Echo path (fixture 0002 only) + admin path use `tokio::net::TcpListener` directly and are naturally excluded. RAII-guarded at `Listener::serve` entry (inc) / exit (dec); decrement fires AFTER drain completes and AFTER stragglers join. Mirrors the 06.3 `listener.<name>.downstream_cx_active` gauge pattern but is global (not per-listener-named); registered idempotently inside `Listener::bind`. |
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments

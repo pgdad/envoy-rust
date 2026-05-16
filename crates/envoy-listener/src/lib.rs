@@ -92,6 +92,22 @@ pub struct Listener {
     /// signpost 6: ALL accept errors count, no carve-outs. Incremented BEFORE
     /// the `tracing::warn!` so the counter fires even if the warn is filtered.
     cx_accept_failed: Arc<envoy_stats::Counter>,
+    /// 08.2 D14: shared gauge `listener_manager.total_listeners_active` —
+    /// count of currently-active data-plane listeners. Registered
+    /// idempotently inside `Listener::bind` (same-name re-registration
+    /// returns the existing `Arc`, so every `Listener` instance shares one
+    /// gauge across the process). RAII inc/dec wiring at `Listener::serve`
+    /// entry/exit lands at Task 6 (D12); Task 2 only registers + stores
+    /// the field. Echo + admin listeners use `tokio::net::TcpListener`
+    /// directly (not `Listener::bind`) and are therefore naturally excluded
+    /// from this gauge per architecture-decision lock-in #12.
+    ///
+    /// `#[allow(dead_code)]` is scoped to this field at Task 2 because the
+    /// field is registered + stored but not yet consumed; Task 6 (D12)
+    /// removes the allow when it hoists the gauge into the RAII guard at
+    /// `serve` entry/exit.
+    #[allow(dead_code)]
+    listener_manager_active: Arc<envoy_stats::Gauge>,
 }
 
 impl std::fmt::Debug for Listener {
@@ -142,12 +158,21 @@ impl Listener {
                 cfg.name
             ))
             .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        // 08.2 D14: register the shared `listener_manager.total_listeners_active`
+        // gauge. Idempotent same-name re-registration across multiple `bind`
+        // calls mirrors the 06.1 cx_total / 06.3 cx_active / 06.3 cx_accept_failed
+        // pattern at adjacent registration sites. RAII inc/dec wiring at
+        // `serve` entry/exit lands at Task 6 (D12).
+        let listener_manager_active = registry
+            .register_gauge("listener_manager.total_listeners_active")
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
         Ok(Self {
             listener,
             handler,
             cx_total,
             cx_active,
             cx_accept_failed,
+            listener_manager_active,
         })
     }
 
@@ -155,6 +180,20 @@ impl Listener {
     /// the kernel-assigned ephemeral port).
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// 08.2 D14: accessor for the shared `listener_manager.total_listeners_active`
+    /// gauge so Task 6's RAII guard can hoist the `Arc<Gauge>` out of `self`
+    /// before `self.listener` is consumed by `serve`. `pub(crate)` because
+    /// no external consumer should touch this gauge directly — the inc/dec
+    /// wiring is internal to `Listener::serve`.
+    ///
+    /// `#[allow(dead_code)]` is scoped to this method at Task 2 because the
+    /// accessor exists for Task 6's RAII guard but is not yet called; Task 6
+    /// removes the allow when it consumes the accessor.
+    #[allow(dead_code)]
+    pub(crate) fn listener_manager_active(&self) -> &Arc<envoy_stats::Gauge> {
+        &self.listener_manager_active
     }
 
     /// Accept loop with shutdown-gated graceful drain. On `shutdown`, stop
@@ -487,6 +526,56 @@ filter_chains:
         let local = listener.local_addr().expect("local_addr");
         assert!(local.port() > 0, "ephemeral port must be assigned: {local}");
         assert_eq!(local.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    /// Task 2 (D14): `Listener::bind` registers
+    /// `listener_manager.total_listeners_active` gauge against the shared
+    /// registry. The RAII inc/dec wiring at `Listener::serve` entry/exit
+    /// lands at Task 6 (D12); Task 2 only verifies registration.
+    #[tokio::test]
+    async fn bind_registers_listener_manager_total_active_gauge() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let handler: Arc<dyn ConnectionHandler> = Arc::new(NullHandler);
+        let registry = mk_registry();
+        let _listener = Listener::bind(&cfg, handler, Arc::clone(&registry))
+            .await
+            .expect("bind succeeds");
+        let snapshot: std::collections::BTreeMap<_, _> = registry.snapshot().into_iter().collect();
+        assert!(
+            snapshot.contains_key("listener_manager.total_listeners_active"),
+            "listener_manager.total_listeners_active not registered; snapshot keys: {:?}",
+            snapshot.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Task 2 (D14): Two `Listener::bind` calls against the same registry
+    /// register exactly one shared `listener_manager.total_listeners_active`
+    /// gauge (idempotent same-name re-registration mirrors the 06.1
+    /// `cx_total` + 06.3 `cx_active` + `cx_accept_failed` pattern at the
+    /// adjacent registration sites).
+    #[tokio::test]
+    async fn bind_listener_manager_gauge_is_idempotent_shared() {
+        let registry = mk_registry();
+        for _ in 0..2 {
+            // Distinct ephemeral ports — listeners must be unique on the
+            // wire; only the gauge NAME is shared (mirrors the 06.1 +
+            // 06.3 idempotent-name patterns at cx_total / cx_active).
+            let cfg = mk_listener_cfg("127.0.0.1", 0);
+            let h: Arc<dyn ConnectionHandler> = Arc::new(NullHandler);
+            let _ = Listener::bind(&cfg, h, Arc::clone(&registry))
+                .await
+                .expect("bind succeeds");
+        }
+        let snapshot_vec = registry.snapshot();
+        let matches: Vec<_> = snapshot_vec
+            .iter()
+            .filter(|(name, _)| name == "listener_manager.total_listeners_active")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "shared gauge must appear exactly once in the snapshot",
+        );
     }
 
     #[tokio::test]

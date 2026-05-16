@@ -269,3 +269,104 @@ The 5 `license-not-encountered` warnings are pre-existing across the project (th
 ### Differential surface delta
 
 **None.** This fixup is logic + test changes inside `drain.rs` only — no admin endpoint surface change, no listener-serve signature change, no gauge registration, no fixture. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
+
+---
+
+## Task 2 (D14 — gauge registrations + `DrainState` wiring)
+
+### Work summary
+
+Widens `DrainState::new` to take `&Arc<envoy_stats::StatsRegistry>`; registers `server.live` + `server.state` gauges via the registry at construction; stores both as `Arc<envoy_stats::Gauge>` fields on `DrainState`; updates the gauges inline at every state-transition CAS-success site in `fail_healthcheck` / `ok_healthcheck` / `drain` (one source of truth — gauges are NEVER polled). Additionally registers the shared third gauge `listener_manager.total_listeners_active` inside `Listener::bind` (idempotent same-name re-registration across multiple `bind` calls returns the same `Arc<Gauge>` per Task 5's contract); stores the `Arc<Gauge>` as a 6th field on `Listener`; exposes a `pub(crate) fn listener_manager_active()` accessor for Task 6's RAII hoist (Task 6 lands the actual inc/dec wiring at `serve` entry/exit; Task 2 only registers + stores).
+
+Per 08.2 SPEC §2.2: `server.live` emits `1` ONLY when `current() == Live`; HealthcheckFailing AND Draining BOTH emit `0`. Gauge writes inside `drain()` happen BEFORE `notify.notify_waiters()` so a just-woken waiter that reads the registry sees the post-drain values (load-bearing ordering).
+
+### Tests landed (7 new tests by name)
+
+**`drain::tests::*` (5 new — total 9 → 14):**
+
+1. `new_registers_server_live_gauge` — fresh `DrainState::new(&registry)` registers the `server.live` key in the snapshot.
+2. `new_registers_server_state_gauge` — fresh `DrainState::new(&registry)` registers the `server.state` key.
+3. `new_initial_gauge_values_are_live` — initial values `server.live = 1`, `server.state = 0` (Live discriminant) per 08.2 SPEC §2.2.
+4. `drain_updates_server_live_to_zero_and_server_state_to_two` — `drain()` flips both gauges at the CAS-success site (Live → Draining; gauges read 0 / 2).
+5. `fail_healthcheck_sets_server_live_to_zero_and_server_state_to_one` — `fail_healthcheck()` flips both gauges (Live → HealthcheckFailing; gauges read 0 / 1). **Corrects the PLAN's first-draft test name `_keeps_server_live_at_one`** — the SPEC §2.2 invariant is "`server.live = 1` ONLY when `Live`", so the HealthcheckFailing case MUST emit `0`, not keep at `1` (the PLAN.md self-correction at line 989 spells this out).
+
+**`tests::*` (2 new — total 11 → 13):**
+
+6. `bind_registers_listener_manager_total_active_gauge` — `Listener::bind` registers `listener_manager.total_listeners_active` against the shared registry.
+7. `bind_listener_manager_gauge_is_idempotent_shared` — two `Listener::bind` calls against the same registry produce exactly one shared gauge entry in the snapshot (per Task 5's idempotent same-name re-registration contract).
+
+### Per-task deviations from PLAN
+
+- **PLAN sketch `let snapshot: BTreeMap<_, _> = registry.snapshot().collect();` rewritten** to `let snapshot: BTreeMap<_, _> = registry.snapshot().into_iter().collect();` in all 5 new drain tests + both 2 new lib tests. `StatsRegistry::snapshot()` returns `Vec<(String, StatHandle)>`, not an iterator; the PLAN sketch as-written would not compile. Mirrors the existing `crates/envoy-stats/src/registry.rs:188` test pattern.
+- **PLAN's `NoopHandler` test stub replaced with the existing `NullHandler`** at `crates/envoy-listener/src/lib.rs:470` (the no-op connection handler already in scope from Task 1's bind-side tests). The PLAN named the stub `NoopHandler`; the actual codebase has the equivalent under the name `NullHandler`.
+- **PLAN's first-draft test `fail_healthcheck_keeps_server_live_at_one` REPLACED with the SPEC-correct `fail_healthcheck_sets_server_live_to_zero_and_server_state_to_one`** asserting `g.value() == 0` for `server.live` in the HealthcheckFailing case. This is the PLAN's own self-correction at PLAN.md line 989 — the SPEC §2.2 invariant is "`server.live = 1` ONLY when `current() == Live`", which HealthcheckFailing does NOT satisfy.
+- **`Default for DrainState` impl removed** (not just stubbed) — the new `DrainState::new(&Arc<StatsRegistry>)` signature requires a registry argument, which `Default::default()` cannot synthesize. Replaced the impl block with a tombstone comment pointing at the Task 2 cause. This closes Minor finding #4 from the Task-1 code-quality review as a forced-removal rather than an opportunistic cleanup.
+- **`Listener::listener_manager_active` field + accessor decorated with `#[allow(dead_code)]`** at Task 2 because both are registered + stored but not yet consumed (Task 6 (D12) hoists the gauge into the RAII guard at `serve` entry/exit). The allows are scoped to the two declarations and carry inline comments referencing Task 6's removal of the allow. Without this, `cargo clippy -D warnings` flags `field never read` + `method never used`.
+- **The 9 existing Task-1 tests had their `DrainState::new()` calls swept** to `DrainState::new(&mk_registry())` via a new module-local `fn mk_registry() -> Arc<envoy_stats::StatsRegistry>` helper at the top of `drain::tests` (parallels the `lib.rs` test helper of the same name — same semantics).
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `crates/envoy-listener/src/drain.rs` | +169 | -19 |
+| `crates/envoy-listener/src/lib.rs` | +86 | -3 |
+| `docs/envoy-rust/BEHAVIOR_CONTRACT.md` | +6 | 0 |
+| **Total source + doc:** | **+261** | **-22** |
+
+Test-count delta: `envoy-listener` lib bucket grew **21 → 28** (+7 = 5 new `drain::tests::*` + 2 new `tests::*`); workspace total grew by the same +7 (no other crate touched).
+
+No new top-level Cargo deps — `envoy_stats` was already a `[dependencies]` entry on `envoy-listener` (used since 06.1 for `cx_total` + 06.3 for `cx_active` / `cx_accept_failed`). Crate root still carries `#![forbid(unsafe_code)]`; zero new unsafe blocks.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff after one `cargo fmt --all` apply during implementation — a single line in the new bind test's `let snapshot` line wrapped vs. rustfmt's preferred single-line shape).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean compile across all 8 workspace crates, zero warnings). The two `#[allow(dead_code)]` annotations on `Listener::listener_manager_active` field + accessor are required at Task 2 (the gauge is registered + stored but not consumed until Task 6's RAII hoist).
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 crates + 2 helper bin crates compiled).
+
+**Gate 4 — `cargo test --workspace`:** PASS (exit 0; every per-bucket `test result:` line reads `ok. N passed; 0 failed`; the `envoy-listener` lib bucket grew from 21 → 28 tests). Focused re-run: `cargo test -p envoy-listener --lib drain::tests` reads `14 passed; 0 failed`.
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per 07.1-REVIEW doctrine.
+
+### Differential surface delta
+
+**None at the differential / fixture surface.** Gauges register but no fixture asserts their values yet — fixture 0015 at Task 8 (the new differential fixture for `/drain_listeners`) is the first to assert `server.state = 2` post-drain. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
+
+The `BEHAVIOR_CONTRACT.md` "Stat-name mapping" section gains 3 new rows under a new `**08.2 entries (drain machinery):**` subheading inserted between the existing `**06.3 entries:**` table and the `**06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**` callout — mirrors the per-phase subheading cadence the 06.1 → 06.3 entries already established.
