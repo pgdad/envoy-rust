@@ -1373,7 +1373,7 @@ Done 370923 runs in 31 second(s)
 
 ## Task 13 — D17.4a — In-process backstop admin_config_dump_server_info.rs
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 13 — in-process backstop (admin_config_dump_server_info)`
+**Commit:** `fcfb940` — `phase 08.1: task 13 — in-process backstop (admin_config_dump_server_info)`
 **LoC delta:** +230 tests (the new backstop at `crates/envoy-bin/tests/admin_config_dump_server_info.rs`), +1 production-ish (`serde_json = "1"` added to `crates/envoy-bin/Cargo.toml` `[dev-dependencies]`), +~85 doc (this PROGRESS narrative). Net +~316 insertions, 0 deletions. No production code change.
 
 ### Work summary
