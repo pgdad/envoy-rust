@@ -476,3 +476,103 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 **None at the differential / fixture surface.** Task 3 introduces the 3 POST endpoint variants + render fns but the `render_with` dispatch is still `todo!()`-gated (Task 4 lands `handler.drain()`), so no live HTTP wire surface changes yet. Fixture 0015 at Task 8 is the first differential surface to exercise the endpoints end-to-end. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior on already-shipped endpoints); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
 
 The `BEHAVIOR_CONTRACT.md` "Admin endpoint body shapes" table gains 3 new rows (one per POST endpoint) + the existing `/server_info` row note patched to acknowledge the D5e value-source rebind that Task 5 lands. Per the PLAN architecture-decision lock-in #24 (body-shape rows land at Task 3); the Admin-action effect equivalence subsection lands at Task 8.
+
+## Task 4 (D13b — `AdminHandler::new` 7-arg widen + envoy-bin DrainState wiring)
+
+### Work summary
+
+Widens `AdminHandler::new` from 6-arg to 7-arg (adds the trailing `drain: Arc<DrainState>` parameter per 08.2 PLAN architecture-decision lock-in #13 — additive, no reordering of existing positional args). Adds a `drain: Arc<DrainState>` field on the `AdminHandler` struct + a `pub(crate) fn drain(&self) -> &Arc<DrainState>` accessor mirroring the existing `bootstrap()` / `registry()` / `cluster_manager()` / `command_line_options()` accessor shape. Extends the `ConnectionHandler::handle` impl's `let cloned = Arc::new(AdminHandler { ... })` site to clone the new `drain` `Arc` (mirrors the pattern Task 5 / 06.1 established for the other handle-arc fields).
+
+Replaces the 3 `todo!()`-gated arms in `endpoint::AdminEndpoint::render_with` (introduced at Task 3 as the architecture-decision deviation #1 placeholders) with the real `render_drain_listeners(handler.drain())` / `render_healthcheck_fail(handler.drain())` / `render_healthcheck_ok(handler.drain())` calls. Removes the `#[allow(dead_code)]` annotations from the 3 render fns + the shared `empty_200_ok()` helper introduced at Task 3 — the production-side dispatch path now reaches all four declarations, so the per-decl allows are no longer needed (and would themselves now trigger `clippy::useless_attribute` under `-D warnings`).
+
+Threads the new `drain` handle through `envoy-bin::main`: constructs a single process-wide `Arc<DrainState>` ONCE at startup (alongside the existing `Arc<StatsRegistry>` at `crates/envoy-bin/src/main.rs:101-102`, before the data-plane listener-walk so both the admin and the future Task-6 data-plane `Listener::serve` call sites observe the same handle) and passes `Arc::clone(&drain)` as the 7th argument to `envoy_admin::AdminHandler::new` at the admin-handler-construction site (`crates/envoy-bin/src/main.rs:358-365`). The data-plane `Listener::serve` call sites at the tcp_proxy + HCM arms continue to invoke the still-1-arg `Listener::serve(shutdown)` signature unchanged at Task 4 — Task 6 (D12) widens `Listener::serve` to 2-arg (`shutdown, drain`) and updates envoy-bin's two `set.spawn(async move { listener.serve(...) })` sites accordingly.
+
+Updates every existing `AdminHandler::new(...)` test call site (7 sites in the `handler.rs::tests` module plus the `handler_with_bootstrap` helper at `endpoint.rs::config_dump_tests` plus the constructor-coverage test at `handler.rs::admin_handler_new_6arg_tests`) to pass `Arc::new(envoy_listener::DrainState::new(&registry))` as the new 7th arg. Where call sites previously moved a bare `registry: Arc<StatsRegistry>` into `new`, the move-by-value was switched to `Arc::clone(&registry)` so the same `registry` can also feed `DrainState::new(&registry)` on the next line (3 sites required this adjustment; the other 4 already cloned).
+
+### Tests landed (2)
+
+Both colocated in the existing `handler::tests` module at `crates/envoy-admin/src/handler.rs` (the 06.1-era in-process integration-style test cohort), positioned immediately before the `handler_response_carries_admin_headers` test:
+
+1. **`admin_handler_new_takes_drain_state_as_seventh_arg`** — Constructs a fresh `Arc<DrainState>` + `AdminHandler::new(…, Arc::clone(&drain))`, then asserts `Arc::ptr_eq(handler.drain(), &drain)`. Verifies (a) the constructor accepts the 7th positional arg and (b) the new `drain()` accessor returns the same `Arc` (pointer equality — the constructor stores the passed-in handle without cloning the underlying `DrainState`).
+2. **`drain_listeners_endpoint_invokes_drain_via_render_with`** — Constructs a handler with a fresh `DrainState`, asserts pre-state is `DrainStage::Live`, dispatches `AdminEndpoint::DrainListeners.render_with(&handler)`, then asserts (a) `resp.status == 200` and (b) post-state is `DrainStage::Draining`. The end-to-end equivalent of Task 3's `render_drain_listeners(&drain)` direct-call test, but routed through the dispatch surface that Task 4 wires by removing the `todo!()` placeholder.
+
+Red phase (Step 2) verified pre-implementation: `cargo test -p envoy-admin --lib` produced `error[E0061]: this function takes 6 arguments but 7 arguments were supplied` on the 2 new tests AND `error[E0599]: no method named drain found for struct AdminHandler` on the `handler.drain()` call in test 1 (3 errors total — both tests show the E0061 + test 1 also shows the E0599; the 2nd test's `render_with` call indirectly triggers the same `drain()` method lookup through the dispatch). Green phase (Step 4) verified post-implementation: `test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out` (67 → 69, +2 exactly the new tests).
+
+### Per-task deviations from PLAN
+
+1. **Test-helper names diverge from the PLAN snippet (`test_admin_config` / `test_bootstrap_arc` / `test_cluster_manager_arc`) — used the existing helpers `admin_config(port)` / `dummy_bootstrap()` / `dummy_cluster_manager()` in scope at `crates/envoy-admin/src/handler.rs::tests::{387,405,414}` instead.** The PLAN snippet at Task 4 Step 1 referenced names that don't exist in the file (a notational shorthand in the PLAN's brainstorming style). The two new tests live in the same `handler::tests` module as the 7 existing in-process integration tests, so the existing helpers are in scope by direct super-module use; no new helper introduction needed. Functionally identical to the PLAN snippet (the 2 tests construct the same handle set + invoke the same assertions).
+
+2. **`admin_handler_new_6arg_tests::admin_handler_new_accepts_six_args_and_constructs` retained its 08.1 historical name + module name.** The test name + module name both reference "six args" / "6arg" — accurate descriptions of the 08.1 D13a shape that this test originally covered. Task 4's 7-arg widening makes those names mildly misleading, but renaming a sibling test that already passes (constructor-coverage tautology + `config()` accessor sanity-check) at this task would noise the diff for zero behavior change. Updated the test body to pass the new `drain` arg + added an inline doc-comment at `crates/envoy-admin/src/handler.rs:955-967` noting the historical name retention and pointing readers to the new sibling `admin_handler_new_takes_drain_state_as_seventh_arg` in `super::tests` as the Task-4-shape-specific coverage. (Test 9 at fixture 0015 + the future fuzz seed at Task 9 are the more authoritative post-08.2 surfaces; renaming this 06.1-era in-file constructor test is best deferred to a dedicated cleanup pass if reviewers prefer.)
+
+3. **Clippy `doc_lazy_continuation` red on initial `drain()` accessor doc-comment.** The first draft of the `pub(crate) fn drain` doc-comment used `+`-joined list-style across continuation lines (`/// + render_healthcheck_fail + render_healthcheck_ok`), which `clippy::doc_lazy_continuation` (1.95.0) interprets as malformed Markdown list items. Reworded to use comma-separated prose; the doc-comment content is functionally identical (every render-fn reference + Task-5 reference is preserved). Recorded per the cross-task precedent of documenting incidental clippy-driven rewordings.
+
+4. **Switched 3 `AdminHandler::new(…, registry, …)` move-by-value test call sites to `Arc::clone(&registry)`.** The pre-Task-4 sites at `handler.rs::tests::{handler_serves_ready_in_process, handler_returns_404_for_unknown_path, handler_returns_405_for_post_method, handler_response_carries_server_header, admin_handler_idle_read_times_out_at_5s, handler_response_carries_admin_headers}` moved `registry` directly into `AdminHandler::new`. Task 4 needs the same `registry` to also feed `DrainState::new(&registry)` on the same expression, so the move-by-value was changed to `Arc::clone(&registry)` (cheap refcount bump). The `handler_serves_stats_prometheus_in_process` site already used `Arc::clone(&registry)` (it needs the registry alive to register a counter post-construction); 6 sites adjusted total.
+
+5. **`drain` binding in `envoy-bin::main` is not yet observed by the data-plane listeners.** Per the PLAN spec, Task 4 only threads `drain` into the admin handler; the tcp_proxy + HCM `set.spawn(async move { listener.serve(...) })` sites at `crates/envoy-bin/src/main.rs:235-240` and `crates/envoy-bin/src/main.rs:333-338` continue to call the still-1-arg `Listener::serve(shutdown)` signature unchanged. Task 6 (D12) widens `Listener::serve` to 2-arg and updates those two sites. Rust does NOT warn about this — the `drain` binding is referenced inside the `if let Some(admin_cfg)` block via `Arc::clone(&drain)`, which counts as a use; clippy stayed green (verified with `cargo clippy --workspace --all-targets --all-features -- -D warnings` at Step 5).
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `crates/envoy-admin/src/handler.rs` | +110 | -14 |
+| `crates/envoy-admin/src/endpoint.rs` | +28 | -34 |
+| `crates/envoy-bin/src/main.rs` | +11 | 0 |
+| **Total source:** | **+149** | **-48** |
+
+Test-count delta: `envoy-admin` lib bucket grew **67 → 69** (+2, exactly the 2 new tests in `handler::tests`); `envoy-bin` lib bucket unchanged at 8 (Task 4 widened the binary's startup wiring but did not add new envoy-bin lib tests — the binary-level coverage is the existing `cargo build -p envoy-bin --bin envoy-bin` compile check, plus the upcoming fixture 0015 differential at Task 8). Workspace total grew by the same +2 (no other crate touched).
+
+No new top-level Cargo deps. `envoy_listener` was already on `envoy-admin`'s `[dependencies]` list (Task 3 added the `envoy_listener::DrainState` references through the re-export at `crates/envoy-admin/src/lib.rs:17`); the new `use envoy_listener::{..., DrainState}` import in `handler.rs:11` is purely a name-scope addition. Crate root `crates/envoy-admin/src/lib.rs` still carries `#![forbid(unsafe_code)]`; zero new unsafe blocks.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean across all 8 workspace crates, zero warnings, zero errors). The initial draft of the `drain()` accessor doc-comment tripped `clippy::doc_lazy_continuation` (6 errors at `handler.rs:151-158`) — reworded `+`-joined references to comma-separated prose (per-task deviation #3); the rewording landed before Step 5's authoritative gate run.
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 workspace crates + 2 helper bin crates compiled — `envoy-admin` rebuilt because of the new field + accessor + dispatch arms, `envoy-bin` rebuilt because of the new `drain` binding + 7th arg at the `AdminHandler::new` call site, all downstream test compilation succeeded).
+
+**Gate 4 — `cargo test --workspace`:** PASS (exit 0; every per-bucket `test result:` line reads `ok. N passed; 0 failed`; the `envoy-admin` lib bucket grew from 67 → 69 tests — the 2 new `handler::tests::{admin_handler_new_takes_drain_state_as_seventh_arg, drain_listeners_endpoint_invokes_drain_via_render_with}`). Focused re-run: `cargo test -p envoy-admin --lib` reads `69 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s`. No flakes observed on the workspace run — every previously-flaky bucket (`differential::backend::tests::tcp_proxy_backend_*` per Task 3 PROGRESS) ran clean on the single authoritative run.
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per 07.1-REVIEW doctrine.
+
+### Differential surface delta
+
+**None at the differential / fixture surface.** Task 4 wires the `handler.drain()` accessor through the dispatch path (the `render_with` arms now invoke the real render fns instead of `todo!()`-panicking), but the 3 POST endpoints' end-to-end wire surface is exercised only by fixture 0015 at Task 8 (the first differential surface that POSTs to `/drain_listeners` + observes the post-drain `/ready 503` and `/server_info.state == "DRAINING"` mappings — those mappings themselves land at Task 5's D5e + D-ready patch). All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior on any already-shipped endpoint; the only behavioral change at Task 4 is that POSTing to the 3 new endpoints now returns 200 OK instead of crashing on `todo!()`, and no shipped fixture POSTs to those endpoints — fixture 0015 is the first). The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
+
+The `#[allow(dead_code)]` removal at the 3 render fns + `empty_200_ok()` helper is a Task-4 hard requirement per the inline doc-comments Task 3 added (each annotation's doc-comment explicitly said "Task 4 removes the allow"); the production-side `render_with` arms now reach all four declarations, so clippy under `-D warnings` would itself flag the `#[allow(dead_code)]` annotations as `useless_attribute` if they were left in place. Confirmed removed at Task 4 — Gate 2 (clippy) green is the structural evidence.

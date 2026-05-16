@@ -101,6 +101,16 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let registry: std::sync::Arc<envoy_stats::StatsRegistry> =
         std::sync::Arc::new(envoy_stats::StatsRegistry::new());
 
+    // 08.2 D13b: construct the shared DrainState ONCE at startup. Cloned
+    // into the admin handler (writer; for the 3 POST endpoints + /server_info
+    // state read + /ready drain-aware response) and into every data-plane
+    // Listener::serve call (reader/observer per D12 — the tcp_proxy + HCM
+    // paths). The echo path (fixture 0002 only) and the admin path itself
+    // use TcpListener::bind directly and are naturally excluded from drain
+    // observation per 08.2 PLAN architecture-decision lock-in #12.
+    let drain: std::sync::Arc<envoy_listener::DrainState> =
+        std::sync::Arc::new(envoy_listener::DrainState::new(&registry));
+
     // Build the cluster manager once. Empty `clusters` is permitted at the
     // envoy-config validator (admin-only configs); the manager is empty in
     // that case and `tcp_proxy` filters reference clusters by name, which
@@ -362,6 +372,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
             std::sync::Arc::clone(&cluster_mgr),
             start_instant,
             command_line_options.clone(),
+            std::sync::Arc::clone(&drain),
         ));
         let shutdown = token.clone();
         set.spawn(async move {

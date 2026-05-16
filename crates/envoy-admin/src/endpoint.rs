@@ -202,20 +202,14 @@ impl AdminEndpoint {
             AdminEndpoint::ServerInfo => render_server_info(handler),
             AdminEndpoint::Clusters => render_clusters(handler),
             AdminEndpoint::Listeners => render_listeners(handler),
-            // 08.2 D9 / D10 — the three POST endpoints need an
-            // `Arc<DrainState>` accessor on `AdminHandler`. Task 4 (D13b)
-            // widens `AdminHandler::new` from 6-arg to 7-arg and exposes a
-            // `handler.drain()` accessor; until then the dispatch arms are
-            // gated with `todo!()`. The 9 Task-3 unit tests in
-            // `drain_admin_tests` exercise the render fns directly via
-            // `render_drain_listeners(&drain)` etc. so the side effect +
-            // response shape are verified independent of this dispatch path.
-            // Per PROGRESS Task-3 architecture-decision deviation #1.
-            AdminEndpoint::DrainListeners => todo!(
-                "Task 4 (D13b) wires handler.drain() accessor; until then dispatch returns todo!()"
-            ),
-            AdminEndpoint::HealthcheckFail => todo!("Task 4 wires handler.drain() accessor"),
-            AdminEndpoint::HealthcheckOk => todo!("Task 4 wires handler.drain() accessor"),
+            // 08.2 D9 / D10 — the three POST endpoints route through the
+            // `handler.drain()` accessor (08.2 D13b, Task 4). Each render fn
+            // invokes the corresponding `DrainState` method (drain /
+            // fail_healthcheck / ok_healthcheck) and returns 200 OK with an
+            // empty body via the shared `empty_200_ok()` helper.
+            AdminEndpoint::DrainListeners => render_drain_listeners(handler.drain()),
+            AdminEndpoint::HealthcheckFail => render_healthcheck_fail(handler.drain()),
+            AdminEndpoint::HealthcheckOk => render_healthcheck_ok(handler.drain()),
             // 06.1 endpoints carry forward through the registry-only path.
             _ => self.render(handler.registry()),
         }
@@ -479,22 +473,18 @@ pub(crate) fn render_listeners(handler: &crate::handler::AdminHandler) -> envoy_
 /// draining within tens of microseconds. Sticky — repeat POSTs are idempotent
 /// (per parent-08 SPEC §5.6 + 08.2 SPEC §3 D11 sticky-drain).
 ///
-/// `#[allow(dead_code)]` at Task 3: the `render_with` dispatch arm is gated
-/// with `todo!()` until Task 4 (D13b) wires the `handler.drain()` accessor,
-/// so this fn is reachable only from the colocated unit tests until then.
-/// Task 4 removes the allow.
-#[allow(dead_code)]
+/// Reachable from Task 4 onward via `render_with`'s `DrainListeners` arm
+/// (`handler.drain()`-routed) AND from the colocated `drain_admin_tests` unit
+/// tests. Task 3's `#[allow(dead_code)]` was removed at Task 4 once the
+/// dispatch arm started invoking this fn.
 pub(crate) fn render_drain_listeners(drain: &envoy_listener::DrainState) -> envoy_http1::Response {
     drain.drain();
     empty_200_ok()
 }
 
 /// Phase 08.2 D10a: `/healthcheck/fail` POST endpoint. Invokes
-/// `DrainState::fail_healthcheck()` and returns 200 OK empty body.
-///
-/// `#[allow(dead_code)]` at Task 3 — removed by Task 4 (see
-/// `render_drain_listeners` doc-comment for the rationale).
-#[allow(dead_code)]
+/// `DrainState::fail_healthcheck()` and returns 200 OK empty body. Reachable
+/// from Task 4 via `render_with`'s `HealthcheckFail` arm.
 pub(crate) fn render_healthcheck_fail(drain: &envoy_listener::DrainState) -> envoy_http1::Response {
     drain.fail_healthcheck();
     empty_200_ok()
@@ -504,11 +494,8 @@ pub(crate) fn render_healthcheck_fail(drain: &envoy_listener::DrainState) -> env
 /// `DrainState::ok_healthcheck()` and returns 200 OK empty body. Sticky-drain:
 /// if state is already `Draining`, this is a no-op (the underlying
 /// `compare_exchange` from `HealthcheckFailing → Live` fails silently; state
-/// stays `Draining`).
-///
-/// `#[allow(dead_code)]` at Task 3 — removed by Task 4 (see
-/// `render_drain_listeners` doc-comment for the rationale).
-#[allow(dead_code)]
+/// stays `Draining`). Reachable from Task 4 via `render_with`'s
+/// `HealthcheckOk` arm.
 pub(crate) fn render_healthcheck_ok(drain: &envoy_listener::DrainState) -> envoy_http1::Response {
     drain.ok_healthcheck();
     empty_200_ok()
@@ -517,10 +504,7 @@ pub(crate) fn render_healthcheck_ok(drain: &envoy_listener::DrainState) -> envoy
 /// Shared 200 OK empty-body response shape for the 3 D9/D10 POST endpoints.
 /// `content-length: 0` per the established admin response convention; no
 /// `content-type` (no body — content-type is moot per RFC 7231 §3.1.1.5).
-///
-/// `#[allow(dead_code)]` at Task 3 — call sites in `render_with` are gated
-/// with `todo!()` until Task 4 wires the dispatch. Task 4 removes the allow.
-#[allow(dead_code)]
+/// Reachable from Task 4 onward via the 3 `render_*` callers above.
 fn empty_200_ok() -> envoy_http1::Response {
     envoy_http1::Response {
         status: 200,
@@ -721,13 +705,23 @@ mod config_dump_tests {
             access_log_path: None,
         };
         let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        // Phase 08.2 Task 4 (D13b): every `AdminHandler::new` call site adds
+        // the trailing `Arc<DrainState>` arg. The shared helper here covers
+        // the 08.1 endpoint-task test cohort (config_dump / server_info /
+        // clusters / listeners); the DrainState constructed here is
+        // never observed by those tests (they read bootstrap / cluster /
+        // listener state, not drain state), so a fresh per-call DrainState
+        // is sufficient.
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
         AdminHandler::new(
             cfg,
-            Arc::new(StatsRegistry::new()),
+            registry,
             Arc::new(bootstrap),
             Arc::new(ClusterManager::empty()),
             Instant::now(),
             BTreeMap::new(),
+            drain,
         )
     }
 

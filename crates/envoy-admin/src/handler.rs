@@ -8,7 +8,7 @@ use crate::error::AdminError;
 use bytes::BytesMut;
 use envoy_cluster::ClusterManager;
 use envoy_config::Bootstrap;
-use envoy_listener::{BoxFuture, ConnectionHandler, DRAIN_BUDGET};
+use envoy_listener::{BoxFuture, ConnectionHandler, DRAIN_BUDGET, DrainState};
 use envoy_stats::StatsRegistry;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -66,14 +66,27 @@ pub struct AdminHandler {
     /// Currently `envoy-bin` populates this with `{"config_path":
     /// Value::String(<-c value>)}`.
     command_line_options: BTreeMap<String, serde_yaml::Value>,
+    /// Phase 08.2 D13b: shared `DrainState` handle for the 3 POST endpoints
+    /// (D9 + D10) AND the `/server_info` state-source read (D5e) AND the
+    /// `/ready` drain-aware response (D-ready). Constructed ONCE at
+    /// `envoy-bin::main` startup alongside the registry; cloned into the
+    /// admin handler (writer) and each data-plane `Listener::serve` call
+    /// (reader/observer per D12). Held as `Arc<DrainState>` so the handler
+    /// can stay `Send + Sync`.
+    drain: Arc<DrainState>,
 }
 
 impl AdminHandler {
     /// Phase 08.1 D13a: widened from the 2-arg `(config, registry)` shape to
     /// a 6-arg shape that captures the four additional handles Tasks 6-9 need
-    /// at render time. The 7th `Arc<DrainState>` parameter is added in 08.2
-    /// D13b. SPEC §3 D13a called this "5-arg"; PLAN lock-in #7 refines that
-    /// to 6-arg by capturing `command_line_options` at construction time.
+    /// at render time. Phase 08.2 D13b (Task 4) widens further to 7-arg by
+    /// adding the trailing `drain: Arc<DrainState>` consumed by the 3 POST
+    /// admin endpoints + `/server_info` state read + `/ready` drain-aware
+    /// response. SPEC §3 D13a called the 08.1 widening "5-arg"; PLAN lock-in
+    /// #7 refines that to 6-arg by capturing `command_line_options` at
+    /// construction time. 08.2 PLAN architecture-decision lock-in #13 binds
+    /// the 7th parameter as the trailing `Arc<DrainState>` (additive — every
+    /// existing call site updates by appending one arg, no reordering).
     pub fn new(
         config: Arc<AdminConfig>,
         registry: Arc<StatsRegistry>,
@@ -81,6 +94,7 @@ impl AdminHandler {
         cluster_manager: Arc<ClusterManager>,
         start_instant: Instant,
         command_line_options: BTreeMap<String, serde_yaml::Value>,
+        drain: Arc<DrainState>,
     ) -> Self {
         Self {
             config,
@@ -89,6 +103,7 @@ impl AdminHandler {
             cluster_manager,
             start_instant,
             command_line_options,
+            drain,
         }
     }
 
@@ -131,6 +146,18 @@ impl AdminHandler {
     /// `/server_info` renderer; borrowed into `ServerInfoBody.command_line_options`.
     pub(crate) fn command_line_options(&self) -> &BTreeMap<String, serde_yaml::Value> {
         &self.command_line_options
+    }
+
+    /// Phase 08.2 D13b accessor: consumed by Task 3's `render_drain_listeners`,
+    /// `render_healthcheck_fail`, and `render_healthcheck_ok` (via `render_with`'s
+    /// dispatch arms — Task 4 replaces the `todo!()` placeholders with the real
+    /// `handler.drain()` calls) AND by Task 5's `render_server_info` state-source
+    /// patch AND by Task 5's `render_ready_with` drain-aware response branch.
+    /// Returns the `Arc<DrainState>` by reference so callers can `Arc::clone`
+    /// when they need owned handles (the render fns at Task 3 only need a
+    /// borrowed `&DrainState`).
+    pub(crate) fn drain(&self) -> &Arc<DrainState> {
+        &self.drain
     }
 
     /// Read at most `MAX_REQUEST_HEAD` bytes until CRLF-CRLF; parse via
@@ -303,6 +330,11 @@ impl ConnectionHandler for AdminHandler {
             cluster_manager: Arc::clone(&self.cluster_manager),
             start_instant: self.start_instant,
             command_line_options: self.command_line_options.clone(),
+            // Phase 08.2 D13b: extend the per-connection handle-clone to the
+            // new DrainState Arc so each spawned task observes the same
+            // process-wide DrainState (writes from one connection are
+            // immediately visible to subsequent reads from any connection).
+            drain: Arc::clone(&self.drain),
         });
         Box::pin(Self::handle_inner(cloned, downstream))
     }
@@ -437,11 +469,12 @@ mod tests {
         let cfg = Arc::new(admin_config(addr.port()));
         let handler = Arc::new(AdminHandler::new(
             cfg,
-            registry,
+            Arc::clone(&registry),
             dummy_bootstrap(),
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
+            Arc::new(envoy_listener::DrainState::new(&registry)),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -476,6 +509,7 @@ mod tests {
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
+            Arc::new(envoy_listener::DrainState::new(&registry)),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -501,11 +535,12 @@ mod tests {
         let cfg = Arc::new(admin_config(addr.port()));
         let handler = Arc::new(AdminHandler::new(
             cfg,
-            registry,
+            Arc::clone(&registry),
             dummy_bootstrap(),
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
+            Arc::new(envoy_listener::DrainState::new(&registry)),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -530,11 +565,12 @@ mod tests {
         let cfg = Arc::new(admin_config(addr.port()));
         let handler = Arc::new(AdminHandler::new(
             cfg,
-            registry,
+            Arc::clone(&registry),
             dummy_bootstrap(),
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
+            Arc::new(envoy_listener::DrainState::new(&registry)),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -560,11 +596,12 @@ mod tests {
         let cfg = Arc::new(admin_config(addr.port()));
         let handler = Arc::new(AdminHandler::new(
             cfg,
-            registry,
+            Arc::clone(&registry),
             dummy_bootstrap(),
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
+            Arc::new(envoy_listener::DrainState::new(&registry)),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -597,11 +634,12 @@ mod tests {
         let cfg = Arc::new(admin_config(addr.port()));
         let handler = Arc::new(AdminHandler::new(
             cfg,
-            registry,
+            Arc::clone(&registry),
             dummy_bootstrap(),
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
+            Arc::new(envoy_listener::DrainState::new(&registry)),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(serve(lst, handler, async move {
@@ -642,6 +680,55 @@ mod tests {
         let _ = tx.send(());
     }
 
+    /// Phase 08.2 Task 4 (D13b): `AdminHandler::new` widens from 6-arg to
+    /// 7-arg (trailing `drain: Arc<DrainState>`). Verifies the new accessor
+    /// returns the same `Arc` (pointer equality) — i.e., the constructor
+    /// stores the passed-in handle without cloning the underlying state.
+    #[tokio::test]
+    async fn admin_handler_new_takes_drain_state_as_seventh_arg() {
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        let cfg = Arc::new(admin_config(0));
+        let handler = AdminHandler::new(
+            cfg,
+            Arc::clone(&registry),
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+            Arc::clone(&drain),
+        );
+        // Verify the new accessor returns the same Arc (pointer equality).
+        assert!(Arc::ptr_eq(handler.drain(), &drain));
+    }
+
+    /// Phase 08.2 Task 4 (D13b): exercises the `render_with` dispatch path
+    /// post-Task-3-`todo!()`-replacement. Constructs an `AdminHandler` with a
+    /// fresh `DrainState`, dispatches `/drain_listeners` through `render_with`,
+    /// and asserts (a) the response is 200 OK and (b) the side effect landed
+    /// (state flipped from `Live` → `Draining`). This is the end-to-end
+    /// equivalent of Task 3's `render_drain_listeners(&drain)` direct-call
+    /// test, but routed through the dispatch surface that Task 4 wires.
+    #[tokio::test]
+    async fn drain_listeners_endpoint_invokes_drain_via_render_with() {
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        let cfg = Arc::new(admin_config(0));
+        let handler = AdminHandler::new(
+            cfg,
+            Arc::clone(&registry),
+            dummy_bootstrap(),
+            dummy_cluster_manager(),
+            Instant::now(),
+            BTreeMap::new(),
+            Arc::clone(&drain),
+        );
+        assert_eq!(drain.current(), envoy_listener::DrainStage::Live);
+        let resp = crate::endpoint::AdminEndpoint::DrainListeners.render_with(&handler);
+        assert_eq!(resp.status, 200);
+        assert_eq!(drain.current(), envoy_listener::DrainStage::Draining);
+    }
+
     #[tokio::test]
     async fn handler_response_carries_admin_headers() {
         let (lst, addr) = bind_random().await;
@@ -649,11 +736,12 @@ mod tests {
         let cfg = Arc::new(admin_config(addr.port()));
         let handler = Arc::new(AdminHandler::new(
             cfg,
-            registry,
+            Arc::clone(&registry),
             dummy_bootstrap(),
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
+            Arc::new(envoy_listener::DrainState::new(&registry)),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -867,16 +955,23 @@ mod admin_handler_new_6arg_tests {
     #[test]
     fn admin_handler_new_accepts_six_args_and_constructs() {
         // The body of the test is intentionally minimal: the constructor
-        // must accept all six handles and produce a usable `AdminHandler`.
-        // The 7th-parameter `Arc<DrainState>` widening is deferred to 08.2
-        // D13b. Detailed field-routing tests live with the consumer tasks
-        // (6/7/8/9), which render the handles into their endpoints.
+        // must accept all (now seven) handles and produce a usable
+        // `AdminHandler`. The 7th-parameter `Arc<DrainState>` is the 08.2
+        // D13b (Task 4) widening — the test name retains its 08.1
+        // "six_args" suffix as a deliberate historical artifact (the
+        // sibling `admin_handler_new_takes_drain_state_as_seventh_arg`
+        // test in `super::tests` is the post-Task-4-shape-specific
+        // coverage; this test continues to assert the constructor + the
+        // `config()` accessor still works post-widening). Detailed
+        // field-routing tests live with the consumer tasks (6/7/8/9)
+        // which render the handles into their endpoints.
         let cfg = dummy_admin_config();
         let registry = Arc::new(StatsRegistry::new());
         let bootstrap = dummy_bootstrap();
         let cluster_manager = dummy_cluster_manager();
         let start_instant = Instant::now();
         let command_line_options: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
 
         let handler = AdminHandler::new(
             cfg,
@@ -885,6 +980,7 @@ mod admin_handler_new_6arg_tests {
             cluster_manager,
             start_instant,
             command_line_options,
+            drain,
         );
 
         // Sanity: the existing `config()` accessor still works post-widening.
