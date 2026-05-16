@@ -185,12 +185,24 @@ impl DrainState {
     /// admin listener stays serving during drain so `/server_info` +
     /// `/stats/prometheus` remain reachable.
     pub fn drain_signal(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        // Already-Draining: return an immediately-ready future. Avoids
-        // registering a waiter that would never unpark.
+        // Anchor the notify snapshot BEFORE the state load so a concurrent
+        // `drain()` firing between the two cannot leave a registered waiter
+        // permanently parked. `tokio::sync::Notify::notified()` snapshots the
+        // notify_waiters counter at construction time per the tokio docs
+        // ("guaranteed to receive wakeups from notify_waiters() as soon as it
+        // has been created"). If we loaded state first and then constructed
+        // `notified`, a between-the-two `drain()` could bump the counter,
+        // making the subsequently-constructed `Notified` snapshot the post-bump
+        // value — on first poll the counter comparison would fall through and
+        // register a waiter that never unparks (sticky-drain idempotency means
+        // no second `notify_waiters()` ever fires).
+        let notified = self.notify.notified();
         if self.state.load(Ordering::Acquire) == DrainStage::Draining as u8 {
+            // Discard the unpolled `Notified` and return immediately. Drop on
+            // an unpolled `Notified` is safe (no registration has occurred yet).
             return Box::pin(std::future::ready(()));
         }
-        Box::pin(self.notify.notified())
+        Box::pin(notified)
     }
 }
 
@@ -206,27 +218,45 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Test 1 of 6: a fresh `DrainState::new()` starts at `DrainStage::Live`.
+    /// Test 1 of 9: a fresh `DrainState::new()` starts at `DrainStage::Live`.
     #[test]
     fn new_returns_live() {
         let drain = DrainState::new();
         assert_eq!(drain.current(), DrainStage::Live);
     }
 
-    /// Test 2 of 6: `drain()` flips state to `Draining` AND notifies all
-    /// pending `drain_signal()` waiters exactly once.
+    /// Test 2 of 9: `drain()` flips state to `Draining` AND notifies all
+    /// pending `drain_signal()` waiters exactly once. Uses a 3-party `Barrier`
+    /// (Important #2 carryforward from Task 1 fixup review: deterministic
+    /// rendezvous replaces the prior 50ms sleep, which was flake-prone on
+    /// loaded CI runners).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_flips_to_draining_and_notifies_waiters_once() {
+        use tokio::sync::Barrier;
+
         let drain = Arc::new(DrainState::new());
+        let barrier = Arc::new(Barrier::new(3));
 
-        // Two waiters block on `drain_signal()` before drain fires.
+        // Spawn two waiters; each constructs `drain_signal()`, signals at the
+        // barrier (rendezvous with main task + sibling waiter), then awaits.
         let d1 = Arc::clone(&drain);
-        let h1 = tokio::spawn(async move { d1.drain_signal().await });
+        let b1 = Arc::clone(&barrier);
+        let h1 = tokio::spawn(async move {
+            let signal = d1.drain_signal();
+            b1.wait().await;
+            signal.await;
+        });
         let d2 = Arc::clone(&drain);
-        let h2 = tokio::spawn(async move { d2.drain_signal().await });
+        let b2 = Arc::clone(&barrier);
+        let h2 = tokio::spawn(async move {
+            let signal = d2.drain_signal();
+            b2.wait().await;
+            signal.await;
+        });
 
-        // Yield to let the two waiters call `notified()` and register.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait at the barrier; once all 3 parties arrive, both waiters have
+        // anchored their notify snapshots and are about to await.
+        barrier.wait().await;
 
         // Fire drain ONCE; both waiters must complete.
         drain.drain();
@@ -248,7 +278,7 @@ mod tests {
             .expect("post-drain drain_signal must be immediately ready");
     }
 
-    /// Test 3 of 6: `fail_healthcheck()` from `Live` flips to
+    /// Test 3 of 9: `fail_healthcheck()` from `Live` flips to
     /// `HealthcheckFailing`.
     #[test]
     fn fail_healthcheck_flips_to_healthcheck_failing() {
@@ -258,7 +288,7 @@ mod tests {
         assert_eq!(drain.current(), DrainStage::HealthcheckFailing);
     }
 
-    /// Test 4 of 6: `ok_healthcheck()` from `HealthcheckFailing` restores
+    /// Test 4 of 9: `ok_healthcheck()` from `HealthcheckFailing` restores
     /// `Live`.
     #[test]
     fn ok_healthcheck_restores_to_live() {
@@ -269,7 +299,7 @@ mod tests {
         assert_eq!(drain.current(), DrainStage::Live);
     }
 
-    /// Test 5 of 6: `ok_healthcheck()` AFTER `drain()` is a no-op (sticky-
+    /// Test 5 of 9: `ok_healthcheck()` AFTER `drain()` is a no-op (sticky-
     /// drain semantic per parent-08 SPEC §5.6).
     #[test]
     fn ok_healthcheck_after_drain_is_noop_sticky() {
@@ -284,7 +314,7 @@ mod tests {
         );
     }
 
-    /// Test 6 of 6: repeat `drain()` calls are idempotent (no second
+    /// Test 6 of 9: repeat `drain()` calls are idempotent (no second
     /// notify_waiters; state stays `Draining`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn repeat_drain_calls_are_idempotent() {
@@ -304,5 +334,101 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), drain.drain_signal())
             .await
             .expect("post-drain drain_signal must be immediately ready");
+    }
+
+    /// Test 7 of 9: `drain_signal()` is race-free with respect to a concurrent
+    /// `drain()` call that fires AFTER the future's caller has entered
+    /// `drain_signal()` but BEFORE the returned future is polled. Regression
+    /// test for the TOCTOU race closed at the Task 1 fixup commit: in the
+    /// pre-fix shape `state.load() → (window) → notify.notified()` a `drain()`
+    /// in the window would bump the notify counter, the subsequently-constructed
+    /// `Notified` would snapshot the post-bump value, and on poll the waiter
+    /// would park forever (sticky-drain means no second `notify_waiters()` ever
+    /// fires). The fixed shape inverts the order — `notify.notified()` first,
+    /// then state.load — so the snapshot anchors before any concurrent counter
+    /// bump can race in. Without the fix this test deterministically hangs;
+    /// with the fix it completes well within the 1s timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_signal_is_race_free_with_concurrent_drain() {
+        use tokio::sync::Barrier;
+
+        let drain = Arc::new(DrainState::new());
+        // Barrier of 2: the spawned task signals it has called `drain_signal()`
+        // (anchoring the notify snapshot); the main task then fires `drain()`.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let d_inner = Arc::clone(&drain);
+        let b_inner = Arc::clone(&barrier);
+        let handle = tokio::spawn(async move {
+            // Construct the signal future BEFORE the barrier rendezvous so
+            // the notify snapshot is anchored before drain can fire.
+            let signal = d_inner.drain_signal();
+            b_inner.wait().await;
+            // Now drain may fire on the main task; poll the signal future.
+            signal.await;
+        });
+
+        // Wait for the spawned task to have constructed its signal future.
+        barrier.wait().await;
+        // Fire drain on the main task. The spawned task's signal future must
+        // observe completion via the counter-bump fast path inside `Notified`'s
+        // poll (the snapshot was taken before the bump, so the counter check
+        // succeeds on first poll).
+        drain.drain();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("signal future must complete within 1s of drain() under the race-free shape")
+            .expect("spawned task join");
+    }
+
+    /// Test 8 of 9: `drain()` from `HealthcheckFailing` flips state to
+    /// `Draining` AND notifies any pending `drain_signal()` waiter — exercises
+    /// the second-CAS branch of `drain()` (Live→Draining CAS fails because
+    /// state is HealthcheckFailing, then HealthcheckFailing→Draining CAS
+    /// succeeds; `notify_waiters()` still fires exactly once).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_from_healthcheck_failing_notifies_waiters_once() {
+        use tokio::sync::Barrier;
+
+        let drain = Arc::new(DrainState::new());
+        drain.fail_healthcheck();
+        assert_eq!(drain.current(), DrainStage::HealthcheckFailing);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let d_inner = Arc::clone(&drain);
+        let b_inner = Arc::clone(&barrier);
+        let h = tokio::spawn(async move {
+            let signal = d_inner.drain_signal();
+            b_inner.wait().await;
+            signal.await;
+        });
+
+        barrier.wait().await;
+        drain.drain();
+        tokio::time::timeout(Duration::from_secs(1), h)
+            .await
+            .expect("waiter must complete within 1s of drain() from HealthcheckFailing")
+            .expect("waiter join");
+
+        assert_eq!(drain.current(), DrainStage::Draining);
+    }
+
+    /// Test 9 of 9: `fail_healthcheck()` AFTER `drain()` is a no-op (sticky-
+    /// drain semantic per parent-08 SPEC §5.6; symmetric with Test 5's
+    /// `ok_healthcheck()` post-drain assertion). The `compare_exchange` for
+    /// Live → HealthcheckFailing silently fails when the current value is
+    /// Draining (CAS expected-value mismatch).
+    #[test]
+    fn fail_healthcheck_after_drain_is_noop_sticky() {
+        let drain = DrainState::new();
+        drain.drain();
+        assert_eq!(drain.current(), DrainStage::Draining);
+        drain.fail_healthcheck();
+        assert_eq!(
+            drain.current(),
+            DrainStage::Draining,
+            "fail_healthcheck after drain must NOT downgrade out of Draining (sticky)"
+        );
     }
 }

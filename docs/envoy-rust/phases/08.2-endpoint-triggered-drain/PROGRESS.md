@@ -181,3 +181,91 @@ The 5 `license-not-encountered` warnings are pre-existing across the project (th
 ### Differential surface delta
 
 **None.** Task 1 lands the `DrainState` foundation only — no admin endpoint surface change, no listener-serve signature change, no gauge registration, no fixture. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence. The new differential fixture (0015) lands at Task 8; the state-4 CI re-run lands at Task 11.
+
+---
+
+## Task 1 fixup (review-driven; lands on top of `c1c9604`)
+
+### Fixup driver
+
+Code-quality review of Task 1 commit `c1c9604` (the D11 DrainState foundation) flagged 1 Critical + 3 Important findings against `crates/envoy-listener/src/drain.rs`. This fixup commit closes all 4. The 8 Minor findings from that review (`DrainStage::from_u8` pub→pub(crate); `panic!` → `unreachable!`; `Err(0)` sentinel readability; `Default` impl Task-2-anticipation widening; `Hash` derive on `DrainStage`; etc.) are deferred per the project's close-opportunistically doctrine — none gate Task 2 and they accumulate naturally into a future minor-polish pass.
+
+### What changed
+
+**1 Critical (TOCTOU race in `drain_signal()`) closed.** Pre-fix `drain_signal()` sequenced `state.load(Acquire) → (race window) → self.notify.notified()`. A concurrent `drain()` firing in the window — CAS state to `Draining`, then `notify_waiters()` — would bump the notify counter; the subsequently-constructed `Notified` would snapshot the post-bump counter at construction time; on first poll, `poll_notified`'s counter-comparison would equal-out (snapshot == current) and fall through to register a waiter that never unparks (sticky-drain idempotency means no second `notify_waiters()` ever fires). Tokio's `Notify::notified()` docs make construction (not first poll) the race-free anchor: "The `Notified` future is guaranteed to receive wakeups from `notify_waiters()` as soon as it has been created." Fix inverts the order: construct `notified` FIRST (anchoring the snapshot before any racer can bump the counter), then load state. If already `Draining`, discard the unpolled `Notified` (Drop on an unpolled `Notified` is safe — no registration has occurred) and return `std::future::ready(())`. Otherwise return `Box::pin(notified)`.
+
+**Why this matters now:** Task 6 (D12 listener observation, scheduled ~5 commits from now) calls `drain_signal()` from `Listener::serve`'s accept-loop `tokio::select!` — the structurally worst-case exposure point because the listener re-enters the call on every loop iteration concurrent with the admin thread that fires `drain()`. The race must be closed before Task 6 lands.
+
+**3 Important closed:**
+
+- **Important #1** — Test 2 (`drain_flips_to_draining_and_notifies_waiters_once`) rewritten to use a 3-party `tokio::sync::Barrier` instead of a 50ms sleep. The sleep was flake-prone on busy CI (past phases have shown 100-200ms scheduling jitter on macOS runners) and didn't actively verify registration — it just gave a budget. The 3-party Barrier (the two waiters + the main task) explicitly anchors each waiter's `drain_signal()` construction at the barrier rendezvous before the main task fires `drain()`.
+- **Important #2** — NEW Test 7 (`drain_signal_is_race_free_with_concurrent_drain`) — regression test for the Critical race. Spawned task constructs the signal future BEFORE the 2-party Barrier rendezvous; main task fires `drain()` AFTER the rendezvous. Without the Critical fix this test deterministically hangs; with the fix it completes in <1s. Comment header explicitly references the fix shape so a future-reader sees the regression coverage chain.
+- **Important #3** — NEW Test 8 (`drain_from_healthcheck_failing_notifies_waiters_once`) — exercises the second-CAS branch of `drain()` end-to-end (Live→Draining CAS fails because state is HealthcheckFailing; HealthcheckFailing→Draining CAS succeeds; `notify_waiters()` still fires exactly once). Previously only Test 2 covered drain-from-Live; the second-CAS branch had no end-to-end coverage.
+- **Important #4** — NEW Test 9 (`fail_healthcheck_after_drain_is_noop_sticky`) — symmetric to Test 5's `ok_healthcheck()` post-drain assertion. Verifies `fail_healthcheck()` post-drain leaves state at `Draining` (`compare_exchange` for Live→HealthcheckFailing silently fails on Draining current value).
+
+### Diff summary
+
+| File | Lines touched |
+|---|---|
+| `crates/envoy-listener/src/drain.rs` — `drain_signal()` body | replaced lines 187-194 (8 lines) with the race-free shape (20 lines incl. extended comment block — the comment block expansion is required per the fix's source-address-stability directive) |
+| `crates/envoy-listener/src/drain.rs` — Test 2 body | replaced internals (kept test name); +20 lines for the Barrier construction + waiter spawn rewrite |
+| `crates/envoy-listener/src/drain.rs` — Tests 1, 3, 4, 5, 6 comment headers | renumbered "Test N of 6" → "Test N of 9" (5 single-line edits) |
+| `crates/envoy-listener/src/drain.rs` — Test 7 (NEW) | +44 lines including doc-comment |
+| `crates/envoy-listener/src/drain.rs` — Test 8 (NEW) | +28 lines |
+| `crates/envoy-listener/src/drain.rs` — Test 9 (NEW) | +14 lines |
+
+Test count delta: `drain::tests` 6 → 9 (+3). `envoy-listener` lib bucket: 18 → 21 (+3). Workspace test count delta from the pre-Task-1 baseline now stands at **+9** (Task 1 commit landed +6; this fixup adds +3).
+
+No changes to `lib.rs` (envoy-listener or envoy-admin). No new top-level Cargo deps — `tokio::sync::Barrier` rides on the existing `tokio` `sync` feature already declared at `crates/envoy-listener/Cargo.toml:16` + `:21`. Crate root still carries `#![forbid(unsafe_code)]`.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean compile across all 8 workspace crates, zero warnings).
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 crates compiled).
+
+**Gate 4 — `cargo test --workspace`:** PASS (exit 0; every per-bucket `test result:` line reads `ok. N passed; 0 failed`; the `envoy-listener` lib bucket grew from 18 → 21 tests — the 3 new `drain::tests::{drain_signal_is_race_free_with_concurrent_drain, drain_from_healthcheck_failing_notifies_waiters_once, fail_healthcheck_after_drain_is_noop_sticky}`). Focused re-run on the drain module: `cargo test -p envoy-listener --lib drain::tests -- --nocapture` reads `test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s`.
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing across the project (the `deny.toml` allow-list is broader than the workspace's transitive dependency tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per the 07.1-REVIEW doctrine (no "assumed no-op" handwave).
+
+### Differential surface delta
+
+**None.** This fixup is logic + test changes inside `drain.rs` only — no admin endpoint surface change, no listener-serve signature change, no gauge registration, no fixture. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior); the 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
