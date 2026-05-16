@@ -371,6 +371,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",

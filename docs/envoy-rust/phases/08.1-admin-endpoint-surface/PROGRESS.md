@@ -1371,6 +1371,135 @@ Done 370923 runs in 31 second(s)
 
 ---
 
+## Task 13 — D17.4a — In-process backstop admin_config_dump_server_info.rs
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 13 — in-process backstop (admin_config_dump_server_info)`
+**LoC delta:** +230 tests (the new backstop at `crates/envoy-bin/tests/admin_config_dump_server_info.rs`), +1 production-ish (`serde_json = "1"` added to `crates/envoy-bin/Cargo.toml` `[dev-dependencies]`), +~85 doc (this PROGRESS narrative). Net +~316 insertions, 0 deletions. No production code change.
+
+### Work summary
+
+Landed an in-process happy-path backstop that spawns `envoy-bin` against an in-memory bootstrap (admin + 1 listener with a single `envoy.filters.network.echo` filter + 1 STRICT_DNS cluster with one populated locality / one lb_endpoint resolving `localhost:7001`), then scrapes all four of phase 08.1's new admin endpoints via a one-shot HTTP/1.1 client and asserts JSON-parse + required-key presence on `/config_dump` + `/server_info` and line-presence on `/clusters` + `/listeners`. Mirrors the helper-shape of `admin_only.rs` (single `#[tokio::test]`, `reserve_port()` + `wait_ready()` + `Connection: close`-plus-`shutdown(Write)` scrape, kill-on-drop child process) and reuses the stderr-dump-on-failure convention from `http_filter_header_mutation.rs` (07.2 backstop). All four Task 12 schema constraints from the PLAN sketch were applied (no `connect_timeout`, populated locality, `lb_policy: ROUND_ROBIN`, single listener) plus a fifth adaptation forced at run-time: the listener must carry ≥1 filter (envoy-bin's `src/main.rs:158` `.expect("validator guarantees ≥1 filter")`), so `filter_chains: []` was replaced with one `envoy.filters.network.echo` entry. This complements Task 11's Docker-gated fixture-0014 bilateral assertion with a fast Docker-free happy-path scrape.
+
+### Tests landed
+
+- `crates/envoy-bin/tests/admin_config_dump_server_info.rs::admin_config_dump_server_info_in_process` — single `#[tokio::test]`. Spawns `envoy-bin` against an in-memory bootstrap (admin + 1 echo-filter listener + 1 STRICT_DNS cluster on `localhost:7001`); scrapes 4 endpoints via one-shot HTTP/1.1; asserts: `/config_dump` → 200 + JSON parseable + top-level `configs` key present; `/server_info` → 200 + JSON parseable + `state == "LIVE"`; `/clusters` → 200 + plain-text body contains `backstop_cluster::`; `/listeners` → 200 + plain-text body contains `listener_0::0.0.0.0:<port>`.
+
+### Deviations from PLAN
+
+1. **PLAN sketch's `connect_timeout: 1s` removed.** Same forcing function as Task 12 deviation 1 — `Cluster` has `#[serde(deny_unknown_fields)]` and no `connect_timeout` field at the phase-01 surface (`crates/envoy-config/src/bootstrap.rs:54-83`). The field is omitted from the bootstrap.
+
+2. **PLAN sketch's `endpoints: []` replaced with one populated locality + lb_endpoint.** Same forcing function as Task 12 deviation 2 — `EmptyClusterEndpoints` validator at `bootstrap.rs:1215-1225` rejects `total_endpoints == 0`. The single locality holds a `STRICT_DNS`-resolvable name `localhost:7001` (matches the 05.1 golden test in `crates/envoy-cluster/src/cluster.rs:901`) so the cluster-build-time `tokio::net::lookup_host` succeeds without external DNS. A `.local` name would `NXDOMAIN` at startup on stock developer machines and was avoided.
+
+3. **PLAN sketch's `lb_policy` missing — added `ROUND_ROBIN`.** Same forcing function as Task 12 deviation 3 — `Cluster.lb_policy` field is mandatory (`bootstrap.rs:60`, no `#[serde(default)]`). `ROUND_ROBIN` is the only currently-defined `LbPolicy` variant (`bootstrap.rs:118-120`).
+
+4. **Added `serde_json = "1"` to `crates/envoy-bin/Cargo.toml` `[dev-dependencies]`.** Per bootstrap-prompt instruction. D-3.2 permitted foundation — already pulled transitively by many other workspace members so no new license-encounter is introduced. Alphabetically inserted between `rustls-pki-types` and `tempfile`.
+
+5. **PLAN sketch's `filter_chains: []` replaced with one `envoy.filters.network.echo` filter.** Surfaced at run-time (NOT at parse-time — the parser accepts empty filter chains; `crates/envoy-config/src/bootstrap.rs:196` types `filter_chains: Vec<FilterChain>` with no min-len validator at this layer). `envoy-bin`'s startup path at `crates/envoy-bin/src/main.rs:154-158` calls `listener_cfg.filter_chains.first().and_then(|c| c.filters.first()).expect("validator guarantees ≥1 filter")` — empty filter_chains panic the bin at startup. Adding one trivial echo filter (the simplest filter the bin recognises; `envoy_config::ECHO_FILTER == "envoy.filters.network.echo"`) satisfies the runtime constraint while preserving the test's focus on the admin-endpoint surface. The data-plane listener is not exercised by any of the 4 scrapes; the echo filter is purely a startup-gate satisfier.
+
+6. **`stdout(Stdio::null())` + `stderr(Stdio::piped())` with conditional stderr dump on wait-ready failure** rather than `stderr(Stdio::null())` (per `admin_only.rs`'s simpler shape). Adopted the 07.2 `http_filter_header_mutation.rs` convention because the run-time deviation 5 above only surfaced because the stderr dump exposed the bin's "validator guarantees ≥1 filter" panic; suppressing stderr would have left the bug as a silent "Connection refused". Keeps the helper-shape close to `admin_only.rs` while gaining diagnosability for future schema/runtime mismatches.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.65s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.77s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+# envoy-bin unit bucket (unittests src/main.rs)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+# envoy-bin integration buckets (12 pre-existing + 1 NEW = 13):
+#   tests/access_log_file_sink.rs         → 1 passed
+#   tests/admin_config_dump_server_info.rs → 1 passed  [NEW Task 13]
+#   tests/admin_only.rs                   → 1 passed
+#   tests/admin_ready.rs                  → 1 passed
+#   tests/http1_direct_response.rs        → 1 passed
+#   tests/http1_router_upstream.rs        → 1 passed
+#   tests/http2_direct_response.rs        → 1 passed
+#   tests/http2_router_upstream.rs        → 1 passed
+#   tests/http_filter_header_mutation.rs  → 1 passed
+#   tests/tcp_proxy.rs                    → 1 passed
+#   tests/tls_downstream.rs               → 1 passed
+#   tests/tls_sni.rs                      → 1 passed
+#   tests/tls_upstream.rs                 → 1 passed
+# Each: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+# Lib buckets (unchanged from Task 12 counts):
+test result: ok. 94 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.03s   # differential lib
+test result: ok. 209 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s  # envoy-config lib
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s   # envoy-admin lib
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-cluster lib
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-filter lib
+test result: ok. 68 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-http1 lib
+test result: ok. 42 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out                        # envoy-http2 lib
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-listener lib
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-stats lib
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-tcp lib
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-tls lib
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out                        # envoy-accesslog lib
+
+# Differential integration buckets — 14 each `1 passed` simultaneously (unchanged from Task 11/12):
+#   admin_config_dump_server_info, admin_only, admin_ready, admin_stats_prometheus,
+#   echo, http1_direct_response, http1_router_upstream, http2_direct_response,
+#   http2_router_upstream, http_filter_header_mutation, tcp_proxy, tls_downstream,
+#   tls_sni, tls_upstream — each: test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+Bucket-level summary: NEW `envoy-bin` integration bucket `admin_config_dump_server_info` contributes `1 passed`; 12 pre-existing `envoy-bin` integration buckets stay green at `1 passed` each; `envoy-bin` lib bucket unchanged at `8 passed`; `envoy-config` lib at `209 passed` (unchanged from Task 12); `envoy-admin` lib at `58 passed` (unchanged); `differential` lib at `94 passed + 1 ignored` (unchanged); the 14 differential integration buckets each at `1 passed` (unchanged). Test bucket count for `envoy-bin` rises from 12 → 13 integration buckets; M6 per-bucket cadence restored.
+
+`cargo deny check`:
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. Task 13 adds `serde_json = "1"` as a `[dev-dependencies]` entry on `envoy-bin` — already pulled transitively by many other workspace members so no new license-encounter is introduced.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:
