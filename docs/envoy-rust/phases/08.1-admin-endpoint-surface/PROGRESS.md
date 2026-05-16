@@ -748,7 +748,7 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 7 — D5: /server_info endpoint + BEHAVIOR_CONTRACT row
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 7 — /server_info endpoint + BEHAVIOR_CONTRACT row`
+**Commit:** `f463a3c` — `phase 08.1: task 7 — /server_info endpoint + BEHAVIOR_CONTRACT row`
 **LoC delta:** +187/-3 endpoint.rs (~55 production: `ServerInfo` variant + `/server_info` `from_path` arm + extended `allowed_method` `|`-chain + `render` `unreachable!` arm + `render_with` arm + `ServerInfoBody<'a>` body type + `render_server_info` fn + doc updates; ~120 test for the new `server_info_tests` module + 1-line `each_endpoint_declares_its_allowed_method` extension + 1 visibility bump on `handler_with_bootstrap` to `pub(super)` so Task 7 can reuse it), +7/-11 handler.rs (removed 2 field-level + 2 accessor-level `#[allow(dead_code)]` annotations on `start_instant` and `command_line_options` now that Task 7 consumes them; refreshed `(Task 6)` doc-comment references to `(Task 7)` on those two fields; tightened `cluster_manager`'s field-level comment from `// wired for Tasks 6-9` to `// wired for Task 8`), +1 docs/envoy-rust/BEHAVIOR_CONTRACT.md (new `/server_info` row in the "Admin endpoint body shapes" table), +PROGRESS.md narrative. Net +195 insertions, 14 deletions.
 
 ### Work summary
