@@ -116,6 +116,13 @@ inclusion):
   data-plane scaffolding mirrored here).
 
 **Acceptance signal:** the fixture is green at the Docker-gated CI
-level (`tests/differential/tests/admin_config_dump_server_info.rs`). No
-in-process backstop exists for this fixture (the differential level is
-the only level that exercises the upstream-Envoy admin output).
+level (`tests/differential/tests/admin_config_dump_server_info.rs`)
+AND the in-process happy-path level
+(`crates/envoy-bin/tests/admin_config_dump_server_info.rs`). The
+differential level provides the bilateral assertion against upstream
+Envoy; the in-process level provides a fast Docker-free smoke test
+of the 4-endpoint happy path. The in-process backstop landed at
+phase 08.1 Task 13 (commit `fcfb940`); see PROGRESS.md Task 13 for
+the implementation narrative and the trivial-echo-filter workaround
+adopted to satisfy `envoy-bin/src/main.rs:158`'s
+`.expect("validator guarantees ≥1 filter")` startup invariant.
