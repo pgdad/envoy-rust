@@ -53,20 +53,18 @@ pub struct AdminHandler {
     bootstrap: Arc<Bootstrap>,
     /// Phase 08.1 D13a: cluster manager handle for the `/clusters` renderer
     /// (Task 8). `Arc` shape mirrors `bootstrap` for the same Send+Sync reason.
-    #[allow(dead_code)] // wired for Tasks 6-9
+    #[allow(dead_code)] // wired for Task 8
     cluster_manager: Arc<ClusterManager>,
     /// Phase 08.1 D13a: process-start `Instant` captured at construction. The
-    /// `/server_info` renderer (Task 6) computes uptime as
+    /// `/server_info` renderer (Task 7) computes uptime as
     /// `Instant::now().duration_since(start_instant)`. Held by value (not
     /// `Arc`) because `Instant` is `Copy`.
-    #[allow(dead_code)] // wired for Tasks 6-9
     start_instant: Instant,
     /// Phase 08.1 D13a: command-line options surfaced in `/server_info`
-    /// (Task 6). Built once at construction time per architecture lock-in
+    /// (Task 7). Built once at construction time per architecture lock-in
     /// #7 (see PROGRESS Task 1 preamble) — not built lazily at first render.
     /// Currently `envoy-bin` populates this with `{"config_path":
     /// Value::String(<-c value>)}`.
-    #[allow(dead_code)] // wired for Tasks 6-9
     command_line_options: BTreeMap<String, serde_yaml::Value>,
 }
 
@@ -123,16 +121,14 @@ impl AdminHandler {
         &self.cluster_manager
     }
 
-    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Reserved for Task 7's
-    /// `/server_info` uptime computation. Currently unused.
-    #[allow(dead_code)] // wired for Task 7
+    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Consumed by Task 7's
+    /// `/server_info` renderer for uptime computation.
     pub(crate) fn start_instant(&self) -> Instant {
         self.start_instant
     }
 
-    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Reserved for Task 7's
-    /// `/server_info` renderer. Currently unused.
-    #[allow(dead_code)] // wired for Task 7
+    /// Phase 08.1 D13a accessor (PLAN lock-in #2). Consumed by Task 7's
+    /// `/server_info` renderer; borrowed into `ServerInfoBody.command_line_options`.
     pub(crate) fn command_line_options(&self) -> &BTreeMap<String, serde_yaml::Value> {
         &self.command_line_options
     }

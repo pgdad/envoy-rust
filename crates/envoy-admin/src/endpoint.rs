@@ -27,6 +27,15 @@ pub enum AdminEndpoint {
     /// Secrets) are deferred to the xDS family and explicitly land on
     /// `allowlist_envoy_only` per BEHAVIOR_CONTRACT.
     ConfigDump,
+
+    /// `GET /server_info` — returns 200 with body shaped per upstream
+    /// Envoy's `envoy.admin.v3.ServerInfo`: top-level JSON object with
+    /// `version`, `state`, `hot_restart_version`, `command_line_options`,
+    /// `node`, `uptime_current_epoch_seconds`, `uptime_all_epochs_seconds`.
+    /// Phase 08.1 D5 emits `state` as the constant `"LIVE"` per SPEC §5.4;
+    /// 08.2's D5e patches the value-binding source from this constant to a
+    /// `DrainState`-derived match.
+    ServerInfo,
 }
 
 /// Method-aware dispatch result. Introduced at phase 08.1 D4 to give every
@@ -50,6 +59,7 @@ impl AdminEndpoint {
             "/stats" => Some(AdminEndpoint::Stats),
             "/stats/prometheus" => Some(AdminEndpoint::StatsPrometheus),
             "/config_dump" => Some(AdminEndpoint::ConfigDump),
+            "/server_info" => Some(AdminEndpoint::ServerInfo),
             _ => None,
         }
     }
@@ -62,8 +72,9 @@ impl AdminEndpoint {
             AdminEndpoint::Ready
             | AdminEndpoint::Stats
             | AdminEndpoint::StatsPrometheus
-            | AdminEndpoint::ConfigDump => "GET",
-            // Tasks 7-9 add: ServerInfo | Clusters | Listeners => "GET",
+            | AdminEndpoint::ConfigDump
+            | AdminEndpoint::ServerInfo => "GET",
+            // Tasks 8-9 add: Clusters | Listeners => "GET",
         }
     }
 
@@ -102,6 +113,9 @@ impl AdminEndpoint {
             AdminEndpoint::ConfigDump => unreachable!(
                 "ConfigDump requires handler-scoped state; dispatch via AdminEndpoint::render_with"
             ),
+            AdminEndpoint::ServerInfo => unreachable!(
+                "ServerInfo requires handler-scoped state; dispatch via AdminEndpoint::render_with"
+            ),
         }
     }
 
@@ -114,6 +128,7 @@ impl AdminEndpoint {
     pub fn render_with(&self, handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
         match self {
             AdminEndpoint::ConfigDump => render_config_dump(handler),
+            AdminEndpoint::ServerInfo => render_server_info(handler),
             // 06.1 endpoints carry forward through the registry-only path.
             _ => self.render(handler.registry()),
         }
@@ -223,6 +238,65 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
     };
     let body_bytes = serde_json::to_vec_pretty(&body)
         .expect("ConfigDumpBody serializes (all subtypes derive Serialize per Task 4)");
+    envoy_http1::Response {
+        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
+        // leave `reason: None` per PLAN lock-in #7.
+        status: 200,
+        reason: None,
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: Bytes::from(body_bytes),
+    }
+}
+
+/// Phase 08.1 D5: top-level body envelope for `/server_info`. Mirrors upstream
+/// Envoy's `envoy.admin.v3.ServerInfo` JSON projection. The body type is
+/// lifetime-parameterized so the renderer can borrow `&Bootstrap.node` and the
+/// `command_line_options` `BTreeMap` from the handler — same borrowed-reference
+/// shape as `ConfigDumpBody<'a>` (PLAN lock-in #1, no `Clone` cascade).
+///
+/// `state` is a `&'static str` literal at 08.1 — SPEC §5.4 binds it to the
+/// constant `"LIVE"`. 08.2's D5e patches the value-binding source from this
+/// constant to a `DrainState`-derived match; the struct shape is locked.
+///
+/// `hot_restart_version` is `&'static str = "disabled"` — envoy-rust does
+/// NOT implement hot restart. `uptime_current_epoch_seconds` equals
+/// `uptime_all_epochs_seconds` for the same reason (current epoch is the only
+/// epoch).
+#[derive(Serialize)]
+pub(crate) struct ServerInfoBody<'a> {
+    pub version: &'a str,
+    pub state: &'static str,
+    pub hot_restart_version: &'static str,
+    pub command_line_options: &'a std::collections::BTreeMap<String, serde_yaml::Value>,
+    // `Bootstrap.node` is `Option<Node>` (parse-time optional per envoy-config's
+    // bootstrap schema). Borrow as `Option<&Node>` so a missing `node` block
+    // serializes to JSON `null` rather than failing — the SPEC contract for
+    // `/server_info.node` is "value-exact from the parsed bootstrap".
+    pub node: Option<&'a envoy_config::Node>,
+    pub uptime_current_epoch_seconds: u64,
+    pub uptime_all_epochs_seconds: u64,
+}
+
+/// Phase 08.1 D5: render `/server_info` as pretty JSON. Borrows the `Node`
+/// subtree from the handler's cached `Bootstrap` and the
+/// `command_line_options` map (constructed once at handler-init time per PLAN
+/// lock-in #7). Uptime is computed from `handler.start_instant()`.
+pub(crate) fn render_server_info(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+    let uptime = handler.start_instant().elapsed().as_secs();
+    let body = ServerInfoBody {
+        version: concat!("envoy-rust ", env!("CARGO_PKG_VERSION")),
+        // SPEC §5.4: 08.1 hardcodes the constant "LIVE"; 08.2 D5e patches the
+        // value-binding source to a DrainState-derived match.
+        state: "LIVE",
+        // envoy-rust does not implement hot restart.
+        hot_restart_version: "disabled",
+        command_line_options: handler.command_line_options(),
+        node: handler.bootstrap().node.as_ref(),
+        uptime_current_epoch_seconds: uptime,
+        uptime_all_epochs_seconds: uptime,
+    };
+    let body_bytes = serde_json::to_vec_pretty(&body)
+        .expect("ServerInfoBody serializes (all subtypes derive Serialize)");
     envoy_http1::Response {
         // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
         // leave `reason: None` per PLAN lock-in #7.
@@ -408,7 +482,7 @@ mod config_dump_tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    fn handler_with_bootstrap(yaml: &str) -> AdminHandler {
+    pub(super) fn handler_with_bootstrap(yaml: &str) -> AdminHandler {
         let bootstrap: Bootstrap = serde_yaml::from_str(yaml).expect("yaml parses");
         let admin = Admin {
             address: Address {
@@ -503,6 +577,115 @@ mod config_dump_tests {
 }
 
 #[cfg(test)]
+mod server_info_tests {
+    //! Phase 08.1 Task 7 — D5: `/server_info` endpoint coverage. Seven tests:
+    //! two dispatch-shape tests (GET routes to `ServerInfo`; POST returns 405)
+    //! and five body-shape tests (200 + `application/json`; required keys;
+    //! `state == "LIVE"` constant per SPEC §5.4; `node` subtree carries the
+    //! parsed `node.id`; uptime is non-negative).
+
+    use super::config_dump_tests::handler_with_bootstrap; // reuse Task 6 helper
+    use super::{AdminEndpoint, Dispatch};
+
+    #[test]
+    fn server_info_path_dispatches_on_get() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/server_info"),
+            Dispatch::Endpoint(AdminEndpoint::ServerInfo)
+        ));
+    }
+
+    #[test]
+    fn server_info_405_on_post() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("POST", "/server_info"),
+            Dispatch::MethodNotAllowed { allow: "GET" }
+        ));
+    }
+
+    #[test]
+    fn server_info_renders_200_with_application_json() {
+        let yaml =
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::ServerInfo.render_with(&handler);
+        assert_eq!(resp.status, 200);
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str());
+        assert_eq!(ct, Some("application/json"));
+    }
+
+    #[test]
+    fn server_info_body_has_required_keys() {
+        let yaml =
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::ServerInfo.render_with(&handler);
+        let body_str = std::str::from_utf8(&resp.body).unwrap();
+        let value: serde_json::Value = serde_json::from_str(body_str).unwrap();
+        let obj = value.as_object().expect("top-level object");
+        for key in &[
+            "version",
+            "state",
+            "hot_restart_version",
+            "command_line_options",
+            "node",
+            "uptime_current_epoch_seconds",
+            "uptime_all_epochs_seconds",
+        ] {
+            assert!(obj.contains_key(*key), "missing key: {key}");
+        }
+    }
+
+    #[test]
+    fn server_info_state_is_live_at_phase_08_1() {
+        // SPEC §5.4: 08.1 emits the constant "LIVE". 08.2's D5e patches the
+        // value-binding source from this constant to a DrainState-derived match.
+        let yaml =
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::ServerInfo.render_with(&handler);
+        let value: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&resp.body).unwrap()).unwrap();
+        assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("LIVE"));
+    }
+
+    #[test]
+    fn server_info_node_subtree_carries_id() {
+        let yaml = "node:\n  id: my-id\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::ServerInfo.render_with(&handler);
+        let value: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&resp.body).unwrap()).unwrap();
+        assert_eq!(
+            value.pointer("/node/id").and_then(|v| v.as_str()),
+            Some("my-id")
+        );
+    }
+
+    #[test]
+    fn server_info_uptime_is_non_negative() {
+        let yaml =
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+        let handler = handler_with_bootstrap(yaml);
+        let resp = AdminEndpoint::ServerInfo.render_with(&handler);
+        let value: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&resp.body).unwrap()).unwrap();
+        let uptime = value
+            .get("uptime_current_epoch_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert!(
+            uptime < 60,
+            "fresh handler uptime should be small; got {uptime}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod dispatch_tests {
     use super::{AdminEndpoint, Dispatch};
 
@@ -576,6 +759,7 @@ mod dispatch_tests {
         assert_eq!(AdminEndpoint::Stats.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::StatsPrometheus.allowed_method(), "GET");
         assert_eq!(AdminEndpoint::ConfigDump.allowed_method(), "GET");
+        assert_eq!(AdminEndpoint::ServerInfo.allowed_method(), "GET");
     }
 
     #[test]

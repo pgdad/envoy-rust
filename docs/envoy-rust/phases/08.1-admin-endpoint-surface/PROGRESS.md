@@ -746,6 +746,96 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ---
 
+## Task 7 — D5: /server_info endpoint + BEHAVIOR_CONTRACT row
+
+**Commit:** `<sha-pending>` — `phase 08.1: task 7 — /server_info endpoint + BEHAVIOR_CONTRACT row`
+**LoC delta:** +187/-3 endpoint.rs (~55 production: `ServerInfo` variant + `/server_info` `from_path` arm + extended `allowed_method` `|`-chain + `render` `unreachable!` arm + `render_with` arm + `ServerInfoBody<'a>` body type + `render_server_info` fn + doc updates; ~120 test for the new `server_info_tests` module + 1-line `each_endpoint_declares_its_allowed_method` extension + 1 visibility bump on `handler_with_bootstrap` to `pub(super)` so Task 7 can reuse it), +7/-11 handler.rs (removed 2 field-level + 2 accessor-level `#[allow(dead_code)]` annotations on `start_instant` and `command_line_options` now that Task 7 consumes them; refreshed `(Task 6)` doc-comment references to `(Task 7)` on those two fields; tightened `cluster_manager`'s field-level comment from `// wired for Tasks 6-9` to `// wired for Task 8`), +1 docs/envoy-rust/BEHAVIOR_CONTRACT.md (new `/server_info` row in the "Admin endpoint body shapes" table), +PROGRESS.md narrative. Net +195 insertions, 14 deletions.
+
+### Work summary
+
+Landed `/server_info` GET endpoint at `crates/envoy-admin/src/endpoint.rs`: added `AdminEndpoint::ServerInfo` variant (5th total), extended `from_path` and `allowed_method` (collapsed `|`-pattern now covers all 5 GET variants), added explicit `AdminEndpoint::ServerInfo => render_server_info(handler)` arm to `render_with` ahead of the catch-all, added an `unreachable!` arm in the registry-only `render` path mirroring the Task 6 `ConfigDump` precedent, and added lifetime-parameterized `ServerInfoBody<'a>` body type + `render_server_info` fn per PLAN lock-in #1 (borrowed-reference shape: `Option<&'a envoy_config::Node>` and `&'a BTreeMap<String, serde_yaml::Value>` — avoids any `Clone` cascade). The `node` field is `Option<&'a envoy_config::Node>` rather than `&'a envoy_config::Node` because `Bootstrap.node` is `Option<Node>` on disk (PLAN stub assumed `Node` directly — this is a re-anchor against disk reality). At `crates/envoy-admin/src/handler.rs`: removed the field-level `#[allow(dead_code)] // wired for Tasks 6-9` annotations on `start_instant` (line 62) and `command_line_options` (line 69) AND the accessor-level `#[allow(dead_code)] // wired for Task 7` on `start_instant()` and `command_line_options()` (per Task 7's consumer obligations); refreshed the `(Task 6)` doc-comment references on those fields to `(Task 7)` (Task 6 code-quality review M1 close); tightened `cluster_manager`'s field-level comment to `// wired for Task 8` (Task 6 review M2 close); the `cluster_manager` annotations themselves are left in place per the PLAN's explicit "Leave both" instruction. Added the new `/server_info` row to BEHAVIOR_CONTRACT.md's "Admin endpoint body shapes" table.
+
+### Tests landed
+
+- `endpoint::server_info_tests::server_info_path_dispatches_on_get` (production crate `envoy-admin`)
+- `endpoint::server_info_tests::server_info_405_on_post` (production crate `envoy-admin`)
+- `endpoint::server_info_tests::server_info_renders_200_with_application_json` (production crate `envoy-admin`)
+- `endpoint::server_info_tests::server_info_body_has_required_keys` (production crate `envoy-admin`)
+- `endpoint::server_info_tests::server_info_state_is_live_at_phase_08_1` (production crate `envoy-admin`)
+- `endpoint::server_info_tests::server_info_node_subtree_carries_id` (production crate `envoy-admin`)
+- `endpoint::server_info_tests::server_info_uptime_is_non_negative` (production crate `envoy-admin`)
+
+7 new tests total, all in a new sibling `#[cfg(test)] mod server_info_tests` block placed AFTER `config_dump_tests` and BEFORE `dispatch_tests` in `endpoint.rs` (maintaining file's increasing-task-number order). `envoy-admin` test bucket: 48 passed (was 41 post-Task-6; +7 new). All existing tests stay green. The `each_endpoint_declares_its_allowed_method` test in `dispatch_tests` was extended with a 5th `assert_eq!` for `ServerInfo` (one-line additive change).
+
+TDD discipline: tests written first, watched fail with the expected error shape (`E0599: no variant or associated item named ServerInfo found for enum AdminEndpoint`), then implementation added; iterated once on a real disk-vs-PLAN drift (`Bootstrap.node` is `Option<Node>`, surfacing `E0308: expected &Node, found &Option<Node>`) which I resolved by widening `ServerInfoBody.node` to `Option<&'a envoy_config::Node>` and switching the renderer to `handler.bootstrap().node.as_ref()`; re-ran tests to confirm 7/7 green.
+
+### Deviations from PLAN
+
+1. **`ServerInfoBody.node` widened to `Option<&'a envoy_config::Node>` (PLAN stub used `&'a envoy_config::Node`).** On-disk, `envoy_config::Bootstrap.node` is `Option<Node>` (see `crates/envoy-config/src/bootstrap.rs:12`) — the PLAN's Step 3 code stub assumed unconditional `Node`. The minimal-impact correction is to carry `Option<&Node>` in the body envelope (serde_json renders `None` → JSON `null`); the renderer wires `node: handler.bootstrap().node.as_ref()`. Test `server_info_node_subtree_carries_id` exercises the present-`node` path (passes); absent-`node` would serialize as `"node": null` which is consistent with the SPEC's "value-exact from the parsed bootstrap" disposition. No struct-shape divergence visible to consumers when `node` is present.
+
+2. **`render` arm for `ServerInfo` is `unreachable!()` mirroring Task 6's `ConfigDump` arm.** PLAN-implicit but not stated: the registry-only `render(&StatsRegistry)` API must stay exhaustive. Adding a parallel `ServerInfo => unreachable!("ServerInfo requires handler-scoped state; dispatch via AdminEndpoint::render_with")` arm preserves the structural invariant that `render_with` is the only legitimate path for state-bearing endpoints. This is the same deviation Task 6 explicitly ratified (Task 6 deviation #2).
+
+3. **`handler_with_bootstrap` visibility promoted from private to `pub(super)`.** PLAN Step 1 stub said `use super::config_dump_tests::handler_with_bootstrap;` — but on disk the helper was `fn handler_with_bootstrap(yaml: &str)` (private). Promoted to `pub(super)` so both `config_dump_tests` and the new `server_info_tests` sibling can share one helper without duplication. Task 8's `/clusters` and Task 9's `/listeners` tests will benefit too. Minimal, justified deviation per the prompt's explicit recommendation.
+
+4. **Field-level + accessor-level `#[allow(dead_code)]` cleanup landed in this commit.** Per the prompt's explicit obligations: removed the field-level `#[allow(dead_code)] // wired for Tasks 6-9` annotations on `start_instant` (line 62) and `command_line_options` (line 69), AND the accessor-level `#[allow(dead_code)] // wired for Task 7` annotations on `start_instant()` and `command_line_options()`. `cluster_manager`'s field and accessor annotations are left in place (Task 8 removes those). All four annotations were `// wired for Tasks 6-9` / `// wired for Task 7` — Task 7 is the consumer.
+
+5. **Doc-comment refresh on `start_instant` + `command_line_options` field-level comments (Task 6 review M1 close).** Changed `(Task 6)` references in the field-level doc comments to `(Task 7)` since Task 7 is the actual consumer that lights up the dead accessors. Optional cleanup per prompt recommendation; landed.
+
+6. **`cluster_manager` field-level comment tightened to `// wired for Task 8` (Task 6 review M2 close).** Changed `// wired for Tasks 6-9` to `// wired for Task 8` on the `cluster_manager` field. Optional cleanup per prompt recommendation; landed.
+
+7. **`server_info_tests` placed AFTER `config_dump_tests` and BEFORE `dispatch_tests` (sibling-module placement).** Per the standing reminder from Task 1's review, sibling-vs-nested placement is recorded as a Deviation even when expected. Four sibling test modules now coexist in `endpoint.rs`: `tests` (06.1 endpoint coverage), `config_dump_tests` (08.1 D6), `server_info_tests` (08.1 D5), `dispatch_tests` (08.1 D4). Sibling placement is consistent with Tasks 1-6 cadence.
+
+8. **`render_server_info` headers literal collapsed by `cargo fmt` (mechanical reformatting).** The first version of the tests module used a multi-line YAML literal; `cargo fmt --all` collapsed the trailing `let yaml = "node:\n..."` literal to its single-line form across several tests. Mechanical reformatting; no behavioral impact. Mirrors the same Task 6 fmt-pass deviation.
+
+9. **PLAN body-stub omitted `Bytes::from(body_bytes)` wrap on the response.** The PLAN's Step 3 stub wrote `body: body_bytes` (raw `Vec<u8>`). On disk, `envoy_http1::Response.body` is `bytes::Bytes` (see `render_config_dump` at endpoint.rs:232). Wrapped with `Bytes::from(body_bytes)` to match the existing precedent. Explicitly anticipated by the prompt.
+
+### 5-gate test-bucket attestation
+
+`cargo build --workspace --all-targets`:
+```
+   Compiling envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+   Compiling envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.51s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Checking envoy-admin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-admin)
+    Checking envoy-bin v0.0.0 (/Users/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.50s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace`:
+```
+test endpoint::server_info_tests::server_info_path_dispatches_on_get ... ok
+test endpoint::server_info_tests::server_info_405_on_post ... ok
+test endpoint::server_info_tests::server_info_node_subtree_carries_id ... ok
+test endpoint::server_info_tests::server_info_uptime_is_non_negative ... ok
+test endpoint::server_info_tests::server_info_renders_200_with_application_json ... ok
+test endpoint::server_info_tests::server_info_state_is_live_at_phase_08_1 ... ok
+test endpoint::server_info_tests::server_info_body_has_required_keys ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+```
+
+(envoy-admin tail: 48 = 41 pre-task + 7 new. Full `cargo test --workspace` green across all buckets — no port-binding flakes resurfaced this run; the differential `http1_echo_backend_*` flake noted at Tasks 3/4/5/6 did NOT recur.)
+
+`cargo deny check`:
+```
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; no new advisories or license issues. Task 7 introduces no new direct deps — `serde`, `serde_json`, and `serde_yaml` are already direct deps of `envoy-admin` from Tasks 4/6.)
+
+---
+
 ## Per-task append template
 
 For each task commit, append the following block:
