@@ -576,3 +576,105 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 **None at the differential / fixture surface.** Task 4 wires the `handler.drain()` accessor through the dispatch path (the `render_with` arms now invoke the real render fns instead of `todo!()`-panicking), but the 3 POST endpoints' end-to-end wire surface is exercised only by fixture 0015 at Task 8 (the first differential surface that POSTs to `/drain_listeners` + observes the post-drain `/ready 503` and `/server_info.state == "DRAINING"` mappings — those mappings themselves land at Task 5's D5e + D-ready patch). All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior on any already-shipped endpoint; the only behavioral change at Task 4 is that POSTing to the 3 new endpoints now returns 200 OK instead of crashing on `todo!()`, and no shipped fixture POSTs to those endpoints — fixture 0015 is the first). The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
 
 The `#[allow(dead_code)]` removal at the 3 render fns + `empty_200_ok()` helper is a Task-4 hard requirement per the inline doc-comments Task 3 added (each annotation's doc-comment explicitly said "Task 4 removes the allow"); the production-side `render_with` arms now reach all four declarations, so clippy under `-D warnings` would itself flag the `#[allow(dead_code)]` annotations as `useless_attribute` if they were left in place. Confirmed removed at Task 4 — Gate 2 (clippy) green is the structural evidence.
+
+## Task 5 (D5e + D-ready — `/server_info` state-source rebind + `/ready` drain-aware response)
+
+### Work summary
+
+Patches `render_server_info`'s `state` field source from the 08.1 literal `"LIVE"` to a `DrainState`-derived match: `match handler.drain().current() { Live | HealthcheckFailing => "LIVE", Draining => "DRAINING" }` per parent-08 SPEC §5.5 wire-state mapping. The `ServerInfoBody<'a>.state: &'static str` shape is unchanged at the 08.1 → 08.2 boundary — only the value-binding source moves from the constant literal to the live-state read.
+
+Widens `/ready` from the 06.1 hardcoded 200 `"LIVE\n"` shape to a 3-arm drain-aware response. The old `fn render_ready()` inside `impl AdminEndpoint` is removed; a new `pub(crate) fn render_ready_with(handler: &AdminHandler) -> envoy_http1::Response` free fn lives alongside the other handler-aware renderers (`render_config_dump` / `render_server_info` / `render_clusters` / `render_listeners`). The three arms per parent-08 SPEC §5.5:
+- `DrainStage::Live` → status 200, reason `"OK"`, body `"LIVE\n"`
+- `DrainStage::HealthcheckFailing` → status 503, reason `"Service Unavailable"`, body `"Service Unavailable\n"`
+- `DrainStage::Draining` → status 503, reason `"Service Unavailable"`, body `"DRAINING\n"`
+
+All three response shapes carry `content-type: text/plain` + `content-length: <body.len()>` headers (the established admin-response convention; the 06.1 `render_ready` shape did the same). The `reason` field is set explicitly via `Some(...)` for all three arms — preserves the 06.1 convention where `Ready`'s wire reason phrase comes from the renderer rather than falling through to `reason_for_status`.
+
+Updates the `AdminEndpoint::render_with` dispatch tree to route `AdminEndpoint::Ready → render_ready_with(handler)`. The `AdminEndpoint::render` (registry-only path) `Ready` arm becomes `unreachable!("Ready requires handler-scoped DrainState; dispatch via AdminEndpoint::render_with")` — matches the existing pattern for the other handler-scoped endpoints (`ConfigDump`, `ServerInfo`, `Clusters`, `Listeners`, and the 08.2 D9/D10 trio). The `_ => self.render(handler.registry())` fallback at the bottom of `render_with` still carries the two purely registry-only endpoints (`Stats`, `StatsPrometheus`) through to the original `render` path.
+
+### Tests landed (5)
+
+All 5 tests live in a new `ready_drain_tests` submodule colocated at the bottom of `crates/envoy-admin/src/endpoint.rs`, positioned after the existing `drain_admin_tests` submodule (mirrors the per-task per-submodule precedent: Task 3 added `drain_admin_tests`; Tasks 6/7/8/9 added `config_dump_tests` / `server_info_tests` / `clusters_tests` / `listeners_tests` at 08.1). The module hosts one `test_handler_with_drain(drain: Arc<DrainState>) -> AdminHandler` helper that mirrors the existing `handler_with_bootstrap` in `config_dump_tests` but accepts a pre-constructed `Arc<DrainState>` so each test can drive the underlying state transition (`drain()` / `fail_healthcheck()`) BEFORE invoking the render fn.
+
+1. **`server_info_state_is_draining_when_drain_state_is_draining`** — Constructs a fresh `Arc<DrainState>`, calls `drain.drain()`, builds an `AdminHandler` carrying that drain, invokes `render_server_info(&handler)`, parses the JSON body, asserts `body["state"] == "DRAINING"`.
+2. **`server_info_state_is_live_when_drain_state_is_healthcheck_failing`** — Same shape but with `drain.fail_healthcheck()` instead; asserts `body["state"] == "LIVE"` (validates the parent-08 SPEC §5.5 "server-state is INDEPENDENT of healthcheck-failure" semantic — only `/ready` flips to 503 under HealthcheckFailing; `/server_info.state` stays LIVE).
+3. **`ready_returns_200_live_when_drain_state_is_live`** — Default `DrainState::new` stage is `Live`; dispatches `AdminEndpoint::Ready.render_with(&handler)`, asserts `status=200`, `reason=Some("OK")`, body `b"LIVE\n"`.
+4. **`ready_returns_503_draining_when_drain_state_is_draining`** — Calls `drain.drain()` pre-render; asserts `status=503`, `reason=Some("Service Unavailable")`, body `b"DRAINING\n"`.
+5. **`ready_returns_503_service_unavailable_when_drain_state_is_healthcheck_failing`** — Calls `drain.fail_healthcheck()` pre-render; asserts `status=503`, `reason=Some("Service Unavailable")`, body `b"Service Unavailable\n"`.
+
+Red phase (Step 2) verified pre-implementation: focused run `cargo test -p envoy-admin --lib ready_drain_tests` produced `test result: FAILED. 2 passed; 3 failed; 0 ignored` — the 3 stage-transition tests (`server_info_state_is_draining_…`, `ready_returns_503_draining_…`, `ready_returns_503_service_unavailable_…`) failed with `left: Some("LIVE"); right: Some("DRAINING")` and `left: 200; right: 503` assertions (the literal-`"LIVE"` state field and the hardcoded `200 LIVE` body shapes from the pre-Task-5 surface). The 2 Live-stage tests passed by coincidence pre-implementation because the existing 06.1 shape ALREADY returns 200 LIVE / state=LIVE under default `DrainStage::Live`; they serve as negative-control assertions that the impl preserves the Live path bilaterally. Green phase (Step 4) verified post-implementation: `cargo test -p envoy-admin --lib` reads `test result: ok. 74 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s` (69 → 74, +5 exactly the new tests in `ready_drain_tests`).
+
+### Per-task deviations from PLAN
+
+1. **The existing 06.1 `render_ready_returns_200_live` test was UPDATED rather than REPLACED.** Spec Step 4 said "update it to call `Ready.render_with(&test_handler())` instead". The test body at `crates/envoy-admin/src/endpoint.rs:598-624` (pre-Task-5) called `AdminEndpoint::Ready.render(&reg)` with a bare `StatsRegistry`; post-Task-5 it constructs a handler via `handler_with_bootstrap(TINY_BOOTSTRAP)` (reusing the 08.1 Task-6 helper hoisted in `config_dump_tests`) and calls `AdminEndpoint::Ready.render_with(&handler)`. All four shape assertions (status=200, reason="OK", body="LIVE\n", content-type/content-length headers) are preserved verbatim. Added an inline doc-comment explaining the Task-5 dispatch reroute + pointing to the colocated `ready_drain_tests` submodule for the new per-stage coverage. Functionally identical assertion set; per-stage tests are a strict superset of the original 06.1 shape coverage.
+
+2. **`test_handler_with_drain` helper is a near-duplicate of `handler_with_bootstrap` (rather than reusing it).** The PLAN said the new helper "mirrors handler.rs::tests helpers". `config_dump_tests::handler_with_bootstrap` already constructs a fresh per-call `Arc<DrainState>` internally and would not let the test pre-mutate the drain state. The cleanest path was to introduce a sibling helper in `ready_drain_tests` that takes the pre-mutated `Arc<DrainState>` as an arg + builds the handler around the supplied drain (otherwise the test would need to mutate drain post-handler-construction via the pub(crate) accessor — same effect but a less direct test-time API). The 8-line duplication is intentional + cheap; an alternative refactor of `handler_with_bootstrap` to accept an `Option<Arc<DrainState>>` was rejected as out-of-scope churn for a 5-test cohort.
+
+3. **The new submodule lives in `ready_drain_tests` (NOT `server_info_drain_tests` or split across 2 submodules).** All 5 tests share the `test_handler_with_drain` helper and operate against the same two state-flipping primitives (`drain()` / `fail_healthcheck()`); splitting into two submodules would force helper duplication or a sibling-import indirection without test-organization benefit. The submodule name reflects that the dominant new surface is `/ready` widening; the 2 `/server_info` tests are co-located because they exercise the same `DrainState` reads from the same handler.
+
+4. **No data-plane or backstop changes required.** The in-process backstop `crates/envoy-bin/tests/admin_ready.rs` calls `GET /ready` against a freshly-spawned `envoy-bin` whose `DrainState` defaults to `DrainStage::Live`; the new dispatch path returns the same 200 OK "LIVE\n" surface as the pre-Task-5 shape (verified by `cargo test -p envoy-bin --test admin_ready` → `1 passed; 0 failed`). Fixtures 0001-0014 stay GREEN by construction — none of them POSTs to `/drain_listeners` or `/healthcheck/fail`, so the `state` field stays "LIVE" and `/ready` stays 200 LIVE under the new dispatch. The first fixture to exercise the new 503 path is fixture 0015 at Task 8.
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `crates/envoy-admin/src/endpoint.rs` | +201 | -20 |
+| **Total source:** | **+201** | **-20** |
+
+Test-count delta: `envoy-admin` lib bucket grew **69 → 74** (+5, exactly the 5 new tests in `endpoint::ready_drain_tests`); no other crate touched. Workspace total grew by the same +5.
+
+No new top-level Cargo deps. `envoy_listener::DrainStage` is reached through the existing `envoy_listener` dep on `envoy-admin` (Task 3 added it; Task 4 carried it forward through `handler.rs`). Crate root `crates/envoy-admin/src/lib.rs` still carries `#![forbid(unsafe_code)]`; zero new unsafe blocks.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean across all 8 workspace crates, zero warnings, zero errors).
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 workspace crates compiled — `envoy-admin` rebuilt because of the `render_server_info` state-source patch + the new `render_ready_with` free fn + the dispatch tree rewire + the new test submodule; all downstream test compilation succeeded).
+
+**Gate 4 — `cargo test --workspace`:** PASS — every per-bucket `test result:` line reads `ok. N passed; 0 failed`; the `envoy-admin` lib bucket grew from 69 → 74 tests (the 5 new `endpoint::ready_drain_tests::{server_info_state_is_draining_when_drain_state_is_draining, server_info_state_is_live_when_drain_state_is_healthcheck_failing, ready_returns_200_live_when_drain_state_is_live, ready_returns_503_draining_when_drain_state_is_draining, ready_returns_503_service_unavailable_when_drain_state_is_healthcheck_failing}`). Focused re-run: `cargo test -p envoy-admin --lib` reads `74 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s`. The in-process backstop `cargo test -p envoy-bin --test admin_ready` reads `1 passed; 0 failed` (verifies the Live-default dispatch reroute preserves the end-to-end wire shape). One flake observed on the first workspace run (`differential::backend::tests::tcp_proxy_backend_spawns_and_echoes` + `…_drop_terminates_child` failed with "tcp-echo-server never became accept-ready" — port-contention flake; same pair flaked at Task 3 / Task 4 PROGRESS); a focused re-run `cargo test -p differential --lib backend::tests::tcp_proxy_backend` passed both deterministically (`2 passed; 0 failed`). The flake is orthogonal to Task 5's surface (no code path involved in the change touches `differential::backend`).
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per 07.1-REVIEW doctrine.
+
+### Differential surface delta
+
+**None at the differential / fixture surface.** Task 5 lands the wire-state mapping (per parent-08 SPEC §5.5) BUT no shipped fixture (0001-0014) POSTs to `/drain_listeners` or `/healthcheck/fail`, so every fixture observes `DrainStage::Live` for its `/server_info.state` (→ "LIVE", unchanged) and `/ready` (→ 200 OK "LIVE\n", unchanged) reads. Fixture 0011 (06.1 admin stats) stays GREEN: it scrapes `/stats` + `/stats/prometheus`, both of which are unaffected by Task 5 (no DrainState read on those paths). Fixture 0014 (08.1 admin config_dump) stays GREEN: it scrapes `/config_dump` (untouched by Task 5) + `/server_info` (state stays "LIVE" because no drain POST landed) + `/clusters` + `/listeners` + `/ready` (200 LIVE under default `Live` stage). Fixture 0015 at Task 8 is the first differential surface to exercise the new 503 path. The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
+
+Regression-equivalence on fixtures 0001-0014 preserved by construction: the bilateral `state == "LIVE"` and `/ready == 200 LIVE` assertions remain true because both upstream Envoy AND envoy-rust observe `DrainStage::Live` throughout each fixture's scrape window (no fixture issues a drain POST).

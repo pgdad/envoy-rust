@@ -159,7 +159,14 @@ impl AdminEndpoint {
     /// `ConfigDump` through `render_with` exclusively.
     pub fn render(&self, registry: &StatsRegistry) -> envoy_http1::Response {
         match self {
-            AdminEndpoint::Ready => Self::render_ready(),
+            // Phase 08.2 Task 5 (D-ready): `Ready` now requires the
+            // handler-scoped `DrainState` to compute the response shape
+            // (200 LIVE / 503 Service Unavailable / 503 DRAINING). The
+            // registry-only path can no longer satisfy this and must
+            // dispatch through `render_with`.
+            AdminEndpoint::Ready => unreachable!(
+                "Ready requires handler-scoped DrainState; dispatch via AdminEndpoint::render_with"
+            ),
             AdminEndpoint::Stats => Self::render_stats(registry),
             AdminEndpoint::StatsPrometheus => Self::render_stats_prometheus(registry),
             AdminEndpoint::ConfigDump => unreachable!(
@@ -198,6 +205,12 @@ impl AdminEndpoint {
     /// add `ServerInfo`, `Clusters`, `Listeners`.
     pub fn render_with(&self, handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
         match self {
+            // Phase 08.2 Task 5 (D-ready): `/ready` widens to a drain-aware
+            // response. Routes through the handler-aware path so the
+            // renderer can read `handler.drain().current()` to select the
+            // status / reason / body (200 LIVE, 503 Service Unavailable, or
+            // 503 DRAINING per parent-08 SPEC §5.5).
+            AdminEndpoint::Ready => render_ready_with(handler),
             AdminEndpoint::ConfigDump => render_config_dump(handler),
             AdminEndpoint::ServerInfo => render_server_info(handler),
             AdminEndpoint::Clusters => render_clusters(handler),
@@ -210,21 +223,9 @@ impl AdminEndpoint {
             AdminEndpoint::DrainListeners => render_drain_listeners(handler.drain()),
             AdminEndpoint::HealthcheckFail => render_healthcheck_fail(handler.drain()),
             AdminEndpoint::HealthcheckOk => render_healthcheck_ok(handler.drain()),
-            // 06.1 endpoints carry forward through the registry-only path.
+            // Registry-only endpoints (`/stats`, `/stats/prometheus`) carry
+            // forward through the original `render` path.
             _ => self.render(handler.registry()),
-        }
-    }
-
-    fn render_ready() -> envoy_http1::Response {
-        let body = Bytes::from_static(b"LIVE\n");
-        envoy_http1::Response {
-            status: 200,
-            reason: Some("OK"),
-            headers: vec![
-                ("content-type".to_string(), "text/plain".to_string()),
-                ("content-length".to_string(), body.len().to_string()),
-            ],
-            body,
         }
     }
 
@@ -307,6 +308,51 @@ pub(crate) enum ConfigDumpEntry<'a> {
     },
 }
 
+/// Phase 08.2 Task 5 (D-ready): drain-aware `/ready` response. Widens the
+/// 06.1 hardcoded 200 `"LIVE\n"` shape to a three-arm match on
+/// `handler.drain().current()` per parent-08 SPEC §5.5 wire-state mapping:
+///
+/// - `Live` → 200 OK, body `"LIVE\n"`
+/// - `HealthcheckFailing` → 503 Service Unavailable, body `"Service Unavailable\n"`
+/// - `Draining` → 503 Service Unavailable, body `"DRAINING\n"`
+///
+/// All three shapes carry `content-type: text/plain` + a `content-length`
+/// matching the body length (the established admin response convention; the
+/// 06.1 `render_ready` shape did the same). The `reason` field is set
+/// explicitly (`Some("OK")` / `Some("Service Unavailable")`) — the 06.1 shape
+/// set it too; we preserve that for the post-Task-5 surface so the wire-line
+/// reason phrase comes from the renderer rather than falling through to
+/// `reason_for_status`.
+///
+/// Dispatched exclusively through `AdminEndpoint::render_with` (the
+/// registry-only `render` path's `Ready` arm is `unreachable!()` post-Task-5
+/// for the same reason as the other handler-scoped endpoints).
+pub(crate) fn render_ready_with(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+    use envoy_listener::DrainStage;
+    let (status, reason, body): (u16, &'static str, Bytes) = match handler.drain().current() {
+        DrainStage::Live => (200, "OK", Bytes::from_static(b"LIVE\n")),
+        DrainStage::HealthcheckFailing => (
+            503,
+            "Service Unavailable",
+            Bytes::from_static(b"Service Unavailable\n"),
+        ),
+        DrainStage::Draining => (
+            503,
+            "Service Unavailable",
+            Bytes::from_static(b"DRAINING\n"),
+        ),
+    };
+    envoy_http1::Response {
+        status,
+        reason: Some(reason),
+        headers: vec![
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("content-length".to_string(), body.len().to_string()),
+        ],
+        body,
+    }
+}
+
 /// Phase 08.1 D6: render `/config_dump` as pretty JSON. Borrows the cached
 /// `Bootstrap` from the handler; the `last_updated` timestamp is the wall
 /// clock at render time formatted via [`envoy_accesslog::format_iso8601`].
@@ -363,12 +409,22 @@ pub(crate) struct ServerInfoBody<'a> {
 /// `command_line_options` map (constructed once at handler-init time per PLAN
 /// lock-in #7). Uptime is computed from `handler.start_instant()`.
 pub(crate) fn render_server_info(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
+    use envoy_listener::DrainStage;
     let uptime = handler.start_instant().elapsed().as_secs();
+    // Phase 08.2 D5e: rebind the `state` value source from the 08.1 literal
+    // "LIVE" to a DrainState-derived match (parent-08 SPEC §5.5 wire-state
+    // mapping). Per upstream Envoy semantics + parent-08 SPEC §5.5,
+    // `/server_info.state` is INDEPENDENT of healthcheck-failure: the
+    // `HealthcheckFailing` stage maps to "LIVE" here (only `/ready` flips
+    // to 503 under HealthcheckFailing). Only the `Draining` stage flips
+    // `/server_info.state` to "DRAINING".
+    let state = match handler.drain().current() {
+        DrainStage::Live | DrainStage::HealthcheckFailing => "LIVE",
+        DrainStage::Draining => "DRAINING",
+    };
     let body = ServerInfoBody {
         version: concat!("envoy-rust ", env!("CARGO_PKG_VERSION")),
-        // SPEC §5.4: 08.1 hardcodes the constant "LIVE"; 08.2 D5e patches the
-        // value-binding source to a DrainState-derived match.
-        state: "LIVE",
+        state,
         // envoy-rust does not implement hot restart.
         hot_restart_version: "disabled",
         command_line_options: handler.command_line_options(),
@@ -596,8 +652,16 @@ mod tests {
 
     #[test]
     fn render_ready_returns_200_live() {
-        let reg = StatsRegistry::new();
-        let resp = AdminEndpoint::Ready.render(&reg);
+        // Phase 08.2 Task 5 (D-ready): `Ready` now dispatches through
+        // `render_with` (the registry-only path's `Ready` arm became
+        // `unreachable!()`). This 06.1-era test was updated to route
+        // through the new handler-aware path; the Live-stage assertion is
+        // preserved (default `DrainState::new` → `DrainStage::Live` →
+        // 200 OK "LIVE\n"). Per-stage coverage (HealthcheckFailing,
+        // Draining) lives in the colocated `ready_drain_tests` submodule.
+        use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap};
+        let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
+        let resp = AdminEndpoint::Ready.render_with(&handler);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.reason, Some("OK"));
         assert_eq!(&resp.body[..], b"LIVE\n");
@@ -1283,5 +1347,122 @@ mod drain_admin_tests {
         assert_eq!(AdminEndpoint::DrainListeners.allowed_method(), "POST");
         assert_eq!(AdminEndpoint::HealthcheckFail.allowed_method(), "POST");
         assert_eq!(AdminEndpoint::HealthcheckOk.allowed_method(), "POST");
+    }
+}
+
+#[cfg(test)]
+mod ready_drain_tests {
+    //! Phase 08.2 Task 5 — D5e + D-ready: `/server_info` state-source rebind
+    //! and `/ready` drain-aware response. Five tests: two `server_info`
+    //! state-source tests (Draining → "DRAINING"; HealthcheckFailing →
+    //! "LIVE" — server-state is INDEPENDENT of healthcheck-failure per
+    //! parent-08 SPEC §5.5) and three `ready` response-shape tests
+    //! (Live → 200 LIVE; Draining → 503 DRAINING; HealthcheckFailing →
+    //! 503 Service Unavailable).
+    //!
+    //! Test helper `test_handler_with_drain(drain)` mirrors the existing
+    //! `handler_with_bootstrap` helper in `config_dump_tests` but accepts
+    //! a pre-constructed `Arc<DrainState>` so the test can drive the
+    //! underlying state transitions BEFORE invoking the render fn.
+
+    use super::config_dump_tests::TINY_BOOTSTRAP;
+    use super::{AdminEndpoint, render_server_info};
+    use crate::config::AdminConfig;
+    use crate::handler::AdminHandler;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_listener::DrainState;
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn test_handler_with_drain(drain: Arc<DrainState>) -> AdminHandler {
+        let bootstrap: Bootstrap = serde_yaml::from_str(TINY_BOOTSTRAP).expect("yaml parses");
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+        )
+    }
+
+    #[test]
+    fn server_info_state_is_draining_when_drain_state_is_draining() {
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(DrainState::new(&registry));
+        drain.drain();
+        let handler = test_handler_with_drain(Arc::clone(&drain));
+        let resp = render_server_info(&handler);
+        let value: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&resp.body).unwrap()).unwrap();
+        assert_eq!(
+            value.get("state").and_then(|v| v.as_str()),
+            Some("DRAINING")
+        );
+    }
+
+    #[test]
+    fn server_info_state_is_live_when_drain_state_is_healthcheck_failing() {
+        // Envoy's server-state is INDEPENDENT of healthcheck-failure per
+        // parent-08 SPEC §5.5 — `/server_info.state` stays "LIVE" while
+        // `/ready` flips to 503.
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(DrainState::new(&registry));
+        drain.fail_healthcheck();
+        let handler = test_handler_with_drain(Arc::clone(&drain));
+        let resp = render_server_info(&handler);
+        let value: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&resp.body).unwrap()).unwrap();
+        assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("LIVE"));
+    }
+
+    #[test]
+    fn ready_returns_200_live_when_drain_state_is_live() {
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(DrainState::new(&registry));
+        let handler = test_handler_with_drain(Arc::clone(&drain));
+        let resp = AdminEndpoint::Ready.render_with(&handler);
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.reason, Some("OK"));
+        assert_eq!(&resp.body[..], b"LIVE\n");
+    }
+
+    #[test]
+    fn ready_returns_503_draining_when_drain_state_is_draining() {
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(DrainState::new(&registry));
+        drain.drain();
+        let handler = test_handler_with_drain(Arc::clone(&drain));
+        let resp = AdminEndpoint::Ready.render_with(&handler);
+        assert_eq!(resp.status, 503);
+        assert_eq!(resp.reason, Some("Service Unavailable"));
+        assert_eq!(&resp.body[..], b"DRAINING\n");
+    }
+
+    #[test]
+    fn ready_returns_503_service_unavailable_when_drain_state_is_healthcheck_failing() {
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(DrainState::new(&registry));
+        drain.fail_healthcheck();
+        let handler = test_handler_with_drain(Arc::clone(&drain));
+        let resp = AdminEndpoint::Ready.render_with(&handler);
+        assert_eq!(resp.status, 503);
+        assert_eq!(resp.reason, Some("Service Unavailable"));
+        assert_eq!(&resp.body[..], b"Service Unavailable\n");
     }
 }
