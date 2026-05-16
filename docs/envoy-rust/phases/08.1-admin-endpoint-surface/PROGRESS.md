@@ -1502,14 +1502,14 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ## Task 14 — state-4 phase-done verification + STATE advance to state-5-next
 
-**Commit:** `<sha-pending>` — `phase 08.1: task 14 — state-4 verification + fixture 0014 CI bridge IP hardening (14 fixtures simultaneously green)`
+**Commit:** `03e6435` — `phase 08.1: task 14 — state-4 verification + fixture 0014 CI bridge IP hardening (14 fixtures simultaneously green)`
 **LoC delta:** +5 fixture (one new prefix entry + comment refresh in `tests/fixtures/0014-admin-config-dump-server-info/expectations.yaml`), +~120 doc (this PROGRESS Task 14 narrative), +~25 docs (STATE.md "Active phase" + "Next expected skill" + "Last commit" + "Last updated" rewrites + new "Phase-08.1 state-3 execution arc close" subsection). Net +~150 insertions, ~5 deletions. No production code change. Lands the §7.5 phase-done gate evidence + advances STATE.md from `08.1` lifecycle state 3 → state-4-reached / state-5-next.
 
 ### Work summary
 
-Substantive commit at HEAD `<sha-pending>` materializes the §7.5 phase-done gate evidence for phase 08.1 and advances STATE.md to state-5-next. **One in-flight fixture-coverage fix landed at this commit alongside the state-4 STATE-advance**, per the cold-start prompt's "if diagnosis surfaces a CI-environment-specific bug requiring a workflow change, that change lands at Task 14 alongside the state-4 evidence anchor" guidance: fixture 0014's `/clusters` `allowlist_envoy_only_line_prefixes` originally listed only the macOS Docker Desktop bridge IP `192.168.65.254` (Task 11 seeding was done on macOS Docker Desktop); on Linux Docker (GitHub Actions `ubuntu-latest` runners) the bridge IP is `172.17.0.1` (the default `docker0` bridge), so all 18 per-endpoint counter lines `backend::172.17.0.1:<port>::<key>::<value>` fell outside the allowlist and the bilateral `text_lines` body rule rejected them — surfacing as deterministic `admin_config_dump_server_info` FAILURE in the differential bucket at all three CI runs triggered by Tasks 11/12/13 pushes (CI runs `25962757953` + `25963715339` + `25964262139`, all conclusion `failure` at the `test (includes differential harness → Docker)` step). The fix is purely additive: append `backend::172.17.0.1:` as a second prefix entry; refresh the comment to explain both bridge-IP cases. Local 5-gate stays green; the next CI run at this commit's pushed HEAD becomes the state-4 evidence anchor.
+Substantive commit at HEAD `03e6435` materializes the §7.5 phase-done gate evidence for phase 08.1 and advances STATE.md to state-5-next. **One in-flight fixture-coverage fix landed at this commit alongside the state-4 STATE-advance**, per the cold-start prompt's "if diagnosis surfaces a CI-environment-specific bug requiring a workflow change, that change lands at Task 14 alongside the state-4 evidence anchor" guidance: fixture 0014's `/clusters` `allowlist_envoy_only_line_prefixes` originally listed only the macOS Docker Desktop bridge IP `192.168.65.254` (Task 11 seeding was done on macOS Docker Desktop); on Linux Docker (GitHub Actions `ubuntu-latest` runners) the bridge IP is `172.17.0.1` (the default `docker0` bridge), so all 18 per-endpoint counter lines `backend::172.17.0.1:<port>::<key>::<value>` fell outside the allowlist and the bilateral `text_lines` body rule rejected them — surfacing as deterministic `admin_config_dump_server_info` FAILURE in the differential bucket at all three CI runs triggered by Tasks 11/12/13 pushes (CI runs `25962757953` + `25963715339` + `25964262139`, all conclusion `failure` at the `test (includes differential harness → Docker)` step). The fix is purely additive: append `backend::172.17.0.1:` as a second prefix entry; refresh the comment to explain both bridge-IP cases. Local 5-gate stays green; the next CI run at this commit's pushed HEAD becomes the state-4 evidence anchor.
 
-After this commit lands at remote-tracking HEAD + the CI run completes green, a follow-up `phase 08.1: task 14 PROGRESS SHA fixup (<sha>)` commit replaces the `<sha-pending>` + `<ci-run-pending>` placeholders below with the actual CI run URL + run id + HEAD SHA + completion timestamp — same 2-commit pattern Tasks 1-13 used (substantive → SHA-fixup), adapted to the state-4 evidence-anchor shape.
+**State-4 CI evidence anchor materialized at CI run `25964680619`** (`https://github.com/pgdad/envoy-rust/actions/runs/25964680619`, conclusion `success`, completed `2026-05-16T14:42:35Z`, HEAD `03e6435`). The state-4 gate (a)–(e) are all GREEN; gate (f) (`REVIEW.md` approved) defers to state 5 per `BOOTSTRAP_PROMPT.md` §5.1. This SHA-fixup commit (`phase 08.1: task 14 PROGRESS SHA fixup (03e6435)`) resolves the `<sha-pending>` + `<ci-run-pending>` placeholders the substantive commit landed — same 2-commit pattern Tasks 1-13 used (substantive → SHA-fixup), adapted to the state-4 evidence-anchor shape because the predecessor Task 13 CI run was deterministic-failure (cured by the fixture-0014 cross-platform bridge-IP fix at the substantive commit).
 
 ### CI diagnosis (cold-start prompt's "CI / pushing context" section)
 
@@ -1654,17 +1654,18 @@ advisories ok, bans ok, licenses ok, sources ok
 
 ### CI evidence anchor (state-4)
 
-**CI run:** `<ci-run-pending>` — to be filled at the SHA-fixup commit once the CI run at HEAD `<sha-pending>` (this substantive commit) completes green.
-**HEAD SHA:** `<sha-pending>` (this substantive commit).
-**Conclusion:** `<ci-run-pending>`.
-**Completed at:** `<ci-run-pending>`.
+**CI run:** `25964680619` — `https://github.com/pgdad/envoy-rust/actions/runs/25964680619`.
+**HEAD SHA:** `03e6435` (substantive commit `03e6435da9e759e52fe211b1907687053f4cc20f`).
+**Conclusion:** `success`.
+**Created at:** `2026-05-16T14:40:36Z`.
+**Completed at:** `2026-05-16T14:42:35Z` (overall run; both jobs).
 
-Both CI jobs expected green at the post-push run:
+Both CI jobs GREEN:
 
-- **`build + test + lint`** — runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo build --workspace --all-targets`, `cargo test --workspace` (including the differential harness → Docker step exercising all 14 Docker-gated fixtures bilaterally), `cargo deny check`.
-- **`fuzz (parse_bootstrap, 30s)`** — runs `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`. Has been GREEN on every CI run during the Task 11/12/13 arc (the deterministic CI red was scoped to the differential `test` step on `build + test + lint`; the fuzz job is orthogonal and unaffected by the fixture fix at this commit).
+- **`build + test + lint`** ✅ — started `2026-05-16T14:40:39Z`, completed `2026-05-16T14:42:34Z` (~115 s; cache-warm from prior runs at this exact HEAD). All 11 steps green: `fmt` + `clippy` + `build` + `install h2spec` + `test (includes differential harness → Docker)` (49 s; ran `cargo test --workspace` with all 14 Docker-gated differential integration buckets `1 passed` each — including the previously-red `admin_config_dump_server_info ... ok` at `2026-05-16T14:41:42Z` — plus all 13 in-process envoy-bin integration buckets + all 12 lib buckets + h2spec conformance gate + helper-crate buckets; total 0 failed across the workspace) + `install cargo-deny` + `cargo deny check`.
+- **`fuzz (parse_bootstrap, 30s)`** ✅ — started `2026-05-16T14:40:39Z`, completed `2026-05-16T14:41:49Z` (~70 s). `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` ran clean (the Task 12 `admin_multi_endpoint_bootstrap.yaml` seed exercised; no crash). This job had been GREEN on every Task 11/12/13 CI run; the deterministic CI red was scoped to the `test` step on `build + test + lint`, cured at this commit by the fixture-0014 cross-platform bridge-IP fix.
 
-After the fixup commit lands, all six §7.5 gates are GREEN; STATE.md (advanced at this commit) directs the next session to `superpowers:requesting-code-review`.
+All five §7.5 gates (a)–(e) are GREEN; gate (f) (`REVIEW.md` approved) defers to state 5. STATE.md directs the next session to `superpowers:requesting-code-review`.
 
 ### Phase-08.1 state-3 execution arc summary (13 task commits closed)
 
