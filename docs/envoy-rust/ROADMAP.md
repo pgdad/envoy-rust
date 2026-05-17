@@ -63,6 +63,10 @@ These are seeded as headings only. Each family becomes one or more concrete phas
 
 Header manipulation, cors, compression, fault, local+global rate limit, jwt_authn, rbac, ext_authz, ext_proc, oauth2, csrf, buffer, lua, wasm, adaptive concurrency, admission control, bandwidth limit.
 
+| id | title | depends-on | status | sub-phases | summary |
+|---|---|---|---|---|---|
+| 09 | envoy.filters.http.local_ratelimit + fixture 0016 + 07.2 REVIEW M1 close | 07 | planned | — | fixture 0016-http-filter-local-rate-limit green; envoy-filter gains LocalRateLimitFilter (hand-rolled token bucket + decode-side StopAndSend with 429 + `x-envoy-ratelimited`) + HttpFilterInstance::LocalRateLimit variant; envoy-config gains LocalRateLimit + TokenBucket schema + 4 new ConfigError variants; 07.2 REVIEW M1 closed (severed `position` plumbing deleted) |
+
 ### Network filters family
 
 Redis, mongo, kafka_broker, thrift, zookeeper [scope TBD], echo, direct_response, sni_cluster, rbac network.
