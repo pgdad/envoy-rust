@@ -332,7 +332,171 @@ state-2 commit context above for the cadence rule).
 
 ### Task 2 — D3 hand-rolled token bucket primitive + concurrency torture test
 
-_(Pending state-3 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `818a3c5` — `phase 09: task 1 — D1 envoy-config schema + D2 validator`.
+
+**Work summary.** Landed the hand-rolled `TokenBucketState` token-bucket primitive
+per PLAN Task 2 (SPEC §3 D3 + §5.2 + §6.3) as a new module
+`crates/envoy-filter/src/local_rate_limit.rs`. The primitive is the lock-in #3-#9
+shape: `AtomicU64` for the live token count + `std::sync::Mutex<Instant>` for the
+last-fill timestamp; lazy-fill computed at `try_acquire` time (no background refill
+task); single `compare_exchange` loop with `Ordering::AcqRel` on success +
+`Ordering::Acquire` on failure (lock-in #6); the Mutex is held only briefly inside
+the loop for the last-fill timestamp read + only on CAS success for the timestamp
+update (lock-in #7); poisoning is fatal — `.expect("TokenBucketState
+last_fill_instant Mutex poisoned")` at every lock site (lock-in #8). On CAS-success,
+the new `last_fill_instant` carries forward by `intervals * fill_interval` (NOT
+`Instant::now()`) so partial intervals are preserved (lock-in #5).
+
+The runtime filter struct (`LocalRateLimitFilter` wrapping `Arc<TokenBucketState>`)
+defers to Task 3; the `HttpFilterInstance::LocalRateLimit` variant + dispatch glue
+defers to Task 4. At this commit the module is module-private (no `lib.rs`
+re-export) per PLAN Step 1. The 4th-file cross-crate bridge arm landed by Task 1 in
+`crates/envoy-filter/src/instance.rs` stays AS-IS at this commit — Task 4 replaces
+it with the proper dispatch.
+
+The REQUIRED concurrency torture test (`token_bucket_concurrent_acquire_does_not_double_count`)
+runs under `#[tokio::test(flavor = "multi_thread", worker_threads = 8)]` and spawns
+8 tasks × 10_000 acquires against a bucket sized `max_tokens = 1000` with
+`tokens_per_fill = 0` (no refill window). The assertion is `observed_success_count
+== min(N*M, max_tokens) = 1000` AND `state.tokens.load(Acquire) == 0` post-run.
+This is the SPEC §6.3 + PLAN lock-in #9 + 08.2 Task 1 fixup TOCTOU-lesson
+precedent — a naive read-then-decrement implementation would observably
+double-count or lose tokens; the single-CAS-loop discipline preserves the invariant.
+The test ran 3 additional times locally (1 + 3 verification runs) and passed
+deterministically each time; wall-clock per run was ~10-30ms.
+
+**Files modified (4):**
+- `crates/envoy-filter/Cargo.toml` — `envoy-stats = { path = "../envoy-stats" }`
+  added to `[dependencies]` (workspace-internal path-dep per PLAN lock-in #2; the
+  Counter handles wired at Task 3 will need it); `tokio = { version = "1",
+  default-features = false, features = ["rt-multi-thread", "macros", "sync"] }`
+  added to `[dev-dependencies]` (the multi-threaded torture test runtime).
+- `crates/envoy-filter/src/lib.rs` — added `pub mod local_rate_limit;` in
+  alphabetical position between `instance` and `pipeline` (PLAN Step 1). No
+  re-export at this commit (lock-in #1 — re-export deferred to Task 3).
+- `crates/envoy-filter/src/local_rate_limit.rs` — NEW file; the entire token bucket
+  primitive shape (`TokenBucketState` struct + `new` + `try_acquire`) plus the
+  6-test `#[cfg(test)] mod tests` block.
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` — this
+  subsection (per-task PROGRESS cadence).
+
+Also: `Cargo.lock` carries 2 added lines (envoy-stats + tokio entries in the
+envoy-filter dependency-listing) — see deviation #1.
+
+**Tests landed (6 new; 729 → 735 in workspace test count).**
+1. `new_bucket_starts_at_capacity` — verifies the fresh bucket loads at
+   `max_tokens` capacity.
+2. `try_acquire_consumes_one_token_at_a_time` — drains a 3-capacity bucket via 3
+   `try_acquire` calls; 4th returns false.
+3. `try_acquire_returns_false_on_empty_bucket_with_no_refill` — 0-capacity bucket
+   returns false on first call.
+4. `try_acquire_drains_then_recovers_after_sleep` — verifies the lazy-fill formula
+   refills after `intervals = elapsed / fill_interval > 0`.
+5. `try_acquire_refill_caps_at_max_tokens` — verifies the `.min(max_tokens)` cap
+   on the refill arithmetic (high `tokens_per_fill * intervals` does not overflow
+   the bucket).
+6. `token_bucket_concurrent_acquire_does_not_double_count` — REQUIRED per SPEC
+   §6.3; 8-thread × 10_000-acquire torture test; asserts
+   `min(N*M, max_tokens) = 1000` total successes AND `state.tokens.load(Acquire) == 0`
+   post-run. Verifies the CAS atomicity discipline at lock-in #6.
+
+**Per-task deviations from PLAN (1).**
+
+1. **`Cargo.lock` carries a +2-line dependency-listing delta vs the lock-in #39
+   "empty diff" projection.** Lock-in #39 read: *"Cargo.lock diff at the phase-09
+   reviewed range is expected to be empty (envoy-stats is already a workspace
+   member; the new `envoy-stats = { path = "../envoy-stats" }` entry on
+   envoy-filter/Cargo.toml does NOT add to lockfile)."* Empirically, the per-crate
+   dependency-listing block in Cargo.lock for `envoy-filter` IS updated to record
+   the new `envoy-stats` and `tokio` dependency edges — these are metadata-only
+   entries (no new package versions resolved; envoy-stats was already a workspace
+   member at v0.0.0; tokio was already at v1.52.1 from the workspace cluster). The
+   diff is 2 lines added to the existing `[[package]] name = "envoy-filter"` block:
+   `+ "envoy-stats",` and `+ "tokio",`. No new top-level Cargo deps resolved; no
+   ADR-grant engaged; the D-3.2 permitted-foundations posture is unchanged. This
+   refines the lock-in #39 projection: path-dep additions DO produce metadata-only
+   Cargo.lock diffs (the lockfile records the per-crate dependency edge), but
+   these are not "new dep resolutions" in the cadence sense. Stage Cargo.lock with
+   the commit per PLAN Step 6's "include in commit but flag as deviation"
+   guidance.
+
+**LoC delta (production + tests; doc-comments excluded by manual inspection of
+`local_rate_limit.rs` totals).** Production: ~+128 LoC (the
+`TokenBucketState` struct + `new` + `try_acquire` lazy-fill + single-CAS loop in
+the new module file; 1 line in `lib.rs` for the `pub mod` declaration; 2 lines in
+`Cargo.toml` for the path-dep + dev-dep). Tests: ~+93 LoC (the 6-test
+`#[cfg(test)] mod tests` block). Fixture/doc: 0. Total: ~+222 LoC.
+
+Against PLAN §3 row 2's projection (~70 production / ~150 tests / 0 fixture-doc /
+~220 total):
+- Production: +58 over projection (~70 → 128). The overshoot is the
+  `#[allow(dead_code)]` annotations + the formatted `match` shape produced by
+  `cargo fmt` on the CAS expression + the lazy-fill `match` shape vs the projected
+  `if/else` shape (clippy `manual_checked_ops` lint forced the rewrite — see
+  per-task deviation 1 below).
+- Tests: -57 under projection (~150 → 93). The 6 tests are tighter than projected
+  because the torture test is a single self-contained `#[tokio::test]` (no
+  multi-fixture matrix).
+- Total: 222 vs 220 projection — exact match within rounding.
+
+Total LoC delta is within PLAN §3's accept-drift posture (~+50% acceptable on a
+single task per the established 06.x / 07.x / 08.x discipline). Production +83%
+relative drift sits at the upper edge of "accept" but the total is on-projection;
+recording for transparency rather than as a concern.
+
+**Additional discovered-at-task-time refinement.** Beyond the PLAN-write SPEC
+corrections (the 7 in PROGRESS §"Task 1 preamble" + the 9th + 10th flagged at Task
+1 commit), Task 2 surfaces one mechanical adjustment:
+
+- **Clippy `manual_checked_ops` lint required rewriting the lazy-fill
+  `interval_nanos == 0` guard.** The PLAN Step 3 code paragraph reads `if
+  interval_nanos == 0 { ... } else { let intervals = (elapsed_nanos /
+  interval_nanos) as u64; ... }`. Clippy on the stable toolchain flags this as
+  `manual_checked_ops` and recommends `checked_div`. Resolution: rewrite as
+  `match elapsed_nanos.checked_div(interval_nanos) { None | Some(0) => (current,
+  last_fill), Some(intervals_u128) => { /* ... */ } }`. Semantics are preserved
+  (None ↔ zero-divisor defensive arm; Some(0) ↔ zero-intervals-elapsed early
+  return; Some(n) ↔ refill arithmetic). The `#[allow(dead_code)]` annotations on
+  the struct + impl block are paired with the lock-in #1 deferred-re-export
+  posture — the production-code callers land at Task 3, but the test module
+  exercises the surface at this commit; the `#[allow(dead_code)]` annotations
+  satisfy clippy's `--all-features --all-targets -- -D warnings` discipline. This
+  follows the existing `crates/envoy-http1/src/codec.rs:51-61` precedent (3
+  `#[allow(dead_code)] // wired up by Task 9's router-proxy arm`).
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain.
+
+#### Gate 1: `cargo fmt --all -- --check`
+PASS (exit 0). One mid-task `cargo fmt --all` mutation applied (the initial PLAN
+Step 3 module copy + the clippy follow-up both required rustfmt-canonical
+re-formatting); after the mutation, `cargo fmt --all -- --check` exits 0.
+
+#### Gate 2: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+PASS (exit 0). Initial run flagged 3 errors (struct-never-constructed,
+methods-never-used, manual_checked_ops); resolved per the per-task refinement
+above (`#[allow(dead_code)]` annotations + `checked_div` rewrite). Re-run clean.
+
+#### Gate 3: `cargo build --workspace --all-targets`
+PASS (exit 0). All 15 workspace crates compile; no warnings.
+
+#### Gate 4: `cargo test --workspace`
+PASS (exit 0). Test result counts: **735 passed; 0 failed; 2 ignored** across the
+workspace — +6 vs Task-1 predecessor (729 → 735), exactly matching the 6 new
+tests in the `local_rate_limit::tests` module. The torture test ran ~10-30ms
+wall-clock per run; 4 verification runs all green.
+
+#### Gate 5: `cargo deny check`
+PASS (exit 0). `advisories ok, bans ok, licenses ok, sources ok`. 3 cosmetic
+`license-not-encountered` warnings unchanged from Task 1 (MPL-2.0,
+Unicode-DFS-2016, Zlib — allowed-but-not-used at this resolution graph).
+
+**Carryforward dispositions unchanged.** The 07.2 REVIEW M1 close site (Task 4) is
+not engaged at Task 2.
+
+**STATE.md / ROADMAP.md / BEHAVIOR_CONTRACT.md / DECISIONS.md / ENVOY_TARGET.md /
+rust-toolchain.toml diffs at this commit:** None (per the per-task PROGRESS
+cadence rule; state-2 commit context above for the cadence).
 
 ### Task 3 — D3 LocalRateLimitFilter runtime + D6 stats wiring + D7.1 4 stat-mapping rows
 

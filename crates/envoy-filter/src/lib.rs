@@ -9,6 +9,7 @@
 pub mod error;
 pub mod header_mutation;
 pub mod instance;
+pub mod local_rate_limit;
 pub mod pipeline;
 pub mod router;
 pub mod types;
