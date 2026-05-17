@@ -1562,7 +1562,254 @@ _(Populated at this commit above.)_
 
 ### Task 8 — state-4 phase-done verification + STATE advance to state-5-next
 
-_(Pending state-3 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `1effb0f` — `phase 09: task 6 follow-up — add hcm_local_rate_limit_filter.yaml to fuzz_corpus_seeds SUCCESS array`.
+
+**Work summary.** Substantive docs-only commit at this HEAD materializes
+the `BOOTSTRAP_PROMPT.md` §7.5 phase-done gate evidence for phase 09 and
+advances STATE.md to state-5-next. The §7.5 phase-done gate (a)–(e) are
+all GREEN at the predecessor HEAD `1effb0f8939130e2173b5085567d33bf3cb30ff6`
+(Task 6 follow-up — the SUCCESS array extension covering the new
+`hcm_local_rate_limit_filter.yaml` fuzz seed) per **CI run `26002996677`**
+(conclusion `success`, completed `2026-05-17T21:20:41Z`, wall ~2m 1s).
+Gate (f) (`REVIEW.md` approved) defers to state 5 per
+`BOOTSTRAP_PROMPT.md` §5.1.
+
+This commit mirrors the 08.2 Task 11 (`cade4b0`) / 08.1 Task 14 (`03e6435`)
+/ 07.2 Task 10 (`f921fdd`) / 06.3 Task 12 (`42fc726`) state-4-reached
+precedents — docs-only PROGRESS append + STATE.md status / next-skill /
+last-commit / last-updated rewrites, no production code or test changes.
+The Task 6 follow-up predecessor CI run was GREEN on first push at HEAD
+`1effb0f`, so no in-flight fixture-coverage fix is required — Task 8
+lands as a pure docs-only 1-commit shape per the 08.2 / 07.2 / 06.3
+cadence (NOT the 08.1 Task 14 2-commit pattern).
+
+### CI evidence anchor (state-4)
+
+**CI run:** `26002996677` — `https://github.com/pgdad/envoy-rust/actions/runs/26002996677`.
+**HEAD SHA:** `1effb0f8939130e2173b5085567d33bf3cb30ff6` (Task 6
+follow-up — SUCCESS array extension covering
+`hcm_local_rate_limit_filter.yaml`; predecessor of THIS commit).
+**Conclusion:** `success`.
+**Created at:** `2026-05-17T21:18:40Z`.
+**Completed at:** `2026-05-17T21:20:41Z` (overall run; both jobs).
+**Wall:** ~2m 1s.
+**Workflow:** `ci` (.github/workflows/ci.yml).
+
+Both CI jobs GREEN:
+
+- **`build + test + lint`** ✅ — job ID `76429519366`
+  (`https://github.com/pgdad/envoy-rust/actions/runs/26002996677/job/76429519366`);
+  wall ~1m 58s. All 9 steps green: `install Rust` → `cargo cache` →
+  `fmt` → `clippy` → `build` → `install h2spec` (v2.6.0 pinned) →
+  `test (includes differential harness → Docker)` (~46s; the load-bearing
+  step running `cargo test --workspace` with all 16 Docker-gated
+  differential integration buckets `1 passed` each + all 15 in-process
+  `envoy-bin` integration buckets + all lib buckets + h2spec conformance
+  gate + helper-crate buckets; 0 failed across the workspace) →
+  `install cargo-deny` → `cargo deny check`.
+- **`fuzz (parse_bootstrap, 30s)`** ✅ — job ID `76429519376`
+  (`https://github.com/pgdad/envoy-rust/actions/runs/26002996677/job/76429519376`);
+  wall ~1m 16s. `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`
+  ran clean; the Task 6 seed `hcm_local_rate_limit_filter.yaml` is in
+  corpus and exercised (verified in-tree by the Task 6 follow-up at
+  `1effb0f` extending
+  `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`'s
+  SUCCESS array); no crash.
+
+### §7.5 phase-done gate — six gates
+
+| Gate | Disposition | Evidence |
+|---|---|---|
+| **(a)** Fixture 0016-http-filter-local-rate-limit green | **PASS** | `build + test + lint` job 76429519366, `test (includes differential harness → Docker)` step at `2026-05-17T21:20:05.3814423Z`: `test http_filter_local_rate_limit_fixture ... ok` + `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s` (differential wrapper at `tests/differential/tests/http_filter_local_rate_limit.rs`; ADR-0033 contract: `[200, 200, 200, 429, 429]` + body `"local_rate_limited"` on 429 probes + `set_equal_modulo_allow_list` headers). |
+| **(b)** 15 pre-existing fixtures (0001-0015) green simultaneously | **PASS** | Same job + step: all 15 Docker-gated wrapper binaries pass alongside 0016 in a single `cargo test --workspace` invocation (per-binary `1 passed; 0 failed`). Wall ~46s for the full differential bucket. |
+| **(c)** h2spec ≥95% with known-failures.txt unchanged | **PASS** | 99.31% (05.2 baseline; carried forward unchanged — phase 09 engages no H2-framing surfaces; the filter operates on the post-codec `FilterRequest` / `FilterResponse` abstraction). `tests/h2spec_runner.rs` step at `2026-05-17T21:20:29.2559426Z`: `test h2spec_pass_rate_gate ... ok`. |
+| **(d)** parse_bootstrap fuzz clean for short-budget CI run | **PASS** | `fuzz (parse_bootstrap, 30s)` job 76429519376 (wall ~1m 16s). Task 6's `hcm_local_rate_limit_filter.yaml` seed in corpus + listed in `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (Task 6 follow-up at `1effb0f`). No crash. |
+| **(e)** Stable-toolchain gates (fmt / clippy / build / test / deny) | **PASS** | All 5 steps in `build + test + lint` job conclude `success` (fmt, clippy, build, test step + cargo deny check step). |
+| **(f)** REVIEW.md approved | **CLOSE-at-state-5-REVIEW.md** | State-5 session writes REVIEW.md per `BOOTSTRAP_PROMPT.md` §5 + the `superpowers:requesting-code-review` skill's per-phase REVIEW.md output. |
+
+#### (a) all new/changed differential fixtures green
+
+Phase 09 introduces **one new differential fixture:
+`0016-http-filter-local-rate-limit`** (Task 5; ADR-0033 corrective Commit
+D at `1384c48`). The fixture asserts bilateral equivalence of the
+ADR-0033-revised 429 wire shape (5 standard HTTP/1.1 response headers +
+body `"local_rate_limited"` + NO `x-envoy-ratelimited`) across a 5-probe
+burst that drains the `max_tokens: 3` bucket and triggers rate-limit on
+probes 4 + 5.
+
+```
+2026-05-17T21:20:04.5546583Z      Running tests/http_filter_local_rate_limit.rs (target/debug/deps/http_filter_local_rate_limit-aae36e1c4d7ddff2)
+2026-05-17T21:20:05.3814423Z test http_filter_local_rate_limit_fixture ... ok
+2026-05-17T21:20:05.3815953Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+```
+
+The `envoy-bin` in-process backstop
+`tests/http_filter_local_rate_limit.rs` (Task 7) also runs at the same
+`cargo test --workspace`:
+
+```
+2026-05-17T21:20:22.2979520Z      Running tests/http_filter_local_rate_limit.rs (target/debug/deps/http_filter_local_rate_limit-dd6ec6e49af97511)
+2026-05-17T21:20:22.3539338Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+
+(Both binaries share the test-file basename
+`http_filter_local_rate_limit.rs` but live in different crates —
+`differential` (Docker-gated) vs `envoy-bin` (in-process) integration
+tests — so their compiled hashes differ.)
+
+#### (b) all pre-existing differential fixtures still green
+
+The 15 pre-existing Docker-gated differential fixtures `0001-tcp-echo`
+through `0015-admin-drain-listeners` are all GREEN simultaneously at this
+CI run. **All 16 fixtures (0001-0016) green simultaneously** at the
+single CI `cargo test --workspace` invocation (each its own
+`tests/differential/tests/*.rs` integration bucket; each `1 passed;
+0 failed`). Per-fixture wrapper test names + fixture mapping:
+
+| Wrapper test binary | Fixture | CI timestamp + result |
+|---|---|---|
+| `tests/access_log_file_sink.rs` | 0012-access-log-file-sink | `2026-05-17T21:19:49.4172658Z` — `1 passed; 0 failed; finished in 6.19s` |
+| `tests/admin_config_dump_server_info.rs` | 0014-admin-config-dump-server-info | `2026-05-17T21:19:51.8992848Z` — `1 passed; 0 failed; finished in 2.48s` |
+| `tests/admin_drain_listeners.rs` | 0015-admin-drain-listeners | `2026-05-17T21:19:52.7740410Z` — `1 passed; 0 failed; finished in 0.87s` |
+| `tests/admin_ready.rs` | 0002-static-admin-ready | `2026-05-17T21:19:53.5910923Z` — `1 passed; 0 failed; finished in 0.81s` |
+| `tests/admin_stats_prometheus.rs` | 0011-admin-stats-prometheus | `2026-05-17T21:19:54.5119313Z` — `1 passed; 0 failed; finished in 0.92s` |
+| `tests/echo.rs` | 0001-tcp-echo | `2026-05-17T21:19:55.5470533Z` — `1 passed; 0 failed; finished in 1.03s` |
+| `tests/http1_direct_response.rs` | 0007-http1-direct-response | `2026-05-17T21:19:56.3712346Z` — `1 passed; 0 failed; finished in 0.82s` |
+| `tests/http1_router_upstream.rs` | 0008-http1-router-upstream | `2026-05-17T21:19:58.8016078Z` — `1 passed; 0 failed; finished in 2.43s` |
+| `tests/http2_direct_response.rs` | 0009-http2-direct-response | `2026-05-17T21:19:59.6608060Z` — `1 passed; 0 failed; finished in 0.86s` |
+| `tests/http2_router_upstream.rs` | 0010-http2-router-upstream | `2026-05-17T21:20:02.1324825Z` — `1 passed; 0 failed; finished in 2.47s` |
+| `tests/http_filter_header_mutation.rs` | 0013-http-filter-header-mutation | `2026-05-17T21:20:04.5540636Z` — `1 passed; 0 failed; finished in 2.42s` |
+| `tests/http_filter_local_rate_limit.rs` | **0016-http-filter-local-rate-limit** (NEW Phase 09) | `2026-05-17T21:20:05.3815953Z` — `1 passed; 0 failed; finished in 0.82s` |
+| `tests/tcp_proxy.rs` | 0003-tcp-proxy | `2026-05-17T21:20:08.0109278Z` — `1 passed; 0 failed; finished in 2.63s` |
+| `tests/tls_downstream.rs` | 0004-tls-downstream | `2026-05-17T21:20:10.8249721Z` — `1 passed; 0 failed; finished in 2.81s` |
+| `tests/tls_sni.rs` | 0006-tls-sni | `2026-05-17T21:20:13.8928630Z` — `1 passed; 0 failed; finished in 3.06s` |
+| `tests/tls_upstream.rs` | 0005-tls-upstream | `2026-05-17T21:20:16.5379907Z` — `1 passed; 0 failed; finished in 2.64s` |
+
+The `differential` lib bucket itself (`unittests src/lib.rs`) runs `106
+passed; 0 failed; 1 ignored` (`finished in 0.97s` at
+`2026-05-17T21:19:43.2225897Z`).
+
+#### (c) conformance suites pass at the declared threshold
+
+`h2spec` conformance suite holds at the **≥95% pass** gate (05.2 baseline
+99.31%; `h2spec_pass_rate_gate` PASS). `known-failures.txt` unchanged —
+phase 09 engages no H2-framing surfaces (the filter operates on the
+post-codec `FilterRequest` / `FilterResponse` abstraction per phase-07.1
+ADR-0031). From CI log:
+
+```
+2026-05-17T21:19:42.0582732Z Version: 2.6.0 (70ac2294010887f48b18e2d64f5cccd48421fad1)
+...
+2026-05-17T21:20:28.9893949Z      Running tests/h2spec_runner.rs (target/debug/deps/h2spec_runner-b978c3ad0d8fa2bd)
+2026-05-17T21:20:29.2559426Z test h2spec_pass_rate_gate ... ok
+```
+
+#### (d) new fuzz target clean for short-budget CI run
+
+`parse_bootstrap` is the only fuzz target in 09's scope (phase 09
+introduces no new fuzz target — Task 6 only added a new seed
+`hcm_local_rate_limit_filter.yaml` to the existing `parse_bootstrap`
+corpus, mirroring the 08.2 Task 9 cadence). CI `fuzz (parse_bootstrap,
+30s)` job ran `cargo +nightly fuzz run parse_bootstrap --
+-max_total_time=30` GREEN (job ID `76429519376`, wall ~1m 16s). The Task
+6 seed
+`crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_local_rate_limit_filter.yaml`
+is in corpus and was exercised; in-tree corroboration via
+`crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`
+SUCCESS-walk (the seed is listed in the SUCCESS array per the Task 6
+follow-up at `1effb0f` and parses cleanly through `parse_bootstrap`).
+
+#### (e) `cargo build` + `cargo clippy` + `cargo fmt` + `cargo test` + `cargo deny check` all clean
+
+All five stable-toolchain gates are GREEN at CI run `26002996677`'s
+`build + test + lint` job (76429519366). Workspace test count at this CI
+run: **746 passed; 0 failed; 2 ignored** across all bucket tests (+1
+over the predecessor Task 7 baseline 745; the +1 is Task 7's
+`local_rate_limit_enforces_429_after_token_exhaustion` in-process backstop
+test).
+
+#### (f) REVIEW.md approved
+
+**Deferred to state 5** (this is the state-4 commit; per
+`BOOTSTRAP_PROMPT.md` §5.1 "one state per session", REVIEW.md lands at
+the next session via `superpowers:requesting-code-review` scoped to the
+range `b9da8d4..<this commit's HEAD>`, where `b9da8d4` is the phase-09
+state-2 PLAN-write commit — the project's standard reviewed range for
+closing-phase REVIEWs).
+
+### Deviations from PLAN
+
+**None.** Task 8 lands as a pure docs-only 1-commit shape per the
+PLAN-prescribed shape + the 08.2 Task 11 / 07.2 Task 10 / 06.3 Task 12
+state-4-reached precedent. No fixture fix is folded (the predecessor
+Task 6-follow-up CI run at HEAD `1effb0f` was GREEN on first push; no
+in-flight coverage fix required). No production code change, no test
+change, no fixture change — only `docs/envoy-rust/STATE.md` + this
+PROGRESS file are edited.
+
+### Task 1-7 + ADR-0033 corrective sequence — execution-arc summary
+
+| Task | Substantive SHA | Surface delta |
+|---|---|---|
+| 1 | `818a3c5` | D1 envoy-config schema + D2 validator (HttpFilterTypedConfig::LocalRateLimit variant + 3 new structs + 4 new ConfigError variants + parse_duration helper + validate_local_rate_limit_config + envoy-filter bridge arm + 16 unit tests) |
+| 2 | `b5c81d2` | D3 hand-rolled TokenBucketState primitive + REQUIRED 8×10_000 concurrency torture test + 5 unit tests |
+| 3 | `70bad43` | D3 LocalRateLimitFilter runtime + D6 4-counter stats wiring (`enabled`/`ok`/`rate_limited`/`enforced` under `http_local_rate_limit.<stat_prefix>`) + D7.1 4 BEHAVIOR_CONTRACT Stat-name mapping rows + parse_duration visibility promotion |
+| 4 | `78128f4` | D4 HttpFilterInstance::LocalRateLimit variant + dispatch + signature widening (drop `_position`; add `&Arc<StatsRegistry>`) + D5 **07.2 REVIEW M1 closure** (severed `_position` plumbing deleted at `instance.rs::build` + `pipeline.rs::build_from_config` `.enumerate()`; header_mutation.rs hardcoded `position: 0` PRESERVED per PLAN lock-in #23); 5 test sites updated for the cascading signature change |
+| **ADR-0033 Commit A** | `e9a6cb4` | Mid-execution corrective fixup per upstream Envoy v1.33 empirical observation: ADR-0033 + SPEC §2.2 revision + PROGRESS preamble (docs-only). Voids PLAN lock-ins #13 / #30 / partial #33 — upstream's local_ratelimit emits NO `x-envoy-ratelimited` header, emits body `"local_rate_limited"`, and the H1 HCM's filter-synth writer-path was missing standard-header decoration. |
+| **ADR-0033 Commit B** | `1c1de0f` | Task 3 fixup: `LocalRateLimitFilter::decode_headers` drops the `x-envoy-ratelimited` injection; body changes from `Bytes::new()` → `Bytes::from_static(b"local_rate_limited")`; 2 unit tests updated. |
+| **ADR-0033 Commit C** | `ae2cef0` | Task 4 H1 HCM fixup: new `decorate_filter_synth_response(resp, close)` helper called from both `RequestPath::SynthFromDecode` + encode-side `Decision::StopAndSend` arm sites; adds 5 standard HTTP/1.1 response headers (`server`, `date`, `content-length`, `content-type`, `connection`) to filter-synth responses; 2 new unit tests. |
+| **ADR-0033 Commit D** | `1384c48` | Task 5: fixture `0016-http-filter-local-rate-limit` (envoy.yaml + envoy-rust.yaml + expectations.yaml + README.md) + Docker-gated wrapper `tests/differential/tests/http_filter_local_rate_limit.rs`. Per-side YAML asymmetry per fixture-0013 precedent. NO BEHAVIOR_CONTRACT row (PLAN lock-in #30 voided per ADR-0033). |
+| 6 | `28e1666` | D8.2 parse_bootstrap fuzz corpus seed `hcm_local_rate_limit_filter.yaml` (+ `.gitignore` allow-list entry per the established curated-seed pattern). |
+| 6 follow-up | `1effb0f` | Add `hcm_local_rate_limit_filter.yaml` to `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (1-line test extension). |
+| 7 | `7fcaeb1` | D8.3 in-process backstop `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` per ADR-0033 revised contract (status `[200, 200, 429, 429]` + body `"local_rate_limited"` on 429 + 5 standard headers + NO `x-envoy-ratelimited`). |
+| **8 (this)** | `<sha-pending>` | State-4 verification + STATE advance to state-5-next (docs-only). |
+
+**7 substantive task commits + 4 ADR-0033 corrective commits + 1 Task 6
+follow-up commit + this Task 8 docs-only commit = 13 commits over the
+state-3 execution arc**, between the state-2 standalone-PLAN base
+`b9da8d4` and Task 7 HEAD `7fcaeb1`. The Task 6 follow-up commit
+`1effb0f` is the immediate predecessor of THIS Task 8 docs-only commit;
+the state-4 evidence anchor is CI run `26002996677` against `1effb0f`.
+
+**Carryforward closures landed in phase 09:** **07.2 REVIEW M1** (severed
+`_position` plumbing) — CLOSED at Task 4 `78128f4` per SPEC §3 D5 + PLAN
+lock-in #22. The chain 07.2 → 09 ends.
+
+**Mid-execution discovery + corrective sequence:** ADR-0033 ratified the
+SPEC §2.2 revision per upstream Envoy v1.33 empirical observation (Task
+5 dispatch surfaced 3 discrepancies between SPEC §2.2 + Task 3 lock-in
+#13 and upstream's actual `envoy.filters.http.local_ratelimit` wire
+shape: no `x-envoy-ratelimited` header, body `"local_rate_limited"`, H1
+HCM filter-synth standard-header decoration gap). 4 corrective commits
+A→B→C→D landed cleanly; the phase-09 differential surface is bilaterally
+green per the §7.5 gate evidence above. **DECISIONS.md ledger advanced
+`ADR-0032 → ADR-0033`** at Commit A `e9a6cb4`.
+
+### State-5 entry routing (next session)
+
+Per `BOOTSTRAP_PROMPT.md` §5 state 5 + STATE.md's advance at THIS commit,
+**next session enters phase-09 lifecycle state 5** with next-skill
+`superpowers:requesting-code-review` scoped to the reviewed range
+`b9da8d4..<this commit's HEAD>` (the phase-09 state-2 PLAN-write base
+SHA through THIS commit's new HEAD). The session writes
+`docs/envoy-rust/phases/09-http-filter-local-rate-limit/REVIEW.md` per
+the skill's per-phase REVIEW.md output. With Approved verdict, state-6
+(the session after) closes phase 09 + flips ROADMAP row `09` `in-progress`
+→ `done` per the closing-phase invariant.
+
+### Differential surface delta
+
+**16 Docker-gated fixtures (`0001-tcp-echo` through
+`0016-http-filter-local-rate-limit`) GREEN simultaneously** at CI run
+`26002996677` HEAD `1effb0f` — extends the 08.2 state-4 anchor's
+15-fixture baseline by the new `0016-http-filter-local-rate-limit` (Task
+5 per ADR-0033 Commit D). h2spec held at the 05.2 baseline 99.31%.
+parse_bootstrap fuzz clean on the Task 6 corpus seed (and listed in the
+SUCCESS-walk test per the Task 6 follow-up). No production code change
+at this commit; the surface delta is the phase-09 execution arc's
+cumulative production surface materialized at the state-4 evidence-anchor
+CI run, NOT a delta from THIS commit (which is docs-only).
 
 ---
 

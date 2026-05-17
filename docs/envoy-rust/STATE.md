@@ -10,7 +10,7 @@
 **id:** `09`
 **slug:** `09-http-filter-local-rate-limit`
 **directory:** `docs/envoy-rust/phases/09-http-filter-local-rate-limit/`
-**status:** **phase 09 lifecycle state 2-complete / state-3-next** (PLAN.md landed; first task commit pending). The **first post-MVP-trunk feature-family phase** per `BOOTSTRAP_PROMPT.md` §9. The MVP trunk 00→08 stands `done` as of base `304ce98`; the phase-09 state-1 brainstorm landed at `3025594` (immediate predecessor). THIS commit lands the state-2 standalone PLAN.md per the established 04.3 / 05.1 / 06.x / 07.x / 08.x PLAN-write cadence. **DECISIONS.md ledger head stays at `ADR-0032`**; ADR-0033 stays reserved-available (per phase-09 SPEC §7 + PLAN lock-in #34: defer the per-route-config-deferral ADR to a future filter that needs per-route config; defer the foundations-grant ADR unless state-3 surfaces a need).
+**status:** **phase 09 lifecycle state 4-complete / state-5-next** (state-3 execution arc complete; all 16 Docker-gated differential fixtures green simultaneously per `BOOTSTRAP_PROMPT.md` §7.5 gate; REVIEW.md pending). The **first post-MVP-trunk feature-family phase** per `BOOTSTRAP_PROMPT.md` §9 is now wire-level done; the phase 07.2 REVIEW M1 carryforward (severed `_position` plumbing) CLOSED at Task 4 `78128f4`. **DECISIONS.md ledger head advanced `ADR-0032 → ADR-0033`** at the mid-execution ADR-0033 commit `e9a6cb4` (phase-09 SPEC §2.2 revision per upstream Envoy v1.33 empirical observation — drop `x-envoy-ratelimited` injection; align 429 body to `"local_rate_limited"` + H1 HCM filter-synth standard-header decoration). The MVP trunk 00→08 stands `done` as of base `304ce98`; the phase-09 state-1 brainstorm landed at `3025594`; the state-2 standalone PLAN.md at `b9da8d4`. THIS commit lands the state-4 phase-done verification + STATE advance per the established 08.2 Task 11 (`cade4b0`) / 08.1 Task 14 (`03e6435`) / 07.2 Task 10 (`f921fdd`) / 06.3 Task 12 (`42fc726`) state-4-reached precedents.
 
 THIS COMMIT lands the phase-09 state-2 PLAN-write output: `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PLAN.md` (~1180 lines; 8 tasks; full `- [ ]` checkbox steps per task; mirrors the parent-08.2 state-2 PLAN-write commit `1aa250d` shape precedent) + `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` skeleton + Task 1 preamble (per the 06.2 / 06.3 / 07.x / 08.x cadence — PROGRESS lands alongside PLAN at state-2, NOT created at Task 1 per the 06.1 superseded pattern). The PLAN-write session — driven by the user's standing preference auto-memory `feedback_pick_recommendation` ("always pick the recommended option; do not ask") — locked in **39 architecture decisions** at this commit (full table in PLAN.md §2; grouped summary in PROGRESS Task 1 preamble). The PLAN materializes **8 tasks / ~1100-1400 LoC projected** (production ~380, tests ~655, fixture/doc ~260) — comfortably **under** the `BOOTSTRAP_PROMPT.md` §6.1 split-gate (~25 tasks / ~1500 LoC). **Decision: single-phase; no split.** Accept up to ~+50% state-3 empirical drift per the parent-08 SPEC §6.1 alternative (vi) + the established 06.x / 07.x / 08.x accept-drift discipline. ROADMAP row `09` flips `planned` → `in-progress` at THIS commit per the 08.1 / 08.2 new-row precedent.
 
@@ -19,6 +19,12 @@ Carryforward closure projection: **07.2 REVIEW M1** (severed `position` plumbing
 THIS COMMIT is **docs-only** (mirrors the parent-08.2 state-2 PLAN-write commit `1aa250d`'s docs-only shape exactly). Touches 4 files: (1) **CREATE** `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PLAN.md` (the state-2 PLAN — ~1180 lines; 8 tasks); (2) **CREATE** `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` (skeleton + Task 1 preamble per the 06.2 / 06.3 / 07.x / 08.x cadence); (3) **MODIFY** `docs/envoy-rust/ROADMAP.md` — flip row `09` `status: planned` → `status: in-progress`; (4) **MODIFY** `docs/envoy-rust/STATE.md` (this file) — rewrites Active phase / Next expected skill / Last commit / Last updated blocks; appends new "Phase-09 state-2 PLAN-write" subsection in Notes. No production code changes, no test changes, no fixture changes, no Cargo.toml / Cargo.lock changes, no DECISIONS.md changes, no BEHAVIOR_CONTRACT.md changes. ENVOY_TARGET.md + rust-toolchain.toml untouched (D-3.7 / D-3.9 unchanged).
 
 The 15-Docker-gated-fixture regression baseline established at parent-08 close (`0001-tcp-echo` through `0015-admin-drain-listeners`) carries forward unchanged per `BOOTSTRAP_PROMPT.md` §7.5 (b); phase 09's fixture 0016-http-filter-local-rate-limit extends the baseline to 16 at the state-4 evidence anchor (planned at Task 8). The h2spec ≥95% gate carries forward at the 05.2 baseline 99.31% (phase 09 engages no H2-framing surfaces — the filter operates on the post-codec `FilterRequest` / `FilterResponse` abstraction). The `parse_bootstrap` fuzz target's 15-seed corpus extends to 16 at the Task 6 (D8.2) commit.
+
+**Phase 09 state-3 execution arc (this STATE-advance commit caps).** Landed in **7 substantive task commits + 4 ADR-0033 mid-execution corrective commits + 1 Task 6 follow-up + THIS Task 8 docs-only commit = 13 commits** between the state-2 standalone-PLAN base `b9da8d4` and Task 7 HEAD `7fcaeb1`. Task 1 (`818a3c5`) envoy-config schema + validator + 16 unit tests; Task 2 (`b5c81d2`) hand-rolled TokenBucketState + REQUIRED 8×10_000 concurrency torture test; Task 3 (`70bad43`) LocalRateLimitFilter runtime + 4-counter stats wiring + 4 BEHAVIOR_CONTRACT Stat-name mapping rows; Task 4 (`78128f4`) HttpFilterInstance::LocalRateLimit variant + 07.2 REVIEW M1 closure (severed `_position` plumbing deleted; header_mutation.rs `map_entry` `position: 0` hardcode PRESERVED per PLAN lock-in #23). Task 5 dispatch surfaced 3 SPEC §2.2 discrepancies via Docker-based empirical verification of upstream Envoy v1.33's `envoy.filters.http.local_ratelimit` wire shape: (1) upstream emits NO `x-envoy-ratelimited` header (that header belongs to the global ratelimit filter); (2) upstream's 429 body is the source-hardcoded `"local_rate_limited"` (18 bytes), not empty; (3) envoy-rust's H1 HCM filter-synth writer-path lacks standard-header decoration (a latent 07.x framework defect that 07.2 HeaderMutation never exposed). Per `BOOTSTRAP_PROMPT.md` D-3.3 + D-3.5, ADR-0033 ratified the corrective sequence: Commit A `e9a6cb4` (ADR-0033 + SPEC §2.2 revision + PROGRESS preamble; docs-only); Commit B `1c1de0f` (Task 3 fixup — drop `x-envoy-ratelimited` injection; body `"local_rate_limited"`; 2 unit tests updated); Commit C `ae2cef0` (Task 4 H1 HCM fixup — new `decorate_filter_synth_response` helper called from both `SynthFromDecode` + encode-side `StopAndSend` arms; 2 new unit tests); Commit D `1384c48` (Task 5 — fixture 0016 + Docker-gated wrapper; per-side YAML asymmetry per fixture-0013 precedent; NO BEHAVIOR_CONTRACT row per PLAN lock-in #30 voided). Task 6 `28e1666` (D8.2 fuzz corpus seed `hcm_local_rate_limit_filter.yaml` + `.gitignore` allow-list entry); Task 6 follow-up `1effb0f` (extend `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array with the new seed). Task 7 `7fcaeb1` (D8.3 in-process backstop `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` per ADR-0033 revised contract — status `[200, 200, 429, 429]` + body `"local_rate_limited"` on 429 + 5 standard headers + NO `x-envoy-ratelimited`).
+
+**State-4 phase-done gate (a)-(e) all GREEN per CI run `26002996677` HEAD `1effb0f` (conclusion `success`, completed `2026-05-17T21:20:41Z`, wall ~2m 1s; both jobs `build + test + lint` job ID `76429519366` ~1m 58s and `fuzz (parse_bootstrap, 30s)` job ID `76429519376` ~1m 16s):** (a) fixture `0016-http-filter-local-rate-limit` green per the Docker-gated wrapper at `tests/differential/tests/http_filter_local_rate_limit.rs` (test result: `1 passed; 0 failed; finished in 0.82s` at `2026-05-17T21:20:05.3814423Z`); (b) all 15 pre-existing Docker-gated fixtures `0001-0015` GREEN simultaneously alongside 0016 in the single `cargo test --workspace` invocation (16-fixture matrix per-binary `1 passed; 0 failed`; full per-fixture timestamp table in PROGRESS Task 8 subsection); (c) `h2spec_pass_rate_gate` PASS at the 05.2 baseline 99.31% (no H2-framing surface engagement in phase 09); (d) `parse_bootstrap` fuzz target ran ~30s effective fuzz time at the 30s budget, no crash; (e) all 5 stable-toolchain gates GREEN (fmt, clippy, build, test, deny). Workspace test count at this CI run: **746 passed; 0 failed; 2 ignored** (+1 over Task 6-follow-up baseline 745; the +1 is Task 7's in-process backstop test). Gate (f) `REVIEW.md` approved DEFERS to state 5 per `BOOTSTRAP_PROMPT.md` §5.1.
+
+**DECISIONS.md ledger after phase 09's state-3 arc:** **ADR-0033** at HEAD (landed at Commit A `e9a6cb4`). Conditional ADR-0034 (foundations grant for token-bucket primitive per phase-09 SPEC §7) stays reserved-available and unused per the no-foundations-grant posture; recommended posture remains no-grant. THIS state-4 commit is **docs-only** (touches 2 files: this STATE.md `Active phase` + `Next expected skill` + `Last commit` + `Last updated` block rewrites + new "Phase-09 state-3 execution arc + ADR-0033 corrective sequence + state-4 verification" subsection in Notes; PROGRESS.md Task 8 subsection populated). No production code change at this commit; the surface delta is the phase-09 state-3 execution arc's cumulative production surface materialized at the state-4 evidence-anchor CI run, NOT a delta from THIS commit.
 
 **Parent phase 08 (`08-admin-api-and-drain`) + MVP trunk 00→08 stand DONE as of predecessor `304ce98`.** See predecessor commit `304ce98`'s STATE.md "Active phase" block for the full parent-08 + MVP-trunk-completion narrative (preserved in git history at `git show 304ce98:docs/envoy-rust/STATE.md` — the parent-08 sub-phase descriptions for 08.1 + 08.2 + the per-parent close-out narratives for parents 02 → 03 → 04 → 05 → 06 → 07 → 08 are recorded there in full; they are intentionally NOT re-described at THIS state-1 commit per the docs-only convention + D-3.4 context-isolation discipline).
 
@@ -82,9 +88,17 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per `BOOTSTRAP_PROMPT.md` §5 state 3 (PLAN.md exists; implementation incomplete) + `SKILL_ROUTING.md` lines 23-26 + the user's standing preference auto-memory `feedback_execution_style` ("default to subagent-driven-development; skip the two-option fork"): the next session invokes **`superpowers:subagent-driven-development`** scoped to `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PLAN.md`. Dispatch Task 1 first (D1 envoy-config schema + D2 validator; ~325 LoC; no carryforwards engaged); subsequent tasks follow the PLAN's dependency chain (Task 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8) per the established 06.x / 07.x / 08.x subagent-driven cadence (one task per subagent dispatch; two-stage review per task; PROGRESS append per-task at task commit).
+Per `BOOTSTRAP_PROMPT.md` §5 state 5 (verified, not reviewed) + `SKILL_ROUTING.md` lines 39-42: the next session invokes **`superpowers:requesting-code-review`** scoped to the reviewed range `b9da8d4..<this commit's HEAD>` (the phase-09 state-2 PLAN-write base SHA through THIS Task 8 state-4-verification commit's new HEAD; covers the entire phase-09 state-3 execution arc — 7 substantive task commits + 4 ADR-0033 mid-execution corrective commits + 1 Task 6 follow-up). The session writes `docs/envoy-rust/phases/09-http-filter-local-rate-limit/REVIEW.md` per the skill's per-phase REVIEW.md output. With Approved verdict, state-6 (the session after) closes phase 09 + flips ROADMAP row `09` `in-progress` → `done` per the closing-phase invariant (mirrors the 08.2 close-out at `304ce98` / 07.2 close-out at `1d52156` shape precedents — phase 09 is a standalone phase, NOT a sub-phase, so no parent-row close-out is required).
 
-The state-2 session's concrete acts at THIS commit (mirrors the parent-08.2 state-2 PLAN-write commit `1aa250d` shape exactly — the most-recent state-2 PLAN-write precedent):
+**The state-4 session's concrete acts at THIS commit** (mirrors the 08.2 Task 11 state-4-reached commit `cade4b0` shape exactly — the most-recent state-4-reached precedent):
+
+1. **Quoted** per-gate CI evidence in `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` `### Task 8 — state-4 phase-done verification + STATE advance to state-5-next` subsection (CI run `26002996677` against HEAD `1effb0f` `success` 2026-05-17T21:20:41Z; per-fixture timestamps for all 16 Docker-gated fixtures; h2spec_pass_rate_gate PASS; parse_bootstrap fuzz GREEN on 16-seed corpus; 5 stable-toolchain gates GREEN; gate (f) defers to state 5).
+2. **Advanced** STATE.md (this file) — Active phase status `state 2-complete / state-3-next` → `state 4-complete / state-5-next`; Next expected skill `superpowers:subagent-driven-development` → `superpowers:requesting-code-review`; Last commit; Last updated; new "Phase-09 state-3 execution arc + ADR-0033 corrective sequence + state-4 verification" subsection in Notes (preserves all prior subsections verbatim per D-3.5 + D-3.4).
+3. **No ROADMAP.md change at THIS commit** — row `09` stays `in-progress` (flipped to `in-progress` at state-2 PLAN-write `b9da8d4`; flips to `done` at the upcoming state-6 close-out commit per the closing-phase invariant).
+4. **No DECISIONS.md change at THIS commit** — ledger head stays at **ADR-0033** (landed at the mid-execution ADR-0033 commit `e9a6cb4` during state-3). Conditional ADR-0034 stays reserved-unused.
+5. **No BEHAVIOR_CONTRACT.md change at THIS commit** — the 4 Stat-name mapping rows landed at Task 3 commit `70bad43`; the 1 Header allow-list row per PLAN lock-in #30 was voided per ADR-0033 (Commit A `e9a6cb4`).
+
+**Original state-2 session's concrete acts** (preserved for historical context — the state-2 PLAN-write commit at `b9da8d4`):
 
 1. **Wrote** `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PLAN.md` (~1180 lines; 8 tasks; full `- [ ]` checkbox steps per task; PLAN-write SPEC corrections + 39-row architecture-decision lock-in table + LoC projection table + task summary + dependency chain + conventions + state-2 commit narrative + per-task TDD steps + self-review checklist).
 2. **Wrote** `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` (skeleton + Task 1 preamble — 7 SPEC corrections + 39-lock-in grouped summary + 1 PLAN-write deviation + 16-row carryforward dispositions table + state-3 entry routing).
@@ -139,9 +153,32 @@ Inputs the state-3 session should read, in order:
 
 ## Last commit
 
-Phase-09 state-2 PLAN-write commit (THIS commit): `phase 09: state-2 standalone PLAN.md`.
+Phase-09 Task 8 state-4-reached commit (THIS commit): `phase 09: task 8 — state-4 phase-done verification + STATE advance to state-5-next`.
 
-Docs-only state-2 PLAN-write commit per the established 04.3 / 05.1 / 06.x / 07.x / 08.x state-2 PLAN-write cadence (mirrors `1aa250d` shape — `phase 08.2: state-2 standalone PLAN.md`). No production code changes; no test changes; no Cargo.toml / Cargo.lock changes. Touches 4 files:
+Docs-only state-4-reached commit per the established 08.2 (`cade4b0`) / 08.1 (`03e6435`) / 07.2 (`f921fdd`) / 06.3 (`42fc726`) state-4-reached precedents. Touches 2 files: PROGRESS.md Task 8 subsection populated with §7.5 phase-done gate evidence (CI run + HEAD + per-gate quoted output + 16-fixture green attestation + execution-arc summary + state-5 entry routing); STATE.md (this file) Active phase status flip / Next expected skill flip / Last commit + Last updated rewrite / new "Phase-09 state-3 execution arc + ADR-0033 corrective sequence + state-4 verification" Notes subsection. No production code change; no test change; no fixture change; no Cargo.toml / Cargo.lock change; no DECISIONS.md change (ledger head stays at ADR-0033 from the state-3 mid-execution commit `e9a6cb4`); no BEHAVIOR_CONTRACT.md change (4 stat rows landed at Task 3 commit `70bad43`; 1 header row per PLAN lock-in #30 voided per ADR-0033); no ROADMAP.md change (row 09 stays `in-progress`; flips to `done` at the upcoming state-6 close-out).
+
+**Predecessor commit (immediate former HEAD of `origin/main`):** `1effb0f` — `phase 09: task 6 follow-up — add hcm_local_rate_limit_filter.yaml to fuzz_corpus_seeds SUCCESS array`. The Task 6 follow-up extended `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`'s SUCCESS array with the new Task 6 fuzz seed (1-line test extension). CI run `26002996677` against `1effb0f` is the state-4 evidence anchor for THIS commit.
+
+**Phase-09 state-3 execution arc commits (predecessors of THIS Task 8 commit; newest first):**
+
+- `1effb0f` — Task 6 follow-up (SUCCESS array extension; 1-line); **immediate predecessor**.
+- `28e1666` — Task 6 (D8.2 fuzz corpus seed + `.gitignore` allow-list entry).
+- `7fcaeb1` — Task 7 (D8.3 in-process backstop per ADR-0033 revised contract).
+- `1384c48` — ADR-0033 Commit D = Task 5 (fixture 0016 + Docker-gated wrapper).
+- `ae2cef0` — ADR-0033 Commit C = Task 4 H1 HCM fixup (`decorate_filter_synth_response` helper).
+- `1c1de0f` — ADR-0033 Commit B = Task 3 fixup (drop x-envoy-ratelimited + body "local_rate_limited").
+- `e9a6cb4` — ADR-0033 Commit A (SPEC §2.2 revision per upstream Envoy v1.33 empirical observation; docs-only).
+- `78128f4` — Task 4 (D4 HttpFilterInstance::LocalRateLimit variant + D5 07.2 REVIEW M1 closure).
+- `70bad43` — Task 3 (D3 LocalRateLimitFilter runtime + D6 stats wiring + D7.1 4 stat-mapping rows).
+- `b5c81d2` — Task 2 (D3 hand-rolled TokenBucketState + REQUIRED 8×10_000 concurrency torture test).
+- `818a3c5` — Task 1 (D1 envoy-config schema + D2 validator).
+- `b9da8d4` — state-2 standalone PLAN.md (the state-3 execution arc base).
+- `3025594` — state-1 brainstorm SPEC.md.
+- `304ce98` — parent-08.2 state-6 close-out (MVP trunk 00→08 done).
+
+**Original state-2 PLAN-write commit details** (preserved historical context — the state-2 commit at `b9da8d4`):
+
+`phase 09: state-2 standalone PLAN.md` — docs-only state-2 PLAN-write commit per the established 04.3 / 05.1 / 06.x / 07.x / 08.x state-2 PLAN-write cadence (mirrors `1aa250d` shape — `phase 08.2: state-2 standalone PLAN.md`). Touched 4 files:
 
 - **CREATE** `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PLAN.md` — the phase-09 state-2 implementation plan (~1180 lines; 8 tasks; full `- [ ]` checkbox steps per task per the project's mature TDD cadence). Sections: Goal + Architecture + Tech Stack + §1 PLAN-write SPEC corrections (7) + §2 Architecture decisions locked at PLAN-write time (39-row table) + §3 LoC drift posture / split-gate evaluation + §4 Task summary + §5 Conventions + §6 State-2 commit + per-task TDD steps (Tasks 1-8) + Self-review checklist. Mirrors the 08.2 PLAN.md `1aa250d`-shape + 07.2 PLAN.md `c7dea4c`-shape precedents (the closest state-2 PLAN-write shape precedents).
 
@@ -175,34 +212,81 @@ No production code changes at this commit. No test changes. No fixture changes. 
 
 ## Last updated
 
-2026-05-17 (phase-09 state-2 PLAN-write commit — the standalone
+2026-05-17 (phase-09 Task 8 state-4-reached commit — the docs-only
+state-4 phase-done verification + STATE advance to state-5-next.
+Mirrors the 08.2 Task 11 commit `cade4b0`'s docs-only shape exactly
+— the most-recent state-4-reached precedent. Caps the phase-09
+state-3 execution arc: 7 substantive task commits (Task 1 `818a3c5`
+through Task 7 `7fcaeb1`) + 4 ADR-0033 mid-execution corrective
+commits (A `e9a6cb4` / B `1c1de0f` / C `ae2cef0` / D `1384c48`) + 1
+Task 6 follow-up `1effb0f` + THIS state-4-reached commit = 13
+commits over the state-3 arc, between the state-2 standalone-PLAN
+base `b9da8d4` and THIS HEAD. Materializes the
+`BOOTSTRAP_PROMPT.md` §7.5 phase-done gate evidence: CI run
+`26002996677` against HEAD `1effb0f` `success` 2026-05-17T21:20:41Z
+(both jobs green; ~2m 1s overall); all 16 Docker-gated
+differential fixtures (`0001-tcp-echo` through
+`0016-http-filter-local-rate-limit`) green simultaneously; h2spec
+held at 99.31% (05.2 baseline; phase 09 engages no H2-framing
+surfaces); parse_bootstrap fuzz clean on the 16-seed corpus
+(extended by Task 6 + Task 6 follow-up); 5 stable-toolchain gates
+green; workspace test count 746 passed / 0 failed / 2 ignored.
+**Carryforward closures landed in phase 09:** 07.2 REVIEW M1
+(severed `_position` plumbing) CLOSED at Task 4 `78128f4`.
+**DECISIONS.md ledger advanced `ADR-0032 → ADR-0033`** at
+mid-execution Commit A `e9a6cb4` (phase-09 SPEC §2.2 revision per
+upstream Envoy v1.33 empirical observation — drop
+`x-envoy-ratelimited` injection; align 429 body to
+`"local_rate_limited"`; H1 HCM filter-synth standard-header
+decoration). Advances STATE.md "Active phase" status `state
+2-complete / state-3-next` → `state 4-complete / state-5-next`;
+"Next expected skill" `superpowers:subagent-driven-development` →
+`superpowers:requesting-code-review`; "Last commit" + "Last
+updated" rewrites; appends new "Phase-09 state-3 execution arc +
+ADR-0033 corrective sequence + state-4 verification" subsection
+in Notes. Docs-only; 2 files modified (PROGRESS.md + STATE.md);
+one state per session per `BOOTSTRAP_PROMPT.md` §5.1.
+BEHAVIOR_CONTRACT.md unchanged at this commit (the 4 stat rows
+landed at Task 3 commit `70bad43`; the 1 header row per PLAN
+lock-in #30 was voided per ADR-0033); ROADMAP.md unchanged at
+this commit (row 09 stays `in-progress`; flips to `done` at the
+upcoming state-6 close-out); ENVOY_TARGET.md + rust-toolchain.toml
+untouched. Preserves all prior "Phase-NN rollovers" sections +
+Notes ADR-numbering subsections + "Phase-08 state-1 brainstorm" +
+"Phase-08 state-2 split" + "Phase-08.1 state-2 PLAN-write" +
+"Phase-08.1 rollovers" +
+
+[Historical state-2 PLAN-write entry preserved for context:]
+phase-09 state-2 PLAN-write commit (`b9da8d4`) — the standalone
 PLAN.md + PROGRESS.md skeleton + Task 1 preamble + ROADMAP row
 flip + STATE.md advance. Mirrors the parent-08.2 state-2 PLAN-write
-commit `1aa250d`'s docs-only shape exactly — the most-recent
-state-2 PLAN-write precedent. Lands `PLAN.md` (~1180 lines; 8
-tasks; full `- [ ]` checkbox steps per task; 39-row
-architecture-decision lock-in table) + `PROGRESS.md` skeleton +
-Task 1 preamble (7 SPEC corrections + lock-in grouped summary + 1
-PLAN-write deviation + 16-row carryforward dispositions table).
-Flips ROADMAP row `09` `status: planned` → `status: in-progress`
-per the 08.1 / 08.2 new-row precedent. Rewrites STATE.md's "Active
-phase" / "Next expected skill" / "Last commit" / "Last updated"
-blocks; appends new "Phase-09 state-2 PLAN-write" subsection in
-Notes recording the 39 architecture-decision lock-ins + 7 SPEC
-corrections + 1 PLAN-write deviation + split-gate verdict
-(single-phase; no split; ~8 tasks / ~1295 LoC projected,
-comfortably under the §6.1 ~25-task / ~1500-LoC gate) + the
-projected closure of 07.2 REVIEW M1 at Task 4 (D4 + D5 co-located
-per SPEC §6.2). Docs-only; 4 files modified (PLAN.md + PROGRESS.md
-+ ROADMAP.md + STATE.md); one state per session per
-`BOOTSTRAP_PROMPT.md` §5.1. DECISIONS.md unchanged at
-**ADR-0032**; BEHAVIOR_CONTRACT.md unchanged (4 stat-name mapping
-rows land at Task 3 commit; 1 header allow-list row lands at Task
-5 commit per SPEC §6.5 cadence); ENVOY_TARGET.md +
-rust-toolchain.toml untouched. Preserves all prior "Phase-NN
-rollovers" sections + Notes ADR-numbering subsections +
-"Phase-08 state-1 brainstorm" + "Phase-08 state-2 split" +
-"Phase-08.1 state-2 PLAN-write" + "Phase-08.1 rollovers" +
+commit `1aa250d`'s docs-only shape exactly. Lands `PLAN.md`
+(~1180 lines; 8 tasks; full `- [ ]` checkbox steps per task;
+39-row architecture-decision lock-in table) + `PROGRESS.md`
+skeleton + Task 1 preamble (7 SPEC corrections + lock-in grouped
+summary + 1 PLAN-write deviation + 16-row carryforward
+dispositions table). Flipped ROADMAP row `09` `status: planned`
+→ `status: in-progress` per the 08.1 / 08.2 new-row precedent.
+Rewrote STATE.md's "Active phase" / "Next expected skill" /
+"Last commit" / "Last updated" blocks; appended new "Phase-09
+state-2 PLAN-write" subsection in Notes recording the 39
+architecture-decision lock-ins + 7 SPEC corrections + 1 PLAN-write
+deviation + split-gate verdict (single-phase; no split; ~8 tasks
+/ ~1295 LoC projected, comfortably under the §6.1 ~25-task /
+~1500-LoC gate) + the projected closure of 07.2 REVIEW M1 at
+Task 4 (D4 + D5 co-located per SPEC §6.2). Docs-only; 4 files
+modified (PLAN.md + PROGRESS.md + ROADMAP.md + STATE.md); one
+state per session per `BOOTSTRAP_PROMPT.md` §5.1. DECISIONS.md
+unchanged at **ADR-0032** at state-2 (advanced to ADR-0033 later
+in the state-3 arc at the mid-execution `e9a6cb4`);
+BEHAVIOR_CONTRACT.md unchanged at state-2 (4 stat-name mapping
+rows landed at Task 3 commit; 1 header allow-list row planned at
+Task 5 commit per SPEC §6.5 cadence was later voided per
+ADR-0033); ENVOY_TARGET.md + rust-toolchain.toml untouched.
+Preserves all prior "Phase-NN rollovers" sections + Notes
+ADR-numbering subsections + "Phase-08 state-1 brainstorm" +
+"Phase-08 state-2 split" + "Phase-08.1 state-2 PLAN-write" +
+"Phase-08.1 rollovers" +
 "Phase-08.2 state-2 PLAN-write" + "Phase-08.2 rollovers" +
 "Phase-09 state-1 brainstorm" subsections verbatim. The §7.5
 phase-done gate is NOT re-run at THIS state-2 PLAN-write commit
@@ -1104,3 +1188,51 @@ State-2 decisions (THIS commit), all per the user's standing preferences `feedba
 - **BEHAVIOR_CONTRACT.md unchanged at this commit.** The 4 new "Stat-name mapping" rows (LocalRateLimit counters) land at Task 3 commit; the 1 new "Header allow-list" row (`x-envoy-ratelimited`) lands at Task 5 commit per the 06.x / 07.x / 08.x cadence (contract extensions land at empirical-engagement task time, NOT at PLAN-write time).
 
 - **State-2 commit message + push:** title `phase 09: state-2 standalone PLAN.md` per the parent-08.2 state-2 PLAN-write commit `1aa250d` shape precedent. No `[ADR-NNNN]` brackets (no ADR lands at this commit). Predecessor docs-only CI runs took ~2-3m; the next CI run (triggered by THIS commit's push) re-validates the docs-only edits compile cleanly through the 5 stable-toolchain gates + the parse_bootstrap fuzz target on the unchanged 15-seed corpus.
+
+### Phase-09 state-3 execution arc + ADR-0033 corrective sequence + state-4 verification
+
+State-3 execution arc landed in **7 substantive task commits + 4 ADR-0033 mid-execution corrective commits + 1 Task 6 follow-up + 1 state-4-reached docs-only commit = 13 commits** between the state-2 standalone-PLAN base `b9da8d4` and THIS Task 8 state-4-reached commit's new HEAD. Phase 09 IS the **first post-MVP-trunk feature-family state-3 + state-4 arc**; THIS arc establishes the post-MVP cadence for all subsequent feature-family arcs. Per `feedback_execution_style`, all 7 substantive tasks were dispatched to fresh subagents per `superpowers:subagent-driven-development` with two-stage review (spec compliance + code quality) per task.
+
+**Tasks 1-4: foundation + framework integration (4 commits over the state-3 arc base `b9da8d4`).**
+
+- **Task 1 (`818a3c5`)** — D1 envoy-config schema + D2 validator. Added `HttpFilterTypedConfig::LocalRateLimit` variant + 3 new schema structs (`LocalRateLimitConfig`, `TokenBucket`, `HttpStatus`) + 4 new `ConfigError` variants (`EmptyLocalRateLimitStatPrefix` / `TokenBucketMaxTokensMustBePositive` / `InvalidTokenBucketFillInterval` / `UnsupportedLocalRateLimitStatusCode`) + `validate_local_rate_limit_config` sub-validator + hand-rolled `parse_duration` helper + `default_status` helper + 16 unit tests in `local_rate_limit_tests` submodule. **Deviation #1 (the 8th SPEC correction discovered at task time):** PLAN Step 4 proposed new `HeaderValueOption` + `Header` structs that collided with the existing 07.2-landed `HeaderValueOption { header: HeaderValue, append_action: AppendAction }` (re-exported from `lib.rs:15`); resolved by reusing the existing 07.2 types per upstream-Envoy-canonical parity (`response_headers_to_add` field in `LocalRateLimitConfig` resolves to the existing `HeaderValueOption`). **Deviation #2:** non-exhaustive `match` in `crates/envoy-filter/src/instance.rs` once the new variant landed — resolved with a temporary bridge arm returning `FilterError::UnsupportedFilterType` for the LocalRateLimit case during the Tasks 1-3 interim window; Task 4 replaces with the proper dispatch.
+
+- **Task 2 (`b5c81d2`)** — D3 hand-rolled `TokenBucketState` primitive at `crates/envoy-filter/src/local_rate_limit.rs` (new module). `AtomicU64` for live token count + `std::sync::Mutex<Instant>` for last-fill timestamp; lazy fill at `try_acquire` time via single `compare_exchange` loop with `Ordering::AcqRel`/`Acquire` semantics. **REQUIRED 8-thread × 10_000-acquire concurrency torture test** `token_bucket_concurrent_acquire_does_not_double_count` per SPEC §6.3 + PLAN lock-in #9 + the 08.2 Task 1 `fddabd2` TOCTOU-lesson precedent: spawns 8 tokio tasks each calling `try_acquire` 10_000 times; asserts `total_true_returns == min(N*M, max_tokens)` (1000 expected; 79K rejections); verifies post-state `tokens.load(Acquire) == 0`. Deterministic across 5 verification reruns. **Deviation #1:** Cargo.lock +2 lines (envoy-stats + tokio listed as edges of envoy-filter; refines PLAN lock-in #39's "empty diff" projection — path-dep additions DO produce metadata-only lockfile diffs). **Refinement:** clippy-driven `#[allow(dead_code)]` on struct + impl (Task 3 close site named in comments) + `manual_checked_ops` rewrite from `if`-based to `match checked_div(interval_nanos)` — both semantically equivalent to PLAN-verbatim shapes.
+
+- **Task 3 (`70bad43`)** — D3 `LocalRateLimitFilter` runtime + D6 4-counter stats wiring + D7.1 4 BEHAVIOR_CONTRACT.md Stat-name mapping rows. Filter struct wraps Task-2's `Arc<TokenBucketState>` + 4 `Arc<Counter>` handles registered via `StatsRegistry::register_counter` at `build_from_config` time. Stat namespace `http_local_rate_limit.<stat_prefix>.{enabled,ok,rate_limited,enforced}` matches upstream Envoy v1.33 parity. 6 new unit tests. **Deviation #1 (per Task 1 deviation #1):** test code adjusted to use existing 07.2 `HeaderValueOption { header: HeaderValue, append_action: AppendAction::AppendIfExistsOrAdd }` shape. **Deviation #2:** `envoy_config::parse_duration` visibility promoted `pub(crate)` → `pub` + re-exported from `envoy-config/src/lib.rs` (LocalRateLimitFilter's cross-crate call site needs it). **Deviation #4 (PLAN-text typo correction):** `FilterResponse.reason` is `Option<&'static str>`, not `Option<String>`; impl + tests use `Some("Too Many Requests")` directly.
+
+- **Task 4 (`78128f4`)** — D4 `HttpFilterInstance::LocalRateLimit` variant + dispatch + signature widening + D5 **07.2 REVIEW M1 closure** (severed `_position` plumbing). Added the new variant between `HeaderMutation` and the `#[cfg(feature = "test-util")]` block; widened `HttpFilterInstance::build` signature `(hf, position: usize)` → `(hf, registry: &Arc<StatsRegistry>)` (drops `_position`; adds `registry`); widened `FilterPipeline::build_from_config` signature `(filters)` → `(filters, registry: &Arc<StatsRegistry>)` (drops `.enumerate()`); threaded `&registry` through `Http1HCMConfig::from_config` call site at `crates/envoy-http1/src/hcm.rs:185`. H2 path reuses HCMConfig via re-export (no second call site). Updated 5 test sites for the cascading signature change. The Task-1 bridge arm in `instance.rs` REPLACED (not augmented). **Hardcoded `position: 0` at `crates/envoy-filter/src/header_mutation.rs::map_entry` PRESERVED per PLAN lock-in #23** — header_mutation.rs production code untouched (3 test-side cascade call-site updates only). **07.2 REVIEW M1 chain closes at THIS commit; the chain `07.2 → 09 ends`.** **Deviation #1:** narrower per-field `#[allow(dead_code)]` retained on `LocalRateLimitFilter::stat_prefix` (only read by the `#[cfg(test)]` accessor; production-build clippy flagged dead_code; PLAN Step 6 instructed removal of struct/impl-level annotations — the narrower per-field annotation is the minimal alternative).
+
+**Mid-execution discovery + ADR-0033 corrective sequence (4 commits over Tasks 5-7).**
+
+Task 5 dispatch (the Docker-gated differential fixture authoring step) surfaced 3 SPEC §2.2 + Task 3 lock-in #13 discrepancies against upstream Envoy v1.33's actual `envoy.filters.http.local_ratelimit` wire shape per empirical Docker observation:
+
+1. **Upstream does NOT emit `x-envoy-ratelimited` from local_ratelimit** (that header belongs to the global ratelimit filter + router-side response-flag handling per upstream v1.33 source).
+2. **Upstream's 429 body is the source-hardcoded `"local_rate_limited"` (18 bytes)**, not empty (the upstream proto has no configurable `response_body` field).
+3. **envoy-rust's H1 HCM filter-StopAndSend writer-path skips standard-header decoration** — the synth-from-build paths (`synth_status`, `synth_direct_response`) populate the 5 standard HTTP/1.1 response headers inline; the filter-synth path (`RequestPath::SynthFromDecode` arm + encode-side `Decision::StopAndSend` arm) takes `filter_resp.headers` verbatim. A latent 07.x framework defect that 07.2 HeaderMutation never exposed (HeaderMutation's `decode_headers` returns `Decision::Continue` unconditionally — the filter only mutates header lists, never short-circuits); phase 09's LocalRateLimit is the first production filter to surface the gap.
+
+Per `BOOTSTRAP_PROMPT.md` D-3.3 ("differential correctness beats internal fidelity") + D-3.5 ("Decisions are written, not remembered"), **ADR-0033** ratified the 4-commit corrective sequence:
+
+- **Commit A (`e9a6cb4`)** — ADR-0033 + SPEC §2.2 revision + PROGRESS mid-execution preamble subsection (docs-only). Voids PLAN lock-ins #13 (429 synth response shape with `x-envoy-ratelimited` + empty body), #30 (`x-envoy-ratelimited` BEHAVIOR_CONTRACT row at Task 5), partial #33 (in-process backstop direct presence assertion). **DECISIONS.md ledger advances `ADR-0032 → ADR-0033`** at this commit.
+
+- **Commit B (`1c1de0f`)** — Task 3 runtime fixup. `LocalRateLimitFilter::decode_headers` drops the `("x-envoy-ratelimited", "true")` header injection from the synth `FilterResponse`; changes `body: Bytes::new()` → `body: Bytes::from_static(b"local_rate_limited")` (18 bytes; static literal; zero-allocation). 2 unit tests updated (`decode_headers_rate_limits_after_max_tokens_and_increments_rate_limited_enforced` drops the x-envoy-ratelimited assertion + adds the body + headers-empty asserts; `decode_headers_appends_configured_response_headers` drops the x-envoy-ratelimited assertion + adds the `headers.len() == 1` + body asserts). Operator-configurable `response_headers_to_add` plumbing PRESERVED.
+
+- **Commit C (`ae2cef0`)** — Task 4 H1 HCM fixup. New `decorate_filter_synth_response(resp: &mut Response, close: bool)` helper at `crates/envoy-http1/src/hcm.rs` (immediately before `synth_400`, after `synth_status`); called from both `RequestPath::SynthFromDecode(resp)` arm (decode-side) + `Decision::StopAndSend(replacement)` arm (encode-side filter substitution). The helper conditionally adds 5 standard headers (`server`, `date`, `content-length`, `content-type`, `connection`) if not provided by the filter (case-insensitive name check matching the 06.1 D1 / 08.1 D1 dedupe precedent); `content-length` is ALWAYS set from `body.len()` (overwrites any stale filter-provided value). 2 new unit tests covering the empty-filter-headers happy path + the filter-provides-overlapping-headers edge case (dedupe + overwrite semantic).
+
+- **Commit D (`1384c48`)** — Task 5 re-attempt. Fixture `tests/fixtures/0016-http-filter-local-rate-limit/{envoy.yaml,envoy-rust.yaml,expectations.yaml,README.md}` per the ADR-0033 revised contract (5-probe burst `[200, 200, 200, 429, 429]` + body `"local_rate_limited"` byte_exact on 429 probes + `set_equal_modulo_allow_list` headers). Docker-gated wrapper at `tests/differential/tests/http_filter_local_rate_limit.rs`. Per-side YAML asymmetry per the fixture-0013 precedent: upstream's `envoy.yaml` has an admin block + `filter_enabled`/`filter_enforced: { default_value: { numerator: 100, denominator: HUNDRED } }` (upstream defaults both to 0%; envoy-rust defaults to always-on); envoy-rust.yaml omits both. Both YAMLs use `tokens_per_fill: 3` (upstream rejects 0 per its `TokenBucketValidator`; envoy-rust accepts 0; intersection picked at 3). **NO BEHAVIOR_CONTRACT.md row** at this commit per PLAN lock-in #30 voiding.
+
+**Tasks 6 + Task 6 follow-up + Task 7: corpus + in-process backstop.**
+
+- **Task 6 (`28e1666`)** — D8.2 parse_bootstrap fuzz corpus seed `hcm_local_rate_limit_filter.yaml` (~45 LoC YAML data) + 1-line `crates/envoy-config/fuzz/.gitignore` allow-list entry per the established curated-seed pattern (the existing 20 named seeds are each listed as `!corpus/parse_bootstrap/<name>.yaml`; this commit extends to 21).
+- **Task 6 follow-up (`1effb0f`)** — 1-line extension to `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array to enumerate the new seed (the test enumerates seeds explicitly; without the entry, the unit-test bucket wouldn't exercise the new seed against `parse_bootstrap`).
+- **Task 7 (`7fcaeb1`)** — D8.3 in-process backstop `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` (~260 LoC). Boots envoy-bin subprocess with synthesized bootstrap (`max_tokens: 2, tokens_per_fill: 2, fill_interval: 60s`); drives 4 sequential `GET /` requests; asserts the ADR-0033 revised contract: status sequence `[200, 200, 429, 429]` + body `"local_rate_limited"` on 429 probes + 5 standard HTTP/1.1 headers (`server`/`date`/`content-length`/`content-type`/`connection`) on 429 probes + NO `x-envoy-ratelimited` on ANY of the 4 probes (per ADR-0033 voiding lock-in #33) + body `"ok\n"` on 200 probes. **Deviations:** `tokens_per_fill: 0 → 2` (PLAN-prescribed `0` changed to `2` for fixture-0016 symmetry; no observable behavior change); `body_lists` captured per ADR-0033 body assertions (PLAN discarded with `_body`); assertion block fully rewritten per ADR-0033 dispatch. Two-stage review code-quality reviewer flagged 2 IMPORTANT items deferred to state-5 housekeeping (subprocess leak risk on probe-helper panic; un-drained stderr pipe — both inherit from the 07.2 in-process backstop precedent's same pattern).
+
+**Task 8 (THIS state-4-reached commit) — state-4 phase-done verification per `BOOTSTRAP_PROMPT.md` §7.5.**
+
+CI evidence anchor: **CI run `26002996677` against HEAD `1effb0f`** (Task 6 follow-up; immediate predecessor of THIS commit). `success` 2026-05-17T21:20:41Z; wall ~2m 1s; both jobs green (`build + test + lint` job ID `76429519366` ~1m 58s + `fuzz (parse_bootstrap, 30s)` job ID `76429519376` ~1m 16s). §7.5 gates (a)-(e) all GREEN: (a) fixture 0016 green per the Docker-gated wrapper test (`finished in 0.82s` at `2026-05-17T21:20:05.3814423Z`); (b) all 15 pre-existing Docker-gated fixtures (`0001-0015`) GREEN simultaneously alongside 0016 in the single `cargo test --workspace` invocation (16-fixture matrix per-binary `1 passed; 0 failed`); (c) h2spec held at 05.2 baseline 99.31% (`h2spec_pass_rate_gate` PASS); (d) `parse_bootstrap` fuzz target ran ~30s effective fuzz time at the 30s budget, no crash; (e) all 5 stable-toolchain gates GREEN (fmt / clippy / build / test / deny). Workspace test count: **746 passed / 0 failed / 2 ignored** (+1 over Task 6-follow-up baseline 745; the +1 is Task 7's `local_rate_limit_enforces_429_after_token_exhaustion` in-process backstop test). Gate (f) `REVIEW.md` approved DEFERS to state 5 per `BOOTSTRAP_PROMPT.md` §5.1.
+
+**Carryforward closures landed in phase 09:** **07.2 REVIEW M1** (severed `_position` plumbing — `_position: usize` parameter on `HttpFilterInstance::build` + `.enumerate()` on `FilterPipeline::build_from_config`) **CLOSED at Task 4 `78128f4`** per SPEC §3 D5 + PLAN lock-in #22. The chain 07.2 → 09 ends. Hardcoded `position: 0` at `header_mutation.rs::map_entry` PRESERVED per lock-in #23.
+
+**DECISIONS.md ledger after phase 09's state-3 arc:** **ADR-0033** at HEAD (landed at Commit A `e9a6cb4`). Conditional ADR-0034 (foundations grant for token-bucket primitive per phase-09 SPEC §7) stays reserved-available and UNUSED per the no-foundations-grant posture; recommended posture remains no-grant. The phase-09 ADR ledger evolved `ADR-0032 → ADR-0033` (1 ADR landed; not the 0 ADRs the SPEC §7 projected — ADR-0033 was discovered, not projected, at Task 5 dispatch).
+
+**State-5 entry routing.** Next session enters phase-09 lifecycle state 5 per `BOOTSTRAP_PROMPT.md` §5; invokes `superpowers:requesting-code-review` scoped to the reviewed range `b9da8d4..<this commit's HEAD>` (phase-09 state-2 PLAN-write base through THIS Task 8 state-4-verification commit). The session writes `docs/envoy-rust/phases/09-http-filter-local-rate-limit/REVIEW.md` per the skill's per-phase output. With Approved verdict, state-6 (the session after) closes phase 09 + flips ROADMAP row `09` `in-progress` → `done` per the closing-phase invariant (phase 09 is a standalone phase, NOT a sub-phase, so no parent-row close-out is required — mirrors the 07.2 close-out at `1d52156` standalone-phase shape precedent).
