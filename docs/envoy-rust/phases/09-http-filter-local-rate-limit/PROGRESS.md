@@ -709,9 +709,169 @@ diffs at this commit:** None (per the per-task PROGRESS cadence rule; state-2
 commit context above for the cadence). BEHAVIOR_CONTRACT.md DOES change at
 this commit (4 new stat-name mapping rows per SPEC §6.5 + PLAN lock-in #31).
 
-### Task 4 — D4 HttpFilterInstance::LocalRateLimit variant + D5 07.2 REVIEW M1 closure
+### Task 4 — D4 HttpFilterInstance::LocalRateLimit variant + D5 07.2 REVIEW M1 closure (severed `_position` plumbing)
 
-_(Pending state-3 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `70bad43` — `phase 09: task 3 — D3 LocalRateLimitFilter runtime + D6 stats wiring + D7.1 4 stat-mapping rows`.
+
+**Work summary.** Plugged the Task-3 `LocalRateLimitFilter` into the framework
+dispatch per PLAN Task 4 (SPEC §3 D4 + D5). Three coordinated edits:
+
+1. **D4: `HttpFilterInstance::LocalRateLimit(LocalRateLimitFilter)` variant
+   landed.** Placed between `HeaderMutation` and the two
+   `#[cfg(feature = "test-util")]` variants per PLAN-write SPEC correction #5 +
+   lock-in. The `decode_headers` + `encode_headers` arms call the Task-3
+   runtime methods straight-through; the `build` arm calls
+   `LocalRateLimitFilter::build_from_config(cfg, registry)` (Task-3's two-arg
+   shape per PLAN-write SPEC correction #6). The Task-1 bridge arm that
+   returned `FilterError::UnsupportedFilterType { position, name }` is **replaced**
+   (not augmented) — the bridge's comment block (Tasks 1-3 interim window
+   marker) is gone too.
+
+2. **D5: 07.2 REVIEW M1 lands closed at this commit.** The severed `_position`
+   plumbing is closed at the named site per SPEC §3 D5 + PLAN lock-in #22. The
+   closure deletes `_position: usize` from `HttpFilterInstance::build` and
+   `.enumerate()` from `FilterPipeline::build_from_config`'s loop. Both
+   signatures now take `&Arc<StatsRegistry>` as their last argument instead
+   (registry threading is the load-bearing new wiring; position threading was
+   YAGNI plumbing inherited from the 07.1 builder's interim shape that 07.2
+   carried forward unconsumed). The hardcoded `position: 0` in
+   `crates/envoy-filter/src/header_mutation.rs::map_entry` is **PRESERVED AS-IS**
+   per SPEC §3 D5 rationale + PLAN lock-in #23 (minimum-touch the 07.2
+   surface; the hardcode is unreachable in normal operation because the
+   envoy-config validator rejects the corresponding failure case at parse
+   time). The chain **07.2 → 09 ends at this commit.**
+
+3. **HCM threading: H1 HCMConfig constructor extended in one line.** The
+   `crates/envoy-http1/src/hcm.rs:185` call to
+   `FilterPipeline::build_from_config(&cfg.http_filters)` becomes
+   `FilterPipeline::build_from_config(&cfg.http_filters, &registry)`.
+   `registry: Arc<envoy_stats::StatsRegistry>` is already a positional
+   parameter on `HCMConfig::from_config` (the 06.1 stats-registration plumbing
+   landed this; phase 09 reuses the existing parameter). The H2 path reuses
+   the same `HCMConfig` type alias via `envoy-http2`'s re-export and so the
+   H2 dispatch path needs zero additional edits per PLAN-write SPEC
+   correction #2 + lock-in #24. Two test-helper sites in `hcm.rs`
+   (`test_router_only_pipeline` + `header_mutation_pipeline`) and two
+   test-helper sites in `header_mutation.rs` (the
+   `round_trip_via_filter_pipeline_decode` + `iteration_order_on_encode_via_filter_pipeline`
+   call sites + the `http_filter_instance_build_on_header_mutation_produces_header_mutation_variant`
+   instance-build site) also pick up the new arg — mechanical cascade with no
+   semantic change. `envoy-http2` only uses
+   `FilterPipeline::test_from_instances` (no build_from_config call sites);
+   no edits needed there.
+
+**Files modified (5):**
+- `crates/envoy-filter/src/instance.rs` — added `use std::sync::Arc;` + `use envoy_stats::StatsRegistry;` + `use crate::local_rate_limit::LocalRateLimitFilter;` imports; added `LocalRateLimit(LocalRateLimitFilter)` variant; widened `build` signature (drop `_position: usize`, add `registry: &Arc<StatsRegistry>`); replaced bridge arm with dispatch arm; added `LocalRateLimit` arms to `decode_headers` + `encode_headers`; updated module doc-comment to name LocalRateLimit landing + 07.2 REVIEW M1 closure; added `build_local_rate_limit_succeeds` test + `test_registry()` helper; updated `build_router_succeeds` test to pass `&registry` instead of `0`.
+- `crates/envoy-filter/src/pipeline.rs` — added `use std::sync::Arc;` + `use envoy_stats::StatsRegistry;` imports; widened `build_from_config` signature (drop `position`, add `registry`); replaced `.enumerate()` loop with plain `.iter()` loop; updated 4 existing tests (`build_from_config_rejects_empty_list`, `build_from_config_with_single_router_succeeds`, `decode_headers_on_single_router_returns_continue`, `encode_headers_on_single_router_returns_continue`) to pass `&test_registry()` as second arg; added `test_registry()` helper.
+- `crates/envoy-filter/src/header_mutation.rs` — updated 3 in-test `HttpFilterInstance::build` / `FilterPipeline::build_from_config` call sites to thread `&registry` (the cross-crate signature cascade). `header_mutation.rs::map_entry`'s hardcoded `position: 0` left AS-IS per SPEC §3 D5 + lock-in #23.
+- `crates/envoy-filter/src/local_rate_limit.rs` — removed `#[allow(dead_code)]` annotations from `LocalRateLimitFilter` struct + impl AND from `TokenBucketState` struct + impl (the Task 4 dispatch arm activates the production-side caller chain; clippy now passes without them). Per-field `#[allow(dead_code)]` retained on `LocalRateLimitFilter::stat_prefix` (the field is read only by the `#[cfg(test)]` accessor — see deviation #1).
+- `crates/envoy-http1/src/hcm.rs` — extended the production `FilterPipeline::build_from_config(...)` call at line 185 with `&registry`; updated two test-helper sites (`test_router_only_pipeline`, `header_mutation_pipeline`) to register a fresh `StatsRegistry` and pass it through.
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` — this
+  subsection (per-task PROGRESS cadence).
+
+**07.2 REVIEW M1 closure attribution.** Per the PROGRESS Task 1 preamble
+carryforward table entry — *"07.2 REVIEW M1 ... **PROJECTED-CLOSE at Task 4
+(D5).** Co-located with D4 per SPEC §6.2 lock-in #22. The PROGRESS subsection
+at Task 4 commit will record the closure attribution. The chain 07.2 → 09
+ends."* — **the 07.2 REVIEW M1 chain lands closed at this commit.** The
+specific edits attributable to the closure: (a) `_position: usize` parameter
+deleted from `HttpFilterInstance::build`; (b) `.enumerate()` deleted from
+`FilterPipeline::build_from_config`'s for-loop; (c) the variable name
+`position` deleted from the same loop. The hardcoded `position: 0` in
+`crates/envoy-filter/src/header_mutation.rs::map_entry` is preserved as-is
+because: (i) it is unreachable in normal operation (the envoy-config validator
+at `validate_header_mutation_config` rejects the corresponding error case at
+parse time); (ii) preserving it conforms to PLAN lock-in #23 (minimum-touch
+the 07.2 surface); (iii) the surface engagement is zero pending a future
+filter-family phase that exercises the `apply_mutations` error path. No new
+carryforward entry created; the row simply moves from "PROJECTED-CLOSE at
+Task 4" to **CLOSED at this commit**.
+
+**Tests landed (1 new; 741 → 742 in workspace test count).**
+1. `build_local_rate_limit_succeeds` — asserts that
+   `HttpFilterInstance::build(&hf, &registry)` returns
+   `Ok(HttpFilterInstance::LocalRateLimit(_))` for a valid LocalRateLimit
+   `HttpFilter` config (`stat_prefix: "phase_09"`, `max_tokens: 3`,
+   `tokens_per_fill: 0`, `fill_interval: "60s"`, `status: 429`, no response
+   headers). Verifies the new variant + the widened signature wire correctly
+   end-to-end. The existing `build_router_succeeds` test was updated to pass
+   `&registry` (signature cascade); test count delta is +1 not +2 because
+   the existing test gets re-signed rather than replaced.
+
+**Per-task deviations from PLAN (1).**
+
+1. **Per-field `#[allow(dead_code)]` retained on `LocalRateLimitFilter::stat_prefix`.**
+   PLAN Step 6 instructed *"Remove `#[allow(dead_code)]` from the
+   `LocalRateLimitFilter` struct"* unconditionally. Empirically, clippy on
+   `--all-targets --all-features -- -D warnings` against the production
+   (`!cfg(test)`) build flags `stat_prefix` as `field is never read` — the
+   only reader is the `#[cfg(test)]` accessor `stat_prefix()`. The other 9
+   fields (`bucket`, `max_tokens`, `tokens_per_fill`, `fill_interval`,
+   `response_headers_to_add`, 4 `Arc<Counter>` handles) are all read by
+   `decode_headers` on the production path; only `stat_prefix` is
+   test-only-read. Resolution: keep the struct-level + impl-level
+   `#[allow(dead_code)]` removed (per PLAN Step 6); add a per-field
+   `#[allow(dead_code)]` to `stat_prefix` only, with an inline comment
+   pointing to the `#[cfg(test)]` accessor + the diagnostic-parity rationale
+   for retaining the field. This is a narrower allow than the original
+   blanket annotation and surfaces the future "production-side stat_prefix
+   reader" as a clean per-field remove site whenever it lands. The other
+   `#[allow(dead_code)]` annotations identified in Task 4 instructions (the
+   `LocalRateLimitFilter` impl block + the `TokenBucketState` struct + the
+   `TokenBucketState` impl block) ARE all removed per the original plan.
+
+**LoC delta (production + tests; doc-comments excluded by manual inspection).**
+Production: ~+25 LoC (`LocalRateLimit` variant + import lines + `decode_headers` arm + `encode_headers` arm + `build` arm in `instance.rs`; widened signature + `Arc`/`StatsRegistry` imports + 1-line loop change in `pipeline.rs`; 1-line registry threading in `hcm.rs`; 1-line registry threading in 2 hcm.rs test helpers; 1-line registry threading in 3 header_mutation.rs test helpers; net -8 LoC from removing the bridge arm + comment block in instance.rs; net -4 LoC from removing the 4 `#[allow(dead_code)]` annotations + comments; +5 LoC from the new per-field allow on `stat_prefix`).
+Tests: ~+25 LoC (1 new test in instance.rs + test_registry helper; 4 updated test signatures in pipeline.rs + test_registry helper; 3 updated test-helper sites in header_mutation.rs; 2 updated test-helper sites in hcm.rs). Fixture/doc: 0. Total: ~+50 LoC.
+
+Against PLAN §3 row 4's projection (~50 production / ~10 tests / 0
+fixture-doc / ~60 total): production at projection; tests at +15 over
+projection (the cross-crate cascade touched more sites than the lock-in #27
+focus on `build_router_succeeds` alone projected). Total ~50 vs projection
+60 — under projection, comfortable margin.
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain.
+
+#### Gate 1: `cargo fmt --all -- --check`
+PASS (exit 0). One mid-task `cargo fmt --all` mutation applied (the
+extended `build_from_config(&filters, &test_registry())` line in pipeline.rs
+exceeded line-width and rustfmt reflowed it); after the mutation,
+`cargo fmt --all -- --check` exits 0.
+
+#### Gate 2: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+PASS (exit 0). Initial run flagged 1 error: `field stat_prefix is never read`
+on `LocalRateLimitFilter` (the `#[allow(dead_code)]` removal exposed it —
+see deviation #1). Resolved per deviation #1 (per-field
+`#[allow(dead_code)]` with inline comment). Re-run clean.
+
+#### Gate 3: `cargo build --workspace --all-targets`
+PASS (exit 0). All 15 workspace crates compile; no warnings.
+
+#### Gate 4: `cargo test --workspace`
+PASS (exit 0). Test result counts: **742 passed; 0 failed; 2 ignored**
+across the workspace — +1 vs Task-3 predecessor (741 → 742), exactly
+matching the 1 new `build_local_rate_limit_succeeds` test in
+`instance::tests`. The 4 updated tests in `pipeline::tests` + the
+`build_router_succeeds` test in `instance::tests` are re-signs (same test
+identity, same assertions; the registry arg is mechanical) so they don't
+register a delta.
+
+#### Gate 5: `cargo deny check`
+PASS (exit 0). `advisories ok, bans ok, licenses ok, sources ok`. 3
+cosmetic `license-not-encountered` warnings unchanged from Task 3 (MPL-2.0,
+Unicode-DFS-2016, Zlib — allowed-but-not-used at this resolution graph).
+
+**Carryforward dispositions update.** The 07.2 REVIEW M1 row moves from
+**PROJECTED-CLOSE at Task 4 (D5)** to **CLOSED at this commit.** Chain
+07.2 → 09 ends. All other carryforward rows unchanged. No new
+carryforward entries.
+
+**STATE.md / ROADMAP.md / BEHAVIOR_CONTRACT.md / DECISIONS.md / ENVOY_TARGET.md /
+rust-toolchain.toml diffs at this commit:** None (per the per-task PROGRESS
+cadence rule; state-2 commit context above for the cadence). The 1 new
+BEHAVIOR_CONTRACT row (Header allow-list `x-envoy-ratelimited`) lands at
+Task 5 per PLAN lock-in #31 + SPEC §6.5 cadence.
 
 ### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper + D7.2 x-envoy-ratelimited row
 

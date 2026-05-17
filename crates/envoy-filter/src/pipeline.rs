@@ -1,5 +1,9 @@
 //! Filter chain iteration protocol.
 
+use std::sync::Arc;
+
+use envoy_stats::StatsRegistry;
+
 use crate::error::FilterError;
 use crate::instance::HttpFilterInstance;
 use crate::types::{FilterRequest, FilterResponse};
@@ -19,17 +23,25 @@ impl FilterPipeline {
     /// Build a `FilterPipeline` from a parsed envoy-config `HttpFilter` list.
     ///
     /// Returns an error if the list is empty. Per-instance build is delegated
-    /// to `HttpFilterInstance::build` (Task 3). The parse-time validator at
+    /// to `HttpFilterInstance::build`. The parse-time validator at
     /// `envoy_config::validate_http_filters` performs the same cardinality
     /// checks earlier in the config-load path; this method's checks are
     /// defense-in-depth at the framework crate boundary.
-    pub fn build_from_config(filters: &[envoy_config::HttpFilter]) -> Result<Self, FilterError> {
+    ///
+    /// `registry` is threaded through so stats-bearing filter arms (phase-09
+    /// `LocalRateLimit`) can register their counters at build time. Phase 09
+    /// Task 4 (D5 closure of 07.2 REVIEW M1) dropped the prior
+    /// `.enumerate()` + per-instance `position: usize` plumbing.
+    pub fn build_from_config(
+        filters: &[envoy_config::HttpFilter],
+        registry: &Arc<StatsRegistry>,
+    ) -> Result<Self, FilterError> {
         if filters.is_empty() {
             return Err(FilterError::EmptyChain);
         }
         let mut out = Vec::with_capacity(filters.len());
-        for (position, hf) in filters.iter().enumerate() {
-            out.push(HttpFilterInstance::build(hf, position)?);
+        for hf in filters.iter() {
+            out.push(HttpFilterInstance::build(hf, registry)?);
         }
         Ok(Self { filters: out })
     }
@@ -77,11 +89,17 @@ impl FilterPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envoy_stats::StatsRegistry;
+    use std::sync::Arc;
+
+    fn test_registry() -> Arc<StatsRegistry> {
+        Arc::new(StatsRegistry::new())
+    }
 
     #[test]
     fn build_from_config_rejects_empty_list() {
         let filters: Vec<envoy_config::HttpFilter> = Vec::new();
-        let err = FilterPipeline::build_from_config(&filters).unwrap_err();
+        let err = FilterPipeline::build_from_config(&filters, &test_registry()).unwrap_err();
         assert!(matches!(err, FilterError::EmptyChain));
     }
 
@@ -93,8 +111,8 @@ mod tests {
                 envoy_config::RouterConfig {},
             ),
         }];
-        let pipeline =
-            FilterPipeline::build_from_config(&filters).expect("single-Router build succeeds");
+        let pipeline = FilterPipeline::build_from_config(&filters, &test_registry())
+            .expect("single-Router build succeeds");
         assert_eq!(pipeline.filters.len(), 1);
     }
 
@@ -106,7 +124,7 @@ mod tests {
                 envoy_config::RouterConfig {},
             ),
         }];
-        let mut pipeline = FilterPipeline::build_from_config(&filters).unwrap();
+        let mut pipeline = FilterPipeline::build_from_config(&filters, &test_registry()).unwrap();
         let mut req = test_request();
         let decision = pipeline.decode_headers(&mut req);
         assert!(matches!(decision, Decision::Continue));
@@ -120,7 +138,7 @@ mod tests {
                 envoy_config::RouterConfig {},
             ),
         }];
-        let mut pipeline = FilterPipeline::build_from_config(&filters).unwrap();
+        let mut pipeline = FilterPipeline::build_from_config(&filters, &test_registry()).unwrap();
         let mut resp = test_response();
         let decision = pipeline.encode_headers(&mut resp);
         assert!(matches!(decision, Decision::Continue));

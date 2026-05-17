@@ -184,6 +184,7 @@ impl HCMConfig {
         // propagates via the `#[from]` impl on `Http1Error::FilterPipeline`.
         let filter_pipeline = Arc::new(envoy_filter::FilterPipeline::build_from_config(
             &cfg.http_filters,
+            &registry,
         )?);
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
@@ -973,13 +974,17 @@ static_resources:
     /// envoy-config validator at 07.1 Task 4 enforces Router-at-terminus
     /// for every production `HttpConnectionManagerConfig`).
     fn test_router_only_pipeline() -> Arc<envoy_filter::FilterPipeline> {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
         Arc::new(
-            envoy_filter::FilterPipeline::build_from_config(&[envoy_config::HttpFilter {
-                name: "envoy.filters.http.router".to_string(),
-                typed_config: envoy_config::HttpFilterTypedConfig::Router(
-                    envoy_config::RouterConfig {},
-                ),
-            }])
+            envoy_filter::FilterPipeline::build_from_config(
+                &[envoy_config::HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                        envoy_config::RouterConfig {},
+                    ),
+                }],
+                &registry,
+            )
             .expect("single-Router pipeline builds"),
         )
     }
@@ -2622,7 +2627,8 @@ static_resources:
                 ),
             },
         ];
-        Arc::new(envoy_filter::FilterPipeline::build_from_config(&filters).unwrap())
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Arc::new(envoy_filter::FilterPipeline::build_from_config(&filters, &registry).unwrap())
     }
 
     /// Build an HCMConfig whose single route matches on the header

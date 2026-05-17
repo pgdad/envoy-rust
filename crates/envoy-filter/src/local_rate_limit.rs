@@ -34,10 +34,13 @@ use crate::types::{FilterRequest, FilterResponse};
 /// At phase-09 scope `enforced == rate_limited` (no `filter_enforced`
 /// fractional-percent override); both are landed independently to match
 /// upstream Envoy v1.33's stat tree exactly.
-#[allow(dead_code)]
-// wired up by Task 4's HttpFilterInstance::LocalRateLimit dispatch arm; exercised by unit tests in this module at Task 3.
 #[derive(Debug, Clone)]
 pub struct LocalRateLimitFilter {
+    // Read only by the `#[cfg(test)]` accessor `stat_prefix()`; retained on
+    // production builds for diagnostic parity with upstream Envoy's filter
+    // struct (the stat-name prefix is the single user-visible identifier
+    // for the filter instance).
+    #[allow(dead_code)]
     stat_prefix: String,
     bucket: Arc<TokenBucketState>,
     max_tokens: u64,
@@ -50,7 +53,6 @@ pub struct LocalRateLimitFilter {
     enforced_counter: Arc<Counter>,
 }
 
-#[allow(dead_code)] // wired up by Task 4's HttpFilterInstance::LocalRateLimit dispatch arm; exercised by unit tests in this module at Task 3.
 impl LocalRateLimitFilter {
     /// Lower an `envoy_config::LocalRateLimitConfig` into the runtime filter
     /// and register the 4 stat counters against the StatsRegistry. Returns
@@ -161,15 +163,12 @@ impl LocalRateLimitFilter {
 /// Hand-rolled token-bucket primitive. `AtomicU64` for the live token count;
 /// `Mutex<Instant>` for the last-fill timestamp. Lazy fill: tokens computed
 /// at `try_acquire` time, NOT via a background refill task. Per phase-09 SPEC §5.2.
-#[allow(dead_code)]
-// consumed by LocalRateLimitFilter (above) via Arc<TokenBucketState>; production callers land at Task 4's dispatch arm.
 #[derive(Debug)]
 pub(crate) struct TokenBucketState {
     tokens: AtomicU64,
     last_fill_instant: Mutex<Instant>,
 }
 
-#[allow(dead_code)] // consumed by LocalRateLimitFilter (above) via Arc<TokenBucketState>; production callers land at Task 4's dispatch arm.
 impl TokenBucketState {
     /// Construct a fresh bucket at full capacity (`max_tokens` tokens
     /// available immediately) with `last_fill_instant` set to `now`.
