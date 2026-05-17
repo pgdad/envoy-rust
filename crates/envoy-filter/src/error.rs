@@ -27,6 +27,12 @@ pub enum FilterError {
 
     #[error("filter chain references unsupported filter type at position {position}: {name}")]
     UnsupportedFilterType { position: usize, name: String },
+
+    /// 09: filter config rejected at `build_from_config` time (defense-in-depth
+    /// — the envoy-config validator at `validate_local_rate_limit_config` is
+    /// the primary gate).
+    #[error("Filter config invalid: {message}")]
+    InvalidConfig { message: String },
 }
 
 #[cfg(test)]

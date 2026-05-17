@@ -3,25 +3,173 @@
 //! Hand-rolled per D-3.2's "Every individual filter ... Must be written from
 //! scratch" doctrine + the broader stats / accesslog / admin / drain
 //! hand-roll posture across the MVP trunk. Token bucket lives at this
-//! module's `TokenBucketState`; the filter struct + decode/encode glue
-//! lands in Task 3.
+//! module's `TokenBucketState`; the `LocalRateLimitFilter` runtime struct
+//! wraps it + threads 4 stats counters per SPEC §3 D6.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use envoy_stats::{Counter, StatsRegistry};
+
+use crate::error::FilterError;
+use crate::pipeline::Decision;
+use crate::types::{FilterRequest, FilterResponse};
+
+/// The `envoy.filters.http.local_ratelimit` runtime filter.
+///
+/// Decode-only filter (per upstream Envoy v1.33 semantic + phase-09 SPEC
+/// §5.4): consumes one token per decode-side invocation; on token exhaustion
+/// short-circuits with a `Decision::StopAndSend` response (429 +
+/// `x-envoy-ratelimited: true`). Encode-side is a no-op `Decision::Continue`.
+///
+/// Stat counters (4, per phase-09 SPEC §3 D6):
+///   - `http_local_rate_limit.<stat_prefix>.enabled` — every decode-side invocation
+///   - `http_local_rate_limit.<stat_prefix>.ok` — every `try_acquire` success
+///   - `http_local_rate_limit.<stat_prefix>.rate_limited` — every `try_acquire` failure
+///   - `http_local_rate_limit.<stat_prefix>.enforced` — every 429 emission
+///
+/// At phase-09 scope `enforced == rate_limited` (no `filter_enforced`
+/// fractional-percent override); both are landed independently to match
+/// upstream Envoy v1.33's stat tree exactly.
+#[allow(dead_code)]
+// wired up by Task 4's HttpFilterInstance::LocalRateLimit dispatch arm; exercised by unit tests in this module at Task 3.
+#[derive(Debug, Clone)]
+pub struct LocalRateLimitFilter {
+    stat_prefix: String,
+    bucket: Arc<TokenBucketState>,
+    max_tokens: u64,
+    tokens_per_fill: u64,
+    fill_interval: Duration,
+    response_headers_to_add: Vec<(String, String)>,
+    enabled_counter: Arc<Counter>,
+    ok_counter: Arc<Counter>,
+    rate_limited_counter: Arc<Counter>,
+    enforced_counter: Arc<Counter>,
+}
+
+#[allow(dead_code)] // wired up by Task 4's HttpFilterInstance::LocalRateLimit dispatch arm; exercised by unit tests in this module at Task 3.
+impl LocalRateLimitFilter {
+    /// Lower an `envoy_config::LocalRateLimitConfig` into the runtime filter
+    /// and register the 4 stat counters against the StatsRegistry. Returns
+    /// `FilterError::InvalidConfig` if `fill_interval` fails to parse
+    /// (defense-in-depth — the envoy-config validator at
+    /// `validate_local_rate_limit_config` is the primary gate).
+    pub(crate) fn build_from_config(
+        cfg: &envoy_config::LocalRateLimitConfig,
+        registry: &Arc<StatsRegistry>,
+    ) -> Result<Self, FilterError> {
+        let fill_str =
+            cfg.token_bucket
+                .fill_interval
+                .as_str()
+                .ok_or_else(|| FilterError::InvalidConfig {
+                    message:
+                        "LocalRateLimit token_bucket.fill_interval must be a string (e.g. \"60s\")"
+                            .to_string(),
+                })?;
+        let fill_interval =
+            envoy_config::parse_duration(fill_str).map_err(|m| FilterError::InvalidConfig {
+                message: format!("LocalRateLimit token_bucket.fill_interval: {m}"),
+            })?;
+        let max_tokens = cfg.token_bucket.max_tokens as u64;
+        let tokens_per_fill = cfg.token_bucket.tokens_per_fill as u64;
+        let response_headers_to_add = cfg
+            .response_headers_to_add
+            .iter()
+            .map(|opt| (opt.header.key.clone(), opt.header.value.clone()))
+            .collect();
+        let enabled_counter = registry
+            .register_counter(&format!(
+                "http_local_rate_limit.{}.enabled",
+                cfg.stat_prefix
+            ))
+            .map_err(|e| FilterError::InvalidConfig {
+                message: format!("StatsRegistry: {e}"),
+            })?;
+        let ok_counter = registry
+            .register_counter(&format!("http_local_rate_limit.{}.ok", cfg.stat_prefix))
+            .map_err(|e| FilterError::InvalidConfig {
+                message: format!("StatsRegistry: {e}"),
+            })?;
+        let rate_limited_counter = registry
+            .register_counter(&format!(
+                "http_local_rate_limit.{}.rate_limited",
+                cfg.stat_prefix
+            ))
+            .map_err(|e| FilterError::InvalidConfig {
+                message: format!("StatsRegistry: {e}"),
+            })?;
+        let enforced_counter = registry
+            .register_counter(&format!(
+                "http_local_rate_limit.{}.enforced",
+                cfg.stat_prefix
+            ))
+            .map_err(|e| FilterError::InvalidConfig {
+                message: format!("StatsRegistry: {e}"),
+            })?;
+        Ok(Self {
+            stat_prefix: cfg.stat_prefix.clone(),
+            bucket: Arc::new(TokenBucketState::new(max_tokens)),
+            max_tokens,
+            tokens_per_fill,
+            fill_interval,
+            response_headers_to_add,
+            enabled_counter,
+            ok_counter,
+            rate_limited_counter,
+            enforced_counter,
+        })
+    }
+
+    pub(crate) fn decode_headers(&mut self, _req: &mut FilterRequest) -> Decision {
+        self.enabled_counter.inc();
+        if self
+            .bucket
+            .try_acquire(self.max_tokens, self.tokens_per_fill, self.fill_interval)
+        {
+            self.ok_counter.inc();
+            Decision::Continue
+        } else {
+            self.rate_limited_counter.inc();
+            self.enforced_counter.inc();
+            let mut headers: Vec<(String, String)> =
+                vec![("x-envoy-ratelimited".to_string(), "true".to_string())];
+            headers.extend(self.response_headers_to_add.iter().cloned());
+            Decision::StopAndSend(FilterResponse {
+                status: 429,
+                reason: Some("Too Many Requests"),
+                headers,
+                body: Bytes::new(),
+            })
+        }
+    }
+
+    pub(crate) fn encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision {
+        Decision::Continue
+    }
+
+    /// Accessor for the configured stat_prefix (test-only convenience).
+    #[cfg(test)]
+    pub(crate) fn stat_prefix(&self) -> &str {
+        &self.stat_prefix
+    }
+}
 
 /// Hand-rolled token-bucket primitive. `AtomicU64` for the live token count;
 /// `Mutex<Instant>` for the last-fill timestamp. Lazy fill: tokens computed
 /// at `try_acquire` time, NOT via a background refill task. Per phase-09 SPEC §5.2.
 #[allow(dead_code)]
-// wired up by Task 3's LocalRateLimitFilter runtime; exercised by unit tests in this module at Task 2.
+// consumed by LocalRateLimitFilter (above) via Arc<TokenBucketState>; production callers land at Task 4's dispatch arm.
 #[derive(Debug)]
 pub(crate) struct TokenBucketState {
     tokens: AtomicU64,
     last_fill_instant: Mutex<Instant>,
 }
 
-#[allow(dead_code)] // wired up by Task 3's LocalRateLimitFilter runtime; exercised by unit tests in this module at Task 2.
+#[allow(dead_code)] // consumed by LocalRateLimitFilter (above) via Arc<TokenBucketState>; production callers land at Task 4's dispatch arm.
 impl TokenBucketState {
     /// Construct a fresh bucket at full capacity (`max_tokens` tokens
     /// available immediately) with `last_fill_instant` set to `now`.
@@ -215,5 +363,186 @@ mod tests {
         );
         // The bucket should be empty.
         assert_eq!(state.tokens.load(Ordering::Acquire), 0);
+    }
+
+    // --- Task 3: LocalRateLimitFilter runtime tests ----------------------
+
+    use crate::pipeline::Decision;
+    use crate::types::{FilterRequest, FilterResponse};
+    use envoy_stats::StatsRegistry;
+
+    fn test_request() -> FilterRequest {
+        FilterRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: vec![("host".to_string(), "envoy-rust.test".to_string())],
+            body: None,
+        }
+    }
+
+    fn ok_cfg() -> envoy_config::LocalRateLimitConfig {
+        envoy_config::LocalRateLimitConfig {
+            stat_prefix: "phase_09".to_string(),
+            token_bucket: envoy_config::TokenBucket {
+                max_tokens: 2,
+                tokens_per_fill: 0,
+                fill_interval: serde_yaml::Value::String("60s".to_string()),
+            },
+            response_headers_to_add: Vec::new(),
+            status: envoy_config::HttpStatus { code: 429 },
+        }
+    }
+
+    #[test]
+    fn build_from_config_succeeds_and_registers_counters() {
+        let registry = Arc::new(StatsRegistry::new());
+        let filter = LocalRateLimitFilter::build_from_config(&ok_cfg(), &registry)
+            .expect("build_from_config succeeds");
+        assert_eq!(filter.stat_prefix(), "phase_09");
+        // The 4 counters are registered idempotently — registering again
+        // returns the same Arc<Counter> via StatsRegistry's idempotence.
+        let enabled = registry
+            .register_counter("http_local_rate_limit.phase_09.enabled")
+            .expect("enabled counter already registered");
+        assert_eq!(enabled.value(), 0);
+    }
+
+    #[test]
+    fn decode_headers_allows_request_under_limit_and_increments_ok_counter() {
+        let registry = Arc::new(StatsRegistry::new());
+        let mut filter =
+            LocalRateLimitFilter::build_from_config(&ok_cfg(), &registry).expect("build");
+        let mut req = test_request();
+        let decision = filter.decode_headers(&mut req);
+        assert!(matches!(decision, Decision::Continue));
+        let enabled = registry
+            .register_counter("http_local_rate_limit.phase_09.enabled")
+            .unwrap();
+        let ok = registry
+            .register_counter("http_local_rate_limit.phase_09.ok")
+            .unwrap();
+        let rate_limited = registry
+            .register_counter("http_local_rate_limit.phase_09.rate_limited")
+            .unwrap();
+        let enforced = registry
+            .register_counter("http_local_rate_limit.phase_09.enforced")
+            .unwrap();
+        assert_eq!(enabled.value(), 1);
+        assert_eq!(ok.value(), 1);
+        assert_eq!(rate_limited.value(), 0);
+        assert_eq!(enforced.value(), 0);
+    }
+
+    #[test]
+    fn decode_headers_rate_limits_after_max_tokens_and_increments_rate_limited_enforced() {
+        let registry = Arc::new(StatsRegistry::new());
+        let mut filter =
+            LocalRateLimitFilter::build_from_config(&ok_cfg(), &registry).expect("build");
+        let mut req = test_request();
+        // Drain the 2 tokens.
+        assert!(matches!(
+            filter.decode_headers(&mut req),
+            Decision::Continue
+        ));
+        assert!(matches!(
+            filter.decode_headers(&mut req),
+            Decision::Continue
+        ));
+        // Third request is rate-limited.
+        let decision = filter.decode_headers(&mut req);
+        let resp = match decision {
+            Decision::StopAndSend(r) => r,
+            Decision::Continue => panic!("expected StopAndSend"),
+        };
+        assert_eq!(resp.status, 429);
+        assert_eq!(resp.reason, Some("Too Many Requests"));
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| { k.eq_ignore_ascii_case("x-envoy-ratelimited") && v == "true" }),
+            "x-envoy-ratelimited: true missing from headers: {:?}",
+            resp.headers
+        );
+        assert!(resp.body.is_empty(), "rate-limited body must be empty");
+        let enabled = registry
+            .register_counter("http_local_rate_limit.phase_09.enabled")
+            .unwrap();
+        let ok = registry
+            .register_counter("http_local_rate_limit.phase_09.ok")
+            .unwrap();
+        let rate_limited = registry
+            .register_counter("http_local_rate_limit.phase_09.rate_limited")
+            .unwrap();
+        let enforced = registry
+            .register_counter("http_local_rate_limit.phase_09.enforced")
+            .unwrap();
+        assert_eq!(enabled.value(), 3);
+        assert_eq!(ok.value(), 2);
+        assert_eq!(rate_limited.value(), 1);
+        assert_eq!(enforced.value(), 1);
+    }
+
+    #[test]
+    fn decode_headers_appends_configured_response_headers() {
+        let registry = Arc::new(StatsRegistry::new());
+        let mut cfg = ok_cfg();
+        // max_tokens=1 + pre-drain → second request rate-limited.
+        cfg.token_bucket.max_tokens = 1;
+        cfg.response_headers_to_add = vec![envoy_config::HeaderValueOption {
+            header: envoy_config::HeaderValue {
+                key: "x-rate-limit-policy".to_string(),
+                value: "phase-09".to_string(),
+            },
+            append_action: envoy_config::AppendAction::AppendIfExistsOrAdd,
+        }];
+        let mut filter = LocalRateLimitFilter::build_from_config(&cfg, &registry).expect("build");
+        let mut req = test_request();
+        let _ = filter.decode_headers(&mut req); // drain
+        let resp = match filter.decode_headers(&mut req) {
+            Decision::StopAndSend(r) => r,
+            Decision::Continue => panic!("expected StopAndSend"),
+        };
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "x-envoy-ratelimited" && v == "true")
+        );
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k == "x-rate-limit-policy" && v == "phase-09")
+        );
+    }
+
+    #[test]
+    fn encode_headers_is_noop_continue() {
+        let registry = Arc::new(StatsRegistry::new());
+        let mut filter =
+            LocalRateLimitFilter::build_from_config(&ok_cfg(), &registry).expect("build");
+        let mut resp = FilterResponse {
+            status: 200,
+            reason: Some("OK"),
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        };
+        let decision = filter.encode_headers(&mut resp);
+        assert!(matches!(decision, Decision::Continue));
+        // No counter increments on encode.
+        let enabled = registry
+            .register_counter("http_local_rate_limit.phase_09.enabled")
+            .unwrap();
+        assert_eq!(enabled.value(), 0);
+    }
+
+    #[test]
+    fn build_from_config_rejects_unparseable_fill_interval() {
+        let registry = Arc::new(StatsRegistry::new());
+        let mut cfg = ok_cfg();
+        cfg.token_bucket.fill_interval = serde_yaml::Value::String("forever".to_string());
+        let err = LocalRateLimitFilter::build_from_config(&cfg, &registry).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::FilterError::InvalidConfig { .. }
+        ));
     }
 }

@@ -500,7 +500,214 @@ cadence rule; state-2 commit context above for the cadence).
 
 ### Task 3 — D3 LocalRateLimitFilter runtime + D6 stats wiring + D7.1 4 stat-mapping rows
 
-_(Pending state-3 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `b5c81d2` — `phase 09: task 2 — D3 hand-rolled token bucket primitive`.
+
+**Work summary.** Landed the `LocalRateLimitFilter` runtime struct on top of
+Task-2's `TokenBucketState` primitive, per PLAN Task 3 (SPEC §3 D3 + D6 + §6.5).
+The filter is the lock-in #10 shape — 10 fields: `stat_prefix: String`,
+`bucket: Arc<TokenBucketState>`, `max_tokens: u64`, `tokens_per_fill: u64`,
+`fill_interval: Duration`, `response_headers_to_add: Vec<(String, String)>`, plus
+4 `Arc<Counter>` handles (`enabled_counter`, `ok_counter`, `rate_limited_counter`,
+`enforced_counter`). `#[derive(Debug, Clone)]` so the FilterPipeline build path
+can clone the per-listener filter into the per-stream pipeline at Task 4. The
+4 counters are registered at `build_from_config` time via `registry.register_counter`
+(idempotent — repeat registrations under the same `stat_prefix` return the same
+`Arc<Counter>`, so multiple per-stream Clone instances share the underlying
+counter state; per lock-in #14).
+
+`decode_headers(&mut self, _req: &mut FilterRequest) -> Decision` per lock-in #11:
+increment `enabled_counter` unconditionally; call `bucket.try_acquire(max_tokens,
+tokens_per_fill, fill_interval)`; on success → inc `ok_counter`, return
+`Decision::Continue`; on failure → inc `rate_limited_counter` + inc
+`enforced_counter`, return `Decision::StopAndSend(FilterResponse { status: 429,
+reason: Some("Too Many Requests"), headers: [("x-envoy-ratelimited", "true"),
+...response_headers_to_add], body: Bytes::new() })`. The 429 synth shape matches
+lock-in #13 verbatim — the `x-envoy-ratelimited: true` header is prepended ahead
+of any configured `response_headers_to_add` so the rate-limit signal is
+unambiguous. `content-length: 0` is added by the H1/H2 codec writers at the
+06.x writer-arm convention (the filter does NOT add it).
+
+`encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision { Decision::Continue }`
+per lock-in #12 — decode-only filter; encode-side method exists for framework
+symmetry. The `#[cfg(test)] pub(crate) fn stat_prefix(&self) -> &str` accessor
+lets the test module read the field without making it crate-public (per PLAN
+Step 3 lines ~1462-1466 adjustment).
+
+The `FilterError::InvalidConfig { message: String }` variant lands on the
+existing `pub enum FilterError` in `crates/envoy-filter/src/error.rs`. It is a
+defense-in-depth landing site — the primary validation gate is at
+`envoy_config::bootstrap::validate_local_rate_limit_config` (landed at Task 1).
+The build_from_config path raises it on `fill_interval` parse failure (string
+expected but non-string seen; or recognized-string format unparseable) and on
+unexpected `StatsRegistry` registration failure.
+
+Also lands the 4 BEHAVIOR_CONTRACT.md "Stat-name mapping" rows per lock-in #31
+(SPEC §6.5 cadence), appended to a new `**09 entries (LocalRateLimit filter):**`
+subsection below the existing `**08.2 entries (drain machinery):**` table.
+
+**Files modified (5):**
+- `crates/envoy-filter/src/local_rate_limit.rs` — extended with the
+  `LocalRateLimitFilter` struct + `build_from_config` + `decode_headers` +
+  `encode_headers` + `stat_prefix()` accessor (above the existing
+  `TokenBucketState`); 6 new tests appended to the existing `#[cfg(test)] mod
+  tests` block.
+- `crates/envoy-filter/src/lib.rs` — added `pub use local_rate_limit::LocalRateLimitFilter;`
+  in alphabetical position between `instance::HttpFilterInstance` and
+  `pipeline::{Decision, FilterPipeline}` (per PLAN Step 4).
+- `crates/envoy-filter/src/error.rs` — added `FilterError::InvalidConfig
+  { message: String }` variant (per PLAN Step 3 lines ~1456-1458).
+- `crates/envoy-filter/Cargo.toml` — added `serde_yaml = "0.9"` to
+  `[dev-dependencies]` (the test helpers construct
+  `envoy_config::TokenBucket::fill_interval = serde_yaml::Value::String(...)`).
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md` — 4 new rows appended under a new
+  `**09 entries (LocalRateLimit filter):**` subsection in the `## Stat-name
+  mapping` section (per PLAN Step 6).
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` — this
+  subsection (per-task PROGRESS cadence).
+
+Also: 2 envoy-config source files touched for the `parse_duration` visibility
+promotion (deviation #2 below): `crates/envoy-config/src/bootstrap.rs` (1
+visibility-keyword change: `pub(crate)` → `pub`) + `crates/envoy-config/src/lib.rs`
+(1 re-export addition: `parse_duration` appended to the `pub use bootstrap::{...}`
+block).
+
+Also: `Cargo.lock` carries a 1-line `+ "serde_yaml",` addition recording the new
+serde_yaml dependency edge on `envoy-filter`'s dependency-listing block (no new
+top-level Cargo dep resolved — serde_yaml was already a workspace dep at v0.9.x
+via envoy-config; this is the same metadata-only delta shape as Task 2
+deviation #1).
+
+**Tests landed (6 new; 735 → 741 in workspace test count).**
+1. `build_from_config_succeeds_and_registers_counters` — asserts
+   `LocalRateLimitFilter::build_from_config` returns Ok on the minimal ok_cfg
+   AND that the 4 counters appear in the registry post-build (verified via
+   idempotent re-registration returning the existing handle with value 0).
+2. `decode_headers_allows_request_under_limit_and_increments_ok_counter` — a
+   single `decode_headers` call returns `Decision::Continue`; counters land
+   `enabled=1, ok=1, rate_limited=0, enforced=0`.
+3. `decode_headers_rate_limits_after_max_tokens_and_increments_rate_limited_enforced`
+   — drains the 2-token bucket, then 3rd request returns `Decision::StopAndSend`
+   with status 429, reason "Too Many Requests", `x-envoy-ratelimited: true`
+   header present (case-insensitive match), empty body; counters land
+   `enabled=3, ok=2, rate_limited=1, enforced=1`.
+4. `decode_headers_appends_configured_response_headers` — configures a single
+   `response_headers_to_add` entry `x-rate-limit-policy: phase-09`; after a
+   pre-drain (max_tokens=1) the rate-limited response carries BOTH the
+   `x-envoy-ratelimited: true` header AND the configured
+   `x-rate-limit-policy: phase-09` header.
+5. `encode_headers_is_noop_continue` — `encode_headers` returns
+   `Decision::Continue` and increments NO counters (the `enabled_counter`
+   stays at 0).
+6. `build_from_config_rejects_unparseable_fill_interval` — passes a
+   `fill_interval: "forever"` (unparseable by `parse_duration`); asserts the
+   error is the new `FilterError::InvalidConfig { .. }` variant.
+
+**Per-task deviations from PLAN (4).**
+
+1. **PLAN Step 1 test code at lines ~1246-1261 used a `HeaderValueOption`
+   shape pre-dating Task-1's deviation #1.** PLAN wrote
+   `HeaderValueOption { header: Header { key, value } }`, but Task 1 reused
+   the existing 07.2 `HeaderValueOption { header: HeaderValue { key, value },
+   append_action: AppendAction }`. The
+   `decode_headers_appends_configured_response_headers` test was adjusted to
+   construct the actual 07.2-landed shape: `HeaderValueOption { header:
+   HeaderValue { key, value }, append_action: AppendAction::AppendIfExistsOrAdd }`.
+   The runtime code (`build_from_config`'s `opt.header.key`/`opt.header.value`
+   access pattern at PLAN lines ~1372-1376) needs NO adjustment — `HeaderValue`
+   has identical `.key`/`.value` fields as the PLAN-projected `Header`.
+
+2. **`envoy_config::parse_duration` visibility promotion: `pub(crate)` →
+   `pub` + re-export from `envoy-config/src/lib.rs`.** Task 1 landed
+   `parse_duration` as `pub(crate)` inside `bootstrap.rs`. Task 3's
+   `LocalRateLimitFilter::build_from_config` invokes
+   `envoy_config::parse_duration(fill_str)` from the cross-crate boundary
+   (envoy-filter → envoy-config), so the visibility had to be widened. The
+   alternative (duplicate the parse logic inline at the filter call site) was
+   rejected as more invasive and harder to keep in sync with the validator's
+   parse semantics. The promotion is purely additive (no callers regress); the
+   re-export sits alphabetically at the end of the existing
+   `pub use bootstrap::{...}` block in `lib.rs`.
+
+3. **`#[allow(dead_code)]` annotations stay on TokenBucketState struct + impl;
+   added on LocalRateLimitFilter struct + impl.** The Task-2 PLAN-write
+   anticipated that `LocalRateLimitFilter`'s consumption of `TokenBucketState`
+   at Task 3 would warrant the `#[allow(dead_code)]` removal. Empirically:
+   `LocalRateLimitFilter` itself is `pub(crate)` for production-side reachability
+   (the framework-dispatch arm at `HttpFilterInstance::LocalRateLimit` lands at
+   Task 4), so clippy's `dead_code` lint still fires in the non-test build.
+   Resolution mirrors Task 2's posture: both struct + impl carry
+   `#[allow(dead_code)]` with comments pointing to Task 4 as the production
+   wire-up site. The annotations come off naturally at Task 4 when the
+   dispatch arm activates the production-side caller chain.
+
+4. **`reason: Option<&'static str>` (NOT `Option<String>`) on `FilterResponse`.**
+   The PLAN Step 3 code at lines ~1432 wrote
+   `reason: Some("Too Many Requests".to_string())`, but
+   `crates/envoy-filter/src/types.rs:45` defines
+   `pub reason: Option<&'static str>`. The implementation + tests use
+   `Some("Too Many Requests")` directly (no `.to_string()`); this is a
+   PLAN-text typo correction, not a semantic deviation.
+
+**LoC delta (production + tests; doc-comments excluded by manual inspection).**
+Production: ~+120 LoC (the `LocalRateLimitFilter` struct + `build_from_config`
++ `decode_headers` + `encode_headers` + `stat_prefix` accessor in
+`local_rate_limit.rs`; 6 lines for the `InvalidConfig` variant in `error.rs`;
+1 line each for the `lib.rs` re-export, the `Cargo.toml` dev-dep, the
+`bootstrap.rs` visibility change, the `lib.rs` parse_duration re-export).
+Tests: ~+205 LoC (6 new tests + 2 helpers — `test_request()` + `ok_cfg()` — in
+the `local_rate_limit::tests` block). Fixture/doc: ~+9 LoC (4 BEHAVIOR_CONTRACT
+rows + 1 subsection header + surrounding blank lines). Total: ~+334 LoC.
+
+Against PLAN §3 row 3's projection (~110 production / ~120 tests / ~15
+fixture-doc / ~245 total):
+- Production: +10 over projection — 1-for-1 with the planned struct shape.
+- Tests: +85 over projection. Two contributors: (i) the rustfmt-canonical
+  multi-line shape of `register_counter(&format!(...))` chains across 4
+  counters with `.unwrap()` per call inflates the test body for the 2
+  counter-assertion tests; (ii) the 4-counter assertion blocks were expanded
+  per test (rather than abstracted into a helper) for readability.
+- Fixture/doc: -6 under projection — the 4 rows are compact.
+- Total: 334 vs 245 projection — +36% relative drift on tests, within
+  PLAN §3's accept-drift posture (~+50% acceptable on a single task per the
+  established 06.x / 07.x / 08.x discipline).
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain.
+
+#### Gate 1: `cargo fmt --all -- --check`
+PASS (exit 0). One mid-task `cargo fmt --all` mutation applied (the initial
+test-code append carried 07.2-style indentation that rustfmt reflowed); after
+the mutation, `cargo fmt --all -- --check` exits 0.
+
+#### Gate 2: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+PASS (exit 0). Initial run flagged 7 errors: 4 `dead_code` (LocalRateLimitFilter
+struct + impl; TokenBucketState struct + impl) + 3 `doc_lazy_continuation`
+(the multi-line bullet on the `build_from_config` doc-comment). Resolved per
+deviation #3 (re-add `#[allow(dead_code)]` annotations with Task-4-wire-up
+pointers) + rewriting the multi-line bullet as a continuous flowing sentence
+("and register the 4 stat counters ... primary gate" with no awkward bullet
+indentation). Re-run clean.
+
+#### Gate 3: `cargo build --workspace --all-targets`
+PASS (exit 0). All 15 workspace crates compile; no warnings.
+
+#### Gate 4: `cargo test --workspace`
+PASS (exit 0). Test result counts: **741 passed; 0 failed; 2 ignored** across
+the workspace — +6 vs Task-2 predecessor (735 → 741), exactly matching the 6
+new tests in the `local_rate_limit::tests` module under Task 3.
+
+#### Gate 5: `cargo deny check`
+PASS (exit 0). `advisories ok, bans ok, licenses ok, sources ok`. 3 cosmetic
+`license-not-encountered` warnings unchanged from Task 2 (MPL-2.0,
+Unicode-DFS-2016, Zlib — allowed-but-not-used at this resolution graph).
+
+**Carryforward dispositions unchanged.** The 07.2 REVIEW M1 close site (Task 4)
+is not engaged at Task 3.
+
+**STATE.md / ROADMAP.md / DECISIONS.md / ENVOY_TARGET.md / rust-toolchain.toml
+diffs at this commit:** None (per the per-task PROGRESS cadence rule; state-2
+commit context above for the cadence). BEHAVIOR_CONTRACT.md DOES change at
+this commit (4 new stat-name mapping rows per SPEC §6.5 + PLAN lock-in #31).
 
 ### Task 4 — D4 HttpFilterInstance::LocalRateLimit variant + D5 07.2 REVIEW M1 closure
 

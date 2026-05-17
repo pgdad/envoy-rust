@@ -17,6 +17,7 @@ pub mod types;
 pub use error::FilterError;
 pub use header_mutation::HeaderMutationFilter;
 pub use instance::HttpFilterInstance;
+pub use local_rate_limit::LocalRateLimitFilter;
 pub use pipeline::{Decision, FilterPipeline};
 pub use router::RouterTerminus;
 pub use types::{FilterRequest, FilterResponse};

@@ -409,6 +409,7 @@ dependencies = [
  "bytes",
  "envoy-config",
  "envoy-stats",
+ "serde_yaml",
  "thiserror",
  "tokio",
 ]

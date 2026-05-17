@@ -19,7 +19,7 @@ pub use bootstrap::{
     Node, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
     SafeRegex, SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
     TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
-    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost,
+    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.

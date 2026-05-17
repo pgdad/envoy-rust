@@ -22,3 +22,4 @@ envoy-stats = { path = "../envoy-stats" }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync"] }
+serde_yaml = "0.9"

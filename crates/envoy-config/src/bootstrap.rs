@@ -1821,7 +1821,7 @@ fn validate_local_rate_limit_config(
 /// the parsed `Duration` on success; an error message on failure. Lands
 /// inline here per phase-09 SPEC §5.2's no-foundations-grant posture
 /// (no `humantime` / `humantime-serde` pull).
-pub(crate) fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     if s.is_empty() {
         return Err("empty duration string".to_string());
     }
