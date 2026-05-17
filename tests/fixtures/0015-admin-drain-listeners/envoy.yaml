@@ -6,13 +6,20 @@
 # /drain_listeners POST flips DrainState to Draining.
 #
 # Sequence (Driver::AdminScrape; temporal order driven by Task 7's
-# dispatch arm regardless of YAML field order):
-#   1. pre_requests:        GET /ready → 200 "LIVE\n" (pre-drain baseline)
-#   2. pre_admin_actions:   POST /drain_listeners → 200 (the drain trigger)
-#   3. scrapes:             GET /ready → 503 "DRAINING\n" (post-drain state)
-#   4. post_admin_assertions: data_plane_connection_refused on the HCM
-#      listener → ECONNREFUSED OR immediate-EOF within 5s budget
-#      (wire-level drain effect).
+# dispatch arm regardless of YAML field order; pre_requests omitted —
+# see expectations.yaml "No pre_requests" docstring + fixture README
+# "Why no pre_requests" section):
+#   1. pre_admin_actions:   POST /drain_listeners → 200 (the drain trigger).
+#   2. scrapes:             GET /server_info → 200 application/json with
+#      required `state` key whose VALUE is permitted to differ across
+#      proxies (empirical pivot from PLAN-sketched /ready scrape;
+#      upstream Envoy v1.33's /ready does NOT flip to 503 on POST
+#      /drain_listeners without --drain-strategy immediate CLI flag —
+#      see expectations.yaml inline rationale at the scrapes block).
+#   3. post_admin_assertions: data_plane_connection_refused on the HCM
+#      listener → ECONNREFUSED OR immediate-EOF OR RST within 5s budget
+#      (wire-level drain effect — bilateral invariant per
+#      BEHAVIOR_CONTRACT.md "Admin-action effect equivalence").
 #
 # Admin listener stays serving during drain per parent-08 SPEC §5.5
 # (operator reachability invariant).

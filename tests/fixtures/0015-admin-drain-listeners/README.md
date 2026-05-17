@@ -10,10 +10,19 @@ landed at 08.2 Task 7 (D16) — `pre_admin_actions` + `post_admin_assertions`
 parent-08 SPEC §2.4 "Admin-action effect equivalence" wire-level
 invariant: BOTH proxies MUST refuse-or-immediately-close new connections
 on their data-plane listeners within the 5s `DRAIN_BUDGET` after a
-`POST /drain_listeners` returns 200, AND BOTH proxies' admin `/ready`
-endpoint MUST flip to 503 with the literal token `DRAINING` in the
-response body. See `docs/envoy-rust/BEHAVIOR_CONTRACT.md`
-"Admin-action effect equivalence" subsection (Task 8 lands this).
+`POST /drain_listeners` returns 200. The companion admin-bookkeeping
+scrape is **`/server_info`** (200 application/json; required `state`
+key with value bilaterally allowed to differ) rather than `/ready`,
+per the Task 8 empirical pivot: upstream Envoy v1.33's `/ready` does
+NOT flip to 503 on `POST /drain_listeners` without the server-level
+`--drain-strategy immediate` CLI flag (NOT bootstrap-configurable);
+envoy-rust per parent-08 SPEC §5.5 flips `/ready` immediately on
+drain. The load-bearing bilateral wire-level invariant is the
+`data_plane_connection_refused` post_admin_assertion; `/server_info`
+merely satisfies the harness's `scrapes.is_empty() → bail` invariant
+with a bilateral-stable JSON shape. See
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md` "Admin-action effect
+equivalence" subsection (Task 8 lands this).
 
 ## Configuration
 
@@ -99,28 +108,48 @@ not assertable through it. Additionally `pre_requests` target the HCM
 listener (`port_key = PORT`), not the admin listener, so a path of
 `/ready` would land on the HCM's direct_response route (status 200,
 body `"ok\n"`), not the admin `/ready` endpoint. The drain trigger
-followed by the post-drain `DRAINING` scrape + the
+followed by the post-drain `/server_info` JSON scrape + the
 `data_plane_connection_refused` post-assertion together form the
-substantive end-to-end signal; the pre-drain baseline is covered in
-isolation by the in-process backstop at Task 10
-(`tests/differential/tests/admin_drain_listeners.rs`) where the
-admin `/ready` endpoint can be probed directly without the
+substantive end-to-end signal; the pre-drain baseline + the
+envoy-rust-side `/ready=503 DRAINING` flip are covered in isolation
+by the in-process backstop at Task 10
+(`crates/envoy-bin/tests/admin_drain_listeners.rs`) where the admin
+`/ready` endpoint can be probed directly without the cross-proxy
+`--drain-strategy` asymmetry constraint AND without the
 `Driver::PreRequest` HCM-routing constraint.
 
 ## Empirical allow-list seeding (SPEC §6 signpost 12)
 
-Fixture 0015 ships with a minimal expectations.yaml — the only body
-rule is the `BodyRule::TextLines { required_lines: ["DRAINING"] }`
-shape on the `/ready` scrape. There are no per-side allow-list
-entries seeded at fixture-landing time; if the first Docker-gated
-green run surfaces an envoy-only or envoy-rust-only line that the
-literal-content-match doesn't cover, additional allow-list entries
-land at Task 11's state-4 verification per the established 06.1 /
-06.3 / 08.1 seeding doctrine. The data_plane_connection_refused
-assertion is wire-level (kernel-side ECONNREFUSED / immediate-EOF /
-RST signals); it has no allow-list and is bilateral by construction —
-both proxies must refuse the connection within `within_ms` for the
-assertion to pass.
+Fixture 0015's `expectations.yaml` carries a single
+`BodyRule::JsonShape` rule on the post-drain `/server_info` scrape
+(the PLAN-sketched `/ready` scrape pivoted to `/server_info` per the
+empirical Task 8 investigation — upstream Envoy v1.33's `/ready` does
+NOT flip to 503 on `POST /drain_listeners` without the server-level
+`--drain-strategy immediate` CLI flag, NOT bootstrap-configurable).
+The JsonShape rule encodes the `/server_info` per-side allow-list
+seeded by mirroring fixture 0014's already-seeded subset for the same
+endpoint:
+
+- `required_keys: ["state"]` — both proxies MUST emit a `state` key
+  (the bilateral structural invariant).
+- `value_may_differ_keys` — `state`, `version`, `hot_restart_version`,
+  `command_line_options`, `node` (per-side value divergence permitted;
+  presence required).
+- `allowlist_envoy_only_keys` — `uptime_current_epoch`,
+  `uptime_all_epochs` (Envoy emits; envoy-rust does not).
+- `allowlist_envoy_rust_only_keys` — `uptime_current_epoch_seconds`,
+  `uptime_all_epochs_seconds` (envoy-rust emits; Envoy does not).
+
+The `data_plane_connection_refused` post-assertion is wire-level
+(kernel-side ECONNREFUSED / immediate-EOF / RST signals); it has no
+allow-list and is bilateral by construction — both proxies must
+refuse the connection within `within_ms` for the assertion to pass.
+This is the load-bearing bilateral wire-level drain invariant per
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md` "Admin-action effect
+equivalence" subsection. If a future Docker-gated re-run surfaces an
+envoy-only or envoy-rust-only `/server_info` key not in the above
+allow-list, the seeding extends here per the established 06.1 / 06.3
+/ 08.1 seeding doctrine.
 
 ## Cross-references
 

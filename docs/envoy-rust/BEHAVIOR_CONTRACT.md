@@ -156,6 +156,27 @@ value wins.
 > `/healthcheck/ok`) must drive observable wire-level effects on both
 > proxies. The internal mechanism is implementation-specific; only the
 > wire-level observable is contract.
+>
+> **For `POST /drain_listeners`, the bilateral wire-level invariant is
+> `data_plane_connection_refused` on the data-plane listener** —
+> kernel-side ECONNREFUSED / immediate-EOF / RST within the 5s
+> `DRAIN_BUDGET`. The admin-bookkeeping `/ready` flip is NOT a
+> bilateral invariant on `/drain_listeners`: upstream Envoy v1.33's
+> `/ready` does NOT flip to 503 on `POST /drain_listeners` without the
+> server-level `--drain-strategy immediate` CLI flag (NOT
+> bootstrap-configurable); envoy-rust per parent-08 SPEC §5.5 flips
+> `/ready` immediately on drain. Fixture 0015 (D17.2) therefore pairs
+> the `data_plane_connection_refused` post-assertion (the bilateral
+> wire-level invariant) with a `/server_info` JSON scrape (bilaterally
+> 200-with-JSON across the drain transition; `state` key presence is
+> the bilateral structural invariant; `state` VALUE is permitted to
+> differ across proxies). The envoy-rust-side `/ready=503 DRAINING`
+> flip is verified in isolation by the in-process backstop at
+> `crates/envoy-bin/tests/admin_drain_listeners.rs` (Task 10), which
+> does not face the cross-proxy `--drain-strategy` asymmetry. The
+> `/healthcheck/fail` + `/healthcheck/ok` rows below DO assert the
+> bilateral `/ready` flip because both proxies flip `/ready`
+> synchronously on those endpoints (no CLI-flag gap).
 
 | Action | Wire-level invariant |
 |---|---|

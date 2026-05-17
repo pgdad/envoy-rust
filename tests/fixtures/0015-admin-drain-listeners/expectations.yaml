@@ -4,15 +4,24 @@
 #   1. pre_admin_actions:   POST /drain_listeners → 200 (the drain
 #                           trigger; flips DrainState Live → Draining
 #                           on the receiving side).
-#   2. scrapes:             GET /ready → 503 with "DRAINING" text line
-#                           (post-drain admin /ready observation; both
-#                           proxies must emit 503 with body containing
-#                           the literal token "DRAINING").
+#   2. scrapes:             GET /server_info → 200 application/json
+#                           with required key `state` whose VALUE is
+#                           permitted to differ across proxies (the
+#                           empirical PLAN-vs-reality pivot — upstream
+#                           Envoy v1.33's /ready does NOT flip to 503
+#                           on POST /drain_listeners without the
+#                           server-level --drain-strategy immediate CLI
+#                           flag; /server_info is bilaterally 200-with-
+#                           JSON across the drain transition and its
+#                           `state` key presence is the bilateral
+#                           invariant — value bilateral-equivalence is
+#                           NOT asserted).
 #   3. post_admin_assertions: data_plane_connection_refused on the HCM
 #                           listener within 5s (wire-level drain effect:
 #                           data-plane listener MUST refuse-or-immediately-
 #                           close new connections per BEHAVIOR_CONTRACT.md
-#                           "Admin-action effect equivalence").
+#                           "Admin-action effect equivalence" — this
+#                           IS the bilateral wire-level drain invariant).
 #
 # YAML field order shows pre_admin_actions BEFORE pre_requests for
 # reader-ergonomics (drain trigger at the top of the block); the dispatch

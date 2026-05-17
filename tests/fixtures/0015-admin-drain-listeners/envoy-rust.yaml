@@ -3,9 +3,11 @@
 #   - request_headers_to_remove omitted (envoy-rust does not inject these).
 #   - generate_request_id omitted (envoy-rust does not inject x-request-id).
 # Admin listener IS retained — fixture 0015's whole purpose is differential
-# end-to-end exercise of /drain_listeners + /ready via Driver::AdminScrape;
-# admin_host_port plugs into {{ADMIN_PORT}} on the subject side just as it
-# plugs into the upstream side.
+# end-to-end exercise of /drain_listeners + /server_info via Driver::AdminScrape
+# (the scrape pivoted from PLAN-sketched /ready to landed /server_info per
+# the upstream-Envoy --drain-strategy gap; see envoy.yaml + expectations.yaml
+# docstrings + README "Driver" section); admin_host_port plugs into
+# {{ADMIN_PORT}} on the subject side just as it plugs into the upstream side.
 
 node:
   id: envoy-rust-phase-08.2-fixture-0015
