@@ -10,7 +10,7 @@
 **id:** `08.2`
 **slug:** `08.2-endpoint-triggered-drain` — assigned at the parent-08 state-2 split commit `56dee82` per the parent-08 SPEC §6.1 recommended split-shape (08.2 = drain machinery slice + fixture 0015 + parent-08 close + MVP-trunk close). Preserves the project's `NN.M-<slug>` pattern for sub-phases (mirrors 02.2 / 03.2 / 04.3 / 05.3 / 06.3 / 07.2 closing-sub-phase shapes).
 **directory:** exists at `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/` — created at the parent-08 state-2 split commit `56dee82` alongside the sibling `docs/envoy-rust/phases/08.1-admin-endpoint-surface/`. Contains `SPEC.md` (328 lines, 10 sections) carved out from the parent-08 SPEC's surface (the parent-08 SPEC committed at `0202e38` enumerated 17 deliverables; 08.2's SPEC covers D5e `/server_info` value rebind + D9 `/drain_listeners` + D10 `/healthcheck/fail` + `/healthcheck/ok` + D11 `DrainState` foundation + D12 listener observation + D13b `Arc<DrainState>` wiring + D14 three new drain stats + D16 harness `pre_admin_actions` + `post_admin_assertions` extensions + D17.2 fixture 0015 + D17.3b corpus seed + D17.4b in-process backstop + the `/ready` drain-aware patch + the parent-08 close-out narrative).
-**status:** phase 08.2 lifecycle **state 4-reached at THIS commit; state-5-next per next-skill below** (SPEC.md at `56dee82`; PLAN.md at `1aa250d`; implementation complete across 12 task commits + 2 review-driven fixups between state-2 base `1aa250d` and Task 10 HEAD `87eab1c`; §7.5 phase-done gate (a)-(e) GREEN at CI run `25989340550` HEAD `87eab1c`; gate (f) REVIEW.md defers to state 5). Advanced at THIS commit's STATE-advance per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session). ROADMAP row `08.2` STAYS `in-progress` (it flips `done` ONLY at the state-6 close-out commit per the schema invariant; mirrors the 08.1 / 07.2 / 06.3 state-4 → state-5 → state-6 cadence). Parent ROADMAP row `08` STAYS `in-progress` (08.2 is the closing sub-phase of parent-08; row `08` flips `done` only at 08.2's state-6 commit per the schema invariant "parent flips to `done` only after all sub-phases are `done`" — mirrors 02.2 → parent-02, 03.2 → parent-03, 04.3 → parent-04, 05.3 → parent-05, 06.3 → parent-06, 07.2 → parent-07). Sibling ROADMAP row `08.1` stays `done` (flipped at commit `3ed6af0`).
+**status:** phase 08.2 lifecycle **state 5-reached at THIS commit (REVIEW.md landed); state-6-next per next-skill below** (SPEC.md at `56dee82`; PLAN.md at `1aa250d`; implementation complete across 11 task commits + 2 review-driven fixups between state-2 base `1aa250d` and Task 10 HEAD `87eab1c`; Task 11 state-4 STATE-advance at predecessor `cade4b0`; §7.5 phase-done gate (a)-(e) GREEN at CI run `25989340550` HEAD `87eab1c`; gate (f) **CLOSED at THIS commit's REVIEW.md verdict: Approved with M-track follow-ups — zero Critical / zero Important / 8 Minor M1-M8 + 5 doc-staleness D1-D5 + 3 test/audit-trail T1-T3, all awareness-only / close-opportunistically**). Advanced at THIS commit's STATE-advance per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session). ROADMAP row `08.2` STAYS `in-progress` (it flips `done` ONLY at the state-6 close-out commit per the schema invariant; mirrors the 08.1 / 07.2 / 06.3 state-4 → state-5 → state-6 cadence). Parent ROADMAP row `08` STAYS `in-progress` (08.2 is the closing sub-phase of parent-08; row `08` flips `done` only at 08.2's state-6 commit per the schema invariant "parent flips to `done` only after all sub-phases are `done`" — mirrors 02.2 → parent-02, 03.2 → parent-03, 04.3 → parent-04, 05.3 → parent-05, 06.3 → parent-06, 07.2 → parent-07). Sibling ROADMAP row `08.1` stays `done` (flipped at commit `3ed6af0`).
 
 **Parent phase 08 (`08-admin-api-and-drain`) is `in-progress`** with sub-phases `08.1 (done), 08.2 (in-progress)` as of THIS commit. The parent-08 ROADMAP row `08` continues at `status: in-progress` (it flipped to `in-progress` at the predecessor commit `0202e38` when STATE.md first pointed at phase 08 with lifecycle state 2). With 08.2's state-6 close-out (several sessions out — the closing sub-phase of parent-08) the parent-08 row flips `in-progress` → `done` AND the MVP trunk stands **00→08 all `done`**, transitioning the project to the `BOOTSTRAP_PROMPT.md` §9 feature-family expansion (phases 09+). 08.2 ships AFTER 08.1 in execution order per ADR-0032 + 08.2 SPEC §5.1 (08.2's D9/D10 add new `AdminEndpoint` variants consuming 08.1's `Dispatch` enum; 08.2's `/server_info` D5e patches the value source on 08.1's `ServerInfoBody`; 08.2's D13b widens 08.1's `AdminHandler::new` signature; 08.2 closes the parent-08 ROADMAP row).
 
@@ -73,11 +73,23 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 30-34, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 5): the next session — operating as the **phase-08.2 state-5 reviewer** — invokes **`superpowers:requesting-code-review`** scoped to the range `1aa250d..HEAD` (the 08.2 state-2 standalone-PLAN base SHA `1aa250d` through THIS Task 11 state-4 STATE-advance commit's HEAD). The state-5 session writes `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/REVIEW.md` per the skill's per-phase REVIEW.md output. **The reviewed range** is 12 substantive task commits + 2 review-driven fixups + THIS state-4 STATE-advance commit (14 commits total over the state-3 arc + this state-4 commit).
+Per the phase lifecycle state machine (`SKILL_ROUTING.md` lines 36-43, verbatim from `BOOTSTRAP_PROMPT.md` §5 state 6): the next session — operating as the **phase-08.2 state-6 close-out session AND the parent-08 close-out session AND the MVP-trunk close-out session** — lands the **state-6 close-out commit per `BOOTSTRAP_PROMPT.md` §5.3 + §6 + 08.2 SPEC §9**. The commit is docs-only (no production code / no tests / no fixtures), title `phase 08.2: endpoint-triggered drain (drain_listeners, healthcheck/fail, healthcheck/ok) + DrainState + listener observation [parent 08 done] [MVP trunk complete]` (no ADR brackets — ledger stays ADR-0032; no ADRs landed in 08.2). The commit:
 
-**Standing context for the 08.2 state-5 reviewer:**
+1. Flips ROADMAP row `08.2` `in-progress` → `done`.
+2. Flips parent ROADMAP row `08` `in-progress` → `done` (the closing-sub-phase invariant; mirrors 02.2 → parent-02, 03.2 → parent-03, 04.3 → parent-04, 05.3 → parent-05, 06.3 → parent-06, 07.2 → parent-07).
+3. Advances STATE.md "Active phase" pointer to **"awaiting next planning"** — the **MVP trunk stands 00→08 all `done`**.
+4. Adds an MVP-trunk-completion narrative to STATE.md's "Notes" section (per parent-08 SPEC §6 + 08.2 SPEC §3 close-out narrative).
+5. Records the REVIEW.md's 8 Minor + 5 doc-staleness + 3 test/audit-trail carryforwards in a new "Phase-08.2 rollovers" subsection.
 
-- **§7.5 phase-done gate disposition** at THIS state-4 commit: **(a) PASS / (b) PASS / (c) PASS / (d) PASS / (e) PASS / (f) CLOSE-at-state-5-REVIEW.md** per the PROGRESS Task 11 table. CI evidence anchor: `https://github.com/pgdad/envoy-rust/actions/runs/25989340550` at HEAD `87eab1cff42b59aa983b55d74a482e4dbcdd5818`, conclusion `success`, completed `2026-05-17T11:19:57Z`, wall ~2m 10s. All 15 Docker-gated fixtures (`0001-tcp-echo` through `0015-admin-drain-listeners`) GREEN simultaneously in CI's `cargo test --workspace` step. h2spec held at the 05.2 baseline 99.31%. parse_bootstrap fuzz clean on Task 9's `admin_healthcheck_bootstrap.yaml` seed.
+The session that lands the state-6 commit may also fold the **REVIEW.md §3 D1-D5 doc-staleness fixes** (5 fixture files + BEHAVIOR_CONTRACT subsection still reference the PLAN-sketched `/ready` scrape rather than the landed `/server_info` pivot) into the same docs-bearing commit per the established 08.1 state-6 close-out precedent (which folded the 08.1 REVIEW M1 README fix into the close-out commit). D1-D5 are non-load-bearing doc drift; opportunistic close-in-close-out is the natural disposition. The 8 Minor M1-M8 + 3 test/audit-trail T1-T3 findings carry forward to future phases per their named-owner dispositions in REVIEW §4.
+
+After the state-6 close-out, **the project transitions to the `BOOTSTRAP_PROMPT.md` §9 feature-family expansion**: the session AFTER the state-6 close-out invokes `superpowers:brainstorming` scoped to the first feature-family phase per BOOTSTRAP_PROMPT.md §9 (feature-family ordering is a brainstorm-time decision; the headings are seeded in ROADMAP.md awaiting per-family elaboration).
+
+**Standing context for the 08.2 state-6 close-out session:**
+
+- **§7.5 phase-done gate disposition** at THIS state-5 commit: **(a) PASS / (b) PASS / (c) PASS / (d) PASS / (e) PASS / (f) PASS — CLOSED at THIS commit's REVIEW.md verdict (Approved with M-track follow-ups; zero Critical / zero Important / 8 Minor M1-M8 + 5 doc-staleness D1-D5 + 3 test/audit-trail T1-T3)**. CI evidence anchor (unchanged from state-4): `https://github.com/pgdad/envoy-rust/actions/runs/25989340550` at HEAD `87eab1cff42b59aa983b55d74a482e4dbcdd5818`, conclusion `success`, completed `2026-05-17T11:19:57Z`, wall ~2m 10s. All 15 Docker-gated fixtures (`0001-tcp-echo` through `0015-admin-drain-listeners`) GREEN simultaneously in CI's `cargo test --workspace` step. h2spec held at the 05.2 baseline 99.31%. parse_bootstrap fuzz clean on Task 9's `admin_healthcheck_bootstrap.yaml` seed. **REVIEW.md independently re-verified the CI evidence via `gh -R pgdad/envoy-rust run view 25989340550 --json conclusion,status,headSha,jobs`** — every PROGRESS Task 11 claim matched the JSON output exactly.
+
+- **REVIEW.md verdict landed at THIS commit: Approved with M-track follow-ups.** Mirrors 06.1 / 06.2 / 06.3 / 07.1 / 07.2 / 08.1 cadence (the consistent "zero Critical / zero Important / N Minor" verdict across this 7-sub-phase run is the project's mature-state-3 doctrine working as designed). The 8 Minor findings (M1 `drain` variable shadowing at `lib.rs:323`; M2 `Err(0)` sentinel discriminant collision at `drain.rs:204`; M3 BEHAVIOR_CONTRACT "100ms" unenforced budget; M4 `empty_200_ok()` omits content-type; M5 `drain_signal()` heap-allocates via Box::pin; M6 `admin_handler_new_6arg_tests` historical-name artifact; M7 `drain_signal()` "tens of microseconds" doc claim unmeasured; M8 `AdminEndpoint::render`'s `Ready` arm `unreachable!()` typestate refactor opportunity), 5 doc-staleness items (D1-D5: 5 fixture files + BEHAVIOR_CONTRACT subsection still reference the PLAN-sketched `/ready` scrape rather than landed `/server_info` pivot — file bodies correct; only docstrings/READMEs carry stale language), and 3 test/audit-trail polish items (T1 Task 6 duplicate-test deletion opportunity; T2 Task 5 negative-control test comments; T3 Task 4 doc-comment forward-references — no action needed) are all awareness-only / close-opportunistically with no hard-gated owner. None gates the state-6 close-out OR the parent-08 close-out OR the MVP-trunk close.
 
 - **08.2 execution-arc summary** (full per-task table in PROGRESS Task 11): 12 substantive task commits + 2 review-driven fixups across the state-3 arc between state-2 base `1aa250d` and Task 10 HEAD `87eab1c`. Task 1 `c1c9604` (D11 DrainState foundation) + Task 1 fixup `fddabd2` (drain_signal TOCTOU race + test hardening) + Task 2 `3b5d653` (D14 gauges) + Task 3 `b829f32` (D9/D10 three POST endpoints) + Task 4 `5600216` (D13b AdminHandler::new 7-arg widen) + Task 5 `60c5341` (D5e + D-ready) + Task 6 `970e7a5` (D12 Listener::serve 2-arg widening + RAII guard) + Task 7 `bc83f8e` (D16 Driver::AdminScrape extensions + 08.1 REVIEW M2 + M4 closures) + Task 7 fixup `8528c6a` (assert_data_plane_connection_refused I1+I2 PLAN alignment) + Task 8 `832abe6` (D17.2 fixture 0015 + Docker wrapper + BEHAVIOR_CONTRACT subsection) + Task 9 `9b94dd5` (D17.3b fuzz corpus seed) + Task 10 `87eab1c` (D17.4b in-process backstop) + Task 11 (THIS commit; state-4 STATE advance, docs-only).
 
@@ -117,21 +129,22 @@ Inputs the 08.2 state-5 reviewer should read, in order:
 
 ## Last commit
 
-08.2 Task 11 state-4-reached / state-5-next STATE-advance commit (THIS commit): `phase 08.2: task 11 — state-4 phase-done verification + STATE advance to state-5-next`.
+08.2 state-5 REVIEW.md commit (THIS commit): `phase 08.2: state 5 REVIEW.md Approved with M-track follow-ups`.
 
-Docs-only state-4 commit per the established state-4-reached cadence (mirrors 08.1 `03e6435` / 07.2 `f921fdd` / 06.3 `42fc726` / 06.2 `4262b64` / 06.1 `a5f795c`). No code changes; no test changes; no workspace dependency changes. Touches 2 files:
+Docs-only state-5 commit per the established state-5 cadence (mirrors 08.1 `7c5adf2` / 07.2 `ab01755` / 06.3 `e9c1828` / 06.2 `d0238e1` / 06.1 `499e374` / 05.3 `36edcda`). No code changes; no test changes; no workspace dependency changes. Touches 2 files:
 
-- **MODIFY** `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/PROGRESS.md` — appends new `## Task 11 — state-4 phase-done verification + STATE advance to state-5-next` section (~155 LoC) recording the §7.5 phase-done gate evidence at the predecessor Task 10 HEAD `87eab1cff42b59aa983b55d74a482e4dbcdd5818` per CI run `25989340550` (conclusion `success`, completed `2026-05-17T11:19:57Z`, wall ~2m 10s); the 6-part gate disposition table ((a)/(b)/(c)/(d)/(e) PASS / (f) CLOSE-at-state-5-REVIEW.md); per-fixture wrapper test-name + CI timestamp table for all 15 Docker-gated fixtures; verbatim local 5-gate output including `cargo deny check`; the Task 1-10 execution-arc summary table; carryforward dispositions; and state-5 entry routing.
+- **CREATE** `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/REVIEW.md` (~500 lines, 8 sections — header + §1 Verdict + §2 Strengths + §3 Issues (Critical / Important / Minor) + §4 Carryforward inventory + §5 Disposition decisions + §6 Phase-done gate verification + §7 Per-task code-quality reviewer finding dispositions + §8 State-4 evidence re-attestation + closing paragraph naming the state-6 close-out + MVP-trunk-close transition). Verdict: **Approved with M-track follow-ups** — zero Critical / zero Important / 8 Minor M1-M8 + 5 doc-staleness D1-D5 + 3 test/audit-trail T1-T3, all awareness-only / close-opportunistically; none gates the state-6 close-out OR the parent-08 close-out OR the MVP-trunk close.
 
-- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances active-phase status from `08.2` lifecycle state 3 (SPEC + PLAN exist; implementation incomplete) to `08.2` lifecycle state 4-reached / state-5-next (implementation complete; §7.5 gate (a)-(e) GREEN); rewrites Active-phase / Next-expected-skill / Last-commit / Last-updated; advances next-skill from `superpowers:subagent-driven-development` to `superpowers:requesting-code-review` scoped to the reviewed range `1aa250d..HEAD`; preserves all "Phase-NN rollovers" sections + "Phase-08 state-1 brainstorm" + "Phase-08 state-2 split" + "Phase-08.1 state-2 PLAN-write" + "Phase-08.1 rollovers" + "Phase-08.2 state-2 PLAN-write" subsections verbatim.
+- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances active-phase status from `08.2` lifecycle state 4-reached / state-5-next (implementation complete; §7.5 gate (a)-(e) GREEN) to `08.2` lifecycle state 5-reached / state-6-next (REVIEW.md landed; §7.5 gate (a)-(f) all PASS); rewrites Active-phase / Next-expected-skill / Last-commit / Last-updated; advances next-session routing from `superpowers:requesting-code-review` (state-5) to **state-6 close-out** (docs-only commit per `BOOTSTRAP_PROMPT.md` §5.3 + §6 + 08.2 SPEC §9; closes parent-08 + the MVP trunk); preserves all "Phase-NN rollovers" sections + "Phase-08 state-1 brainstorm" + "Phase-08 state-2 split" + "Phase-08.1 state-2 PLAN-write" + "Phase-08.1 rollovers" + "Phase-08.2 state-2 PLAN-write" subsections verbatim.
 
-No production code changes at this commit. No fixture changes. No test changes. DECISIONS.md unchanged at **ADR-0032** — no ADR lands at a state-4 STATE-advance commit per the D-3.5 append-only discipline + the recommended no-foundations-grants posture per 08.2 SPEC §7 + parent-08 SPEC §5.3. ADR-0033 stays reserved-available for the 08.2 state-6 close-out if reality forces it (it has not so far). BEHAVIOR_CONTRACT.md unchanged at this commit (the 3 new POST-endpoint body-shape rows + 3 new stat-name-mapping rows + the Admin-action effect equivalence subsection + the `/server_info` row note patch landed at execution-time Tasks 2/3/8 commits per the 06.x / 07.x / 08.1 doctrine; the state-4 commit does NOT add contract rows). ROADMAP.md unchanged at this commit (row `08.2` STAYS `in-progress` — flips `done` only at 08.2's state-6 commit per the closing-sub-phase invariant; parent row `08` STAYS `in-progress`). ENVOY_TARGET.md and rust-toolchain.toml untouched (D-3.7 / D-3.9 unchanged).
+No production code changes at this commit. No fixture changes. No test changes. DECISIONS.md unchanged at **ADR-0032** — no ADR lands at a state-5 REVIEW.md commit per the D-3.5 append-only discipline + the recommended no-foundations-grants posture per 08.2 SPEC §7 + parent-08 SPEC §5.3. ADR-0033 stays reserved-available for the 08.2 state-6 close-out if reality forces it (it has not so far; REVIEW.md verdict did not surface any foundations grant). BEHAVIOR_CONTRACT.md unchanged at this commit (the 3 new POST-endpoint body-shape rows + 3 new stat-name-mapping rows + the Admin-action effect equivalence subsection + the `/server_info` row note patch landed at execution-time Tasks 2/3/8 commits per the 06.x / 07.x / 08.1 doctrine; the state-5 commit does NOT add contract rows; the REVIEW §3 D5 doc-staleness on the "Admin-action effect equivalence" subsection's PLAN-prose-rather-than-empirical-iteration narrative is opportunistic-close at the state-6 close-out per REVIEW §4). ROADMAP.md unchanged at this commit (row `08.2` STAYS `in-progress` — flips `done` only at 08.2's state-6 commit per the closing-sub-phase invariant; parent row `08` STAYS `in-progress`). ENVOY_TARGET.md and rust-toolchain.toml untouched (D-3.7 / D-3.9 unchanged).
 
-**The §7.5 phase-done gate (a)-(e) is GREEN at the predecessor HEAD `87eab1c`** per CI run `25989340550`. Gate (f) (REVIEW.md approved) defers to state 5 per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session). This docs-only state-4 commit does NOT trigger a §7.5 re-run by itself — the predecessor's CI run carries forward unchanged (per the docs-only convention), and the next CI run (triggered by THIS commit's push) re-validates the docs-only edits compile cleanly through the 5 stable-toolchain gates.
+**The §7.5 phase-done gate (a)-(f) is fully GREEN at THIS commit** — gates (a)-(e) were GREEN at the predecessor state-4 HEAD `cade4b0` per CI run `25989340550`; gate (f) (REVIEW.md approved) CLOSES at THIS commit's REVIEW.md verdict. The state-6 close-out (next session) is unblocked per `BOOTSTRAP_PROMPT.md` §5.2 (no Critical or Important findings means the phase does NOT re-enter state 3). This docs-only state-5 commit does NOT trigger a §7.5 re-run by itself — the predecessor's CI run carries forward unchanged (per the docs-only convention), and the next CI run (triggered by THIS commit's push) re-validates the docs-only edits compile cleanly through the 5 stable-toolchain gates.
 
 **Predecessor commits (newest first; the 08.2 execution-arc + state-2 base):**
 
-- `87eab1c` — `phase 08.2: task 10 — D17.4b in-process backstop admin_drain_listeners.rs` (Task 10; immediate predecessor / former HEAD of `origin/main`; the state-4 CI evidence anchor's HEAD).
+- `cade4b0` — `phase 08.2: task 11 — state-4 phase-done verification + STATE advance to state-5-next` (Task 11 state-4 STATE-advance commit; immediate predecessor / former HEAD of `origin/main`; docs-only).
+- `87eab1c` — `phase 08.2: task 10 — D17.4b in-process backstop admin_drain_listeners.rs` (Task 10; the state-4 CI evidence anchor's HEAD).
 - `9b94dd5` — `phase 08.2: task 9 — D17.3b fuzz corpus seed (admin_healthcheck_bootstrap.yaml)` (Task 9).
 - `832abe6` — `phase 08.2: task 8 — D17.2 fixture 0015-admin-drain-listeners + Docker-gated wrapper + BEHAVIOR_CONTRACT Admin-action effect equivalence subsection` (Task 8).
 - `8528c6a` — `phase 08.2: task 7 fixup — assert_data_plane_connection_refused PLAN worked-example alignment (I1 + I2 closures)` (Task 7 fixup).
@@ -151,11 +164,27 @@ No production code changes at this commit. No fixture changes. No test changes. 
 
 ## Last updated
 
-2026-05-17 (08.2 Task 11 state-4-reached / state-5-next
-STATE-advance commit — docs-only state-4 commit per the
-established state-4-reached cadence mirroring 08.1 `03e6435` /
-07.2 `f921fdd` / 06.3 `42fc726` / 06.2 `4262b64` / 06.1 `a5f795c`.
-§7.5 phase-done gate (a)-(e) GREEN at the predecessor Task 10
+2026-05-17 (08.2 state-5 REVIEW.md commit — docs-only state-5
+commit per the established state-5 cadence mirroring 08.1
+`7c5adf2` / 07.2 `ab01755` / 06.3 `e9c1828` / 06.2 `d0238e1` /
+06.1 `499e374` / 05.3 `36edcda`. **REVIEW.md verdict: Approved
+with M-track follow-ups** — zero Critical / zero Important / 8
+Minor M1-M8 + 5 doc-staleness D1-D5 + 3 test/audit-trail T1-T3,
+all awareness-only / close-opportunistically; none gates the
+state-6 close-out OR the parent-08 close-out OR the MVP-trunk
+close. Both 08.1 REVIEW carryforwards (M2
+`value_may_differ_keys` doc-comment + M4 `walk_pointer`
+empty-segment guard) confirmed closed at Task 7 `bc83f8e`. Both
+review-driven fixup commits (Task 1 fixup `fddabd2` closing 1
+Critical + 3 Important; Task 7 fixup `8528c6a` closing 2
+Important + 2 opportunistic Minor) confirmed substantive via
+direct code spot-check at `crates/envoy-listener/src/drain.rs:230-249`
+(TOCTOU-safe Notified construction) + `tests/differential/src/lib.rs:1502-1593`
+(3-disposition drain-success acceptance + 200ms connect
+timeout). CI evidence anchor independently re-verified at this
+state-5 review via `gh -R pgdad/envoy-rust run view 25989340550`
+— every PROGRESS Task 11 claim matched the JSON output exactly.
+§7.5 phase-done gate (a)-(e) GREEN at the state-4 anchor Task 10
 HEAD `87eab1cff42b59aa983b55d74a482e4dbcdd5818` per CI run
 `25989340550` (conclusion `success`, completed
 `2026-05-17T11:19:57Z`, wall ~2m 10s, workflow `ci` —
@@ -167,59 +196,69 @@ known-failures.txt unchanged — 08.2 engages no H2-framing
 surfaces). parse_bootstrap fuzz clean on Task 9's
 `admin_healthcheck_bootstrap.yaml` corpus seed. All 5
 stable-toolchain gates (fmt / clippy / build / test / deny) GREEN
-locally + in CI. Gate (f) (REVIEW.md approved) defers to state 5
-per `BOOTSTRAP_PROMPT.md` §5.1. STATE.md advances active-phase
-status `08.2 state 3 (SPEC + PLAN exist; implementation
-incomplete)` → `08.2 state 4-reached / state-5-next
-(implementation complete; §7.5 gate (a)-(e) GREEN)`; next-skill
-`superpowers:subagent-driven-development` →
-`superpowers:requesting-code-review` scoped to the reviewed range
-`1aa250d..HEAD` (the 08.2 state-2 base SHA `1aa250d` through THIS
-Task 11 commit's HEAD; 14 task-arc commits + THIS state-4
-commit). Touches 2 files (PROGRESS.md + STATE.md) — no production
+locally + in CI. Gate (f) CLOSED at THIS commit's REVIEW.md
+verdict per `BOOTSTRAP_PROMPT.md` §5.1 + §5.2 (no Critical or
+Important findings means the phase does NOT re-enter state 3).
+STATE.md advances active-phase status `08.2 state 4-reached /
+state-5-next (implementation complete; §7.5 gate (a)-(e) GREEN)`
+→ `08.2 state 5-reached / state-6-next (REVIEW.md landed;
+§7.5 gate (a)-(f) all PASS)`; next-session routing advances from
+`superpowers:requesting-code-review` (state-5) → **state-6
+close-out** (docs-only commit per `BOOTSTRAP_PROMPT.md` §5.3 +
+§6 + 08.2 SPEC §9; closes parent-08 + the MVP trunk; flips
+ROADMAP rows `08.2` AND parent `08` both `in-progress → done`
+simultaneously per the closing-sub-phase invariant). Touches 2
+files (REVIEW.md CREATE + STATE.md MODIFY) — no production
 code change, no test change, no fixture change. ROADMAP row
 `08.2` STAYS `in-progress` (flips `done` only at 08.2's state-6
 commit per the closing-sub-phase invariant); parent row `08`
 STAYS `in-progress` (flips `done` only after 08.2 closes per the
 schema invariant); sibling row `08.1` stays `done`.
 DECISIONS.md unchanged at **ADR-0032** — no ADR lands at a
-state-4 STATE-advance commit per D-3.5 append-only discipline +
+state-5 REVIEW.md commit per D-3.5 append-only discipline +
 the recommended no-foundations-grants posture; ADR-0033 stays
 reserved-available for 08.2's state-6 close-out if reality forces
-it. BEHAVIOR_CONTRACT.md unchanged at this commit (the
+it (REVIEW.md verdict did not surface any foundations grant).
+BEHAVIOR_CONTRACT.md unchanged at this commit (the
 08.2-contributed rows landed at execution-time Tasks 2/3/8
 commits per the 06.x / 07.x / 08.1 doctrine). ENVOY_TARGET.md,
 rust-toolchain.toml untouched. All prior "Phase-NN rollovers"
 sections + the "Phase-08 state-1 brainstorm" + "Phase-08 state-2
 split" + "Phase-08.1 state-2 PLAN-write" + "Phase-08.1 rollovers"
 + "Phase-08.2 state-2 PLAN-write" subsections preserved verbatim.
-08.2 execution-arc summary (12 substantive task commits + 2
-review-driven fixups; recorded in the Task 11 PROGRESS narrative
-table): Task 1 `c1c9604` (D11) + Task 1 fixup `fddabd2` + Task 2
+08.2 execution-arc summary (11 substantive task commits + 2
+review-driven fixups + Task 11 state-4 STATE-advance commit;
+recorded in the Task 11 PROGRESS narrative table + the REVIEW.md
+header): Task 1 `c1c9604` (D11) + Task 1 fixup `fddabd2` + Task 2
 `3b5d653` (D14) + Task 3 `b829f32` (D9/D10) + Task 4 `5600216`
 (D13b) + Task 5 `60c5341` (D5e + D-ready) + Task 6 `970e7a5`
 (D12) + Task 7 `bc83f8e` (D16 + 08.1 M2/M4) + Task 7 fixup
 `8528c6a` + Task 8 `832abe6` (fixture 0015 + BEHAVIOR_CONTRACT
 subsection) + Task 9 `9b94dd5` (fuzz seed) + Task 10 `87eab1c`
-(in-process backstop) + Task 11 (THIS commit; state-4 STATE
-advance). 08.1 REVIEW M2 + M4 carryforward closures CLOSED at
-Task 7 `bc83f8e` per the harness-widening co-location; M3
-continues to carry forward indefinitely; the
+(in-process backstop) + Task 11 `cade4b0` (state-4 STATE advance)
++ THIS state-5 REVIEW.md commit. 08.1 REVIEW M2 + M4 carryforward
+closures CLOSED at Task 7 `bc83f8e` per the harness-widening
+co-location; M3 continues to carry forward indefinitely; the
 `filter_chains: []` process-note disposition closed at Task 10
 (option (b) workaround documented for future admin-only
 backstops; Task 10 itself uses HCM + direct_response shape).
-NEXT SESSION enters 08.2 lifecycle state 5 with
-`superpowers:requesting-code-review` scoped to range
-`1aa250d..HEAD`; writes
-`docs/envoy-rust/phases/08.2-endpoint-triggered-drain/REVIEW.md`
-per the skill's per-phase REVIEW.md output. With Approved
-verdict, state-6 (the session after) closes parent-08 + the MVP
-trunk (00→08 all `done`) per the closing-sub-phase invariant —
-that commit flips ROADMAP row `08.2` `in-progress` → `done` AND
-flips parent ROADMAP row `08` `in-progress` → `done` AND
-advances STATE.md "Active phase" pointer to "awaiting next
-planning" (the `BOOTSTRAP_PROMPT.md` §9 feature-family expansion
-begins at the next session per §9).)
+NEXT SESSION lands the **08.2 state-6 close-out commit** —
+docs-only per `BOOTSTRAP_PROMPT.md` §5.3 + §6 + 08.2 SPEC §9;
+title `phase 08.2: endpoint-triggered drain (drain_listeners,
+healthcheck/fail, healthcheck/ok) + DrainState + listener
+observation [parent 08 done] [MVP trunk complete]` (no ADR
+brackets — ledger stays ADR-0032); flips ROADMAP rows `08.2`
+AND parent `08` both `in-progress → done` simultaneously per
+the closing-sub-phase invariant; advances STATE.md "Active
+phase" pointer to "awaiting next planning"; **the MVP trunk
+stands 00→08 all `done`**; the project transitions to the
+`BOOTSTRAP_PROMPT.md` §9 feature-family expansion at the
+session AFTER state-6 close-out. The state-6 session MAY also
+fold the REVIEW.md §3 D1-D5 doc-staleness fixes into the same
+docs-bearing commit per the established 08.1 state-6 close-out
+precedent (which folded the 08.1 REVIEW M1 README fix into the
+close-out commit); D1-D5 are non-load-bearing and opportunistic
+close-in-close-out is the natural disposition.)
 
 ## Notes
 
