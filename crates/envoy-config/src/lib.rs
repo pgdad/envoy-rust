@@ -14,12 +14,12 @@ pub use bootstrap::{
     FileAccessLog, FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode,
     HeaderMutationConfig, HeaderMutationEntry, HeaderValue, HeaderValueOption,
     Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
-    HttpFilterTypedConfig, HttpProtocolOptions, Int64Range, LbEndpoint, LbPolicy, Listener,
-    LoadAssignment, LocalityLbEndpoints, Mutations, NetworkFilter, Node, Route, RouteAction,
-    RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, SafeRegex, SocketAddress,
-    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, TlsCertificate,
-    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
-    UpstreamTlsContext, VirtualHost,
+    HttpFilterTypedConfig, HttpProtocolOptions, HttpStatus, Int64Range, LbEndpoint, LbPolicy,
+    Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter,
+    Node, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
+    SafeRegex, SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
+    TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
+    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
@@ -292,6 +292,28 @@ pub enum ConfigError {
         position: usize,
         key: String,
     },
+
+    /// 09: LocalRateLimit filter has an empty `stat_prefix`.
+    #[error("HCM listener {listener:?}: LocalRateLimit filter has an empty stat_prefix")]
+    EmptyLocalRateLimitStatPrefix { listener: String },
+
+    /// 09: LocalRateLimit filter's `token_bucket.max_tokens` is zero.
+    #[error("HCM listener {listener:?}: LocalRateLimit filter token_bucket.max_tokens must be > 0")]
+    TokenBucketMaxTokensMustBePositive { listener: String },
+
+    /// 09: LocalRateLimit filter's `token_bucket.fill_interval` is missing, has
+    /// the wrong shape, has an unsupported unit suffix, or parses to zero.
+    #[error(
+        "HCM listener {listener:?}: LocalRateLimit filter token_bucket.fill_interval is invalid: {message}"
+    )]
+    InvalidTokenBucketFillInterval { listener: String, message: String },
+
+    /// 09: LocalRateLimit filter's `status.code` is not 429. Phase 09 accepts
+    /// 429 only.
+    #[error(
+        "HCM listener {listener:?}: LocalRateLimit filter status.code {code} is unsupported (phase 09 accepts 429 only)"
+    )]
+    UnsupportedLocalRateLimitStatusCode { listener: String, code: u16 },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

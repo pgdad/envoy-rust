@@ -36,7 +36,7 @@ impl HttpFilterInstance {
     /// `FilterPipeline::build_from_config`, not here).
     pub(crate) fn build(
         hf: &envoy_config::HttpFilter,
-        _position: usize,
+        position: usize,
     ) -> Result<Self, FilterError> {
         match &hf.typed_config {
             envoy_config::HttpFilterTypedConfig::Router(_cfg) => {
@@ -45,6 +45,20 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::HeaderMutation(cfg) => Ok(
                 HttpFilterInstance::HeaderMutation(HeaderMutationFilter::build_from_config(cfg)?),
             ),
+            // Phase 09 Task 1: the `HttpFilterTypedConfig::LocalRateLimit`
+            // variant lands at config-load time (envoy-config schema +
+            // validator) BEFORE the runtime dispatch arm lands (Task 4 adds
+            // the `HttpFilterInstance::LocalRateLimit` variant + the build
+            // dispatch). For the interim window (Tasks 1-3), the build site
+            // rejects the variant with `UnsupportedFilterType` so the
+            // workspace builds cleanly without a `todo!()` runtime panic.
+            // Task 4 replaces this arm with the proper dispatch.
+            envoy_config::HttpFilterTypedConfig::LocalRateLimit(_cfg) => {
+                Err(FilterError::UnsupportedFilterType {
+                    position,
+                    name: hf.name.clone(),
+                })
+            }
         }
     }
 

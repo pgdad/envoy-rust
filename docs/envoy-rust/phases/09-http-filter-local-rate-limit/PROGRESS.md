@@ -205,7 +205,130 @@ _(Per-task `### Task N — <name>` subsections append at state-3 task commits pe
 
 ### Task 1 — D1 envoy-config schema + D2 validator (co-located)
 
-_(Pending state-3 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `b9da8d4` — `phase 09: state-2 standalone PLAN.md`.
+
+**Work summary.** Landed the LocalRateLimit envoy-config schema + parse-time validator
+per PLAN Task 1 (SPEC §3 D1 + D2). The schema adds 3 new schema structs
+(`LocalRateLimitConfig`, `TokenBucket`, `HttpStatus`) + 1 new `HttpFilterTypedConfig`
+enum variant (`LocalRateLimit(LocalRateLimitConfig)`) + 1 default-helper
+(`default_status`) — note that `HeaderValueOption` + `HeaderValue` were NOT re-landed
+(reused from 07.2; see deviation #1 below). The validator adds 4 new `ConfigError`
+variants (`EmptyLocalRateLimitStatPrefix`, `TokenBucketMaxTokensMustBePositive`,
+`InvalidTokenBucketFillInterval`, `UnsupportedLocalRateLimitStatusCode`) + 1 new
+dispatch arm in `validate_http_filters` + 1 new sub-validator
+(`validate_local_rate_limit_config`) + 1 new `parse_duration` helper.
+
+**Files modified (4):**
+- `crates/envoy-config/src/lib.rs` — 4 new `ConfigError` variants; 3 new `pub use`
+  re-exports (`HttpStatus, LocalRateLimitConfig, TokenBucket` placed alphabetically
+  within the existing `pub use bootstrap::{...}` block).
+- `crates/envoy-config/src/bootstrap.rs` — new variant on `HttpFilterTypedConfig`; 3
+  new schema struct definitions + 1 `default_status()` helper; 1 new match arm on
+  `validate_http_filters`; 2 new helper functions (`validate_local_rate_limit_config`
+  + `parse_duration`); `Clone` derive added to existing `HeaderValueOption` and
+  `HeaderValue` (so `LocalRateLimitConfig` can derive `Clone` for downstream
+  reuse — Tasks 3/7); 16 new unit tests in the new `local_rate_limit_tests`
+  submodule under the existing `mod tests` block (line 7130 area).
+- `crates/envoy-filter/src/instance.rs` — cross-crate bridge arm: the new
+  `HttpFilterTypedConfig::LocalRateLimit` variant must be handled in the
+  `HttpFilterInstance::build` match (otherwise non-exhaustive match breaks the
+  workspace build). The interim arm returns `FilterError::UnsupportedFilterType`;
+  Task 4 replaces it with the proper `HttpFilterInstance::LocalRateLimit` dispatch.
+  Comment in the source explains the deferral.
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` — this
+  subsection (per-task PROGRESS cadence).
+
+**Tests landed (16 new; 209 → 225 in envoy-config lib).**
+1. `deserialize_local_rate_limit_minimal_succeeds`
+2. `deserialize_local_rate_limit_with_status_succeeds`
+3. `deserialize_local_rate_limit_with_response_headers_succeeds` (4 assertions
+   including `append_action: AppendIfExistsOrAdd` — see deviation #1)
+4. `deserialize_local_rate_limit_rejects_unknown_field`
+5. `validate_accepts_local_rate_limit_followed_by_router`
+6. `validate_rejects_empty_stat_prefix`
+7. `validate_rejects_zero_max_tokens`
+8. `validate_rejects_zero_fill_interval`
+9. `validate_rejects_unparseable_fill_interval`
+10. `validate_rejects_non_429_status_code`
+11. `validate_rejects_local_rate_limit_with_wrong_name`
+12. `parse_duration_accepts_seconds`
+13. `parse_duration_accepts_milliseconds`
+14. `parse_duration_accepts_microseconds`
+15. `parse_duration_rejects_unknown_unit`
+16. `parse_duration_rejects_empty`
+
+**LoC delta (production + tests; doc-comments excluded).** Production: ~+135 LoC
+(schema structs + variant + helper + 2 validator functions in `bootstrap.rs`; 4
+ConfigError variants + 3 re-exports in `lib.rs`; bridge arm in `instance.rs`). Tests:
+~+200 LoC (16 new tests in `local_rate_limit_tests` submodule). Total: ~+335 LoC.
+Under PLAN §3's Task-1 projection (~120 production + ~150 tests = ~270); the
+overshoot is the cross-crate bridge arm in `instance.rs` (~25 LoC) + the helper
+plumbing for the AppendAction-bearing test assertion (~10 LoC).
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — PASS
+- `cargo build --workspace --all-targets` — PASS
+- `cargo test --workspace` — PASS (729 passed, 0 failed, 2 ignored)
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok, sources ok)
+
+**Per-task deviations from PLAN (2; the 8th + 9th discovered-at-task-time SPEC
+corrections — extends the PLAN §1 list of 7).**
+
+1. **Discovered-at-task-time PLAN-write SPEC correction (8th — extends the PLAN §1
+   list of 7).** PLAN Step 4 proposed adding new `pub struct HeaderValueOption
+   { pub header: Header }` and `pub struct Header { pub key: String, pub value: String }`
+   definitions to `crates/envoy-config/src/bootstrap.rs`. These collide with the
+   existing 07.2-landed `HeaderValueOption { header: HeaderValue, append_action:
+   AppendAction }` (lines 491-498 of `bootstrap.rs` at HEAD `b9da8d4`) and `HeaderValue
+   { key, value }` (lines 500-503) — both re-exported from `lib.rs:15`. The existing
+   types are upstream-Envoy-canonical (`envoy.config.core.v3.HeaderValueOption`),
+   and upstream Envoy v1.33's `envoy.extensions.filters.http.local_ratelimit.v3.
+   LocalRateLimit.response_headers_to_add` is `repeated config.core.v3.HeaderValueOption`
+   — the same proto. **Resolution: reuse the existing 07.2 types.**
+   `LocalRateLimitConfig.response_headers_to_add: Vec<HeaderValueOption>` resolves
+   to the existing type. The `deserialize_local_rate_limit_with_response_headers_succeeds`
+   test YAML adds `append_action: APPEND_IF_EXISTS_OR_ADD` to the response-header
+   entry (upstream-canonical), plus a 4th assertion verifying the parsed
+   AppendAction value. lib.rs re-exports drop the (non-existent) `Header` and
+   (already-re-exported) `HeaderValueOption`; keep `HttpStatus, LocalRateLimitConfig,
+   TokenBucket` additions. `AppendAction` was already re-exported from `lib.rs:11`
+   (verified at task time); no additional re-export needed. Sub-action: `Clone` was
+   added to existing `HeaderValueOption` and `HeaderValue` so the new
+   `LocalRateLimitConfig` (which embeds `Vec<HeaderValueOption>`) can derive `Clone`
+   — purely additive change; HeaderMutation call sites don't clone these types. The
+   unresolved follow-on impact: Task 5's fixture 0016 YAML must also include
+   `append_action: APPEND_IF_EXISTS_OR_ADD` on any LocalRateLimit
+   `response_headers_to_add` entries (the fixture-0016 sketch in PLAN §3 doesn't add
+   `response_headers_to_add` anyway, so the surface engagement is zero). No semantic
+   loss; the change is upstream-canonical.
+
+2. **Discovered-at-task-time PLAN-write SPEC correction (9th — cross-crate ripple).**
+   Adding the new `HttpFilterTypedConfig::LocalRateLimit(LocalRateLimitConfig)`
+   variant in `crates/envoy-config/src/bootstrap.rs` triggers a non-exhaustive
+   `match` error in `crates/envoy-filter/src/instance.rs:41` (the
+   `HttpFilterInstance::build` match on `&hf.typed_config`). PLAN Task 1's "Files to
+   stage" list (3 files) did not anticipate this cross-crate ripple. **Resolution:**
+   stage 4 files instead of 3; add a bridge arm in `instance.rs::build` that returns
+   `FilterError::UnsupportedFilterType` for the `LocalRateLimit` arm during the
+   Tasks 1-3 interim window. Task 4 (which adds
+   `HttpFilterInstance::LocalRateLimit(LocalRateLimitFilter)` per PLAN Step 4 +
+   widens `build_from_config` per lock-in #25) replaces this interim arm with the
+   proper dispatch (uses Task 3's `LocalRateLimitFilter::build_from_config(cfg,
+   &registry)`). The bridge arm exists in code with a comment block explaining the
+   deferral. No tests assert on `UnsupportedFilterType` for `LocalRateLimit` — the
+   error is only reachable if a caller tries to build an `HttpFilterInstance` from a
+   `LocalRateLimit` typed-config during the Tasks 1-3 window; the config-validator
+   doesn't take this path, so the surface engagement is zero until Task 4. (At Task
+   4 the bridge arm is gone, so no defensive test is wasted at Task 1.)
+
+**Carryforward dispositions unchanged.** The 07.2 REVIEW M1 close site (Task 4) is
+not engaged at Task 1.
+
+**STATE.md / ROADMAP.md / BEHAVIOR_CONTRACT.md / DECISIONS.md / ENVOY_TARGET.md /
+rust-toolchain.toml diffs at this commit:** None (per PLAN-write expectation; see
+state-2 commit context above for the cadence rule).
 
 ### Task 2 — D3 hand-rolled token bucket primitive + concurrency torture test
 

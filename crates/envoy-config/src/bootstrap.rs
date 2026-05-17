@@ -449,6 +449,11 @@ pub enum HttpFilterTypedConfig {
         rename = "type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation"
     )]
     HeaderMutation(HeaderMutationConfig),
+
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit"
+    )]
+    LocalRateLimit(LocalRateLimitConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -464,6 +469,58 @@ pub struct RouterConfig {}
 #[serde(deny_unknown_fields)]
 pub struct HeaderMutationConfig {
     pub mutations: Mutations,
+}
+
+/// Configuration for `envoy.filters.http.local_ratelimit` (phase 09).
+///
+/// Minimum-viable surface per phase-09 SPEC §3 D1: filter-chain config only;
+/// no per-route variation; no descriptors; no per-downstream-connection
+/// scope; no runtime fractional overrides. The 5 upstream-Envoy fields
+/// (`descriptors`, `local_rate_limit_per_downstream_connection`,
+/// `filter_enabled`, `filter_enforced`, `request_headers_to_add_when_not_enforced`)
+/// are explicitly NOT modeled at the 09 baseline; serde
+/// `deny_unknown_fields` rejects them.
+///
+/// `response_headers_to_add` reuses the 07.2-landed
+/// `HeaderValueOption { header: HeaderValue, append_action: AppendAction }`
+/// type. Upstream Envoy v1.33's
+/// `envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit.response_headers_to_add`
+/// is `repeated config.core.v3.HeaderValueOption` — the same proto type as
+/// HeaderMutation uses — so each entry must carry an `append_action`
+/// (typically `APPEND_IF_EXISTS_OR_ADD`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalRateLimitConfig {
+    pub stat_prefix: String,
+    pub token_bucket: TokenBucket,
+    #[serde(default)]
+    pub response_headers_to_add: Vec<HeaderValueOption>,
+    #[serde(default = "default_status")]
+    pub status: HttpStatus,
+}
+
+/// Token-bucket parameters for the `LocalRateLimit` filter. `fill_interval`
+/// is deserialized as a free-form YAML scalar and parsed to `Duration` at
+/// validate-time via `parse_duration` (supports `"<N>s"` / `"<N>ms"` /
+/// `"<N>us"` shapes per upstream Envoy v1.33's documented Duration formats).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TokenBucket {
+    pub max_tokens: u32,
+    pub tokens_per_fill: u32,
+    pub fill_interval: serde_yaml::Value,
+}
+
+/// HTTP status code for the synthesized rate-limited response. Phase 09
+/// accepts `code: 429` only; the validator rejects any other value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpStatus {
+    pub code: u16,
+}
+
+fn default_status() -> HttpStatus {
+    HttpStatus { code: 429 }
 }
 
 /// The request-side and response-side mutation lists. Both default to empty
@@ -487,7 +544,12 @@ pub struct HeaderMutationEntry {
 }
 
 /// `HeaderValueOption` — a header key/value plus the append action.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+///
+/// `Clone` added at phase 09 to allow the LocalRateLimitConfig
+/// (which embeds `Vec<HeaderValueOption>` in `response_headers_to_add`)
+/// to derive `Clone`. The change is additive; HeaderMutation call sites
+/// don't clone HeaderValueOption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderValueOption {
     pub header: HeaderValue,
@@ -495,7 +557,9 @@ pub struct HeaderValueOption {
 }
 
 /// `HeaderValue` — the literal header key + value.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+///
+/// `Clone` added at phase 09 — see `HeaderValueOption` doc-comment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HeaderValue {
     pub key: String,
@@ -1627,6 +1691,14 @@ pub(crate) fn validate_http_filters(
                 validate_header_mutation_entries(&cfg.mutations.request_mutations, listener_name)?;
                 validate_header_mutation_entries(&cfg.mutations.response_mutations, listener_name)?;
             }
+            crate::HttpFilterTypedConfig::LocalRateLimit(cfg) => {
+                if f.name != "envoy.filters.http.local_ratelimit" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_local_rate_limit_config(cfg, listener_name)?;
+            }
         }
     }
 
@@ -1696,6 +1768,86 @@ fn validate_header_mutation_entries(
         }
     }
     Ok(())
+}
+
+/// Validate one LocalRateLimit filter config. Phase 09 (SPEC §3 D2):
+///   - stat_prefix non-empty
+///   - token_bucket.max_tokens > 0
+///   - token_bucket.fill_interval parses to a Duration > 0
+///   - status.code == 429 (phase 09 accepts 429 only)
+fn validate_local_rate_limit_config(
+    cfg: &crate::LocalRateLimitConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if cfg.stat_prefix.is_empty() {
+        return Err(crate::ConfigError::EmptyLocalRateLimitStatPrefix {
+            listener: listener_name.to_string(),
+        });
+    }
+    if cfg.token_bucket.max_tokens == 0 {
+        return Err(crate::ConfigError::TokenBucketMaxTokensMustBePositive {
+            listener: listener_name.to_string(),
+        });
+    }
+    let fill = cfg.token_bucket.fill_interval.as_str().ok_or_else(|| {
+        crate::ConfigError::InvalidTokenBucketFillInterval {
+            listener: listener_name.to_string(),
+            message: "fill_interval must be a string like \"60s\" / \"250ms\" / \"500us\""
+                .to_string(),
+        }
+    })?;
+    let dur =
+        parse_duration(fill).map_err(|msg| crate::ConfigError::InvalidTokenBucketFillInterval {
+            listener: listener_name.to_string(),
+            message: msg,
+        })?;
+    if dur.is_zero() {
+        return Err(crate::ConfigError::InvalidTokenBucketFillInterval {
+            listener: listener_name.to_string(),
+            message: "fill_interval must be > 0".to_string(),
+        });
+    }
+    if cfg.status.code != 429 {
+        return Err(crate::ConfigError::UnsupportedLocalRateLimitStatusCode {
+            listener: listener_name.to_string(),
+            code: cfg.status.code,
+        });
+    }
+    Ok(())
+}
+
+/// Hand-rolled Duration string parser covering upstream Envoy v1.33's
+/// documented Duration shapes (`"<N>s"` / `"<N>ms"` / `"<N>us"`). Returns
+/// the parsed `Duration` on success; an error message on failure. Lands
+/// inline here per phase-09 SPEC §5.2's no-foundations-grant posture
+/// (no `humantime` / `humantime-serde` pull).
+pub(crate) fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    if s.is_empty() {
+        return Err("empty duration string".to_string());
+    }
+    // Order matters: "ms" / "us" before "s" because the longer suffixes share
+    // the trailing 's' character.
+    if let Some(num) = s.strip_suffix("ms") {
+        let n: u64 = num
+            .parse()
+            .map_err(|e| format!("invalid millisecond value {num:?}: {e}"))?;
+        return Ok(std::time::Duration::from_millis(n));
+    }
+    if let Some(num) = s.strip_suffix("us") {
+        let n: u64 = num
+            .parse()
+            .map_err(|e| format!("invalid microsecond value {num:?}: {e}"))?;
+        return Ok(std::time::Duration::from_micros(n));
+    }
+    if let Some(num) = s.strip_suffix("s") {
+        let n: u64 = num
+            .parse()
+            .map_err(|e| format!("invalid second value {num:?}: {e}"))?;
+        return Ok(std::time::Duration::from_secs(n));
+    }
+    Err(format!(
+        "unsupported duration unit in {s:?} (expected suffix s / ms / us)"
+    ))
 }
 
 /// RFC 7230 §3.2.6 `token` validation: a header field name is a non-empty
@@ -6980,6 +7132,240 @@ static_resources:
                 }
                 other => panic!("expected UnsupportedHttpFilter, got {other:?}"),
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 09 — LocalRateLimit envoy-config schema + validator tests
+    // (Task 1; see docs/envoy-rust/phases/09-http-filter-local-rate-limit/PLAN.md)
+    // -------------------------------------------------------------------
+    mod local_rate_limit_tests {
+        use super::super::{parse_duration, validate_http_filters};
+        use crate::{
+            AppendAction, ConfigError, HttpFilter, HttpFilterTypedConfig, HttpStatus,
+            LocalRateLimitConfig, TokenBucket,
+        };
+
+        fn parse(yaml: &str) -> Result<LocalRateLimitConfig, serde_yaml::Error> {
+            serde_yaml::from_str(yaml)
+        }
+
+        #[test]
+        fn deserialize_local_rate_limit_minimal_succeeds() {
+            let yaml = r#"
+stat_prefix: phase_09
+token_bucket:
+  max_tokens: 3
+  tokens_per_fill: 0
+  fill_interval: 60s
+"#;
+            let cfg = parse(yaml).expect("minimal LocalRateLimit parses");
+            assert_eq!(cfg.stat_prefix, "phase_09");
+            assert_eq!(cfg.token_bucket.max_tokens, 3);
+            assert_eq!(cfg.token_bucket.tokens_per_fill, 0);
+            assert_eq!(cfg.status.code, 429);
+            assert!(cfg.response_headers_to_add.is_empty());
+        }
+
+        #[test]
+        fn deserialize_local_rate_limit_with_status_succeeds() {
+            let yaml = r#"
+stat_prefix: phase_09
+token_bucket:
+  max_tokens: 3
+  tokens_per_fill: 0
+  fill_interval: 60s
+status:
+  code: 429
+"#;
+            let cfg = parse(yaml).expect("with status parses");
+            assert_eq!(cfg.status.code, 429);
+        }
+
+        #[test]
+        fn deserialize_local_rate_limit_with_response_headers_succeeds() {
+            let yaml = r#"
+stat_prefix: phase_09
+token_bucket:
+  max_tokens: 3
+  tokens_per_fill: 0
+  fill_interval: 60s
+response_headers_to_add:
+  - header:
+      key: x-rate-limit-policy
+      value: phase-09
+    append_action: APPEND_IF_EXISTS_OR_ADD
+"#;
+            let cfg = parse(yaml).expect("with response_headers_to_add parses");
+            assert_eq!(cfg.response_headers_to_add.len(), 1);
+            assert_eq!(
+                cfg.response_headers_to_add[0].header.key,
+                "x-rate-limit-policy"
+            );
+            assert_eq!(cfg.response_headers_to_add[0].header.value, "phase-09");
+            assert_eq!(
+                cfg.response_headers_to_add[0].append_action,
+                AppendAction::AppendIfExistsOrAdd
+            );
+        }
+
+        #[test]
+        fn deserialize_local_rate_limit_rejects_unknown_field() {
+            let yaml = r#"
+stat_prefix: phase_09
+token_bucket:
+  max_tokens: 3
+  tokens_per_fill: 0
+  fill_interval: 60s
+descriptors: []
+"#;
+            let err = parse(yaml).expect_err("unknown field rejected by deny_unknown_fields");
+            assert!(format!("{err}").contains("descriptors"), "err: {err}");
+        }
+
+        fn make_filter(cfg: LocalRateLimitConfig) -> HttpFilter {
+            HttpFilter {
+                name: "envoy.filters.http.local_ratelimit".to_string(),
+                typed_config: HttpFilterTypedConfig::LocalRateLimit(cfg),
+            }
+        }
+
+        fn router_filter() -> HttpFilter {
+            HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+            }
+        }
+
+        fn ok_cfg() -> LocalRateLimitConfig {
+            LocalRateLimitConfig {
+                stat_prefix: "phase_09".to_string(),
+                token_bucket: TokenBucket {
+                    max_tokens: 3,
+                    tokens_per_fill: 0,
+                    fill_interval: serde_yaml::Value::String("60s".to_string()),
+                },
+                response_headers_to_add: Vec::new(),
+                status: HttpStatus { code: 429 },
+            }
+        }
+
+        #[test]
+        fn validate_accepts_local_rate_limit_followed_by_router() {
+            let filters = vec![make_filter(ok_cfg()), router_filter()];
+            validate_http_filters(&filters, "ingress_http").expect("valid chain");
+        }
+
+        #[test]
+        fn validate_rejects_empty_stat_prefix() {
+            let mut cfg = ok_cfg();
+            cfg.stat_prefix = String::new();
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::EmptyLocalRateLimitStatPrefix { ref listener } if listener == "ingress_http"
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_zero_max_tokens() {
+            let mut cfg = ok_cfg();
+            cfg.token_bucket.max_tokens = 0;
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::TokenBucketMaxTokensMustBePositive { ref listener } if listener == "ingress_http"
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_zero_fill_interval() {
+            let mut cfg = ok_cfg();
+            cfg.token_bucket.fill_interval = serde_yaml::Value::String("0s".to_string());
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidTokenBucketFillInterval { .. }),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_unparseable_fill_interval() {
+            let mut cfg = ok_cfg();
+            cfg.token_bucket.fill_interval = serde_yaml::Value::String("forever".to_string());
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidTokenBucketFillInterval { .. }),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_non_429_status_code() {
+            let mut cfg = ok_cfg();
+            cfg.status = HttpStatus { code: 503 };
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::UnsupportedLocalRateLimitStatusCode { code, .. } if code == 503
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_local_rate_limit_with_wrong_name() {
+            let mut filter = make_filter(ok_cfg());
+            filter.name = "envoy.filters.http.something_else".to_string();
+            let filters = vec![filter, router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::UnsupportedHttpFilter { .. }),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn parse_duration_accepts_seconds() {
+            let d = parse_duration("60s").expect("60s parses");
+            assert_eq!(d, std::time::Duration::from_secs(60));
+        }
+
+        #[test]
+        fn parse_duration_accepts_milliseconds() {
+            let d = parse_duration("250ms").expect("250ms parses");
+            assert_eq!(d, std::time::Duration::from_millis(250));
+        }
+
+        #[test]
+        fn parse_duration_accepts_microseconds() {
+            let d = parse_duration("500us").expect("500us parses");
+            assert_eq!(d, std::time::Duration::from_micros(500));
+        }
+
+        #[test]
+        fn parse_duration_rejects_unknown_unit() {
+            let err = parse_duration("60m")
+                .expect_err("60m has no documented Duration shape at phase 09");
+            assert!(err.contains("unit"), "err: {err}");
+        }
+
+        #[test]
+        fn parse_duration_rejects_empty() {
+            let err = parse_duration("").expect_err("empty rejected");
+            assert!(!err.is_empty());
         }
     }
 }
