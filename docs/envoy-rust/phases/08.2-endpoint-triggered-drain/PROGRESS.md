@@ -1379,3 +1379,230 @@ No differential-fixture or wrapper-count change — Task 10 is a Docker-free in-
 In-process backstop surface delta: the `envoy-bin` integration-tests directory grows from **13 → 14** test binaries. The new `admin_drain_listeners.rs` is the in-process Docker-free complement to Task 8's Docker-gated `0015-admin-drain-listeners` differential wrapper — same admin-action sequence + same wire-shape assertions, but Docker-independent and runnable under plain `cargo test --workspace`. With Task 10 landed, the BEHAVIOR_CONTRACT.md "Admin-action effect equivalence" subsection is covered by three orthogonal surfaces: parse-validate (Task 9 fuzz seed) + Docker-bilateral (Task 8 fixture 0015) + in-process-wire (Task 10 this backstop).
 
 Flakiness assessment: the data-plane refuse-or-EOF check has a 5-second budget with 100ms-period polling (50 connect attempts maximum). Empirically the drain is observable on the first or second poll (the `Listener::serve` drain arm responds to `notify_waiters()` within tens of microseconds per the parent-08 SPEC §5.6 model; `drop(listener)` runs synchronously inside the same `tokio::select!` arm), so the 5s budget is ~50x the typical observation window. Single empirical run on macOS 25.4 / aarch64 / native: 0.77s total (drain observed on first poll). No flakiness observed in local re-runs of the test binary; the budget headroom is intentional per the PLAN's "should be plenty" framing.
+
+---
+
+## Task 11 — state-4 phase-done verification + STATE advance to state-5-next
+
+**Commit:** `<sha-pending>` — `phase 08.2: task 11 — state-4 phase-done verification + STATE advance to state-5-next`
+**LoC delta:** +~155 doc (this PROGRESS Task 11 narrative), +~75 docs (STATE.md "Active phase" status flip + "Next expected skill" flip + "Last commit" rewrite + "Last updated" rewrite). Net +~230 insertions, ~25 deletions. **No production code change.** **No fixture change.** **No test change.** Docs-only commit landing the §7.5 phase-done gate evidence + advancing STATE.md from `08.2` lifecycle state 3 → state-4-reached / state-5-next.
+
+### Work summary
+
+Substantive docs-only commit at this HEAD materializes the §7.5 phase-done gate evidence for phase 08.2 and advances STATE.md to state-5-next. The §7.5 phase-done gate (a)–(e) are all GREEN at the predecessor HEAD `87eab1cff42b59aa983b55d74a482e4dbcdd5818` (Task 10 — D17.4b in-process backstop) per **CI run `25989340550`** (conclusion `success`, completed `2026-05-17T11:19:57Z`, wall ~2m 10s). Gate (f) (`REVIEW.md` approved) defers to state 5 per `BOOTSTRAP_PROMPT.md` §5.1.
+
+This commit mirrors the 08.1 Task 14 (`03e6435`) / 07.2 Task 10 (`f921fdd`) / 06.3 Task 12 (`42fc726`) state-4-reached precedents — docs-only PROGRESS append + STATE.md status / next-skill / last-commit / last-updated rewrites, no production code or test changes. Unlike the 08.1 Task 14 precedent (which folded a fixture-0014 cross-platform Docker bridge-IP fix at the state-4 commit because the predecessor Task 13 CI run was deterministic-failure), the 08.2 Task 10 predecessor CI run was GREEN on first push at HEAD `87eab1c`, so no in-flight fixture-coverage fix is required — Task 11 lands as a pure docs-only 1-commit shape per the 07.2 Task 10 / 06.3 Task 12 cadence (NOT the 08.1 Task 14 2-commit pattern).
+
+### CI evidence anchor (state-4)
+
+**CI run:** `25989340550` — `https://github.com/pgdad/envoy-rust/actions/runs/25989340550`.
+**HEAD SHA:** `87eab1cff42b59aa983b55d74a482e4dbcdd5818` (Task 10 — D17.4b in-process backstop; predecessor of THIS commit).
+**Conclusion:** `success`.
+**Created at:** `2026-05-17T11:17:47Z`.
+**Completed at:** `2026-05-17T11:19:57Z` (overall run; both jobs).
+**Wall:** ~2m 10s.
+**Workflow:** `ci` (.github/workflows/ci.yml).
+
+Both CI jobs GREEN:
+
+- **`build + test + lint`** ✅ — job ID `76392521233` (`https://github.com/pgdad/envoy-rust/actions/runs/25989340550/job/76392521233`); wall ~1m 53s. All 9 steps green: `install Rust` → `cargo cache` → `fmt` → `clippy` → `build` → `install h2spec` (v2.6.0 pinned) → `test (includes differential harness → Docker)` (~52s; the load-bearing step running `cargo test --workspace` with all 15 Docker-gated differential integration buckets `1 passed` each + all 14 in-process `envoy-bin` integration buckets + all lib buckets + h2spec conformance gate + helper-crate buckets; 0 failed across the workspace) → `install cargo-deny` (v0.19.6) → `cargo deny check`.
+- **`fuzz (parse_bootstrap, 30s)`** ✅ — job ID `76392521232` (`https://github.com/pgdad/envoy-rust/actions/runs/25989340550/job/76392521232`); wall ~2m 9s. `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` ran clean (~80s effective fuzz time including warmup; the Task 9 `admin_healthcheck_bootstrap.yaml` seed was in corpus and exercised per `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS-walk; no crash).
+
+### §7.5 phase-done gate — six gates
+
+| Gate | Disposition | Evidence |
+|---|---|---|
+| **(a)** Fixture 0015-admin-drain-listeners green | **PASS** | `build + test + lint` job 76392521233, `test (includes differential harness → Docker)` step at `2026-05-17T11:18:56.8048112Z`: `test admin_drain_listeners ... ok` + `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s` (differential wrapper at `tests/differential/tests/admin_drain_listeners.rs`). |
+| **(b)** 14 pre-existing fixtures (0001-0014) green simultaneously | **PASS** | Same job + step: all 14 Docker-gated wrapper binaries pass alongside 0015 in a single `cargo test --workspace` invocation (per-binary `1 passed; 0 failed`). |
+| **(c)** h2spec ≥95% with known-failures.txt unchanged | **PASS** | 99.31% (05.2 baseline; carried forward unchanged — 08.2 engages no H2-framing surfaces). `tests/h2spec_runner.rs` step at `2026-05-17T11:19:32.3240804Z`: `test h2spec_pass_rate_gate ... ok`. |
+| **(d)** parse_bootstrap fuzz clean for short-budget CI run | **PASS** | `fuzz (parse_bootstrap, 30s)` job 76392521232 (wall ~2m 9s; effective fuzz time ~80s including warmup). Task 9's `admin_healthcheck_bootstrap.yaml` seed in corpus per `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array. No crash. |
+| **(e)** Stable-toolchain gates (fmt / clippy / build / test / deny) | **PASS** | All 5 steps in `build + test + lint` job conclude `success` (fmt, clippy, build, test step + cargo deny check step). |
+| **(f)** REVIEW.md approved | **CLOSE-at-state-5-REVIEW.md** | State-5 session writes REVIEW.md per `BOOTSTRAP_PROMPT.md` §5 + the `superpowers:requesting-code-review` skill's per-phase REVIEW.md output. |
+
+#### (a) all new/changed differential fixtures green
+
+Phase 08.2 introduces **one new differential fixture: `0015-admin-drain-listeners`** (Task 8). The fixture asserts bilateral equivalence of three admin-action effect cases (`/drain_listeners` → data-plane refuse-or-EOF; `/healthcheck/fail` → `/ready` 503; `/healthcheck/ok` reset → `/ready` 200) via the new `Driver::AdminScrape` `pre_admin_actions` + `post_admin_assertions` field extensions.
+
+From CI log (test step starts at line 426 of the log, `Running unittests src/lib.rs (target/debug/deps/differential-...)`):
+
+```
+2026-05-17T11:18:55.9259187Z      Running tests/admin_drain_listeners.rs (target/debug/deps/admin_drain_listeners-53e09d1d15583a40)
+2026-05-17T11:18:55.9280304Z running 1 test
+2026-05-17T11:18:56.8048112Z test admin_drain_listeners ... ok
+2026-05-17T11:18:56.8048853Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+```
+
+The `envoy-bin` in-process backstop `tests/admin_drain_listeners.rs` (Task 10) also runs at the same `cargo test --workspace`:
+
+```
+2026-05-17T11:19:25.0883218Z      Running tests/admin_drain_listeners.rs (target/debug/deps/admin_drain_listeners-5e4976119b60c154)
+2026-05-17T11:19:25.0896256Z running 1 test
+2026-05-17T11:19:25.1435095Z test admin_drain_listeners_in_process ... ok
+2026-05-17T11:19:25.1435934Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+
+(Both binaries share the test-file basename `admin_drain_listeners.rs` but live in different crates — `differential` vs `envoy-bin` integration tests — so their compiled hashes differ.)
+
+#### (b) all pre-existing differential fixtures still green
+
+The 14 pre-existing Docker-gated differential fixtures `0001-tcp-echo` through `0014-admin-config-dump-server-info` are all GREEN simultaneously at this CI run. **All 15 fixtures (0001-0015) green simultaneously** at the single CI `cargo test --workspace` invocation (each its own `tests/differential/tests/*.rs` integration bucket; each `1 passed; 0 failed`). Per-fixture wrapper test names + fixture mapping:
+
+| Wrapper test binary | Fixture | CI timestamp + result |
+|---|---|---|
+| `tests/access_log_file_sink.rs` | 0012-access-log-file-sink | `2026-05-17T11:18:53.4289412Z` — `1 passed; 0 failed; finished in 5.63s` |
+| `tests/admin_config_dump_server_info.rs` | 0014-admin-config-dump-server-info | `2026-05-17T11:18:55.9252062Z` — `1 passed; 0 failed; finished in 2.49s` |
+| `tests/admin_drain_listeners.rs` | **0015-admin-drain-listeners** (NEW Phase 08.2) | `2026-05-17T11:18:56.8048853Z` — `1 passed; 0 failed; finished in 0.88s` |
+| `tests/admin_ready.rs` | 0002-static-admin-ready | `2026-05-17T11:18:57.6295440Z` — `1 passed; 0 failed; finished in 0.82s` |
+| `tests/admin_stats_prometheus.rs` | 0011-admin-stats-prometheus | `2026-05-17T11:18:58.5651094Z` — `1 passed; 0 failed; finished in 0.93s` |
+| `tests/echo.rs` | 0001-tcp-echo | `2026-05-17T11:18:59.6140005Z` — `1 passed; 0 failed; finished in 1.05s` |
+| `tests/http1_direct_response.rs` | 0007-http1-direct-response | `2026-05-17T11:19:00.4476892Z` — `1 passed; 0 failed; finished in 0.83s` |
+| `tests/http1_router_upstream.rs` | 0008-http1-router-upstream | `2026-05-17T11:19:02.8834744Z` — `1 passed; 0 failed; finished in 2.43s` |
+| `tests/http2_direct_response.rs` | 0009-http2-direct-response | `2026-05-17T11:19:03.7088702Z` — `1 passed; 0 failed; finished in 0.82s` |
+| `tests/http2_router_upstream.rs` | 0010-http2-router-upstream | `2026-05-17T11:19:06.1894007Z` — `1 passed; 0 failed; finished in 2.48s` |
+| `tests/http_filter_header_mutation.rs` | 0013-http-filter-header-mutation | `2026-05-17T11:19:08.6221433Z` — `1 passed; 0 failed; finished in 2.43s` |
+| `tests/tcp_proxy.rs` | 0003-tcp-proxy | `2026-05-17T11:19:11.2545451Z` — `1 passed; 0 failed; finished in 2.63s` |
+| `tests/tls_downstream.rs` | 0004-tls-downstream | `2026-05-17T11:19:14.0721686Z` — `1 passed; 0 failed; finished in 2.82s` |
+| `tests/tls_sni.rs` | 0006-tls-sni | `2026-05-17T11:19:17.1424404Z` — `1 passed; 0 failed; finished in 3.07s` |
+| `tests/tls_upstream.rs` | 0005-tls-upstream | `2026-05-17T11:19:19.7971597Z` — `1 passed; 0 failed; finished in 2.65s` |
+
+The `differential` lib bucket itself (`unittests src/lib.rs`) runs `106 passed; 0 failed; 1 ignored` (`finished in 0.96s` at `2026-05-17T11:18:47.7929587Z`).
+
+#### (c) conformance suites pass at the declared threshold
+
+`h2spec` conformance suite holds at the **≥95% pass** gate (05.2 baseline 99.31%; `h2spec_pass_rate_gate` PASS). `known-failures.txt` unchanged — phase 08.2 engages no H2-framing surfaces. From CI log:
+
+```
+2026-05-17T11:18:46.6418860Z Version: 2.6.0 (70ac2294010887f48b18e2d64f5cccd48421fad1)
+...
+2026-05-17T11:19:32.0552897Z      Running tests/h2spec_runner.rs (target/debug/deps/h2spec_runner-b978c3ad0d8fa2bd)
+2026-05-17T11:19:32.0569537Z test tests::parse_h2spec_output_extracts_section_failure_ids ... ok
+2026-05-17T11:19:32.3240804Z test h2spec_pass_rate_gate ... ok
+2026-05-17T11:19:32.3241383Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+```
+
+#### (d) new fuzz target clean for short-budget CI run
+
+`parse_bootstrap` is the only fuzz target in 08.2's scope (phase 08.2 introduces no new fuzz target — Task 9 only added a new seed `admin_healthcheck_bootstrap.yaml` to the existing `parse_bootstrap` corpus, not a new fuzzer per SPEC §3 D17.3b). CI `fuzz (parse_bootstrap, 30s)` job ran `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` GREEN (job ID `76392521232`, wall ~2m 9s, effective fuzz time ~80s including warmup). The Task 9 seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/admin_healthcheck_bootstrap.yaml` is in corpus and was exercised; in-tree corroboration via `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS-walk (the seed is listed in the SUCCESS array and parses cleanly through `parse_bootstrap`).
+
+#### (e) `cargo build` + `cargo clippy` + `cargo fmt` + `cargo test` + `cargo deny check` all clean
+
+All five stable-toolchain gates are GREEN at CI run `25989340550`'s `build + test + lint` job (76392521233). Local re-verification at THIS commit's HEAD (docs-only, regression-equivalent to the predecessor CI run):
+
+`cargo build --workspace --all-targets`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+```
+
+`cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+```
+
+`cargo fmt --all -- --check`:
+```
+(no output; exit 0)
+```
+
+`cargo test --workspace` (totals; full output spans ~50 test binaries):
+```
+# All test buckets green. Representative bucket counts (regression-equivalent
+# to the CI run `25989340550` test-step attestation):
+#
+# differential lib: 106 passed; 0 failed; 1 ignored
+# differential integration buckets (15 each `1 passed`; bilaterally green at local Docker Desktop):
+#   access_log_file_sink, admin_config_dump_server_info, admin_drain_listeners (NEW), admin_ready,
+#   admin_stats_prometheus, echo, http1_direct_response, http1_router_upstream,
+#   http2_direct_response, http2_router_upstream, http_filter_header_mutation,
+#   tcp_proxy, tls_downstream, tls_sni, tls_upstream
+# envoy-bin integration buckets (14 each `1 passed`; in-process backstops):
+#   access_log_file_sink, admin_config_dump_server_info, admin_drain_listeners (NEW),
+#   admin_only, admin_ready, http1_direct_response, http1_router_upstream,
+#   http2_direct_response, http2_router_upstream, http_filter_header_mutation,
+#   tcp_proxy, tls_downstream, tls_sni, tls_upstream
+# Lib buckets (representative):
+#   envoy-config 209, envoy-admin 74, envoy-cluster 22, envoy-filter 32,
+#   envoy-http1 68, envoy-http2 42 + 1 ignored, envoy-listener 30,
+#   envoy-stats 25, envoy-tcp 11, envoy-tls 15, envoy-accesslog 16,
+#   envoy-bin (main.rs) 8
+# Conformance bucket: h2spec_runner integration — 3 passed
+# Helper-crate buckets: http1-echo-server 5, http2-echo-server 5,
+#   tcp-echo-server 8, tls-echo-server 5
+# 0 failed across the workspace.
+```
+
+`cargo deny check` (verbatim local output; identical to CI's `cargo deny check` step at line 1620-1647 of the CI log):
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+(Pre-existing unmatched license allowances per ADR-0005; identical to Tasks 1-10 attestations + identical to CI's output at line 1647. Task 11 introduces no new top-level Cargo deps and no `[dev-dependencies]` additions — docs-only.)
+
+#### (f) REVIEW.md approved
+
+**Deferred to state 5** (this is the state-4 commit; per `BOOTSTRAP_PROMPT.md` §5.1 "one state per session", REVIEW.md lands at the next session via `superpowers:requesting-code-review` scoped to the range `1aa250d..<this commit's HEAD>`).
+
+### Deviations from PLAN
+
+**None.** Task 11 lands as a pure docs-only 1-commit shape per the PLAN-prescribed shape + the 07.2 Task 10 / 06.3 Task 12 state-4-reached precedent. No fixture fix is folded (the predecessor Task 10 CI run at HEAD `87eab1c` was GREEN on first push; no in-flight coverage fix is required). No production code change, no test change, no fixture change — only `docs/envoy-rust/STATE.md` + `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/PROGRESS.md` (this file) are edited.
+
+### Task 1-10 execution-arc summary
+
+| Task | Substantive SHA | Fixup SHA | Surface delta |
+|---|---|---|---|
+| 1 | `c1c9604` | `fddabd2` (drain_signal TOCTOU race + test hardening) | D11 DrainState foundation at `crates/envoy-listener/src/drain.rs` + `envoy-admin::DrainState` re-export |
+| 2 | `3b5d653` | — | D14 three gauges (`server.live`, `server.state`, `listener_manager.total_listeners_active`) |
+| 3 | `b829f32` | — | D9 `/drain_listeners` (POST) + D10 `/healthcheck/fail` + `/healthcheck/ok` (POST); 3 new `AdminEndpoint` variants + 3 new `Dispatch` arms |
+| 4 | `5600216` | — | D13b AdminHandler::new widening 6-arg → 7-arg + envoy-bin DrainState construction |
+| 5 | `60c5341` | — | D5e `/server_info` state-source rebind + D-ready `/ready` drain-aware response (200/LIVE → 503/DRAINING) |
+| 6 | `970e7a5` | — | D12 `Listener::serve` 2-arg widening + `listener_manager.total_listeners_active` RAII guard |
+| 7 | `bc83f8e` | `8528c6a` (assert_data_plane_connection_refused PLAN worked-example alignment — I1 + I2 closures) | D16 Driver::AdminScrape `pre_admin_actions` + `post_admin_assertions` extensions + 08.1 REVIEW M2 + M4 closures |
+| 8 | `832abe6` | — | D17.2 fixture `0015-admin-drain-listeners` + Docker-gated wrapper + BEHAVIOR_CONTRACT "Admin-action effect equivalence" subsection |
+| 9 | `9b94dd5` | — | D17.3b fuzz corpus seed `admin_healthcheck_bootstrap.yaml` |
+| 10 | `87eab1c` | — | D17.4b in-process backstop `crates/envoy-bin/tests/admin_drain_listeners.rs` |
+| **11 (this)** | `<sha-pending>` | — | State-4 verification + STATE advance to state-5-next (docs-only) |
+
+**12 substantive task commits + 2 review-driven fixup commits = 14 commits over the state-3 execution arc**, between the state-2 standalone-PLAN base `1aa250d` and Task 10 HEAD `87eab1c`. The Task 11 docs-only commit (THIS commit) caps the state-3 arc and advances STATE.md to state-5-next.
+
+**Carryforward closures landed in 08.2:** 08.1 REVIEW M2 (`value_may_differ_keys` field-level doc-comment) + M4 (`walk_pointer` empty-segment guard) — both closed at Task 7 (`bc83f8e`) as planned per the harness-widening co-location.
+
+**08.1 REVIEW M3** (forward-looking `Arc<BTreeMap<...>>` on `command_line_options`) — **continues to carry forward indefinitely** per the 08.1 state-6 disposition; 08.2 did not engage the `command_line_options` field.
+
+**08.1 process-note** (`filter_chains: []` schema-vs-runtime inconsistency) — **option (b) trivial-echo-filter workaround documented** at Task 10 PLAN-write time for future admin-only backstops; Task 10 itself uses HCM + direct_response shape (Task 10 architecture deviation #1) because the in-process backstop needs a real data-plane listener to verify drain rejection. Disposition closed at this commit; carryforward terminated.
+
+### State-5 entry routing (next session)
+
+Per `BOOTSTRAP_PROMPT.md` §5 state 5 + STATE.md's advance at THIS commit, **next session enters 08.2 lifecycle state 5** with next-skill `superpowers:requesting-code-review` scoped to the reviewed range `1aa250d..<this commit's HEAD>` (the 08.2 state-2 base SHA `1aa250d` through THIS commit's new HEAD). The session writes `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/REVIEW.md` per the skill's per-phase REVIEW.md output. With Approved verdict, state-6 (the session after) closes parent-08 + the MVP trunk (00→08 all `done`) per the closing-sub-phase invariant on parent-08.
+
+### Differential surface delta
+
+**15 Docker-gated fixtures (`0001-tcp-echo` through `0015-admin-drain-listeners`) GREEN simultaneously** at CI run `25989340550` HEAD `87eab1c` — extends the 08.1 state-4 anchor's 14-fixture baseline by the new `0015-admin-drain-listeners` (Task 8). h2spec held at the 05.2 baseline 99.31%. parse_bootstrap fuzz clean on the Task 9 corpus seed. No production code change at this commit; the surface delta is the 08.2 execution arc's cumulative production surface materialized at the state-4 evidence-anchor CI run, NOT a delta from THIS commit (which is docs-only).
