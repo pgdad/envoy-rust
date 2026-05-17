@@ -1,0 +1,60 @@
+# Phase 09: 5-probe sequential burst against the HCM filter chain
+#   [envoy.filters.http.local_ratelimit, envoy.filters.http.router]
+# with token_bucket { max_tokens: 3, tokens_per_fill: 3, fill_interval: 60s }.
+# Both proxies start at full bucket; first 3 probes consume the initial 3
+# tokens (200 / "ok\n"); probes 4 + 5 hit the rate limit (429 +
+# upstream-Envoy-parity body "local_rate_limited" per ADR-0033).
+#
+# ADR-0033 (phase-09 SPEC §2.2 revision): upstream Envoy v1.33's
+# envoy.filters.http.local_ratelimit emits 429 responses with the 5
+# standard HTTP/1.1 response headers (server / date / content-length /
+# content-type / connection) + body "local_rate_limited" (18 bytes;
+# source-hardcoded). envoy-rust matches the upstream wire shape per
+# ADR-0033's Commit B (LocalRateLimitFilter::decode_headers emits body
+# `local_rate_limited`; the x-envoy-ratelimited header from the original
+# Task 3 lock-in #13 is voided) + ADR-0033's Commit C (H1 HCM's
+# decorate_filter_synth_response helper adds the 5 standard headers).
+#
+# The set_equal_modulo_allow_list disposition compares header SETS
+# modulo the documented allow-list at BEHAVIOR_CONTRACT.md (server / date
+# have implementation-identifying / wall-clock divergences; the remaining
+# content-length / content-type / connection are value-exact across proxies
+# under the deterministic burst).
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-allowed
+      method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-allowed
+      method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-allowed
+      method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-4-rate-limited
+      method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 429
+      expected_body: { kind: byte_exact, body: "local_rate_limited" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-5-rate-limited
+      method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 429
+      expected_body: { kind: byte_exact, body: "local_rate_limited" }
+      expected_headers: set_equal_modulo_allow_list

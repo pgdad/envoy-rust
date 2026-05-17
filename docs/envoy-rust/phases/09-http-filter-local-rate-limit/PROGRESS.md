@@ -1201,11 +1201,132 @@ match shapes are codec-specific but the FilterResponse → Response conversion
 filter-family phase first surfaces encode-side `StopAndSend`, the encode-arm
 decoration at line ~595 is already in place.
 
-### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper
+### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper (Commit D per ADR-0033)
 
-_(Pending state-3 dispatch — Commit D per ADR-0033. The "+ D7.2
-x-envoy-ratelimited row" suffix from the original placeholder is dropped:
-ADR-0033 voids PLAN lock-in #30 — no BEHAVIOR_CONTRACT row lands at Task 5.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `ae2cef0` — `phase 09: task 4 fixup — H1 HCM decorates filter-
+synth responses with standard headers per ADR-0033`.
+
+**Work summary.** Implemented Commit D of ADR-0033's 4-commit corrective
+sequence. Lands the differential fixture `0016-http-filter-local-rate-limit`
++ the Docker-gated test wrapper at
+`tests/differential/tests/http_filter_local_rate_limit.rs`. The fixture
+asserts the deterministic 5-probe burst `[200, 200, 200, 429, 429]` across
+both upstream Envoy v1.33 and envoy-rust per the ADR-0033 revised contract:
+
+- 200 probes carry body `"ok\n"` (direct_response inline string).
+- 429 probes carry body `"local_rate_limited"` (18 bytes; upstream's
+  source-hardcoded default; envoy-rust matches per ADR-0033 Commit B).
+- All 5 probes use `set_equal_modulo_allow_list` header comparison; the
+  04.1-landed `server` + `date` allow-list rows cover the cross-proxy
+  implementation-identifying / wall-clock divergences; the remaining 3
+  standard headers (`content-length`, `content-type`, `connection`) are
+  value-exact across proxies under the deterministic burst per ADR-0033
+  Commit C's H1 HCM `decorate_filter_synth_response` helper.
+
+**NO `docs/envoy-rust/BEHAVIOR_CONTRACT.md` change at this commit.** PLAN
+lock-in #30 (the `x-envoy-ratelimited` Header allow-list row) is voided
+per ADR-0033. The 4 Stat-name mapping rows already landed at Task 3 commit
+`70bad43`. The fixture relies on the 04.1-landed Header allow-list rows
+plus the 06.x / 07.x / 08.x landed equivalence matrix; no additions needed.
+
+**Per-side YAML asymmetry** (fixture-0013 precedent): `envoy.yaml` carries
+an `admin` block, binds `0.0.0.0:{{PORT}}`, sets `filter_enabled` +
+`filter_enforced` to 100% explicit (upstream defaults both to 0%; envoy-rust
+defaults to always-on per phase-09 lock-in — the `filter_enabled` +
+`filter_enforced` fields are rejected by envoy-rust's
+`LocalRateLimitConfig` `deny_unknown_fields`). `envoy-rust.yaml` has no
+admin block, binds `127.0.0.1:{{PORT}}`, omits the runtime fractional-percent
+fields. Both YAMLs use `tokens_per_fill: 3` (upstream rejects 0; envoy-rust
+accepts 0 per validator lock-in #4; the stricter intersection is 3 and the
+60s `fill_interval` makes refill semantic moot within the burst window).
+
+**Files created (5):**
+- `tests/fixtures/0016-http-filter-local-rate-limit/envoy.yaml` — upstream
+  Envoy bootstrap (~75 LoC; per-side asymmetric admin + filter_enabled
+  fields per the precedent).
+- `tests/fixtures/0016-http-filter-local-rate-limit/envoy-rust.yaml` —
+  envoy-rust counterpart bootstrap (~40 LoC; narrower symmetric shape).
+- `tests/fixtures/0016-http-filter-local-rate-limit/expectations.yaml` —
+  `Driver::Http1ProbeList` with 5 probes; ADR-0033 body assertion
+  (`"local_rate_limited"` byte_exact on 429 probes); set-equal-modulo-allow-
+  list header comparison on all probes (~55 LoC).
+- `tests/fixtures/0016-http-filter-local-rate-limit/README.md` — fixture
+  documentation (~95 LoC; explains the ADR-0033 contract; references
+  Commits B + C of ADR-0033; explains the per-side YAML asymmetry and the
+  set-equal-modulo-allow-list disposition).
+- `tests/differential/tests/http_filter_local_rate_limit.rs` — single
+  `#[tokio::test]` Docker-gated wrapper (~35 LoC; matches the 07.2
+  `http_filter_header_mutation.rs` precedent shape).
+
+**Files modified (1):**
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` —
+  this subsection.
+
+**Tests landed (1 new Docker-gated wrapper; 5 fixture probes per run).**
+Workspace test count: 744 → 745 (+1 for the new wrapper test;
+`differential::run_fixture` is the single test entry-point per the
+established 06.x / 07.x / 08.x convention; the 5 fixture probes are
+embedded data, not separate `#[test]` functions).
+
+**Per-task deviations from ADR-0033 dispatch instructions:** None
+substantive. The fixture YAMLs land per ADR-0033 Decision §iii (d) verbatim;
+the README documents the revised contract; the wrapper test references
+ADR-0033 in its doc-comment for context-isolation per D-3.4.
+
+**LoC delta:**
+
+| Bucket | Production | Tests | Fixture/doc | Total |
+|---|---|---|---|---|
+| Projected (PLAN §3 row 5; pre-ADR) | ~10 | ~25 | ~110 | ~145 |
+| Actual (post-ADR-0033) | 0 | ~35 (Docker-gated wrapper) | ~265 (4 fixture files + README) | ~300 |
+
+Production drift: zero (this commit lands fixture data + a Docker-gated
+wrapper; no production-code change). Fixture/doc drift (+141%) is above the
+PLAN projection but driven by the more substantive README documenting the
+ADR-0033 revised contract + per-side YAML asymmetry + assertion strategy.
+Per parent-08 SPEC §6.1 alternative (vi) accept-drift posture; the LoC
+budget is doc-heavy and reviewable.
+
+**Gate results (5-stable-toolchain):**
+
+- **Gate 1 (`cargo fmt --all -- --check`):** PASS (exit 0).
+- **Gate 2 (`cargo clippy --workspace --all-targets --all-features -- -D warnings`):**
+  PASS (exit 0).
+- **Gate 3 (`cargo build --workspace --all-targets`):** PASS (the new
+  Docker-gated wrapper compiles; subsumed by test).
+- **Gate 4 (`cargo test --workspace`):** PASS — 745 expected (+1 vs Commit C
+  baseline 744). The Docker-gated fixture is included in `--workspace`;
+  testcontainers auto-pulls the `envoyproxy/envoy:v1.33.0` image (cached
+  locally per ENVOY_TARGET pin); fixture runs against the live upstream +
+  envoy-rust subprocess; bilateral diff per the harness's 5-axis cascade
+  per `tests/differential/src/lib.rs`.
+- **Gate 5 (`cargo deny check`):** PASS (no Cargo.toml diff).
+
+**Docker fixture local verification:** PASS — both proxies emit
+`[200, 200, 200, 429, 429]`; bodies match `[ok\n, ok\n, ok\n, local_rate_limited, local_rate_limited]`;
+headers `set_equal_modulo_allow_list` passes (5 standard headers present on
+both proxies post-ADR-0033). The fixture lands fully green on the
+controller's local Docker-equipped environment; CI on push exercises the
+same code path under the GitHub Actions runner's Docker.
+
+**Carryforwards engaged:** None additional at this commit. ADR-0033's
+4-commit corrective sequence completes at this commit (Commits A through D
+all landed). The phase-09 ADR ledger advanced `ADR-0032 → ADR-0033`;
+conditional ADR-0034 stays reserved-unused per phase-09 SPEC §7.
+
+**Forward-looking note for Task 7 (in-process backstop):** PLAN lock-in #33
+(in-process backstop's direct per-header `x-envoy-ratelimited: true`
+assertion) is voided per ADR-0033. Task 7's PROGRESS subsection records
+the lock-in #33 deviation when it dispatches; the in-process backstop's
+revised assertion shape is: status `[200, 200, 429, 429]` (4-probe burst;
+`max_tokens: 2` per the original PLAN Step 1) + body
+`"local_rate_limited"` (18 bytes) on 429 probes + standard-header presence
+(server / date / content-length / content-type / connection) on 429 probes.
+
+### Task 6 — D8.2 parse_bootstrap fuzz corpus seed
+
+_(Pending state-3 dispatch — unchanged from original PLAN.)_
 
 ### Task 6 — D8.2 parse_bootstrap fuzz corpus seed
 
