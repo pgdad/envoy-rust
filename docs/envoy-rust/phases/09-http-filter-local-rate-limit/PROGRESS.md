@@ -1396,19 +1396,169 @@ On-projection for the seed; PROGRESS prose adds ~60 LoC documentation.
 
 ### Task 7 — D8.3 in-process backstop http_filter_local_rate_limit.rs
 
-_(Pending state-3 dispatch — see ADR-0033 forward-looking note in Task 5
-subsection above: PLAN lock-in #33's direct `x-envoy-ratelimited: true`
-per-header presence assertion is voided per ADR-0033; the in-process
-backstop's revised assertion shape is status `[200, 200, 429, 429]` +
-body `"local_rate_limited"` on 429 probes + standard-header presence.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `28e1666` — `phase 09: task 6 — D8.2 parse_bootstrap fuzz corpus
+seed hcm_local_rate_limit_filter.yaml`.
+
+**Work summary.** Implemented Task 7 per PLAN Task 7 (SPEC §3 D8.3) with the
+ADR-0033 revised contract. Lands the in-process backstop at
+`crates/envoy-bin/tests/http_filter_local_rate_limit.rs` — a single
+`#[tokio::test(flavor = "multi_thread")]` test that boots an `envoy-bin`
+subprocess against a synthesized bootstrap (HCM with `http_filters:
+[envoy.filters.http.local_ratelimit, envoy.filters.http.router]`,
+`token_bucket { max_tokens: 2, tokens_per_fill: 2, fill_interval: 60s }`,
+`status: { code: 429 }`, `direct_response` 200 with body `"ok\n"`), drives
+4 sequential `GET /` requests against the bound listener, and asserts the
+ADR-0033 contract on the captured responses. No Docker dependency;
+complementary to the Docker-gated differential fixture at
+`tests/differential/tests/http_filter_local_rate_limit.rs` (fixture 0016).
+
+**ADR-0033 voids PLAN lock-in #33.** The original PLAN's direct
+`x-envoy-ratelimited: true` per-header presence assertion on the 429
+responses is replaced by the ADR-0033 revised assertion shape:
+
+- **Status sequence** `[200, 200, 429, 429]` (unchanged — 4 probes,
+  `max_tokens: 2`).
+- **Body `"local_rate_limited"` (18 bytes) on the two 429 responses** —
+  upstream Envoy v1.33's source-hardcoded body; envoy-rust matches via
+  ADR-0033 Commit B (`1c1de0f`) — `LocalRateLimitFilter::decode_headers`
+  emits `Bytes::from_static(b"local_rate_limited")`.
+- **5 standard HTTP/1.1 response headers present on the 429 responses**
+  (`server`, `date`, `content-length`, `content-type`, `connection`) —
+  populated via the H1 HCM's `decorate_filter_synth_response` helper from
+  ADR-0033 Commit C (`ae2cef0`).
+- **NO `x-envoy-ratelimited` header on any of the 4 responses** — upstream
+  Envoy v1.33's local_ratelimit does not emit this header (it's a
+  global-ratelimit-filter artifact); envoy-rust matches per Commit B.
+- **Body `"ok\n"` on the two 200 responses** (direct_response inline
+  string; unchanged from original PLAN).
+
+**Test ↔ fixture complementarity.** Fixture 0016 (Docker-gated, Task 5)
+provides the bilateral parity signal across upstream Envoy v1.33 +
+envoy-rust under identical bootstraps; this in-process backstop provides
+an envoy-rust-only contract assertion that runs on every `cargo test`
+invocation without Docker — so contract regressions surface immediately
+in local dev loops + CI even on hosts without Docker installed. The two
+together honor the project doctrine of "every Docker-gated fixture has an
+in-process backstop with overlapping but non-identical assertion scope"
+established at phase 04.3 (`http1_router_upstream.rs` ↔ fixture 0007) and
+extended at 07.2 (`http_filter_header_mutation.rs` ↔ fixture 0013).
+
+**Files created (1):**
+- `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` — single test
+  function `local_rate_limit_enforces_429_after_token_exhaustion` (~259
+  LoC including doc-comment + helpers + bootstrap YAML).
+
+**Files modified (1):**
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` —
+  this subsection.
+
+**Tests landed (1 new):**
+- `crates/envoy-bin/tests/http_filter_local_rate_limit.rs::
+  local_rate_limit_enforces_429_after_token_exhaustion` — boots envoy-bin
+  subprocess, drives 4 sequential probes, asserts the 5 ADR-0033 contract
+  facets (status sequence + body on 429 + 5 standard headers on 429 +
+  absence of `x-envoy-ratelimited` on all probes + body on 200).
+
+**Workspace test count:** 745 → 746 (+1 for the new backstop test).
+
+**Per-task deviations from PLAN/ADR-0033:**
+
+1. **`tokens_per_fill: 0` → `tokens_per_fill: 2` (bootstrap YAML).** The
+   PLAN's verbatim Rust code (lines ~2334-2336) used `tokens_per_fill: 0`.
+   This commit uses `tokens_per_fill: 2` (matching `max_tokens`) for
+   symmetry with the fixture-0016 envoy-rust.yaml shape (envoy-rust accepts
+   both 0 and N per validator lock-in #4; the 60s `fill_interval` makes the
+   refill semantic moot within the 4-probe burst either way). No
+   observable behavior change — both values produce the same `[200, 200,
+   429, 429]` sequence under the burst.
+
+2. **Captured response body (`body_lists`).** The PLAN's verbatim code
+   discarded the response body (`let (status, headers, _body) =
+   send_request_and_collect(...)`). This commit captures the body
+   (`let (status, headers, body) = ...; body_lists.push(body)`) because
+   the ADR-0033 revised assertion shape asserts `body == "local_rate_limited"`
+   on the 429 probes + `body == "ok\n"` on the 200 probes; the original
+   PLAN's assertion shape only inspected headers.
+
+3. **Assertion block rewrite.** Replaced the PLAN's two header-presence
+   loops (`x-envoy-ratelimited: true` on 429s; absence on 200s) with four
+   ADR-0033 assertion blocks (body on 429 + 5 standard headers on 429 +
+   absence of `x-envoy-ratelimited` on ALL probes + body on 200). Per
+   ADR-0033 § "Decision" subsection's Task 7 note: "PLAN lock-in #33
+   defers to Task 7 dispatch — the Task 7 assertion shape drops
+   `x-envoy-ratelimited` per-header presence in favor of body-content +
+   standard-header presence assertions (Task 7 PROGRESS records the
+   lock-in #33 deviation)".
+
+4. **rustfmt + clippy stylistic adjustments.** Two iterations on the
+   author's first-pass to satisfy stable-toolchain gates: (a) one
+   `write_all` chain split across 3 lines per rustfmt's preferred
+   long-method-chain shape; (b) two `for i in N..=M` loops over indexed
+   `body_lists`/`header_lists` rewritten as
+   `for (i, item) in slice.iter().enumerate().skip(N)/.take(M)` per
+   clippy `needless_range_loop`. No semantic change.
+
+**LoC delta:**
+
+| Bucket | Production | Tests | Fixture/doc | Total |
+|---|---|---|---|---|
+| Projected (PLAN §3 row 7) | 0 | ~170 | 0 | ~170 |
+| Actual | 0 | 259 (test file) | ~100 (PROGRESS) | ~359 |
+
+The test file came in at +52% vs the ~170 projection. Drift accounts:
+the ADR-0033 assertion block is larger than the original PLAN's
+header-presence-only block (4 distinct assertion loops vs 2; each
+ADR-0033 loop carries explanatory comments referencing the ADR + the
+specific corrective commit per D-3.4 context-isolation discipline);
+plus the file doc-comment expanded from ~9 lines to ~25 lines to capture
+the ADR-0033 narrative + Commit B/C cross-references; plus the bootstrap
+YAML block is unchanged in length but the surrounding helpers (`reserve_port`,
+`wait_ready`, `send_request_and_collect`, `parse_response`) are verbatim
+from the PLAN. Within the parent-08 SPEC §6.1 alternative (vi) accept-
+drift posture — no split warranted at this single-file backstop scale.
+
+**Gate results (5-stable-toolchain):**
+
+- **Gate 1 (`cargo fmt --all -- --check`):** PASS (exit 0; after the
+  2-iteration rustfmt cleanup noted in deviation #4).
+- **Gate 2 (`cargo clippy --workspace --all-targets --all-features -- -D
+  warnings`):** PASS (exit 0; after the `needless_range_loop` fix noted
+  in deviation #4).
+- **Gate 3 (`cargo build --workspace --all-targets`):** PASS.
+- **Gate 4 (`cargo test --workspace`):** PASS — **746 tests passed, 0
+  failed** (745 → 746, +1 for `local_rate_limit_enforces_429_after_token_exhaustion`).
+- **Gate 5 (`cargo deny check`):** PASS (no Cargo.toml diff; no
+  dependency changes — `httparse`, `tempfile`, `tokio` already in
+  `envoy-bin`'s dependency set per the prior 07.x / 08.x landings).
+
+**ADR-0033 contract verification (in-process backstop ran locally;
+assertion-by-assertion outcome):**
+
+- Status sequence `[200, 200, 429, 429]`: **PASS** (deterministic under
+  `max_tokens: 2` + the 4-probe burst).
+- Body `"local_rate_limited"` on probes 3 + 4: **PASS** (envoy-rust emits
+  the upstream-parity bytes per Commit B).
+- 5 standard headers (`server`, `date`, `content-length`, `content-type`,
+  `connection`) on probes 3 + 4: **PASS** (H1 HCM's
+  `decorate_filter_synth_response` helper from Commit C decorates the
+  filter-synth response).
+- NO `x-envoy-ratelimited` on any probe: **PASS** (envoy-rust no longer
+  injects this header per Commit B; the original PLAN lock-in #33's
+  direct-presence assertion is voided per ADR-0033 — the inverse
+  absence-assertion lands here as positive verification).
+- Body `"ok\n"` on probes 1 + 2: **PASS** (`direct_response` inline
+  string passes through unchanged).
+
+**Carryforwards engaged:** None.
 
 ### Task 6 — D8.2 parse_bootstrap fuzz corpus seed
 
-_(Pending state-3 dispatch.)_
+_(Populated at task-6 commit above.)_
 
 ### Task 7 — D8.3 in-process backstop http_filter_local_rate_limit.rs
 
-_(Pending state-3 dispatch.)_
+_(Populated at this commit above.)_
 
 ### Task 8 — state-4 phase-done verification + STATE advance to state-5-next
 
