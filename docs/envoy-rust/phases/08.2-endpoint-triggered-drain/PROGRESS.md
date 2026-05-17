@@ -937,3 +937,113 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 **None at this task.** Task 7 is harness-only; the new D16 surface (`pre_admin_actions` + `post_admin_assertions` + the 2 helper fns `drive_admin_post` + `assert_data_plane_connection_refused`) is exercised end-to-end by fixture 0015 at Task 8 (Docker-gated, against a real envoy + envoy-rust pair) and by the in-process backstop `tests/differential/tests/admin_drain_listeners.rs` at Task 10 (non-Docker, against an in-process envoy-rust). The 11 new unit tests at this task exercise deserialization + helper-behavior in isolation against synthetic mock listeners; they do NOT drive any fixture or real proxy. The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
 
 Regression-equivalence on fixtures 0001-0014 preserved by construction: both new `Driver::AdminScrape` fields default to empty `Vec` via `#[serde(default)]`; the dispatch arm's STEP 2 + STEP 4 loops iterate over empty `Vec`s and exit immediately when the fields are absent, so fixtures 0011 + 0014 (which declare neither field) hit the same execution path they did at 08.1 plus zero added work. Test `admin_scrape_pre_admin_actions_defaults_to_empty_vec` is the regression-equivalence proof for this property.
+
+---
+
+## Task 7 fixup (review-driven; lands on top of `bc83f8e`)
+
+### Fixup driver
+
+Code-quality review of Task 7 commit `bc83f8e` flagged **2 Important** findings against `tests/differential/src/lib.rs::assert_data_plane_connection_refused` (lines ~1503-1565 at the substantive commit). Both are load-bearing before Task 8's fixture 0015 lands atop this helper. This fixup commit closes both Important findings AND opportunistically closes 2 of the Minor findings (M3 + M4) whose fix is trivial; the remaining Minor findings (M1, M2, M5) are comment/test-coverage polish that can land opportunistically later and do not gate Task 8.
+
+### What changed
+
+**Important #1 — Read-error disposition aligned to PLAN worked example.** Pre-fix the `Ok(Err(err))` arm of the timeout-wrapped `read(&mut buf)` (the post-connect read step) was treated as failure-and-continue-polling — it set `last_disposition = format!("read error after connect: {err}")` and fell through to the deadline check. PLAN.md worked example at lines 2282-2286 explicitly specifies this arm as drain success ("Read Err — accept as drain success (the listener shut the connection ungracefully)") — i.e. RST / ECONNRESET / ungraceful mid-handshake close IS the third drain-success disposition alongside ECONNREFUSED + immediate-EOF. Architecture-decision lock-in #20 ("ECONNREFUSED OR immediate-EOF, either accepted") was permissive enough to encompass this third disposition per the PLAN's worked example. Fix changes the arm body to `return Ok(())` with a brief inline comment naming "ungraceful close. Drain success per PLAN.md worked example lines 2282-2286". The dead-code `last_disposition` assignment on this branch is removed. The function-level doc-comment is rewritten to enumerate ALL THREE drain-success dispositions as a numbered list (was: 2-disposition prose paragraph).
+
+**Why this matters now:** a listener that RSTs the connection mid-handshake (some drain configurations do exactly this) would NOT have been detected as drained under the pre-fix implementation — the loop would observe `Ok(Err(ECONNRESET))` on every probe, accumulate the "read error after connect" disposition, and bail at deadline expiry with a false-negative. Fixture 0015 at Task 8 (the Docker-gated D17.2 fixture exercising `/drain_listeners` against a real envoy + envoy-rust pair) will fail in exactly this shape if the listener's drain implementation chooses RST over FIN. Closing this BEFORE Task 8 lands is required.
+
+**Important #2 — Per-attempt `connect` timeout added.** Pre-fix `TcpStream::connect(addr).await` at line ~1521 was unbounded — could block far longer than the 100ms poll interval on a slow accept, eroding the deadline budget and making the polling loop run fewer attempts than designed. PLAN.md worked example lines 2257-2261 explicitly wraps the connect call in a 200ms timeout. Fix wraps the connect in `tokio::time::timeout(Duration::from_millis(200), tokio::net::TcpStream::connect(addr)).await`; the outer match arms expand by one: `Err(_timeout) => { last_disposition = format!("connect timed out (>200ms) to {addr}"); }` (treats connect-timeout as failure-and-continue per the PLAN's worked example, NOT as drain success — a slow accept is still evidence the listener is responding). The structural rename of the success arm from `Ok(mut s)` to `Ok(Ok(mut s))` and the error arm from `Err(e)` to `Ok(Err(e))` reflects the new outer `Result<Result<_>, _timeout>` shape.
+
+**Why this matters now:** without the per-attempt connect bound, a slow-accepting listener (e.g. envoy mid-drain under load, where the accept loop is being interrupted by the drain-state transition) could consume the entire `within` budget in a single connect call — the helper would make ONE attempt instead of the expected ~5 (500ms ÷ 100ms poll interval) and bail with the connect-still-pending uncertainty unresolved. Fixture 0015's polling cadence depends on the per-attempt bound being honored.
+
+**M3 (opportunistic minor closure) — `last_disposition` refactor removes `#[allow(unused_assignments)]`.** Pre-fix the binding was `let mut last_disposition = String::from("(no probe completed before deadline)");` with `#[allow(unused_assignments)]` to silence a clippy warning about the initial value being never-read (the loop arms overwrite it before the deadline branch reads it). Refactor changes the initial value to `format!("no live-listener disposition observed before {within:?}")` — a real diagnostic string that IS surfaced if the deadline branch fires before any live-listener arm has run (logically unreachable but the new initial value is now a sound output on the unreachable path). The `#[allow(unused_assignments)]` attribute is REMOVED. The accompanying comment block is updated to explain why M3's refactor is sound (the binding's initial value is itself a valid output of the deadline branch). Verified clean under `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+
+**M4 (opportunistic minor closure) — inner read timeout 100ms → 50ms** matching PLAN.md worked example line 2271. Pre-fix the inner `tokio::time::timeout(Duration::from_millis(100), s.read(&mut tail))` used a 100ms budget; PLAN's worked example specifies 50ms. The 50ms budget is sufficient for FIN/RST to arrive when the server has already closed (kernel signaling is sub-millisecond on Unix; loopback RTT is microseconds), and the shorter budget further limits per-attempt wall-clock cost. Fix changes `100` to `50` in the single call site.
+
+### New test landed (1)
+
+`admin_action_extension_tests::assert_data_plane_connection_refused_treats_ungraceful_close_as_drain_success` (`#[tokio::test(flavor = "multi_thread")]`). Spawns a mock listener on `127.0.0.1:0` that accepts each connection, calls `set_linger(Some(Duration::from_secs(0)))` on the accepted socket (forcing the kernel to issue RST instead of FIN on close), then drops the socket. The client (the helper-under-test) connects successfully then observes `read → Err(ECONNRESET)` on every probe. Asserts the helper returns `Ok(())` within 500ms. Comment block explicitly names this as the third drain-success disposition per PLAN.md lines 2282-2286, sibling to `_succeeds_on_immediate_eof` (which exercises the `Ok(Ok(0))` arm).
+
+The `set_linger` call uses `#[allow(deprecated)]` locally on the single call site because `tokio::net::TcpStream::set_linger` is deprecated upstream (the deprecation flags that SO_LINGER causes the socket to block the EXECUTOR thread on drop in production code paths). For this synthetic mock listener that exists solely to RST the per-attempt accepted socket and then returns to the accept loop, the executor-blocking concern does not apply (the linger duration is 0, the close issues RST immediately without buffering, and the spawned task is the only user of this executor scaffold). The std-library equivalent `std::net::TcpStream::set_linger` is still nightly-unstable (rust-lang/rust#88494) and adding `socket2` or `libc` as a new top-level Cargo dep is rejected at this fixup per the 08.2 no-new-deps doctrine — so the documented + locally-allowed deprecated tokio path is the right call. The allow is narrowly scoped to one statement and carries a multi-line comment naming the trade-off + the rejected alternatives.
+
+**Red phase (TDD) verified:** pre-fix the test FAILED with the exact disposition `"read error after connect: Connection reset by peer (os error 54)"` — i.e. the helper saw `Ok(Err(ECONNRESET))` on every probe and bailed at deadline expiry. Green phase verified: post-fix the test PASSES in ~0ms (first probe hits the RST and the new `Ok(Err(_err)) => return Ok(())` arm fires immediately).
+
+### Per-task deviations from the fixup spec
+
+**Zero structural deviations.** All 2 Important findings + the 2 opportunistic Minor findings (M3 + M4) were closed exactly as specified by the fixup spec. The fixup spec said "Skip M1, M2, M5" and those were skipped.
+
+**One incidental note re: the M3 refactor's design exploration.** The first M3 attempt used `let mut last_disposition: Option<String> = None;` (initialize as `None`; deadline branch reads via `last_disposition.as_deref().unwrap_or("(no probe completed before deadline)")`). That shape compiled but still triggered the `unused_assignments` warning on the initial `None` (the compiler proved the read-site's `unwrap_or` fallback handled `None` explicitly, so the initial assignment was provably never the value read). The final shape — initialize to a real diagnostic string that IS the surface-of-record on the logically-unreachable path — is the second attempt. Both attempts are functionally identical; only the second produces a warning-free build. Documented here so the design space is visible for future readers.
+
+### Confirmations
+
+- **I1 fix applied:** the `Ok(Err(_err))` arm of the inner read at `tests/differential/src/lib.rs:1557-1561` now returns `Ok(())` with a brief inline comment naming "ungraceful close. Drain success per PLAN.md worked example lines 2282-2286". Verified by the new test passing.
+- **I2 fix applied:** the connect call at `tests/differential/src/lib.rs:1533-1535` is now wrapped in `tokio::time::timeout(Duration::from_millis(200), ...)`; the outer match has 3 arms (`Ok(Err(e))` ⇒ ECONNREFUSED drain success; `Err(_timeout)` ⇒ failure-and-continue; `Ok(Ok(mut s))` ⇒ connect-succeeded, read-step). Verified by the helper still passing all 4 existing tests (ECONNREFUSED, immediate-EOF, live-listener-fails, plus the new ungraceful-close test).
+- **M3 closure applied:** `#[allow(unused_assignments)]` REMOVED from the `last_disposition` binding (line 1518 at the substantive commit). Verified clean under `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- **M4 closure applied:** inner read timeout 100ms → 50ms at the single call site (line 1555). Matches PLAN.md worked example line 2271.
+- **No new top-level Cargo deps.** `git diff Cargo.lock` and `git diff tests/differential/Cargo.toml` are both empty for this fixup. The new test's `set_linger` rides on `tokio`'s existing `net` feature already declared at `tests/differential/Cargo.toml:26`.
+- **No new ADRs.** Ledger head stays **ADR-0032**.
+- **No changes to STATE.md / ROADMAP.md / SPEC.md / DECISIONS.md / BEHAVIOR_CONTRACT.md.** This fixup is harness-only.
+- **`#![forbid(unsafe_code)]` retained** on all touched crates. The fixup touches only `tests/differential/src/lib.rs`; the crate-root attribute is unchanged. Zero new unsafe blocks. The `#[allow(deprecated)]` on the test's `set_linger` call is NOT an unsafe escape — it is a per-call lint allow for an upstream deprecation, scoped to one statement with a documented rationale.
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `tests/differential/src/lib.rs` | +109 | -36 |
+| **Total source:** | **+109** | **-36** |
+
+(Numbers from `git diff --stat tests/differential/src/lib.rs`: `1 file changed, 109 insertions(+), 36 deletions(-)`. The +109 includes: the helper's doc-comment rewrite expansion (5 → 16 lines, +11), the connect-wrap restructure with new `Err(_timeout)` arm (+12), the M3 initial-value + comment-block expansion (+8 net), the inline ungraceful-close comment (+3), and the new 41-line test including its 21-line doc-comment + trade-off-naming. The -36 is the pre-fix doc-comment + the pre-fix unwrapped connect + the `#[allow(unused_assignments)]` annotation + the prior comment block.)
+
+Test-count delta: differential lib bucket grew **105 → 106 tests** (+1, exactly the new `assert_data_plane_connection_refused_treats_ungraceful_close_as_drain_success`). No other crate touched; workspace total grew by the same +1. The `admin_action_extension_tests` sibling module now hosts 12 tests (was 11 at the Task 7 substantive commit). PLAN's Task 7 narrative still applies (11 new tests at Task 7); this fixup adds the 12th in the same module.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff after one `cargo fmt --all` apply during implementation — the connect-wrap restructure produced a single line that rustfmt preferred to split into the multi-line `tokio::time::timeout(\n   Duration::from_millis(200),\n   tokio::net::TcpStream::connect(addr),\n)\n.await` shape per PLAN.md's worked-example layout).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean across all 8 workspace crates, zero warnings, zero errors). The pre-fix `#[allow(unused_assignments)]` is removed (M3); the new test's single `#[allow(deprecated)]` on `set_linger` is the only lint allow in the diff and is documented + narrowly scoped to one statement.
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 workspace crates + test/bench/example targets compiled cleanly).
+
+**Gate 4 — `cargo test --workspace`:** PASS — every per-bucket `test result:` line reads `ok. N passed; 0 failed`. The differential lib bucket grew **105 → 106** (the new ungraceful-close test). Focused re-run: `cargo test -p differential --lib admin_action_extension_tests::assert_data_plane_connection_refused` reads `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.42s` — all 4 helper tests (the 3 pre-existing + the new ungraceful-close) pass together. No other bucket changed test counts. No `tcp_proxy_backend_*` flakes observed.
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per 07.1-REVIEW doctrine.
+
+### Differential surface delta
+
+**None.** This fixup is logic + test changes inside `tests/differential/src/lib.rs` only — no admin endpoint surface change, no listener-serve signature change, no gauge registration, no fixture. The helper's wire-level behavior changes ONLY by accepting one additional drain-success disposition (read-Err / ungraceful close) that the PLAN's worked example always specified. All 14 Docker-gated fixtures (0001-0014) remain GREEN by construction (zero changed wire-protocol behavior on the fixture side; the helper is harness-internal and not exercised by any fixture until 0015 lands at Task 8). The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11. Fixture 0015 at Task 8 will exercise this helper end-to-end against a real envoy + envoy-rust pair; the fixup's correctness is a precondition for that fixture's correctness.

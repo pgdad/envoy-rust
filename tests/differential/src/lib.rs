@@ -1490,60 +1490,84 @@ pub async fn drive_admin_post(
 }
 
 /// 08.2 Task 7 (D16): poll `addr` in 100ms intervals until `within`
-/// elapses; succeed on the first observation of EITHER ECONNREFUSED
-/// (the kernel-level "no listener" signal) OR an immediate-EOF
-/// connect (the in-flight-drain shape: kernel still accepts because
-/// the listening fd is alive on this side but server-side immediately
-/// FINs the accepted socket without writing any bytes). Both
-/// dispositions are accepted as evidence the listener is drained.
+/// elapses; succeed on the first observation of ANY of THREE
+/// dispositions, all treated as evidence the listener is drained:
 ///
-/// Returns `Err` if neither disposition is observed before `within`
-/// elapses; the error names the address and the last-observed
-/// disposition (live connection, partial read, etc.).
+/// 1. **ECONNREFUSED** (or any connect error) — the kernel-level
+///    "no listener" signal.
+/// 2. **Immediate-EOF after connect** — kernel still accepts because
+///    the listening fd is alive on this side, but server-side
+///    immediately FINs the accepted socket without writing any bytes
+///    (read returns `Ok(0)`).
+/// 3. **Ungraceful close (RST) after connect** — server-side RSTs the
+///    accepted socket mid-handshake; the read returns `Err`
+///    (ECONNRESET on Unix). Some drain configurations RST in-flight
+///    connections rather than FINing cleanly; this is the third
+///    disposition per PLAN.md worked example (lines 2282-2286).
+///
+/// Returns `Err` if NONE of the three dispositions is observed before
+/// `within` elapses; the error names the address and the
+/// last-observed live-listener disposition (read bytes or read
+/// timeout).
 pub async fn assert_data_plane_connection_refused(
     addr: SocketAddr,
     within: Duration,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + within;
     let poll_interval = Duration::from_millis(100);
-    // `last_disposition` is the diagnostic string surfaced on
-    // deadline expiry; the loop arms overwrite it on every "live
-    // listener observed" pass before the deadline check, so the
-    // initial sentinel here is only surfaced if the deadline expires
-    // BEFORE any "live listener" disposition was observed — which can
-    // only happen if every connect succeeded AND every read returned
-    // Ok(0) (success arms return early), which is logically
-    // unreachable but the binding still needs an initial value for
-    // the deadline-branch reader to see.
-    #[allow(unused_assignments)]
-    let mut last_disposition = String::from("(no probe completed before deadline)");
+    // Diagnostic surfaced on deadline expiry. Every live-listener
+    // loop arm (connect-timeout, read-bytes, read-timeout) overwrites
+    // this binding before the deadline-reached branch can fire — the
+    // initial sentinel here is the surface-of-record IFF the deadline
+    // expires before any live-listener arm has run (which would
+    // require every prior loop pass to have hit a success arm and
+    // returned early; logically unreachable). Carries a real
+    // diagnostic string so the M3 closure (remove
+    // `#[allow(unused_assignments)]`) is now sound: the binding's
+    // initial value is itself a valid output of the deadline branch.
+    let mut last_disposition = format!("no live-listener disposition observed before {within:?}");
     loop {
-        match tokio::net::TcpStream::connect(addr).await {
-            Err(e) => {
-                // ECONNREFUSED is the success signal. Any connect error
-                // satisfies the "no live listener" disposition since we
-                // already cleared `wait_accept_ready` earlier in the
-                // dispatch and the listener was alive then; a connect
-                // error now ⇒ the listener fd is gone.
+        // Wrap connect in a 200ms timeout per PLAN.md worked example
+        // (lines 2257-2261) so a slow accept does not erode the
+        // deadline budget beyond the poll interval.
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Err(e)) => {
+                // Connect error — ECONNREFUSED disposition. Drain success.
                 let _ = e;
                 return Ok(());
             }
-            Ok(mut s) => {
-                // Connect succeeded. Read with a short timeout; if the
-                // server immediately FINs (Ok(0)), accept that as the
-                // "draining" disposition. If we observe bytes, the
-                // listener is still live — record and re-poll.
+            Err(_timeout) => {
+                // Connect timed out — listener accepted slowly enough
+                // that we exceeded the per-attempt budget. Treat as
+                // failure-and-continue (slow accept ⇒ listener is
+                // still live in some form); record + re-poll.
+                last_disposition = format!("connect timed out (>200ms) to {addr}");
+            }
+            Ok(Ok(mut s)) => {
+                // Connect succeeded. Read with a short timeout (50ms
+                // per PLAN.md worked example line 2271): Ok(0) ⇒
+                // immediate-EOF drain success; Err ⇒ ungraceful-close
+                // drain success; Ok(n) or timeout ⇒ live listener,
+                // re-poll.
                 let mut tail = [0u8; 64];
-                match tokio::time::timeout(Duration::from_millis(100), s.read(&mut tail)).await {
+                match tokio::time::timeout(Duration::from_millis(50), s.read(&mut tail)).await {
                     Ok(Ok(0)) => return Ok(()),
+                    Ok(Err(_err)) => {
+                        // Read Err (ECONNRESET / etc.) — ungraceful
+                        // close. Drain success per PLAN.md worked
+                        // example lines 2282-2286.
+                        return Ok(());
+                    }
                     Ok(Ok(n)) => {
                         last_disposition = format!(
                             "live listener responded with {n} bytes: {:?}",
                             String::from_utf8_lossy(&tail[..n]),
                         );
-                    }
-                    Ok(Err(err)) => {
-                        last_disposition = format!("read error after connect: {err}");
                     }
                     Err(_) => {
                         last_disposition =
@@ -4941,6 +4965,55 @@ driver:
             msg.contains("listener") || msg.contains("data plane") || msg.contains("LIVE"),
             "unexpected error: {msg}",
         );
+        server.abort();
+    }
+
+    /// `assert_data_plane_connection_refused` succeeds when the target
+    /// address accepts the connection but the listener tears it down
+    /// ungracefully (RST), so the harness's post-connect read returns
+    /// `Err` rather than `Ok(0)`. This is the third drain-success
+    /// disposition per PLAN.md worked example (lines 2282-2286): some
+    /// drain configurations RST in-flight connections rather than
+    /// FINing cleanly, and either shape counts as evidence the
+    /// listener is drained.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assert_data_plane_connection_refused_treats_ungraceful_close_as_drain_success() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Spawn a server that accepts then RSTs each connection. The
+        // RST shape is forced by SO_LINGER=0 before drop — the kernel
+        // emits RST instead of FIN. The client's read on a RST'd
+        // socket returns Err (ECONNRESET), exercising the helper's
+        // ungraceful-close arm (NOT the Ok(0) immediate-EOF arm
+        // exercised by the sibling _succeeds_on_immediate_eof test).
+        //
+        // Note: tokio::net::TcpStream::set_linger is deprecated
+        // upstream (the deprecation flags that SO_LINGER causes the
+        // socket to block the EXECUTOR thread on drop in production
+        // code paths). For this synthetic mock listener that exists
+        // solely to RST the per-attempt accepted socket and then
+        // returns to the accept loop, the executor-blocking concern
+        // does not apply: the linger duration is 0, the close issues
+        // RST immediately without buffering, and the spawned task is
+        // the only user of this executor scaffold. std::net's
+        // set_linger is still unstable (rust-lang/rust#88494) and we
+        // cannot add socket2 or libc as new top-level Cargo deps
+        // per the 08.2 no-new-deps doctrine — so the documented +
+        // locally-allowed deprecated tokio path is the right call
+        // here. The allow is narrowly scoped to this single
+        // statement.
+        let server = tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                #[allow(deprecated)]
+                let _ = s.set_linger(Some(Duration::from_secs(0)));
+                drop(s);
+            }
+        });
+        assert_data_plane_connection_refused(addr, Duration::from_millis(500))
+            .await
+            .expect("ungraceful close (RST) accepted as drained");
         server.abort();
     }
 
