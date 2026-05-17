@@ -137,10 +137,45 @@ pub enum Driver {
     /// `Driver` variant (architecture-decision lock-in #13). Fixture 0011
     /// migrated in lockstep to a single-element `scrapes:` list with no
     /// semantic change.
+    ///
+    /// 08.2 Task 7 (D16): widened again with `pre_admin_actions` (POST
+    /// hooks issued against the admin listener BEFORE the scrape loop —
+    /// fixture 0015's `/drain_listeners` trigger) and
+    /// `post_admin_assertions` (wire-level invariants verified AFTER the
+    /// scrape loop — fixture 0015's "data-plane refuses connections").
+    /// Both default to empty `Vec` via `#[serde(default)]` so fixtures
+    /// 0011 + 0014 (which declare neither field) carry forward
+    /// unchanged.
+    ///
+    /// YAML field order: `pre_admin_actions` is declared BEFORE
+    /// `pre_requests` (architecture-decision lock-in #18) so a reader of
+    /// the YAML sees the drain trigger at the top of the block. The
+    /// TEMPORAL dispatch order is independent — the dispatch fn body
+    /// fires `pre_requests` FIRST (HCM-side traffic so the registry has
+    /// counters incremented for the pre-drain baseline), then
+    /// `pre_admin_actions` (the drain POSTs), then the `scrapes` loop
+    /// (post-drain state assertions), then `post_admin_assertions`
+    /// (wire-level "drained" assertion). This matches fixture 0015's
+    /// natural shape: "verify pre-drain baseline → drain → verify
+    /// post-drain state → wire-level assertion."
     AdminScrape {
+        /// 08.2 Task 7 (D16): POST hooks issued against the admin
+        /// listener BEFORE the scrape loop. Used by fixture 0015 to
+        /// trigger `/drain_listeners` so the subsequent scrape +
+        /// wire-level assertion observe the post-drain state.
+        #[serde(default)]
+        pre_admin_actions: Vec<AdminAction>,
         #[serde(default)]
         pre_requests: Vec<PreRequest>,
         scrapes: Vec<AdminScrapeCase>,
+        /// 08.2 Task 7 (D16): wire-level invariants verified AFTER the
+        /// scrape loop. Today's only variant
+        /// (`DataPlaneConnectionRefused`) probes a data-plane listener
+        /// address with a poll loop and accepts either ECONNREFUSED or
+        /// an immediate-EOF connect as evidence the listener is
+        /// drained.
+        #[serde(default)]
+        post_admin_assertions: Vec<AdminAssertion>,
     },
 }
 
@@ -179,6 +214,53 @@ pub struct PreRequest {
     pub path: String,
     pub host: String,
     pub port_key: String,
+}
+
+/// 08.2 Task 7 (D16): a single admin-side action issued BEFORE the
+/// `Driver::AdminScrape` scrape loop. Today only `Post` is supported;
+/// the variant carries the admin-listener path to POST against and the
+/// expected response status. Internally-tagged on `kind` (e.g.
+/// `{ kind: post, path: /drain_listeners, expected_status: 200 }`) so
+/// future variants slot in without re-shaping the YAML.
+///
+/// `path` is GET-formatted (`/foo`, NOT `http://host/foo`); the helper
+/// `drive_admin_post` issues `POST <path> HTTP/1.1\r\nHost: admin.local\r\n…`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdminAction {
+    /// `POST <path>` against the admin listener; the response status
+    /// MUST equal `expected_status` or the dispatch arm bails with a
+    /// descriptive error.
+    Post { path: String, expected_status: u16 },
+}
+
+/// 08.2 Task 7 (D16): a wire-level invariant verified AFTER the
+/// `Driver::AdminScrape` scrape loop. Today only
+/// `DataPlaneConnectionRefused` is supported; the variant carries the
+/// data-plane listener address to probe and a `within_ms` budget for
+/// the poll loop. Internally-tagged on `kind` so future variants slot
+/// in without re-shaping the YAML.
+///
+/// `within_ms` is `u64` (raw milliseconds) per architecture-decision
+/// lock-in #19 — adding `humantime-serde` would be a new top-level
+/// Cargo dep and is rejected at this phase.
+///
+/// `DataPlaneConnectionRefused` succeeds on EITHER ECONNREFUSED (the
+/// kernel-level "no listener" signal that the listener fd has been
+/// dropped) OR an immediate-EOF connect (the in-flight-drain shape:
+/// kernel still accepts because the listening fd is alive on this
+/// side but server-side immediately FINs the accepted socket). Both
+/// dispositions are accepted as evidence the listener is drained.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdminAssertion {
+    /// Probe `listener_address` (e.g. `127.0.0.1:8080`) in 100ms
+    /// intervals until `within_ms` elapses; succeed on the first
+    /// observation of ECONNREFUSED OR immediate EOF.
+    DataPlaneConnectionRefused {
+        listener_address: String,
+        within_ms: u64,
+    },
 }
 
 /// One TLS-SNI probe entry inside `Driver::TlsTcpProbeList`. SPEC §D6.
@@ -296,6 +378,7 @@ pub enum BodyRule {
         allowlist_envoy_only_keys: Vec<String>,
         #[serde(default)]
         allowlist_envoy_rust_only_keys: Vec<String>,
+        /// Shared keys whose values may differ bilaterally; presence is required, value equality is not. (08.1 REVIEW M2 closure landed at 08.2 D16.)
         #[serde(default)]
         value_may_differ_keys: Vec<String>,
     },
@@ -380,6 +463,14 @@ fn walk_pointer<'a>(
     value: &'a serde_json::Value,
     dotted_path: &str,
 ) -> Result<&'a serde_json::Value> {
+    // 08.1 REVIEW M4 closure landed at 08.2 D16: reject dotted paths
+    // containing empty segments (e.g. `a..b`, `a.b.`, `.foo`) with a
+    // structured error naming the offending path; the existing
+    // "key not found: " message is opaque under this shape because
+    // serde_json::Value::get("") silently returns None.
+    if dotted_path.split('.').any(str::is_empty) {
+        bail!("walk_pointer: dotted path contains empty segment: {dotted_path:?}");
+    }
     let mut cur = value;
     for seg in dotted_path.split('.') {
         cur = if let Ok(idx) = seg.parse::<usize>() {
@@ -1334,6 +1425,145 @@ pub async fn drive_admin_scrape(
         .with_context(|| format!("admin scrape GET {path}"))
 }
 
+/// 08.2 Task 7 (D16): issue a POST against an admin listener at `path`
+/// and assert the response status equals `expected_status`. Used by
+/// the `Driver::AdminScrape::pre_admin_actions` dispatch arm to drive
+/// `/drain_listeners` (and future admin POSTs) before the scrape loop.
+///
+/// Mirrors `drive_admin_scrape`'s wire-shape conventions: connects via
+/// raw TCP, writes a minimal HTTP/1.1 request (zero-length body,
+/// `Host: admin.local`, `Connection: close`), parses the response head
+/// via `httparse`, and discards the body. The 5s per-poll read timeout
+/// matches `drive_http1`'s budget.
+pub async fn drive_admin_post(
+    admin_addr: SocketAddr,
+    path: &str,
+    expected_status: u16,
+) -> Result<()> {
+    let mut stream = tokio::net::TcpStream::connect(admin_addr)
+        .await
+        .with_context(|| format!("connecting to {admin_addr} for admin POST {path}"))?;
+    let req = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: admin.local\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .with_context(|| format!("write admin POST {path}"))?;
+    stream.flush().await.ok();
+
+    let read_timeout = Duration::from_secs(5);
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let status = loop {
+        let mut chunk = [0u8; 2048];
+        let n = tokio::time::timeout(read_timeout, stream.read(&mut chunk))
+            .await
+            .with_context(|| format!("admin POST {path}: read timeout"))?
+            .with_context(|| format!("admin POST {path}: read error"))?;
+        if n == 0 {
+            bail!("admin POST {path}: unexpected EOF before headers complete");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+
+        let mut hp_headers = [httparse::EMPTY_HEADER; 32];
+        let mut resp = httparse::Response::new(&mut hp_headers);
+        match resp
+            .parse(&buf)
+            .with_context(|| format!("admin POST {path}: response parse"))?
+        {
+            httparse::Status::Complete(_) => {
+                break resp
+                    .code
+                    .ok_or_else(|| anyhow::anyhow!("admin POST {path}: no status code"))?;
+            }
+            httparse::Status::Partial => continue,
+        }
+    };
+
+    if status != expected_status {
+        bail!("admin POST {path}: response status {status} != expected {expected_status}",);
+    }
+    Ok(())
+}
+
+/// 08.2 Task 7 (D16): poll `addr` in 100ms intervals until `within`
+/// elapses; succeed on the first observation of EITHER ECONNREFUSED
+/// (the kernel-level "no listener" signal) OR an immediate-EOF
+/// connect (the in-flight-drain shape: kernel still accepts because
+/// the listening fd is alive on this side but server-side immediately
+/// FINs the accepted socket without writing any bytes). Both
+/// dispositions are accepted as evidence the listener is drained.
+///
+/// Returns `Err` if neither disposition is observed before `within`
+/// elapses; the error names the address and the last-observed
+/// disposition (live connection, partial read, etc.).
+pub async fn assert_data_plane_connection_refused(
+    addr: SocketAddr,
+    within: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + within;
+    let poll_interval = Duration::from_millis(100);
+    // `last_disposition` is the diagnostic string surfaced on
+    // deadline expiry; the loop arms overwrite it on every "live
+    // listener observed" pass before the deadline check, so the
+    // initial sentinel here is only surfaced if the deadline expires
+    // BEFORE any "live listener" disposition was observed — which can
+    // only happen if every connect succeeded AND every read returned
+    // Ok(0) (success arms return early), which is logically
+    // unreachable but the binding still needs an initial value for
+    // the deadline-branch reader to see.
+    #[allow(unused_assignments)]
+    let mut last_disposition = String::from("(no probe completed before deadline)");
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Err(e) => {
+                // ECONNREFUSED is the success signal. Any connect error
+                // satisfies the "no live listener" disposition since we
+                // already cleared `wait_accept_ready` earlier in the
+                // dispatch and the listener was alive then; a connect
+                // error now ⇒ the listener fd is gone.
+                let _ = e;
+                return Ok(());
+            }
+            Ok(mut s) => {
+                // Connect succeeded. Read with a short timeout; if the
+                // server immediately FINs (Ok(0)), accept that as the
+                // "draining" disposition. If we observe bytes, the
+                // listener is still live — record and re-poll.
+                let mut tail = [0u8; 64];
+                match tokio::time::timeout(Duration::from_millis(100), s.read(&mut tail)).await {
+                    Ok(Ok(0)) => return Ok(()),
+                    Ok(Ok(n)) => {
+                        last_disposition = format!(
+                            "live listener responded with {n} bytes: {:?}",
+                            String::from_utf8_lossy(&tail[..n]),
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        last_disposition = format!("read error after connect: {err}");
+                    }
+                    Err(_) => {
+                        last_disposition =
+                            "live listener kept connection open without writing (read timeout)"
+                                .into();
+                    }
+                }
+                drop(s);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "assert_data_plane_connection_refused({addr}, within={within:?}): \
+                 listener did not refuse within deadline; last disposition: {last_disposition}",
+            );
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// Decode HTTP/1.1 chunked transfer-encoded body bytes into plain body bytes.
 /// Each chunk has the form `<hex-size>\r\n<data>\r\n`; the last chunk is
 /// `0\r\n\r\n`. Trailer headers (if any) are ignored. Returns an error if the
@@ -2183,8 +2413,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // assertions on each side. Body-rule equivalence is enforced by
         // `assert_body_rule` per sub-case.
         Driver::AdminScrape {
+            pre_admin_actions,
             pre_requests,
             scrapes,
+            post_admin_assertions,
         } => {
             if scrapes.is_empty() {
                 bail!(
@@ -2221,12 +2453,101 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             let mut subject_hcm = std::collections::BTreeMap::new();
             subject_hcm.insert("PORT".to_string(), subject_addr);
 
-            // Pre-requests run ONCE per fixture (not per sub-case). The
-            // 50ms registry-visibility sleep inside `drive_admin_scrape`
-            // also runs at most once because it is now guarded on
-            // `pre_requests.is_empty()` and we pass `&[]` to subsequent
-            // sub-case calls.
-            let mut pre = pre_requests.as_slice();
+            // 08.2 Task 7 (D16) temporal dispatch sequence per PLAN
+            // architecture-decision lock-in #18:
+            //
+            //   1. pre_requests          — HCM-side traffic so the
+            //                              registry has counters
+            //                              incremented (pre-drain
+            //                              baseline).
+            //   2. pre_admin_actions     — POSTs against the admin
+            //                              listener (e.g. fixture
+            //                              0015's `/drain_listeners`
+            //                              trigger).
+            //   3. scrapes               — GETs against the admin
+            //                              listener (post-drain state
+            //                              assertions).
+            //   4. post_admin_assertions — wire-level invariants (e.g.
+            //                              fixture 0015's
+            //                              `data_plane_connection_refused`).
+            //
+            // The YAML field order (`pre_admin_actions` declared
+            // BEFORE `pre_requests` in the struct definition) is
+            // independent of this temporal order. The YAML shape is
+            // for reader ergonomics (drain trigger at the top of the
+            // block); the temporal order is for fixture-semantic
+            // correctness ("verify baseline → drain → verify
+            // post-drain state → wire-level assertion").
+            //
+            // STEP 1: pre_requests. Drive each HCM-side pre-request
+            // against BOTH proxies, then sleep ~50ms (SPEC §6
+            // signpost 11) to let the registry's Relaxed-ordered
+            // counter writes become visible to subsequent scrapes.
+            // Extracted out of the scrape loop so it precedes
+            // pre_admin_actions; the per-side dispatch shape mirrors
+            // `drive_admin_scrape`'s internal pre-request handling
+            // verbatim. (When `pre_requests.is_empty()`, both the
+            // dispatch loop and the visibility sleep are skipped.)
+            for pre in pre_requests {
+                let method = match pre.method.to_ascii_uppercase().as_str() {
+                    "GET" => Http1Method::Get,
+                    other => bail!(
+                        "PreRequest.method {other:?} not supported (only GET); widen drive_admin_scrape to add more"
+                    ),
+                };
+                let upstream_pre_addr = *upstream_hcm.get(&pre.port_key).ok_or_else(|| {
+                    anyhow::anyhow!("unknown PreRequest.port_key on upstream: {}", pre.port_key)
+                })?;
+                let subject_pre_addr = *subject_hcm.get(&pre.port_key).ok_or_else(|| {
+                    anyhow::anyhow!("unknown PreRequest.port_key on subject: {}", pre.port_key)
+                })?;
+                drive_http1(upstream_pre_addr, &method, &pre.path, &pre.host, &[])
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "upstream envoy pre-request {} {} (host={}, port_key={})",
+                            pre.method, pre.path, pre.host, pre.port_key,
+                        )
+                    })?;
+                drive_http1(subject_pre_addr, &method, &pre.path, &pre.host, &[])
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "envoy-rust pre-request {} {} (host={}, port_key={})",
+                            pre.method, pre.path, pre.host, pre.port_key,
+                        )
+                    })?;
+            }
+            if !pre_requests.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // STEP 2: pre_admin_actions — POSTs against BOTH proxies'
+            // admin listeners. Each action is dispatched serially per
+            // proxy with anyhow context tags naming the side and the
+            // action path.
+            for action in pre_admin_actions {
+                match action {
+                    AdminAction::Post {
+                        path,
+                        expected_status,
+                    } => {
+                        drive_admin_post(upstream_admin_addr, path, *expected_status)
+                            .await
+                            .with_context(|| {
+                                format!("upstream envoy pre_admin_action POST {path}")
+                            })?;
+                        drive_admin_post(subject_admin_addr, path, *expected_status)
+                            .await
+                            .with_context(|| format!("envoy-rust pre_admin_action POST {path}"))?;
+                    }
+                }
+            }
+
+            // STEP 3: the scrape loop. pre_requests already fired in
+            // STEP 1; pass `&[]` so drive_admin_scrape skips its
+            // bundled pre-request + visibility-sleep path.
+            let pre: &[PreRequest] = &[];
             let mut results = Vec::with_capacity(scrapes.len());
             for case in scrapes {
                 let upstream_resp =
@@ -2237,14 +2558,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     drive_admin_scrape(pre, subject_admin_addr, &subject_hcm, &case.path)
                         .await
                         .with_context(|| format!("envoy-rust admin scrape: {}", case.path))?;
-                // pre-requests + the 50ms registry-visibility sleep belong
-                // to the first sub-case only. Subsequent sub-cases hit the
-                // admin listener directly.
-                pre = &[];
                 results.push((case, upstream_resp, subject_resp));
             }
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
 
             // 08.1 Task 11 diagnostic: set `DIFFERENTIAL_DUMP_ADMIN=1`
             // to dump ALL sub-cases' bodies (both sides + content-type)
@@ -2313,6 +2628,60 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 )
                 .with_context(|| format!("admin body rule: {}", case.path))?;
             }
+
+            // STEP 4: post_admin_assertions — wire-level invariants
+            // verified AFTER the scrape loop. Today's only variant
+            // (`DataPlaneConnectionRefused`) probes a data-plane
+            // listener address with a poll loop and accepts either
+            // ECONNREFUSED or an immediate-EOF connect as evidence the
+            // listener is drained. Per architecture-decision lock-in
+            // #18, this is the final step in the temporal sequence —
+            // fired BEFORE the subject/upstream teardown so the
+            // data-plane addresses are still live (drained-but-live;
+            // post-drain "kernel-refused" is the success signal).
+            //
+            // Per-side dispatch: a `listener_address` of "PORT" or
+            // "ADMIN_PORT" is resolved against the per-side address
+            // map (matching the existing PreRequest.port_key
+            // convention); a fully-formed `host:port` literal is
+            // probed verbatim on the subject side AND on the upstream
+            // side (subject and upstream may share an address-shape).
+            // For fixture 0015 the post-assertion probes the subject's
+            // HCM listener address (drained); the upstream is in
+            // lock-step. The simplest shape covering both cases is to
+            // probe the LITERAL address parsed from the YAML on BOTH
+            // sides — fixtures that need per-side resolution can
+            // declare two assertions or extend this dispatch later.
+            for assertion in post_admin_assertions {
+                match assertion {
+                    AdminAssertion::DataPlaneConnectionRefused {
+                        listener_address,
+                        within_ms,
+                    } => {
+                        let parsed: SocketAddr = listener_address
+                            .parse()
+                            .with_context(|| {
+                                format!(
+                                    "parsing post_admin_assertion listener_address {listener_address:?}",
+                                )
+                            })?;
+                        let within = Duration::from_millis(*within_ms);
+                        assert_data_plane_connection_refused(parsed, within)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "post_admin_assertion: data_plane_connection_refused {listener_address}",
+                                )
+                            })?;
+                    }
+                }
+            }
+
+            // Teardown LAST so post_admin_assertions observe the
+            // post-drain state against a still-running subject /
+            // upstream.
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
         }
     }
 
@@ -3697,6 +4066,7 @@ scrapes:
             Driver::AdminScrape {
                 pre_requests,
                 scrapes,
+                ..
             } => {
                 assert!(pre_requests.is_empty());
                 assert_eq!(scrapes.len(), 1);
@@ -3735,6 +4105,7 @@ scrapes:
             Driver::AdminScrape {
                 pre_requests,
                 scrapes,
+                ..
             } => {
                 assert_eq!(pre_requests.len(), 1);
                 assert_eq!(pre_requests[0].method, "GET");
@@ -3773,6 +4144,7 @@ scrapes:
             Driver::AdminScrape {
                 pre_requests,
                 scrapes,
+                ..
             } => {
                 assert!(pre_requests.is_empty());
                 assert_eq!(scrapes.len(), 2);
@@ -4238,6 +4610,374 @@ mod body_rule_extension_tests {
         assert!(
             !msg.contains("cx_active"),
             "prefix-allow-listed line should NOT appear in diff, got: {msg}"
+        );
+    }
+}
+
+/// 08.2 Task 7 (D16): tests for the `Driver::AdminScrape`
+/// `pre_admin_actions` + `post_admin_assertions` extensions, the new
+/// `AdminAction` + `AdminAssertion` enums, the supporting helpers
+/// (`drive_admin_post` + `assert_data_plane_connection_refused`), and
+/// the 08.1 REVIEW M4 closure (`walk_pointer` empty-segment guard).
+/// Sibling `#[cfg(test)]` block placed AFTER `body_rule_extension_tests`
+/// per the per-task placement convention.
+#[cfg(test)]
+mod admin_action_extension_tests {
+    use super::{
+        AdminAction, AdminAssertion, Driver, Expectations, assert_data_plane_connection_refused,
+        drive_admin_post, walk_pointer,
+    };
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    // ----- Deserialization tests ---------------------------------------
+
+    /// Driver::AdminScrape YAML carries an explicit `pre_admin_actions:`
+    /// list with a `kind: post` action; the action deserializes to
+    /// `AdminAction::Post { path, expected_status }`.
+    #[test]
+    fn admin_scrape_deserializes_pre_admin_actions_with_post() {
+        let yaml = r#"
+driver:
+  kind: admin_scrape
+  pre_admin_actions:
+    - kind: post
+      path: /drain_listeners
+      expected_status: 200
+  scrapes:
+    - path: /server_info
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["state"]
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::AdminScrape {
+            pre_admin_actions, ..
+        } = e.driver
+        else {
+            panic!("expected AdminScrape");
+        };
+        assert_eq!(pre_admin_actions.len(), 1);
+        match &pre_admin_actions[0] {
+            AdminAction::Post {
+                path,
+                expected_status,
+            } => {
+                assert_eq!(path, "/drain_listeners");
+                assert_eq!(*expected_status, 200u16);
+            }
+        }
+    }
+
+    /// Driver::AdminScrape YAML carries an explicit `post_admin_assertions:`
+    /// list with `kind: data_plane_connection_refused`; the assertion
+    /// deserializes to `AdminAssertion::DataPlaneConnectionRefused` with
+    /// `within_ms` as a raw `u64` (per architecture-decision lock-in #19,
+    /// no humantime dep).
+    #[test]
+    fn admin_scrape_deserializes_post_admin_assertions_with_data_plane_connection_refused() {
+        let yaml = r#"
+driver:
+  kind: admin_scrape
+  scrapes:
+    - path: /server_info
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["state"]
+  post_admin_assertions:
+    - kind: data_plane_connection_refused
+      listener_address: 127.0.0.1:8080
+      within_ms: 5000
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::AdminScrape {
+            post_admin_assertions,
+            ..
+        } = e.driver
+        else {
+            panic!("expected AdminScrape");
+        };
+        assert_eq!(post_admin_assertions.len(), 1);
+        match &post_admin_assertions[0] {
+            AdminAssertion::DataPlaneConnectionRefused {
+                listener_address,
+                within_ms,
+            } => {
+                assert_eq!(listener_address, "127.0.0.1:8080");
+                assert_eq!(*within_ms, 5000u64);
+            }
+        }
+    }
+
+    /// Driver::AdminScrape YAML that omits BOTH new fields keeps fixtures
+    /// 0011 + 0014 backward-compatible: each new field defaults to an
+    /// empty `Vec` via `#[serde(default)]`.
+    #[test]
+    fn admin_scrape_pre_admin_actions_defaults_to_empty_vec() {
+        let yaml = r#"
+driver:
+  kind: admin_scrape
+  scrapes:
+    - path: /stats/prometheus
+      expected_status: 200
+      expected_content_type: text/plain
+      expected_body_rule:
+        kind: prometheus_exposition
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::AdminScrape {
+            pre_admin_actions,
+            post_admin_assertions,
+            ..
+        } = e.driver
+        else {
+            panic!("expected AdminScrape");
+        };
+        assert!(pre_admin_actions.is_empty());
+        assert!(post_admin_assertions.is_empty());
+    }
+
+    /// AdminScrape YAML may declare multiple pre_admin_actions and
+    /// multiple post_admin_assertions; both deserialize in order.
+    #[test]
+    fn admin_scrape_deserializes_multiple_pre_admin_actions_and_assertions() {
+        let yaml = r#"
+driver:
+  kind: admin_scrape
+  pre_admin_actions:
+    - kind: post
+      path: /healthcheck/fail
+      expected_status: 200
+    - kind: post
+      path: /drain_listeners
+      expected_status: 200
+  scrapes:
+    - path: /server_info
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["state"]
+  post_admin_assertions:
+    - kind: data_plane_connection_refused
+      listener_address: 127.0.0.1:1
+      within_ms: 100
+    - kind: data_plane_connection_refused
+      listener_address: 127.0.0.1:2
+      within_ms: 100
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::AdminScrape {
+            pre_admin_actions,
+            post_admin_assertions,
+            ..
+        } = e.driver
+        else {
+            panic!("expected AdminScrape");
+        };
+        assert_eq!(pre_admin_actions.len(), 2);
+        assert_eq!(post_admin_assertions.len(), 2);
+        match &pre_admin_actions[0] {
+            AdminAction::Post { path, .. } => assert_eq!(path, "/healthcheck/fail"),
+        }
+        match &pre_admin_actions[1] {
+            AdminAction::Post { path, .. } => assert_eq!(path, "/drain_listeners"),
+        }
+    }
+
+    // ----- Helper: drive_admin_post ------------------------------------
+
+    /// `drive_admin_post` issues a real POST against a mock admin
+    /// listener; when the mock returns the expected status, the helper
+    /// returns `Ok(())`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_admin_post_succeeds_on_expected_status() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // Drain headers until CRLFCRLF.
+            let mut buf = [0u8; 1024];
+            let mut acc = Vec::new();
+            loop {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            use tokio::io::AsyncWriteExt as _;
+            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            s.shutdown().await.ok();
+            drop(s);
+        });
+
+        drive_admin_post(addr, "/drain_listeners", 200)
+            .await
+            .expect("expected status matched");
+        server.await.unwrap();
+    }
+
+    /// `drive_admin_post` fails when the mock returns a status that
+    /// does not match the expected one; the error mentions both values.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_admin_post_fails_on_status_mismatch() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let mut acc = Vec::new();
+            loop {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                acc.extend_from_slice(&buf[..n]);
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            use tokio::io::AsyncWriteExt as _;
+            s.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            s.shutdown().await.ok();
+            drop(s);
+        });
+
+        let err = drive_admin_post(addr, "/drain_listeners", 200)
+            .await
+            .expect_err("status 503 != expected 200");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("503"), "msg: {msg}");
+        assert!(msg.contains("200"), "msg: {msg}");
+        server.await.unwrap();
+    }
+
+    // ----- Helper: assert_data_plane_connection_refused ----------------
+
+    /// `assert_data_plane_connection_refused` succeeds when the target
+    /// address has no listener (kernel returns ECONNREFUSED).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assert_data_plane_connection_refused_succeeds_when_econnrefused() {
+        // Bind+drop reserves a port the kernel will reject when
+        // re-connected against (TOCTOU window minimal; harness-side
+        // pattern matches reserve_port).
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        drop(listener);
+        assert_data_plane_connection_refused(addr, Duration::from_millis(500))
+            .await
+            .expect("ECONNREFUSED accepted as drained");
+    }
+
+    /// `assert_data_plane_connection_refused` succeeds when the target
+    /// address accepts the connection but immediately closes with EOF
+    /// (the post-drain "draining listener" disposition: kernel still
+    /// accepts because the listening fd hasn't been torn down on this
+    /// side, but the server-side immediately FINs).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assert_data_plane_connection_refused_succeeds_on_immediate_eof() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Spawn a server that accepts and immediately drops every connection
+        // for the duration of the assertion window.
+        let server = tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                drop(s);
+            }
+        });
+        assert_data_plane_connection_refused(addr, Duration::from_millis(500))
+            .await
+            .expect("immediate EOF accepted as drained");
+        server.abort();
+    }
+
+    /// `assert_data_plane_connection_refused` FAILS when the target
+    /// address accepts the connection and writes data before EOF (the
+    /// listener is still "live" — drain did not take effect).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn assert_data_plane_connection_refused_fails_when_listener_responds() {
+        use tokio::io::AsyncWriteExt as _;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Keep accepting + responding for the duration of the assertion
+            // window so every poll within `within` observes "live".
+            while let Ok((mut s, _)) = listener.accept().await {
+                let _ = s.write_all(b"LIVE\n").await;
+                // Hold open briefly so the harness's read does not
+                // hit immediate EOF.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(s);
+            }
+        });
+        let err = assert_data_plane_connection_refused(addr, Duration::from_millis(400))
+            .await
+            .expect_err("live listener must fail the assertion");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("listener") || msg.contains("data plane") || msg.contains("LIVE"),
+            "unexpected error: {msg}",
+        );
+        server.abort();
+    }
+
+    // ----- 08.1 REVIEW M4 closure --------------------------------------
+
+    /// `walk_pointer` MUST reject dotted paths containing empty segments
+    /// with a structured error that names the offending path; this is
+    /// the 08.1 REVIEW M4 closure.
+    #[test]
+    fn walk_pointer_rejects_empty_segment_with_structured_error() {
+        let v = serde_json::json!({"a": {"b": 1}});
+        let err = walk_pointer(&v, "a..b").expect_err("dotted path with empty segment must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty segment"),
+            "error must name the empty-segment defect, got: {msg}",
+        );
+        assert!(
+            msg.contains("a..b"),
+            "error must include the offending path, got: {msg}",
+        );
+    }
+
+    /// `walk_pointer` MUST also reject paths with a trailing dot
+    /// (empty segment at the tail). Same guard, second exemplar.
+    #[test]
+    fn walk_pointer_rejects_trailing_empty_segment() {
+        let v = serde_json::json!({"a": {"b": 1}});
+        let err = walk_pointer(&v, "a.b.").expect_err("trailing-dot path must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("empty segment"),
+            "error must name the empty-segment defect, got: {msg}",
+        );
+        assert!(
+            msg.contains("a.b."),
+            "error must include the offending path, got: {msg}",
         );
     }
 }

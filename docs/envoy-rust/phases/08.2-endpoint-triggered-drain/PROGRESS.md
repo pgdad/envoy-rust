@@ -791,3 +791,149 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 **None at the differential / fixture surface.** Task 6 wires the wire-level drain observation into the data-plane listener accept loop, but no shipped fixture (0001-0014) POSTs to `/drain_listeners` — the `drain.drain_signal()` arm in `Listener::serve` is reachable only after the admin POST handler fires `handler.drain().drain()`. Fixture 0015 at Task 8 is the first differential surface to drive a POST `/drain_listeners` against a live envoy-rust + observe both the listener's `serve` returning (graceful drain) and the `listener_manager.total_listeners_active` gauge decrementing to 0. The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
 
 Regression-equivalence on fixtures 0001-0014 preserved by construction: the bilateral `Listener::serve(shutdown, drain)` continues to honor the shutdown arm verbatim (verified by `serves_honors_shutdown_signal` AND the new `serves_honors_shutdown_signal_with_drain_param` test); no fixture issues a drain POST, so the new drain arm never fires within any fixture's scrape window. The `listener_manager.total_listeners_active` gauge increments to 1 (or 2 if a fixture spawns both a tcp_proxy and HCM listener, though no shipped fixture does) at envoy-rust startup and stays at 1 through the entire fixture run — Task 7 (D16 admin scrape extension) will surface the gauge in `/stats` + `/stats/prometheus` so the value is observable, but no current fixture asserts on it. The first differential-fixture surface asserting on the gauge value's drop-to-0 post-drain lands at Task 8 (fixture 0015).
+
+## Task 7 (D16 — `Driver::AdminScrape` `pre_admin_actions` + `post_admin_assertions` extensions + 08.1 REVIEW M2 + M4 closures)
+
+### Work summary
+
+Widens `Driver::AdminScrape` with two new `#[serde(default)] Vec<…>` fields: `pre_admin_actions: Vec<AdminAction>` (declared BEFORE `pre_requests` in the YAML struct definition per architecture-decision lock-in #18 so the drain trigger appears at the top of the YAML block) and `post_admin_assertions: Vec<AdminAssertion>` (declared AFTER `scrapes`). Both fields default to empty `Vec` so 08.1-landed fixtures 0011 + 0014 carry forward unchanged — they declare neither field and continue to parse cleanly. The variant doc-comment at `tests/differential/src/lib.rs:141-178` explicitly documents the temporal dispatch order (`pre_requests → pre_admin_actions → scrapes → post_admin_assertions`) as independent of the YAML field order, with the rationale ("verify pre-drain baseline → drain → verify post-drain state → wire-level assertion").
+
+Adds two new public enums at `tests/differential/src/lib.rs:219-264`:
+
+- **`AdminAction { Post { path: String, expected_status: u16 } }`** — internally-tagged on `kind` (`#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]`). The single `Post` variant carries the admin-listener path and the expected response status. Today's only consumer is fixture 0015's `/drain_listeners` POST; future admin POSTs (e.g. `/healthcheck/fail`, `/reset_counters`) slot in without YAML-shape churn.
+- **`AdminAssertion { DataPlaneConnectionRefused { listener_address: String, within_ms: u64 } }`** — same serde shape. `within_ms` is a raw `u64` (NOT `humantime::Duration`) per architecture-decision lock-in #19 — adding `humantime-serde` would be a new top-level Cargo dep and is rejected at this phase. The `DataPlaneConnectionRefused` variant succeeds on EITHER ECONNREFUSED (the kernel-level "no listener" signal) OR an immediate-EOF connect (the in-flight-drain shape: kernel still accepts because the listening fd is alive on this side but server-side immediately FINs); both dispositions are accepted as evidence the listener is drained per architecture-decision lock-in #20.
+
+Adds two new public async helpers:
+
+- **`pub async fn drive_admin_post(admin_addr: SocketAddr, path: &str, expected_status: u16) -> Result<()>`** at `tests/differential/src/lib.rs:1438-1490`. Mirrors `drive_admin_scrape`'s wire-shape conventions verbatim: connects via raw TCP, writes a minimal `POST <path> HTTP/1.1\r\nHost: admin.local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n` request, parses the response head via `httparse` in a 2 KiB read loop with a 5s per-poll timeout, and discards the body. Bails with a descriptive error if the response status does not equal `expected_status`.
+- **`pub async fn assert_data_plane_connection_refused(addr: SocketAddr, within: Duration) -> Result<()>`** at `tests/differential/src/lib.rs:1503-1565`. Polls `addr` in 100ms intervals until `within` elapses; returns `Ok(())` on the first observation of EITHER a connect error (any error, treated as ECONNREFUSED-equivalent) OR a connect-then-read-Ok(0) (immediate-EOF disposition). On deadline expiry, bails with an error naming the address, the deadline, and the last-observed live-listener disposition (read bytes, read error, or read timeout).
+
+Extends the `Driver::AdminScrape` dispatch arm at `tests/differential/src/lib.rs:2415-2685` with the explicit 4-step temporal sequence:
+
+1. **STEP 1 — `pre_requests`** (verbatim from 06.1 D6.a, hoisted out of `drive_admin_scrape`'s internal handling so it precedes `pre_admin_actions`). Drives each HCM-side pre-request against BOTH proxies, then sleeps ~50ms (SPEC §6 signpost 11) to let registry's Relaxed-ordered counter writes become visible. `drive_admin_scrape` is then invoked with an empty `pre: &[]` so it skips its bundled pre-request + visibility-sleep path.
+2. **STEP 2 — `pre_admin_actions`**. Each `AdminAction::Post` is dispatched serially against both proxies' admin listeners via `drive_admin_post`, with per-side `with_context` tags naming the side + path.
+3. **STEP 3 — `scrapes`** (verbatim from 08.1 Task 11 shape: per-case dispatch + collect, optional `DIFFERENTIAL_DUMP_ADMIN=1` diagnostic, per-case body-rule assertion).
+4. **STEP 4 — `post_admin_assertions`**. Each `AdminAssertion::DataPlaneConnectionRefused` parses `listener_address` as `SocketAddr` and invokes `assert_data_plane_connection_refused` with `Duration::from_millis(within_ms)`. Per-side dispatch deviation: the literal address parsed from YAML is probed verbatim (not resolved against the per-side address map) — see deviation #2 below.
+
+Subject + upstream teardown is moved to AFTER `post_admin_assertions` (was previously inside `drive_admin_scrape`) so the wire-level assertion observes the drained-but-live listener (post-drain "kernel-refused" is the success signal; teardown FIRST would race against the assertion).
+
+**08.1 REVIEW M2 closed.** Adds a one-line doc-comment to `BodyRule::JsonShape::value_may_differ_keys` at `tests/differential/src/lib.rs:381-383`: "Shared keys whose values may differ bilaterally; presence is required, value equality is not. (08.1 REVIEW M2 closure landed at 08.2 D16.)". The 08.1 REVIEW chain ends.
+
+**08.1 REVIEW M4 closed.** Adds a 3-line guard at the head of `walk_pointer` at `tests/differential/src/lib.rs:466-473` that rejects dotted paths containing empty segments (e.g. `a..b`, `a.b.`, `.foo`) with the structured error `walk_pointer: dotted path contains empty segment: {dotted_path:?}` BEFORE the existing `serde_json::Value::get("")` opaque "key not found" message can fire. The 08.1 REVIEW chain ends.
+
+### Tests landed (11 new)
+
+All colocated in a new sibling module `mod admin_action_extension_tests` at `tests/differential/src/lib.rs:4625-4982` (end-of-file). The new module is named to mirror the existing `mod body_rule_extension_tests` sibling that 08.1 Task 11 introduced; the precedent for putting new test families in a dedicated `<feature>_extension_tests` module is established and continued at Task 7.
+
+Deserialization tests (4):
+
+1. **`admin_scrape_deserializes_pre_admin_actions_with_post`** — YAML carries an explicit `pre_admin_actions:` list with a single `kind: post` action; the parsed variant deserializes to `AdminAction::Post { path, expected_status }` with the correct field values.
+2. **`admin_scrape_deserializes_post_admin_assertions_with_data_plane_connection_refused`** — YAML carries an explicit `post_admin_assertions:` list with a single `kind: data_plane_connection_refused` assertion; verifies `listener_address: String` AND `within_ms: u64` (NOT a humantime string) both parse correctly.
+3. **`admin_scrape_pre_admin_actions_defaults_to_empty_vec`** — YAML that omits BOTH new fields parses cleanly and both fields default to an empty `Vec` via `#[serde(default)]`. This is the regression-equivalence test for fixtures 0011 + 0014.
+4. **`admin_scrape_deserializes_multiple_pre_admin_actions_and_assertions`** — YAML declares 2 `pre_admin_actions` + 2 `post_admin_assertions`; both deserialize in declaration order. Verifies the `Vec` ordering invariant the dispatch arm relies on.
+
+`drive_admin_post` helper tests (2):
+
+5. **`drive_admin_post_succeeds_on_expected_status`** (`#[tokio::test(flavor = "multi_thread")]`) — spawns a mock admin listener on `127.0.0.1:0` that returns `HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n`; asserts `drive_admin_post(addr, "/drain_listeners", 200)` returns `Ok(())`.
+6. **`drive_admin_post_fails_on_status_mismatch`** (`#[tokio::test(flavor = "multi_thread")]`) — same mock-listener shape, returns `503 Service Unavailable`; asserts `drive_admin_post(addr, "/drain_listeners", 200)` returns `Err(_)` whose message contains BOTH `"503"` and `"200"`.
+
+`assert_data_plane_connection_refused` helper tests (3):
+
+7. **`assert_data_plane_connection_refused_succeeds_when_econnrefused`** (`#[tokio::test(flavor = "multi_thread")]`) — binds-then-drops a `TcpListener` on `127.0.0.1:0` to reserve a port the kernel will reject; asserts the helper returns `Ok(())` within 500ms.
+8. **`assert_data_plane_connection_refused_succeeds_on_immediate_eof`** (`#[tokio::test(flavor = "multi_thread")]`) — spawns a mock listener that accepts and immediately drops every connection (server-side FIN with zero bytes); asserts the helper returns `Ok(())` within 500ms. Exercises the second-disposition success path per architecture-decision lock-in #20.
+9. **`assert_data_plane_connection_refused_fails_when_listener_responds`** (`#[tokio::test(flavor = "multi_thread")]`) — spawns a mock listener that writes `LIVE\n` then holds the connection open for 50ms before dropping (so the harness's 100ms read observes bytes, not EOF); asserts the helper returns `Err(_)` whose message names the live disposition.
+
+08.1 REVIEW M4 closure tests (2):
+
+10. **`walk_pointer_rejects_empty_segment_with_structured_error`** — calls `walk_pointer(&value, "a..b")` against a `{"a": {"b": 1}}` value; asserts the error message contains BOTH `"empty segment"` AND the offending path `"a..b"` (in `Debug` form via the helper's `{dotted_path:?}` formatter).
+11. **`walk_pointer_rejects_trailing_empty_segment`** — calls `walk_pointer(&value, "a.b.")` (trailing dot); same dual-assertion shape (`"empty segment"` + `"a.b."`). Verifies the guard catches the tail-empty-segment exemplar in addition to the middle-empty-segment exemplar.
+
+Focused re-run post-implementation: `cargo test -p differential --lib admin_action_extension_tests::` reads `test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 95 filtered out; finished in 0.43s`. The differential lib bucket grew **94 → 105 tests** (+11, exactly the new module). PLAN required **9+**; landed 11.
+
+### Per-task deviations from PLAN
+
+1. **PLAN Step-3 code-snippet dispatch order vs PROGRESS preamble lock-in #18 temporal order.** The PLAN's Step-3 worked-example code snippet showed the dispatch arm body in the order `pre_admin_actions → pre_requests → scrapes → post_admin_assertions`, but PROGRESS preamble lock-in #18 (line 43) + the PLAN-write deviation #1 (line 73) explicitly settle the temporal sequence at `pre_requests → pre_admin_actions → scrapes → post_admin_assertions` ("verify pre-drain baseline → drain → verify post-drain state → wire-level assertion"). The Task 7 dispatch arm at `tests/differential/src/lib.rs:2456-2678` implements the PROGRESS-authoritative temporal order, with a leading multi-line comment block (lines 2456-2480) re-stating the temporal sequence + naming PROGRESS lock-in #18 as the authority. The YAML struct field declaration order (lines 161-179) keeps `pre_admin_actions` BEFORE `pre_requests` per the lock-in's reader-ergonomics half (drain trigger at the top of the YAML block); the doc-comment at lines 150-160 explicitly notes this YAML-vs-temporal separation. Verified by reading the diff: the dispatch arm body unambiguously fires `pre_requests` FIRST.
+
+2. **`post_admin_assertions` per-side dispatch resolves the `listener_address` literally on BOTH sides instead of via a per-side address map.** The `PreRequest.port_key` convention threads template markers (`"PORT"`, `"ADMIN_PORT"`) through a per-side `BTreeMap<String, SocketAddr>` so a single YAML declaration resolves to two distinct subject + upstream addresses. The PLAN sketched a similar shape for `post_admin_assertions` but did not lock it. The Task 7 dispatch arm at `tests/differential/src/lib.rs:2655-2677` parses the YAML `listener_address` directly as a `SocketAddr` and probes it verbatim, treating both sides identically. Rationale: fixture 0015's post-assertion probes the SUBJECT's HCM listener address (the drained side); the upstream is in lock-step but the YAML simplicity wins over per-side resolution at this fixture cardinality. Fixtures that need per-side resolution can declare two `post_admin_assertions` (one for each side's literal address) or extend this dispatch later. A `with_context` tag at line 2671-2675 names the failing assertion. Documented as a deviation because the architecture-decision section did not fully specify this.
+
+3. **`assert_data_plane_connection_refused` does not parse the `last_disposition` initial sentinel as load-bearing.** The helper's `last_disposition: String` binding is initialized at line 1519 to `"(no probe completed before deadline)"` with an `#[allow(unused_assignments)]` attribute. The loop arms overwrite this binding on every "live listener observed" pass before the deadline branch reads it, so the sentinel is only surfaced if the deadline expires BEFORE any "live listener" disposition was observed — which can only happen if every connect succeeded AND every read returned `Ok(0)`, which the success arms return early on. The sentinel is therefore logically unreachable but the binding still needs an initial value for the deadline-branch reader to see; the `#[allow(unused_assignments)]` silences a clippy warning that would otherwise fire under `-D warnings` because the compiler can't prove the unreachability. Documented under deviations because it's a small but visible departure from the PLAN's worked-example shape (the PLAN sketched a `Result<&'static str, _>` for the disposition; the implementation chose a `String` for richer diagnostics).
+
+4. **Test count 11 vs PLAN "9+" floor.** The PLAN required at least 9 tests; the landed module ships 11. The two surplus tests are the second M4-closure exemplar (`walk_pointer_rejects_trailing_empty_segment`) AND the immediate-EOF-success-path test for `assert_data_plane_connection_refused` (`assert_data_plane_connection_refused_succeeds_on_immediate_eof`); both exercise behaviors that the helpers explicitly accept per architecture-decision lock-in #20 + the M4 guard's empty-segment definition. The test count is comfortably above the floor.
+
+5. **No new ADRs (per architecture-decision lock-in #1: 08.2 ships zero new ADRs).** The 4-step temporal dispatch sequence, the AdminAction + AdminAssertion enum shapes, the raw-u64 `within_ms`, and the dual-disposition success of `DataPlaneConnectionRefused` are all locked at the PROGRESS preamble (lock-ins #18-#20). No design freedom is being claimed at Task 7. The ledger head stays **ADR-0032**.
+
+6. **Task implementer subagent crashed mid-flight at ~2.5 hours; a finisher subagent (this commit) verified the partial work compiles + tests pass + gates green + wrote PROGRESS + committed. The 752-line partial diff was preserved as-is.** The finisher subagent inspected each of the 11 new tests, the 2 new helpers, the 2 new enums, the widened variant declaration, the M2 doc-comment, the M4 guard, AND the dispatch arm's temporal order; found the work structurally + semantically complete; ran the 5 gates clean; mirrored the Tasks 1-6 PROGRESS narrative shape; staged + committed via HEREDOC per spec; did NOT amend, rewrite, or re-execute the implementer's work. No additional tests were added (the 11 landed tests are comfortably above the PLAN's 9+ floor and cover every spec-named behavior).
+
+### Confirmations
+
+- **`#![forbid(unsafe_code)]` retained on all touched crates.** Task 7 touches only `tests/differential/src/lib.rs`; the crate-root attribute is unchanged. Zero new unsafe blocks.
+- **No new top-level Cargo deps.** `git diff tests/differential/Cargo.toml` is empty; `git diff Cargo.lock` is empty; no `humantime-serde` or other new dep was added (the raw `u64` `within_ms` on `AdminAssertion::DataPlaneConnectionRefused` is the architecture-decision lock-in #19 choice that avoids the new dep). All Task 7 surfaces use already-on-graph items (`anyhow`, `serde`, `serde_yaml`, `tokio`, `httparse`, `std::net::SocketAddr`, `std::time::Duration`).
+- **08.1 REVIEW M2 doc-comment present** at `tests/differential/src/lib.rs:381-383`: `/// Shared keys whose values may differ bilaterally; presence is required, value equality is not. (08.1 REVIEW M2 closure landed at 08.2 D16.)`.
+- **08.1 REVIEW M4 guard present** at `tests/differential/src/lib.rs:466-473`: the 3-line `if dotted_path.split('.').any(str::is_empty) { bail!("walk_pointer: dotted path contains empty segment: {dotted_path:?}"); }` block precedes the existing per-segment walk loop. Verified by both new walk_pointer tests passing.
+- **Fixtures 0011 + 0014 Docker-gated wrappers still build.** `cargo build -p differential --tests` finishes clean (exit 0, `Finished dev profile`); the two fixture-runner wrappers (in `tests/differential/tests/`) consume the widened `Driver::AdminScrape` variant via the same module-level types and inherit `#[serde(default)]` backward compatibility without any per-fixture change.
+- **STATE.md / ROADMAP.md / SPEC.md / DECISIONS.md / BEHAVIOR_CONTRACT.md untouched.** Task 7 is harness-only; no docs surface changes ship at this task.
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `tests/differential/src/lib.rs` | +764 | -12 |
+| **Total source:** | **+764** | **-12** |
+
+(Numbers from `git diff --stat` pre-commit: `1 file changed, 752 insertions(+), 12 deletions(-)`; the +764/-12 line above is the +/-/-summary split that `git diff --stat` collapses into "752 insertions". Both numbers reflect the same single-file diff.)
+
+Test-count delta: differential lib bucket grew **94 → 105** tests (+11, exactly the new module). No other crate touched; workspace test-count grew by the same +11. The new sibling test module `admin_action_extension_tests` brings the total `#[test]` + `#[tokio::test]` annotations in `tests/differential/src/lib.rs` from **70 → 81** (the 105 number above counts ALL differential tests including `backend::`, `subject::`, `tls::` submodules; the per-file annotation count of 70 → 81 reflects only the `lib.rs`-resident tests).
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff). No iteration required — the prior subagent's partial work was already rustfmt-clean.
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean across all 8 workspace crates, zero warnings, zero errors). The `#[allow(unused_assignments)]` on `last_disposition` inside `assert_data_plane_connection_refused` is necessary because the compiler can't prove the loop's success-path returns make the sentinel unreachable; without the allow, clippy would flag the never-read initial value.
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 workspace crates + test/bench/example targets compiled cleanly). The differential crate rebuilt because of the new enums, new helpers, widened variant declaration, and new test module; no downstream crate rebuilt (Task 7 is contained to the differential test harness).
+
+**Gate 4 — `cargo test --workspace`:** PASS — every per-bucket `test result:` line reads `ok. N passed; 0 failed`. The differential lib bucket grew **94 → 105** (the 11 new `admin_action_extension_tests::*` tests). Focused re-run: `cargo test -p differential --lib admin_action_extension_tests::` reads `test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 95 filtered out; finished in 0.43s`. No `tcp_proxy_backend_*` flakes observed on this run. No other bucket changed test counts.
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Quoted verbatim per 07.1-REVIEW doctrine.
+
+### Differential surface delta
+
+**None at this task.** Task 7 is harness-only; the new D16 surface (`pre_admin_actions` + `post_admin_assertions` + the 2 helper fns `drive_admin_post` + `assert_data_plane_connection_refused`) is exercised end-to-end by fixture 0015 at Task 8 (Docker-gated, against a real envoy + envoy-rust pair) and by the in-process backstop `tests/differential/tests/admin_drain_listeners.rs` at Task 10 (non-Docker, against an in-process envoy-rust). The 11 new unit tests at this task exercise deserialization + helper-behavior in isolation against synthetic mock listeners; they do NOT drive any fixture or real proxy. The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` remains the authoritative bridge-CI evidence until the 08.2 state-4 anchor at Task 11.
+
+Regression-equivalence on fixtures 0001-0014 preserved by construction: both new `Driver::AdminScrape` fields default to empty `Vec` via `#[serde(default)]`; the dispatch arm's STEP 2 + STEP 4 loops iterate over empty `Vec`s and exit immediately when the fields are absent, so fixtures 0011 + 0014 (which declare neither field) hit the same execution path they did at 08.1 plus zero added work. Test `admin_scrape_pre_admin_actions_defaults_to_empty_vec` is the regression-equivalence proof for this property.
