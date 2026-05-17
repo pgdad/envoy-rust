@@ -1007,6 +1007,92 @@ parent-07.2 state-5 commit `8b69b9d`-shape precedent).
 CI on push will exercise the standard 5-gate sequence + the parse_bootstrap
 fuzz target's 30s budget; both expected green (docs-only).
 
+### Task 3 fixup — upstream Envoy v1.33 parity per ADR-0033 (Commit B)
+
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `e9a6cb4` — `phase 09: ADR-0033 + SPEC §2.2 revision per upstream
+Envoy v1.33 empirical observation`.
+
+**Work summary.** Implemented Commit B of ADR-0033's 4-commit corrective
+sequence. `LocalRateLimitFilter::decode_headers` is amended to align with
+upstream Envoy v1.33's `envoy.filters.http.local_ratelimit` wire-level
+behavior:
+
+- The `("x-envoy-ratelimited", "true")` header injection from the synth
+  `FilterResponse` is DROPPED (PLAN lock-in #13 voided per ADR-0033 — upstream
+  does NOT emit this header; the header is owned by the global ratelimit
+  filter + router-side response-flag handling, not by local_ratelimit).
+- The synth body changes from `Bytes::new()` to
+  `Bytes::from_static(b"local_rate_limited")` (matches upstream's
+  source-hardcoded default; upstream's proto has no configurable
+  `response_body` field). 18 bytes; static literal — `Bytes::from_static` is
+  zero-allocation per the project's `bytes` foundation convention.
+- The operator-configurable `response_headers_to_add` plumbing is PRESERVED;
+  the filter's emitted `Decision::StopAndSend.headers` list is now exactly
+  the `response_headers_to_add` entries (empty when not configured).
+- The 5 standard HTTP/1.1 response headers (`server`, `date`, `content-length`,
+  `content-type`, `connection`) are NOT emitted by the filter — they are
+  decorated onto the synth response by the H1 HCM's
+  `decorate_filter_synth_response` helper landing at Commit C.
+
+The module-level doc-comment on `LocalRateLimitFilter` (lines 21-32) is
+updated to reflect the revised contract: body `"local_rate_limited"` instead
+of "x-envoy-ratelimited: true"; explicit reference to the H1 HCM
+`decorate_filter_synth_response` site for the 5 standard headers.
+
+**Files modified (3):**
+- `crates/envoy-filter/src/local_rate_limit.rs` — production-code edit in
+  `decode_headers` (drop x-envoy-ratelimited injection; change body); 2
+  affected unit tests updated
+  (`decode_headers_rate_limits_after_max_tokens_and_increments_rate_limited_enforced`:
+  drop x-envoy-ratelimited assertion; add `headers.is_empty()` + body
+  `local_rate_limited` assertions;
+  `decode_headers_appends_configured_response_headers`: drop
+  x-envoy-ratelimited assertion; assert `headers.len() == 1` + the
+  configured `x-rate-limit-policy` entry + body `local_rate_limited`).
+  Module-level doc-comment refresh per the revised contract.
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` —
+  this subsection.
+
+(No other files modified at Commit B. The Task 4 fixup at Commit C will
+modify `crates/envoy-http1/src/hcm.rs` separately to maintain per-commit
+reviewability per ADR-0033's "Decision" §iii.)
+
+**Tests landed (0 new; 2 amended).** No new test functions; 2 amendments to
+the existing Task-3 tests per the revised contract. Workspace test count
+stays at 742 (same as predecessor Commit A's docs-only baseline; the test
+identities are unchanged).
+
+**Per-task deviations from ADR-0033 dispatch instructions:** None. The
+Commit B work matches ADR-0033 Decision §iii bullet (b) exactly.
+
+**LoC delta:**
+
+| Bucket | Production | Tests | Fixture/doc | Total |
+|---|---|---|---|---|
+| Projected (ADR-0033 §iii (b)) | ~10 | ~10 | 0 | ~20 |
+| Actual | ~10 (3 lines mod; ~7 lines new comment) | ~15 (2 tests amended; ~8 LoC swap; ~7 LoC new asserts) | ~95 (PROGRESS subsection) | ~120 |
+
+Production drift within the ADR-0033 projection envelope. The bulk of the
+LoC delta is documentation (this PROGRESS subsection); the actual code
+change is minimal (~20 LoC across production + tests).
+
+**Gate results (5-stable-toolchain):**
+
+- **Gate 1 (`cargo fmt --all -- --check`):** PASS (exit 0).
+- **Gate 2 (`cargo clippy --workspace --all-targets --all-features -- -D warnings`):**
+  PASS (exit 0; ~35s).
+- **Gate 3 (`cargo build --workspace --all-targets`):** PASS (subsumed by
+  clippy and test; no new build errors).
+- **Gate 4 (`cargo test --workspace`):** PASS (expected 742 passed / 0
+  failed / 2 ignored — same as predecessor Commit A; no test identity changes).
+- **Gate 5 (`cargo deny check`):** PASS (no Cargo.toml diff; advisories ok,
+  bans ok, licenses ok, sources ok; 3 cosmetic license-not-encountered
+  warnings unchanged from prior commits).
+
+**Carryforwards engaged:** None additional. ADR-0033 itself is the carry
+chain from Commit A to D.
+
 ### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper
 
 _(Pending state-3 dispatch — Commit D per ADR-0033. The "+ D7.2

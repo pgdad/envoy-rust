@@ -22,8 +22,14 @@ use crate::types::{FilterRequest, FilterResponse};
 ///
 /// Decode-only filter (per upstream Envoy v1.33 semantic + phase-09 SPEC
 /// §5.4): consumes one token per decode-side invocation; on token exhaustion
-/// short-circuits with a `Decision::StopAndSend` response (429 +
-/// `x-envoy-ratelimited: true`). Encode-side is a no-op `Decision::Continue`.
+/// short-circuits with a `Decision::StopAndSend` response (429 + body
+/// `"local_rate_limited"` matching upstream Envoy v1.33's source-hardcoded
+/// default per ADR-0033). Encode-side is a no-op `Decision::Continue`. The 5
+/// standard HTTP/1.1 response headers (`server`, `date`, `content-length`,
+/// `content-type`, `connection`) are decorated onto the synth response by
+/// the H1 HCM's `decorate_filter_synth_response` helper at the writer-arm
+/// site; the filter only emits the operator-configured
+/// `response_headers_to_add` entries.
 ///
 /// Stat counters (4, per phase-09 SPEC §3 D6):
 ///   - `http_local_rate_limit.<stat_prefix>.enabled` — every decode-side invocation
@@ -137,14 +143,24 @@ impl LocalRateLimitFilter {
         } else {
             self.rate_limited_counter.inc();
             self.enforced_counter.inc();
-            let mut headers: Vec<(String, String)> =
-                vec![("x-envoy-ratelimited".to_string(), "true".to_string())];
-            headers.extend(self.response_headers_to_add.iter().cloned());
+            // Upstream Envoy v1.33's `envoy.filters.http.local_ratelimit` emits
+            // a 429 response with body `"local_rate_limited"` (source-hardcoded;
+            // no configurable `response_body` field on the proto) and NO
+            // `x-envoy-ratelimited` header (that header belongs to the global
+            // ratelimit filter and to router-side response-flag handling, not
+            // to local_ratelimit). Per ADR-0033 envoy-rust matches the upstream
+            // wire shape exactly. The standard HTTP/1.1 response headers
+            // (server / date / content-length / content-type / connection) are
+            // decorated onto the synth response by the H1 HCM's
+            // `decorate_filter_synth_response` helper at the writer-arm site —
+            // the filter only emits the operator-configured
+            // `response_headers_to_add` entries.
+            let headers: Vec<(String, String)> = self.response_headers_to_add.clone();
             Decision::StopAndSend(FilterResponse {
                 status: 429,
                 reason: Some("Too Many Requests"),
                 headers,
-                body: Bytes::new(),
+                body: Bytes::from_static(b"local_rate_limited"),
             })
         }
     }
@@ -455,14 +471,26 @@ mod tests {
         };
         assert_eq!(resp.status, 429);
         assert_eq!(resp.reason, Some("Too Many Requests"));
+        // ADR-0033 (upstream Envoy v1.33 parity): the filter emits NO
+        // `x-envoy-ratelimited` header (that header belongs to the global
+        // ratelimit filter, not local_ratelimit) and the 5 standard HTTP/1.1
+        // response headers are decorated by the H1 HCM's
+        // `decorate_filter_synth_response` helper, not by the filter. The
+        // filter's own header list is empty when no `response_headers_to_add`
+        // is configured.
         assert!(
-            resp.headers
-                .iter()
-                .any(|(k, v)| { k.eq_ignore_ascii_case("x-envoy-ratelimited") && v == "true" }),
-            "x-envoy-ratelimited: true missing from headers: {:?}",
+            resp.headers.is_empty(),
+            "filter headers must be empty when no response_headers_to_add configured (ADR-0033); got {:?}",
             resp.headers
         );
-        assert!(resp.body.is_empty(), "rate-limited body must be empty");
+        // ADR-0033: upstream Envoy v1.33's local_ratelimit emits body
+        // `"local_rate_limited"` (18 bytes; source-hardcoded). envoy-rust
+        // emits the same bytes for bilateral parity.
+        assert_eq!(
+            resp.body.as_ref(),
+            b"local_rate_limited",
+            "rate-limited body must be upstream-parity `local_rate_limited`"
+        );
         let enabled = registry
             .register_counter("http_local_rate_limit.phase_09.enabled")
             .unwrap();
@@ -501,16 +529,17 @@ mod tests {
             Decision::StopAndSend(r) => r,
             Decision::Continue => panic!("expected StopAndSend"),
         };
-        assert!(
-            resp.headers
-                .iter()
-                .any(|(k, v)| k == "x-envoy-ratelimited" && v == "true")
-        );
+        // ADR-0033 (upstream Envoy v1.33 parity): the filter does NOT emit
+        // `x-envoy-ratelimited`. Operator-configured `response_headers_to_add`
+        // entries land verbatim. Body matches upstream parity
+        // (`local_rate_limited`).
+        assert_eq!(resp.headers.len(), 1, "headers: {:?}", resp.headers);
         assert!(
             resp.headers
                 .iter()
                 .any(|(k, v)| k == "x-rate-limit-policy" && v == "phase-09")
         );
+        assert_eq!(resp.body.as_ref(), b"local_rate_limited");
     }
 
     #[test]
