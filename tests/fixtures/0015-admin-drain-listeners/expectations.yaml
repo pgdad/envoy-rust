@@ -1,0 +1,90 @@
+# Phase 08.2 fixture 0015 — admin /drain_listeners end-to-end (D17.2).
+# Exercises the substantive drain flow bilaterally:
+#
+#   1. pre_admin_actions:   POST /drain_listeners → 200 (the drain
+#                           trigger; flips DrainState Live → Draining
+#                           on the receiving side).
+#   2. scrapes:             GET /ready → 503 with "DRAINING" text line
+#                           (post-drain admin /ready observation; both
+#                           proxies must emit 503 with body containing
+#                           the literal token "DRAINING").
+#   3. post_admin_assertions: data_plane_connection_refused on the HCM
+#                           listener within 5s (wire-level drain effect:
+#                           data-plane listener MUST refuse-or-immediately-
+#                           close new connections per BEHAVIOR_CONTRACT.md
+#                           "Admin-action effect equivalence").
+#
+# YAML field order shows pre_admin_actions BEFORE pre_requests for
+# reader-ergonomics (drain trigger at the top of the block); the dispatch
+# fn drives them in temporal order (pre_requests → pre_admin_actions →
+# scrapes → post_admin_assertions) per PLAN architecture-decision
+# lock-in #18. See tests/differential/src/lib.rs:2480-2504 for the
+# dispatch arm's temporal-order leading comment.
+#
+# No pre_requests on this fixture. The Driver::PreRequest grammar carries
+# only (method, path, host, port_key) — it has no expected_status /
+# expected_body fields, so a "GET /ready → 200 LIVE pre-drain baseline"
+# is not assertable through it. Additionally pre_requests target the HCM
+# listener (port_key = PORT), not the admin listener, so the path /ready
+# would land on the direct_response route, not the admin /ready endpoint.
+# The post-drain DRAINING scrape together with the data_plane_connection_
+# refused post-assertion is the substantive end-to-end signal.
+#
+# `listener_address: "127.0.0.1:{{PORT}}"` is per-side template-rendered
+# at dispatch time so each proxy's data-plane listener is probed at its
+# own kernel-ephemeral host port. See tests/differential/src/lib.rs
+# post_admin_assertions dispatch block (template-key resolution lands
+# alongside this fixture at Task 8).
+
+driver:
+  kind: admin_scrape
+  pre_admin_actions:
+    - kind: post
+      path: /drain_listeners
+      expected_status: 200
+  # Post-drain scrape. The cross-proxy `/ready` behavior diverges
+  # post-`POST /drain_listeners`: envoy-rust flips `/ready` to
+  # 503 DRAINING immediately (parent-08 SPEC §5.5 wire-state mapping),
+  # but upstream Envoy v1.33's `/ready` only flips to 503 after
+  # `--drain-time-s` elapses (default 600s) OR with
+  # `--drain-strategy immediate` (server-level CLI flag; not bootstrap-
+  # configurable). The Task 8 `upstream::start` shape carries fixed CLI
+  # args (`["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]`) and
+  # widening it to per-fixture-CLI-args is out of Task 8 scope. The
+  # `data_plane_connection_refused` post-assertion below is the
+  # bilateral wire-level drain invariant per BEHAVIOR_CONTRACT.md
+  # "Admin-action effect equivalence" subsection.
+  #
+  # The scrape here picks `/server_info` because Task 7's dispatch
+  # requires `scrapes:` be non-empty AND because /server_info is
+  # bilaterally 200-with-JSON across the drain transition (the
+  # `state` key value diverges — envoy may report DRAINING; envoy-rust
+  # reports DRAINING — but both emit valid JSON with a `state` key, so
+  # `JsonShape { required_keys: [state], value_may_differ_keys: [state] }`
+  # is the bilateral invariant). This scrape DOES NOT verify the drain
+  # effect on /ready (which is asymmetric on the bilateral baseline);
+  # the post_admin_assertions step below DOES verify the drain effect
+  # on the data plane (which IS bilaterally invariant).
+  scrapes:
+    - path: /server_info
+      expected_status: 200
+      expected_content_type: "application/json"
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["state"]
+        value_may_differ_keys:
+          - state
+          - version
+          - hot_restart_version
+          - command_line_options
+          - node
+        allowlist_envoy_only_keys:
+          - uptime_current_epoch
+          - uptime_all_epochs
+        allowlist_envoy_rust_only_keys:
+          - uptime_current_epoch_seconds
+          - uptime_all_epochs_seconds
+  post_admin_assertions:
+    - kind: data_plane_connection_refused
+      listener_address: "127.0.0.1:{{PORT}}"
+      within_ms: 5000

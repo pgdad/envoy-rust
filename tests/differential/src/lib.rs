@@ -2664,37 +2664,64 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // data-plane addresses are still live (drained-but-live;
             // post-drain "kernel-refused" is the success signal).
             //
-            // Per-side dispatch: a `listener_address` of "PORT" or
-            // "ADMIN_PORT" is resolved against the per-side address
-            // map (matching the existing PreRequest.port_key
-            // convention); a fully-formed `host:port` literal is
-            // probed verbatim on the subject side AND on the upstream
-            // side (subject and upstream may share an address-shape).
-            // For fixture 0015 the post-assertion probes the subject's
-            // HCM listener address (drained); the upstream is in
-            // lock-step. The simplest shape covering both cases is to
-            // probe the LITERAL address parsed from the YAML on BOTH
-            // sides — fixtures that need per-side resolution can
-            // declare two assertions or extend this dispatch later.
+            // Per-side dispatch (08.2 Task 8 extension): the YAML
+            // `listener_address` is template-rendered per-side via the
+            // `{{PORT}}` + `{{ADMIN_PORT}}` markers — `{{PORT}}` resolves
+            // to the side's HCM data-plane port (from
+            // `upstream_hcm` / `subject_hcm`), `{{ADMIN_PORT}}` resolves
+            // to the side's admin port (`upstream_admin_port` /
+            // `subject_admin_port`). Both sides are probed; the
+            // assertion succeeds only if BOTH proxies refuse the
+            // connection within `within_ms`. A YAML address with no
+            // markers (a fully-formed `host:port` literal) is probed
+            // verbatim on BOTH sides — useful for fixtures where
+            // upstream + subject share an address shape, and the
+            // backward-compatible shape for Task 7's existing literal-
+            // address tests at the parsing layer. The template-render
+            // mirrors the existing `render_yaml` mechanism used to
+            // substitute `{{PORT}}` / `{{ADMIN_PORT}}` in the fixture
+            // YAMLs at config-load time; we re-use the same marker
+            // grammar here so a fixture author writes one address
+            // template and gets per-side resolution for free.
             for assertion in post_admin_assertions {
                 match assertion {
                     AdminAssertion::DataPlaneConnectionRefused {
                         listener_address,
                         within_ms,
                     } => {
-                        let parsed: SocketAddr = listener_address
+                        let upstream_addr_s = listener_address
+                            .replace("{{PORT}}", &upstream_addr.port().to_string())
+                            .replace("{{ADMIN_PORT}}", &upstream_admin_port.to_string());
+                        let subject_addr_s = listener_address
+                            .replace("{{PORT}}", &subject_addr.port().to_string())
+                            .replace("{{ADMIN_PORT}}", &subject_admin_port.to_string());
+                        let upstream_parsed: SocketAddr = upstream_addr_s
                             .parse()
                             .with_context(|| {
                                 format!(
-                                    "parsing post_admin_assertion listener_address {listener_address:?}",
+                                    "parsing post_admin_assertion upstream listener_address {upstream_addr_s:?} (template {listener_address:?})",
+                                )
+                            })?;
+                        let subject_parsed: SocketAddr = subject_addr_s
+                            .parse()
+                            .with_context(|| {
+                                format!(
+                                    "parsing post_admin_assertion subject listener_address {subject_addr_s:?} (template {listener_address:?})",
                                 )
                             })?;
                         let within = Duration::from_millis(*within_ms);
-                        assert_data_plane_connection_refused(parsed, within)
+                        assert_data_plane_connection_refused(upstream_parsed, within)
                             .await
                             .with_context(|| {
                                 format!(
-                                    "post_admin_assertion: data_plane_connection_refused {listener_address}",
+                                    "post_admin_assertion: upstream data_plane_connection_refused {upstream_addr_s} (template {listener_address})",
+                                )
+                            })?;
+                        assert_data_plane_connection_refused(subject_parsed, within)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "post_admin_assertion: subject data_plane_connection_refused {subject_addr_s} (template {listener_address})",
                                 )
                             })?;
                     }

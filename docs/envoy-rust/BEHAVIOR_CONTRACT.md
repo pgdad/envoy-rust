@@ -149,6 +149,22 @@ value wins.
 
 ---
 
+## Admin-action effect equivalence
+
+> Authored per phase 08.2 SPEC §2.3. States the cross-proxy invariant that
+> admin-action POSTs (`/drain_listeners`, `/healthcheck/fail`,
+> `/healthcheck/ok`) must drive observable wire-level effects on both
+> proxies. The internal mechanism is implementation-specific; only the
+> wire-level observable is contract.
+
+| Action | Wire-level invariant |
+|---|---|
+| `POST /drain_listeners` | Both proxies MUST refuse-or-immediately-close new connections on their data-plane listeners within the drain window (5s `DRAIN_BUDGET`). The harness `AdminAssertion::DataPlaneConnectionRefused { listener_address, within_ms }` polls for ECONNREFUSED OR immediate-EOF on connect; either disposition satisfies the invariant. Admin listener stays serving during drain (operator reachability per parent-08 SPEC §5.5). Sticky — subsequent `POST /healthcheck/ok` does NOT un-drain. |
+| `POST /healthcheck/fail` | Both proxies MUST flip `/ready` to 503 within 100ms; `/server_info.state` stays `"LIVE"` (server-state independent of healthcheck-failure). |
+| `POST /healthcheck/ok` | Both proxies MUST flip `/ready` back to 200 within 100ms IF and ONLY IF current state is `HealthcheckFailing`; if current state is `Draining`, the action is a no-op (sticky drain). |
+
+---
+
 ## Access log field mapping
 
 > **To be filled per-phase as needed.**
