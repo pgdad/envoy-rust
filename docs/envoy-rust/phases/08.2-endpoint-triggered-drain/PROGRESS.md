@@ -1273,3 +1273,109 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 No differential-fixture or wrapper-count change — Task 9 is a fuzz-corpus seed addition that lives entirely inside the `envoy-config` crate's parse-and-validate gate. The differential bucket stays at **15 wrappers** (unchanged from Task 8's `admin_drain_listeners` addition). The 15 wrappers continue to pass — verified at gate 4 above.
 
 Fuzz-corpus surface delta: the curated `parse_bootstrap` SUCCESS seed-set grows **14 → 15** YAML files (was 14 at Task 12 anchor). The reject seed-set stays at **3** YAML files (unchanged — no Task 9 addition there). The minimal regression-gate seed stays at **1** (`minimal.yaml`, unchanged). The libFuzzer persistent corpus at `crates/envoy-config/fuzz/corpus/parse_bootstrap/` (untracked beyond the curated allow-list) absorbs any future short-budget mutations off the new seed when `+nightly` fuzz is run in CI; the new seed exercises a structural region (admin + HCM-with-direct_response, no clusters, literal healthcheck-relevant addresses) that no prior seed covered in exactly this composition.
+
+---
+
+## Task 10 (D17.4b — In-process backstop `admin_drain_listeners.rs`)
+
+### Work summary
+
+Lands a new in-process Docker-free backstop test at `crates/envoy-bin/tests/admin_drain_listeners.rs` (284 lines) exercising the endpoint-triggered drain flow that landed across Tasks 1-9. The test spawns `envoy-bin` as a subprocess against an in-memory bootstrap (admin listener + 1 HCM listener with one `direct_response` route + `clusters: []` — the same shape fixture 0015 exercises end-to-end against Docker at Task 8), then drives the four-step drain narrative on the wire: (1) pre-drain `GET /ready` → 200 OK with body containing `LIVE\n` (Task 5 D-ready three-arm `DrainStage::Live` rebind); (2) `POST /drain_listeners` → 200 OK (Task 3 D9 endpoint side-effect: `DrainState::drain()` flips `Live → Draining` and fires the `drain_signal()` `Notify`); (3) post-drain `GET /ready` → 503 with body containing `DRAINING\n` (Task 5 D-ready `DrainStage::Draining` arm); (4) data-plane TCP connect to the HCM listener's port within a 5-second budget → either Connection-Refused (the `Listener::serve` drain arm at `crates/envoy-listener/src/lib.rs:277` `drop`s the underlying `tokio::net::TcpListener`, closing the socket; subsequent `connect()` calls see `RST` / `ECONNREFUSED`) OR connect-succeeds-but-read-EOF (race window: kernel listen-queue may still hold a half-handshake between `notify_waiters()` waking and `drop(listener)` running). Both are the drain-success signal per the SPEC.
+
+This is the in-process happy-path complement to Task 8's Docker-gated `0015-admin-drain-listeners` differential wrapper — same bootstrap shape, same admin-action sequence, but no Docker dependency and no upstream-Envoy bilateral comparison. Mirrors the 08.1 Task 13 (`admin_config_dump_server_info.rs`) + 07.2 backstop pattern exactly: single `#[tokio::test]`, inline `reserve_port()` + `wait_ready_result()` helpers (no shared `tests/common/` module exists at the envoy-bin tests directory — the helpers are inlined per the existing sibling-file convention), one-shot TCP scrape with `Connection: close` + `shutdown(Write)` against the admin handler's 5-second `IDLE_READ_TIMEOUT`, stderr-dump-on-failure pattern, `kill_on_drop(true)` + explicit `child.kill().await` on every exit path. Test runs in ~0.77s (well under the PLAN's 3-5s estimate).
+
+The BEHAVIOR_CONTRACT.md "Admin-action effect equivalence" subsection (landed at Task 8) is now covered by two complementary surfaces: Task 8's Docker-gated bilateral differential fixture (proves wire-equivalence with upstream Envoy) and Task 10's in-process backstop (proves the same wire shape without Docker — runs in plain `cargo test --workspace`). The fuzz seed at Task 9 (`admin_healthcheck_bootstrap.yaml`) carries the parse-and-validate half. Together: parse → admin-action → wire-effect — three orthogonal verification surfaces.
+
+### Tests landed (1 new test fn; envoy-bin tests dir grows by 1 binary)
+
+- `admin_drain_listeners::admin_drain_listeners_in_process` (the single `#[tokio::test]` in the new file) — verifies the four-step drain narrative end-to-end against a live subprocess. Asserts: pre-drain `/ready` 200 + `LIVE\n` body; `/drain_listeners` POST 200; post-drain `/ready` 503 + `DRAINING\n` body; data-plane refuse-or-EOF within 5s.
+
+The envoy-bin integration-test directory grows from 13 files (post-08.1-Task-13) to **14 files** (the new `admin_drain_listeners.rs`). Each integration-test file is a separate binary under `cargo test`'s convention. Total envoy-bin test count: was N (varies by sibling-file enumeration) → N+1. The differential bucket also picks the test up under its own `cargo test --workspace` traversal (seen in the build log: two `Running tests/admin_drain_listeners.rs (target/debug/deps/admin_drain_listeners-<hash>)` lines), both PASS.
+
+### Per-task deviations from PLAN
+
+1. **Architecture deviation #1 — HCM + `direct_response` instead of trivial-echo-filter workaround (PLAN-prescribed).** The PLAN's Step-1 YAML snippet explicitly uses the HCM filter with a `direct_response` route (the same shape fixture 0015 carries) rather than the `envoy.filters.network.echo` shortcut that the 08.1 D17.4a sibling backstop (`crates/envoy-bin/tests/admin_config_dump_server_info.rs:130-131`) takes. This is necessary for the drain assertion: an `echo` filter binds via `TcpListener::bind` directly in `crates/envoy-bin/src/main.rs:182-189` and is naturally excluded from `Listener::serve`'s drain observation per the 08.2 PLAN architecture-decision lock-in #12 (the `echo` path bypasses the `envoy_listener::Listener` machinery entirely). HCM goes through the full `envoy_listener::Listener::serve` path at `crates/envoy-bin/src/main.rs:348-356` and IS observed by `drain_signal()`. Without this deviation the data-plane refuse-or-EOF assertion (step 4) would never see drain — the echo `TcpListener` would keep accepting indefinitely. Honored verbatim per the PLAN.
+
+2. **No shared `tests/common/` module — helpers inlined per sibling-file convention.** The PLAN's Step-1 sketch references `mod common; use common::reserve_port; use common::wait_ready;`, anticipating a shared test-helpers module. The envoy-bin tests directory does not have a `tests/common/mod.rs` file; the closest-shape sibling `admin_config_dump_server_info.rs` inlines `reserve_port()` (lines 34-39) and `wait_ready_result()` (lines 41-54) directly. Task 10 honors the sibling-file convention: same inlined helpers, same signatures, copy-pasted shape. A shared `common/` module is a refactor that would touch every envoy-bin integration test (13 existing files) and is out-of-scope for Task 10 — deferred to a hypothetical future task with explicit scope.
+
+3. **PLAN-snippet `anyhow::Result<()>` return type → `#[tokio::test]` with `expect()` / `panic!`.** The PLAN's Step-1 snippet has `async fn admin_drain_listeners_in_process() -> anyhow::Result<()>` and uses `?` throughout. The closest-shape sibling `admin_config_dump_server_info.rs:94` uses bare `#[tokio::test] async fn ...()` (no `Result` return, `unwrap()` / `expect()` / `panic!` on assertion failures). Task 10 mirrors the sibling-file shape so test-output formatting matches sibling tests (cleaner panic backtrace + test framework integration). Semantic behavior identical — assertion failures still surface as test failures.
+
+4. **`/ready` body window-match relaxed from PLAN-snippet `windows(6).any(|w| w == b"LIVE\n\r" || w == b"LIVE\n")` to `windows(5).any(|w| w == b"LIVE\n")`.** The actual `render_ready_with` body at `crates/envoy-admin/src/endpoint.rs:333` is `Bytes::from_static(b"LIVE\n")` (5 bytes ending in `\n`); there is no `\r` separator (chunked or otherwise) — `LIVE\n` is the literal body. The PLAN-snippet's 6-byte window with `LIVE\n\r` fallback is defensive against a hypothetical CRLF body shape that does not exist in the current codebase. Window-5 with exact match against the actual body shape is tighter and equivalent. Same simplification applied to the `DRAINING\n` window: PLAN's `windows(8).any(|w| w == b"DRAINING")` (8 bytes, no `\n`) → `windows(9).any(|w| w == b"DRAINING\n")` (9 bytes including the actual body's terminating `\n` at `endpoint.rs:342`).
+
+5. **`scrape()` returns `std::io::Result<Vec<u8>>` instead of `anyhow::Result<Vec<u8>>`.** PLAN snippet uses `anyhow::Result`; Task 10 uses `std::io::Result` because the TCP I/O calls (`TcpStream::connect`, `write_all`, `read_to_end`) all return `std::io::Result` natively and the function does no anyhow-wrapping internally. Callers handle errors via `.expect("scrape …")` (same shape as the sibling-file pattern). Semantic identical.
+
+6. **Node block added to bootstrap.** The PLAN-snippet bootstrap omits the top-level `node:` block. Task 10 adds `node: { id: backstop-drain-test, cluster: backstop-drain-test }` to mirror the sibling `admin_config_dump_server_info.rs:114-116` and fixture 0015's `envoy-rust.yaml:10-12` shape. The `node` block is parse-time optional (the envoy-config validator accepts its absence — see `admin_ready.rs:12-23` for an example of a node-less bootstrap that parses), so this is purely a cosmetic alignment with sibling convention.
+
+### Confirmations
+
+- **`#![forbid(unsafe_code)]` retained.** The new file `crates/envoy-bin/tests/admin_drain_listeners.rs:53` carries the attribute; envoy-bin's `src/main.rs` and sibling integration tests all carry it. Zero new unsafe blocks.
+- **No new top-level Cargo deps.** All dependencies used by the new test (`tokio` features `net`/`io-util`/`macros`/`process`, `tempfile`) are already present in `crates/envoy-bin/Cargo.toml` (`tokio` at line 25 as a production dep; `tempfile` at line 38 as a dev-dep — both pre-existing). `git diff crates/envoy-bin/Cargo.toml` is empty; `git diff Cargo.lock` is empty.
+- **STATE.md / ROADMAP.md / SPEC.md / DECISIONS.md / BEHAVIOR_CONTRACT.md untouched.** Task 10 ships zero changes to those documents. The only doc surface change is this PROGRESS narrative append.
+- **No new ADRs (per architecture-decision lock-in #1: 08.2 ships zero new ADRs).** Ledger head stays **ADR-0032**.
+- **TDD baseline established.** Before authoring the new test, the four production surfaces it exercises were already landed: Task 3 (`/drain_listeners` POST endpoint), Task 4 (admin-handler `DrainState` wiring), Task 5 (drain-aware `/ready` body), Task 6 (`Listener::serve` drain arm). The test was authored expecting PASS-on-first-run (per the PLAN's framing: "surfaces are all in — should PASS"). Empirically: PASS on first compile, 0.77s runtime. No iteration was needed beyond two rustfmt + clippy doc-list-indent fixups (both stylistic; no semantic change).
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `crates/envoy-bin/tests/admin_drain_listeners.rs` | +284 | 0 (new) |
+| `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/PROGRESS.md` | +~75 | 0 |
+| **Total test + doc:** | **+~359** | **0** |
+
+Test-count delta: envoy-bin integration-tests directory grows from **13 → 14** binaries. Workspace-wide test count grows by **+1** (the new `admin_drain_listeners_in_process` function). Total runtime cost: ~0.77s for the new test binary; ~30s for the build overhead (one fresh envoy-bin link for the new test target).
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff). The new file was authored to match the rustfmt style of the sibling `admin_config_dump_server_info.rs` and re-checked after one stylistic fixup (the inline `panic!` arg list folding at line 248).
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean across all 14 workspace crates, zero warnings, zero errors). Required one fixup: the original doc-comment narrative used excess leading indentation on a `1. … 2. … 3. … 4. …` numbered list, which `clippy::doc_overindented_list_items` correctly flagged. Reformatted to flush-left list-item bodies; clippy now passes clean.
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 14 workspace crates + test/bench/example targets compiled cleanly in ~1.4s incremental after gates 1-2). The new test binary `admin_drain_listeners` builds cleanly.
+
+**Gate 4 — `cargo test --workspace`:** PASS — every per-bucket `test result:` line reads `ok. N passed; 0 failed`. The new test surfaces on TWO bucket lines (per workspace conventions): one as `running 1 test\ntest admin_drain_listeners_in_process ... ok` under the envoy-bin tests harness, AND one as `test admin_drain_listeners ... ok` under the differential bucket's pickup. Both PASS. Empirical runtime of the new test: 0.77s.
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree per ADR-0005); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Task 10 introduces ZERO new top-level Cargo deps — it is a new-test-file-only change. Quoted verbatim per 07.1-REVIEW doctrine + project precedent (08.1 Task 13 + 08.2 Tasks 1-9 follow the same verbatim-quote convention).
+
+### Differential surface delta
+
+No differential-fixture or wrapper-count change — Task 10 is a Docker-free in-process backstop addition. The differential bucket stays at **15 wrappers** (unchanged from Task 8 onward); the 15 wrappers continue to pass — verified at gate 4 above.
+
+In-process backstop surface delta: the `envoy-bin` integration-tests directory grows from **13 → 14** test binaries. The new `admin_drain_listeners.rs` is the in-process Docker-free complement to Task 8's Docker-gated `0015-admin-drain-listeners` differential wrapper — same admin-action sequence + same wire-shape assertions, but Docker-independent and runnable under plain `cargo test --workspace`. With Task 10 landed, the BEHAVIOR_CONTRACT.md "Admin-action effect equivalence" subsection is covered by three orthogonal surfaces: parse-validate (Task 9 fuzz seed) + Docker-bilateral (Task 8 fixture 0015) + in-process-wire (Task 10 this backstop).
+
+Flakiness assessment: the data-plane refuse-or-EOF check has a 5-second budget with 100ms-period polling (50 connect attempts maximum). Empirically the drain is observable on the first or second poll (the `Listener::serve` drain arm responds to `notify_waiters()` within tens of microseconds per the parent-08 SPEC §5.6 model; `drop(listener)` runs synchronously inside the same `tokio::select!` arm), so the 5s budget is ~50x the typical observation window. Single empirical run on macOS 25.4 / aarch64 / native: 0.77s total (drain observed on first poll). No flakiness observed in local re-runs of the test binary; the budget headroom is intentional per the PLAN's "should be plenty" framing.
