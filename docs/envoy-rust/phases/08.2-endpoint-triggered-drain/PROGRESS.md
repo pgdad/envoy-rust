@@ -1167,3 +1167,109 @@ The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-lis
 Phase 08.2's first NEW end-to-end Docker-gated bilateral fixture. The 14 prior Docker-gated wrappers (0001-0014) continue to pass unchanged — verified at gate 4 above. Fixture 0015 brings the differential wrapper count to **15** and exercises (a) the 08.2 D9/D10 `POST /drain_listeners` admin endpoint surface end-to-end against upstream Envoy v1.33, (b) the 08.2 D11/D12/D-ready/D13b drain-state-cascade end-to-end (POST receipt → DrainState compare-exchange → Listener::serve drain-signal observation → connection-refused-or-immediate-EOF on the data-plane listener), (c) the 08.2 D16 `Driver::AdminScrape::pre_admin_actions` + `Driver::AdminScrape::post_admin_assertions` harness extensions Task 7 introduced, (d) the new Task 8 template-key resolution path in the dispatch-arm's STEP 4 (per Per-task deviation #2). The 08.1 state-4 anchor CI run `25964680619` HEAD `03e6435` no longer covers the new fixture; the 08.2 state-4 anchor at Task 11 will be the next bridge-CI evidence point and will include this new wrapper in the 15-fixture sweep. Local empirical Docker-gated GREEN at this commit (3 consecutive runs) is the immediate evidence the Task-11 CI run will be expected to reproduce.
 
 The new fixture exercises the BEHAVIOR_CONTRACT.md "Admin-action effect equivalence" subsection's `POST /drain_listeners` row (the data-plane connection-refused wire-level invariant); the second + third rows (`/healthcheck/fail` + `/healthcheck/ok`) are covered in isolation by the in-process backstop at Task 10 + the fuzz corpus seed at Task 9 (per the PLAN's task-coverage matrix).
+
+---
+
+## Task 9 (D17.3b — Fuzz corpus seed `admin_healthcheck_bootstrap.yaml`)
+
+### Work summary
+
+Lands a new fuzz-corpus seed at `crates/envoy-config/fuzz/corpus/parse_bootstrap/admin_healthcheck_bootstrap.yaml` (30 lines) exercising the admin + 1 HCM listener + 1 `direct_response` route bootstrap shape from fixture 0015's `envoy-rust.yaml` (minus the harness substitution markers `{{PORT}}` / `{{ADMIN_PORT}}` — the seed uses deterministic literals `127.0.0.1:9901` for admin and `127.0.0.1:8080` for the HCM listener). Adds the matching per-file allow-line `!corpus/parse_bootstrap/admin_healthcheck_bootstrap.yaml` to `crates/envoy-config/fuzz/.gitignore` (appended at the bottom per the 08.1 Task 12 + 07.2 Task 6 chronological-insertion convention — the existing list is grouped chronologically, not alphabetically). Appends the seed's path to the `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array in `crates/envoy-config/src/bootstrap.rs` (was 14 entries at Task 12; now 15). No new test function landed — Task 9 EXTENDS test data, not test logic. The seed broadens libFuzzer's structural coverage of the `parse_bootstrap` target into the admin + HCM-with-direct_response shape that fixture 0015 exercises end-to-end against Docker but that no prior fuzz seed covered in isolation (the closest precedent `hcm_direct_response_happy.yaml` carries the same HCM + direct_response shape but binds the admin listener to `0.0.0.0:0` rather than the literal `127.0.0.1:9901` healthcheck-relevant address, and is shaped around the HCM happy-path rather than the admin+healthcheck framing). Per the PLAN's task-coverage matrix the seed is one of two Task 9/10 surfaces that cover the BEHAVIOR_CONTRACT.md "Admin-action effect equivalence" subsection's second + third rows (`POST /healthcheck/fail` + `POST /healthcheck/ok`) in isolation; the in-process backstop at Task 10 carries the runtime wire-level half, while Task 9 carries the parse-and-validate half (a parser regression that breaks admin+HCM+direct_response bootstraps with literal healthcheck-relevant addresses would be caught by libFuzzer mutating off this seed).
+
+### Tests landed (0 new test fns; SUCCESS-array grows 14 → 15)
+
+- None. Task 9 extends the existing `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (was 14 entries post-Task-12; now 15 with the new seed). The new seed becomes test data, not a new test function. The `envoy-config` lib bucket count stays at **209** (unchanged at Task 12, unchanged through 08.2 Tasks 1-8 which did not touch the envoy-config lib bucket — 08.2's bucket-growth happened in `envoy-admin` and `differential`, not `envoy-config`). Verified at gate 4 below.
+
+### Per-task deviations from PLAN
+
+The PLAN's Task 9 spec says "Mirror the 08.1 Task 12 5-deviation envelope (no `connect_timeout`, populated locality, mandatory `lb_policy`, single-listener cap, `+nightly` invocation)." Re-applying that envelope to this seed's shape:
+
+1. **`connect_timeout` — N/A.** The 08.1 Task 12 seed had two STRICT_DNS clusters and dropped the PLAN-sketch `connect_timeout` field (unsupported by the `Cluster` struct's `#[serde(deny_unknown_fields)]`). Task 9's seed declares `clusters: []` (no clusters at all — the HCM listener routes purely via `direct_response`), so `connect_timeout` does not appear. Mirror is moot but the underlying constraint (deny_unknown_fields on `Cluster`) carries forward unchanged.
+
+2. **Populated locality / endpoints — N/A.** The 08.1 Task 12 seed had to populate each cluster's `lb_endpoints` to clear `ConfigError::EmptyClusterEndpoints`. Task 9's seed declares zero clusters, so the empty-endpoints validator at `bootstrap.rs:1215-1225` does not fire (it iterates over `clusters[]` which is empty). Mirror is moot.
+
+3. **Mandatory `lb_policy` — N/A.** The 08.1 Task 12 seed had to declare `lb_policy: ROUND_ROBIN` on each cluster because the `Cluster` struct's `lb_policy` field is non-optional. Task 9's seed declares zero clusters, so no `lb_policy` is needed. Mirror is moot.
+
+4. **Single-listener cap — APPLIES.** The validator at `bootstrap.rs:1198-1202` caps listeners at 1 (`ConfigError::TooManyListeners`) per phase 01. Task 9's seed declares exactly one listener (`hcm_drain_test`), satisfying the cap. The PLAN's "+ 1 HCM listener" phrasing already honors this — no PLAN deviation needed; documenting for envelope completeness.
+
+5. **`+nightly` invocation — APPLIES (CI-only / not locally run).** Per ADR-0010 the fuzz subcrate is workspace-excluded and `cargo-fuzz` requires its own `Cargo.toml` directory + nightly toolchain. The PLAN's short-budget invocation would be `cd crates/envoy-config/fuzz && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`. Local empirical execution of this long-budget invocation is NOT a Task 9 gate (the parent-PLAN's 5-deviation envelope reference to "+nightly invocation" is CI-only); the SHORT-budget parse-or-reject test in `bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly` is what gates this commit and was empirically verified PASS at gate 4 below. Mirror is the parent-task's framing, applied honestly: local +nightly fuzz was not exercised at this commit boundary.
+
+Additional Task-9-specific clarifications (not from the envelope):
+
+6. **Seed-file content authored literally per the PLAN's Step-1 YAML block.** The PLAN spec's YAML is reproduced verbatim — admin listener on `127.0.0.1:9901`, HCM listener on `127.0.0.1:8080`, `stat_prefix: drain_test`, `codec_type: HTTP1`, single virtual_host `default` with `domains: ["*"]` and one route `prefix: "/"` → `direct_response { status: 200, body: { inline_string: "ok\n" } }`, `http_filters: [router]`, `clusters: []`. No additional fields. Zero harness template markers (no `{{PORT}}` / `{{ADMIN_PORT}}` — this is a parser corpus seed, not a fixture template).
+
+7. **Gitignore append, not alphabetical insertion.** The existing `.gitignore` allow-list at `crates/envoy-config/fuzz/.gitignore:2-20` is ordered chronologically (insertion-order across 08.1 Task 12 + 07.2 Task 6 + 06.2 Task 5 + 06.1 Task 9 + 05.3 Task 4 + earlier), not alphabetically. Task 9 appends the new allow-line at the bottom (after `admin_multi_endpoint_bootstrap.yaml`) per the established commit-history pattern — matches Task 12's actual practice. The PLAN's "insertion alphabetical" wording is honored ONLY in the bootstrap.rs SUCCESS-array context, where it is interpreted as "append at the end of the array literal" (consistent with Task 12's actual placement and with the array's pre-existing non-strictly-alphabetical ordering — e.g., `admin_with_stats_route.yaml` precedes `admin_multi_endpoint_bootstrap.yaml` despite `m < w` alphabetically).
+
+### Confirmations
+
+- **`#![forbid(unsafe_code)]` retained on all touched crates.** Task 9 touches only `crates/envoy-config/fuzz/.gitignore` (1 line added), `crates/envoy-config/fuzz/corpus/parse_bootstrap/admin_healthcheck_bootstrap.yaml` (new 30-line YAML file, no Rust code), `crates/envoy-config/src/bootstrap.rs` (1 line added to the SUCCESS array), and `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/PROGRESS.md` (this narrative). The `envoy-config` crate's `#![forbid(unsafe_code)]` (at `crates/envoy-config/src/lib.rs:1`) is unchanged. Zero new unsafe blocks. Zero new Rust code at all — only a data-line addition to the SUCCESS array literal.
+- **No new top-level Cargo deps.** `git diff Cargo.lock` is empty; `git diff crates/envoy-config/Cargo.toml` is empty. Task 9 is fixture-data + 1-test-data-line + 1-gitignore-line only. No code, no deps.
+- **STATE.md / ROADMAP.md / SPEC.md / DECISIONS.md / BEHAVIOR_CONTRACT.md untouched.** Task 9 ships zero changes to those documents. The only doc surface change is this PROGRESS narrative append.
+- **No new ADRs (per architecture-decision lock-in #1: 08.2 ships zero new ADRs).** Ledger head stays **ADR-0032**.
+- **TDD baseline established.** Before adding the SUCCESS-array entry, `cargo test -p envoy-config --lib fuzz_corpus_seeds_parse_or_reject_cleanly -- --nocapture` was run against HEAD `832abe6` (the Task 8 anchor): PASS with 14 SUCCESS entries + 3 reject entries + 1 minimal regression check. After adding the SUCCESS-array entry referencing the new seed file, re-run: PASS with 15 SUCCESS entries (the new entry parses cleanly). The TDD shape per the PLAN's Step-2 spec is satisfied — baseline PASS, post-edit PASS, the new seed exercises the parser without error.
+
+### LoC delta
+
+| File | Insertions | Deletions |
+|---|---|---|
+| `crates/envoy-config/fuzz/corpus/parse_bootstrap/admin_healthcheck_bootstrap.yaml` | +30 | 0 (new) |
+| `crates/envoy-config/fuzz/.gitignore` | +1 | 0 |
+| `crates/envoy-config/src/bootstrap.rs` | +1 | 0 |
+| `docs/envoy-rust/phases/08.2-endpoint-triggered-drain/PROGRESS.md` | +~90 | 0 |
+| **Total fixture + test-data + doc:** | **+~122** | **0** |
+
+Test-count delta: envoy-config lib bucket stays at **209** (was 209 at Task 12 anchor; unchanged through 08.2 Tasks 1-8). The SUCCESS-array literal inside `fuzz_corpus_seeds_parse_or_reject_cleanly` grows from **14 → 15** entries (the new `admin_healthcheck_bootstrap.yaml` line); the test-function count is unchanged because Task 9 extends test data, not test logic. Workspace-wide test-count is unchanged.
+
+### 5-gate test-bucket attestation
+
+**Gate 1 — `cargo fmt --all -- --check`:** PASS (exit 0; zero diff). The only Rust-file edit is a 1-line array-literal insertion that matches the surrounding indentation exactly.
+
+**Gate 2 — `cargo clippy --workspace --all-targets --all-features -- -D warnings`:** PASS (exit 0; clean across all 8 workspace crates, zero warnings, zero errors). The envoy-config + envoy-cluster + envoy-listener + envoy-filter + envoy-tls + envoy-http1 + envoy-tcp + envoy-http2 + envoy-admin + http1-echo-server + http2-echo-server + envoy-bin compiles + checks completed in ~29s. No new lints fired.
+
+**Gate 3 — `cargo build --workspace --all-targets`:** PASS (exit 0; all 8 workspace crates + test/bench/example targets compiled cleanly in ~28s). The envoy-config crate rebuilt because of the 1-line bootstrap.rs edit; no downstream rebuild cascade (the change is inside a `#[cfg(test)]` block).
+
+**Gate 4 — `cargo test --workspace`:** PASS — every per-bucket `test result:` line reads `ok. N passed; 0 failed`. The envoy-config lib bucket reads `test result: ok. 209 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s` (unchanged from Task 12; Task 9 extends test data inside `fuzz_corpus_seeds_parse_or_reject_cleanly` without growing the test-function count). Focused re-run via `cargo test -p envoy-config --lib fuzz_corpus_seeds_parse_or_reject_cleanly -- --nocapture` reads `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 208 filtered out; finished in 0.01s` — the SUCCESS-array iteration now parses the new seed file successfully alongside the existing 14 SUCCESS seeds + 3 reject seeds + 1 minimal regression check. The 15 differential wrappers (including Task 8's new `admin_drain_listeners`) stay GREEN — verified by the per-bucket `1 passed; 0 failed` lines for each. All other workspace buckets unchanged.
+
+**Gate 5 — `cargo deny check`:** PASS (exit 0). Verbatim output:
+
+```
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:49:6
+   │
+49 │     "0BSD",
+   │      ━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:40:6
+   │
+40 │     "BSD-2-Clause",
+   │      ━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:47:6
+   │
+47 │     "MPL-2.0",
+   │      ━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:43:6
+   │
+43 │     "Unicode-DFS-2016",
+   │      ━━━━━━━━━━━━━━━━ unmatched license allowance
+
+warning[license-not-encountered]: license was not encountered
+   ┌─ /Users/esa/git/envoy-rust/deny.toml:45:6
+   │
+45 │     "Zlib",
+   │      ━━━━ unmatched license allowance
+
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+The 5 `license-not-encountered` warnings are pre-existing (`deny.toml` allow-list broader than the transitive tree per ADR-0005); the verdict line `advisories ok, bans ok, licenses ok, sources ok` is the gate-pass signal. Task 9 introduces ZERO new top-level Cargo deps — it is a fixture-only + 1-test-data-line + 1-gitignore-line change. Quoted verbatim per 07.1-REVIEW doctrine + project precedent (08.1 Task 12 + 08.2 Tasks 1-8 follow the same verbatim-quote convention).
+
+### Differential surface delta
+
+No differential-fixture or wrapper-count change — Task 9 is a fuzz-corpus seed addition that lives entirely inside the `envoy-config` crate's parse-and-validate gate. The differential bucket stays at **15 wrappers** (unchanged from Task 8's `admin_drain_listeners` addition). The 15 wrappers continue to pass — verified at gate 4 above.
+
+Fuzz-corpus surface delta: the curated `parse_bootstrap` SUCCESS seed-set grows **14 → 15** YAML files (was 14 at Task 12 anchor). The reject seed-set stays at **3** YAML files (unchanged — no Task 9 addition there). The minimal regression-gate seed stays at **1** (`minimal.yaml`, unchanged). The libFuzzer persistent corpus at `crates/envoy-config/fuzz/corpus/parse_bootstrap/` (untracked beyond the curated allow-list) absorbs any future short-budget mutations off the new seed when `+nightly` fuzz is run in CI; the new seed exercises a structural region (admin + HCM-with-direct_response, no clusters, literal healthcheck-relevant addresses) that no prior seed covered in exactly this composition.

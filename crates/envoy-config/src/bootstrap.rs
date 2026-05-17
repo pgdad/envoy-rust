@@ -2779,6 +2779,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/hcm_access_log_file.yaml",
             "fuzz/corpus/parse_bootstrap/hcm_header_mutation_filter.yaml",
             "fuzz/corpus/parse_bootstrap/admin_multi_endpoint_bootstrap.yaml",
+            "fuzz/corpus/parse_bootstrap/admin_healthcheck_bootstrap.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
