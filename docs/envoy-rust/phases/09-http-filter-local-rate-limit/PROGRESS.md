@@ -1093,6 +1093,114 @@ change is minimal (~20 LoC across production + tests).
 **Carryforwards engaged:** None additional. ADR-0033 itself is the carry
 chain from Commit A to D.
 
+### Task 4 fixup — H1 HCM filter-synth header decoration per ADR-0033 (Commit C)
+
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `1c1de0f` — `phase 09: task 3 fixup — drop x-envoy-ratelimited
++ body "local_rate_limited" per ADR-0033`.
+
+**Work summary.** Implemented Commit C of ADR-0033's 4-commit corrective
+sequence. The H1 HCM's filter-synth writer-path was discovered at Task 5
+dispatch to skip the standard HTTP/1.1 response header decoration (5 standard
+headers: `server`, `date`, `content-length`, `content-type`, `connection`).
+The 07.1-landed framework converts `FilterResponse` ↔ `Response` verbatim
+across the boundary; filter implementations are not expected to populate
+these wire-level headers (their responsibility ends at the application-
+semantic content). The synth-from-build paths (`synth_status`,
+`synth_direct_response`) populate the 5 standard headers inline at
+construction time; the filter-synth paths did not. Phase 07.2's
+HeaderMutation filter never short-circuited via `Decision::StopAndSend`
+(HeaderMutation's `decode_headers` returns `Decision::Continue`
+unconditionally — the filter only mutates header lists, never short-circuits),
+so the gap went unobserved at 07.x. Phase 09's LocalRateLimit is the first
+production filter to emit `StopAndSend` with a sparse header list, surfacing
+the latent framework defect.
+
+This commit adds `decorate_filter_synth_response(resp: &mut Response,
+close: bool)` at `crates/envoy-http1/src/hcm.rs` immediately before
+`synth_400` (after `synth_status`); calls it from both filter-synth writer
+sites — the decode-side `RequestPath::SynthFromDecode(resp)` arm at line
+~556 (after `outgoing = resp;`) and the encode-side
+`envoy_filter::Decision::StopAndSend(replacement)` arm at line ~595 (after
+constructing `outgoing = Response { ... }`). Per ADR-0033 semantics:
+
+- **`content-length` is ALWAYS set from `resp.body.len()`** (overwrites any
+  filter-provided value). The filter's body is the source of truth; a stale
+  filter-provided `content-length` would corrupt downstream HTTP/1.1 framing.
+- **`server`, `date`, `content-type`, `connection` are added only-if-missing**
+  (case-insensitive name check; matches the 06.1 D1 + 08.1 D1 dedupe precedent
+  at `crates/envoy-admin/src/handler.rs::serialize_response`). If a filter
+  chooses to set its own `server`/`date`/`content-type`/`connection`, the
+  filter's value wins.
+- Defaults match `synth_status` at the same file's lines 866-887:
+  `DEFAULT_SERVER_NAME` ("envoy-rust"), `now_imf_fixdate()`,
+  `DEFAULT_CONTENT_TYPE` ("text/plain"), `connection_value(close)`
+  ("close" / "keep-alive").
+
+**Files modified (2):**
+- `crates/envoy-http1/src/hcm.rs` — new `decorate_filter_synth_response`
+  helper (~50 LoC including doc-comment); 2 call-site additions (decode +
+  encode); 2 new unit tests
+  (`decorate_adds_all_five_standard_headers_when_filter_provides_none` —
+  filter contributes empty headers; decorator adds all 5;
+  `decorate_preserves_filter_provided_headers_and_always_overwrites_content_length`
+  — filter contributes 3 headers including a stale content-length and a
+  custom server; decorator overwrites content-length, preserves server +
+  x-rate-limit-policy, adds date / content-type / connection).
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` —
+  this subsection.
+
+**Tests landed (2 new; 0 amended).** Workspace test count: 742 → 744 (+2
+exact for the new decorator unit tests; Task 3 fixup added 0 new tests).
+
+**Per-task deviations from ADR-0033 dispatch instructions:** None
+substantive. Minor: the ADR-0033 Decision §iii (c) projected "1-2 new unit
+tests covering the decoration"; this commit lands 2 (both the
+empty-filter-headers happy path AND the filter-provides-overlapping-headers
+edge case). Both tests are necessary — the second test directly verifies the
+case-insensitive dedupe + the content-length always-overwrite semantic that
+the helper's contract specifies.
+
+**LoC delta:**
+
+| Bucket | Production | Tests | Fixture/doc | Total |
+|---|---|---|---|---|
+| Projected (ADR-0033 §iii (c)) | ~30 | ~30 | 0 | ~60 |
+| Actual | ~70 (helper + 2 call sites + doc-comments) | ~60 (2 unit tests) | ~85 (this PROGRESS) | ~215 |
+
+Production drift (+133%) is above the ADR-0033 projection envelope but
+within the parent-08 SPEC §6.1 alternative (vi) accept-drift posture (the
+PLAN's ±50% drift posture per §3 is per-task; this is a corrective fixup
+which carries its own drift budget separate from the PLAN). The driver of
+the drift is the doc-comment on `decorate_filter_synth_response` (~25 LoC of
+prose explaining the contract + the case-insensitive dedupe + the
+content-length always-overwrite invariant) — load-bearing for context
+isolation per D-3.4. The actual logic is ~25 LoC.
+
+**Gate results (5-stable-toolchain):**
+
+- **Gate 1 (`cargo fmt --all -- --check`):** PASS (exit 0).
+- **Gate 2 (`cargo clippy --workspace --all-targets --all-features -- -D warnings`):**
+  PASS (exit 0; ~21s).
+- **Gate 3 (`cargo build --workspace --all-targets`):** PASS (subsumed).
+- **Gate 4 (`cargo test --workspace`):** PASS (expected 744 passed / 0
+  failed / 2 ignored; +2 vs Task 3 fixup baseline 742).
+- **Gate 5 (`cargo deny check`):** PASS (no Cargo.toml diff).
+
+**Carryforwards engaged:** None additional. ADR-0033 itself is the carry
+chain from Commit A to D.
+
+**Forward-looking note for future HTTP-filter-family phases:** Any future
+filter that emits `Decision::StopAndSend(FilterResponse)` (e.g., fault,
+ext_authz, oauth2, rbac, csrf) automatically benefits from
+`decorate_filter_synth_response`'s standard-header decoration. The H2 HCM
+path (`crates/envoy-http2/src/hcm.rs`) shares the H1 HCMConfig via re-export
+per the PLAN-write SPEC correction #2 wiring discipline; the writer-arm
+match shapes are codec-specific but the FilterResponse → Response conversion
++ standard-header decoration semantic translates verbatim. When a future
+filter-family phase first surfaces encode-side `StopAndSend`, the encode-arm
+decoration at line ~595 is already in place.
+
 ### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper
 
 _(Pending state-3 dispatch — Commit D per ADR-0033. The "+ D7.2

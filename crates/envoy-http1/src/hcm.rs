@@ -548,9 +548,17 @@ async fn serve_connection(
             },
             RequestPath::SynthFromDecode(resp) => {
                 // 07.1 Task 6: decode-side filter short-circuit. Unreachable
-                // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation.
-                // `upstream_host_for_log` stays None (no proxy attempt).
+                // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation
+                // (which never short-circuits via StopAndSend on production
+                // paths) and by phase 09's LocalRateLimit filter (the first
+                // production filter to emit StopAndSend with a sparse header
+                // list). `upstream_host_for_log` stays None (no proxy attempt).
                 outgoing = resp;
+                // Phase 09 ADR-0033: decorate the filter-synth response with
+                // the 5 standard HTTP/1.1 response headers if the filter did
+                // not provide them, and ALWAYS overwrite content-length from
+                // body.len() (the filter's body is the source of truth).
+                decorate_filter_synth_response(&mut outgoing, close);
             }
         }
 
@@ -582,6 +590,13 @@ async fn serve_connection(
                     headers: replacement.headers,
                     body: replacement.body,
                 };
+                // Phase 09 ADR-0033: encode-side filter substitution discards
+                // any standard headers that the prior decode-arm response
+                // carried. Decorate symmetric to the SynthFromDecode site so
+                // future filters that emit encode-side StopAndSend (e.g., a
+                // hypothetical RBAC-on-encode rejection) inherit the standard
+                // HTTP/1.1 response header set on the wire.
+                decorate_filter_synth_response(&mut outgoing, close);
             }
         }
 
@@ -882,6 +897,67 @@ fn synth_status(status: u16, close: bool) -> Response {
             ),
         ],
         body,
+    }
+}
+
+/// Decorate a filter-synth response with the 5 standard HTTP/1.1 response
+/// headers (`server`, `date`, `content-length`, `content-type`, `connection`)
+/// per phase-09 ADR-0033. Called from both writer-arm sites where a filter
+/// emits `Decision::StopAndSend` (decode-side `RequestPath::SynthFromDecode`
+/// at the writer-arm match; encode-side `Decision::StopAndSend(replacement)`
+/// after the encode iteration). The 07.1-landed framework converts
+/// `FilterResponse` ↔ `Response` verbatim; filter implementations are not
+/// expected to populate the standard HTTP/1.1 response headers (their
+/// responsibility ends at the application-semantic content). This helper
+/// brings filter-synth responses to wire-shape parity with the synth-from-build
+/// paths (`synth_status`, `synth_direct_response`) that already populate
+/// these headers inline.
+///
+/// Semantics per ADR-0033:
+///
+/// - `content-length` is ALWAYS set from `resp.body.len()` (overwrites any
+///   filter-provided value). The filter's body is the source of truth; a
+///   stale filter-provided `content-length` would corrupt downstream parsing.
+/// - `server`, `date`, `content-type`, `connection` are added only-if-missing
+///   (case-insensitive name check) — matches the 06.1 D1 / 08.1 D1 dedupe
+///   precedent at `crates/envoy-admin/src/handler.rs::serialize_response`.
+///   If a filter chooses to set its own `server`/`date`/`content-type`/
+///   `connection` (e.g., a `server: my-proxy` override), the filter's value
+///   wins; the decorator does not override.
+///
+/// Symmetric to `synth_status` at lines 866-887 — same defaults
+/// (`DEFAULT_SERVER_NAME`, `DEFAULT_CONTENT_TYPE`, `now_imf_fixdate()`,
+/// `connection_value(close)`).
+fn decorate_filter_synth_response(resp: &mut Response, close: bool) {
+    // content-length: always derived from body.len(); overwrite if present.
+    let cl_value = resp.body.len().to_string();
+    let mut cl_set = false;
+    for (k, v) in resp.headers.iter_mut() {
+        if k.eq_ignore_ascii_case(headers::CONTENT_LENGTH) {
+            *v = cl_value.clone();
+            cl_set = true;
+            break;
+        }
+    }
+    if !cl_set {
+        resp.headers
+            .push((headers::CONTENT_LENGTH.to_string(), cl_value));
+    }
+    // server / date / content-type / connection: add only-if-missing.
+    let standards: [(&str, String); 4] = [
+        (headers::SERVER, DEFAULT_SERVER_NAME.to_string()),
+        (headers::DATE, now_imf_fixdate()),
+        (headers::CONTENT_TYPE, DEFAULT_CONTENT_TYPE.to_string()),
+        (headers::CONNECTION, connection_value(close).to_string()),
+    ];
+    for (name, value) in standards {
+        if !resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            resp.headers.push((name.to_string(), value));
+        }
     }
 }
 
@@ -1286,6 +1362,72 @@ static_resources:
                 }],
             }),
         })
+    }
+
+    // ── 09 ADR-0033 decorate_filter_synth_response unit tests ────────────────
+
+    #[test]
+    fn decorate_adds_all_five_standard_headers_when_filter_provides_none() {
+        let mut resp = Response {
+            status: 429,
+            reason: Some("Too Many Requests"),
+            headers: Vec::new(),
+            body: bytes::Bytes::from_static(b"local_rate_limited"),
+        };
+        super::decorate_filter_synth_response(&mut resp, true);
+        let name = |n: &str| -> Option<&str> {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(name(headers::CONTENT_LENGTH), Some("18"));
+        assert_eq!(name(headers::SERVER), Some("envoy-rust"));
+        assert_eq!(name(headers::CONTENT_TYPE), Some("text/plain"));
+        assert_eq!(name(headers::CONNECTION), Some("close"));
+        // date is wall-clock; existence + non-empty suffices.
+        let date = name(headers::DATE).expect("date header added");
+        assert!(!date.is_empty(), "date header empty: {date:?}");
+        // All 5 standard headers present; no more, no fewer (filter contributed 0).
+        assert_eq!(resp.headers.len(), 5, "headers: {:?}", resp.headers);
+    }
+
+    #[test]
+    fn decorate_preserves_filter_provided_headers_and_always_overwrites_content_length() {
+        let mut resp = Response {
+            status: 429,
+            reason: Some("Too Many Requests"),
+            // Filter provides a custom server, a stale content-length (10),
+            // and an extra non-standard header. Decorator must:
+            //   - preserve `server: my-proxy` (filter wins on standard headers
+            //     that have non-CL semantics);
+            //   - OVERWRITE content-length to the body.len() = 18;
+            //   - add date / content-type / connection (filter didn't provide);
+            //   - preserve x-rate-limit-policy verbatim.
+            headers: vec![
+                ("server".to_string(), "my-proxy".to_string()),
+                ("content-length".to_string(), "10".to_string()),
+                ("x-rate-limit-policy".to_string(), "phase-09".to_string()),
+            ],
+            body: bytes::Bytes::from_static(b"local_rate_limited"),
+        };
+        super::decorate_filter_synth_response(&mut resp, false);
+        let name = |n: &str| -> Option<String> {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(name("server").as_deref(), Some("my-proxy"));
+        assert_eq!(name("content-length").as_deref(), Some("18"));
+        assert_eq!(name("content-type").as_deref(), Some("text/plain"));
+        assert_eq!(name("connection").as_deref(), Some("keep-alive"));
+        assert_eq!(name("x-rate-limit-policy").as_deref(), Some("phase-09"));
+        assert!(name("date").is_some(), "date header added");
+        // Exact count: 3 filter-provided + 3 decorator-added (date / content-type
+        // / connection). The decorator did NOT add an extra `server`/`content-length`
+        // duplicate; it edited content-length in place and skipped server.
+        assert_eq!(resp.headers.len(), 6, "headers: {:?}", resp.headers);
     }
 
     // ── 04.2 header-matcher HCM integration tests ────────────────────────────
