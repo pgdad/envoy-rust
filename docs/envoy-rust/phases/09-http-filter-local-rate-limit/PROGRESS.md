@@ -873,9 +873,145 @@ cadence rule; state-2 commit context above for the cadence). The 1 new
 BEHAVIOR_CONTRACT row (Header allow-list `x-envoy-ratelimited`) lands at
 Task 5 per PLAN lock-in #31 + SPEC §6.5 cadence.
 
-### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper + D7.2 x-envoy-ratelimited row
+### Mid-execution corrective fixup per ADR-0033 (Commits A-D)
 
-_(Pending state-3 dispatch.)_
+**Commit:** _(this commit — Commit A only; Commits B/C/D land in subsequent commits)_
+**Parent:** `78128f4` — `phase 09: task 4 — D4 HttpFilterInstance::LocalRateLimit
+variant + D5 07.2 REVIEW M1 closure`.
+
+**Discovery.** Phase 09 Task 5 dispatch (the Docker-gated fixture 0016
+authoring step) surfaced three empirical discrepancies between the phase-09
+SPEC §2.2 + Task 3 lock-in #13 (both authored at state 1 / state 2 without
+Docker-level empirical verification of upstream Envoy v1.33's actual
+`envoy.filters.http.local_ratelimit` wire-level behavior) and the empirically
+observed reality:
+
+1. **`x-envoy-ratelimited` header is NOT emitted by upstream Envoy v1.33's
+   `envoy.filters.http.local_ratelimit` filter.** Empirical Docker run yielded
+   429 responses with header set `{content-length, content-type, date,
+   server}` — the `x-envoy-ratelimited` header is absent. The SPEC §2.2 claim
+   that upstream auto-injects this header is factually incorrect.
+2. **Upstream's local_ratelimit 429 response body is the source-hardcoded
+   string `"local_rate_limited"` (18 bytes), not empty.** Task 3 lock-in #13's
+   `body: Bytes::new()` is incorrect for bilateral parity.
+3. **envoy-rust's H1 HCM filter-StopAndSend writer-path skips standard-header
+   decoration.** The synth-from-build path at `crates/envoy-http1/src/hcm.rs:866-887`
+   (`synth_status`) emits 5 standard headers (server/date/content-length/
+   content-type/connection); the filter-synth writer-arm sites at lines
+   371-379 (decode-side `SynthFromDecode`) and 577 (encode-side
+   `SynthFromEncode`) take `filter_resp.headers` verbatim with no
+   standard-header augmentation. Phase 07.2's HeaderMutation filter never
+   short-circuited via `StopAndSend`, so the gap went unobserved; phase 09's
+   LocalRateLimit is the first filter to surface it.
+
+**Disposition: ADR-0033 + 4 corrective commits (option (iii) per ADR-0033).**
+
+- **Commit A** (this commit, docs-only): land ADR-0033 in `docs/envoy-rust/DECISIONS.md`;
+  revise SPEC §2.2 in `docs/envoy-rust/phases/09-http-filter-local-rate-limit/SPEC.md`
+  lines 55-63; append this preamble subsection. `phase 09: ADR-0033 + SPEC §2.2
+  revision per upstream Envoy v1.33 empirical observation [ADR-0033]`.
+
+- **Commit B** (next): Task 3 runtime fixup. `crates/envoy-filter/src/local_rate_limit.rs`
+  drops the `("x-envoy-ratelimited", "true")` injection from
+  `LocalRateLimitFilter::decode_headers`; changes `body: Bytes::new()` →
+  `body: Bytes::from_static(b"local_rate_limited")`; 3 affected unit tests
+  update (drop x-envoy-ratelimited assertions; add body-content assertions).
+  PROGRESS appends a `### Task 3 fixup — upstream Envoy v1.33 parity per
+  ADR-0033` subsection. Operator-configurable `response_headers_to_add`
+  plumbing is preserved.
+
+- **Commit C** (after B): Task 4 H1 HCM fixup. `crates/envoy-http1/src/hcm.rs`
+  adds `decorate_filter_synth_response(resp: &mut Response, close: bool)`
+  helper called from both `RequestPath::SynthFromDecode` (line ~440) and
+  `RequestPath::SynthFromEncode` (line ~577) writer-arm sites; helper adds 5
+  standard headers (server, date, content-length, content-type, connection)
+  if not already provided by the filter (case-insensitive name check
+  matching the 06.1/08.1 D1 dedupe precedent); `content-length` is ALWAYS
+  derived from `body.len()` (the filter's body is the source of truth). 1-2
+  new unit tests cover the decoration. PROGRESS appends a `### Task 4 fixup
+  — H1 HCM filter-synth header decoration per ADR-0033` subsection.
+
+- **Commit D** (after C): Task 5 (re-attempt). Fixture
+  `tests/fixtures/0016-http-filter-local-rate-limit/{envoy.yaml,envoy-rust.yaml,
+  expectations.yaml,README.md}` + Docker-gated wrapper
+  `tests/differential/tests/http_filter_local_rate_limit.rs` + populated
+  `### Task 5` PROGRESS subsection. **No `BEHAVIOR_CONTRACT.md` change** at
+  Commit D (the `x-envoy-ratelimited` Header allow-list row PLAN lock-in #30
+  projected is voided per ADR-0033; the 4 Stat-name mapping rows already
+  landed at Task 3 commit `70bad43`).
+
+**PLAN lock-ins affected by ADR-0033:**
+
+- **#13** (429 synth response shape with `x-envoy-ratelimited` + empty body):
+  voided; replaced by ADR-0033's revised contract (no `x-envoy-ratelimited`;
+  `Bytes::from_static(b"local_rate_limited")` body; 5 standard headers via
+  H1 HCM `decorate_filter_synth_response` helper).
+- **#30** (`x-envoy-ratelimited` BEHAVIOR_CONTRACT row at Task 5): voided
+  (no row appended).
+- **#33** (in-process backstop at Task 7 with direct `x-envoy-ratelimited`
+  per-header presence assertion): revised — Task 7 dropdown drops the
+  `x-envoy-ratelimited` per-header presence assertion in favor of body-content
+  (`"local_rate_limited"`) + standard-header presence assertions.
+
+PLAN lock-ins **NOT affected**: #1-#9 (token bucket primitive shape +
+atomicity; landed cleanly at Task 2); #10/#11/#12/#14 (filter struct shape +
+decode/encode semantics + counter registration; remain unchanged except for
+#13's affected sub-fields); #15-#27 (envoy-config schema + validator +
+dispatch + signature widening; landed cleanly at Tasks 1 + 4); #22/#23
+(07.2 REVIEW M1 closure at Task 4 + header_mutation.rs map_entry preservation;
+landed cleanly at Task 4); #28/#29 (fixture 0016 bootstrap + probe list
+shapes; Commit D applies modulo the SPEC §2.2 revision); #31 (4 Stat-name
+mapping rows; landed cleanly at Task 3); #34/#35/#36/#37/#38/#39 (ADR ledger,
+unsafe posture, split-gate verdict, subagent-driven execution, PROGRESS
+cadence, Cargo.lock cadence; unchanged).
+
+**DECISIONS.md ledger advance at this commit:** `ADR-0032 → ADR-0033`. The
+ADR title: "Phase-09 SPEC §2.2 revision per upstream Envoy v1.33 empirical
+observation (drop x-envoy-ratelimited injection; align 429 body + H1 HCM
+filter-synth header decoration)".
+
+**Files modified at Commit A (3):**
+
+- `docs/envoy-rust/DECISIONS.md` — appended ADR-0033 after ADR-0032 (~3300
+  words; Date / Status / Context / Options considered (5) / Decision (4
+  commits) / Rationale / Consequences / Provenance sections per the
+  established ADR-NNNN shape precedent at ADR-0028 through ADR-0032).
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/SPEC.md` — §2.2
+  rewritten (was: 1-row table; now: prose explaining empirical discovery +
+  ADR-0033 disposition + envoy-rust upstream-parity disposition; no
+  BEHAVIOR_CONTRACT row needed).
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` —
+  this preamble subsection appended between Task 4 and Task 5 placeholder.
+
+**STATE.md / ROADMAP.md / BEHAVIOR_CONTRACT.md / ENVOY_TARGET.md /
+rust-toolchain.toml diffs at this commit:** None. STATE.md advances at Task
+8 commit per the original PLAN; ROADMAP.md row 09's `in-progress` status
+unchanged; BEHAVIOR_CONTRACT.md unchanged at this commit (the
+`x-envoy-ratelimited` row is voided; the 4 stat-mapping rows already landed
+at Task 3); ENVOY_TARGET pin + toolchain pin unchanged.
+
+**Gate results at Commit A (5-stable-toolchain):** N/A — docs-only commit;
+the 5 stable-toolchain gates are skipped per the established docs-only
+commit convention (parent-08.2 state-5 commit `1dcf7f4` precedent;
+parent-07.2 state-5 commit `8b69b9d`-shape precedent).
+
+**5-gate attestation at Commit A:**
+- **Gate 1 (`cargo fmt --all -- --check`):** N/A — no Rust source diff.
+- **Gate 2 (`cargo clippy --workspace --all-targets --all-features -- -D warnings`):**
+  N/A — no Rust source diff.
+- **Gate 3 (`cargo build --workspace --all-targets`):** N/A — no Rust source diff.
+- **Gate 4 (`cargo test --workspace`):** N/A — no Rust source diff.
+- **Gate 5 (`cargo deny check`):** N/A — no Cargo.toml diff; no advisory window
+  shift; no license-set shift.
+
+CI on push will exercise the standard 5-gate sequence + the parse_bootstrap
+fuzz target's 30s budget; both expected green (docs-only).
+
+### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper
+
+_(Pending state-3 dispatch — Commit D per ADR-0033. The "+ D7.2
+x-envoy-ratelimited row" suffix from the original placeholder is dropped:
+ADR-0033 voids PLAN lock-in #30 — no BEHAVIOR_CONTRACT row lands at Task 5.)_
 
 ### Task 6 — D8.2 parse_bootstrap fuzz corpus seed
 

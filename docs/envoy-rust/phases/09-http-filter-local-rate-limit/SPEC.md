@@ -52,15 +52,69 @@ At phase-09 scope the four counters satisfy: `enabled == ok + rate_limited` and 
 
 The `<stat_prefix>` segment is sourced from the filter config's `stat_prefix` field (required; rejected at parse time if absent or empty). This mirrors 06.1's `http.<stat_prefix>.downstream_rq_*` namespacing pattern.
 
-### 2.2 "Header allow-list" extension — 1 new row
+### 2.2 "Header allow-list" extension — none required per ADR-0033
 
-One new row in the response Header allow-list:
+> **Revised at state 3 per ADR-0033** (the original state-1 row claiming
+> upstream Envoy v1.33 auto-injects `x-envoy-ratelimited` on local-ratelimit
+> 429 responses was empirically discovered to be incorrect at Task 5
+> dispatch). See `docs/envoy-rust/DECISIONS.md` ADR-0033 for the full
+> empirical evidence + the 4-commit corrective fixup sequence.
 
-| Header | Equivalence | Rationale |
-|---|---|---|
-| `x-envoy-ratelimited` | value-exact (`"true"` on rate-limited responses) | Synthetic-emit on both proxies when the local-ratelimit filter short-circuits via `Decision::StopAndSend`. Upstream Envoy v1.33's `envoy.filters.http.local_ratelimit` auto-injects this header on every rate-limited response per the documented semantic. envoy-rust's `LocalRateLimitFilter::decode_headers` injects the same header on the synthesized `FilterResponse`. Both proxies emit the literal value `"true"`; never absent on 429 paths from this filter; never present on 200 paths (the filter's no-op encode path does not inject). |
+**Empirical upstream Envoy v1.33 behavior** (verified at Task 5 dispatch
+against `envoyproxy/envoy:v1.33.0` with canonical bootstrap
+`max_tokens: 3, tokens_per_fill: 3, fill_interval: 60s, status: { code: 429 }, filter_enabled: 100%, filter_enforced: 100%`):
 
-No new BEHAVIOR_CONTRACT subsection is needed — the existing structure (Header allow-list + Stat-name mapping + Equivalence matrix) covers the surface. The 07.x-landed `Response status` row (exact) and `Response body` row (byte-exact for deterministic handlers) cover the rest of the filter's wire-level observables; no extension required.
+- **429 response header set:** `content-length`, `content-type`, `date`,
+  `server` — the four standard HTTP/1.1 response headers. **`x-envoy-ratelimited`
+  is NOT emitted** by upstream's `envoy.filters.http.local_ratelimit`. That
+  header is emitted only by the GLOBAL ratelimit filter
+  (`envoy.filters.http.ratelimit`) and by router-side response-flag handling
+  on the `RateLimited` response flag — neither of which the local_ratelimit
+  filter sets or triggers in v1.33.
+- **429 response body:** the source-hardcoded byte string `"local_rate_limited"`
+  (18 bytes; `content-length: 18`). The upstream proto
+  `envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit` has no
+  configurable `response_body` field.
+
+**envoy-rust upstream-parity disposition per ADR-0033:**
+
+- `LocalRateLimitFilter::decode_headers` does NOT inject `x-envoy-ratelimited`
+  (revised at Commit B per ADR-0033; original Task 3 lock-in #13's injection
+  is voided).
+- `LocalRateLimitFilter::decode_headers` emits body
+  `Bytes::from_static(b"local_rate_limited")` (18 bytes; revised at Commit B
+  per ADR-0033; original Task 3 lock-in #13's `Bytes::new()` is voided).
+- The 5 standard HTTP/1.1 response headers (`server`, `date`, `content-length`,
+  `content-type`, `connection`) are decorated onto every filter-synth
+  response by a new H1 HCM helper `decorate_filter_synth_response` (added at
+  Commit C per ADR-0033; called from both `RequestPath::SynthFromDecode` and
+  `RequestPath::SynthFromEncode` writer-arm sites; symmetric to `synth_status`
+  at `crates/envoy-http1/src/hcm.rs:866-887`).
+
+**No new Header allow-list row is needed.** The 04.1-landed `server` row +
+the 04.1-landed `date` row of `docs/envoy-rust/BEHAVIOR_CONTRACT.md`'s
+Header allow-list cover the cross-proxy implementation-identifying differences
+(envoy-rust emits `server: envoy-rust`; upstream emits `server: envoy`;
+both values are implementation-identifying; wall-clock `date` divergence
+across the two proxies is the standard timing-non-determinism allowance).
+The remaining 3 standard headers (`content-length`, `content-type`,
+`connection`) are value-exact across proxies under the deterministic
+fixture-0016 burst (5 sequential GET / probes; static `direct_response`
+body; sticky H1 close-on-response convention).
+
+**`response_headers_to_add` operator-configurable header plumbing is
+preserved** by ADR-0033. Operators may still configure per-instance
+response headers via the `response_headers_to_add` field on
+`LocalRateLimitConfig`; these append to the synth response's header list
+alongside the 5 standard headers from `decorate_filter_synth_response`.
+
+No new BEHAVIOR_CONTRACT subsection is needed — the existing structure
+(Header allow-list + Stat-name mapping + Equivalence matrix) covers the
+surface. The 07.x-landed `Response status` row (exact) and `Response body`
+row (byte-exact for deterministic handlers) cover the rest of the filter's
+wire-level observables; the `Response body` row's `byte-exact for
+deterministic handlers` clause directly anchors the bilateral
+`"local_rate_limited"` body assertion on 429 probes.
 
 ---
 
