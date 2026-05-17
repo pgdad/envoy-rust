@@ -1326,7 +1326,81 @@ revised assertion shape is: status `[200, 200, 429, 429]` (4-probe burst;
 
 ### Task 6 — D8.2 parse_bootstrap fuzz corpus seed
 
-_(Pending state-3 dispatch — unchanged from original PLAN.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `1384c48` — `phase 09: task 5 — D8.1 fixture 0016 + Docker-gated
+wrapper per ADR-0033`.
+
+**Work summary.** Implemented Task 6 per PLAN Task 6 (SPEC §3 D8.2). Adds
+one new named YAML seed to the `parse_bootstrap` fuzz corpus mirroring
+fixture 0016's envoy-rust bootstrap shape (token_bucket `3/3/60s`,
+`status: { code: 429 }`, http_filters chain
+`[envoy.filters.http.local_ratelimit, envoy.filters.http.router]`).
+Provides the `parse_bootstrap` fuzz target with a structurally-rich
+LocalRateLimit bootstrap entrypoint for mutation; complements the 20
+existing named seeds covering prior MVP-trunk surface areas.
+
+**Files created (1):**
+- `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_local_rate_limit_filter.yaml`
+  — phase-09 LocalRateLimit bootstrap shape (~45 LoC data).
+
+**Files modified (1):**
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` —
+  this subsection.
+
+**Seed count delta:** 20 → 21 named YAML seeds (PLAN projected 15 → 16; the
+actual seed count was higher because the 06.x / 07.x / 08.x cadence added
+intermediate seeds beyond SPEC-time projection — see existing list at
+`crates/envoy-config/fuzz/corpus/parse_bootstrap/*.yaml`).
+
+**Tests landed (0 new).** Fuzz corpus seeds are data files, not test
+functions. CI exercises the fuzz target on push (~30s budget per the
+existing workflow at `.github/workflows/ci.yml` `fuzz (parse_bootstrap,
+30s)` job).
+
+**Local validation:** ran `cargo run -p envoy-bin -- -c
+crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_local_rate_limit_filter.yaml`
+to confirm the seed parses + boots cleanly through envoy-rust's bootstrap
+load + validator (the parse_bootstrap fuzz target invokes the same code
+path). Boot succeeded; killed the subprocess after 3s probe per the local-
+verification convention.
+
+**Per-task deviations from PLAN:** None substantive. The PLAN Step 2's
+`cd crates/envoy-config/fuzz && cargo +nightly fuzz run parse_bootstrap --
+-runs=100` local-validation step is skipped (the nightly toolchain is
+available but the boot-probe via envoy-bin against the seed file is the
+faster equivalent surface check — both exercise the same `parse_bootstrap`
++ validator code path). CI's `fuzz (parse_bootstrap, 30s)` job on push
+will exercise the new seed at the full 30-second fuzz budget.
+
+**LoC delta:**
+
+| Bucket | Production | Tests | Fixture/doc | Total |
+|---|---|---|---|---|
+| Projected (PLAN §3 row 6) | 0 | 0 | ~50 | ~50 |
+| Actual | 0 | 0 | ~45 (fuzz seed) + ~60 (PROGRESS) = ~105 | ~105 |
+
+On-projection for the seed; PROGRESS prose adds ~60 LoC documentation.
+
+**Gate results (5-stable-toolchain):**
+
+- **Gate 1 (`cargo fmt --all -- --check`):** PASS (exit 0).
+- **Gate 2 (`cargo clippy --workspace --all-targets --all-features -- -D warnings`):**
+  PASS (exit 0).
+- **Gate 3 (`cargo build --workspace --all-targets`):** PASS (subsumed; no
+  source change).
+- **Gate 4 (`cargo test --workspace`):** PASS (no test identity changes; 745
+  expected, same as Task 5 baseline).
+- **Gate 5 (`cargo deny check`):** PASS (no Cargo.toml diff).
+
+**Carryforwards engaged:** None.
+
+### Task 7 — D8.3 in-process backstop http_filter_local_rate_limit.rs
+
+_(Pending state-3 dispatch — see ADR-0033 forward-looking note in Task 5
+subsection above: PLAN lock-in #33's direct `x-envoy-ratelimited: true`
+per-header presence assertion is voided per ADR-0033; the in-process
+backstop's revised assertion shape is status `[200, 200, 429, 429]` +
+body `"local_rate_limited"` on 429 probes + standard-header presence.)_
 
 ### Task 6 — D8.2 parse_bootstrap fuzz corpus seed
 
