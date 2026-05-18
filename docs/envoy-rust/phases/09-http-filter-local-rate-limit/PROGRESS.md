@@ -1201,6 +1201,8 @@ match shapes are codec-specific but the FilterResponse → Response conversion
 filter-family phase first surfaces encode-side `StopAndSend`, the encode-arm
 decoration at line ~595 is already in place.
 
+**Cross-ref (phase-10 D5 follow-up):** the H2 HCM analogous gap recorded in this commit's PROGRESS narrative is amended via the phase-10 D5 ADR-0033 Consequences amendment (closes 09 REVIEW M2 per preferred close shape (a)); the close site for the implementation deferral is named there.
+
 ### Task 5 — D8.1 fixture 0016 + Docker-gated wrapper (Commit D per ADR-0033)
 
 **Commit:** _(this commit; SHA emitted at `git commit` time)_

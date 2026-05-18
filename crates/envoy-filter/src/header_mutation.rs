@@ -247,7 +247,8 @@ mod tests {
             )),
         };
         let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
-        let instance = crate::instance::HttpFilterInstance::build(&hf, &registry).unwrap();
+        let instance =
+            crate::instance::HttpFilterInstance::build(&hf, &registry, "test_prefix").unwrap();
         assert!(matches!(
             instance,
             crate::instance::HttpFilterInstance::HeaderMutation(_)
@@ -430,7 +431,8 @@ mod tests {
             },
         ];
         let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
-        let mut pipeline = crate::FilterPipeline::build_from_config(&filters, &registry).unwrap();
+        let mut pipeline =
+            crate::FilterPipeline::build_from_config(&filters, &registry, "test_prefix").unwrap();
         let mut req = req_with(vec![("host", "example.com")]);
         assert!(matches!(
             pipeline.decode_headers(&mut req),
@@ -459,7 +461,8 @@ mod tests {
             },
         ];
         let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
-        let mut pipeline = crate::FilterPipeline::build_from_config(&filters, &registry).unwrap();
+        let mut pipeline =
+            crate::FilterPipeline::build_from_config(&filters, &registry, "test_prefix").unwrap();
         let mut resp = resp_with(vec![("content-length", "0")]);
         assert!(matches!(
             pipeline.encode_headers(&mut resp),

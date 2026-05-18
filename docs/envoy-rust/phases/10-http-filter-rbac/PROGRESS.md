@@ -786,7 +786,183 @@ per PLAN lock-in #36.)
 
 ### Task 4 — D4 HttpFilterInstance::Rbac variant + D5 ADR-0033 amendment (closes 09 REVIEW M2)
 
-_(Pending Task 4 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `65181c1` — `phase 10: task 3 — record commit SHA da32137 in PROGRESS.md`.
+
+**Work summary.** Landed the D4 `HttpFilterInstance::Rbac(RbacFilter)` variant
++ proper dispatch per PLAN Task 4 (SPEC §3 D4 + D5 + D7.2). Replaced the
+Task-1 transient bridge arm in `crates/envoy-filter/src/instance.rs` (which
+returned `Err(FilterError::UnsupportedFilterType)` for the `Rbac` typed-config
+variant) with the proper construction
+`HttpFilterInstance::Rbac(RbacFilter::build_from_config(cfg, registry, hcm_stat_prefix)?)`.
+Widened `HttpFilterInstance::build` + `FilterPipeline::build_from_config`
+signatures with a new `hcm_stat_prefix: &str` 3rd parameter so the new Rbac
+arm can register its 2 stat counters under
+`http.{hcm_stat_prefix}.rbac.{allowed,denied}` at build time per PLAN lock-in
+#15. Threaded `&cfg.stat_prefix` at the single H1 HCM production call site
+(`crates/envoy-http1/src/hcm.rs:185`); H2 reuses the same `Http1HCMConfig`
+via re-export per the 09 wiring discipline so no second production call site
+exists. The `Rbac` enum variant was placed between `LocalRateLimit` and the
+`#[cfg(feature = "test-util")]` block per PLAN lock-in #30; `decode_headers`
++ `encode_headers` dispatch arms were extended symmetrically.
+
+**CLOSES 09 REVIEW M2** at the named site (D5 ADR-0033 Consequences
+amendment per preferred close shape (a)). Landed an in-place clarification
+paragraph after ADR-0033 Consequences §iii(c) bullet in `DECISIONS.md`
+correcting the "naturally inherits via the shared Http1HCMConfig re-export"
+claim — empirically the H2 HCM has its own `build_http_response` helper
+that does NOT include the standard-header decoration the H1
+`decorate_filter_synth_response` helper adds. The amendment names the close
+site for the implementation deferral ("next HTTP-filter-family phase
+exercising filters bilaterally on H2") and confirms phase 10's RBAC fixture
+exercises H1 only (matching the 07.2 + 09 single-codec cadence). Per PLAN
+lock-in #32, this is an in-place clarification — DECISIONS.md ledger head
+stays at ADR-0034 (no new ADR added). The D7.2 1-sentence cross-ref note
+appended at the end of phase-09 PROGRESS's `### Task 4 fixup — H1 HCM
+filter-synth header decoration per ADR-0033 (Commit C)` subsection points
+forward to this amendment.
+
+**Dead-code-attr retirement.** Removed all 12 of the Task-3 interim
+`#[allow(dead_code)]` attrs in `crates/envoy-filter/src/rbac.rs` that
+became live once `instance.rs::build` constructs `RbacFilter`: on
+`RuntimePermission` enum, `RuntimePrincipal` enum, `eval_permission` fn,
+`eval_principal` fn, `RbacFilter` struct, `RuntimeAction` enum,
+`RuntimePolicy` struct, `RbacFilter::build_from_config`,
+`RbacFilter::decode_headers`, `RbacFilter::encode_headers`,
+`lower_permission`, and `lower_principal`. Also pruned the explanatory
+"covers the Tasks 3-4 interim" doc-comment paragraphs that accompanied
+several of these attrs. The permanent `#[allow(dead_code)]` on
+`RuntimePolicy::name` (kept for future `tracing::debug!` diagnostics per
+PLAN lock-in #5) was preserved verbatim. Clippy is clean (0 warnings)
+after the retirement — no item required keeping its interim attr.
+
+**Signature widening propagation (9 widened call sites — 1 production +
+8 tests/test-helpers).**
+1. `crates/envoy-http1/src/hcm.rs:185` — production `Http1HCMConfig::from_config` call (adds `&cfg.stat_prefix`).
+2. `crates/envoy-http1/src/hcm.rs:1055` — `test_router_only_pipeline()` test helper.
+3. `crates/envoy-http1/src/hcm.rs:2773` — `header_mutation_pipeline()` test helper.
+4. `crates/envoy-filter/src/header_mutation.rs:250` — `HttpFilterInstance::build` call in `http_filter_instance_build_on_header_mutation_produces_header_mutation_variant`.
+5. `crates/envoy-filter/src/header_mutation.rs:433` — `FilterPipeline::build_from_config` in `round_trip_via_filter_pipeline_decode`.
+6. `crates/envoy-filter/src/header_mutation.rs:462` — `FilterPipeline::build_from_config` in `iteration_order_on_encode_via_filter_pipeline`.
+7. `crates/envoy-filter/src/instance.rs` — `build_router_succeeds` test (3-arg call).
+8. `crates/envoy-filter/src/instance.rs` — `build_local_rate_limit_succeeds` test (3-arg call).
+9. `crates/envoy-filter/src/pipeline.rs` — all 4 tests
+   (`build_from_config_rejects_empty_list`,
+   `build_from_config_with_single_router_succeeds`,
+   `decode_headers_on_single_router_returns_continue`,
+   `encode_headers_on_single_router_returns_continue`) widened to pass `"test_prefix"`.
+
+(Item count is 9 distinct widening sites; pipeline.rs's 4 widenings are
+grouped under item 9 because they all sit in the same `mod tests` block.)
+
+**Files modified (8):**
+- `crates/envoy-filter/src/instance.rs` — module doc-comment updated
+  ("Three" → "Four"); `use crate::rbac::RbacFilter;` import added;
+  `Rbac(RbacFilter)` variant added with doc-comment; `build` signature
+  widened with `hcm_stat_prefix: &str` parameter + doc-comment paragraph;
+  Task-1 transient bridge arm replaced with proper
+  `HttpFilterInstance::Rbac(RbacFilter::build_from_config(...)?)`
+  construction; `decode_headers` + `encode_headers` dispatch arms extended
+  with `Rbac` cases; 2 existing tests widened to 3-arg `build` calls;
+  new `build_rbac_succeeds` test added.
+- `crates/envoy-filter/src/pipeline.rs` — `build_from_config` signature
+  widened with `hcm_stat_prefix: &str` parameter; doc-comment paragraph
+  added; 4 test sites widened to pass `"test_prefix"`.
+- `crates/envoy-filter/src/rbac.rs` — removed all 12 interim
+  `#[allow(dead_code)]` attrs + their explanatory doc-comment paragraphs;
+  preserved the permanent `#[allow(dead_code)]` on `RuntimePolicy::name`.
+- `crates/envoy-filter/src/header_mutation.rs` — 3 test call sites
+  widened (1 `HttpFilterInstance::build` + 2 `FilterPipeline::build_from_config`).
+- `crates/envoy-http1/src/hcm.rs` — 1 production call (passes
+  `&cfg.stat_prefix`) + 2 test helpers (`test_router_only_pipeline`,
+  `header_mutation_pipeline`) widened to pass `"test_prefix"`.
+- `docs/envoy-rust/DECISIONS.md` — ADR-0033 Consequences amendment
+  (~1 paragraph; in-place clarification per PLAN lock-in #32). Ledger
+  head stays at ADR-0034 (NOT a new ADR).
+- `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md` —
+  1-sentence D7.2 cross-ref note appended at end of `### Task 4 fixup`
+  subsection pointing forward to the ADR-0033 amendment.
+- `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` — this
+  subsection (per-task PROGRESS cadence; replaces the state-2 skeleton's
+  `_(Pending Task 4 dispatch.)_` placeholder).
+
+**Tests landed (1 new; 778 → 779 in workspace test count).**
+1. `build_rbac_succeeds` (under `instance::tests`) — constructs an
+   `HttpFilter` carrying a minimal `RbacConfig` (1 ALLOW policy
+   `permissions: [Any(true)]` × `principals: [Any(true)]`) and asserts
+   `HttpFilterInstance::build(&hf, &registry, "test_prefix")` returns
+   `HttpFilterInstance::Rbac(_)`.
+
+The 6 Task-3 `rbac::tests` continue passing; the 2 widened existing
+`instance::tests` (`build_router_succeeds`, `build_local_rate_limit_succeeds`)
+continue passing; the 4 widened `pipeline::tests` continue passing; the 3
+widened `header_mutation` test sites continue passing; the 2 widened H1
+HCM test helpers continue feeding their callers without behavior change.
+
+**LoC delta (production + tests + docs; doc-comments included).** Per
+`git diff --stat HEAD` at this commit: 7 files changed, 86 insertions(+),
+51 deletions(-). Net `+35 LoC`. Breakdown:
+- `instance.rs`: +71 / -16 (variant + dispatch arms + import + doc-comment
+  expansion + widened tests + new `build_rbac_succeeds` test).
+- `pipeline.rs`: +19 / -8 (signature widening + doc-comment + 4 test sites).
+- `rbac.rs`: -27 net (12 attrs removed + several explanatory doc-comment
+  paragraphs removed; no production code added).
+- `header_mutation.rs`: +9 / -5 (3 test sites widened).
+- `hcm.rs`: +7 / -2 (1 production + 2 test helpers widened).
+- `DECISIONS.md`: +2 (1 markdown paragraph + 1 blank line).
+- `09 PROGRESS.md`: +2 (1 sentence + 1 blank line).
+
+PLAN §3's Task-4 projection was ~30 production + ~15 tests = ~45 LoC
+combined (essentially "the variant + dispatch arm + 1 widened test").
+The actual delta (+35 net) is on the low side because the dead-code-attr
+retirement happens to subtract ~27 LoC, masking the per-call-site
+widening growth — a coincidence of opposed-direction edits rather than
+overshoot or undershoot. Production code grew exactly per projection;
+the larger-than-anticipated test-widening surface (9 sites vs the PLAN's
+3-ish narrative) was offset by the attr removals.
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS (after one `cargo fmt --all` to fix a
+  single line-wrap drift on the new `build_rbac_succeeds` test's
+  `HttpFilterInstance::build(...).expect(...)` chain in `instance.rs`).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  PASS (0 warnings; the 12 interim `#[allow(dead_code)]` attrs were all
+  retired without any clippy regrowth; the permanent attr on
+  `RuntimePolicy::name` stays).
+- `cargo build --workspace --all-targets` — PASS.
+- `cargo test --workspace` — PASS (779 passed, 0 failed, 2 ignored; +1 vs
+  the phase-10 Task 3 snapshot of 778 — exactly the new `build_rbac_succeeds`
+  test).
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok, sources
+  ok; pre-existing unencountered-license warnings unchanged from Task 3).
+
+**Per-task deviations from PLAN (0).** PLAN Task 4's Steps 1-7 landed
+verbatim (modulo the order-of-operations: TDD-first the new `build_rbac_succeeds`
+test before flipping the signature, then the signature widening + bridge-arm
+replacement + dispatch arms + production threading + dead-code-attr
+retirement + ADR-0033 amendment + phase-09 cross-ref). The 6th opportunistic
+test-import-hoist refactor in `rbac.rs::tests` (Task 3 code-quality review's
+Minor #1) was deliberately skipped — left as Task 8 cleanup per the PLAN's
+explicit "opportunistic, NOT required" guidance and to keep this commit
+narrowly scoped to D4 + D5 + D7.2.
+
+**Carryforward closure.** 09 REVIEW M2 (H2 HCM filter-synth header
+decoration gap + ADR-0033 Consequences misrepresentation) is **CLOSED** at
+this commit per the preferred close shape (a) — in-place ADR-0033
+Consequences clarification paragraph + named close-site for the
+implementation deferral. The chain 09 → 10 ends. 09 REVIEW M3 still targets
+Task 7 per the original disposition; not engaged at Task 4.
+
+**Carryforward dispositions otherwise unchanged.** The 09 REVIEW M3 +
+M1/T1/T2/T3/D1/D2 + all earlier carryforwards continue per the Task-1
+preamble's table.
+
+**STATE.md / ROADMAP.md / BEHAVIOR_CONTRACT.md / ENVOY_TARGET.md /
+rust-toolchain.toml diffs at this commit:** None (state-3 per-task cadence;
+these stay at state-2 values until Task 8). `DECISIONS.md` IS modified
+(ADR-0033 in-place amendment — ledger head stays at ADR-0034; NOT a new
+ADR). `docs/envoy-rust/phases/09-http-filter-local-rate-limit/PROGRESS.md`
+IS modified (1-sentence D7.2 cross-ref note).
 
 ### Task 5 — D8.1 fixture 0017 + Docker-gated wrapper
 

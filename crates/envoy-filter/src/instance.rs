@@ -1,12 +1,17 @@
 //! `HttpFilterInstance` — the per-instance variant enum.
 //!
-//! Three production variants are present: `Router(RouterTerminus)` (landed
+//! Four production variants are present: `Router(RouterTerminus)` (landed
 //! at 07.1), `HeaderMutation(HeaderMutationFilter)` (landed at 07.2 per
-//! parent-07 SPEC §3 D8.2-D15.2), and `LocalRateLimit(LocalRateLimitFilter)`
-//! (landed at phase-09 Task 4 per SPEC §3 D4). The phase-09 task also
+//! parent-07 SPEC §3 D8.2-D15.2), `LocalRateLimit(LocalRateLimitFilter)`
+//! (landed at phase-09 Task 4 per SPEC §3 D4), and `Rbac(RbacFilter)`
+//! (landed at phase-10 Task 4 per SPEC §3 D4). The phase-09 task also
 //! widened `HttpFilterInstance::build` to take `&Arc<StatsRegistry>` (so the
 //! LocalRateLimit arm can register its 4 stat counters) and dropped the
 //! prior `_position: usize` parameter (07.2 REVIEW M1 closure per SPEC §3 D5).
+//! Phase-10 Task 4 further widened the `build` signature to take
+//! `hcm_stat_prefix: &str` so the Rbac arm can register its 2 stat counters
+//! under the HCM-embedded `http.{hcm_stat_prefix}.rbac.{allowed,denied}`
+//! namespace.
 
 use std::sync::Arc;
 
@@ -16,6 +21,7 @@ use crate::error::FilterError;
 use crate::header_mutation::HeaderMutationFilter;
 use crate::local_rate_limit::LocalRateLimitFilter;
 use crate::pipeline::Decision;
+use crate::rbac::RbacFilter;
 use crate::router::RouterTerminus;
 use crate::types::{FilterRequest, FilterResponse};
 
@@ -24,6 +30,11 @@ pub enum HttpFilterInstance {
     Router(RouterTerminus),
     HeaderMutation(HeaderMutationFilter),
     LocalRateLimit(LocalRateLimitFilter),
+    /// Phase-10 Task 4: the `envoy.filters.http.rbac` filter (decode-only;
+    /// short-circuits non-matching requests with a 403 via SPEC §5.6's
+    /// decision matrix; 2 stat counters registered under
+    /// `http.{hcm_stat_prefix}.rbac.{allowed,denied}` at build time).
+    Rbac(RbacFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -52,9 +63,17 @@ impl HttpFilterInstance {
     /// (D5 closure of 07.2 REVIEW M1) dropped the prior `_position: usize`
     /// parameter — diagnostic position metadata is no longer threaded
     /// because no in-flight call site consumes it.
+    ///
+    /// `hcm_stat_prefix` is threaded through so the `Rbac` arm can register
+    /// its 2 stat counters at build time under
+    /// `http.{hcm_stat_prefix}.rbac.{allowed,denied}` (phase 10 D6); the
+    /// `Router` / `HeaderMutation` / `LocalRateLimit` arms ignore it. The H1
+    /// HCM `Http1HCMConfig::from_config` threads `&cfg.stat_prefix` at the
+    /// single production call site per phase-10 PLAN lock-in #5.
     pub(crate) fn build(
         hf: &envoy_config::HttpFilter,
         registry: &Arc<StatsRegistry>,
+        hcm_stat_prefix: &str,
     ) -> Result<Self, FilterError> {
         match &hf.typed_config {
             envoy_config::HttpFilterTypedConfig::Router(_cfg) => {
@@ -68,15 +87,9 @@ impl HttpFilterInstance {
                     LocalRateLimitFilter::build_from_config(cfg, registry)?,
                 ))
             }
-            envoy_config::HttpFilterTypedConfig::Rbac(_cfg) => {
-                // Phase 10 Task 1 transient bridge — Task 4 replaces this with
-                // the proper HttpFilterInstance::Rbac(RbacFilter) dispatch once
-                // Task 3 lands the RbacFilter runtime.
-                Err(FilterError::UnsupportedFilterType {
-                    position: 0,
-                    name: hf.name.clone(),
-                })
-            }
+            envoy_config::HttpFilterTypedConfig::Rbac(cfg) => Ok(HttpFilterInstance::Rbac(
+                RbacFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
+            )),
         }
     }
 
@@ -85,6 +98,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Router(r) => r.decode_headers(req),
             HttpFilterInstance::HeaderMutation(f) => f.decode_headers(req),
             HttpFilterInstance::LocalRateLimit(f) => f.decode_headers(req),
+            HttpFilterInstance::Rbac(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -99,6 +113,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Router(r) => r.encode_headers(resp_arg),
             HttpFilterInstance::HeaderMutation(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::LocalRateLimit(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::Rbac(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
@@ -146,7 +161,8 @@ mod tests {
             ),
         };
         let registry = test_registry();
-        let instance = HttpFilterInstance::build(&hf, &registry).expect("Router build succeeds");
+        let instance = HttpFilterInstance::build(&hf, &registry, "test_prefix")
+            .expect("Router build succeeds");
         assert!(matches!(instance, HttpFilterInstance::Router(_)));
     }
 
@@ -168,8 +184,33 @@ mod tests {
             ),
         };
         let registry = test_registry();
-        let instance =
-            HttpFilterInstance::build(&hf, &registry).expect("LocalRateLimit build succeeds");
+        let instance = HttpFilterInstance::build(&hf, &registry, "test_prefix")
+            .expect("LocalRateLimit build succeeds");
         assert!(matches!(instance, HttpFilterInstance::LocalRateLimit(_)));
+    }
+
+    #[test]
+    fn build_rbac_succeeds() {
+        let mut policies = std::collections::BTreeMap::new();
+        policies.insert(
+            "p".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Any(true)],
+            },
+        );
+        let hf = envoy_config::HttpFilter {
+            name: "envoy.filters.http.rbac".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::Rbac(envoy_config::RbacConfig {
+                rules: envoy_config::Rules {
+                    action: envoy_config::Action::Allow,
+                    policies,
+                },
+            }),
+        };
+        let registry = test_registry();
+        let instance =
+            HttpFilterInstance::build(&hf, &registry, "test_prefix").expect("Rbac build succeeds");
+        assert!(matches!(instance, HttpFilterInstance::Rbac(_)));
     }
 }

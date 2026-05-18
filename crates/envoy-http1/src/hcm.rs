@@ -185,6 +185,7 @@ impl HCMConfig {
         let filter_pipeline = Arc::new(envoy_filter::FilterPipeline::build_from_config(
             &cfg.http_filters,
             &registry,
+            &cfg.stat_prefix,
         )?);
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
@@ -1060,6 +1061,7 @@ static_resources:
                     ),
                 }],
                 &registry,
+                "test_prefix",
             )
             .expect("single-Router pipeline builds"),
         )
@@ -2770,7 +2772,10 @@ static_resources:
             },
         ];
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
-        Arc::new(envoy_filter::FilterPipeline::build_from_config(&filters, &registry).unwrap())
+        Arc::new(
+            envoy_filter::FilterPipeline::build_from_config(&filters, &registry, "test_prefix")
+                .unwrap(),
+        )
     }
 
     /// Build an HCMConfig whose single route matches on the header

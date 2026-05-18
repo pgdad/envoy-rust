@@ -23,10 +23,6 @@ use crate::types::{FilterRequest, FilterResponse};
 /// variants. The `Box` indirection appears only on `NotRule` (single-child
 /// negation); `AndRules` / `OrRules` already hold their children behind the
 /// `Vec`'s allocation so no per-variant `Box` is needed.
-///
-/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: no production-profile
-/// construction site exists until Task 4 wires `HttpFilterInstance::Rbac`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum RuntimePermission {
     /// Constant truth value. Wire-form `{ any: true }` / `{ any: false }`.
@@ -49,9 +45,6 @@ pub(crate) enum RuntimePermission {
 /// wire-format `PrincipalSet { ids: Vec<Principal> }` wrapper is flattened
 /// into a direct `Vec<RuntimePrincipal>` on `AndIds` / `OrIds`; `Box` appears
 /// only on `NotId`.
-///
-/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: see `RuntimePermission`.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum RuntimePrincipal {
     /// Constant truth value. Wire-form `{ any: true }` / `{ any: false }`.
@@ -70,11 +63,6 @@ pub(crate) enum RuntimePrincipal {
 /// pure-compute, no I/O. Returns `true` iff the permission tree matches the
 /// request. Short-circuits via `Iterator::all` (AndRules) and `Iterator::any`
 /// (OrRules); `NotRule` negates its inner result. Per PLAN lock-ins #8 + #9.
-///
-/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: called from
-/// `RbacFilter::decode_headers` which itself has no production-profile
-/// construction site until Task 4 wires `HttpFilterInstance::Rbac`.
-#[allow(dead_code)]
 pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> bool {
     match p {
         RuntimePermission::Any(b) => *b,
@@ -88,9 +76,6 @@ pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> boo
 /// Recursive tree-walk evaluator for `RuntimePrincipal`. Structurally
 /// symmetric to `eval_permission` per PLAN lock-in #7. Short-circuits via
 /// `Iterator::all` (AndIds) and `Iterator::any` (OrIds); `NotId` negates.
-///
-/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: see `eval_permission`.
-#[allow(dead_code)]
 pub(crate) fn eval_principal(p: &RuntimePrincipal, req: &FilterRequest) -> bool {
     match p {
         RuntimePrincipal::Any(b) => *b,
@@ -109,12 +94,7 @@ pub(crate) fn eval_principal(p: &RuntimePrincipal, req: &FilterRequest) -> bool 
 /// (`Decision::StopAndSend`). Encode-side (`encode_headers`) is a no-op.
 /// Two stat counters (`allowed` + `denied`) are wired at construction time
 /// and incremented synchronously at the decision site in `decode_headers`.
-///
-/// `#[allow(dead_code)]` on fields covers the Tasks 3-4 interim: the struct
-/// has no production-profile construction site until Task 4 wires
-/// `HttpFilterInstance::Rbac(RbacFilter::build_from_config(...))`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RbacFilter {
     action: RuntimeAction,
     policies: Arc<Vec<RuntimePolicy>>,
@@ -124,7 +104,6 @@ pub struct RbacFilter {
 
 /// Wire-form action: determines whether a policy _match_ means ALLOW or DENY.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 enum RuntimeAction {
     Allow,
     Deny,
@@ -132,7 +111,6 @@ enum RuntimeAction {
 
 /// Build-time-lowered runtime policy: a named (permission × principal) pair.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct RuntimePolicy {
     #[allow(dead_code)] // retained for future tracing::debug! diagnostics
     name: String,
@@ -146,7 +124,6 @@ impl RbacFilter {
     /// `http.{hcm_stat_prefix}.rbac.{allowed,denied}`. Returns
     /// `FilterError::InvalidConfig` if the registry rejects a counter name
     /// (defense-in-depth; the envoy-config validator is the primary gate).
-    #[allow(dead_code)]
     pub(crate) fn build_from_config(
         cfg: &envoy_config::RbacConfig,
         registry: &Arc<StatsRegistry>,
@@ -193,7 +170,6 @@ impl RbacFilter {
     /// combination determines the outcome:
     /// - `(Allow, true)` or `(Deny, false)` → `Decision::Continue` + increment `allowed`.
     /// - `(Allow, false)` or `(Deny, true)` → `Decision::StopAndSend(403)` + increment `denied`.
-    #[allow(dead_code)]
     pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         let any_policy_matches = self.policies.iter().any(|p| {
             let perm_match = p.permissions.iter().any(|x| eval_permission(x, req));
@@ -221,7 +197,6 @@ impl RbacFilter {
     }
 
     /// Encode-side no-op per SPEC §5.4 — RBAC operates on requests only.
-    #[allow(dead_code)]
     pub(crate) fn encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision {
         Decision::Continue
     }
@@ -231,7 +206,6 @@ impl RbacFilter {
 /// `RuntimePermission`. Flattens the `PermissionSet { rules }` wrapper on
 /// `AndRules`/`OrRules` into the runtime enum's direct `Vec<RuntimePermission>`
 /// payload per PLAN lock-in #6.
-#[allow(dead_code)]
 fn lower_permission(p: &envoy_config::Permission) -> RuntimePermission {
     match p {
         envoy_config::Permission::Any(b) => RuntimePermission::Any(*b),
@@ -251,7 +225,6 @@ fn lower_permission(p: &envoy_config::Permission) -> RuntimePermission {
 /// Recursive lowering of wire-form `envoy_config::Principal` → runtime
 /// `RuntimePrincipal`. Symmetric to `lower_permission` per PLAN lock-in #7;
 /// `PrincipalSet { ids }` wrapper flattened on `AndIds`/`OrIds`.
-#[allow(dead_code)]
 fn lower_principal(p: &envoy_config::Principal) -> RuntimePrincipal {
     match p {
         envoy_config::Principal::Any(b) => RuntimePrincipal::Any(*b),

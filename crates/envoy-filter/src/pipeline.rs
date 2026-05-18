@@ -32,16 +32,22 @@ impl FilterPipeline {
     /// `LocalRateLimit`) can register their counters at build time. Phase 09
     /// Task 4 (D5 closure of 07.2 REVIEW M1) dropped the prior
     /// `.enumerate()` + per-instance `position: usize` plumbing.
+    ///
+    /// `hcm_stat_prefix` is threaded through for phase-10 RBAC stats namespace
+    /// registration under `http.{hcm_stat_prefix}.rbac.{allowed,denied}`. The
+    /// H1 HCM `Http1HCMConfig::from_config` passes `&cfg.stat_prefix` at the
+    /// single production call site (phase-10 PLAN lock-in #5).
     pub fn build_from_config(
         filters: &[envoy_config::HttpFilter],
         registry: &Arc<StatsRegistry>,
+        hcm_stat_prefix: &str,
     ) -> Result<Self, FilterError> {
         if filters.is_empty() {
             return Err(FilterError::EmptyChain);
         }
         let mut out = Vec::with_capacity(filters.len());
         for hf in filters.iter() {
-            out.push(HttpFilterInstance::build(hf, registry)?);
+            out.push(HttpFilterInstance::build(hf, registry, hcm_stat_prefix)?);
         }
         Ok(Self { filters: out })
     }
@@ -99,7 +105,8 @@ mod tests {
     #[test]
     fn build_from_config_rejects_empty_list() {
         let filters: Vec<envoy_config::HttpFilter> = Vec::new();
-        let err = FilterPipeline::build_from_config(&filters, &test_registry()).unwrap_err();
+        let err = FilterPipeline::build_from_config(&filters, &test_registry(), "test_prefix")
+            .unwrap_err();
         assert!(matches!(err, FilterError::EmptyChain));
     }
 
@@ -111,7 +118,7 @@ mod tests {
                 envoy_config::RouterConfig {},
             ),
         }];
-        let pipeline = FilterPipeline::build_from_config(&filters, &test_registry())
+        let pipeline = FilterPipeline::build_from_config(&filters, &test_registry(), "test_prefix")
             .expect("single-Router build succeeds");
         assert_eq!(pipeline.filters.len(), 1);
     }
@@ -124,7 +131,8 @@ mod tests {
                 envoy_config::RouterConfig {},
             ),
         }];
-        let mut pipeline = FilterPipeline::build_from_config(&filters, &test_registry()).unwrap();
+        let mut pipeline =
+            FilterPipeline::build_from_config(&filters, &test_registry(), "test_prefix").unwrap();
         let mut req = test_request();
         let decision = pipeline.decode_headers(&mut req);
         assert!(matches!(decision, Decision::Continue));
@@ -138,7 +146,8 @@ mod tests {
                 envoy_config::RouterConfig {},
             ),
         }];
-        let mut pipeline = FilterPipeline::build_from_config(&filters, &test_registry()).unwrap();
+        let mut pipeline =
+            FilterPipeline::build_from_config(&filters, &test_registry(), "test_prefix").unwrap();
         let mut resp = test_response();
         let decision = pipeline.encode_headers(&mut resp);
         assert!(matches!(decision, Decision::Continue));
