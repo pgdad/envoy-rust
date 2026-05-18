@@ -3,12 +3,16 @@
 //! Hand-rolled per D-3.2's "Every individual filter ... Must be written from
 //! scratch" doctrine + the 07.2 `header_mutation.rs` + 09 `local_rate_limit.rs`
 //! precedent. Permission/Principal tree-walk evaluator + RbacFilter runtime.
-//! The evaluator (this task) is pure-compute recursive descent; the filter
-//! struct + decode/encode glue lands in Task 3.
 
+use std::sync::Arc;
+
+use bytes::Bytes;
 use envoy_config::HeaderMatcher;
+use envoy_stats::{Counter, StatsRegistry};
 
-use crate::types::FilterRequest;
+use crate::error::FilterError;
+use crate::pipeline::Decision;
+use crate::types::{FilterRequest, FilterResponse};
 
 /// Build-time-lowered runtime representation of an Envoy RBAC `Permission`.
 ///
@@ -20,10 +24,8 @@ use crate::types::FilterRequest;
 /// negation); `AndRules` / `OrRules` already hold their children behind the
 /// `Vec`'s allocation so no per-variant `Box` is needed.
 ///
-/// `#[allow(dead_code)]` covers the production-profile build for the
-/// Tasks 2-3 interim: this enum has no non-test consumer until Task 3 lands
-/// `RbacFilter::build_from_config`. Same precedent as
-/// `LocalRateLimitFilter::stat_prefix` (`local_rate_limit.rs:49`).
+/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: no production-profile
+/// construction site exists until Task 4 wires `HttpFilterInstance::Rbac`.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum RuntimePermission {
@@ -48,13 +50,7 @@ pub(crate) enum RuntimePermission {
 /// into a direct `Vec<RuntimePrincipal>` on `AndIds` / `OrIds`; `Box` appears
 /// only on `NotId`.
 ///
-/// `#[allow(dead_code)]` covers the `Any` / `AndIds` / `NotId` variants which
-/// aren't yet constructed at Task 2 (the principal-side tests only exercise
-/// `OrIds` + `Header` per the symmetric-evaluator coverage discipline — the
-/// permission-side tests exercise all 5 shapes). Task 3's
-/// `RbacFilter::build_from_config` will construct all variants; the allow
-/// goes away when this lowering exists. Same precedent as
-/// `LocalRateLimitFilter::stat_prefix` (`local_rate_limit.rs:49`).
+/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: see `RuntimePermission`.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum RuntimePrincipal {
@@ -75,8 +71,9 @@ pub(crate) enum RuntimePrincipal {
 /// request. Short-circuits via `Iterator::all` (AndRules) and `Iterator::any`
 /// (OrRules); `NotRule` negates its inner result. Per PLAN lock-ins #8 + #9.
 ///
-/// `#[allow(dead_code)]` for Tasks 2-3 interim — Task 3 wires this fn into
-/// `RbacFilter::decode_headers`.
+/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: called from
+/// `RbacFilter::decode_headers` which itself has no production-profile
+/// construction site until Task 4 wires `HttpFilterInstance::Rbac`.
 #[allow(dead_code)]
 pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> bool {
     match p {
@@ -92,8 +89,7 @@ pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> boo
 /// symmetric to `eval_permission` per PLAN lock-in #7. Short-circuits via
 /// `Iterator::all` (AndIds) and `Iterator::any` (OrIds); `NotId` negates.
 ///
-/// `#[allow(dead_code)]` for Tasks 2-3 interim — Task 3 wires this fn into
-/// `RbacFilter::decode_headers`.
+/// `#[allow(dead_code)]` covers the Tasks 3-4 interim: see `eval_permission`.
 #[allow(dead_code)]
 pub(crate) fn eval_principal(p: &RuntimePrincipal, req: &FilterRequest) -> bool {
     match p {
@@ -105,10 +101,176 @@ pub(crate) fn eval_principal(p: &RuntimePrincipal, req: &FilterRequest) -> bool 
     }
 }
 
+/// The `envoy.filters.http.rbac` runtime filter (phase 10).
+///
+/// Decode-only filter per SPEC §5.4: evaluates every inbound request against
+/// the lowered `RuntimePolicy` list and either allows it through
+/// (`Decision::Continue`) or short-circuits with a 403 response
+/// (`Decision::StopAndSend`). Encode-side (`encode_headers`) is a no-op.
+/// Two stat counters (`allowed` + `denied`) are wired at construction time
+/// and incremented synchronously at the decision site in `decode_headers`.
+///
+/// `#[allow(dead_code)]` on fields covers the Tasks 3-4 interim: the struct
+/// has no production-profile construction site until Task 4 wires
+/// `HttpFilterInstance::Rbac(RbacFilter::build_from_config(...))`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RbacFilter {
+    action: RuntimeAction,
+    policies: Arc<Vec<RuntimePolicy>>,
+    allowed_counter: Arc<Counter>,
+    denied_counter: Arc<Counter>,
+}
+
+/// Wire-form action: determines whether a policy _match_ means ALLOW or DENY.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum RuntimeAction {
+    Allow,
+    Deny,
+}
+
+/// Build-time-lowered runtime policy: a named (permission × principal) pair.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct RuntimePolicy {
+    #[allow(dead_code)] // retained for future tracing::debug! diagnostics
+    name: String,
+    permissions: Vec<RuntimePermission>,
+    principals: Vec<RuntimePrincipal>,
+}
+
+impl RbacFilter {
+    /// Lower an `envoy_config::RbacConfig` into the runtime filter and register
+    /// the 2 stat counters against the `StatsRegistry` under
+    /// `http.{hcm_stat_prefix}.rbac.{allowed,denied}`. Returns
+    /// `FilterError::InvalidConfig` if the registry rejects a counter name
+    /// (defense-in-depth; the envoy-config validator is the primary gate).
+    #[allow(dead_code)]
+    pub(crate) fn build_from_config(
+        cfg: &envoy_config::RbacConfig,
+        registry: &Arc<StatsRegistry>,
+        hcm_stat_prefix: &str,
+    ) -> Result<Self, FilterError> {
+        let action = match cfg.rules.action {
+            envoy_config::Action::Allow => RuntimeAction::Allow,
+            envoy_config::Action::Deny => RuntimeAction::Deny,
+        };
+        let policies: Vec<RuntimePolicy> = cfg
+            .rules
+            .policies
+            .iter()
+            .map(|(name, policy)| RuntimePolicy {
+                name: name.clone(),
+                permissions: policy.permissions.iter().map(lower_permission).collect(),
+                principals: policy.principals.iter().map(lower_principal).collect(),
+            })
+            .collect();
+        // Reuse FilterError::InvalidConfig per local_rate_limit.rs precedent.
+        let allowed_counter = registry
+            .register_counter(&format!("http.{hcm_stat_prefix}.rbac.allowed"))
+            .map_err(|e| FilterError::InvalidConfig {
+                message: format!("StatsRegistry: {e}"),
+            })?;
+        let denied_counter = registry
+            .register_counter(&format!("http.{hcm_stat_prefix}.rbac.denied"))
+            .map_err(|e| FilterError::InvalidConfig {
+                message: format!("StatsRegistry: {e}"),
+            })?;
+        Ok(Self {
+            action,
+            policies: Arc::new(policies),
+            allowed_counter,
+            denied_counter,
+        })
+    }
+
+    /// Evaluate the RBAC policy against the incoming request headers.
+    ///
+    /// Per SPEC §5.6 decision matrix: iterates policies in `BTreeMap`
+    /// alphabetical order; short-circuits on the first matching policy
+    /// (both permission AND principal must match). The `(action, match)`
+    /// combination determines the outcome:
+    /// - `(Allow, true)` or `(Deny, false)` → `Decision::Continue` + increment `allowed`.
+    /// - `(Allow, false)` or `(Deny, true)` → `Decision::StopAndSend(403)` + increment `denied`.
+    #[allow(dead_code)]
+    pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
+        let any_policy_matches = self.policies.iter().any(|p| {
+            let perm_match = p.permissions.iter().any(|x| eval_permission(x, req));
+            let prin_match = p.principals.iter().any(|x| eval_principal(x, req));
+            perm_match && prin_match
+        });
+        let allow = matches!(
+            (self.action, any_policy_matches),
+            (RuntimeAction::Allow, true) | (RuntimeAction::Deny, false)
+        );
+        if allow {
+            self.allowed_counter.inc();
+            Decision::Continue
+        } else {
+            self.denied_counter.inc();
+            Decision::StopAndSend(FilterResponse {
+                status: 403,
+                // reason is Option<&'static str> per crate::types::FilterResponse.
+                reason: Some("Forbidden"),
+                headers: vec![],
+                // ADR-0034: 19 bytes, no trailing newline, per upstream Envoy v1.33 empirical verification.
+                body: Bytes::from_static(b"RBAC: access denied"),
+            })
+        }
+    }
+
+    /// Encode-side no-op per SPEC §5.4 — RBAC operates on requests only.
+    #[allow(dead_code)]
+    pub(crate) fn encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision {
+        Decision::Continue
+    }
+}
+
+/// Recursive lowering of wire-form `envoy_config::Permission` → runtime
+/// `RuntimePermission`. Flattens the `PermissionSet { rules }` wrapper on
+/// `AndRules`/`OrRules` into the runtime enum's direct `Vec<RuntimePermission>`
+/// payload per PLAN lock-in #6.
+#[allow(dead_code)]
+fn lower_permission(p: &envoy_config::Permission) -> RuntimePermission {
+    match p {
+        envoy_config::Permission::Any(b) => RuntimePermission::Any(*b),
+        envoy_config::Permission::Header(m) => RuntimePermission::Header(m.clone()),
+        envoy_config::Permission::AndRules(set) => {
+            RuntimePermission::AndRules(set.rules.iter().map(lower_permission).collect())
+        }
+        envoy_config::Permission::OrRules(set) => {
+            RuntimePermission::OrRules(set.rules.iter().map(lower_permission).collect())
+        }
+        envoy_config::Permission::NotRule(inner) => {
+            RuntimePermission::NotRule(Box::new(lower_permission(inner)))
+        }
+    }
+}
+
+/// Recursive lowering of wire-form `envoy_config::Principal` → runtime
+/// `RuntimePrincipal`. Symmetric to `lower_permission` per PLAN lock-in #7;
+/// `PrincipalSet { ids }` wrapper flattened on `AndIds`/`OrIds`.
+#[allow(dead_code)]
+fn lower_principal(p: &envoy_config::Principal) -> RuntimePrincipal {
+    match p {
+        envoy_config::Principal::Any(b) => RuntimePrincipal::Any(*b),
+        envoy_config::Principal::Header(m) => RuntimePrincipal::Header(m.clone()),
+        envoy_config::Principal::AndIds(set) => {
+            RuntimePrincipal::AndIds(set.ids.iter().map(lower_principal).collect())
+        }
+        envoy_config::Principal::OrIds(set) => {
+            RuntimePrincipal::OrIds(set.ids.iter().map(lower_principal).collect())
+        }
+        envoy_config::Principal::NotId(inner) => {
+            RuntimePrincipal::NotId(Box::new(lower_principal(inner)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::FilterRequest;
     use envoy_config::{HeaderMatcher, HeaderMatcherMode, StringMatcher, StringMatcherMode};
 
     fn req_with(headers: Vec<(&'static str, &'static str)>) -> FilterRequest {
@@ -239,5 +401,225 @@ mod tests {
             RuntimePrincipal::Header(header_matcher_exact("x-user", "alice")),
         ]);
         assert!(eval_principal(&prin, &req));
+    }
+
+    // --- Task 3: RbacFilter runtime tests -----------------------------------
+
+    #[test]
+    fn build_from_config_allow_with_header_principal_creates_filter() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "pass".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Header(header_matcher_exact(
+                    "x-rbac-pass",
+                    "yes",
+                ))],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let filter =
+            RbacFilter::build_from_config(&cfg, &registry, "ingress_http").expect("build succeeds");
+        let _ = filter; // ensure construction succeeds
+    }
+
+    #[test]
+    fn decode_headers_allow_action_no_header_returns_deny() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "p".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Header(header_matcher_exact(
+                    "x-rbac-pass",
+                    "yes",
+                ))],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let mut filter = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").unwrap();
+        let mut req = req_with(vec![]);
+
+        match filter.decode_headers(&mut req) {
+            crate::pipeline::Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 403);
+                assert_eq!(resp.reason, Some("Forbidden"));
+                assert!(resp.headers.is_empty());
+                assert_eq!(&resp.body[..], b"RBAC: access denied");
+            }
+            other => panic!("expected StopAndSend(403), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_headers_allow_action_with_header_returns_continue() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "p".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Header(header_matcher_exact(
+                    "x-rbac-pass",
+                    "yes",
+                ))],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let mut filter = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").unwrap();
+        let mut req = req_with(vec![("x-rbac-pass", "yes")]);
+
+        assert!(matches!(
+            filter.decode_headers(&mut req),
+            crate::pipeline::Decision::Continue
+        ));
+    }
+
+    #[test]
+    fn decode_headers_deny_action_inverts_semantics() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "block_evil".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Header(header_matcher_exact(
+                    "x-evil", "true",
+                ))],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Deny,
+                policies,
+            },
+        };
+        let mut filter = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").unwrap();
+
+        // No x-evil header → no policy match → Deny action no_match → ALLOW.
+        let mut req_benign = req_with(vec![]);
+        assert!(matches!(
+            filter.decode_headers(&mut req_benign),
+            crate::pipeline::Decision::Continue
+        ));
+
+        // With x-evil: true → policy match → Deny action match → DENY.
+        let mut req_evil = req_with(vec![("x-evil", "true")]);
+        match filter.decode_headers(&mut req_evil) {
+            crate::pipeline::Decision::StopAndSend(resp) => assert_eq!(resp.status, 403),
+            other => panic!("expected StopAndSend(403), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_headers_counters_increment_correctly() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "p".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Header(header_matcher_exact(
+                    "x-rbac-pass",
+                    "yes",
+                ))],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let mut filter = RbacFilter::build_from_config(&cfg, &registry, "test_prefix").unwrap();
+
+        // 2 allowed + 1 denied
+        let mut req_ok = req_with(vec![("x-rbac-pass", "yes")]);
+        let _ = filter.decode_headers(&mut req_ok);
+        let _ = filter.decode_headers(&mut req_ok);
+        let mut req_deny = req_with(vec![]);
+        let _ = filter.decode_headers(&mut req_deny);
+
+        // CORRECTION 1: register_counter (not counter); idempotent — returns existing handle.
+        let allowed = registry
+            .register_counter("http.test_prefix.rbac.allowed")
+            .expect("allowed counter registered");
+        let denied = registry
+            .register_counter("http.test_prefix.rbac.denied")
+            .expect("denied counter registered");
+        assert_eq!(allowed.value(), 2);
+        assert_eq!(denied.value(), 1);
+    }
+
+    #[test]
+    fn encode_headers_is_noop() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "p".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Any(true)],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let mut filter = RbacFilter::build_from_config(&cfg, &registry, "p").unwrap();
+        let mut resp = crate::types::FilterResponse {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(
+            filter.encode_headers(&mut resp),
+            crate::pipeline::Decision::Continue
+        ));
     }
 }

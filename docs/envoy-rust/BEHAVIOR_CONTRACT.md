@@ -109,6 +109,13 @@ value wins.
 | `http_local_rate_limit.<stat_prefix>.rate_limited` | value-exact | Counter; one increment per `try_acquire` failure (no tokens available; request would-be-rate-limited). At phase-09 scope `filter_enforced` defaults to always-on (100%) so `rate_limited` counts coincide with `enforced` — but the upstream-Envoy semantic distinguishes "would-be-rate-limited" (`rate_limited`) from "actually-rate-limited" (`enforced`). Both proxies emit one increment per over-limit request. |
 | `http_local_rate_limit.<stat_prefix>.enforced` | value-exact | Counter; one increment per request actually rate-limited (429 response emitted via `Decision::StopAndSend`). At phase-09 scope `enforced == rate_limited` because `filter_enforced` defaults to always-on; the two stat names track for upstream-Envoy parity. When a future phase lands runtime-fractional-percent `filter_enforced` overrides, the two counters diverge. Both proxies emit one increment per 429 emission. |
 
+**10 entries (RBAC filter):**
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `http.<hcm_stat_prefix>.rbac.allowed` | value-exact | Counter; one increment per request allowed under the primary rules — either by explicit Allow-action policy match OR by Deny-action no-match (per phase-10 SPEC §5.6 decision matrix). Both proxies emit one increment per allowed request at the decision site in `RbacFilter::decode_headers` (synchronously, before `Decision::Continue`). Upstream Envoy v1.33 emits the same name at the same `http.<hcm_stat_prefix>.rbac.*` namespace per the §6.2 empirical verification at PLAN-write. |
+| `http.<hcm_stat_prefix>.rbac.denied` | value-exact | Counter; one increment per request denied under the primary rules — either by explicit Deny-action policy match OR by Allow-action no-match. Both proxies emit one increment per denied request at the decision site in `RbacFilter::decode_headers` (synchronously, before constructing the `Decision::StopAndSend(FilterResponse)` 403). The `allowed + denied == total_requests_to_filter` invariant holds per SPEC §2.1 (each counter incremented at its own fire site; no double-counting). |
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments

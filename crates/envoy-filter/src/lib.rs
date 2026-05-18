@@ -20,5 +20,6 @@ pub use header_mutation::HeaderMutationFilter;
 pub use instance::HttpFilterInstance;
 pub use local_rate_limit::LocalRateLimitFilter;
 pub use pipeline::{Decision, FilterPipeline};
+pub use rbac::RbacFilter;
 pub use router::RouterTerminus;
 pub use types::{FilterRequest, FilterResponse};

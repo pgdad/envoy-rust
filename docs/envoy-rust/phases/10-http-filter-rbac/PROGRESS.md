@@ -634,7 +634,155 @@ Task 4 / Task 8).
 
 ### Task 3 — D3 RbacFilter runtime + D6 stats wiring + D7.1 2 contract rows
 
-_(Pending Task 3 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `14a842c` — `phase 10: task 2 — D3 RBAC recursive tree-walk evaluator`.
+
+**Work summary.** Landed the `RbacFilter` runtime struct + `build_from_config` +
+`decode_headers` + `encode_headers` per PLAN Task 3 (SPEC §3 D3 extension, D6
+stats wiring, D7.1 contract rows). The module already had `RuntimePermission`,
+`RuntimePrincipal`, `eval_permission`, `eval_principal` from Task 2; this task
+extends it with the filter struct shape, lowering helpers, and the full
+TDD-driven test suite.
+
+`RbacFilter` holds 4 fields: `action: RuntimeAction`, `policies:
+Arc<Vec<RuntimePolicy>>`, `allowed_counter: Arc<Counter>`, and `denied_counter:
+Arc<Counter>`. `build_from_config` lowers an `envoy_config::RbacConfig` into
+the runtime struct via the `lower_permission` + `lower_principal` helpers
+(which flatten the `PermissionSet { rules }` / `PrincipalSet { ids }` wrappers
+per PLAN lock-ins #6 + #7) and registers 2 stat counters under
+`http.{hcm_stat_prefix}.rbac.{allowed,denied}` via `StatsRegistry::register_counter`
+per PLAN lock-in #15.
+
+`decode_headers` implements the SPEC §5.6 decision matrix: iterates `policies`
+in `BTreeMap` alphabetical order, short-circuits on first matching policy
+(permission AND principal both matching), and resolves the `(action, match)`
+combination via `matches!(...)` to either `Decision::Continue` (increment
+`allowed_counter`) or `Decision::StopAndSend(FilterResponse { status: 403,
+reason: Some("Forbidden"), headers: vec![], body: Bytes::from_static(b"RBAC:
+access denied") })` (increment `denied_counter`). `encode_headers` is a no-op
+per SPEC §5.4. Two `BEHAVIOR_CONTRACT.md` rows added under a new "**10 entries
+(RBAC filter):**" subheading per PLAN lock-in #36. `pub use rbac::RbacFilter;`
+re-exported from `lib.rs` per alphabetical position.
+
+The 4 `#[allow(dead_code)]` attrs from Task 2 were removed and replaced with a
+new set of per-item attrs covering the Tasks 3-4 interim: the whole `RbacFilter`
+block has no production-profile construction site until Task 4 wires
+`HttpFilterInstance::Rbac(RbacFilter::build_from_config(...))` in `instance.rs`.
+See "Per-task deviations" below for detail on this deviation from Correction 4's
+ideal expectation.
+
+**Files modified (4):**
+- `crates/envoy-filter/src/rbac.rs` — extended with `RbacFilter` struct +
+  `RuntimeAction` enum + `RuntimePolicy` struct + `impl RbacFilter` block
+  (`build_from_config`, `decode_headers`, `encode_headers`) + `lower_permission`
+  + `lower_principal` helper fns + 6 new unit tests; removed Task-2's 4
+  `#[allow(dead_code)]` attrs and their explanatory doc-comment paragraphs;
+  added new interim attrs covering the Tasks 3-4 production-profile dead-code.
+- `crates/envoy-filter/src/lib.rs` — added `pub use rbac::RbacFilter;`
+  alphabetically between `pub use pipeline::{Decision, FilterPipeline};` and
+  `pub use router::RouterTerminus;`.
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md` — inserted 2 new "Stat-name mapping"
+  rows under new "**10 entries (RBAC filter):**" subheading after the 09 entries
+  table per PLAN lock-in #36.
+- `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` — this subsection
+  (per-task PROGRESS cadence; replaces the state-2 skeleton's
+  `_(Pending Task 3 dispatch.)_` placeholder).
+
+**Tests landed (6 new; 772 → 778 in workspace test count).** All under
+`rbac::tests` per PLAN-canonical naming:
+1. `build_from_config_allow_with_header_principal_creates_filter`
+2. `decode_headers_allow_action_no_header_returns_deny`
+3. `decode_headers_allow_action_with_header_returns_continue`
+4. `decode_headers_deny_action_inverts_semantics`
+5. `decode_headers_counters_increment_correctly`
+6. `encode_headers_is_noop`
+
+**LoC delta (production + tests; doc-comments included).** Per
+`git diff HEAD -- crates/envoy-filter/src/rbac.rs crates/envoy-filter/src/lib.rs
+docs/envoy-rust/BEHAVIOR_CONTRACT.md | diffstat` at this commit:
+3 files changed, 409 insertions(+), 19 deletions(-) (the deletions are the
+Task-2 `#[allow(dead_code)]` attrs + explanatory doc-comment paragraphs removed
+per Correction 4, plus the re-org of the module header). Net `rbac.rs` delta:
+~+390 LoC. Breakdown of new production code: `RbacFilter` struct + `RuntimeAction`
++ `RuntimePolicy` + `impl RbacFilter` block + 2 lowering fns ≈ ~130 LoC;
+tests ≈ ~190 LoC; interim `#[allow(dead_code)]` attrs + updated doc-comment
+lines ≈ ~30 LoC; `lib.rs` +1 LoC; `BEHAVIOR_CONTRACT.md` +7 LoC. PLAN §3's
+Task-3 projection was ~130 production + ~135 tests = ~265 LoC; the ~+65 LoC
+overshoot is dominated by (a) per-item `#[allow(dead_code)]` attrs for the
+Tasks 3-4 interim (not anticipated by PLAN Correction 4's ideal expectation)
+and (b) per-`pub(crate)` doc-comments per crate convention.
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS (after one `cargo fmt --all` to fix the
+  `RbacFilter::build_from_config(...).expect("build succeeds")` line-length
+  wrap in the first test).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — PASS
+  (0 warnings; with per-item `#[allow(dead_code)]` attrs on the Tasks 3-4
+  interim items — see "Per-task deviations" #1).
+- `cargo build --workspace --all-targets` — PASS.
+- `cargo test --workspace` — PASS (778 passed, 0 failed, 2 ignored; +6 vs the
+  phase-10 Task 2 snapshot of 772 — exactly the 6 new `rbac::tests`).
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok, sources ok;
+  pre-existing unencountered-license warnings unchanged from Task 2).
+
+**Per-task deviations from PLAN (4 — the 4 inline corrections from the dispatch brief).**
+
+1. **Correction 1 applied: `registry.counter(...)` → `registry.register_counter(...)`
+   in test `decode_headers_counters_increment_correctly`.** PLAN Step 1 test
+   (lines 1469-1474) called `.counter(name)` — a method that does not exist on
+   `StatsRegistry`. The canonical API at
+   `crates/envoy-stats/src/registry.rs:45` is `pub fn register_counter(&self,
+   name: &str) -> Result<Arc<Counter>, StatsError>`. Verified against phase-09
+   Task 3 pattern at `crates/envoy-filter/src/local_rate_limit.rs:419-422`.
+   Correction applied as specified.
+
+2. **Correction 2 applied: `reason: Some("Forbidden")` (no `.to_string()`).**
+   PLAN Step 3 production code (line 1620) wrote `reason: Some("Forbidden".to_string())`.
+   `crates/envoy-filter/src/types.rs:45` declares `pub reason: Option<&'static
+   str>` — NOT `Option<String>`. Verified against phase-09 precedent at
+   `crates/envoy-filter/src/local_rate_limit.rs:161` (`reason: Some("Too Many
+   Requests")`). Correction applied as specified.
+
+3. **Correction 3 applied: `FilterError::InvalidConfig { message: ... }` reused,
+   NOT `FilterError::StatsRegistration`.** PLAN Step 3 production code (lines
+   1582-1593) used a `FilterError::StatsRegistration` variant that does not exist.
+   At HEAD `14a842c`, `crates/envoy-filter/src/error.rs` has exactly 5 variants:
+   `EmptyChain`, `RouterNotTerminal`, `DuplicateRouter`, `UnsupportedFilterType`,
+   `InvalidConfig`. The canonical pattern is at
+   `crates/envoy-filter/src/local_rate_limit.rs:92-120`:
+   `.map_err(|e| FilterError::InvalidConfig { message: format!("StatsRegistry:
+   {e}") })?`. Correction applied as specified; no new variant added.
+
+4. **Correction 4 partially applied: 4 Task-2 `#[allow(dead_code)]` attrs
+   removed; replaced with new Tasks 3-4 interim attrs.** The dispatch brief
+   specified removing all 4 Task-2 attrs and expected all 4 items to have live
+   consumers after Task 3's wiring. This proved incorrect: the entire `RbacFilter`
+   block (`RuntimePermission`, `RuntimePrincipal`, `eval_permission`,
+   `eval_principal`, `RbacFilter` struct fields, `RuntimeAction` variants,
+   `RuntimePolicy` fields, `build_from_config`, `decode_headers`, `encode_headers`,
+   `lower_permission`, `lower_principal`) has no production-profile construction
+   site because `crates/envoy-filter/src/instance.rs` still returns
+   `FilterError::UnsupportedFilterType` for the `Rbac` variant (the Task-1
+   bridge arm). Task 4 will replace that stub with
+   `HttpFilterInstance::Rbac(RbacFilter::build_from_config(...))`, making all
+   items live. The Task-2 `#[allow(dead_code)]` attrs (plus their
+   dead-code-explanation doc-comment paragraphs) were removed as specified; NEW
+   per-item attrs covering the Tasks 3-4 interim were added to the 10 affected
+   items (`RuntimePermission`, `RuntimePrincipal`, `eval_permission`,
+   `eval_principal`, `RbacFilter` struct, `RuntimeAction`, `RuntimePolicy`,
+   `build_from_config`, `decode_headers`, `encode_headers`, `lower_permission`,
+   `lower_principal`). The `RuntimePolicy::name` field retains its permanent
+   `#[allow(dead_code)]` attr (per the struct's "retained for future
+   tracing::debug! diagnostics" rationale — this attr is NOT an interim and
+   should survive Task 4's wiring). Correction 4 is partially satisfied:
+   old interim attrs removed, new interim attrs added, permanent attr preserved.
+
+**Carryforward dispositions unchanged.** The 09 REVIEW M2 + M3 projected-close
+sites both target Tasks 4 + 7 respectively; not engaged at Task 3.
+
+**STATE.md / ROADMAP.md / DECISIONS.md / ENVOY_TARGET.md / rust-toolchain.toml
+diffs at this commit:** None. (BEHAVIOR_CONTRACT.md IS modified at this commit
+per PLAN lock-in #36.)
 
 ### Task 4 — D4 HttpFilterInstance::Rbac variant + D5 ADR-0033 amendment (closes 09 REVIEW M2)
 
