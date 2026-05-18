@@ -634,7 +634,7 @@ Task 4 / Task 8).
 
 ### Task 3 — D3 RbacFilter runtime + D6 stats wiring + D7.1 2 contract rows
 
-**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Commit:** `da32137` — `phase 10: task 3 — D3 RbacFilter runtime + D6 stats + D7.1 2 contract rows`
 **Parent:** `14a842c` — `phase 10: task 2 — D3 RBAC recursive tree-walk evaluator`.
 
 **Work summary.** Landed the `RbacFilter` runtime struct + `build_from_config` +
