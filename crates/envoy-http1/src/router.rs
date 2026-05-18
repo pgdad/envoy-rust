@@ -96,7 +96,7 @@ pub fn construct_proxied_response(
     if upstream_response.status / 100 == 5 {
         cluster.upstream_rq_5xx().inc();
     }
-    let now_date = crate::date::format_imf_fixdate(std::time::SystemTime::now());
+    let now_date = crate::date::now_imf_fixdate();
     let mut headers: Vec<(String, String)> =
         Vec::with_capacity(upstream_response.headers.len() + 2);
 

@@ -37,6 +37,10 @@ impl Client {
         let stream = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|source| Http1Error::UpstreamConnect { addr, source })?;
+        // Disable Nagle on the upstream socket. Same rationale as the
+        // downstream side in envoy-listener: small request/response pairs
+        // would otherwise eat a delayed-ACK stall on every round trip.
+        let _ = stream.set_nodelay(true);
         Ok(ClientStream {
             stream,
             host: host.to_string(),
@@ -67,6 +71,13 @@ impl ClientStream {
     /// implementation handles only the Content-Length response path. Chunked
     /// responses surface as `Http1Error::MalformedChunkedFraming` until Task 7.
     pub async fn send_request(&mut self, request: Request) -> Result<Response, Http1Error> {
+        // Reset the read buffer. After a prior response, leftover bytes (the
+        // already-consumed response headers + body bytes that came in the
+        // same read chunk) remain in `self.buf`; without clearing, the
+        // response-parse loop below would re-parse the stale response. Safe
+        // for first-use too — clear() on an empty buf is a no-op.
+        self.buf.clear();
+
         // (a) Serialize the request.
         let mut wire: Vec<u8> = Vec::with_capacity(256 + request.body_len_estimate());
         wire.extend_from_slice(request.method.as_bytes());

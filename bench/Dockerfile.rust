@@ -1,0 +1,8 @@
+# Minimal runtime image; binary is built on host (faster iteration than building in docker)
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY envoy-bin /usr/local/bin/envoy-bin
+COPY envoy-rust.yaml /etc/envoy-rust.yaml
+ENV ENVOY_RUST_LOG=warn
+EXPOSE 10000
+ENTRYPOINT ["/usr/local/bin/envoy-bin", "-c", "/etc/envoy-rust.yaml"]

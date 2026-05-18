@@ -1,9 +1,8 @@
 //! HTTP connection manager: per-listener config, per-connection state machine,
 //! route walker, hardcoded router-filter call site.
 
-use crate::client::Client;
+use crate::client::{Client, ClientStream};
 use crate::codec::{Http1Codec, HttpVersion, Request};
-use crate::date::format_imf_fixdate;
 use crate::error::Http1Error;
 use crate::headers::{self, find_header};
 use crate::response::{Http1Response, Response};
@@ -15,7 +14,7 @@ use envoy_config::{
 };
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
@@ -266,6 +265,13 @@ async fn serve_connection(
     mut downstream: TcpStream,
 ) -> Result<(), Http1Error> {
     let mut buf = BytesMut::with_capacity(READ_BUFFER_INITIAL_CAPACITY);
+    // Tier-1 upstream connection reuse: hold one upstream stream across
+    // requests on this downstream connection. Reused only when the next
+    // request targets the same cluster + endpoint AND neither side asked
+    // to close. Dropped (and replaced with a fresh connect) on mismatch or
+    // on any send/recv error. cx_total is only incremented on actual
+    // fresh connects — reuses leave it alone (matches Envoy's stat).
+    let mut cached_upstream: Option<(String, std::net::SocketAddr, ClientStream)> = None;
     loop {
         // 1. Try parsing what's already in the buffer (for keep-alive
         //    second-and-later requests where bytes from the previous read
@@ -486,55 +492,84 @@ async fn serve_connection(
                         let _cx_guard = cluster.cx_active_guard();
 
                         let start = std::time::Instant::now();
-                        let client_result = Client::connect(endpoint, &host_header).await;
-                        match client_result {
-                            Ok(mut client_stream) => {
-                                // 06.1 D4.b: per-cluster `upstream_cx_total`
-                                // counter incremented once per established
-                                // upstream TCP connection. Fires only on the
-                                // success arm (a refused-connect path returns
-                                // 502 without incrementing).
-                                cluster.cx_total().inc();
 
-                                match client_stream.send_request(out_req).await {
-                                    Ok(upstream_response) => {
-                                        let elapsed_ms = start.elapsed().as_millis();
-                                        // 07.1 Task 5: factored — was a direct
-                                        // `crate::router::write_proxied_response`
-                                        // call; now constructs the Response
-                                        // value for the unified wire-write site
-                                        // below the match. The x-envoy-upstream-
-                                        // service-time header is injected by
-                                        // construct_proxied_response and flows
-                                        // into response_headers_for_log via the
-                                        // outgoing.headers.clone() at the
-                                        // unified site below.
-                                        outgoing = crate::router::construct_proxied_response(
-                                            &cluster,
-                                            upstream_response,
-                                            elapsed_ms,
-                                            close,
-                                        );
+                        // Tier-1 upstream reuse. Either a cached stream
+                        // (for the same cluster+endpoint) or a fresh connect
+                        // produces the ClientStream we'll send on; a connect
+                        // error short-circuits to a 502 synth response. Modeled
+                        // as Result so every downstream branch provably
+                        // assigns `outgoing`.
+                        let stream_or_synth: Result<ClientStream, Response> =
+                            match cached_upstream.take() {
+                                Some((cname, addr, s))
+                                    if cname == cluster_name && addr == endpoint =>
+                                {
+                                    Ok(s)
+                                }
+                                _ => match Client::connect(endpoint, &host_header).await {
+                                    Ok(s) => {
+                                        // 06.1 D4.b: per-cluster `upstream_cx_total`
+                                        // counter incremented once per established
+                                        // upstream TCP connection. Reused streams
+                                        // skip this — matches Envoy's semantic.
+                                        cluster.cx_total().inc();
+                                        Ok(s)
                                     }
                                     Err(source) => {
                                         tracing::warn!(
                                             cluster = %cluster.name(),
                                             addr = %endpoint,
                                             error = ?source,
-                                            "upstream request failed — returning 502",
+                                            "upstream connect failed — returning 502",
                                         );
-                                        outgoing = synth_status(502, close);
+                                        Err(synth_status(502, close))
+                                    }
+                                },
+                            };
+
+                        match stream_or_synth {
+                            Ok(mut client_stream) => match client_stream
+                                .send_request(out_req)
+                                .await
+                            {
+                                Ok(upstream_response) => {
+                                    let elapsed_ms = start.elapsed().as_millis();
+                                    // Decide reuse BEFORE construct_proxied_response
+                                    // consumes upstream_response. Cache iff
+                                    // both sides allow keep-alive.
+                                    let upstream_close =
+                                        upstream_response.headers.iter().any(|(n, v)| {
+                                            n.eq_ignore_ascii_case(headers::CONNECTION)
+                                                && v.eq_ignore_ascii_case("close")
+                                        });
+                                    outgoing = crate::router::construct_proxied_response(
+                                        &cluster,
+                                        upstream_response,
+                                        elapsed_ms,
+                                        close,
+                                    );
+                                    if !close && !upstream_close {
+                                        cached_upstream =
+                                            Some((cluster_name.clone(), endpoint, client_stream));
                                     }
                                 }
-                            }
-                            Err(source) => {
-                                tracing::warn!(
-                                    cluster = %cluster.name(),
-                                    addr = %endpoint,
-                                    error = ?source,
-                                    "upstream connect failed — returning 502",
-                                );
-                                outgoing = synth_status(502, close);
+                                Err(source) => {
+                                    // No retry on tier-1: a stale cached
+                                    // stream surfaces as 502. nginx's default
+                                    // keepalive_timeout (75s) makes this rare
+                                    // under benchmark traffic; future tiers
+                                    // add half-close validation + retry.
+                                    tracing::warn!(
+                                        cluster = %cluster.name(),
+                                        addr = %endpoint,
+                                        error = ?source,
+                                        "upstream request failed — returning 502",
+                                    );
+                                    outgoing = synth_status(502, close);
+                                }
+                            },
+                            Err(resp) => {
+                                outgoing = resp;
                             }
                         }
                     } else {
@@ -849,7 +884,7 @@ fn route_matches(r: &Route, path: &str, headers: &[(String, String)]) -> bool {
 }
 
 fn now_imf_fixdate() -> String {
-    format_imf_fixdate(SystemTime::now())
+    crate::date::now_imf_fixdate()
 }
 
 fn connection_value(close: bool) -> &'static str {

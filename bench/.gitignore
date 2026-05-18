@@ -1,0 +1,2 @@
+# envoy-bin is host-built and copied in by the bench scripts; not source.
+envoy-bin
