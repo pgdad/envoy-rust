@@ -68,6 +68,15 @@ impl HttpFilterInstance {
                     LocalRateLimitFilter::build_from_config(cfg, registry)?,
                 ))
             }
+            envoy_config::HttpFilterTypedConfig::Rbac(_cfg) => {
+                // Phase 10 Task 1 transient bridge — Task 4 replaces this with
+                // the proper HttpFilterInstance::Rbac(RbacFilter) dispatch once
+                // Task 3 lands the RbacFilter runtime.
+                Err(FilterError::UnsupportedFilterType {
+                    position: 0,
+                    name: hf.name.clone(),
+                })
+            }
         }
     }
 

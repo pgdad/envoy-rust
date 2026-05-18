@@ -326,7 +326,168 @@ _(Per-task `### Task N — <name>` subsections append at state-3 task commits pe
 
 ### Task 1 — D1 envoy-config schema + D2 validator (co-located)
 
-_(Pending Task 1 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `55abc61` — `phase 10: state-2 standalone PLAN.md [ADR-0034]`.
+
+**Work summary.** Landed the RBAC envoy-config schema + parse-time validator per
+PLAN Task 1 (SPEC §3 D1 + D2). The schema adds 8 new items (`RbacConfig`,
+`Rules`, `Action`, `Policy`, `Permission`, `PermissionSet`, `Principal`,
+`PrincipalSet`) + 1 new `HttpFilterTypedConfig` variant (`Rbac(RbacConfig)`) +
+1 `default_action` helper + 1 `pub(crate) const RBAC_TREE_MAX_DEPTH: u32 = 16`.
+The validator adds 6 new `ConfigError` variants (`EmptyRbacPolicies`,
+`EmptyRbacPolicyPermissions`, `EmptyRbacPolicyPrincipals`, `EmptyRbacPermissionSet`,
+`EmptyRbacPrincipalSet`, `RbacTreeTooDeep`) + 1 new dispatch arm in
+`validate_http_filters` (the 4th, after Router / HeaderMutation / LocalRateLimit) +
+3 new sub-validators (`validate_rbac_config` + `validate_permission_tree` +
+`validate_principal_tree`). 14 unit tests landed under a new `rbac_tests`
+submodule beneath the existing `local_rate_limit_tests` peer. A transient bridge
+arm in `crates/envoy-filter/src/instance.rs::build` returns
+`FilterError::UnsupportedFilterType` for the new `Rbac` variant during the
+Tasks 1-3 interim; Task 4 replaces it with the proper
+`HttpFilterInstance::Rbac(RbacFilter)` dispatch.
+
+**Files modified (4):**
+- `crates/envoy-config/src/lib.rs` — 6 new `ConfigError` variants
+  (`EmptyRbacPolicies`, `EmptyRbacPolicyPermissions`, `EmptyRbacPolicyPrincipals`,
+  `EmptyRbacPermissionSet`, `EmptyRbacPrincipalSet`, `RbacTreeTooDeep`); 8 new
+  `pub use bootstrap::{...}` re-exports (`Action`, `Permission`, `PermissionSet`,
+  `Policy`, `Principal`, `PrincipalSet`, `RbacConfig`, `Rules`) placed
+  alphabetically within the existing block. `RBAC_TREE_MAX_DEPTH` deliberately
+  NOT re-exported (per lock-in #27 it's `pub(crate)`).
+- `crates/envoy-config/src/bootstrap.rs` — new `HttpFilterTypedConfig::Rbac`
+  variant; 8 new schema definitions (`RbacConfig`, `Rules`, `Action`, `Policy`,
+  `Permission` + hand-rolled `Deserialize`, `PermissionSet`, `Principal` +
+  hand-rolled `Deserialize`, `PrincipalSet`); `default_action` helper; the
+  `pub(crate) const RBAC_TREE_MAX_DEPTH: u32 = 16` constant; new match arm on
+  `validate_http_filters`; 3 new sub-validator functions
+  (`validate_rbac_config`, `validate_permission_tree`, `validate_principal_tree`);
+  14 new unit tests in the new `rbac_tests` submodule under the existing
+  `mod tests` block (immediately after `local_rate_limit_tests`).
+- `crates/envoy-filter/src/instance.rs` — cross-crate bridge arm: the new
+  `HttpFilterTypedConfig::Rbac` variant must be handled in the
+  `HttpFilterInstance::build` match (otherwise non-exhaustive match breaks the
+  workspace build). The interim arm returns `FilterError::UnsupportedFilterType`;
+  Task 4 replaces it with the proper `HttpFilterInstance::Rbac` dispatch. A
+  comment in the source explains the deferral.
+- `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` — this subsection
+  (per-task PROGRESS cadence).
+
+**Tests landed (14 new; 225 → 239 in envoy-config lib).**
+1. `deserialize_rbac_minimal_allow_succeeds`
+2. `deserialize_rbac_default_action_is_allow`
+3. `deserialize_rbac_deny_action_succeeds`
+4. `deserialize_rbac_rejects_unknown_field`
+5. `deserialize_rbac_permission_and_or_not_combinators_succeed`
+6. `deserialize_rbac_principal_and_or_not_combinators_succeed`
+7. `validate_accepts_rbac_followed_by_router`
+8. `validate_rejects_empty_policies`
+9. `validate_rejects_empty_policy_permissions`
+10. `validate_rejects_empty_policy_principals`
+11. `validate_rejects_empty_permission_set`
+12. `validate_rejects_empty_principal_set`
+13. `validate_rejects_tree_too_deep`
+14. `validate_rejects_rbac_with_wrong_name`
+
+(The PLAN brief named "13 unit tests" + 3 helpers as the verbatim canonical
+block; the actual `#[test]`-annotated function count in the verbatim block is
+**14** — the brief's narrative count was off by one. The verbatim block was
+landed without semantic modification; the 14-fn count is canonical.)
+
+**LoC delta (production + tests; doc-comments included in the raw counts
+below).** Per `git diff --cached --shortstat HEAD` at this commit: 3 files
+changed, 689 insertions(+), 3 deletions(-). Breakdown:
+- `crates/envoy-config/src/bootstrap.rs`: +625 lines (schema + 2 hand-rolled
+  Deserialize impls + 3 sub-validators + 14 unit tests + doc-comments). Of these,
+  ~269 lines are tests in `rbac_tests`; the remaining ~356 are production
+  (schema + Deserialize impls + validators + dispatch arm extension).
+- `crates/envoy-config/src/lib.rs`: +56 / -2 (50 production lines — 6 new
+  `ConfigError` variants + doc-comments; 8 new re-exports interleaved).
+- `crates/envoy-filter/src/instance.rs`: +9 / -1 (bridge arm + comment).
+
+Production total ~+415 LoC (includes ~70 LoC of hand-rolled Deserialize impls
+not anticipated in the PLAN); tests ~+269 LoC; combined ~+684 LoC. PLAN §3's
+Task-1 projection was ~210 production + ~250 tests = ~465. The +47% overshoot
+is dominated by (a) the two hand-rolled `Deserialize` impls (~70 LoC each in
+combined code+docs ~ +120 LoC) required by the discovered-at-task-time `serde_yaml`
+limitation (see deviation #1 below) and (b) doc-comments on every public schema
+item per the established envoy-config discipline. Excluding doc-comments the
+overshoot would be smaller; still material.
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS (after one `cargo fmt --all` to fix
+  thiserror `#[error(...)]` line-length wraps on three of the 6 new variants).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — PASS
+  (0 warnings; no clippy lints triggered by the new code after the
+  unused-imports pruning in `rbac_tests`).
+- `cargo build --workspace --all-targets` — PASS.
+- `cargo test --workspace` — PASS (760 passed, 0 failed, 2 ignored; +31 vs the
+  phase-09 Task 1 snapshot of 729 — the delta covers the 14 new rbac_tests plus
+  the test growth that landed across phase-09 Tasks 2-8 between the two
+  snapshots).
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok, sources ok;
+  pre-existing unencountered-license warnings unchanged).
+
+**Per-task deviations from PLAN (1; the 8th discovered-at-task-time SPEC
+correction — extends the PLAN §1 list of 7).**
+
+1. **Discovered-at-task-time PLAN-write SPEC correction (8th — extends the
+   PLAN §1 list of 7).** PLAN Step 4 schema decls for `Permission` and
+   `Principal` use `#[derive(Debug, Clone, Deserialize, PartialEq)]` with
+   variant-level `#[serde(rename = "any" / "header" / "and_rules" / ...)]`
+   annotations, relying on serde's externally-tagged enum representation to
+   parse YAML maps like `{any: true}`, `{header: {...}}`, `{and_rules: {rules:
+   [...]}}` (which is how upstream Envoy's bootstrap YAML emits the RBAC tree).
+   At task time the resulting `cargo test rbac_tests` run fails 6 of the 6
+   deserialization tests with `serde_yaml`'s
+   `Error("invalid type: map, expected a YAML tag starting with '!'", line: N,
+   column: N)`. Investigation confirms this is a **known `serde_yaml` 0.9
+   limitation**: externally-tagged enums via plain YAML maps are not
+   supported — `serde_yaml::Deserializer::deserialize_enum` requires YAML's
+   native `!Tag` syntax (not `!any true` / `!and_rules {rules: ...}`, which is
+   not how Envoy bootstraps are written). The codebase's pre-existing
+   convention for this exact problem is **hand-rolled `Deserialize`** mirroring
+   the 04.2 `HeaderMatcher` / `StringMatcher` precedent (which use the same
+   map-of-one-key-with-known-discriminator shape). **Resolution:** add
+   hand-rolled `Deserialize` impls for both `Permission` and `Principal` that
+   visit a `MapAccess` with exactly one key and dispatch to the matching
+   variant (including the recursive `NotRule(Box<Permission>)` /
+   `NotId(Box<Principal>)` arms). The variant-level `#[serde(rename = "...")]`
+   attrs are RETAINED for `Serialize`-derive use (derive-Serialize emits the
+   correct `{"any":true}` JSON shape; YAML serialization via derive would emit
+   `!Tag` syntax which is asymmetric to the map-form Deserialize, but YAML
+   emission of `Permission` / `Principal` is not exercised by any code path —
+   the serialize_roundtrip_tests round-trip via JSON only, and no production
+   path serializes these types to YAML). The `#[serde(deny_unknown_fields)]`
+   attr on the two enums was dropped because (a) it conflicts with hand-rolled
+   `Deserialize` (which already enforces single-key + known-key via explicit
+   error returns) and (b) the existing `HeaderMatcher` / `StringMatcher`
+   precedent uses the same shape (hand-rolled Deserialize + `unknown_field`
+   error in the visitor). The 6 affected schema struct decls (`RbacConfig`,
+   `Rules`, `Policy`, `Action`, `PermissionSet`, `PrincipalSet`) retain
+   `#[serde(deny_unknown_fields)]` per PLAN. Additionally, all 8 new schema
+   items were given a `Serialize` derive (PLAN omits it from the decls); the
+   `HttpFilterTypedConfig` enum derives `Serialize` so its new `Rbac(RbacConfig)`
+   variant cannot embed a non-`Serialize` type without breaking the parent
+   enum's `Serialize` derive. Net surface: 2 hand-rolled `impl Deserialize`
+   blocks (~70 LoC combined) + `Serialize` derives added to 8 schema items
+   (zero-line cost beyond the derive list). Both adjustments preserve the
+   PLAN's wire-format intent (the externally-tagged YAML shape) and the
+   established codebase conventions. Sub-action: 4 unused imports
+   (`HeaderMatcher`, `HeaderMatcherMode`, `StringMatcher`, `StringMatcherMode`)
+   were pruned from the `rbac_tests` submodule's `use` block — they were
+   present in the PLAN-verbatim test block but the tests' YAML inputs
+   deserialize *through* these types without referencing them by name, so
+   under `-D warnings` they would fail clippy. The PLAN-named test fn count
+   (13) is off by one from the verbatim block's actual `#[test]`-annotated
+   function count (14); the brief explicitly flags this as a count-narration
+   drift, not a content drift, so the 14-fn block was landed verbatim.
+
+**Carryforward dispositions unchanged.** The 09 REVIEW M2 + M3 projected-close
+sites both target Tasks 4 + 7 respectively; not engaged at Task 1.
+
+**STATE.md / ROADMAP.md / BEHAVIOR_CONTRACT.md / DECISIONS.md / ENVOY_TARGET.md /
+rust-toolchain.toml diffs at this commit:** None (per the state-3 per-task
+cadence — these all stayed at state-2 values).
 
 ### Task 2 — D3 hand-rolled recursive tree-walk evaluator
 

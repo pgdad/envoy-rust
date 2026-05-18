@@ -8,7 +8,7 @@ pub mod bootstrap;
 pub mod matcher;
 
 pub use bootstrap::{
-    AccessLog, AccessLogTypedConfig, Address, Admin, AppendAction, Bootstrap,
+    AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, Bootstrap,
     CertificateValidationContext, Cluster, ClusterType, CodecType, CommonTlsContext, DataSource,
     DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint, ExplicitHttpConfig,
     FileAccessLog, FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode,
@@ -16,8 +16,9 @@ pub use bootstrap::{
     Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
     HttpFilterTypedConfig, HttpProtocolOptions, HttpStatus, Int64Range, LbEndpoint, LbPolicy,
     Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter,
-    Node, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
-    SafeRegex, SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
+    Node, Permission, PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Route,
+    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, Rules, SafeRegex,
+    SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
     TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
     TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
 };
@@ -314,6 +315,57 @@ pub enum ConfigError {
         "HCM listener {listener:?}: LocalRateLimit filter status.code {code} is unsupported (phase 09 accepts 429 only)"
     )]
     UnsupportedLocalRateLimitStatusCode { listener: String, code: u16 },
+
+    /// 10: RBAC filter has no policies (rules.policies is empty).
+    #[error("HCM listener {listener:?}: RBAC filter has no policies (rules.policies is empty)")]
+    EmptyRbacPolicies { listener: String },
+
+    /// 10: RBAC policy has no permissions.
+    #[error("HCM listener {listener:?}: RBAC policy {policy_name:?} has no permissions")]
+    EmptyRbacPolicyPermissions {
+        listener: String,
+        policy_name: String,
+    },
+
+    /// 10: RBAC policy has no principals.
+    #[error("HCM listener {listener:?}: RBAC policy {policy_name:?} has no principals")]
+    EmptyRbacPolicyPrincipals {
+        listener: String,
+        policy_name: String,
+    },
+
+    /// 10: RBAC policy has an empty Permission set
+    /// (`Permission::AndRules` or `Permission::OrRules` with empty `rules`).
+    #[error(
+        "HCM listener {listener:?}: RBAC policy {policy_name:?} has an empty Permission set at {path}"
+    )]
+    EmptyRbacPermissionSet {
+        listener: String,
+        policy_name: String,
+        path: String,
+    },
+
+    /// 10: RBAC policy has an empty Principal set
+    /// (`Principal::AndIds` or `Principal::OrIds` with empty `ids`).
+    #[error(
+        "HCM listener {listener:?}: RBAC policy {policy_name:?} has an empty Principal set at {path}"
+    )]
+    EmptyRbacPrincipalSet {
+        listener: String,
+        policy_name: String,
+        path: String,
+    },
+
+    /// 10: RBAC policy Permission/Principal tree exceeds RBAC_TREE_MAX_DEPTH.
+    /// Defense-in-depth bound at parse time; the runtime evaluator inherits it.
+    #[error(
+        "HCM listener {listener:?}: RBAC policy {policy_name:?} Permission/Principal tree exceeds RBAC_TREE_MAX_DEPTH ({depth} > 16)"
+    )]
+    RbacTreeTooDeep {
+        listener: String,
+        policy_name: String,
+        depth: u32,
+    },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

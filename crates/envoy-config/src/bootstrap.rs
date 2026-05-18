@@ -454,6 +454,9 @@ pub enum HttpFilterTypedConfig {
         rename = "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit"
     )]
     LocalRateLimit(LocalRateLimitConfig),
+
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC")]
+    Rbac(RbacConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -522,6 +525,205 @@ pub struct HttpStatus {
 fn default_status() -> HttpStatus {
     HttpStatus { code: 429 }
 }
+
+/// Configuration for `envoy.filters.http.rbac` (phase 10).
+///
+/// Minimum-viable surface per phase-10 SPEC §3 D1: filter-chain config only;
+/// header-based Permission/Principal types + combinators only. The 3 phase-10
+/// deferred upstream-Envoy fields (`shadow_rules`, `shadow_rules_stat_prefix`,
+/// `track_per_rule_stats`) are NOT modeled; `deny_unknown_fields` rejects them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RbacConfig {
+    pub rules: Rules,
+}
+
+/// The RBAC policy tree at the filter-config level.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Rules {
+    #[serde(default = "default_action")]
+    pub action: Action,
+    #[serde(default)]
+    pub policies: std::collections::BTreeMap<String, Policy>,
+}
+
+/// RBAC top-level action. `Log` (audit-only, never enforce) defers per
+/// phase-10 SPEC §4.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Action {
+    Allow,
+    Deny,
+}
+
+fn default_action() -> Action {
+    Action::Allow
+}
+
+/// One named RBAC policy. `condition` / `checked_condition` (CEL) defer per
+/// phase-10 SPEC §4.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    pub permissions: Vec<Permission>,
+    pub principals: Vec<Principal>,
+}
+
+/// RBAC Permission. Only header-based + combinators land at phase 10;
+/// `url_path`, `destination_ip`, `destination_port[_range]`, `metadata`,
+/// `requested_server_name[_matcher]`, `uri_template` defer per phase-10 SPEC §4.
+///
+/// Deserialize is hand-rolled because `serde_yaml` 0.9 does not support
+/// externally-tagged enums via plain YAML maps (`{any: true}`) — it expects
+/// YAML `!Tag` syntax. The hand-rolled impl mirrors the 04.2 `HeaderMatcher`
+/// pattern: visit a map with exactly one key, dispatch to the matching variant.
+/// Serialize derive is retained (produces `{"any":true}` for JSON, which the
+/// 08.1 roundtrip path uses).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum Permission {
+    #[serde(rename = "any")]
+    Any(bool),
+    #[serde(rename = "header")]
+    Header(HeaderMatcher),
+    #[serde(rename = "and_rules")]
+    AndRules(PermissionSet),
+    #[serde(rename = "or_rules")]
+    OrRules(PermissionSet),
+    #[serde(rename = "not_rule")]
+    NotRule(Box<Permission>),
+}
+
+impl<'de> serde::Deserialize<'de> for Permission {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        const KEYS: &[&str] = &["any", "header", "and_rules", "or_rules", "not_rule"];
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Permission;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "an RBAC Permission map with exactly one of {KEYS:?} as key"
+                )
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<Permission, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    M::Error::custom("Permission: expected one map key, got none")
+                })?;
+                let value = match key.as_str() {
+                    "any" => Permission::Any(map.next_value::<bool>()?),
+                    "header" => Permission::Header(map.next_value::<HeaderMatcher>()?),
+                    "and_rules" => Permission::AndRules(map.next_value::<PermissionSet>()?),
+                    "or_rules" => Permission::OrRules(map.next_value::<PermissionSet>()?),
+                    "not_rule" => Permission::NotRule(Box::new(map.next_value::<Permission>()?)),
+                    other => return Err(M::Error::unknown_field(other, KEYS)),
+                };
+                if map.next_key::<String>()?.is_some() {
+                    return Err(M::Error::custom(
+                        "Permission: expected exactly one map key, got more",
+                    ));
+                }
+                Ok(value)
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+/// Wrapper for `Permission::AndRules` / `Permission::OrRules` sub-rule lists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionSet {
+    pub rules: Vec<Permission>,
+}
+
+/// RBAC Principal. Only header-based + combinators land at phase 10;
+/// `authenticated`, `source_ip`, `direct_remote_ip`, `remote_ip`, `url_path`,
+/// `metadata`, `filter_state` defer per phase-10 SPEC §4.
+///
+/// Deserialize is hand-rolled per the `Permission` rationale above.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum Principal {
+    #[serde(rename = "any")]
+    Any(bool),
+    #[serde(rename = "header")]
+    Header(HeaderMatcher),
+    #[serde(rename = "and_ids")]
+    AndIds(PrincipalSet),
+    #[serde(rename = "or_ids")]
+    OrIds(PrincipalSet),
+    #[serde(rename = "not_id")]
+    NotId(Box<Principal>),
+}
+
+impl<'de> serde::Deserialize<'de> for Principal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        const KEYS: &[&str] = &["any", "header", "and_ids", "or_ids", "not_id"];
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Principal;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "an RBAC Principal map with exactly one of {KEYS:?} as key"
+                )
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<Principal, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let key: String = map
+                    .next_key()?
+                    .ok_or_else(|| M::Error::custom("Principal: expected one map key, got none"))?;
+                let value = match key.as_str() {
+                    "any" => Principal::Any(map.next_value::<bool>()?),
+                    "header" => Principal::Header(map.next_value::<HeaderMatcher>()?),
+                    "and_ids" => Principal::AndIds(map.next_value::<PrincipalSet>()?),
+                    "or_ids" => Principal::OrIds(map.next_value::<PrincipalSet>()?),
+                    "not_id" => Principal::NotId(Box::new(map.next_value::<Principal>()?)),
+                    other => return Err(M::Error::unknown_field(other, KEYS)),
+                };
+                if map.next_key::<String>()?.is_some() {
+                    return Err(M::Error::custom(
+                        "Principal: expected exactly one map key, got more",
+                    ));
+                }
+                Ok(value)
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+/// Wrapper for `Principal::AndIds` / `Principal::OrIds` sub-id lists. Field
+/// name is `ids` (not `rules`) per upstream proto.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalSet {
+    pub ids: Vec<Principal>,
+}
+
+/// Defense-in-depth bound on Permission/Principal tree recursion at parse
+/// time; the runtime evaluator at `envoy_filter::rbac` inherits the bound.
+/// Per phase-10 SPEC §3 D2.
+pub(crate) const RBAC_TREE_MAX_DEPTH: u32 = 16;
 
 /// The request-side and response-side mutation lists. Both default to empty
 /// (`mutations: {}` is legal — a no-op filter).
@@ -1699,6 +1901,14 @@ pub(crate) fn validate_http_filters(
                 }
                 validate_local_rate_limit_config(cfg, listener_name)?;
             }
+            crate::HttpFilterTypedConfig::Rbac(cfg) => {
+                if f.name != "envoy.filters.http.rbac" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_rbac_config(cfg, listener_name)?;
+            }
         }
     }
 
@@ -1814,6 +2024,147 @@ fn validate_local_rate_limit_config(
         });
     }
     Ok(())
+}
+
+/// Validate one RBAC filter config. Phase 10 (SPEC §3 D2):
+///   - rules.policies non-empty
+///   - per-policy permissions + principals non-empty
+///   - recursive: empty AndRules/OrRules/AndIds/OrIds rejected
+///   - recursive: depth ≤ RBAC_TREE_MAX_DEPTH
+fn validate_rbac_config(
+    cfg: &crate::RbacConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if cfg.rules.policies.is_empty() {
+        return Err(crate::ConfigError::EmptyRbacPolicies {
+            listener: listener_name.to_string(),
+        });
+    }
+    for (policy_name, policy) in cfg.rules.policies.iter() {
+        if policy.permissions.is_empty() {
+            return Err(crate::ConfigError::EmptyRbacPolicyPermissions {
+                listener: listener_name.to_string(),
+                policy_name: policy_name.clone(),
+            });
+        }
+        if policy.principals.is_empty() {
+            return Err(crate::ConfigError::EmptyRbacPolicyPrincipals {
+                listener: listener_name.to_string(),
+                policy_name: policy_name.clone(),
+            });
+        }
+        for (idx, perm) in policy.permissions.iter().enumerate() {
+            validate_permission_tree(
+                perm,
+                listener_name,
+                policy_name,
+                &format!("permissions[{idx}]"),
+                1,
+            )?;
+        }
+        for (idx, prin) in policy.principals.iter().enumerate() {
+            validate_principal_tree(
+                prin,
+                listener_name,
+                policy_name,
+                &format!("principals[{idx}]"),
+                1,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_permission_tree(
+    perm: &crate::Permission,
+    listener_name: &str,
+    policy_name: &str,
+    path: &str,
+    depth: u32,
+) -> Result<(), crate::ConfigError> {
+    if depth > RBAC_TREE_MAX_DEPTH {
+        return Err(crate::ConfigError::RbacTreeTooDeep {
+            listener: listener_name.to_string(),
+            policy_name: policy_name.to_string(),
+            depth,
+        });
+    }
+    match perm {
+        crate::Permission::Any(_) => Ok(()),
+        crate::Permission::Header(_) => Ok(()),
+        crate::Permission::AndRules(set) | crate::Permission::OrRules(set) => {
+            if set.rules.is_empty() {
+                return Err(crate::ConfigError::EmptyRbacPermissionSet {
+                    listener: listener_name.to_string(),
+                    policy_name: policy_name.to_string(),
+                    path: path.to_string(),
+                });
+            }
+            for (idx, child) in set.rules.iter().enumerate() {
+                validate_permission_tree(
+                    child,
+                    listener_name,
+                    policy_name,
+                    &format!("{path}.rules[{idx}]"),
+                    depth + 1,
+                )?;
+            }
+            Ok(())
+        }
+        crate::Permission::NotRule(child) => validate_permission_tree(
+            child,
+            listener_name,
+            policy_name,
+            &format!("{path}.not_rule"),
+            depth + 1,
+        ),
+    }
+}
+
+fn validate_principal_tree(
+    prin: &crate::Principal,
+    listener_name: &str,
+    policy_name: &str,
+    path: &str,
+    depth: u32,
+) -> Result<(), crate::ConfigError> {
+    if depth > RBAC_TREE_MAX_DEPTH {
+        return Err(crate::ConfigError::RbacTreeTooDeep {
+            listener: listener_name.to_string(),
+            policy_name: policy_name.to_string(),
+            depth,
+        });
+    }
+    match prin {
+        crate::Principal::Any(_) => Ok(()),
+        crate::Principal::Header(_) => Ok(()),
+        crate::Principal::AndIds(set) | crate::Principal::OrIds(set) => {
+            if set.ids.is_empty() {
+                return Err(crate::ConfigError::EmptyRbacPrincipalSet {
+                    listener: listener_name.to_string(),
+                    policy_name: policy_name.to_string(),
+                    path: path.to_string(),
+                });
+            }
+            for (idx, child) in set.ids.iter().enumerate() {
+                validate_principal_tree(
+                    child,
+                    listener_name,
+                    policy_name,
+                    &format!("{path}.ids[{idx}]"),
+                    depth + 1,
+                )?;
+            }
+            Ok(())
+        }
+        crate::Principal::NotId(child) => validate_principal_tree(
+            child,
+            listener_name,
+            policy_name,
+            &format!("{path}.not_id"),
+            depth + 1,
+        ),
+    }
 }
 
 /// Hand-rolled Duration string parser covering upstream Envoy v1.33's
@@ -7367,6 +7718,280 @@ descriptors: []
         fn parse_duration_rejects_empty() {
             let err = parse_duration("").expect_err("empty rejected");
             assert!(!err.is_empty());
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 10 — RBAC envoy-config schema + validator tests
+    // (Task 1; see docs/envoy-rust/phases/10-http-filter-rbac/PLAN.md)
+    // -------------------------------------------------------------------
+    mod rbac_tests {
+        use super::*;
+        use crate::{
+            Action, ConfigError, HttpFilter, HttpFilterTypedConfig, Permission, PermissionSet,
+            Policy, Principal, PrincipalSet, RbacConfig, Rules,
+        };
+        use std::collections::BTreeMap;
+
+        fn parse(yaml: &str) -> Result<RbacConfig, serde_yaml::Error> {
+            serde_yaml::from_str(yaml)
+        }
+
+        #[test]
+        fn deserialize_rbac_minimal_allow_succeeds() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    "pass_with_header":
+      permissions:
+        - any: true
+      principals:
+        - header:
+            name: x-rbac-pass
+            string_match: { exact: "yes" }
+"#;
+            let cfg = parse(yaml).expect("minimal Rbac parses");
+            assert_eq!(cfg.rules.action, Action::Allow);
+            assert_eq!(cfg.rules.policies.len(), 1);
+            let p = cfg.rules.policies.get("pass_with_header").unwrap();
+            assert_eq!(p.permissions.len(), 1);
+            assert_eq!(p.principals.len(), 1);
+        }
+
+        #[test]
+        fn deserialize_rbac_default_action_is_allow() {
+            let yaml = r#"
+rules:
+  policies:
+    "p":
+      permissions: [{ any: true }]
+      principals: [{ any: true }]
+"#;
+            let cfg = parse(yaml).expect("default action parses");
+            assert_eq!(cfg.rules.action, Action::Allow);
+        }
+
+        #[test]
+        fn deserialize_rbac_deny_action_succeeds() {
+            let yaml = r#"
+rules:
+  action: DENY
+  policies:
+    "p":
+      permissions: [{ any: true }]
+      principals: [{ any: true }]
+"#;
+            let cfg = parse(yaml).expect("DENY action parses");
+            assert_eq!(cfg.rules.action, Action::Deny);
+        }
+
+        #[test]
+        fn deserialize_rbac_rejects_unknown_field() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    "p":
+      permissions: [{ any: true }]
+      principals: [{ any: true }]
+shadow_rules: {}
+"#;
+            let err = parse(yaml).expect_err("unknown top-level field rejected");
+            assert!(format!("{err}").contains("shadow_rules"), "err: {err}");
+        }
+
+        #[test]
+        fn deserialize_rbac_permission_and_or_not_combinators_succeed() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    "complex":
+      permissions:
+        - and_rules:
+            rules:
+              - or_rules:
+                  rules:
+                    - any: true
+                    - header: { name: x-a, string_match: { exact: "1" } }
+              - not_rule:
+                  header: { name: x-b, present_match: true }
+      principals:
+        - any: true
+"#;
+            let cfg = parse(yaml).expect("nested combinators parse");
+            let p = cfg.rules.policies.get("complex").unwrap();
+            assert_eq!(p.permissions.len(), 1);
+            match &p.permissions[0] {
+                Permission::AndRules(set) => assert_eq!(set.rules.len(), 2),
+                other => panic!("expected AndRules, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn deserialize_rbac_principal_and_or_not_combinators_succeed() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    "complex_principals":
+      permissions: [{ any: true }]
+      principals:
+        - and_ids:
+            ids:
+              - or_ids:
+                  ids:
+                    - any: true
+                    - header: { name: x-c, string_match: { exact: "2" } }
+              - not_id:
+                  header: { name: x-d, present_match: true }
+"#;
+            let cfg = parse(yaml).expect("nested principal combinators parse");
+            let p = cfg.rules.policies.get("complex_principals").unwrap();
+            match &p.principals[0] {
+                Principal::AndIds(set) => assert_eq!(set.ids.len(), 2),
+                other => panic!("expected AndIds, got {other:?}"),
+            }
+        }
+
+        fn ok_cfg() -> RbacConfig {
+            let mut policies = BTreeMap::new();
+            policies.insert(
+                "p".to_string(),
+                Policy {
+                    permissions: vec![Permission::Any(true)],
+                    principals: vec![Principal::Any(true)],
+                },
+            );
+            RbacConfig {
+                rules: Rules {
+                    action: Action::Allow,
+                    policies,
+                },
+            }
+        }
+
+        fn make_filter(cfg: RbacConfig) -> HttpFilter {
+            HttpFilter {
+                name: "envoy.filters.http.rbac".to_string(),
+                typed_config: HttpFilterTypedConfig::Rbac(cfg),
+            }
+        }
+
+        fn router_filter() -> HttpFilter {
+            HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+            }
+        }
+
+        #[test]
+        fn validate_accepts_rbac_followed_by_router() {
+            let filters = vec![make_filter(ok_cfg()), router_filter()];
+            validate_http_filters(&filters, "ingress_http").expect("valid chain");
+        }
+
+        #[test]
+        fn validate_rejects_empty_policies() {
+            let mut cfg = ok_cfg();
+            cfg.rules.policies.clear();
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::EmptyRbacPolicies { ref listener } if listener == "ingress_http"
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_empty_policy_permissions() {
+            let mut cfg = ok_cfg();
+            cfg.rules.policies.get_mut("p").unwrap().permissions.clear();
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::EmptyRbacPolicyPermissions { ref policy_name, .. }
+                        if policy_name == "p"
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_empty_policy_principals() {
+            let mut cfg = ok_cfg();
+            cfg.rules.policies.get_mut("p").unwrap().principals.clear();
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::EmptyRbacPolicyPrincipals { ref policy_name, .. }
+                        if policy_name == "p"
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_empty_permission_set() {
+            let mut cfg = ok_cfg();
+            cfg.rules.policies.get_mut("p").unwrap().permissions =
+                vec![Permission::AndRules(PermissionSet { rules: vec![] })];
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::EmptyRbacPermissionSet { .. }),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_empty_principal_set() {
+            let mut cfg = ok_cfg();
+            cfg.rules.policies.get_mut("p").unwrap().principals =
+                vec![Principal::OrIds(PrincipalSet { ids: vec![] })];
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::EmptyRbacPrincipalSet { .. }),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_tree_too_deep() {
+            // Build a Permission::NotRule chain of depth RBAC_TREE_MAX_DEPTH + 1.
+            let mut perm = Permission::Any(true);
+            for _ in 0..=RBAC_TREE_MAX_DEPTH {
+                perm = Permission::NotRule(Box::new(perm));
+            }
+            let mut cfg = ok_cfg();
+            cfg.rules.policies.get_mut("p").unwrap().permissions = vec![perm];
+            let filters = vec![make_filter(cfg), router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RbacTreeTooDeep { .. }),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_rbac_with_wrong_name() {
+            let mut filter = make_filter(ok_cfg());
+            filter.name = "envoy.filters.http.something_else".to_string();
+            let filters = vec![filter, router_filter()];
+            let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::UnsupportedHttpFilter { .. }),
+                "err: {err:?}"
+            );
         }
     }
 }
