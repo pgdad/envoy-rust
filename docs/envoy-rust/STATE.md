@@ -7,10 +7,12 @@
 
 ## Active phase
 
-**id:** `_none_` — awaiting next planning
-**slug:** _not yet assigned_ — the next session (per `BOOTSTRAP_PROMPT.md` §9) brainstorms the next feature-family phase; the slug + `docs/envoy-rust/phases/NN-<slug>/` directory are created at that brainstorm session per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3 (a phase directory is created only when the phase enters `in-progress`).
-**directory:** does not exist yet. `docs/envoy-rust/ROADMAP.md`'s feature-family headings (`BOOTSTRAP_PROMPT.md` §9 — HTTP filters family [now with phase-09 first concrete row `done`], Network filters family, Load balancing family, Upstream robustness family, HTTP/3 + QUIC family, gRPC family, xDS / dynamic config family, Observability family, Runtime + hot restart family, WASM host family, Deprecated / edge features) carry the phase-09 row beneath the HTTP filters family heading as the family's first `done` concrete row; the remaining 10 feature-family headings stay as headings only — each becomes one or more concrete phase rows when it enters `in-progress` and is brainstormed + split as reality demands. ROADMAP rows `00`-`08` + `08.1` + `08.2` + `09` are all `status: done` as of THIS commit.
-**status:** **PHASE 09 (first post-MVP-trunk feature-family phase) DONE as of THIS commit.** Phase 09 (`09-http-filter-local-rate-limit`) landed `envoy.filters.http.local_ratelimit` end-to-end through the 07.x-established filter-chain framework — the first concrete production filter that short-circuits via `Decision::StopAndSend(FilterResponse)` (the 07.2 HeaderMutation precedent never exercised the short-circuit path; phase 09's LocalRateLimit is the first filter to do so on the production path, and surfaced + closed a latent 07.x framework defect via ADR-0033's mid-execution corrective sequence). **All 16 Docker-gated differential fixtures (`0001-tcp-echo` through `0016-http-filter-local-rate-limit`) GREEN simultaneously** at the state-4 CI evidence anchor (CI run `26002996677` HEAD `1effb0f`, conclusion `success`, completed `2026-05-17T21:20:41Z`); h2spec ≥95% gate held at the 05.2 baseline 99.31% (phase 09 engages no H2-framing surfaces — the filter operates on the post-codec `FilterRequest` / `FilterResponse` abstraction per phase-07.1 ADR-0031); `parse_bootstrap` fuzz clean on the extended 16-seed corpus; 5 stable-toolchain gates (fmt / clippy / build / test / deny) clean; workspace test count `746 passed / 0 failed / 2 ignored` (+1 over the 08.2 baseline — Task 7's in-process backstop test). Phase 09 `REVIEW.md` (landed at predecessor `10bb71c`; reviewed range `b9da8d4..a5ebddd`) verdict **Approved with M-track follow-ups** — zero Critical / zero Important / 5 Minor M1-M5 + 2 doc-staleness D1-D2 + 3 test/audit-trail T1-T3 — all awareness-only / close-opportunistically; per `BOOTSTRAP_PROMPT.md` §5.2 the phase did NOT re-enter state 3 (no Critical or Important findings). ROADMAP row `09` flips `in-progress` → `done` at THIS commit (standalone-phase invariant — phase 09 is NOT a sub-phase, so no parent-row close-out is required; mirrors the 07.2 → state-6 close-out at `1d52156` standalone-phase shape precedent without the parent-row close-out fold). **DECISIONS.md ledger head: ADR-0033** at phase-09 close (landed at mid-execution Commit A `e9a6cb4` — the only ADR landed during phase 09's state-3 arc; discovered, not projected; SPEC §7 projected 0 ADRs). Conditional ADR-0034 (foundations grant for token-bucket primitive per phase-09 SPEC §7) stays reserved-available and UNUSED — the no-foundations-grant posture held end-to-end (hand-rolled `TokenBucketState` per std-lib `AtomicU64` + `Mutex<Instant>` + `bytes::Bytes` + std-lib `Duration` was sufficient). Per `BOOTSTRAP_PROMPT.md` §9, the next session invokes **`superpowers:brainstorming`** scoped to the next feature-family phase — ordering is brainstorm-driven; no family is pre-assigned. The MVP trunk 00→08 stands `done` as of commit `304ce98` (phase-08.2 state-6 close-out); phase 09 is the first feature-family phase landed on top of that foundation.
+**id:** `10`
+**slug:** `10-http-filter-rbac`
+**directory:** `docs/envoy-rust/phases/10-http-filter-rbac/`. Created at THIS commit per `BOOTSTRAP_PROMPT.md` §4.1 invariant 3 (a phase directory is created only when the phase enters `in-progress`; phase 10 enters `planned` at THIS state-1 commit with the SPEC.md the directory's sole file). `docs/envoy-rust/ROADMAP.md`'s "HTTP filters family" §9 heading now carries TWO concrete rows beneath it: row `09` (`local_ratelimit`, `status: done`) + row `10` (`rbac`, `status: planned`); the remaining 10 feature-family headings stay as headings only. ROADMAP rows `00`-`08` + `08.1` + `08.2` + `09` are `done`; row `10` is `planned` as of THIS commit.
+**status:** phase 10 lifecycle state 1-complete / state-2-next (SPEC.md landed; PLAN.md does not exist). **THIS commit is the phase-10 state-1 brainstorm close-out** — the **second post-MVP-trunk feature-family state-1 brainstorm commit** (after phase-09 state-1 brainstorm `3025594`, the cadence-setter). Phase 10 (`10-http-filter-rbac`) lands `envoy.filters.http.rbac` as the third concrete pluggable HTTP filter in the 07.x-established framework (after HeaderMutation at 07.2 and LocalRateLimit at 09); scope narrowed to header-based Permission/Principal types only (Any + Header + AndRules/AndIds + OrRules/OrIds + NotRule/NotId combinators); IP/CIDR matchers, metadata, authenticated, url_path, SNI, CEL conditions, shadow_rules all defer per phase-10 SPEC §4. The phase ALSO closes two phase-09 REVIEW carryforwards at their named-owner sites: **09 REVIEW M2** (H2 HCM filter-synth header decoration gap + ADR-0033 Consequences misrepresentation) via D5 ADR-0033 Consequences doc-amendment per preferred close shape (a); **09 REVIEW M3** (Task 7 in-process backstop subprocess discipline regression from 07.2/08.2 precedents) via D8.3 adopting the `tokio::process::Command + kill_on_drop(true) + Stdio::null()` discipline directly. Per `BOOTSTRAP_PROMPT.md` §5 state 2 + the established 04.3 / 05.1 / 06.x / 07.x / 08.x / 09 PLAN-write cadence, the next session writes `docs/envoy-rust/phases/10-http-filter-rbac/PLAN.md` + `PROGRESS.md` skeleton + Task 1 preamble in a single standalone pre-Task-1 commit per `superpowers:writing-plans`, and evaluates the §6.1 split gate (recommended: single-phase, no split; SPEC-time projection ~9-11 tasks / ~1100-1300 LoC — comfortably under the ~25-task / ~1500-LoC gate). **DECISIONS.md ledger head: ADR-0033** (unchanged through phase-10 state-1; no ADR lands at this commit per the recommended posture). ROADMAP row `10` flips `planned` → `in-progress` at state-2 PLAN-write OR state-3 first-task commit per the 08.1 / 08.2 / 09 precedent. The 16 Docker-gated differential fixtures regression baseline (`0001-tcp-echo` through `0016-http-filter-local-rate-limit`) + h2spec ≥95% conformance gate + 16-seed `parse_bootstrap` fuzz corpus all carry forward unchanged per `BOOTSTRAP_PROMPT.md` §7.5 (b); phase 10 will extend to 17 fixtures + 17-seed corpus at its D8.1 + D8.2 task commits.
+
+**Phase 09 (`09-http-filter-local-rate-limit`) stands DONE as of predecessor commit `518140c` (the phase-09 state-6 close-out, the immediate predecessor of THIS phase-10 state-1 brainstorm commit).** The phase-09 close-out narrative (full text preserved below in the historical-context block starting at "Phase 09 ... is DONE as of THIS commit (the phase-09 state-6 close-out)" — those "THIS commit" references are correct in their original phase-09-state-6 context and resolve to `518140c`) describes the standalone-phase shape + the 13-commit phase-09 arc + the 10 awareness-only REVIEW carryforwards (M1-M5 + D1-D2 + T1-T3; M4 + M5 closed at the 09 state-6 commit via the fold-in; the remaining 8 carry forward per their named-owner dispositions). At THIS phase-10 state-1 commit, phase-09 contributes the regression baseline + the `decorate_filter_synth_response` H1 HCM helper (available for any future HTTP-filter-family phase emitting `Decision::StopAndSend(FilterResponse)` — phase 10's RbacFilter is the first such consumer) + ADR-0033's discovery-not-projection process-gap awareness (the recommended state-2 empirical-verification posture for phase 10's stats namespace + 403 body bytes + 403 header set per phase-10 SPEC §6.2).
 
 **Phase 09 (`09-http-filter-local-rate-limit`) is DONE as of THIS commit (the phase-09 state-6 close-out).** Standalone-phase shape — phase 09 is NOT a sub-phase, so no parent-row close-out is required; mirrors the 07.2 state-6 close-out at `1d52156` standalone-phase shape precedent (07.2 was nominally a sub-phase but its state-6 shape is identical regardless; the only difference is phase-09 does NOT fold a parent-row close-out). The phase-09 arc landed in **13 commits** between the state-2 standalone-PLAN base `b9da8d4` and the Task 8 state-4-reached commit `a5ebddd`: 7 substantive task commits (`818a3c5` Task 1 → `7fcaeb1` Task 7) + 4 ADR-0033 mid-execution corrective commits (`e9a6cb4` Commit A docs-only + `1c1de0f` Commit B Task 3 runtime fixup + `ae2cef0` Commit C Task 4 H1 HCM fixup + `1384c48` Commit D Task 5 fixture) + 1 Task 6 follow-up (`1effb0f` SUCCESS-array extension) + the Task 8 state-4-reached docs-only commit (`a5ebddd`). Per `feedback_execution_style`, all 7 substantive tasks were dispatched to fresh subagents per `superpowers:subagent-driven-development` with two-stage review (spec compliance + code quality) per task. The full surface delta: envoy-config `LocalRateLimitConfig` + `TokenBucket` + `HttpStatus` schema + `HttpFilterTypedConfig::LocalRateLimit` variant + 4 new `ConfigError` variants + hand-rolled `parse_duration` helper (Task 1 `818a3c5`); hand-rolled `TokenBucketState { tokens: AtomicU64, last_fill_instant: Mutex<Instant> }` primitive at `crates/envoy-filter/src/local_rate_limit.rs` (lazy-fill `compare_exchange` loop with `AcqRel`/`Acquire` ordering across reader/writer boundaries; REQUIRED 8-task × 10_000-acquire concurrency torture test per phase-09 SPEC §6.3 + the 08.2 `fddabd2` TOCTOU-lesson precedent — Task 2 `b5c81d2`); `LocalRateLimitFilter` runtime + 4-counter stats wiring (`http_local_rate_limit.<stat_prefix>.{enabled,ok,rate_limited,enforced}`) + 4 new BEHAVIOR_CONTRACT.md Stat-name mapping rows (Task 3 `70bad43`); `HttpFilterInstance::LocalRateLimit` variant + `FilterPipeline::build_from_config` registry threading + **07.2 REVIEW M1 closure** (severed `_position` plumbing deleted at `instance.rs::build` + `pipeline.rs::build_from_config` `.enumerate()`; the chain 07.2 → 09 ends — Task 4 `78128f4`); the ADR-0033 mid-execution corrective sequence per upstream Envoy v1.33 empirical Docker observation — drop `x-envoy-ratelimited` injection (it belongs to the global ratelimit filter, not local_ratelimit) + align 429 body to source-hardcoded `"local_rate_limited"` (18 bytes) + new `decorate_filter_synth_response` helper at `crates/envoy-http1/src/hcm.rs` decorating filter-synth responses with 5 standard HTTP/1.1 response headers (`server` / `date` / `content-length` / `content-type` / `connection`) called from BOTH writer-arm sites (`SynthFromDecode` + encode-side `Decision::StopAndSend`) — closing a latent 07.x framework defect that 07.2 HeaderMutation never exposed because HeaderMutation never short-circuits via `StopAndSend` (Commits A/B/C/D); differential fixture `tests/fixtures/0016-http-filter-local-rate-limit/` + Docker-gated wrapper (Commit D = Task 5 `1384c48`); `parse_bootstrap` fuzz corpus seed `hcm_local_rate_limit_filter.yaml` + `.gitignore` allow-list entry (Task 6 `28e1666`) + 1-line SUCCESS-array follow-up (`1effb0f`); in-process backstop `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` per ADR-0033 revised contract (Task 7 `7fcaeb1`); state-4 phase-done verification + STATE-advance + execution-arc summary (Task 8 `a5ebddd`).
 
@@ -86,77 +88,87 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Next expected skill
 
-Per `BOOTSTRAP_PROMPT.md` §9 (Feature Families — phases 09 and onward) + `SKILL_ROUTING.md` lines 9-11 (state 0 — phase not yet in ROADMAP.md → `superpowers:brainstorming`): the next session — operating as the **post-phase-09 feature-family brainstorm session** — invokes **`superpowers:brainstorming`** scoped to the next feature-family phase. **Feature-family ordering is a brainstorm-time decision; no family is pre-assigned.** The 11 feature-family headings seeded in ROADMAP.md (`BOOTSTRAP_PROMPT.md` §9):
+Per `BOOTSTRAP_PROMPT.md` §5 state 2 + `SKILL_ROUTING.md` lines 17-21 (state 2 — SPEC.md exists, PLAN.md does not → `superpowers:writing-plans`): the next session — operating as the **phase-10 state-2 PLAN-write session** — invokes **`superpowers:writing-plans`** scoped to `docs/envoy-rust/phases/10-http-filter-rbac/SPEC.md` (this state-1's SPEC output).
 
-- **HTTP filters family** — header manipulation, cors, compression, fault, local+global rate limit, jwt_authn, rbac, ext_authz, ext_proc, oauth2, csrf, buffer, lua, wasm, adaptive concurrency, admission control, bandwidth limit. **First concrete row (phase 09 — `envoy.filters.http.local_ratelimit`) is `done` as of THIS commit.**
-- **Network filters family** — redis, mongo, kafka_broker, thrift, zookeeper [scope TBD], echo, direct_response, sni_cluster, rbac network.
-- **Load balancing family** — least_request, random, ring_hash, maglev, subset LB, locality-weighted LB, priority load balancing, panic thresholds.
-- **Upstream robustness family** — active health checks (HTTP/TCP/gRPC/custom), outlier detection variants, circuit breakers, retries + hedging, per-protocol connection pooling.
-- **HTTP/3 + QUIC family** — quinn transport, downstream H3 listener, upstream H3 cluster, h3spec gate.
-- **gRPC family** — gRPC bridge, gRPC-Web, gRPC-JSON transcoding, interop conformance.
-- **xDS / dynamic config family** — ADS, delta xDS, LDS, CDS, RDS, EDS, SDS, RTDS, reconnection, initial-fetch timeout.
-- **Observability family** — gRPC ALS, OTLP access log, OTel/Zipkin/Jaeger/Datadog/XRay tracing, stats sinks, tap filter.
-- **Runtime + hot restart family.**
-- **WASM host family** — own multi-phase sub-project; ABI, engine binding, proxy-wasm conformance.
-- **Deprecated / edge features** — explicit out-of-scope ADRs unless later re-opened.
+The state-2 session's concrete acts (mirrors the established 06.2 / 06.3 / 07.1 / 07.2 / 08.1 / 08.2 / 09 PLAN-write cadence — phase-09 state-2 PLAN-write commit `b9da8d4` is the closest post-MVP-trunk precedent):
 
-The brainstorm session's concrete acts (mirrors the parent-NN state-1 brainstorm cadence + the phase-09 state-1 brainstorm commit `3025594` shape — the closest post-MVP-trunk feature-family-brainstorm precedent): brainstorm the family-pick + first-filter-pick (or first-feature-pick) question along the same dimensions documented in the "Phase-09 state-1 brainstorm" subsection in Notes below (carryforward closure value / foundation pressure / architectural risk / contract-surface maturity / first-phase scope tractability), pick the next feature-family phase + its slug, add the row to `docs/envoy-rust/ROADMAP.md` (the family's first or next concrete row beneath its already-seeded heading) with `status: planned`, create `docs/envoy-rust/phases/NN-<slug>/` (the slug is chosen at brainstorm time), land the phase `SPEC.md`, and end (per `BOOTSTRAP_PROMPT.md` §5.1 one-state-per-session). The session AFTER the state-1 brainstorm writes `PLAN.md` per `superpowers:writing-plans` (state 2).
+1. **Read** the phase-10 SPEC + the prior post-MVP-trunk PLAN precedents (phase-09 `PLAN.md` + `PROGRESS.md` at `docs/envoy-rust/phases/09-http-filter-local-rate-limit/`) + the "Phase-09 state-2 PLAN-write" + "Phase-09 state-3 execution arc + ADR-0033 corrective sequence + state-4 verification" subsections in Notes below for full state-2 cadence context.
 
-**Standing context for the post-phase-09 feature-family brainstorm session:**
+2. **Perform the §6.2 empirical verification at PLAN-write time** per phase-10 SPEC §6.2 + the ADR-0033 process-gap-awareness doctrine. Run `envoyproxy/envoy:v1.33.0` Docker against the phase-10 SPEC §3 D8.1 canonical bootstrap shape; verify (a) the stats namespace shape (`http.<hcm_stat_prefix>.rbac.{allowed,denied}` projection — does upstream Envoy v1.33 actually emit under this name?); (b) the 403 response body byte-shape (`"RBAC: access denied\n"` projection — does upstream actually emit exactly this string?); (c) the 403 response header set Envoy v1.33 emits on RBAC denial. **If any of the three projections differs from empirical reality, land an inline ADR-0034 at the state-2 PLAN-write commit** per the 05.1 / 05.4 / 09 Task-1-fixup ADR-inline precedent — avoid the phase-09 process gap that surfaced ADR-0033 only at Task 5 subagent dispatch.
 
-- **PHASE 09 STANDS `done` AS OF THIS COMMIT.** Phase 09 (`09-http-filter-local-rate-limit`) — the first post-MVP-trunk feature-family phase + cadence-setter — is complete end-to-end. The 16 Docker-gated differential fixtures (`0001-tcp-echo` through `0016-http-filter-local-rate-limit`), the h2spec ≥95% conformance gate, the `parse_bootstrap` fuzz target with 16 seeded corpus entries, and the 5 stable-toolchain gates (fmt / clippy / build / test / deny) are GREEN simultaneously at the state-4 CI evidence anchor (CI run `26002996677` HEAD `1effb0f`, conclusion `success`, completed `2026-05-17T21:20:41Z`). The next feature-family phase builds on this foundation; the brainstorm session does NOT need to re-validate the trunk + phase-09 baseline — the regression-equivalence invariant ("all pre-existing differential fixtures still green") carries forward per `BOOTSTRAP_PROMPT.md` §7.5 (b).
+3. **Write** `docs/envoy-rust/phases/10-http-filter-rbac/PLAN.md` per `superpowers:writing-plans` covering: §1 the deliverable enumeration mapped to numbered tasks (~9-11 tasks; co-locate D2 with D1 / D6 with D3 / D5 with D7 per phase-10 SPEC §6.1 + §6.3); §2 the architecture-decision lock-ins table (each lock-in includes the surface effect + the SPEC reference); §3 the §6.1 split-gate verdict (recommended: single-phase, no split); §4 the task-summary dependency-chain table; §5 the SPEC corrections discovered at PLAN-write time (per the 06.2 → 06.3 → 07.x → 08.x → 09 "PLAN-write SPEC corrections at Task 1 preamble" cadence — expected to be modest, since the phase-10 SPEC was written with §6.2 verification signposts).
 
-- **DECISIONS.md** ledger head is **ADR-0033** (phase-09 SPEC §2.2 revision per upstream Envoy v1.33 empirical observation; landed at the mid-execution Commit A `e9a6cb4` during the phase-09 state-3 arc — the only ADR landed during phase 09's state-3 arc; discovered, not projected). ADR-0034 is the next available number; the next feature-family phase's brainstorm or state-2 (if it surfaces a foundations grant or split) takes the next sequential number at landing time per D-3.5. Conditional ADR-0034 (foundations grant for token-bucket primitive per phase-09 SPEC §7) stayed reserved-available and UNUSED through phase-09 — the reservation was filter-specific and is now released; the next phase that needs a foundations grant or split takes ADR-0034 at its landing site without renumbering.
+4. **Co-author** `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` skeleton + Task 1 preamble in the SAME standalone pre-Task-1 commit per the 06.2 / 06.3 / 07.1 / 07.2 / 08.1 / 08.2 / 09 cadence (divergence from the 06.1 "PROGRESS created at Task 1" superseded pattern). The PROGRESS skeleton enumerates Task N stubs `### Task N — <title>` + a Task 1 preamble subsection recording the §6.2 empirical verification findings + the PLAN-write SPEC corrections + the architecture-decision lock-ins.
 
-- **BEHAVIOR_CONTRACT.md** carries through the MVP trunk + phase-09 extensions: the equivalence matrix (Response status / Response body / Response headers / Response trailers / HTTP/2 + HTTP/3 framing / Access log records / Stats / xDS wire behavior / Timing) + populated subsections (Header allow-list, Stat-name mapping [with phase-09 LocalRateLimit's 4 rows under "09 entries (LocalRateLimit filter):"], Access log field mapping, Admin endpoint body shapes, Admin-action effect equivalence). The xDS wire state machine + Timing tolerances subsections remain empty (`_(empty; populated when xDS family begins)_`) awaiting feature-family-time population. Future feature-family phases extend the contract with new rows + subsections at the task where each is first empirically exercised (the established 06.x / 07.x / 08.x / 09 doctrine — contract extensions land at empirical-engagement task time, NOT at PLAN-write time).
+5. **Flip ROADMAP row `10`** `planned` → `in-progress` at the state-2 PLAN-write commit OR at the state-3 first-task commit per the 08.1 / 08.2 / 09 precedent (either timing is doctrinally consistent; the established cadence is flip-at-PLAN-write).
 
-- **16 Docker-gated differential fixtures + the h2spec conformance gate are the regression baseline** any future feature-family phase MUST keep green per `BOOTSTRAP_PROMPT.md` §7.5 (b). The full list: `0001-tcp-echo`, `0002-static-loader`, `0003-tcp-proxy`, `0004-tls-downstream`, `0005-tls-upstream`, `0006-tls-sni`, `0007-http1-direct-response`, `0008-http1-router-upstream`, `0009-http2-direct-response`, `0010-http2-router-upstream`, `0011-admin-stats-prometheus`, `0012-access-log-file-sink`, `0013-http-filter-header-mutation`, `0014-admin-config-dump-server-info`, `0015-admin-drain-listeners`, `0016-http-filter-local-rate-limit`. The `parse_bootstrap` fuzz target carries 16 seeded corpus entries (1 per fixture's bootstrap shape).
+6. **No ADR landing required by default** — DECISIONS.md ledger head stays at **ADR-0033** through the state-2 PLAN-write unless the §6.2 empirical verification surfaces a revision (in which case ADR-0034 lands inline per step 2 above) OR the PLAN-writer chooses to land ADR-0034 (option B per phase-10 SPEC §7) recording the per-route filter config deferral pattern (recommended posture: defer the ADR; the deferral is doctrinally clear without it).
 
-- **ADR-0033 H1 HCM `decorate_filter_synth_response` helper** at `crates/envoy-http1/src/hcm.rs` is now available to any future HTTP-filter-family phase emitting `Decision::StopAndSend(FilterResponse)` (fault / ext_authz / oauth2 / rbac per ADR-0033 Consequences §5). The helper decorates filter-synth responses with the 5 standard HTTP/1.1 response headers (`server` / `date` / `content-length` / `content-type` / `connection`) symmetrically from both the decode-side `SynthFromDecode` arm and the encode-side `Decision::StopAndSend` arm. **The H2 HCM analogous decoration site is unimplemented per the phase-09 REVIEW M2 carryforward** — close at the next HTTP-filter-family phase exercising filters on H2 (fault / ext_authz / oauth2 / rbac) OR prefer doc amendment per parent-08 SPEC §6.1(vi).
+7. **No BEHAVIOR_CONTRACT.md change** at the state-2 PLAN-write commit (the 2 Stat-name mapping rows + the ADR-0033 Consequences amendment land at execution-time task commits per phase-10 SPEC §6.6 + §6.3).
+
+8. **State-2 commit message + push:** title `phase 10: state-2 standalone PLAN.md` per the parent-08.2 + phase-09 state-2 PLAN-write commit shape precedent (or `phase 10: state-2 standalone PLAN.md [ADR-0034]` if ADR-0034 lands at state 2 per step 2 or step 6). Predecessor docs-only CI runs took ~2-3m; the next CI run (triggered by the state-2 commit's push) re-validates the docs-only edits compile cleanly through the 5 stable-toolchain gates + the parse_bootstrap fuzz target on the unchanged 16-seed corpus.
+
+9. **Exit cleanly** per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session). The state-2 PLAN-write commit ends the session. The session AFTER state-2 enters state 3 — dispatches Task 1 per `superpowers:subagent-driven-development` per the `feedback_execution_style` standing preference.
+
+**Standing context for the phase-10 state-2 PLAN-write session:**
+
+- **PHASE 10 STANDS at lifecycle state-1-complete / state-2-next AS OF THIS COMMIT.** Phase 10 (`10-http-filter-rbac`) is the second post-MVP-trunk feature-family phase and the second concrete HTTP-filter-family phase (after phase-09 `local_ratelimit`). The 16 Docker-gated differential fixtures (`0001-tcp-echo` through `0016-http-filter-local-rate-limit`), the h2spec ≥95% conformance gate, the `parse_bootstrap` fuzz target with 16 seeded corpus entries, and the 5 stable-toolchain gates (fmt / clippy / build / test / deny) are GREEN simultaneously at the phase-09 state-4 CI evidence anchor (CI run `26002996677` HEAD `1effb0f`, conclusion `success`, completed `2026-05-17T21:20:41Z`). The phase-10 work builds on this foundation; the state-2 PLAN-write session does NOT need to re-validate the trunk + phase-09 baseline — the regression-equivalence invariant ("all pre-existing differential fixtures still green") carries forward per `BOOTSTRAP_PROMPT.md` §7.5 (b). Phase 10 will extend to 17 fixtures + 17-seed corpus at the D8.1 + D8.2 task commits.
+
+- **DECISIONS.md** ledger head is **ADR-0033** (phase-09 SPEC §2.2 revision per upstream Envoy v1.33 empirical observation; landed at the mid-execution Commit A `e9a6cb4` during the phase-09 state-3 arc). ADR-0034 is the next available number; if the state-2 PLAN-write §6.2 empirical verification surfaces a revision OR the PLAN-writer chooses to land the per-route-deferral ADR, ADR-0034 lands at the state-2 commit per D-3.5.
+
+- **BEHAVIOR_CONTRACT.md** carries through unchanged at THIS phase-10 state-1 commit. Phase 10's projected extensions (2 Stat-name mapping rows + the ADR-0033 Consequences amendment) land at execution-time task commits per the 06.x / 07.x / 08.x / 09 doctrine (contract extensions land at empirical-engagement task time, NOT at PLAN-write or state-1 time).
+
+- **16 Docker-gated differential fixtures + the h2spec conformance gate are the regression baseline** phase 10 MUST keep green per `BOOTSTRAP_PROMPT.md` §7.5 (b). The full list: `0001-tcp-echo`, `0002-static-loader`, `0003-tcp-proxy`, `0004-tls-downstream`, `0005-tls-upstream`, `0006-tls-sni`, `0007-http1-direct-response`, `0008-http1-router-upstream`, `0009-http2-direct-response`, `0010-http2-router-upstream`, `0011-admin-stats-prometheus`, `0012-access-log-file-sink`, `0013-http-filter-header-mutation`, `0014-admin-config-dump-server-info`, `0015-admin-drain-listeners`, `0016-http-filter-local-rate-limit`. The `parse_bootstrap` fuzz target carries 16 seeded corpus entries (1 per fixture's bootstrap shape).
+
+- **ADR-0033 H1 HCM `decorate_filter_synth_response` helper** at `crates/envoy-http1/src/hcm.rs` is reused by phase-10's RbacFilter directly (the helper is filter-agnostic; phase 10 is the second consumer after phase-09's LocalRateLimitFilter — validates the helper's filter-agnostic design). No new H1 HCM helper code lands at phase 10. **The H2 HCM analogous decoration site stays unimplemented** per the phase-09 REVIEW M2 carryforward; phase 10's D5 closes M2 via doc-amendment per preferred close shape (a), NOT via implementation (phase 10's fixture is H1 only; H2 implementation defers to the next HTTP-filter-family phase exercising filters on H2).
 
 - **Inherited carryforward inventory** (per the "Phase-NN rollovers" subsections in the Notes section below — load-bearing for any feature-family phase that touches the affected surface):
-  - **09 REVIEW M1-M5 + D1-D2 + T1-T3** (5 Minor + 2 doc-staleness + 3 test/audit-trail polish; **M4 + M5 already CLOSED at THIS state-6 commit per the fold-in**) — see "Phase-09 rollovers" subsection below. M1 + T2 close at the next HTTP-filter-family phase exercising non-zero `tokens_per_fill` within a refill-window-spanning burst; M2 closes at the next HTTP-filter-family phase exercising filters on H2 (prefer doc amendment); M3 closes opportunistically at the next phase touching `crates/envoy-bin/tests/http_filter_*.rs` backstops.
-  - **08.2 REVIEW M1-M8 + T1-T3** (8 Minor + 3 test/audit-trail polish; D1-D5 closed at the parent-08 close-out) — see "Phase-08.2 rollovers" subsection. Not engaged by phase 09.
-  - **08.1 REVIEW M3** (forward-looking `Arc<BTreeMap<...>>` on `command_line_options`) — indefinite carry; activates only if a future deployment widens the CLI surface.
+  - **09 REVIEW M1-M5 + D1-D2 + T1-T3** (5 Minor + 2 doc-staleness + 3 test/audit-trail polish; **M4 + M5 already CLOSED at phase-09 state-6 commit `518140c` per the fold-in**) — see "Phase-09 rollovers" subsection below. **M2 + M3 CLOSE in phase 10 per D5 + D8.3 per the phase-10 SPEC.** M1 + T2 close at the next HTTP-filter-family phase exercising non-zero `tokens_per_fill` within a refill-window-spanning burst (NOT phase 10 — RBAC does not use token buckets); D1 + D2 + T1 + T3 carry forward opportunistically.
+  - **08.2 REVIEW M1-M8 + T1-T3** (8 Minor + 3 test/audit-trail polish; D1-D5 closed at the parent-08 close-out) — not engaged by phase 10.
+  - **08.1 REVIEW M3** (forward-looking `Arc<BTreeMap<...>>` on `command_line_options`) — indefinite carry; not engaged.
   - **07.2 REVIEW M1** (severed `position` plumbing) — **CLOSED in 09 at Task 4 `78128f4`.** Chain ended.
-  - **07.2 REVIEW M2 / M3** (`apply_mutations` Overwrite O(n²) YAGNI / fixture-0013 `expected_body` coupling) — natural close sites: HTTP-filter-family / future ENVOY_TARGET version-bump phase.
-  - **06.3 REVIEW I2** (synthetic 5xx backend + 4-class `pre_requests` deferred from 06.3 Task 11) — the upstream-robustness family is the natural close site.
+  - **07.2 REVIEW M2 / M3** (`apply_mutations` Overwrite O(n²) YAGNI / fixture-0013 `expected_body` coupling) — not engaged by phase 10.
+  - **06.3 REVIEW I2** (synthetic 5xx backend + 4-class `pre_requests` deferred from 06.3 Task 11) — the upstream-robustness family is the natural close site; not engaged by phase 10.
   - **06.2 REVIEW M1 / M2 / M4 / M5**, **06.1 REVIEW M2 / M3 / M5 / M6**, **05.3 REVIEW I2**, **05.2 REVIEW I1 / I2 / I3**, **04.1 REVIEW M5 / M9 / M-claim / M1 / M2 / M4 / M7**, **02.2 REVIEW M1**, **Phase-00 I3 SIGKILL→SIGTERM** — all carry forward indefinitely unless coincidentally engaged.
 
-Inputs the post-phase-09 feature-family brainstorm session should read, in order:
+Inputs the phase-10 state-2 PLAN-write session should read, in order:
 
 1. `docs/envoy-rust/MISSION.md` (mission — unchanged).
-2. `docs/envoy-rust/STATE.md` (this file — confirm the "awaiting next planning" pointer + the phase-09-DONE narrative in this Active-phase block + the new "Phase-09 rollovers" + "Phase-09 ADR ledger (final)" subsections in Notes + the inherited carryforward inventory).
-3. `docs/envoy-rust/ROADMAP.md` (rows `00`-`08` + `08.1` + `08.2` + `09` all `done`; feature-family headings 10+ seeded as headings only).
-4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0033`).
-5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence matrix + the populated subsections including phase-09's 4 Stat-name mapping rows under "09 entries (LocalRateLimit filter):"; future feature-family phases extend with new rows / subsections at empirical-engagement task time).
-6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-0/state-1 routing for the new feature-family phase).
-7. `BOOTSTRAP_PROMPT.md` §9 (feature-family headings + brainstorm-time-ordering doctrine) + §5 state 0 + state 1 (brainstorming skill routing) + §5.1 (one state per session) + §6 (phase splitting policy — the next feature-family phase may split).
-8. The "Phase-09 rollovers" + "Phase-08.2 rollovers" + "Phase-08.1 rollovers" + "Phase-07.2 rollovers" + "Phase-07.1 rollovers" + "Phase-06.3 rollovers" + "Phase-06.2 rollovers" + "Phase-06.1 rollovers" subsections in this file's "Notes" section — the live carryforward inventory.
-9. `docs/envoy-rust/phases/09-http-filter-local-rate-limit/REVIEW.md` — the most-recent REVIEW.md; for context on the project's mature-state-3 + mature-state-5 doctrine + the ADR-0033 mid-execution corrective sequence narrative.
+2. `docs/envoy-rust/STATE.md` (this file — confirm the phase-10 state-1-complete pointer + the new "Phase-10 state-1 brainstorm" subsection in Notes below + the inherited carryforward inventory).
+3. `docs/envoy-rust/ROADMAP.md` (rows `00`-`08` + `08.1` + `08.2` + `09` `done`; row `10` `planned` as of THIS commit).
+4. `docs/envoy-rust/DECISIONS.md` (all landed ADRs through `ADR-0033`; the ADR-0033 narrative + Consequences §iii(c) bullet is load-bearing context for phase-10's D5 amendment).
+5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (equivalence matrix + the populated subsections; phase-10 extends with 2 Stat-name mapping rows at the D6 task commit).
+6. `docs/envoy-rust/SKILL_ROUTING.md` (state machine — confirm state-2 routing to `superpowers:writing-plans`).
+7. `docs/envoy-rust/phases/10-http-filter-rbac/SPEC.md` (THIS state-1's output — load-bearing for the PLAN-write).
+8. `BOOTSTRAP_PROMPT.md` §5 state 2 + §5.1 (one state per session) + §6.1 (split-gate criteria) + §9 (HTTP-filter-family).
+9. **Precedent state-2 PLAN-write commits** for shape reference:
+   - `b9da8d4` — `phase 09: state-2 standalone PLAN.md` (the closest post-MVP-trunk state-2 precedent for THIS upcoming session).
+   - `1aa250d` — `phase 08.2: state-2 standalone PLAN.md` (the closest sub-phase state-2 precedent referenced by phase-09's PLAN-write commit).
+   - `3a964cc` — phase-06.3 state-2 standalone PLAN.md.
+10. The "Phase-09 state-2 PLAN-write" + "Phase-09 state-3 execution arc + ADR-0033 corrective sequence + state-4 verification" subsections in this file's "Notes" section — the freshest end-to-end execution narrative for shape reference.
+11. `docs/envoy-rust/phases/09-http-filter-local-rate-limit/{PLAN.md,PROGRESS.md,REVIEW.md}` — full state-2 → state-5 narrative for shape reference.
 
 ## Last commit
 
-Phase-09 state-6 close-out commit (THIS commit): `phase 09: envoy.filters.http.local_ratelimit + fixture 0016 + 07.2 REVIEW M1 close [ADR-0033]`.
+Phase-10 state-1 brainstorm commit (THIS commit): `phase 10: state-1 brainstorm — http-filter-rbac SPEC.md (HTTP-filter-family second phase; 09 REVIEW M2 + M3 named close sites)`.
 
-Docs-only state-6 close-out commit per the established standalone-phase state-6 cadence (mirrors the 07.2 `1d52156` shape — the closest standalone-section state-6 precedent; 07.2 was nominally a sub-phase but its state-6 shape is identical regardless; the only difference is phase-09 does NOT fold a parent-row close-out because phase 09 is NOT a sub-phase). No production code changes; no test changes; no workspace dependency changes; no Cargo.toml / Cargo.lock changes; no DECISIONS.md changes; no BEHAVIOR_CONTRACT.md changes; no ENVOY_TARGET.md / rust-toolchain.toml changes. Touches 4 files (ROADMAP + STATE + 2 doc-staleness M4 + M5 fold-in files per the 08.1 / 08.2 state-6 close-out precedent):
+Docs-only state-1 brainstorm commit per the established state-1 brainstorm cadence (mirrors the phase-09 state-1 brainstorm commit `3025594` shape exactly — the closest post-MVP-trunk feature-family-brainstorm precedent + cadence-setter). No production code changes; no test changes; no workspace dependency changes; no Cargo.toml / Cargo.lock changes; no DECISIONS.md changes; no BEHAVIOR_CONTRACT.md changes; no ENVOY_TARGET.md / rust-toolchain.toml changes. Touches 3 files (SPEC create + ROADMAP add row + STATE advance — the established state-1 brainstorm shape):
 
-- **MODIFY** `docs/envoy-rust/ROADMAP.md` — flips row `09` `status: in-progress` → `status: done`. Standalone-phase invariant — phase 09 is NOT a sub-phase, so no parent-row close-out fold required (mirrors the 07.2 → state-6 close-out at `1d52156` shape precedent without the parent-07 close-out fold). The "HTTP filters family" §9 heading + family-row enumeration unchanged. All other ROADMAP rows untouched.
+- **CREATE** `docs/envoy-rust/phases/10-http-filter-rbac/SPEC.md` — the phase-10 state-1 design contract (~580 lines; 10 sections matching the established SPEC structure — goal/acceptance signal / behavior-contract scope / deliverables / out-of-scope / architectural invariants / implementation signposts / ADR projection / state-machine signposts / commit-message format / state-machine commit). Mirrors the phase-09 SPEC structure with parity adjustments for the RBAC scope (header-based Permission/Principal types only at phase-10 scope; IP/CIDR matchers + metadata + authenticated + url_path + SNI + CEL conditions + shadow_rules all defer per §4). Names the §6.2 empirical-verification posture at state-2 PLAN-write per ADR-0033 process-gap-awareness doctrine (verify stats namespace shape + 403 body bytes + 403 header set against `envoyproxy/envoy:v1.33.0` Docker before locking PLAN lock-ins). Names D5 (ADR-0033 Consequences amendment per preferred close shape (a)) + D8.3 (tokio::process::Command + kill_on_drop discipline) as the named-owner close sites for phase-09 REVIEW M2 + M3 carryforwards respectively.
 
-- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances active-phase pointer from `09` lifecycle state 5-reached / state-6-next (REVIEW.md landed; §7.5 gate (a)-(f) all PASS) to **`_none_` — awaiting next planning** (phase 09 is complete; the next session brainstorms the next feature-family phase per `BOOTSTRAP_PROMPT.md` §9); rewrites Active-phase / Next-expected-skill / Last-commit / Last-updated; appends new "Phase-09 rollovers (from REVIEW.md §1-§8)" + "Phase-09 ADR ledger (final)" subsections in Notes recording the REVIEW.md's 10 awareness-only carryforwards' dispositions (M4 + M5 closed at THIS commit via the fold-in) + the phase-09 ADR ledger evolution; preserves all prior "Phase-NN rollovers" sections + "Phase-08 state-1 brainstorm" + "Phase-08 state-2 split" + "Phase-08.1 state-2 PLAN-write" + "Phase-08.1 rollovers" + "Phase-08.2 state-2 PLAN-write" + "Phase-08.2 rollovers" + "Phase-09 state-1 brainstorm" + "Phase-09 state-2 PLAN-write" + "Phase-09 state-3 execution arc + ADR-0033 corrective sequence + state-4 verification" subsections verbatim per D-3.5 (append-only) + D-3.4 (context isolation). Also fixes one pre-existing inherited stale "as of THIS commit" → "as of commit `304ce98`" reference in the parent-08 narrative for D-3.4 stranger-readability.
+- **MODIFY** `docs/envoy-rust/ROADMAP.md` — adds a new row beneath the "HTTP filters family" §9 heading, immediately after the existing phase-09 row. Row content: `| 10 | envoy.filters.http.rbac + fixture 0017 + 09 REVIEW M2 + M3 close | 07 | planned | — | fixture 0017-http-filter-rbac green; envoy-filter gains RbacFilter (hand-rolled recursive tree-walk evaluator + Allow/Deny actions + Any/Header/AndRules/OrRules/NotRule Permission + Any/Header/AndIds/OrIds/NotId Principal + decode-side StopAndSend with 403 + body "RBAC: access denied\n" via ADR-0033 H1 HCM decorate_filter_synth_response helper) + HttpFilterInstance::Rbac variant; envoy-config gains Rbac + Policy + Permission + Principal schema + ~5 new ConfigError variants; 09 REVIEW M2 closed (ADR-0033 Consequences amendment per preferred close shape (a)) + M3 closed (Task 7 backstop tokio::process::Command + kill_on_drop discipline) |`. The "HTTP filters family" heading itself stays unchanged; the new row joins beneath the existing phase-09 row per `BOOTSTRAP_PROMPT.md` §4.1 invariant 2 (append-only history; never delete rows). All other ROADMAP rows untouched.
 
-- **MODIFY** `docs/envoy-rust/phases/09-http-filter-local-rate-limit/SPEC.md:362` — M4 fold-in (REVIEW §3 M4 doc-staleness; D8.3 stale text 1-line edit). Replaced "+ the `x-envoy-ratelimited: true` header on the 429 responses" with "+ ABSENCE of `x-envoy-ratelimited` per ADR-0033 + body `local_rate_limited` per ADR-0033 + presence of 5 standard HTTP/1.1 response headers via `decorate_filter_synth_response`". Non-load-bearing doc drift; no test re-run required. SPEC §2.2 was already revised in-place at Commit A `e9a6cb4`; the §3 D8.3 cross-reference was not synced at that time and is now closed.
+- **MODIFY** `docs/envoy-rust/STATE.md` (this file) — advances "Active phase" pointer from `_none_` — awaiting next planning (the post-phase-09 state) to `id: 10` / `slug: 10-http-filter-rbac` / `directory: docs/envoy-rust/phases/10-http-filter-rbac/` / `status: phase 10 lifecycle state 1-complete / state-2-next (SPEC.md landed; PLAN.md does not exist)`; rewrites "Next expected skill" to `superpowers:writing-plans` scoped to the phase-10 SPEC; rewrites "Last commit" + "Last updated"; appends new "Phase-10 state-1 brainstorm" subsection in Notes recording the family-pick + first-filter-pick rationale + alternatives considered + the 5-dimension scoring + the concrete state-1 acts; preserves all prior subsections verbatim per D-3.5 (append-only) + D-3.4 (context isolation) — including the entire phase-09 state-6 close-out historical narrative (the "Phase 09 ... is DONE as of THIS commit" block where "THIS commit" resolves to `518140c` in its original context; phase-09 "THIS commit" references stay verbatim per the established preserve-historical-narrative discipline).
 
-- **MODIFY** `tests/fixtures/0016-http-filter-local-rate-limit/envoy.yaml:7` — M5 fold-in (REVIEW §3 M5 doc-staleness; docstring header 1-line edit). Replaced `(429 + x-envoy-ratelimited: true)` with `(429 + body "local_rate_limited" per ADR-0033)`. Non-load-bearing YAML-comment doc drift; no test re-run required. The fixture body (bootstrap config) was already ADR-0033-correct at Commit D `1384c48`; only the upstream-Envoy-side docstring header carried the stale claim and is now closed.
+No code changes at this commit. No test changes. No fixture changes. **No DECISIONS.md change** — ledger head stays at **ADR-0033** (no ADR lands at THIS state-1 commit per the recommended posture per phase-10 SPEC §7). **No BEHAVIOR_CONTRACT.md change** — the 2 Stat-name mapping rows + the ADR-0033 Consequences amendment defer to execution-time task commits per phase-10 SPEC §6.6 + §6.3 (contract extensions land at empirical-engagement task time, NOT at state-1 brainstorm time). **No Cargo.toml / Cargo.lock changes** (zero new top-level Cargo deps projected per phase-10 SPEC §5.3; phase 10 adds no workspace-internal path-deps — `envoy-stats` already on `envoy-filter` from phase 09; `envoy-config` already on `envoy-filter` from earlier phases). **No `unsafe` introduced** anywhere (no code changes). **No ENVOY_TARGET.md / rust-toolchain.toml changes** (D-3.7 / D-3.9 unchanged).
 
-No production code changes at this commit. No fixture-body changes (the M5 edit is a YAML comment header, not bootstrap config). No test changes. DECISIONS.md unchanged at **ADR-0033** — no ADR lands at a state-6 close-out commit per the D-3.5 append-only discipline + the established state-6 cadence (the state-6 commit closes the phase; ADR landings happen during state-3 execution or at state-1/state-2 design time). Conditional ADR-0034 (foundations grant for token-bucket primitive per phase-09 SPEC §7) stays reserved-available and UNUSED — the no-foundations-grant posture held end-to-end across phase 09. BEHAVIOR_CONTRACT.md unchanged at this commit (the 4 Stat-name mapping rows landed at Task 3 commit `70bad43` per the 06.x / 07.x / 08.x doctrine; no Header allow-list row per PLAN lock-in #30 voided per ADR-0033 — upstream Envoy v1.33's local_ratelimit does NOT emit `x-envoy-ratelimited`). ENVOY_TARGET.md and rust-toolchain.toml untouched (D-3.7 / D-3.9 unchanged). Cargo.toml + Cargo.lock untouched (zero new top-level Cargo deps per phase-09 SPEC §5.3; the workspace-internal `envoy-stats` path-dep landed at Task 2 `b5c81d2`).
+**The §7.5 phase-done gate is NOT re-run at this state-1 brainstorm commit** per the docs-only convention; the most-recent state-4 gate verification was at phase-09 Task 8 commit `a5ebddd` (CI run `26002996677` against HEAD `1effb0f`; conclusion `success`; completed `2026-05-17T21:20:41Z`); REVIEW.md §6 + §8 re-attested all six §7.5 gates at the phase-09 state-5 commit `10bb71c`; the phase-09 state-6 close-out at `518140c` carried the verdict forward unchanged. This state-1 brainstorm commit modifies no production code, no test code, no fixture-body bytes — the gate verdict carries forward unchanged. The next CI run (triggered by THIS commit's push) re-validates the docs-only edits compile cleanly through the 5 stable-toolchain gates + the parse_bootstrap fuzz target on the unchanged 16-seed corpus.
 
-**The §7.5 phase-done gate is NOT re-run at this state-6 close-out commit** per the docs-only convention; the state-4 phase-done gate verification was performed at Task 8 commit `a5ebddd` (CI run `26002996677` against HEAD `1effb0f`; conclusion `success`; completed `2026-05-17T21:20:41Z`); REVIEW.md §6 + §8 re-attested all six §7.5 gates at the state-5 commit `10bb71c`; this close-out commit modifies no production code, no test code, and no fixture-body bytes (only docstrings / YAML comment header / state-tracking docs for the M4 + M5 fold-in + ROADMAP row flip + STATE.md advance), so the gate verdict carries forward unchanged. The next CI run (triggered by THIS commit's push) re-validates the docs-only edits compile cleanly through the 5 stable-toolchain gates + the parse_bootstrap fuzz target on the unchanged 16-seed corpus.
+**Predecessor commits (newest first; the phase-09 close-out + state-3 arc + state-2 + state-1 + parent-08 ancestry):**
 
-**Predecessor commits (newest first; the phase-09 state-3 execution arc + state-4 + state-5 + parent-08 ancestry):**
-
-- `10bb71c` — `phase 09: state 5 REVIEW.md Approved with M-track follow-ups [first post-MVP-trunk feature-family REVIEW.md]` (phase-09 state-5 REVIEW.md commit; **immediate predecessor / former HEAD of `origin/main`**; docs-only; 2 files modified — REVIEW.md created + STATE.md advanced; landed at `2026-05-17T22:43:48Z`; CI run `26004897377` `success` on both jobs at `2026-05-17T22:46:15Z` ≈3m).
-- `a5ebddd` — `phase 09: task 8 — state-4 phase-done verification + STATE advance to state-5-next` (Task 8 state-4-reached commit; docs-only; CI run `26003190551` `success` on both jobs at `2026-05-17T21:33:09Z`).
+- `518140c` — `phase 09: envoy.filters.http.local_ratelimit + fixture 0016 + 07.2 REVIEW M1 close [ADR-0033]` (phase-09 state-6 close-out commit; **immediate predecessor / former HEAD of `origin/main`**; docs-only state-6 close-out per the standalone-phase invariant; 4 files modified — ROADMAP row 09 flip + STATE.md advance + phase-09 SPEC.md M4 fold-in + fixture envoy.yaml M5 fold-in; landed at `2026-05-18T16:20:55Z`; CI run `26045978899` `success` on both jobs ≈2m).
+- `10bb71c` — `phase 09: state 5 REVIEW.md Approved with M-track follow-ups [first post-MVP-trunk feature-family REVIEW.md]` (phase-09 state-5 REVIEW.md commit; docs-only).
+- `a5ebddd` — `phase 09: task 8 — state-4 phase-done verification + STATE advance to state-5-next` (Task 8 state-4-reached commit; docs-only).
 - `1effb0f` — Task 6 follow-up (SUCCESS array extension; 1-line); the state-4 CI evidence anchor's HEAD per CI run `26002996677`.
 - `28e1666` — Task 6 (D8.2 fuzz corpus seed + `.gitignore` allow-list entry).
 - `7fcaeb1` — Task 7 (D8.3 in-process backstop per ADR-0033 revised contract).
@@ -168,91 +180,104 @@ No production code changes at this commit. No fixture-body changes (the M5 edit 
 - `70bad43` — Task 3 (D3 LocalRateLimitFilter runtime + D6 stats wiring + D7.1 4 stat-mapping rows).
 - `b5c81d2` — Task 2 (D3 hand-rolled TokenBucketState + REQUIRED 8×10_000 concurrency torture test).
 - `818a3c5` — Task 1 (D1 envoy-config schema + D2 validator).
-- `b9da8d4` — `phase 09: state-2 standalone PLAN.md` (the state-3 execution arc base).
-- `3025594` — `phase 09: state-1 brainstorm — http-filter-local-rate-limit SPEC.md` (the phase-09 state-1 brainstorm commit).
+- `b9da8d4` — `phase 09: state-2 standalone PLAN.md` (the closest post-MVP-trunk state-2 PLAN-write shape precedent for the upcoming phase-10 state-2 session).
+- `3025594` — `phase 09: state-1 brainstorm — http-filter-local-rate-limit SPEC.md (HTTP-filter-family first phase; 07.2 REVIEW M1 named close site)` (**the closest post-MVP-trunk state-1 brainstorm shape precedent for THIS commit; the cadence-setter**).
 - `304ce98` — `phase 08.2: endpoint-triggered drain ... [parent 08 done] [MVP trunk complete]` (parent-08.2 state-6 close-out + parent-08 close + MVP-trunk close; pre-phase-09).
-- `1d52156` — `phase 07.2: envoy.filters.http.header_mutation + fixture 0013 [parent 07 done] [ADR-0030, ADR-0031]` (**the closest standalone-section state-6 close-out shape precedent for THIS commit**).
-- `3ed6af0` — `phase 08.1: admin endpoint surface (config_dump, server_info, clusters, listeners) + 06.1 carryforward closures (I2, M1, M4)` (**the closest precedent for folding REVIEW M-track doc-staleness fixes into the state-6 close-out commit**).
+- `0202e38` — `phase 08: state-1 brainstorm — admin-api-and-drain SPEC.md (07 carryforward closures + endpoint-triggered drain scope)` (informative parent-phase-aware state-1 brainstorm precedent; phase 08 was sub-phase-aware while phase 09 + 10 are standalone).
 
 ## Last updated
 
-2026-05-18 (phase-09 state-6 close-out commit — the docs-only
-state-6 close-out per `BOOTSTRAP_PROMPT.md` §5 state 6 + phase-09
-SPEC §9 commit-message format. Mirrors the 07.2 `1d52156` shape —
-the closest standalone-section state-6 precedent (07.2 was
-nominally a sub-phase but its state-6 shape is identical
-regardless; the only difference is phase-09 does NOT fold a
-parent-row close-out because phase 09 is NOT a sub-phase).
-**Phase 09 IS the first post-MVP-trunk feature-family state-6
-close-out** per `BOOTSTRAP_PROMPT.md` §9 — cadence-setter for all
-subsequent feature-family arcs' state-6 shape. Flips ROADMAP row
-`09` `in-progress` → `done` (standalone-phase invariant — no
-parent-row close-out fold required); advances STATE.md "Active
-phase" pointer from `09` lifecycle state 5-reached / state-6-next
-to **`_none_` — awaiting next planning** (the next session
-brainstorms the next feature-family phase per `BOOTSTRAP_PROMPT.md`
-§9); rewrites "Next expected skill" to **`superpowers:brainstorming`**
-scoped to the next feature-family phase (ordering is brainstorm-
-driven; no family is pre-assigned); rewrites "Last commit" + "Last
-updated"; appends new "Phase-09 rollovers (from REVIEW.md §1-§8)"
-+ "Phase-09 ADR ledger (final)" subsections in Notes recording
-the REVIEW.md's 10 awareness-only carryforwards' dispositions
-(M4 + M5 closed at THIS commit via the fold-in; the remaining 8
-carry forward per their REVIEW §4 named-owner dispositions) + the
-phase-09 ADR ledger evolution (`ADR-0032 → ADR-0033` at Commit A
-`e9a6cb4`; ADR-0034 stays reserved-available + UNUSED). Folds
-REVIEW §3 M4 + M5 doc-staleness fixes into the same docs-bearing
-commit per the established 08.1 / 08.2 state-6 close-out
-precedent — `docs/envoy-rust/phases/09-http-filter-local-rate-limit/SPEC.md:362`
-(D8.3 stale `x-envoy-ratelimited: true` text replaced with
-ABSENCE-of-`x-envoy-ratelimited` + body `local_rate_limited` +
-5 standard headers per ADR-0033) + `tests/fixtures/0016-http-filter-local-rate-limit/envoy.yaml:7`
-(docstring header `(429 + x-envoy-ratelimited: true)` replaced
-with `(429 + body "local_rate_limited" per ADR-0033)`); both are
-1-line edits; non-load-bearing; no test or executable assertion
-changed. Also fixes one pre-existing inherited stale "as of THIS
-commit" → "as of commit `304ce98`" reference in the parent-08
-narrative for D-3.4 stranger-readability. Docs-only; 4 files
-modified (ROADMAP.md + STATE.md + phase-09 SPEC.md + fixture
-envoy.yaml); one state per session per `BOOTSTRAP_PROMPT.md`
-§5.1. **One carryforward CLOSED at the phase-09 arc:** 07.2 REVIEW
-M1 (severed `_position` plumbing) — CLOSED at Task 4 `78128f4`;
-chain 07.2 → 09 ends. **Two new carryforwards CLOSED at THIS
-state-6 commit via the fold-in:** REVIEW M4 + M5 (1-line
-doc-staleness fixes per the disposition above). The remaining 8
-new carryforwards (M1 token-bucket CAS-shape race on refill path
-/ M2 H2 HCM analogous decoration gap + ADR-0033 Consequences
-misrepresentation / M3 Task 7 subprocess discipline regression /
-D1 ADR-0033 fictional `RequestPath::SynthFromEncode` references /
-D2 Cargo.lock metadata delta refining PLAN lock-in #39 / T1
-parse_duration silent `+` acceptance / T2 torture test refill-path
-coverage gap / T3 Task 3 brittle `headers.len() == 1` assertion)
-carry forward per their REVIEW §4 named-owner dispositions; none
-gates THIS state-6 close-out and none has a hard-gated owner
-phase. DECISIONS.md unchanged at **ADR-0033** — no ADR lands at a
-state-6 close-out commit per the D-3.5 append-only discipline;
-conditional ADR-0034 stays reserved-available + UNUSED (the
-foundations-grant slot is released; the next phase that needs a
-foundations grant or split takes ADR-0034 at its landing site).
-BEHAVIOR_CONTRACT.md unchanged at THIS commit (the 4 stat rows
-landed at Task 3 commit `70bad43`; no Header allow-list row per
-PLAN lock-in #30 voided per ADR-0033); ENVOY_TARGET.md +
-rust-toolchain.toml untouched. Preserves all prior "Phase-NN
-rollovers" sections + Notes ADR-numbering subsections +
-"Phase-08 state-1 brainstorm" + "Phase-08 state-2 split" +
-"Phase-08.1 state-2 PLAN-write" + "Phase-08.1 rollovers" +
-"Phase-08.2 state-2 PLAN-write" + "Phase-08.2 rollovers" +
-"Phase-09 state-1 brainstorm" + "Phase-09 state-2 PLAN-write" +
-"Phase-09 state-3 execution arc + ADR-0033 corrective sequence +
-state-4 verification" subsections verbatim per D-3.5
-(append-only) + D-3.4 (context isolation). The §7.5 phase-done
-gate is NOT re-run at THIS state-6 close-out per the docs-only
-convention; the state-4 gate verification at CI run
-`26002996677` HEAD `1effb0f` (conclusion `success`, completed
-`2026-05-17T21:20:41Z`) carries forward unchanged. **With THIS
-commit phase 09 stands `done`**; the project continues
-`BOOTSTRAP_PROMPT.md` §9 feature-family expansion at the next
-session via `superpowers:brainstorming`.)
+2026-05-18 (phase-10 state-1 brainstorm commit — the docs-only
+state-1 brainstorm commit per `BOOTSTRAP_PROMPT.md` §5 state 1 +
+phase-10 SPEC §10 commit-message format. Mirrors the phase-09
+state-1 brainstorm commit `3025594` shape exactly — the closest
+post-MVP-trunk feature-family-brainstorm precedent + cadence-
+setter. **Phase 10 IS the second post-MVP-trunk feature-family
+state-1 brainstorm + the second concrete HTTP-filter-family phase
+state-1 brainstorm** per `BOOTSTRAP_PROMPT.md` §9 — amortizes
+the phase-09-established framework + helper investment
+(ADR-0033's `decorate_filter_synth_response` H1 HCM helper +
+4-counter stats-wiring pattern + `Decision::StopAndSend`
+production-path discipline). Adds new row `10` to
+`docs/envoy-rust/ROADMAP.md` beneath the "HTTP filters family"
+§9 heading with `status: planned` (the second concrete row
+beneath the family heading after the existing phase-09 row);
+advances STATE.md "Active phase" pointer from `_none_` —
+awaiting next planning to **`id: 10` / `slug: 10-http-filter-rbac`
+/ `directory: docs/envoy-rust/phases/10-http-filter-rbac/`** /
+`status: phase 10 lifecycle state 1-complete / state-2-next
+(SPEC.md landed; PLAN.md does not exist)`; rewrites "Next
+expected skill" to **`superpowers:writing-plans`** scoped to the
+phase-10 SPEC; rewrites "Last commit" + "Last updated"; appends
+new "Phase-10 state-1 brainstorm" subsection in Notes recording
+the family-pick + first-filter-pick rationale + alternatives
+considered + the 5-dimension scoring + the concrete state-1 acts.
+Creates `docs/envoy-rust/phases/10-http-filter-rbac/SPEC.md` —
+the phase-10 design contract (~580 lines; 10 sections matching
+the established SPEC structure; mirrors phase-09 SPEC shape with
+parity adjustments for the RBAC scope). Docs-only; 3 files
+modified (SPEC create + ROADMAP add row + STATE advance); one
+state per session per `BOOTSTRAP_PROMPT.md` §5.1. **Brainstorm
+decision per `feedback_pick_recommendation`** — picked directly
+without user input pause; the brainstorm IS the recommendation
+engine per the standing preference. Top-3 viable along the
+5-dimension scoring framework: (1) HTTP filters family `rbac`
+(WINNER — closes 09 REVIEW M2 + M3 at named sites; zero
+foundation pressure; low-medium arch risk; high contract
+maturity; ~1100-1300 LoC); (2) HTTP filters family `fault`
+(abort-only) — runner-up; rejected on foundation-pressure
+dimension (`rand` foundations grant OR hand-rolled PRNG); (3)
+Load balancing family `least_request` — third; rejected on
+zero-carryforward-closure + less mature contract surface
+dimensions. **First-feature pick: `envoy.filters.http.rbac`**
+with header-based Permission/Principal types only (Any + Header +
+AndRules/AndIds + OrRules/OrIds + NotRule/NotId combinators);
+IP/CIDR matchers + metadata + authenticated + url_path + SNI +
+CEL conditions + shadow_rules all defer per phase-10 SPEC §4 —
+each named close site (CORS for per-route primitive; future
+RBAC enrichment phase for shadow_rules + IP matchers + CEL).
+**Two named-owner carryforward close sites at phase 10:** 09
+REVIEW M2 (H2 HCM filter-synth header decoration gap + ADR-0033
+Consequences misrepresentation) closes via D5 ADR-0033
+Consequences doc-amendment per preferred close shape (a); 09
+REVIEW M3 (Task 7 in-process backstop subprocess discipline
+regression) closes via D8.3 adopting `tokio::process::Command +
+kill_on_drop(true) + Stdio::null()` discipline directly from the
+07.2 + 08.2 precedents. **No ADR at THIS commit.** DECISIONS.md
+ledger head stays at **ADR-0033**. Conditional ADR-0034 slot
+stays reserved-available for state-2 / state-3 execution-time
+landing if reality forces one — 4 conditional ADR-0034 slots
+named in phase-10 SPEC §7 (option A PLAN-write empirical-
+verification revision per ADR-0033 process-gap doctrine /
+option B per-route filter config deferral / option C
+foundations grant / option D D5 amendment as superseding-ADR
+shape); recommended posture per phase-10 SPEC §7: empirically
+verify at state-2 PLAN-write per §6.2 + land ADR-0034 inline
+only if reality differs from the SPEC projection. BEHAVIOR_
+CONTRACT.md unchanged at THIS commit (the 2 Stat-name mapping
+rows + the ADR-0033 Consequences amendment land at execution-
+time task commits per phase-10 SPEC §6.6 + §6.3); ENVOY_TARGET.md
++ rust-toolchain.toml untouched (D-3.7 / D-3.9 unchanged);
+Cargo.toml + Cargo.lock untouched (zero new top-level Cargo deps
+projected per phase-10 SPEC §5.3). Preserves all prior subsections
+verbatim per D-3.5 (append-only) + D-3.4 (context isolation) —
+including the entire phase-09 state-6 close-out historical
+narrative (the "Phase 09 ... is DONE as of THIS commit" block
+where "THIS commit" resolves to `518140c` in its original
+context; phase-09 "THIS commit" references stay verbatim per
+the established preserve-historical-narrative discipline).
+The §7.5 phase-done gate is NOT re-run at THIS state-1
+brainstorm commit per the docs-only convention; the most-recent
+state-4 gate verification at CI run `26002996677` HEAD `1effb0f`
+(conclusion `success`, completed `2026-05-17T21:20:41Z`)
+carries forward unchanged through the phase-09 state-6 close-out
+at `518140c` and onward through THIS commit. **With THIS commit
+phase 10 stands at lifecycle state-1-complete**; the next session
+enters state 2 — writes `docs/envoy-rust/phases/10-http-filter-rbac/PLAN.md`
++ `PROGRESS.md` skeleton + Task 1 preamble per `superpowers:writing-plans`,
+performs the SPEC §6.2 empirical verification against
+`envoyproxy/envoy:v1.33.0` Docker, and evaluates the SPEC §6.1
+split gate (recommended: single-phase, no split).)
 
 ## Notes
 
@@ -1247,3 +1272,72 @@ The phase-09 state-3 arc evolved DECISIONS.md ledger head **ADR-0032 → ADR-003
 - **Conditional ADR-0034** (foundations grant for token-bucket primitive per phase-09 SPEC §7) — stays **reserved-available + UNUSED** through phase 09. The no-foundations-grant posture per phase-09 SPEC §7 + PLAN lock-in #34 held end-to-end (hand-rolled `TokenBucketState` per std-lib `AtomicU64` + `Mutex<Instant>` + `bytes::Bytes` + std-lib `Duration` was sufficient; no `governor` / `ratelimit` / `nonzero-ext` / `parking_lot` / `humantime` / `humantime-serde` / `rand` / `getrandom` foundations grant required). The ADR-0034 reservation was filter-specific to phase-09 and is now released; the next phase that needs a foundations grant or split takes ADR-0034 at its landing site without renumbering — per the standing D-3.5 numbering discipline.
 
 DECISIONS.md ledger head at phase-09 close: **ADR-0033**. Project-cumulative ADR count: 33 ADRs landed across 00-09. The phase-09 ADR ledger evolution `ADR-0032 → ADR-0033` is the first post-MVP-trunk ADR landing; the discovery-not-projection pattern at Task 5 dispatch demonstrates the D-3.5 "Decisions are written, not remembered" + D-3.3 "differential correctness beats internal fidelity" doctrines working as designed under empirical-engagement pressure. Future state-1 brainstorming sessions should empirically verify upstream wire shapes for novel filter surfaces before locking in BEHAVIOR_CONTRACT projections (per ADR-0033 Provenance's recommendation for future SPEC authoring — an awareness-only doctrine-discipline note, not a doctrine-level enforcement).
+
+### Phase-10 state-1 brainstorm
+
+Brainstorm session decisions (THIS commit), all per the user's standing preferences `feedback_pick_recommendation` ("always pick the recommended option; do not ask") and `feedback_execution_style` ("default to subagent-driven-development; skip the two-option fork"). This is the **second post-MVP-trunk feature-family brainstorm session** (after phase-09 state-1 brainstorm `3025594`; the closest shape precedent + cadence-setter). Mirrors phase-09 state-1 brainstorm `3025594` shape exactly.
+
+- **Family pick: HTTP filters family (continuation; second concrete row beneath the family heading).** Picked directly per `feedback_pick_recommendation`. The phase-09 brainstorm tiebreaker logic (carryforward-closure value + smallest tractable scope + most mature contract surface) carries forward — applying the same 5-dimension scoring framework at phase-10:
+
+  - **HTTP filters family (WINNER)** — (a) carryforward closure value LOW-MEDIUM (M2 closable via doc-amendment per preferred close shape; M3 mechanical via backstop discipline; both phase-09 carryforwards target HTTP-filter-family by named-owner disposition); (b) zero foundation pressure (header-based RBAC reuses 04.2 HeaderMatcher; no new foundations needed); (c) low-medium arch risk (extends 07.x framework + reuses 09 H1 HCM helper; principal/permission matcher tree is bounded new primitive); (d) HIGH contract maturity (HCM helper + 4-counter pattern + StopAndSend established at phase 09); (e) HIGH-MEDIUM scope tractability (~1100-1300 LoC for header-scoped RBAC under §6.1 gate).
+  - **Network filters family** — (a) zero carryforward closure; (b) zero foundation pressure; (c) HIGH arch risk (new network-layer filter chain framework primitive; distinct from HTTP filter chain); (d) LOW contract maturity (no existing network-filter contract entries); (e) VARIES per filter (`echo` ~400-600 LoC + chain framework ~800-1000 LoC). Rejected on arch-risk + contract-maturity dimensions.
+  - **Load balancing family** — (a) zero carryforward closure (phase-09 carryforwards don't engage LB seam); (b) zero foundation pressure; (c) LOW arch risk (extends 02.x ClusterLoadBalancer seam; LB algo is pure endpoint-pick); (d) MEDIUM contract maturity (no specific LB stats in BEHAVIOR_CONTRACT yet); (e) HIGH scope tractability (`least_request` ~600-800 LoC). Strong third-place alternative; rejected on the zero-carryforward-closure + less mature contract surface dimensions (the same tiebreaker phase-09 used). The phase-09 brainstorm's "with phase-09 closed, the carryforward-closure dimension is now more balanced" observation pulls LB family closer to viable; the M2 + M3 closures available in HTTP-filter-family still tip the tiebreaker.
+  - **Upstream robustness family** — (a) HIGH carryforward closure (closes 06.3 REVIEW I2 — synthetic 5xx backend; the named-owner family); (b) zero foundation pressure; (c) MEDIUM arch risk (health-check task subsystem is new primitive); (d) MEDIUM contract maturity; (e) MEDIUM-tractability scope (~1200-1400 LoC for tightly-scoped active HTTP health checks; at the upper end of §6.1 gate). Rejected on scope-tractability dimension (the upper-end LoC + new task-spawning-per-endpoint primitive combination is higher risk than HTTP-filter-family RBAC's bounded matcher-tree primitive).
+  - **HTTP/3 + QUIC family** — VERY HIGH foundation pressure (`quinn` pull) + VERY HIGH arch risk (new UDP listener path; h3spec gate). Rejected per phase-09 brainstorm's identical rejection reasoning.
+  - **gRPC family** — `tonic` already permitted but no concrete gRPC backend engaged yet; possible but unmotivated as second standalone phase. Rejected per phase-09 brainstorm's identical rejection.
+  - **xDS / dynamic config family** — HIGHEST architectural risk (entire new state machine). Rejected per phase-09 brainstorm's identical rejection.
+  - **Observability family** — second-tier alternative at phase-09; same posture applies at phase-10.
+  - **Runtime + hot restart family** — hot restart heavy; rejected.
+  - **WASM host family** — multi-phase sub-project per §9; rejected.
+  - **Deprecated / edge features** — meta-bookkeeping only; not a substantive feature family.
+
+  Top-3 viable: HTTP filters > Load balancing > Upstream robustness. HTTP filters wins on carryforward-closure value (09 REVIEW M2 + M3 close at named sites) + smallest tractable scope-without-foundations (~1100-1300 LoC; no foundations grant) + most mature contract surface (09's HCM helper + 4-counter pattern directly applies). The phase-10 SPEC §1 + §3 record the picked family + first-filter scope.
+
+- **First filter pick: `envoy.filters.http.rbac` (header-based Permission/Principal scope).** Picked directly per `feedback_pick_recommendation`. Per the §9 HTTP-filter sub-feature enumeration (header_mutation DONE at 07.2; local_ratelimit DONE at 09), considered the remaining ~14 candidate filters along (config shape / foundations needed / framework extension needed / carryforward closure):
+
+  - **rbac (WINNER — header-based scope)** — chain-config; no per-route required at phase-10 scope; ZERO foundations (reuses 04.2 HeaderMatcher); ZERO framework extension (Decision::StopAndSend exists from 07.1; H1 HCM `decorate_filter_synth_response` helper exists from 09 ADR-0033 Commit C); closes 09 REVIEW M2 + M3 at named-owner sites; ~1100-1300 LoC including tests + fixture (under §6.1 gate). Header-only Permission/Principal types (Any + Header + AndRules/AndIds + OrRules/OrIds + NotRule/NotId combinators); IP/CIDR + metadata + authenticated + url_path + SNI + CEL + shadow_rules all defer per SPEC §4.
+  - **fault (abort-only)** — runner-up; ~700-900 LoC; needs `rand` foundations grant (ADR-0034) OR hand-rolled XorShift32 PRNG (~30-50 LoC primitive); closes 09 M2 + M3 if H1 backstop. Rejected on foundation-pressure dimension — `rand` grant or hand-rolled PRNG primitive both add risk beyond rbac's reuse-only posture.
+  - **cors** — needs per-route framework extension (CorsPolicy is primary per-route in upstream Envoy); ~1000-1200 LoC + per-route primitive (~200-300 LoC). Rejected on arch-risk dimension — per-route primitive is load-bearing for many later filters but higher risk than rbac's bounded matcher tree.
+  - **rbac (IP-included scope)** — would close 09 M2 + M3 + more; needs IP/CIDR matcher primitive (not currently in envoy-config). Rejected — IP matcher primitive defers per the standing principle that new framework primitives are gating architectural changes; header-scoped rbac is the minimum-viable cut.
+  - **buffer** — tiny config; needs new body-buffering framework extension (larger than the filter itself). Rejected.
+  - **csrf** — per-route primary; same per-route extension as cors. Rejected.
+  - **compression** — needs `flate2`/`brotli`/`zstd` foundations grants + new pluggable-compressor primitive. Rejected.
+  - **jwt_authn** — needs `jsonwebtoken` foundations grant + JOSE primitive. Rejected.
+  - **ext_authz / ext_proc** — needs gRPC client (depends on gRPC family). Rejected.
+  - **oauth2** — needs HTTPS client + auth-state framework. Rejected.
+  - **adaptive concurrency** — sophisticated gradient algorithm. Rejected.
+  - **admission control** — probabilistic + stats-heavy (P50/P99). Rejected.
+  - **bandwidth limit** — per-stream timing; needs body-streaming framework extension. Rejected on framework-extension dimension despite the appealing M1+T2 closure opportunity (TokenBucketState reuse with bytes-as-tokens).
+  - **global rate limit** — depends on gRPC family. Rejected.
+  - **lua / wasm** — own multi-phase sub-projects per §9. Rejected.
+
+  Top-3 viable: rbac (header-scoped) > fault (abort-only) > cors. **rbac (header-scoped) wins** on: zero foundations grant (reuses 04.2 HeaderMatcher directly); zero framework extension (uses existing H1 HCM helper + StopAndSend); closes 09 REVIEW M2 + M3 at named sites; validates StopAndSend on a non-rate-limit semantic (deny-by-policy vs rate-exhaustion); ~1100-1300 LoC under §6.1 gate. The 10 SPEC §3 D3 records the recursive tree-walk evaluator design; SPEC §6.2 makes the §6.2 empirical verification at state-2 PLAN-write REQUIRED per ADR-0033 process-gap doctrine (verify stats namespace + 403 body bytes + 403 header set against `envoyproxy/envoy:v1.33.0` Docker before locking PLAN lock-ins).
+
+- **Phase id + slug pick:** **`10`** / **`10-http-filter-rbac`**. The id `10` is next sequential after `09` per the project's numbering convention (the next standalone-phase id is the next integer; sub-phases get `.N` suffixes only on split). The slug mirrors `09-http-filter-local-rate-limit`'s hyphenation pattern — readable English (`http-filter-rbac`) over upstream-name verbatim. The filter's typed_config `name:` field uses upstream's exact `envoy.filters.http.rbac` (no underscore between "r" and "bac"); the slug + readable name + upstream config name are deliberately distinct surfaces per the 07.2 / 09 precedent.
+
+- **depends-on pick:** **`07`** (the parent filter-chain framework). Per `BOOTSTRAP_PROMPT.md` §9 depends-on doctrine (HTTP-filter-family extensions name `07`). Implicit dependencies on 04.2 (HeaderMatcher reuse) + 09 (the H1 HCM `decorate_filter_synth_response` helper landed at ADR-0033 Commit C `ae2cef0`) are NOT in the depends-on field per ROADMAP schema conventions (only direct ROADMAP-row deps are captured; cross-deliverable reuse is implicit). The 16-Docker-gated-fixture regression baseline established at phase-09 close (`0001-tcp-echo` through `0016-http-filter-local-rate-limit`) carries forward per `BOOTSTRAP_PROMPT.md` §7.5 (b).
+
+- **Split-gate projection at state-2 (SPEC §6.1):** Single-phase, no split. Per SPEC §3 deliverable enumeration: ~9-11 tasks / ~1100-1300 LoC (production ~530, tests ~600, fixture/doc ~200). Both dimensions comfortably under the §6.1 ~25-task / ~1500-LoC gate. Recommended posture: accept the empirical drift at PLAN-write if it materializes (~30-50% as observed at 06.x / 07.x / 08.x / 09); do NOT nest-split per parent-08 SPEC §6.1 alternative (vi) + the established no-nest-split discipline.
+
+- **ADR projection at state-1: NONE.** Recommended posture per SPEC §7 + §5.2 + §5.3 — no foundations grants required at any phase-10 lifecycle state; hand-roll recursive tree-walk evaluator per D-3.2's "Must be written from scratch" doctrine for filter engines + reuse 04.2 HeaderMatcher. DECISIONS.md ledger head stays at **ADR-0033** through this state-1 commit. Four conditional ADR-0034 slots stay reserved-available for state-2 / state-3 execution-time landing:
+
+  - **Option A: PLAN-write empirical-verification revision** (per ADR-0033 process-gap-awareness doctrine). If the SPEC §6.2 verification at state-2 reveals one or more of (stats namespace shape / 403 body bytes / 403 header set) materially differs from the SPEC projection, ADR-0034 lands at the state-2 PLAN-write commit per the 05.1 / 05.4 / 09 inline-ADR-at-Task-1 precedent. **RECOMMENDED:** empirically verify all 3 at state-2 PLAN-write; land ADR-0034 inline only if reality differs.
+  - **Option B: per-route filter config deferral**. If the state-2 PLAN-writer concludes that the per-route deferral pattern warrants append-only durability NOW (rather than at whichever future filter actually needs per-route config), ADR-0034 lands at state-2 recording the family-wide deferral pattern + the named close site. **RECOMMENDED:** defer the ADR (CORS is the natural close site; the 10 deferral is doctrinally clear without an ADR per phase 09's identical posture).
+  - **Option C: foundations grant**. If state-3 surfaces a materially-worse-than-foundation result for the tree-walk evaluator (e.g., need for `serde_with` / `ipnet` / similar), ADR-0034 lands at the surfacing task. **RECOMMENDED:** no grant (std-lib + existing workspace-internal deps are sufficient for v1.33 documented RBAC narrowed to phase-10 scope).
+  - **Option D: D5 amendment shape**. If the state-2 PLAN-writer or state-3 implementer prefers a NEW ADR-0034 superseding ADR-0033's narrow iii(c) Consequences claim (rather than amending ADR-0033 in-place per D5's recommended shape), ADR-0034 lands at the D5 task commit. **RECOMMENDED:** amend in-place per D5 (the change is a clarification, not a Decision shift).
+
+  At most ONE of A/B/C/D can land at any single commit (per D-3.5 sequential ADR numbering); if multiple fire, the second becomes ADR-0035 etc. If none fire, the ledger stays at ADR-0033 through phase 10.
+
+- **Carryforward closure projection at state-1: 09 REVIEW M2 + M3 (BOTH named-owner close sites at phase 10).** Per phase-10 SPEC §1:
+  - **M2** (H2 HCM filter-synth header decoration gap + ADR-0033 Consequences misrepresentation) closes via **D5** (ADR-0033 Consequences amendment per preferred close shape (a); doc-amendment, NOT implementation). The amendment ~10-15 LoC inserts a clarifying paragraph at ADR-0033 Consequences §iii(c)-end recording the H2 analogous gap as known-deferred + naming the close site (next HTTP-filter-family phase exercising filters on H2).
+  - **M3** (Task 7 in-process backstop subprocess discipline regression) closes via **D8.3** (phase-10's Task 7 backstop adopts `tokio::process::Command + kill_on_drop(true) + Stdio::null()` discipline directly from the 07.2 + 08.2 precedents; NO regression to `std::process::Command`). State-3 implementer reads 09 REVIEW M3 + 07.2/08.2 backstop precedents before writing D8.3; direct code-spot-check the precedent shape before writing.
+
+- **No other carryforwards engaged in 10.** Standing inventory carries forward unchanged: 09 REVIEW M1 + T2 (CAS-shape race; not exercised by RBAC — no token bucket); 09 REVIEW M4 + M5 (already CLOSED at 09 state-6 commit `518140c` per fold-in); 09 REVIEW D1 (ADR-0033 fictional `RequestPath::SynthFromEncode` references; no action — close opportunistically); 09 REVIEW D2 (Cargo.lock cadence refinement; no action); 09 REVIEW T1 (parse_duration silent `+` acceptance; not engaged by rbac — no Duration parsing); 09 REVIEW T3 (brittle exact-length assertion; not engaged); 08.2 REVIEW M1-M8 + T1-T3 (none engaged by 10); 08.1 REVIEW M3 (forward-looking indefinite carry; not engaged); 07.2 REVIEW M2 + M3 (not engaged); 06.3 REVIEW I2 (upstream-robustness named owner; not engaged); 06.2 REVIEW M1/M2/M4/M5; 06.1 REVIEW M2/M3/M5/M6; 05.3 REVIEW I2; 05.2 REVIEW I1/I2/I3; 04.1 REVIEW M5/M9/M-claim/M1/M2/M4/M7; 02.2 REVIEW M1; Phase-00 I3 — all carry forward indefinitely per their existing named-owner dispositions.
+
+- **Fixture 0017 projection:** `tests/fixtures/0017-http-filter-rbac/` lands at SPEC §3 D8.1. Bootstrap shape mirrors fixture 0007's minimal HCM + `direct_response` data-plane surface so the bilateral assertion focuses on the filter, not on upstream complexity. RBAC config: `action: ALLOW` + 1 policy permitting requests bearing `x-rbac-pass: yes` AND any principal → 4-probe sequential burst via `Driver::Http1ProbeList` (existing harness primitive from 04.2 + 09; no new harness extension required) → expected status sequence `[403, 200, 403, 200]` (deterministic; probes alternate header presence). Probes 1 and 3 (403 responses) carry the 5 standard HTTP/1.1 headers via `decorate_filter_synth_response` (set-equal-modulo-allow-list per the 04.1-landed `server` + `date` rows) + body `"RBAC: access denied\n"` byte-exact (TBD per §6.2 empirical verification — the state-2 PLAN-writer locks the exact body bytes at PLAN-write time against `envoyproxy/envoy:v1.33.0` Docker). Docker-gated wrapper at `tests/differential/tests/http_filter_rbac.rs` mirrors `tests/differential/tests/http_filter_local_rate_limit.rs` (09 precedent). Fuzz corpus seed at `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_rbac_filter.yaml` extends the corpus from 16 to 17 seeds (one per fixture) + extends the `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array per the 09 Task 6 follow-up precedent. In-process backstop at `crates/envoy-bin/tests/http_filter_rbac.rs` mirrors `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` shape — with the 09 REVIEW M3 fix applied directly (`tokio::process::Command + kill_on_drop(true) + Stdio::null()`).
+
+- **BEHAVIOR_CONTRACT.md extension projection:** 2 new "Stat-name mapping" rows (`http.<hcm_stat_prefix>.rbac.{allowed,denied}` — both value-exact per upstream Envoy v1.33 parity, subject to §6.2 empirical verification at state-2 PLAN-write) land at the D6 task commit; 1 docs-only ADR-0033 Consequences amendment (D5 closing 09 REVIEW M2) lands at the D7 task commit (co-located). No new Header allow-list row needed per SPEC §2.2 (the 04.1-landed `server` + `date` rows already cover the cross-proxy implementation-identifying differences; the 3 other standard headers — `content-length`, `content-type`, `connection` — are value-exact under deterministic fixture-0017 burst). Per the 06.x / 07.x / 08.x / 09 doctrine: contract extensions land at the task where each is first empirically exercised, NOT at PLAN-write time and NOT at state-1 SPEC time.
+
+- **Phase-00 I3 deferral continues:** phase 10 exercises the filter via deterministic HTTP request bursts; no signal-based termination of the harness subject subprocess (`tokio::process::Command::kill_on_drop(true)` is the doctrinally-clean substitute for nix-based SIGTERM). The `nix` crate stays off the permitted-foundations list.
+
+- **State-1 commit message + push:** title `phase 10: state-1 brainstorm — http-filter-rbac SPEC.md (HTTP-filter-family second phase; 09 REVIEW M2 + M3 named close sites)` per the phase-09 state-1 brainstorm commit `3025594` shape precedent. No `[ADR-NNNN]` brackets (no ADR lands at this commit). Predecessor docs-only CI runs took ~2-3m; the next CI run (triggered by THIS commit's push) re-validates the docs-only edits compile cleanly through the 5 stable-toolchain gates + the parse_bootstrap fuzz target on the unchanged 16-seed corpus.

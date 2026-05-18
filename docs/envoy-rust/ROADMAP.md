@@ -66,6 +66,7 @@ Header manipulation, cors, compression, fault, local+global rate limit, jwt_auth
 | id | title | depends-on | status | sub-phases | summary |
 |---|---|---|---|---|---|
 | 09 | envoy.filters.http.local_ratelimit + fixture 0016 + 07.2 REVIEW M1 close | 07 | done | — | fixture 0016-http-filter-local-rate-limit green; envoy-filter gains LocalRateLimitFilter (hand-rolled token bucket + decode-side StopAndSend with 429 + body `local_rate_limited` per ADR-0033) + HttpFilterInstance::LocalRateLimit variant; envoy-config gains LocalRateLimit + TokenBucket schema + 4 new ConfigError variants; 07.2 REVIEW M1 closed (severed `position` plumbing deleted); ADR-0033 mid-execution corrective sequence per upstream Envoy v1.33 empirical parity |
+| 10 | envoy.filters.http.rbac + fixture 0017 + 09 REVIEW M2 + M3 close | 07 | planned | — | fixture 0017-http-filter-rbac green; envoy-filter gains RbacFilter (hand-rolled recursive tree-walk evaluator + Allow/Deny actions + Any/Header/AndRules/OrRules/NotRule Permission + Any/Header/AndIds/OrIds/NotId Principal + decode-side StopAndSend with 403 + body `"RBAC: access denied\n"` via ADR-0033 H1 HCM decorate_filter_synth_response helper) + HttpFilterInstance::Rbac variant; envoy-config gains Rbac + Policy + Permission + Principal schema + ~5 new ConfigError variants; 09 REVIEW M2 closed (ADR-0033 Consequences amendment per preferred close shape (a)) + M3 closed (Task 7 backstop tokio::process::Command + kill_on_drop discipline) |
 
 ### Network filters family
 
