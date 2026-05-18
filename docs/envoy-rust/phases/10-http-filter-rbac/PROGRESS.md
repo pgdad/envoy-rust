@@ -491,7 +491,146 @@ cadence — these all stayed at state-2 values).
 
 ### Task 2 — D3 hand-rolled recursive tree-walk evaluator
 
-_(Pending Task 2 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `3fbe9f5` — `phase 10: task 1 — D1 envoy-config schema + D2 validator`.
+
+**Work summary.** Landed the pure-compute Permission/Principal recursive
+tree-walk evaluator per PLAN Task 2 (SPEC §3 D3) as a new module
+`crates/envoy-filter/src/rbac.rs`. The module ships 2 runtime enums
+(`RuntimePermission`, `RuntimePrincipal`) + 2 synchronous recursive
+evaluators (`eval_permission`, `eval_principal`) + 12 unit tests. Per PLAN
+lock-in #6, the wire-form `PermissionSet { rules: Vec<Permission> }` wrapper
+is flattened on the runtime enum to a direct `Vec<RuntimePermission>` on
+`AndRules` / `OrRules` (and symmetrically for `PrincipalSet` → `AndIds` /
+`OrIds`); `Box` indirection appears only on `NotRule` / `NotId` per PLAN
+lock-ins #6 + #7. The evaluator short-circuits via `Iterator::all`
+(conjunction) and `Iterator::any` (disjunction) per PLAN lock-in #9; `Any(b)`
+returns `*b`; `Header(m)` delegates to the existing
+`HeaderMatcher::matches(&[(String, String)])` predicate landed in 04.2. No
+async, no `dyn`, no I/O — pure recursive descent over the borrowed tree.
+The `RbacFilter` struct + `build_from_config` + `decode_headers` glue +
+stats wiring are deferred to Task 3 per the PLAN scope split; Task 1's
+transient bridge arm in `crates/envoy-filter/src/instance.rs` stays as-is.
+
+**Files modified (3):**
+- `crates/envoy-filter/src/lib.rs` — one-line addition of `pub mod rbac;`
+  in alphabetical position between `pub mod pipeline;` and `pub mod router;`.
+  No `pub use rbac::RbacFilter;` re-export — that ships at Task 3 per the
+  PLAN scope split.
+- `crates/envoy-filter/src/rbac.rs` — new module (243 LoC total). Module
+  doc-comment, 2 `pub(crate)` enums with per-variant doc-comments, 2
+  `pub(crate)` recursive evaluator fns with per-fn doc-comments, and a
+  `#[cfg(test)] mod tests` block with the 12 PLAN-canonical unit tests + 2
+  helper fns (`req_with`, `header_matcher_exact`). The crate-root
+  `#![forbid(unsafe_code)]` at `lib.rs:1` is inherited per PLAN lock-in
+  #46 — no per-module override, consistent with `header_mutation.rs` and
+  `local_rate_limit.rs`.
+- `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` — this
+  subsection (per-task PROGRESS cadence; replaces the state-2 skeleton's
+  `_(Pending Task 2 dispatch.)_` placeholder).
+
+**Tests landed (12 new; 760 → 772 in workspace).** All under
+`rbac::tests` per the PLAN-canonical naming:
+1. `any_true_permission_matches`
+2. `any_false_permission_does_not_match`
+3. `header_permission_matches_when_value_equals`
+4. `header_permission_does_not_match_when_value_differs`
+5. `header_permission_does_not_match_when_header_absent`
+6. `and_rules_short_circuits_on_first_false`
+7. `and_rules_all_true_matches`
+8. `or_rules_short_circuits_on_first_true`
+9. `or_rules_all_false_does_not_match`
+10. `not_rule_negates_inner`
+11. `nested_and_or_not_evaluates_correctly`
+12. `principal_evaluator_mirrors_permission_evaluator`
+
+The permission side exercises all 5 variants (`Any` ×2 polarity, `Header` ×3
+present/differs/absent, `AndRules` ×2 short-circuit + all-true, `OrRules` ×2
+short-circuit + all-false, `NotRule` ×1 dual-polarity); the principal side
+exercises `OrIds` + `Header` only — the symmetric-evaluator coverage
+discipline relies on Task 3's `RbacFilter` tests to exercise the remaining
+Principal variants end-to-end. See "Per-task deviations" #2 below.
+
+**LoC delta (production + tests; doc-comments included).** Per
+`git diff --cached --shortstat HEAD` at this commit: 3 files changed,
+~244 insertions (1 in `lib.rs`; 243 in the new `rbac.rs`; PROGRESS.md
+changes excluded from production-LoC count per cadence). Breakdown of
+`rbac.rs` by region (split at the `#[cfg(test)]` marker):
+- Production: ~107 LoC (module doc-comment + 2 enums w/ per-variant
+  doc-comments + 2 evaluator fns w/ doc-comments + 4 `#[allow(dead_code)]`
+  attrs for the Tasks 2-3 interim — see deviation #1 below).
+- Tests: ~136 LoC (12 `#[test]` fns + 2 helper fns + `use` block).
+
+PLAN §3's Task-2 projection was ~60 production + ~140 tests = ~200 LoC.
+Production overshoot (~+47 LoC) is dominated by (a) the 4 PLAN-not-anticipated
+`#[allow(dead_code)]` attrs with explanatory doc-comments (deviation #1) and
+(b) the project-mandated per-`pub(crate)` doc-comments on every enum +
+variant + fn (PLAN's verbatim Step-2 block omits these; the envoy-filter
+crate convention requires them). Test count matches PLAN exactly (12).
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS (no formatting changes needed; the
+  written-from-scratch file matched the project style first try).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  PASS (after the 4 `#[allow(dead_code)]` annotations per deviation #1;
+  see that deviation for the production-profile dead-code rationale).
+- `cargo build --workspace --all-targets` — PASS.
+- `cargo test --workspace` — PASS (772 passed, 0 failed, 2 ignored; +12 vs
+  the phase-10 Task 1 snapshot of 760 — exactly the 12 new `rbac::tests`).
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok, sources
+  ok; pre-existing unencountered-license warnings unchanged from Task 1).
+
+**Per-task deviations from PLAN (2).**
+
+1. **Discovered-at-task-time: 4 `#[allow(dead_code)]` attrs needed for the
+   Tasks 2-3 interim production-profile build.** PLAN Step 2's verbatim
+   code block has no `#[allow(dead_code)]` annotations. Under the test
+   profile (which the PLAN's Step 3 `cargo test -p envoy-filter --lib
+   rbac::tests` exercises) the 2 enums + 2 evaluator fns have consumers
+   (the test module), so `cargo test` alone reports clean. But under the
+   non-test profile (which Step 4's `cargo clippy --workspace
+   --all-targets --all-features -- -D warnings` exercises), the
+   `#[cfg(test)] mod tests` block is excluded, leaving the 2 `pub(crate)`
+   enums and 2 `pub(crate)` evaluator fns with zero consumers — clippy
+   errors with `dead_code` (promoted from warn to error by `-D warnings`).
+   The PLAN-named-precedent fix is per-item `#[allow(dead_code)]` mirroring
+   `LocalRateLimitFilter::stat_prefix` at `crates/envoy-filter/src/local_rate_limit.rs:49`.
+   Applied to: `RuntimePermission` enum, `RuntimePrincipal` enum,
+   `eval_permission` fn, `eval_principal` fn. Each carries an explanatory
+   doc-comment paragraph naming the Task 3 site that will retire the allow
+   (`RbacFilter::build_from_config` constructs all variants; the two eval
+   fns get called from `RbacFilter::decode_headers`). Net surface: 4 attrs
+   + ~10 lines of explanatory doc-comments. Zero behavioral change. Could
+   alternatively have been a single `#![allow(dead_code)]` at the module
+   root, but per-item is the established `local_rate_limit.rs` precedent
+   and makes the Task-3 cleanup more granular (the allows go away
+   individually as each item gains a consumer).
+
+2. **No PLAN deviation; recorded for the reviewer's context: principal-side
+   test coverage is intentionally narrower than permission-side.** Per the
+   PLAN-canonical 12-test list, the Principal side has exactly one test
+   (`principal_evaluator_mirrors_permission_evaluator`) exercising
+   `OrIds(Vec<RuntimePrincipal::Header>)`. The remaining Principal
+   variants (`Any`, `AndIds`, `NotId`) get coverage at Task 3 via the
+   `RbacFilter`-level end-to-end tests against the full policy tree.
+   This is structural symmetry trust + downstream-test coverage, not a
+   coverage gap — and it's explicitly what the PLAN authored. Calling it
+   out so the reviewer doesn't double-count it as "missing tests" at
+   spec-compliance review.
+
+The 4 PLAN-named corrections (PLAN-narrated Corrections 1-3 + the
+controller-discovered Correction 4 to the `body` field type at
+`crates/envoy-filter/src/types.rs:34`) were applied at write-time without
+incident. The dispatch brief named them all; no surprises.
+
+**Carryforward dispositions unchanged.** The 09 REVIEW M2 + M3
+projected-close sites both target Tasks 4 + 7 respectively; not engaged at
+Task 2.
+
+**STATE.md / ROADMAP.md / BEHAVIOR_CONTRACT.md / DECISIONS.md /
+ENVOY_TARGET.md / rust-toolchain.toml diffs at this commit:** None (per
+the state-3 per-task cadence — these all stay at state-2 values until
+Task 4 / Task 8).
 
 ### Task 3 — D3 RbacFilter runtime + D6 stats wiring + D7.1 2 contract rows
 
