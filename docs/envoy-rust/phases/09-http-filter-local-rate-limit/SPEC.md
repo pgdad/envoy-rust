@@ -359,7 +359,7 @@ Two extensions land at the task commits where they're empirically exercised (NOT
 
 - **D8.2 — Fuzz corpus seed.** New file `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_local_rate_limit_filter.yaml` containing the bootstrap shape above. Mirrors the 07.2 `hcm_header_mutation_filter.yaml` precedent. Extends the fuzz target's seed coverage from 15 to 16 entries (one per fixture's bootstrap shape).
 
-- **D8.3 — In-process backstop.** New file `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` mirroring `crates/envoy-bin/tests/http_filter_header_mutation.rs` (07.2 precedent). Single `#[tokio::test]` exercising the rate-limit semantics in-process (no Docker). The test boots `envoy-bin` with a synthesized bootstrap (`max_tokens: 2`); issues 4 sequential `GET /` requests against the bound listener; asserts the status sequence `[200, 200, 429, 429]` + the `x-envoy-ratelimited: true` header on the 429 responses.
+- **D8.3 — In-process backstop.** New file `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` mirroring `crates/envoy-bin/tests/http_filter_header_mutation.rs` (07.2 precedent). Single `#[tokio::test]` exercising the rate-limit semantics in-process (no Docker). The test boots `envoy-bin` with a synthesized bootstrap (`max_tokens: 2`); issues 4 sequential `GET /` requests against the bound listener; asserts the status sequence `[200, 200, 429, 429]` + ABSENCE of `x-envoy-ratelimited` per ADR-0033 + body `local_rate_limited` per ADR-0033 + presence of 5 standard HTTP/1.1 response headers via `decorate_filter_synth_response`.
 
 ---
 

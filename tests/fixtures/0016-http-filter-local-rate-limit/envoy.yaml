@@ -4,7 +4,7 @@
 # with token_bucket { max_tokens: 3, tokens_per_fill: 3, fill_interval: 60s }
 # (no refill within the 5-probe burst window since the burst completes in
 # well under 60s). First 3 succeed (200); requests 4 + 5 are rate-limited
-# (429 + x-envoy-ratelimited: true). tokens_per_fill is 3 (not 0) because
+# (429 + body "local_rate_limited" per ADR-0033). tokens_per_fill is 3 (not 0) because
 # upstream Envoy v1.33's TokenBucketValidator constrains tokens_per_fill > 0;
 # envoy-rust's validator accepts 0 (lock-in #4) but to keep both proxies
 # bilaterally green we pick the stricter intersection.
