@@ -1,0 +1,357 @@
+# Phase 10 (`10-http-filter-rbac`) — PROGRESS
+
+> Per-task narrative log. Appended at every task commit per the 06.2 / 06.3 / 07.x /
+> 08.x / 09 cadence. State-2 PLAN-write lands this skeleton + the Task 1 preamble;
+> state-3 dispatch appends `### Task N — <name>` subsections in execution order.
+
+---
+
+## State-2 commit context
+
+This commit (the state-2 standalone PLAN-write commit) lands:
+
+- **CREATE** `docs/envoy-rust/phases/10-http-filter-rbac/PLAN.md` (the state-2 PLAN.md
+  per `BOOTSTRAP_PROMPT.md` §5 state 2; ~2610 lines; 8 tasks; full `- [ ]` checkbox
+  steps per task per the project's mature TDD cadence).
+- **CREATE** `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` (this file).
+- **MODIFY** `docs/envoy-rust/ROADMAP.md` — flip row `10` `status: planned` →
+  `status: in-progress`. Earlier rows unchanged.
+- **MODIFY** `docs/envoy-rust/STATE.md` — Active phase status; Next expected skill;
+  Last commit; Last updated; new `Phase-10 state-2 PLAN-write` subsection in Notes.
+- **MODIFY** `docs/envoy-rust/DECISIONS.md` — append **ADR-0034** (the §6.2
+  empirical-verification body-bytes correction per SPEC §7 option A recommended
+  posture; ledger head advances `ADR-0033 → ADR-0034`).
+- **MODIFY** `docs/envoy-rust/phases/10-http-filter-rbac/SPEC.md` — 3 inline ADR-0034
+  revisions (§2.2 body bytes projection; §3 D8.1 fixture body bytes assertion; §5.9
+  filter response shape) — each replaces `"RBAC: access denied\n"` (20 bytes) with
+  `"RBAC: access denied"` (19 bytes per ADR-0034 empirical evidence).
+
+**Predecessor commit:** `c73f44f` — `phase 10: state-1 brainstorm — http-filter-rbac SPEC.md (HTTP-filter-family second phase; 09 REVIEW M2 + M3 named close sites)`
+(the phase-10 state-1 brainstorm commit; immediate prologue).
+
+**SPEC commit base:** `c73f44f` (the state-1 brainstorm commit). This state-2 commit
+edits SPEC.md inline at 3 sites per ADR-0034 — the inline edits ratify the §6.2
+empirical-verification findings.
+
+**ROADMAP status before this commit:** row `10` `planned` (added at state-1).
+**ROADMAP status after this commit:** row `10` `in-progress`.
+
+**STATE.md "Active phase" status before:** `phase 10 lifecycle state 1-complete / state-2-next (SPEC.md landed; PLAN.md does not exist)`.
+**STATE.md "Active phase" status after:** `phase 10 lifecycle state 2-complete / state-3-next (PLAN.md landed; first task commit pending)`.
+
+**DECISIONS.md status before:** **ADR-0033** (phase-09 SPEC §2.2 revision).
+**DECISIONS.md status after:** **ADR-0034** (phase-10 SPEC §2.2 + §3 D8.1 + §5.9
+body-bytes revision per §6.2 empirical verification; recommended posture per SPEC §7
+option A). The ledger head advances by ONE per D-3.5 sequential numbering. The
+remaining 3 conditional ADR-0034 slots (option B per-route deferral; option C
+foundations grant; option D D5 superseding-ADR shape) all DEFER per recommended
+posture — option B deferred to whichever future filter actually needs per-route
+config; option C no grant projected; option D in-place amendment per SPEC §2.3 +
+PLAN lock-in #32. Next available number after THIS commit is **ADR-0035**.
+
+**BEHAVIOR_CONTRACT.md status before AND after:** Unchanged. The 2 stat-name mapping
+rows under "**10 entries (RBAC filter):**" land at Task 3 commit per PLAN lock-in
+#36 (SPEC §6.6 cadence — contract extensions land at empirical-engagement task time,
+NOT at PLAN-write time).
+
+**ENVOY_TARGET.md + rust-toolchain.toml:** Unchanged (D-3.7 / D-3.9).
+
+---
+
+## PLAN scope summary
+
+- **8 tasks** per PLAN §4. Aligned with SPEC §6.1's ~9-11 projection on the lower end.
+  Subagent-driven execution at state 3 per PLAN lock-in #43 + `feedback_execution_style`.
+- **~1525 LoC projected** per PLAN §3 (production ~510, tests ~735, fixture/doc ~280).
+  Marginally at SPEC §6.1's ~1500-LoC gate (+1.7%); accept the projection per the soft
+  gate (lock-in #42).
+- **Single-phase; no nest-split** per PLAN lock-in #42 + parent-08 SPEC §6.1
+  alternative (vi) accept-drift discipline.
+- **ONE ADR landing at state-2:** ADR-0034 (option A per SPEC §7 — empirical-verification
+  body-bytes correction).
+
+---
+
+## Task 1 preamble
+
+### SPEC §6.2 empirical-verification findings (3 — performed at PLAN-write per ADR-0033 process-gap-awareness doctrine)
+
+Per SPEC §6.2's process-improvement directive (the ADR-0033-derived discipline note —
+"state-1 brainstorming should empirically verify upstream wire shapes... but no
+doctrine-level enforcement is introduced; the empirical-discovery-at-Task-5 → ADR-at-state-3
+path is a viable correction route per D-3.5"), the PLAN-writer performed all 3 verifications
+at THIS state-2 commit against `envoyproxy/envoy:v1.33.0` Docker, using the SPEC §3 D8.1
+canonical bootstrap (HCM + envoy.filters.http.rbac + envoy.filters.http.router +
+direct_response action; 1 ALLOW policy `pass_with_header` with `permissions: [- any: true]`
++ `principals: [- header: { name: x-rbac-pass, string_match: { exact: yes } }]`).
+
+**Verification methodology:** wrote canonical bootstrap to `/tmp/phase10-spec62-verify/envoy.yaml`;
+ran `docker run --rm -d -p 10000:10000 -p 9901:9901 -v ... envoyproxy/envoy:v1.33.0 --config-path /etc/envoy/envoy.yaml`;
+issued 2 probe pairs:
+- **Pair A (curl convenience probes, default keep-alive):** `curl -i` against allow + deny.
+- **Pair B (harness-shape probes with `Connection: close` request framing):** Python TCP
+  client mirroring `tests/differential/src/lib.rs::drive_http_get`'s exact request shape
+  (`GET / HTTP/1.1\r\nHost: envoy-rust.test\r\nConnection: close\r\n[+optional headers]\r\n`).
+  Scraped `/stats` from the admin endpoint to capture stat names.
+
+**Finding (a) — Stats namespace shape:** MATCHES SPEC §2.1 projection exactly.
+
+Empirical observation (post-1-allowed + 1-denied probe scrape):
+```
+http.ingress_http.rbac.allowed: 1
+http.ingress_http.rbac.denied: 1
+http.ingress_http.rbac.shadow_allowed: 0
+http.ingress_http.rbac.shadow_denied: 0
+```
+
+SPEC §2.1 + §6.5 project `http.<hcm_stat_prefix>.rbac.{allowed,denied}`. Upstream
+emits 2 additional counters (`shadow_allowed`, `shadow_denied`) at 0 unconditionally —
+these are emitted even when shadow_rules is unconfigured per upstream Envoy v1.33's
+behavior. **Phase-10 registers only the 2 primary counters** since shadow_rules defers
+per SPEC §4. The differential fixture does NOT scrape RBAC stats (only the 4 HTTP
+status probes), so the 2-vs-4 stat-name-set divergence is not exercised bilaterally
+at phase-10's verification surface. The BEHAVIOR_CONTRACT.md "Stat-name mapping" rows
+landing at Task 3 document the 2 primary counters' value-exact equivalence per the
+06.x convention. **No SPEC revision needed; no ADR triggered by this finding.**
+
+**Finding (b) — 403 response body bytes:** DIFFERS from SPEC §2.2 projection by 1 byte.
+
+Empirical body bytes (under both Pair A and Pair B request framing — identical body):
+```
+content-length: 19
+body bytes (hex): 52 42 41 43 3a 20 61 63 63 65 73 73 20 64 65 6e 69 65 64
+body string:     "RBAC: access denied"  (19 bytes, NO trailing newline)
+```
+
+SPEC §2.2 + §3 D8.1 + §5.9 project `"RBAC: access denied\n"` (20 bytes including
+trailing newline). Reality is 19 bytes (no trailing `\n`). **MATERIAL DIFFERENCE** —
+1-byte projection error.
+
+**Disposition:** **ADR-0034 (option A per SPEC §7) lands inline at THIS state-2
+PLAN-write commit.** The ADR records the empirical evidence + the 3 inline SPEC
+revisions (§2.2 + §3 D8.1 + §5.9 — each replaces the 20-byte projection with the
+19-byte reality + cross-refs ADR-0034 as the revision authority). PLAN lock-ins #13 +
+#14 lock the production-code shape `body: Bytes::from_static(b"RBAC: access denied")`
+(19 bytes; no `\n`). The fixture 0017 + in-process backstop assertion shapes adopt the
+19-byte body bytes directly.
+
+This is the **first phase to leverage the SPEC §6.2 empirical-verification process-improvement**
+directly — phase-09 surfaced the analogous ADR-0033 only at Task 5 subagent dispatch
+(a process gap the ADR-0033 Provenance section called out). Phase-10's state-2
+PLAN-write performs the verification BEFORE locking the PLAN lock-ins, AVOIDING the
+process gap. The ADR-0034 landing pattern (inline at PLAN-write with SPEC inline
+edits) mirrors the 05.1 / 05.4 / 09 Task-1-fixup ADR-inline precedent.
+
+**Finding (c) — 403 response header set:** MATCHES SPEC §2.2 projection under
+harness-shape `Connection: close` request framing.
+
+Empirical header set (under Pair B — harness-shape probes; the differential harness's
+`drive_http_get` sends `Connection: close` on every request per
+`tests/differential/src/lib.rs:1039`):
+
+```
+content-length: 19
+content-type: text/plain
+date: Mon, 18 May 2026 17:03:41 GMT
+server: envoy
+connection: close
+```
+
+5 standard HTTP/1.1 headers — exactly matching SPEC §2.2's projection
+`{server, date, content-length, content-type, connection}`. The `connection: close`
+appears because the harness sends `Connection: close`; if a client sends
+`Connection: keep-alive` (or no Connection header — HTTP/1.1 default), upstream omits
+the `connection` response header. envoy-rust's `decorate_filter_synth_response` helper
+(landed at phase-09 ADR-0033 Commit C) decorates the same 5 headers when present, so
+both proxies emit the same 5-header set under the harness's request framing.
+
+**No SPEC revision needed; no ADR triggered by this finding.** Fixture 0017's
+`expected_headers: set_equal_modulo_allow_list` correctly matches under the 04.1-landed
+`server` + `date` allow-list rows.
+
+### PLAN-write SPEC corrections (7 — verified against HEAD `c73f44f`)
+
+Each verified by reading the on-disk surface; corrections land in execution at the
+named task. Per the 06.2 → 06.3 → 07.x → 08.x → 09 precedent (06.1 0 corrections /
+06.2 4 corrections / 06.3 5 corrections / 07.1 6 corrections / 07.2 8 corrections /
+08.1 6 corrections / 08.2 6 corrections / 09 7 corrections), the 7 corrections recorded
+here track the mature PLAN-write cadence:
+
+1. **`HeaderMatcher::matches` takes `&[(String, String)]`, NOT `&[Header]`** as SPEC
+   §3 D3 prose implies. The 04.2-landed signature at
+   `crates/envoy-config/src/matcher.rs:19` is `pub fn matches(&self, headers: &[(String, String)]) -> bool`.
+   `FilterRequest::headers: Vec<(String, String)>` (per
+   `crates/envoy-filter/src/types.rs:28-32`) matches directly — no adapter needed.
+   **Action at Task 3:** call `m.matches(&req.headers)` inside the recursive
+   evaluator's Header arms.
+
+2. **`ConfigError` enum lives in `crates/envoy-config/src/lib.rs`, NOT
+   `crates/envoy-config/src/bootstrap.rs`** as SPEC §3 D2 implies (same correction
+   as phase-09 PLAN §1 item 1). The validator function `validate_http_filters` IS in
+   `bootstrap.rs` (line 1661 at HEAD `c73f44f`). Existing HeaderMutation +
+   LocalRateLimit `ConfigError` variants land in `lib.rs`. **Action at Task 1:** 6
+   new RBAC ConfigError variants land in `lib.rs`; sub-validator + Rbac dispatch arm
+   land in `bootstrap.rs`. Lock-in #26.
+
+3. **The HCM filter-pipeline build site is `Http1HCMConfig::from_config` at
+   `crates/envoy-http1/src/hcm.rs:185`** (same correction as phase-09 PLAN §1 item 2).
+   The current 09-widened signature is
+   `FilterPipeline::build_from_config(&cfg.http_filters, &registry)`. Phase 10
+   widens to `(&cfg.http_filters, &registry, &cfg.stat_prefix)` — one additional
+   argument at the SINGLE call site. H2 reuses the same `Http1HCMConfig` via re-export
+   per the 09 wiring discipline; no second call site exists. Lock-in #5 + #29.
+
+4. **`HttpFilterInstance` carries 2 `#[cfg(feature = "test-util")]` variants**
+   (`TestStopAndSendOnDecode(FilterResponse)` + `TestStopAndSendOnEncode(FilterResponse)`)
+   at `instance.rs` lines 30-35 — landed at 07.1/07.2 + preserved through 09. SPEC §3
+   D4 doesn't reference them. **Action at Task 4:** the new `Rbac(RbacFilter)` variant
+   goes between `LocalRateLimit` and the `#[cfg(feature = "test-util")]` block;
+   test-util variants preserved verbatim.
+
+5. **`RbacFilter::build_from_config` is THREE-arg** `(cfg, registry, hcm_stat_prefix)`
+   — the third arg is needed because the RBAC stat namespace `http.<hcm_stat_prefix>.rbac.*`
+   embeds the HCM's stat_prefix at counter-registration time (vs LocalRateLimit whose
+   stat_prefix is a filter-level config field). This is a new precedent for any filter
+   whose stat namespace embeds the HCM's stat_prefix at register time. Recorded for
+   subagent awareness — NOT a SPEC drift. Lock-in #5 + #15.
+
+6. **Empirical-verification body-bytes correction per ADR-0034.** SPEC §2.2 + §3 D8.1
+   + §5.9 project the 403 body bytes as `"RBAC: access denied\n"` (20 bytes). Per the
+   §6.2 empirical verification at THIS state-2 PLAN-write, upstream Envoy v1.33 emits
+   the 403 body as `"RBAC: access denied"` (19 bytes; NO trailing newline). **ADR-0034
+   lands at THIS state-2 PLAN-write commit** per SPEC §7 option A recommended posture.
+   PLAN lock-in #14 locks the production-code shape; SPEC.md gets 3 inline edits
+   ratifying the revised body. The Task 5 fixture + Task 7 backstop assertion shapes
+   adopt the 19-byte body directly. Lock-in #13 + #14 + #41.
+
+7. **Stats namespace + header-set §6.2 verifications MATCH SPEC projections.** Per
+   the same Docker run: stats namespace is `http.ingress_http.rbac.{allowed,denied}`
+   (matches SPEC §2.1 + §6.5); 403 header set under harness `Connection: close`
+   framing is 5 headers `{content-length, content-type, date, server, connection}`
+   (matches SPEC §2.2 + §5.9). Upstream additionally emits `shadow_allowed` +
+   `shadow_denied` at 0 unconditionally even when shadow_rules is unconfigured; phase-10
+   registers only the 2 primary counters since shadow_rules defers per SPEC §4 (the
+   differential fixture does not scrape RBAC stats so the 2-vs-4 name-set divergence
+   is not exercised). **No SPEC revision needed for (a) or (c).**
+
+### Architecture-decision lock-ins (46 — see PLAN.md §2)
+
+Per `feedback_pick_recommendation` ("always pick the recommended option; do not
+ask"), 46 lock-ins recorded in the PLAN's lock-in table (§2). Grouped by topic for
+in-execution lookup:
+
+- **#1-#2** — module placement + zero new path-deps (no Cargo.toml edits).
+- **#3-#10** — RbacFilter struct shape + RuntimeAction/RuntimePolicy + recursive
+  evaluator shape + short-circuit semantics + decision computation per SPEC §5.6.
+- **#11-#12** — decode/encode method semantics + counter-increment discipline.
+- **#13-#14** — 403 synth response shape + body bytes locked per ADR-0034.
+- **#15** — counter registration namespace `http.<hcm_stat_prefix>.rbac.{allowed,denied}`.
+- **#16-#25** — envoy-config schema (RbacConfig + Rules + Action + default_action
+  + Policy + Permission + PermissionSet + Principal + PrincipalSet + BTreeMap
+  deterministic iteration).
+- **#26-#29** — validator (6 new ConfigError variants + RBAC_TREE_MAX_DEPTH const +
+  validate_rbac_config sub-validator + validator dispatch arm).
+- **#30** — HttpFilterTypedConfig::Rbac variant.
+- **#31** — D5 + D7 + D6 task organization (D6 + D7.1 co-located at Task 3 per SPEC §6.6;
+  D5 + D7.2 co-located at Task 4 per SPEC §6.3).
+- **#32** — D5 in-place amendment shape (NOT superseding ADR-0034 per SPEC §7 option D
+  recommended posture).
+- **#33-#35** — D8.1 fixture 0017 shape (bootstrap; 4-probe burst; per-probe
+  request_headers harness extension).
+- **#36** — D7.1 BEHAVIOR_CONTRACT row landing cadence (2 stat-name rows at Task 3;
+  no Header allow-list row needed per SPEC §2.2).
+- **#37** — D7.2 ADR-0033 amendment landing co-located with D5 at Task 4.
+- **#38** — D8.2 fuzz corpus seed (same-commit `.gitignore` + SUCCESS-array edit per
+  09 Task 6 follow-up lesson).
+- **#39-#40** — D8.3 in-process backstop with 09 REVIEW M3 kill_on_drop discipline +
+  direct code-spot-check of 07.2/08.2 backstop precedents required.
+- **#41** — ADR landings: ONE (ADR-0034 option A inline at state-2; ledger head
+  advances `ADR-0033 → ADR-0034`).
+- **#42** — split-gate verdict (single-phase; no split; accept up to ~+15% drift).
+- **#43** — subagent-driven execution at state 3.
+- **#44** — PROGRESS.md skeleton + Task 1 preamble land alongside PLAN.md (this
+  commit).
+- **#45** — Cargo.lock cadence (empty diff expected — zero new deps).
+- **#46** — `#![forbid(unsafe_code)]` posture (inherited from crate root).
+
+Full text + rationale per lock-in lives in PLAN.md §2. PROGRESS sub-sections at
+state-3 reference lock-ins by `#NN` rather than re-explaining.
+
+### PLAN-write deviations beyond the SPEC corrections (0)
+
+None beyond the 7 SPEC corrections above. Unlike phase-09 (which deviated on schema
+struct renames at lock-in #20), phase-10's lock-ins mirror the SPEC's projected type
+names directly (`RbacConfig`, `Rules`, `Action`, `Policy`, `Permission`, `PermissionSet`,
+`Principal`, `PrincipalSet` per SPEC §3 D1 verbatim).
+
+### Carryforward dispositions
+
+| ID | Severity | Item | Disposition at 10 |
+|---|---|---|---|
+| **09 REVIEW M2** | Minor | H2 HCM filter-synth header decoration gap + ADR-0033 Consequences misrepresentation | **PROJECTED-CLOSE at Task 4 (D5).** ADR-0033 Consequences §iii(c)-end amendment per preferred close shape (a); ~10 LoC docs-only edit. The chain 09 → 10 ends. |
+| **09 REVIEW M3** | Minor | Task 7 in-process backstop subprocess discipline regression from 07.2/08.2 precedents (`std::process::Command` instead of `tokio::process::Command + kill_on_drop`) | **PROJECTED-CLOSE at Task 7 (D8.3).** Phase-10's Task 7 backstop adopts `tokio::process::Command + .kill_on_drop(true) + Stdio::null()` directly per SPEC §6.4 + PLAN lock-in #39. Direct code-spot-check of 07.2/08.2 precedents required per lock-in #40. The chain 09 → 10 ends. |
+| **09 REVIEW M1** | Minor | Token-bucket CAS-shape race on refill path | **Carry forward indefinitely.** Not engaged by RBAC (no token bucket). |
+| **09 REVIEW M4 / M5** | Minor | (CLOSED at phase-09 state-6 commit `518140c` via fold-in) | Already CLOSED; not engaged by phase 10. Recorded here for completeness. |
+| **09 REVIEW D1 / D2** | Doc | ADR-0033 fictional `RequestPath::SynthFromEncode` references; Cargo.lock cadence refinement | **Carry forward indefinitely.** Neither engaged. |
+| **09 REVIEW T1 / T2 / T3** | Test/audit | parse_duration silent `+` acceptance; torture test refill-path gap; Task 3 brittle assertion | **Carry forward indefinitely.** None engaged by phase-10's surface. |
+| **08.1 REVIEW M3** | Minor | Forward-looking `Arc<BTreeMap<...>>` on `command_line_options` | **Carry forward indefinitely.** Not engaged. |
+| **08.2 REVIEW M1-M8** | Minor | Various code-quality / doc-polish items | **Carry forward indefinitely.** None engaged by phase-10's surface. |
+| **08.2 REVIEW T1-T3** | Minor | Test / audit-trail polish | **Carry forward indefinitely.** Not engaged. |
+| **08.2 REVIEW D1-D5** | Doc | (CLOSED at 08.2 state-6 close-out commit `304ce98` via fold-in) | Already CLOSED; chain ended before phase 09. Recorded for completeness. |
+| **07.2 REVIEW M1** | Minor | (CLOSED at phase-09 Task 4 commit `78128f4`) | Already CLOSED in 09. Chain 07.2 → 09 ended; nothing carries forward to 10. |
+| **07.2 REVIEW M2 / M3** | Minor | `apply_mutations` Overwrite O(n²) YAGNI / fixture-0013 `expected_body` coupling | **Carry forward indefinitely.** Phase 10 does NOT touch `header_mutation.rs`. |
+| **06.3 REVIEW I2** | Important | Synthetic 5xx backend + 4-class `pre_requests` deferred | **Carry forward indefinitely.** Upstream-robustness family is the natural close site. Not engaged. |
+| **06.2 REVIEW M1 / M2 / M4 / M5** | Minor | Various | **Carry forward indefinitely.** Not engaged. |
+| **06.1 REVIEW M2 / M3 / M5 / M6** | Minor | Various | **Carry forward indefinitely.** Not engaged. |
+| **05.3 REVIEW I2** | Important | Typed-error chain dissolution at H2 dispatch site | **Carry forward indefinitely.** Not engaged. |
+| **05.2 REVIEW I1 / I2 / I3** | Important | Various | **Carry forward indefinitely.** Not engaged. |
+| **04.1 REVIEW M5 / M9** | Minor | Cargo.lock cadence ratification ADR | **Carry forward unchanged.** Phase 10 introduces zero new top-level Cargo deps; zero new workspace path-deps. The cadence pick stays unforced. |
+| **04.1 REVIEW M-claim / M1 / M2 / M4 / M7** | Minor | Various | **Carry forward indefinitely.** Not engaged. |
+| **02.2 REVIEW M1** | Minor | `*EchoBackend::Drop` polling loop blocks on `std::thread::sleep` | **Carry forward unchanged.** Phase 10's fixture 0017 uses direct_response (no Echo backend); the chain continues unchanged. |
+| **Phase-00 I3** | — | SIGKILL → SIGTERM graceful termination of subject subprocess (`nix` crate deferral) | **Carry forward unchanged.** Phase 10's backstop uses `tokio::process::Command + kill_on_drop(true)` per PLAN lock-in #39 (NOT `nix`); the carryforward continues unchanged. |
+
+### State-3 entry routing
+
+The next session reads STATE.md, sees `state 2-complete / state-3-next (PLAN.md
+landed; first task commit pending)` + Next expected skill
+`superpowers:subagent-driven-development` (per `feedback_execution_style`), and
+dispatches Task 1 per the PLAN.
+
+---
+
+## Tasks 1-8
+
+_(Per-task `### Task N — <name>` subsections append at state-3 task commits per the
+06.x / 07.x / 08.x / 09 cadence. State-2 commit lands this skeleton only.)_
+
+### Task 1 — D1 envoy-config schema + D2 validator (co-located)
+
+_(Pending Task 1 dispatch.)_
+
+### Task 2 — D3 hand-rolled recursive tree-walk evaluator
+
+_(Pending Task 2 dispatch.)_
+
+### Task 3 — D3 RbacFilter runtime + D6 stats wiring + D7.1 2 contract rows
+
+_(Pending Task 3 dispatch.)_
+
+### Task 4 — D4 HttpFilterInstance::Rbac variant + D5 ADR-0033 amendment (closes 09 REVIEW M2)
+
+_(Pending Task 4 dispatch.)_
+
+### Task 5 — D8.1 fixture 0017 + Docker-gated wrapper
+
+_(Pending Task 5 dispatch.)_
+
+### Task 6 — D8.2 fuzz corpus seed
+
+_(Pending Task 6 dispatch.)_
+
+### Task 7 — D8.3 in-process backstop (closes 09 REVIEW M3)
+
+_(Pending Task 7 dispatch.)_
+
+### Task 8 — state-4 phase-done verification + STATE advance to state-5-next
+
+_(Pending Task 8 dispatch.)_

@@ -57,10 +57,10 @@ The `<stat_prefix>` segment is sourced from the filter's `stat_prefix` field —
 
 The 403 response body shape + header decoration are determined by ADR-0033's revised contract:
 
-- `RbacFilter::decode_headers` emits the 403 response with `body: Bytes::from_static(b"RBAC: access denied\n")` per upstream Envoy v1.33's documented denial body (20 bytes; source-hardcoded per upstream — **the state-2 PLAN-writer empirically verifies the exact body bytes against `envoyproxy/envoy:v1.33.0` before locking** per the ADR-0033 process-gap awareness-only doctrine; if reality differs, the SPEC §2.2 revision lands via an ADR at PLAN-write time).
+- `RbacFilter::decode_headers` emits the 403 response with `body: Bytes::from_static(b"RBAC: access denied")` per upstream Envoy v1.33's source-hardcoded denial body (19 bytes; NO trailing newline — per **ADR-0034** ratifying the state-2 §6.2 empirical-verification finding that the original state-1 SPEC projection of `b"RBAC: access denied\n"` (20 bytes) was off by 1 byte; see DECISIONS.md ADR-0034 for the empirical evidence + revision narrative).
 - The 5 standard HTTP/1.1 response headers (`server`, `date`, `content-length`, `content-type`, `connection`) are decorated onto every filter-synth 403 response by the existing H1 HCM helper `decorate_filter_synth_response` (landed at phase-09 ADR-0033 Commit C `ae2cef0` at `crates/envoy-http1/src/hcm.rs`; called from both `RequestPath::SynthFromDecode` and encode-side `Decision::StopAndSend(replacement)` writer-arm sites). The helper conditionally adds the standard headers if not already provided by the filter (case-insensitive name check); phase-10's RBAC filter emits 403 with no headers in `FilterResponse.headers`, so all 5 standard headers are decorated.
 
-**No new Header allow-list row is needed.** The 04.1-landed `server` row + the 04.1-landed `date` row of `docs/envoy-rust/BEHAVIOR_CONTRACT.md`'s Header allow-list cover the cross-proxy implementation-identifying differences. The remaining 3 standard headers (`content-length`, `content-type`, `connection`) are value-exact across proxies under the deterministic fixture-0017 burst (4 sequential GET / probes; static `direct_response` body on Allow; static `"RBAC: access denied\n"` body on Deny; sticky H1 close-on-response convention).
+**No new Header allow-list row is needed.** The 04.1-landed `server` row + the 04.1-landed `date` row of `docs/envoy-rust/BEHAVIOR_CONTRACT.md`'s Header allow-list cover the cross-proxy implementation-identifying differences. The remaining 3 standard headers (`content-length`, `content-type`, `connection`) are value-exact across proxies under the deterministic fixture-0017 burst (4 sequential GET / probes; static `direct_response` body on Allow; static `"RBAC: access denied"` body on Deny per ADR-0034; sticky H1 close-on-response convention).
 
 ### 2.3 ADR-0033 Consequences amendment (closes 09 REVIEW M2)
 
@@ -361,7 +361,7 @@ No new Header allow-list row needed per §2.2.
                   direct_response: { status: 200, body: { inline_string: "ok\n" } }
   ```
 
-  Probe shape: `Driver::Http1ProbeList` (existing harness primitive from 04.2) with 4 sequential probes (`GET /`). Expected per-probe statuses: `[403, 200, 403, 200]` corresponding to (no header / `x-rbac-pass: yes` / `x-rbac-pass: no` / `x-rbac-pass: yes`). Asserts probes 1 and 3 (403 responses) carry the 5 standard HTTP/1.1 headers via `decorate_filter_synth_response` (set-equal-modulo-allow-list per the 04.1-landed `server` + `date` rows) + body `"RBAC: access denied\n"` byte-exact (TBD per §2.2 empirical-verification signpost; the PLAN-writer locks the exact body bytes at PLAN-write time).
+  Probe shape: `Driver::Http1ProbeList` (existing harness primitive from 04.2) with 4 sequential probes (`GET /`). Expected per-probe statuses: `[403, 200, 403, 200]` corresponding to (no header / `x-rbac-pass: yes` / `x-rbac-pass: no` / `x-rbac-pass: yes`). Asserts probes 1 and 3 (403 responses) carry the 5 standard HTTP/1.1 headers via `decorate_filter_synth_response` (set-equal-modulo-allow-list per the 04.1-landed `server` + `date` rows) + body `"RBAC: access denied"` (19 bytes; NO trailing newline per **ADR-0034**) byte-exact.
 
   Docker-gated wrapper at `tests/differential/tests/http_filter_rbac.rs` mirroring `tests/differential/tests/http_filter_local_rate_limit.rs` shape (the 09 precedent). One `#[tokio::test]` `http_filter_rbac_fixture` invoking `run_fixture("0017-http-filter-rbac").await`.
 
@@ -371,7 +371,7 @@ No new Header allow-list row needed per §2.2.
 
 - **D8.3 — In-process backstop.** New file `crates/envoy-bin/tests/http_filter_rbac.rs` mirroring `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` (09 precedent) — **but with the 09 REVIEW M3 fix applied directly**: use `tokio::process::Command` (NOT `std::process::Command`); set `.kill_on_drop(true)` on the subprocess builder; route stdout to `Stdio::null()` (NOT `Stdio::piped()`) to avoid OS-pipe-buffer-fill deadlock. Stderr may stay `Stdio::piped()` per the 07.2/08.2 precedent (for diagnostic capture on test failure) AS LONG AS a concurrent drain reader is spawned (or `Stdio::null()` is used uniformly). This adoption closes 09 REVIEW M3 at the D8.3-landing task commit.
 
-  Single `#[tokio::test]` exercising RBAC semantics in-process (no Docker). The test boots `envoy-bin` with a synthesized bootstrap (1 policy, allow-action, header-principal); issues 4 sequential `GET /` requests against the bound listener with varying `x-rbac-pass` header values; asserts the status sequence `[403, 200, 403, 200]` + body `"RBAC: access denied\n"` on 403 probes + body `"ok\n"` on 200 probes + presence of 5 standard HTTP/1.1 headers via `decorate_filter_synth_response` on 403 probes.
+  Single `#[tokio::test]` exercising RBAC semantics in-process (no Docker). The test boots `envoy-bin` with a synthesized bootstrap (1 policy, allow-action, header-principal); issues 4 sequential `GET /` requests against the bound listener with varying `x-rbac-pass` header values; asserts the status sequence `[403, 200, 403, 200]` + body `"RBAC: access denied"` (19 bytes per ADR-0034) on 403 probes + body `"ok\n"` on 200 probes + presence of 5 standard HTTP/1.1 headers via `decorate_filter_synth_response` on 403 probes.
 
 ---
 
@@ -391,7 +391,7 @@ Phase 10 explicitly does NOT land:
 - **`Permission::UriTemplate`.** URI-template matching (RFC 6570-ish) is a substantial primitive. Defers indefinitely.
 - **`Principal::Metadata`, `Permission::Metadata` (dynamic metadata matchers).** Defers until whichever phase first lands the dynamic-metadata framework (extension framework for filter-set/filter-read metadata).
 - **`Principal::FilterState` (per-stream filter state matcher).** Defers until whichever phase first lands the per-stream filter-state framework.
-- **Custom denial response body / headers.** Phase 10's 403 response body is the upstream-Envoy v1.33 source-hardcoded `"RBAC: access denied\n"` (or whatever the empirical verification reveals at state-2 PLAN-write). Operator-configurable denial bodies defer indefinitely.
+- **Custom denial response body / headers.** Phase 10's 403 response body is the upstream-Envoy v1.33 source-hardcoded `"RBAC: access denied"` (19 bytes; no trailing newline per ADR-0034). Operator-configurable denial bodies defer indefinitely.
 - **Custom HTTP status codes for denial.** Phase 10 emits 403 unconditionally. Whichever later RBAC enrichment phase first needs a configurable denial status lifts the validator constraint.
 - **`envoy.filters.network.rbac` (network-layer RBAC).** Defers to the Network filters family per `BOOTSTRAP_PROMPT.md` §9.
 - **H2 differential fixture coverage for RBAC.** Phase 10's fixture is H1 only per the established cadence. Per the D5 amendment (09 REVIEW M2 close), the next HTTP-filter-family phase exercising filters on H2 lands the H2 fixture + the H2 HCM `decorate_filter_synth_response_h2` analogue.
@@ -456,7 +456,7 @@ The 09 REVIEW M2 carryforward (H2 HCM filter-synth header decoration gap) is clo
 
 ### 5.9 ADR-0033 H1 HCM helper reuse
 
-Phase 10's 403 emission flows through the existing H1 HCM `decorate_filter_synth_response` helper landed at phase-09 ADR-0033 Commit C `ae2cef0`. The filter emits `FilterResponse { status: 403, reason: Some("Forbidden"), headers: vec![], body: Bytes::from_static(b"RBAC: access denied\n") }` (TBD per §2.2 empirical verification); the H1 HCM's `RequestPath::SynthFromDecode` arm + encode-side `Decision::StopAndSend` arm invoke the helper, which decorates the 5 standard HTTP/1.1 response headers onto the response before write. No new H1 HCM helper code lands at phase 10 — pure reuse of the 09-landed primitive. This is the first non-LocalRateLimit filter to exercise the helper; validates the helper's filter-agnostic design.
+Phase 10's 403 emission flows through the existing H1 HCM `decorate_filter_synth_response` helper landed at phase-09 ADR-0033 Commit C `ae2cef0`. The filter emits `FilterResponse { status: 403, reason: Some("Forbidden"), headers: vec![], body: Bytes::from_static(b"RBAC: access denied") }` (19 bytes per **ADR-0034** state-2 §6.2 empirical verification); the H1 HCM's `RequestPath::SynthFromDecode` arm + encode-side `Decision::StopAndSend` arm invoke the helper, which decorates the 5 standard HTTP/1.1 response headers onto the response before write. No new H1 HCM helper code lands at phase 10 — pure reuse of the 09-landed primitive. This is the first non-LocalRateLimit filter to exercise the helper; validates the helper's filter-agnostic design.
 
 ---
 
