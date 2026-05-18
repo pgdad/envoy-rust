@@ -966,7 +966,138 @@ IS modified (1-sentence D7.2 cross-ref note).
 
 ### Task 5 — D8.1 fixture 0017 + Docker-gated wrapper
 
-_(Pending Task 5 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `84b508e` — `phase 10: task 4 — D4 variant + D5 ADR-0033 amendment (closes 09 REVIEW M2)`.
+
+**Work summary.** Landed the D8.1 differential acceptance fixture
+`tests/fixtures/0017-http-filter-rbac/` (4 files: `envoy.yaml`,
+`envoy-rust.yaml`, `expectations.yaml`, `README.md`) + the Docker-gated
+wrapper `tests/differential/tests/http_filter_rbac.rs` per PLAN Task 5
+(SPEC §3 D8). The fixture drives 4 sequential `GET /` probes through an
+HCM filter chain of `[envoy.filters.http.rbac,
+envoy.filters.http.router]` under `action: ALLOW` with a single policy
+`pass_with_header` requiring the `x-rbac-pass: yes` request header. Both
+proxies must produce the deterministic status sequence `[403, 200, 403,
+200]` with body `"RBAC: access denied"` (19 bytes per ADR-0034) on 403
+probes and `"ok\n"` on 200 probes. Per-probe `extra_headers` variation
+(no-header / `yes` / `no` / `yes`) drives the alternation; this is the
+first fixture to exercise the per-probe distinct-headers axis of the
+`Http1Probe` shape (the field has been present at
+`tests/differential/src/lib.rs:619-635` since phase 04.2 with
+`#[serde(default)]` but sat unused by every prior fixture). The fixture
+is the **first non-LocalRateLimit bilateral consumer** of the phase-09
+H1 HCM `decorate_filter_synth_response` helper (landed at ADR-0033
+Commit C `ae2cef0`, at `crates/envoy-http1/src/hcm.rs:932`); the 2 deny
+probes engage the helper end-to-end against both proxies, while the 2
+allow probes pass through to the direct_response route, demonstrating
+that the helper is filter-agnostic by design.
+
+**Files modified (6; all CREATE except PROGRESS.md):**
+- CREATE `tests/fixtures/0017-http-filter-rbac/envoy.yaml` (+97 LoC).
+- CREATE `tests/fixtures/0017-http-filter-rbac/envoy-rust.yaml` (+55 LoC).
+- CREATE `tests/fixtures/0017-http-filter-rbac/expectations.yaml` (+69 LoC).
+- CREATE `tests/fixtures/0017-http-filter-rbac/README.md` (+126 LoC).
+- CREATE `tests/differential/tests/http_filter_rbac.rs` (+33 LoC).
+- MODIFY `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` (this
+  subsection; replaces the state-2 skeleton's `_(Pending Task 5
+  dispatch.)_` placeholder).
+
+**Total LoC delta:** +380 insertions / 0 deletions across the 5 new
+files (excluding the PROGRESS.md self-narration). The 380-LoC count is
+dominated by comments + the README's narrative + per-probe expectations
+block — total production-equivalent code is ~30 LoC of YAML structure
+and ~30 LoC of Rust wrapper boilerplate.
+
+**Tests landed (1 new; 779 → 780 in workspace test count).**
+1. `http_filter_rbac_fixture` (under `differential::tests::http_filter_rbac`)
+   — bare `#[tokio::test]` that constructs the fixture-dir `PathBuf` and
+   awaits `differential::run_fixture(&dir)`. Skipped by the harness when
+   Docker is unavailable; PASS locally with Docker available.
+
+**LoC delta detail (per file).**
+- `envoy.yaml`: +97 (HCM filter chain + RBAC policy + per-side asymmetry comments).
+- `envoy-rust.yaml`: +55 (symmetric narrow shape; no admin block; 127.0.0.1 bind).
+- `expectations.yaml`: +69 (4-probe `Driver::Http1ProbeList` with per-probe `extra_headers`).
+- `README.md`: +126 (filter-chain narrative + ADR-0034 contract + per-side asymmetry rationale).
+- `http_filter_rbac.rs`: +33 (doc-comment + `#[tokio::test]` + `PathBuf` + `run_fixture` call).
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS (no output).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  — PASS (0 warnings).
+- `cargo build --workspace --all-targets` — PASS.
+- `cargo test --workspace` — PASS (780 passed, 0 failed, 2 ignored;
+  +1 vs the phase-10 Task 4 snapshot of 779 — exactly the new
+  `http_filter_rbac_fixture` Docker-gated wrapper).
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok,
+  sources ok; pre-existing unencountered-license warnings unchanged
+  from Task 4).
+- (Locally) `cargo test -p differential --test http_filter_rbac --
+  --nocapture`: PASS (`1 passed; 0 failed; 0 ignored; finished in 0.88s`;
+  envoy-rust subprocess + upstream Docker container both completed the
+  4-probe burst with matching status / body / header sets).
+
+**Per-task deviations from PLAN (4 — adapted from the dispatch brief's
+"Critical PLAN drifts" preflight).**
+
+1. **YAML key rename: `request_headers:` → `extra_headers:`** in the 4
+   probe entries in `expectations.yaml`. PLAN Step 4 (lines 2026-2065)
+   used `request_headers:` but the on-disk `Http1Probe` struct at
+   `tests/differential/src/lib.rs:619-635` declares the field as
+   `extra_headers: Vec<(String, String)>` with `#[serde(default)]`
+   (landed at phase 04.2). The 4 probes use `extra_headers:`; probe 1
+   writes `extra_headers: []` explicitly for narrative clarity (the
+   serde default is also an empty Vec so omission would be equivalent).
+   No harness modification needed; the per-probe distinct-headers axis
+   was already supported.
+
+2. **YAML `port_value: {{PORT}}` substitution + admin `port_value: 0`.**
+   PLAN Step 2 verbatim wrote `port_value: 10000` for the data-plane
+   listener and `port_value: 9901` for the admin block. The harness
+   substitutes `{{PORT}}` to a per-fixture-run kernel-ephemeral port (see
+   `tests/differential/src/lib.rs:1635` → `reserve_port()`); the
+   fixture-0016 precedent uses `port_value: {{PORT}}` on the data-plane
+   listener on BOTH sides and `port_value: 0` (kernel-ephemeral) for the
+   upstream-Envoy admin block. Adapted both sides to the precedent.
+
+3. **Wrapper test signature + cfg gating.** PLAN Step 6 verbatim showed
+   `run_fixture("0017-http-filter-rbac")` (string-literal arg) AND
+   `#[cfg(differential_docker)] mod docker { ... }` gating. Both were
+   wrong against disk: `differential::run_fixture` signature is
+   `pub async fn run_fixture(fixture_dir: &Path) -> Result<()>`
+   (verified at `tests/differential/src/lib.rs:1632`); there is NO
+   `differential_docker` cfg feature in `tests/differential/Cargo.toml`;
+   the fixture-0016 wrapper at
+   `tests/differential/tests/http_filter_local_rate_limit.rs` is a bare
+   `#[tokio::test]` with NO cfg gating (Docker-gating happens at the
+   harness cluster level when `DOCKER_HOST` is unavailable). Wrapper
+   adapted to mirror the 0016 shape verbatim: `PathBuf::from(env!(
+   "CARGO_MANIFEST_DIR")).join(...).join(...).join("tests/fixtures/
+   0017-http-filter-rbac")` + `differential::run_fixture(&dir).await`.
+   Step 7's PLAN command line `cargo test ... --features
+   differential_docker` was correspondingly dropped (no such feature).
+
+4. **YAML quoting on `string_match: { exact: "yes" }`.** Bare `yes` /
+   `no` parse as YAML booleans (`true` / `false`); the RBAC matcher
+   requires the literal strings `"yes"` / `"no"`. Quoted both
+   occurrences in both `envoy.yaml` and `envoy-rust.yaml` (the matcher
+   exact value) and in `expectations.yaml`'s `extra_headers` entries
+   (the request-header values). The PLAN Step 2 verbatim already
+   correctly quoted `exact: "yes"`; this deviation entry documents that
+   the convention is intentional and enforced across all 3 YAML
+   surfaces of the fixture.
+
+**Carryforward dispositions unchanged.** The 09 REVIEW M3 still targets
+Task 7 per the original disposition; not engaged at Task 5. All other
+carryforwards continue per the Task-1 preamble's table; 09 REVIEW M2
+remains CLOSED at Task 4.
+
+**STATE.md / ROADMAP.md / DECISIONS.md / BEHAVIOR_CONTRACT.md /
+ENVOY_TARGET.md / rust-toolchain.toml diffs at this commit:** None.
+(`DECISIONS.md` ledger head stays at ADR-0034; no new ADR projected at
+Task 5.) `tests/differential/src/lib.rs` is also NOT modified (the
+state-2 PLAN's anticipated harness extension for per-probe
+`request_headers` was obviated by the existing `extra_headers` field).
 
 ### Task 6 — D8.2 fuzz corpus seed
 

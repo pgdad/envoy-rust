@@ -1,0 +1,69 @@
+# Phase 10: 4-probe sequential burst against the HCM filter chain
+#   [envoy.filters.http.rbac, envoy.filters.http.router]
+# with action: ALLOW + one policy "pass_with_header" requiring the
+#   x-rbac-pass: yes
+# header on the request. Both proxies must produce the deterministic
+# status sequence [403, 200, 403, 200] for the 4 probes below.
+#
+# Probe sequence:
+#   1. (no x-rbac-pass header)        — DENY (no policy matches; default-Deny under action: ALLOW)
+#   2. x-rbac-pass: yes               — ALLOW (principal exact-matches "yes")
+#   3. x-rbac-pass: no                — DENY (principal exact-match fails on "no")
+#   4. x-rbac-pass: yes               — ALLOW (repeats probe 2 to demonstrate determinism;
+#                                       RBAC is stateless so no order-coupling matters)
+#
+# Per ADR-0034 (phase-10 state-2 §6.2 empirical-verification revision):
+# the 403 response body is `"RBAC: access denied"` (19 bytes, NO trailing
+# newline). Upstream Envoy v1.33's `envoy.extensions.filters.http.rbac.v3.RBAC`
+# source-hardcodes this body; envoy-rust matches via
+# `Bytes::from_static(b"RBAC: access denied")` per phase-10 PLAN lock-in #14.
+# The 5 standard HTTP/1.1 response headers (server / date / content-length /
+# content-type / connection) are decorated onto the filter-synth 403 by the
+# H1 HCM `decorate_filter_synth_response` helper (landed at phase-09
+# ADR-0033 Commit C `ae2cef0`); this fixture is the first non-LocalRateLimit
+# bilateral consumer of that helper.
+#
+# The set_equal_modulo_allow_list disposition compares header SETS modulo
+# the documented allow-list at BEHAVIOR_CONTRACT.md (`server` + `date` rows
+# cover the implementation-identifying / wall-clock divergences; the
+# remaining 3 standard headers content-length / content-type / connection
+# are value-exact across proxies under the harness's `Connection: close`
+# request framing).
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-deny-no-header
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers: []
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "RBAC: access denied" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-allow-with-header
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-rbac-pass, "yes"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-deny-wrong-value
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-rbac-pass, "no"]
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "RBAC: access denied" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-4-allow-with-header-again
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-rbac-pass, "yes"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
