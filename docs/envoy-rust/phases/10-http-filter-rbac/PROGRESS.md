@@ -1702,8 +1702,12 @@ evidence anchor + STATE advance).
 **Total LoC delta at THIS commit** per the Task 6 + Task 7 fixup
 convention (counts the PROGRESS self-edit + STATE.md edits as the
 two file-level deltas — both pure documentation; no source code or
-test code): docs-only; approximately +395 lines (PROGRESS state-4
-evidence anchor subsection replacing the 1-line placeholder ≈ +325
-net) + STATE.md edits (~+70 net — status/next-skill/last-commit/
-last-updated rewrites in-place + new ~50-line "Phase-10 state-3
-execution arc" subsection appended in Notes).
+test code): **+588 insertions / 36 deletions across 2 files** per
+`git diff --shortstat 064a8a5..<this-commit>`: +419 / -1 in
+`docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` (state-4
+evidence anchor subsection replacing the line-1289 placeholder) +
++169 / -35 in `docs/envoy-rust/STATE.md` (status / next-skill /
+last-commit / last-updated rewrites — prior content preserved
+verbatim as "Historical reference" blocks below — plus the new
+"Phase-10 state-3 execution arc" subsection appended at end of
+Notes).
