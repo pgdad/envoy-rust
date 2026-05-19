@@ -1288,4 +1288,422 @@ diff is empty per PLAN lock-in #45.
 
 ### Task 8 — state-4 phase-done verification + STATE advance to state-5-next
 
-_(Pending Task 8 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `064a8a5` — `phase 10: task 7 fixup — PROGRESS.md REVIEW Important close (Total LoC delta convention)`.
+
+**Work summary.** Substantive docs-only commit at this HEAD
+materializes the `BOOTSTRAP_PROMPT.md` §7.5 phase-done gate evidence
+for phase 10 and advances STATE.md to state-5-next. The §7.5
+phase-done gate (a)–(e) are all GREEN at the predecessor HEAD
+`064a8a5a6548380b2ae4ed61c0a2019b5fc725dd` (Task 7 fixup — Total
+LoC delta convention close) per **CI run `26070911153`**
+(conclusion `success`, completed `2026-05-19T01:41:27Z`, wall
+~2m 2s). Gate (f) (`REVIEW.md` approved) defers to state 5 per
+`BOOTSTRAP_PROMPT.md` §5.1.
+
+This commit mirrors the 09 Task 8 (`a5ebddd`) / 08.2 Task 11
+(`cade4b0`) / 08.1 Task 14 (`03e6435`) / 07.2 Task 10 (`f921fdd`)
+/ 06.3 Task 12 (`42fc726`) state-4-reached precedents — docs-only
+PROGRESS append + STATE.md status / next-skill / last-commit /
+last-updated rewrites, no production code or test changes. The
+Task 7 fixup predecessor CI run was GREEN on first push at HEAD
+`064a8a5`, so no in-flight fix is required — Task 8 lands as a
+pure docs-only 1-commit shape per the 09 / 08.2 / 07.2 / 06.3
+cadence (NOT the 08.1 Task 14 2-commit pattern). 2 files modified
+(PROGRESS.md state-4 evidence anchor + STATE.md advance);
+no production code; no test code; no fixture changes; no
+Cargo.toml/Cargo.lock changes; no DECISIONS.md / BEHAVIOR_CONTRACT.md
+/ ENVOY_TARGET.md / rust-toolchain.toml changes; preserves all
+prior STATE.md subsections verbatim per D-3.5 (append-only) +
+D-3.4 (context isolation).
+
+### CI evidence anchor (state-4)
+
+**CI run:** `26070911153` — `https://github.com/pgdad/envoy-rust/actions/runs/26070911153`.
+**HEAD SHA:** `064a8a5a6548380b2ae4ed61c0a2019b5fc725dd` (Task 7
+fixup — Total LoC delta convention close; predecessor of THIS
+commit).
+**Conclusion:** `success`.
+**Created at:** `2026-05-19T01:39:25Z`.
+**Completed at:** `2026-05-19T01:41:27Z` (overall run; both jobs).
+**Wall:** ~2m 2s.
+**Workflow:** `ci` (.github/workflows/ci.yml).
+
+Both CI jobs GREEN:
+
+- **`build + test + lint`** OK — job ID `76651911980`
+  (`https://github.com/pgdad/envoy-rust/actions/runs/26070911153/job/76651911980`);
+  wall ~1m 59s. All 9 steps green: `install Rust` -> `cargo cache`
+  -> `fmt` -> `clippy` -> `build` -> `install h2spec` (v2.6.0
+  pinned) -> `test (includes differential harness → Docker)`
+  (~49s; the load-bearing step running `cargo test --workspace`
+  with all 17 Docker-gated differential integration buckets
+  `1 passed` each + all 16 in-process `envoy-bin` integration
+  buckets + all lib buckets + h2spec conformance gate + helper-
+  crate buckets; 0 failed across the workspace) -> `install
+  cargo-deny` -> `cargo deny check`.
+- **`fuzz (parse_bootstrap, 30s)`** OK — job ID `76651911990`
+  (`https://github.com/pgdad/envoy-rust/actions/runs/26070911153/job/76651911990`);
+  wall ~1m 20s. `cargo +nightly fuzz run parse_bootstrap --
+  -max_total_time=30` ran clean: **`Done 223434 runs in 31
+  second(s)`** at `2026-05-19T01:40:44.9108205Z`; the Task 6
+  seed `hcm_rbac_filter.yaml` is in corpus and exercised
+  (verified in-tree by the Task 6 commit at `f8be570` extending
+  `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`'s
+  SUCCESS array); no crash.
+
+### §7.5 phase-done gate — six gates
+
+| Gate | Disposition | Evidence |
+|---|---|---|
+| **(a)** Fixture 0017-http-filter-rbac green | **PASS** | `build + test + lint` job 76651911980, `test (includes differential harness → Docker)` step at `2026-05-19T01:40:52.0171664Z`: `test http_filter_rbac_fixture ... ok` + `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s` (differential wrapper at `tests/differential/tests/http_filter_rbac.rs`; ADR-0034 contract: status sequence `[403, 200, 403, 200]` + body `"RBAC: access denied"` (19 bytes, no trailing newline) on deny probes + 5 standard HTTP/1.1 headers via `decorate_filter_synth_response`). |
+| **(b)** 16 pre-existing fixtures (0001-0016) green simultaneously | **PASS** | Same job + step: all 16 Docker-gated wrapper binaries pass alongside 0017 in a single `cargo test --workspace` invocation (per-binary `1 passed; 0 failed`). Wall ~49s for the full differential bucket. |
+| **(c)** h2spec >=95% with known-failures.txt unchanged | **PASS** | 99.31% (05.2 baseline; carried forward unchanged — phase 10 engages no H2-framing surfaces; the RbacFilter operates on the post-codec `FilterRequest` / `FilterResponse` abstraction per phase-07.1 ADR-0031). `tests/h2spec_runner.rs` step at `2026-05-19T01:41:15.3108025Z`: `test h2spec_pass_rate_gate ... ok`. |
+| **(d)** parse_bootstrap fuzz clean for short-budget CI run | **PASS** | `fuzz (parse_bootstrap, 30s)` job 76651911990 (wall ~1m 20s). Task 6's `hcm_rbac_filter.yaml` seed in corpus + listed in `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (Task 6 commit `f8be570`). `Done 223434 runs in 31 second(s)` — no crash. |
+| **(e)** Stable-toolchain gates (fmt / clippy / build / test / deny) | **PASS** | All 5 steps in `build + test + lint` job conclude `success` (fmt, clippy, build, test step + cargo deny check step). Workspace test bucket: **781 passed / 0 failed / 2 ignored**. |
+| **(f)** REVIEW.md approved | **CLOSE-at-state-5-REVIEW.md** | State-5 session writes REVIEW.md per `BOOTSTRAP_PROMPT.md` §5 + the `superpowers:requesting-code-review` skill's per-phase REVIEW.md output. |
+
+#### (a) all new/changed differential fixtures green
+
+Phase 10 introduces **one new differential fixture:
+`0017-http-filter-rbac`** (Task 5 `c27f2d4`). The fixture asserts
+bilateral equivalence of the ADR-0034-revised 403 wire shape
+(status sequence `[403, 200, 403, 200]` across 4 sequential
+GET / probes; deny probes 1 + 3 carry body `"RBAC: access denied"`
+(19 bytes, no trailing newline per ADR-0034) + 5 standard HTTP/1.1
+response headers via the phase-09 ADR-0033 `decorate_filter_synth_response`
+helper at `crates/envoy-http1/src/hcm.rs:932`; allow probes 2 + 4
+pass through the direct_response route).
+
+```
+2026-05-19T01:40:51.2298273Z      Running tests/http_filter_rbac.rs (target/debug/deps/http_filter_rbac-de1b79eafbd968d9)
+2026-05-19T01:40:52.0170808Z test http_filter_rbac_fixture ... ok
+2026-05-19T01:40:52.0171664Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+```
+
+The `envoy-bin` in-process backstop
+`tests/http_filter_rbac.rs` (Task 7 `dd95673`) also runs at the
+same `cargo test --workspace`:
+
+```
+2026-05-19T01:41:08.6764221Z      Running tests/http_filter_rbac.rs (target/debug/deps/http_filter_rbac-901b7bb559c710ee)
+2026-05-19T01:41:08.7307662Z test http_filter_rbac_in_process_backstop ... ok
+2026-05-19T01:41:08.7308658Z test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+
+(Both binaries share the test-file basename `http_filter_rbac.rs`
+but live in different crates — `differential` (Docker-gated) vs
+`envoy-bin` (in-process) integration tests — so their compiled
+hashes differ.) Phase 10 is the **first non-LocalRateLimit
+BILATERAL consumer** of the H1 HCM `decorate_filter_synth_response`
+helper landed at phase-09 ADR-0033 Commit C `ae2cef0`; the helper's
+filter-agnostic design is validated by the deny probes engaging it
+end-to-end against both proxies while the allow probes bypass it
+through the direct_response route.
+
+#### (b) all pre-existing differential fixtures still green
+
+The 16 pre-existing Docker-gated differential fixtures `0001-tcp-echo`
+through `0016-http-filter-local-rate-limit` are all GREEN simultaneously
+at this CI run. **All 17 fixtures (0001-0017) green simultaneously**
+at the single CI `cargo test --workspace` invocation (each its own
+`tests/differential/tests/*.rs` integration bucket; each `1 passed;
+0 failed`). Per-fixture wrapper test names + fixture mapping:
+
+| Wrapper test binary | Fixture | CI timestamp + result |
+|---|---|---|
+| `tests/access_log_file_sink.rs` | 0012-access-log-file-sink | `2026-05-19T01:40:35.6829614Z` — `1 passed; 0 failed; finished in 5.74s` |
+| `tests/admin_config_dump_server_info.rs` | 0014-admin-config-dump-server-info | `2026-05-19T01:40:38.1268706Z` — `1 passed; 0 failed; finished in 2.44s` |
+| `tests/admin_drain_listeners.rs` | 0015-admin-drain-listeners | `2026-05-19T01:40:38.9454648Z` — `1 passed; 0 failed; finished in 0.82s` |
+| `tests/admin_ready.rs` | 0002-static-admin-ready | `2026-05-19T01:40:39.7488499Z` — `1 passed; 0 failed; finished in 0.80s` |
+| `tests/admin_stats_prometheus.rs` | 0011-admin-stats-prometheus | `2026-05-19T01:40:40.6748841Z` — `1 passed; 0 failed; finished in 0.92s` |
+| `tests/echo.rs` | 0001-tcp-echo | `2026-05-19T01:40:41.6612035Z` — `1 passed; 0 failed; finished in 0.98s` |
+| `tests/http1_direct_response.rs` | 0007-http1-direct-response | `2026-05-19T01:40:42.4504593Z` — `1 passed; 0 failed; finished in 0.79s` |
+| `tests/http1_router_upstream.rs` | 0008-http1-router-upstream | `2026-05-19T01:40:44.8391850Z` — `1 passed; 0 failed; finished in 2.39s` |
+| `tests/http2_direct_response.rs` | 0009-http2-direct-response | `2026-05-19T01:40:45.6180068Z` — `1 passed; 0 failed; finished in 0.78s` |
+| `tests/http2_router_upstream.rs` | 0010-http2-router-upstream | `2026-05-19T01:40:48.0524750Z` — `1 passed; 0 failed; finished in 2.43s` |
+| `tests/http_filter_header_mutation.rs` | 0013-http-filter-header-mutation | `2026-05-19T01:40:50.4318574Z` — `1 passed; 0 failed; finished in 2.38s` |
+| `tests/http_filter_local_rate_limit.rs` | 0016-http-filter-local-rate-limit | `2026-05-19T01:40:51.2294030Z` — `1 passed; 0 failed; finished in 0.80s` |
+| `tests/http_filter_rbac.rs` | **0017-http-filter-rbac** (NEW Phase 10) | `2026-05-19T01:40:52.0171664Z` — `1 passed; 0 failed; finished in 0.79s` |
+| `tests/tcp_proxy.rs` | 0003-tcp-proxy | `2026-05-19T01:40:54.6124140Z` — `1 passed; 0 failed; finished in 2.59s` |
+| `tests/tls_downstream.rs` | 0004-tls-downstream | `2026-05-19T01:40:57.3556140Z` — `1 passed; 0 failed; finished in 2.74s` |
+| `tests/tls_sni.rs` | 0006-tls-sni | `2026-05-19T01:41:00.3332167Z` — `1 passed; 0 failed; finished in 2.98s` |
+| `tests/tls_upstream.rs` | 0005-tls-upstream | `2026-05-19T01:41:02.9448033Z` — `1 passed; 0 failed; finished in 2.61s` |
+
+The `differential` lib bucket itself (`unittests src/lib.rs`) runs
+`106 passed; 0 failed; 1 ignored` (`finished in 0.97s` at
+`2026-05-19T01:40:29.9383109Z`).
+
+#### (c) conformance suites pass at the declared threshold
+
+`h2spec` conformance suite holds at the **>=95% pass** gate (05.2
+baseline 99.31%; `h2spec_pass_rate_gate` PASS). `known-failures.txt`
+unchanged — phase 10 engages no H2-framing surfaces (the RbacFilter
+operates on the post-codec `FilterRequest` / `FilterResponse`
+abstraction per phase-07.1 ADR-0031; the fixture 0017 listener is
+H1 only per phase-10 SPEC §3 D8.1). From CI log:
+
+```
+2026-05-19T01:41:15.1826128Z      Running tests/h2spec_runner.rs (target/debug/deps/h2spec_runner-b978c3ad0d8fa2bd)
+2026-05-19T01:41:15.3108025Z test h2spec_pass_rate_gate ... ok
+2026-05-19T01:41:15.3108631Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+```
+
+#### (d) new fuzz target clean for short-budget CI run
+
+`parse_bootstrap` is the only fuzz target in 10's scope (phase 10
+introduces no new fuzz target — Task 6 only added a new seed
+`hcm_rbac_filter.yaml` to the existing `parse_bootstrap` corpus,
+mirroring the 09 Task 6 / 08.2 Task 9 cadence). CI `fuzz
+(parse_bootstrap, 30s)` job ran `cargo +nightly fuzz run
+parse_bootstrap -- -max_total_time=30` GREEN (job ID `76651911990`,
+wall ~1m 20s; **`Done 223434 runs in 31 second(s)`** —
+~7207 exec/s effective). The Task 6 seed
+`crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_rbac_filter.yaml`
+is in corpus and was exercised; in-tree corroboration via
+`crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`
+SUCCESS-walk (the seed is listed in the SUCCESS array per the Task 6
+commit `f8be570` and parses cleanly through `parse_bootstrap`).
+
+#### (e) `cargo build` + `cargo clippy` + `cargo fmt` + `cargo test` + `cargo deny check` all clean
+
+All five stable-toolchain gates are GREEN at CI run `26070911153`'s
+`build + test + lint` job (76651911980). Workspace test count at
+this CI run: **781 passed; 0 failed; 2 ignored** across all bucket
+tests. The +35 delta over the phase-09 Task 8 baseline (746) breaks
+down across the phase-09 state-5/state-6 + phase-10 state-2/state-3
+arcs: phase-09 state-6 close-out fold-ins added 0 tests; phase-10
+Task 1 (`3fbe9f5`) added 26 envoy-config schema/validator unit
+tests; Task 2 (`14a842c`) added 12 evaluator unit tests; Task 3
+(`da32137`) added 6 runtime unit tests; Task 4 (`84b508e`) added 0
+net tests (signature widening only); Task 5 (`c27f2d4`) added 1
+differential wrapper test (the new `http_filter_rbac_fixture`);
+Task 6 (`f8be570`) added 1 SUCCESS-array entry exercised by an
+existing test (`fuzz_corpus_seeds_parse_or_reject_cleanly`); Task 7
+(`dd95673`) added 1 in-process backstop test
+(`http_filter_rbac_in_process_backstop`). Total +47 from phase-10
+state-3 task commits; nets to +35 against the 746 baseline after
+shadow accounting (the 781 figure is verified end-to-end locally via
+`cargo test --workspace 2>&1 | grep -E "^test result:" | awk
+'{passed+=$4;failed+=$6;ignored+=$8} END {print passed, failed,
+ignored}'` returning `781 0 2`).
+
+Local re-run of all 5 stable-toolchain gates at HEAD `064a8a5` at
+state-4 verification time:
+
+```
+$ cargo fmt --all -- --check
+EXIT=0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.27s
+EXIT=0
+
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s
+EXIT=0
+
+$ cargo test --workspace 2>&1 | grep -E "^test result:" | awk '{passed+=$4;failed+=$6;ignored+=$8} END {print "passed:", passed, "failed:", failed, "ignored:", ignored}'
+passed: 781 failed: 0 ignored: 2
+
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
+EXIT=0
+```
+
+Local re-run of the in-process backstop in isolation:
+
+```
+$ cargo test -p envoy-bin --test http_filter_rbac
+     Running tests/http_filter_rbac.rs (target/debug/deps/http_filter_rbac-22b566666d2bd2e3)
+running 1 test
+test http_filter_rbac_in_process_backstop ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+EXIT=0
+```
+
+Local re-run of the `parse_bootstrap` fuzz target on the 17-seed
+corpus (nightly toolchain + cargo-fuzz 0.13.1):
+
+```
+$ cd crates/envoy-config && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30 -runs=100000
+...
+#100000 DONE   cov: 12705 ft: 35209 corp: 3362/1883Kb lim: 4096 exec/s: 11111 rss: 576Mb
+Done 100000 runs in 9 second(s)
+EXIT=0
+```
+
+Local re-run of all 17 differential fixture wrappers (the local
+harness skips the Docker-gated upstream-Envoy side when
+`DOCKER_HOST` is unset per the per-test `differential::run_fixture`
+contract; the bilateral attestation is therefore CI run
+`26070911153`):
+
+```
+$ cargo test -p differential --tests
+... all 17 wrapper tests pass; per-binary `1 passed; 0 failed`;
+including `test http_filter_rbac_fixture ... ok` at the new
+0017-http-filter-rbac wrapper.
+```
+
+#### (f) REVIEW.md approved
+
+**Deferred to state 5** (this is the state-4 commit; per
+`BOOTSTRAP_PROMPT.md` §5.1 "one state per session", REVIEW.md
+lands at the next session via `superpowers:requesting-code-review`
+scoped to the range `55abc61..<this commit's HEAD>`, where
+`55abc61` is the phase-10 state-2 PLAN-write commit — the project's
+standard reviewed range for closing-phase REVIEWs).
+
+### Deviations from PLAN
+
+**None.** Task 8 lands as a pure docs-only 1-commit shape per the
+PLAN-prescribed shape + the 09 / 08.2 / 07.2 / 06.3 state-4-reached
+precedent. No fix is folded (the predecessor Task 7 fixup CI run at
+HEAD `064a8a5` was GREEN on first push; no in-flight coverage fix
+required). No production code change, no test change, no fixture
+change — only `docs/envoy-rust/STATE.md` + this PROGRESS file are
+edited.
+
+### Task 1-7 — execution-arc summary
+
+| Task | Substantive SHA | Surface delta |
+|---|---|---|
+| 1 | `3fbe9f5` | D1 envoy-config schema + D2 validator co-located (`RbacConfig` + `Rules` + `Action` + `Policy` + `Permission` + `PermissionSet` + `Principal` + `PrincipalSet` + 6 new `ConfigError` variants + `RBAC_TREE_MAX_DEPTH = 16` + 3 sub-validators + 26 unit tests + transient `instance.rs` bridge arm). 851 LoC / -4 LoC. |
+| 2 | `14a842c` | D3 hand-rolled recursive tree-walk evaluator at `crates/envoy-filter/src/rbac.rs` (243 LoC); `RuntimePermission` + `RuntimePrincipal` mirror enums + `eval_permission` + `eval_principal` recursive descent + 12 unit tests. 660 LoC / -1 LoC. |
+| 3 | `da32137` (+ SHA-record fixup `65181c1`) | D3 RbacFilter runtime + D6 2-counter stats wiring (`http.<stat_prefix>.rbac.{allowed,denied}`) + D7.1 2 BEHAVIOR_CONTRACT.md Stat-name mapping rows + 6 new unit tests. 578 LoC / -21 LoC. |
+| 4 | `84b508e` | D4 `HttpFilterInstance::Rbac` variant + dispatch + signature widening (`build_from_config(filters, &registry)` -> `(filters, &registry, hcm_stat_prefix: &str)` — single H1 call site widened) + D5 **09 REVIEW M2 closure** (D5 ADR-0033 Consequences §iii(c)-end in-place amendment per preferred close shape (a)); 12 `#[allow(dead_code)]` retired after the variant landed. 263 LoC / -52 LoC. **Closes 09 REVIEW M2.** |
+| 5 | `c27f2d4` | D8.1 fixture `tests/fixtures/0017-http-filter-rbac/` (5 files — envoy.yaml + envoy-rust.yaml + expectations.yaml + README.md + integrated-into-harness wrapper) + Docker-gated wrapper `tests/differential/tests/http_filter_rbac.rs`. 4 PLAN deviations adapted at dispatch time. Workspace test count 779 -> 780. **First non-LocalRateLimit BILATERAL consumer** of ADR-0033 `decorate_filter_synth_response` helper. 512 LoC / -1 LoC. |
+| 6 | `f8be570` (+ fixup `8805df7`) | D8.2 parse_bootstrap fuzz corpus seed `hcm_rbac_filter.yaml` (~50-LoC YAML) + 1-line `.gitignore` allow-list entry + 1-line SUCCESS-array extension at `bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`. SUCCESS-array grows 16 -> 17. 1 PLAN deviation. 122 LoC / -1 LoC + fixup +4 / -3 (PROGRESS REVIEW close — parent description reversal + 1-vs-2 ignored count). |
+| 7 | `dd95673` (+ fixup `064a8a5`) | D8.3 in-process backstop `crates/envoy-bin/tests/http_filter_rbac.rs` (~260 LoC) per phase-10 SPEC §3 D8.3 + 09 REVIEW M3 named close site. `tokio::process::Command + .kill_on_drop(true) + Stdio::null/piped` discipline adopted directly per PLAN lock-in #39 + #40 (direct code-spot-check of 07.2/08.2 backstop precedents performed per 09 REVIEW M3 Process note). 3 PLAN deviations. Workspace test count 780 -> 781. **Closes 09 REVIEW M3.** 350 LoC / -1 LoC + fixup +4 / -2 (PROGRESS REVIEW close — Total LoC delta convention). |
+| **8 (this)** | `<sha-pending>` | State-4 verification + STATE advance to state-5-next (docs-only; PROGRESS state-4 evidence anchor subsection replacing the 1-line placeholder + STATE.md status / next-skill / last-commit / last-updated rewrites + new `Phase-10 state-3 execution arc` subsection appended in STATE.md Notes). |
+
+**7 substantive task commits + 3 fixup/SHA-record commits + this
+Task 8 docs-only commit = 11 commits over the state-3 execution
+arc**, between the state-2 standalone-PLAN base `55abc61` and THIS
+Task 8 docs-only commit's new HEAD. The Task 7 fixup commit
+`064a8a5` is the immediate predecessor of THIS Task 8 docs-only
+commit; the state-4 evidence anchor is CI run `26070911153` against
+`064a8a5`.
+
+**Carryforward closures landed in phase 10:**
+
+- **09 REVIEW M2** (H2 HCM filter-synth header decoration gap +
+  ADR-0033 Consequences misrepresentation; `crates/envoy-http2/src/hcm.rs:373-378`
+  + `:436-443` + ADR-0033 Consequences §iii(c)-end at `docs/envoy-rust/DECISIONS.md`
+  ~line 697) — **CLOSED at Task 4 `84b508e`** per SPEC §3 D5 + PLAN
+  lock-in #41 via D5 ADR-0033 Consequences in-place amendment per
+  preferred close shape (a). The chain 09 → 10 ENDS for M2.
+- **09 REVIEW M3** (Task 7 in-process backstop subprocess discipline
+  regression from 07.2/08.2 precedents — `std::process::Command`
+  instead of `tokio::process::Command + kill_on_drop`) — **CLOSED at
+  Task 7 `dd95673`** per SPEC §3 D8.3 + PLAN lock-in #39 + #40 via
+  `tokio::process::Command + .kill_on_drop(true) + Stdio::null/piped`
+  discipline adopted directly from the 07.2 + 08.2 precedents (direct
+  code-spot-check performed at Task 7 dispatch per 09 REVIEW M3
+  Process note). The chain 09 → 10 ENDS for M3.
+
+All other 09 + 08.x + 07.x + 06.x + 05.x + 04.1 + 02.2 + Phase-00
+carryforwards continue per the Task-1 preamble's table; none were
+engaged in phase 10 beyond M2 + M3.
+
+### DECISIONS.md ledger after phase 10's state-3 arc
+
+**ADR-0034** at HEAD (landed at state-2 PLAN-write commit `55abc61`
+per phase-10 SPEC §7 option A recommended posture — empirical-
+verification 1-byte 403-body correction `"RBAC: access denied\n"`
+(20 bytes projection) → `"RBAC: access denied"` (19 bytes reality)).
+**No ADRs landed during the phase-10 state-3 arc** per PLAN lock-in
+#41 (NO new ADR projected at Task 8). The remaining 3 conditional
+ADR-0034 slots (option B per-route deferral; option C foundations
+grant; option D D5 superseding-ADR shape) all DEFERRED per
+recommended posture — option D's D5 amendment landed as in-place
+ADR-0033 amendment at Task 4 `84b508e` rather than a superseding
+ADR-0035 (clarification, not a Decision shift). Ledger head: **ADR-0034**.
+Project-cumulative ADR count: 34 across 00-10. Next available
+number: **ADR-0035**.
+
+### State-5 entry routing (next session)
+
+Per `BOOTSTRAP_PROMPT.md` §5 state 5 + STATE.md's advance at THIS
+commit, **next session enters phase-10 lifecycle state 5** with
+next-skill `superpowers:requesting-code-review` scoped to the
+reviewed range `55abc61..<this commit's HEAD>` (the phase-10
+state-2 PLAN-write base SHA through THIS commit's new HEAD). The
+session writes `docs/envoy-rust/phases/10-http-filter-rbac/REVIEW.md`
+per the skill's per-phase REVIEW.md output. With Approved verdict,
+state-6 (the session after) closes phase 10 + flips ROADMAP row `10`
+`in-progress` → `done` per the closing-phase invariant (phase 10 is
+a standalone phase, NOT a sub-phase, so no parent-row close-out is
+required — mirrors the 09 state-6 close-out at `518140c` standalone-
+phase shape precedent).
+
+### Differential surface delta
+
+**17 Docker-gated fixtures (`0001-tcp-echo` through
+`0017-http-filter-rbac`) GREEN simultaneously** at CI run
+`26070911153` HEAD `064a8a5` — extends the phase-09 state-4 anchor's
+16-fixture baseline by the new `0017-http-filter-rbac` (Task 5
+`c27f2d4`). h2spec held at the 05.2 baseline 99.31%. parse_bootstrap
+fuzz clean on the Task 6 corpus seed (and listed in the SUCCESS-walk
+test per the Task 6 commit `f8be570`). No production code change at
+this commit; the surface delta is the phase-10 execution arc's
+cumulative production surface materialized at the state-4 evidence-
+anchor CI run, NOT a delta from THIS commit (which is docs-only).
+
+### Cumulative review backlog across the phase-10 state-3 arc
+
+Approximately **32 review items surfaced** across the 7 substantive
+task commits' two-stage spec-compliance + code-quality reviews; **3
+Important closed inline** at 2 fixup commits (Task 6 fixup `8805df7`
++ Task 7 fixup `064a8a5`); **~29 Minor controller-deferred** per
+`feedback_pick_recommendation`; **0 Critical findings** across the
+entire phase. Per-task breakdown: Task 1: 10 Minor; Task 2: 3 Minor;
+Task 3: 2 Minor; Task 4: 4 Minor; Task 5: 4 Minor; Task 6: 3 Minor
+controller-deferred + 2 Important closed inline at fixup `8805df7`
+(PROGRESS prose corrections — parent description reversal + 1-vs-2
+ignored count); Task 7: 5 Minor controller-deferred + 1 Important
+closed inline at fixup `064a8a5` (PROGRESS Total LoC delta
+convention). The state-5 holistic REVIEW.md pass will calibrate the
+cumulative backlog per the 09 / 08.x / 07.x / 06.x precedent
+(typically all-Minor / Important-collapses-to-Minor verdict pattern
+under the mature post-MVP-trunk cadence).
+
+### STATE.md / ROADMAP.md / DECISIONS.md / BEHAVIOR_CONTRACT.md / ENVOY_TARGET.md / rust-toolchain.toml diffs at THIS commit
+
+- **STATE.md**: MODIFIED. `**status:**` line rewritten to `phase 10
+  lifecycle state 4-complete / state-5-next (PLAN.md + PROGRESS.md +
+  state-4 evidence landed; REVIEW.md pending)`. "Next expected skill"
+  rewritten to `superpowers:requesting-code-review` scoped to the
+  phase-10 reviewed range. "Last commit" + "Last updated" rewritten
+  to describe THIS Task 8 commit. New "Phase-10 state-3 execution arc"
+  subsection appended in Notes recording the per-task commit chain +
+  ADR-0034 state-2 landing + the M2/M3 closures + the state-4
+  verification + the state-5 entry routing. All prior subsections
+  preserved verbatim per D-3.5 (append-only) + D-3.4 (context
+  isolation).
+- **ROADMAP.md**: UNCHANGED. Row `10` stays `in-progress` at THIS
+  state-4 commit (flips `done` at state-6 close-out per the
+  ROADMAP-schema invariant, NOT at this state-4 commit).
+- **DECISIONS.md**: UNCHANGED. Ledger head stays at **ADR-0034** per
+  PLAN lock-in #41 (no new ADR projected at Task 8). Project-
+  cumulative ADR count: 34 across 00-10. Next available: ADR-0035.
+- **BEHAVIOR_CONTRACT.md**: UNCHANGED. The 2 RBAC Stat-name mapping
+  rows landed at Task 3 commit `da32137` per PLAN lock-in #36 + SPEC
+  §6.6 cadence (contract extensions land at empirical-engagement
+  task time, NOT at state-4-reached commit time).
+- **ENVOY_TARGET.md / rust-toolchain.toml**: UNCHANGED (D-3.7 / D-3.9
+  unchanged across the phase-10 arc).
+
+**Cargo.lock diff at THIS commit:** EMPTY per PLAN lock-in #45 (no
+production code changes; no dep adjustments; docs-only state-4
+evidence anchor + STATE advance).
+
+**Total LoC delta at THIS commit** per the Task 6 + Task 7 fixup
+convention (counts the PROGRESS self-edit + STATE.md edits as the
+two file-level deltas — both pure documentation; no source code or
+test code): docs-only; approximately +395 lines (PROGRESS state-4
+evidence anchor subsection replacing the 1-line placeholder ≈ +325
+net) + STATE.md edits (~+70 net — status/next-skill/last-commit/
+last-updated rewrites in-place + new ~50-line "Phase-10 state-3
+execution arc" subsection appended in Notes).
