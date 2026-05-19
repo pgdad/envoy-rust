@@ -1102,8 +1102,9 @@ state-2 PLAN's anticipated harness extension for per-probe
 ### Task 6 — D8.2 fuzz corpus seed
 
 **Commit:** _(this commit; SHA emitted at `git commit` time)_
-**Parent:** `6c24cd1` — fmt fixup; ALL 5 gates green (parent of the
-phase-10 Task 5 commit `c27f2d4` which landed fixture 0017).
+**Parent:** `6c24cd1` — non-phase-10 fmt + clippy fixup that landed 2
+commits after Task 5 `c27f2d4` to close the perf-interlude `2f28bbf`
+CI fmt + clippy gates; ALL 5 gates green on the fixup CI run.
 
 **Work summary.** Landed the D8.2 fuzz corpus seed
 `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_rbac_filter.yaml`
@@ -1150,7 +1151,7 @@ workspace test count stays at 780).**
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   — PASS (0 warnings).
 - `cargo build --workspace --all-targets` — PASS.
-- `cargo test --workspace` — PASS (780 passed, 0 failed, 1 ignored;
+- `cargo test --workspace` — PASS (780 passed, 0 failed, 2 ignored;
   count unchanged from Task 5 snapshot of 780 — the SUCCESS-array
   extension adds one iteration inside `fuzz_corpus_seeds_parse_or_reject_cleanly`,
   not a new `#[test]` function).
