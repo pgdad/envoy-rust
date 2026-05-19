@@ -23,10 +23,10 @@ pub fn now_imf_fixdate() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut guard = DATE_CACHE.lock().expect("date cache poisoned");
-    if let Some((cached_secs, ref cached_str)) = *guard {
-        if cached_secs == secs {
-            return cached_str.clone();
-        }
+    if let Some((cached_secs, ref cached_str)) = *guard
+        && cached_secs == secs
+    {
+        return cached_str.clone();
     }
     let fresh = format_imf_fixdate(now);
     *guard = Some((secs, fresh.clone()));

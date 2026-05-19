@@ -499,75 +499,76 @@ async fn serve_connection(
                         // error short-circuits to a 502 synth response. Modeled
                         // as Result so every downstream branch provably
                         // assigns `outgoing`.
-                        let stream_or_synth: Result<ClientStream, Response> =
-                            match cached_upstream.take() {
-                                Some((cname, addr, s))
-                                    if cname == cluster_name && addr == endpoint =>
-                                {
+                        let stream_or_synth: Result<ClientStream, Response> = match cached_upstream
+                            .take()
+                        {
+                            Some((cname, addr, s)) if cname == cluster_name && addr == endpoint => {
+                                Ok(s)
+                            }
+                            _ => match Client::connect(endpoint, &host_header).await {
+                                Ok(s) => {
+                                    // 06.1 D4.b: per-cluster `upstream_cx_total`
+                                    // counter incremented once per established
+                                    // upstream TCP connection. Reused streams
+                                    // skip this — matches Envoy's semantic.
+                                    cluster.cx_total().inc();
                                     Ok(s)
                                 }
-                                _ => match Client::connect(endpoint, &host_header).await {
-                                    Ok(s) => {
-                                        // 06.1 D4.b: per-cluster `upstream_cx_total`
-                                        // counter incremented once per established
-                                        // upstream TCP connection. Reused streams
-                                        // skip this — matches Envoy's semantic.
-                                        cluster.cx_total().inc();
-                                        Ok(s)
-                                    }
-                                    Err(source) => {
-                                        tracing::warn!(
-                                            cluster = %cluster.name(),
-                                            addr = %endpoint,
-                                            error = ?source,
-                                            "upstream connect failed — returning 502",
-                                        );
-                                        Err(synth_status(502, close))
-                                    }
-                                },
-                            };
-
-                        match stream_or_synth {
-                            Ok(mut client_stream) => match client_stream
-                                .send_request(out_req)
-                                .await
-                            {
-                                Ok(upstream_response) => {
-                                    let elapsed_ms = start.elapsed().as_millis();
-                                    // Decide reuse BEFORE construct_proxied_response
-                                    // consumes upstream_response. Cache iff
-                                    // both sides allow keep-alive.
-                                    let upstream_close =
-                                        upstream_response.headers.iter().any(|(n, v)| {
-                                            n.eq_ignore_ascii_case(headers::CONNECTION)
-                                                && v.eq_ignore_ascii_case("close")
-                                        });
-                                    outgoing = crate::router::construct_proxied_response(
-                                        &cluster,
-                                        upstream_response,
-                                        elapsed_ms,
-                                        close,
-                                    );
-                                    if !close && !upstream_close {
-                                        cached_upstream =
-                                            Some((cluster_name.clone(), endpoint, client_stream));
-                                    }
-                                }
                                 Err(source) => {
-                                    // No retry on tier-1: a stale cached
-                                    // stream surfaces as 502. nginx's default
-                                    // keepalive_timeout (75s) makes this rare
-                                    // under benchmark traffic; future tiers
-                                    // add half-close validation + retry.
                                     tracing::warn!(
                                         cluster = %cluster.name(),
                                         addr = %endpoint,
                                         error = ?source,
-                                        "upstream request failed — returning 502",
+                                        "upstream connect failed — returning 502",
                                     );
-                                    outgoing = synth_status(502, close);
+                                    Err(synth_status(502, close))
                                 }
                             },
+                        };
+
+                        match stream_or_synth {
+                            Ok(mut client_stream) => {
+                                match client_stream.send_request(out_req).await {
+                                    Ok(upstream_response) => {
+                                        let elapsed_ms = start.elapsed().as_millis();
+                                        // Decide reuse BEFORE construct_proxied_response
+                                        // consumes upstream_response. Cache iff
+                                        // both sides allow keep-alive.
+                                        let upstream_close =
+                                            upstream_response.headers.iter().any(|(n, v)| {
+                                                n.eq_ignore_ascii_case(headers::CONNECTION)
+                                                    && v.eq_ignore_ascii_case("close")
+                                            });
+                                        outgoing = crate::router::construct_proxied_response(
+                                            &cluster,
+                                            upstream_response,
+                                            elapsed_ms,
+                                            close,
+                                        );
+                                        if !close && !upstream_close {
+                                            cached_upstream = Some((
+                                                cluster_name.clone(),
+                                                endpoint,
+                                                client_stream,
+                                            ));
+                                        }
+                                    }
+                                    Err(source) => {
+                                        // No retry on tier-1: a stale cached
+                                        // stream surfaces as 502. nginx's default
+                                        // keepalive_timeout (75s) makes this rare
+                                        // under benchmark traffic; future tiers
+                                        // add half-close validation + retry.
+                                        tracing::warn!(
+                                            cluster = %cluster.name(),
+                                            addr = %endpoint,
+                                            error = ?source,
+                                            "upstream request failed — returning 502",
+                                        );
+                                        outgoing = synth_status(502, close);
+                                    }
+                                }
+                            }
                             Err(resp) => {
                                 outgoing = resp;
                             }
