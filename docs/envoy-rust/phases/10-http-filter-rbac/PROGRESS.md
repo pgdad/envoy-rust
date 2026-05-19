@@ -1101,7 +1101,87 @@ state-2 PLAN's anticipated harness extension for per-probe
 
 ### Task 6 — D8.2 fuzz corpus seed
 
-_(Pending Task 6 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `6c24cd1` — fmt fixup; ALL 5 gates green (parent of the
+phase-10 Task 5 commit `c27f2d4` which landed fixture 0017).
+
+**Work summary.** Landed the D8.2 fuzz corpus seed
+`crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_rbac_filter.yaml`
+for the `parse_bootstrap` fuzz target per PLAN Task 6 (SPEC §3 D8.2).
+The seed encodes a minimal but valid HCM bootstrap with an
+`envoy.filters.http.rbac` filter typed_config (`action: ALLOW`,
+single `pass_with_header` policy, `x-rbac-pass: yes` header
+matcher) followed by `envoy.filters.http.router`, mirroring the
+RBAC config shape already exercised by fixture 0017 but in the
+flat fuzz-corpus form (fixed `port_value` integers, no
+`{{PORT}}` substitution, `codec_type: HTTP1` present). Both the
+`.gitignore` allow-list and the in-source SUCCESS array were
+extended in the same commit per PLAN lock-in #38 (the phase-09
+Task 6 process gap that motivated the lock-in). A single
+one-iteration deviation from the PLAN's verbatim YAML was
+required: `codec_type: HTTP1` was added to the HCM typed_config
+block because the `envoy-config` schema marks the field required
+(the parse test rejected the PLAN's verbatim form on first run;
+Step 4 iteration resolved it before Step 5).
+
+**Files modified (4; 1 CREATE + 3 MODIFY):**
+- CREATE `crates/envoy-config/fuzz/corpus/parse_bootstrap/`
+  `hcm_rbac_filter.yaml` (+38 LoC).
+- MODIFY `crates/envoy-config/fuzz/.gitignore` (+1 LoC; allow-list
+  line inserted immediately after
+  `!corpus/parse_bootstrap/hcm_local_rate_limit_filter.yaml`).
+- MODIFY `crates/envoy-config/src/bootstrap.rs` (+1 LoC; SUCCESS-array
+  string inserted immediately after
+  `"fuzz/corpus/parse_bootstrap/hcm_local_rate_limit_filter.yaml",`).
+- MODIFY `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md`
+  (this subsection; replaces the state-2 skeleton's `_(Pending Task
+  6 dispatch.)_` placeholder).
+
+**Total LoC delta:** +40 insertions / 1 deletion (the 1-line placeholder
+replaced) across the 4 files. The 38-LoC corpus seed is dominated by
+YAML structure; total schema-meaningful YAML is ~25 LoC.
+
+**Tests landed (0 new — SUCCESS-array adds 1 iteration inside the
+existing `fuzz_corpus_seeds_parse_or_reject_cleanly` test function;
+workspace test count stays at 780).**
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS (no output).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  — PASS (0 warnings).
+- `cargo build --workspace --all-targets` — PASS.
+- `cargo test --workspace` — PASS (780 passed, 0 failed, 1 ignored;
+  count unchanged from Task 5 snapshot of 780 — the SUCCESS-array
+  extension adds one iteration inside `fuzz_corpus_seeds_parse_or_reject_cleanly`,
+  not a new `#[test]` function).
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok,
+  sources ok; pre-existing unencountered-license warnings unchanged
+  from Task 5).
+
+**Per-task deviations from PLAN (1).**
+
+1. **`codec_type: HTTP1` added to YAML.** The PLAN's Step 1 verbatim
+   YAML omitted `codec_type:` from the HCM typed_config block. The
+   `envoy-config` schema requires this field (it is not optional);
+   the targeted parse test at Step 4 rejected the verbatim form with
+   `missing field 'codec_type' at line 10 column 9`. Added
+   `codec_type: HTTP1` immediately after `stat_prefix: ingress_http`
+   in the HCM typed_config — matching the pattern established by the
+   predecessor seed `hcm_local_rate_limit_filter.yaml` (line 19 of
+   that file). All other YAML content matches the PLAN's verbatim
+   shape. No production code was changed to accommodate this; the
+   schema requirement has been present throughout the phase.
+
+**Carryforward dispositions unchanged.** The 09 REVIEW M3 still
+targets Task 7 per the original disposition; not engaged at Task 6.
+All other carryforwards continue per the Task-1 preamble's table.
+
+**STATE.md / ROADMAP.md / DECISIONS.md / BEHAVIOR_CONTRACT.md /
+ENVOY_TARGET.md / rust-toolchain.toml diffs at this commit:** None.
+(`DECISIONS.md` ledger head stays at ADR-0034; no new ADR projected
+at Task 6 per PLAN lock-in #41.) No production code outside
+`crates/envoy-config/src/bootstrap.rs` (test-only function) was
+modified. `Cargo.lock` diff is empty per PLAN lock-in #45.
 
 ### Task 7 — D8.3 in-process backstop (closes 09 REVIEW M3)
 

@@ -20,5 +20,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/admin_multi_endpoint_bootstrap.yaml
 !corpus/parse_bootstrap/admin_healthcheck_bootstrap.yaml
 !corpus/parse_bootstrap/hcm_local_rate_limit_filter.yaml
+!corpus/parse_bootstrap/hcm_rbac_filter.yaml
 artifacts/
 target/
