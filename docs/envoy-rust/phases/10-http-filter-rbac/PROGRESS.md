@@ -1186,7 +1186,103 @@ modified. `Cargo.lock` diff is empty per PLAN lock-in #45.
 
 ### Task 7 — D8.3 in-process backstop (closes 09 REVIEW M3)
 
-_(Pending Task 7 dispatch.)_
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `8805df7` — Task 6 fixup commit that closed 2 Important findings
+from the Task 6 review (parent + ignored count corrections in PROGRESS.md);
+ALL 5 gates green on the Task 6 fixup CI run.
+
+**Work summary.** Landed the D8.3 in-process backstop test
+`crates/envoy-bin/tests/http_filter_rbac.rs` that exercises the RBAC
+filter end-to-end against a real envoy-bin subprocess (no Docker).
+Per SPEC §6.4 + 09 REVIEW M3 disposition: uses
+`tokio::process::Command + .kill_on_drop(true)` — NOT `std::process::Command`.
+Closes 09 REVIEW M3 at the named close site per phase-10 SPEC §6.4 + PLAN
+Task 7.
+
+Direct code-spot-check evidence: both precedent backstops were read in full
+via the `Read` tool before authoring this file:
+- `crates/envoy-bin/tests/admin_drain_listeners.rs` (08.2 backstop) — confirmed
+  `tokio::process::Command`, `Stdio::piped()` on stderr, `kill_on_drop(true)`,
+  `wait_ready_result()` + stderr-dump-on-failure pattern, explicit
+  `child.kill().await.ok(); let _ = child.wait().await;` on both success and
+  failure paths.
+- `crates/envoy-bin/tests/http_filter_header_mutation.rs` (07.2 backstop) —
+  confirmed the same `tokio::process::Command + kill_on_drop + Stdio::piped()`
+  shape; `#[tokio::test(flavor = "multi_thread")]` noted but not adopted (the
+  4 sequential RBAC probes do not require multi-thread; PLAN skeleton uses
+  `#[tokio::test]` which is sufficient; documented below as deviation #3).
+- `crates/envoy-bin/tests/http_filter_local_rate_limit.rs` (09 backstop —
+  awareness-only; the regression target) — confirmed it uses
+  `std::process::Command` at line 29, which Task 7 explicitly does NOT repeat.
+
+The bootstrap YAML mirrors fixture 0017
+(`tests/fixtures/0017-http-filter-rbac/envoy-rust.yaml`) with concrete port
+values substituted in. The test drives 4 sequential GET probes asserting
+`[403, 200, 403, 200]` and body `[b"RBAC: access denied", b"ok\n",
+b"RBAC: access denied", b"ok\n"]`.
+
+**Files modified (2; 1 CREATE + 1 MODIFY):**
+- CREATE `crates/envoy-bin/tests/http_filter_rbac.rs` (+253 LoC).
+- MODIFY `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md`
+  (this subsection; replaces the `_(Pending Task 7 dispatch.)_` placeholder).
+
+**Total LoC delta:** +253 insertions / 1 deletion (the 1-line placeholder
+replaced) across 2 files.
+
+**Tests landed (1 new `#[tokio::test]`: `http_filter_rbac_in_process_backstop`;
+workspace test count 780 → 781).**
+
+**5-stable-toolchain attestation.** All 5 gates PASS on stable toolchain:
+- `cargo fmt --all -- --check` — PASS (no output; one formatting fix applied
+  during gate iteration: `stream.write_all(...).await.expect(...)` split to
+  multi-line per rustfmt's line-length rules).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  — PASS (0 warnings; one doc-comment iteration required: clippy's
+  `doc_lazy_continuation` lint flagged continuation lines starting with
+  backticks in the module-level doc comment; reworded to single-sentence
+  form per the lint's suggestion).
+- `cargo build --workspace --all-targets` — PASS.
+- `cargo test --workspace` — PASS (781 passed, 0 failed, 2 ignored;
+  count up by 1 from Task 6 snapshot of 780).
+- `cargo deny check` — PASS (advisories ok, bans ok, licenses ok,
+  sources ok; pre-existing unencountered-license warnings unchanged
+  from Task 6).
+
+**Per-task deviations from PLAN (3).**
+
+1. **`codec_type: HTTP1` added to bootstrap YAML.** The PLAN's verbatim
+   skeleton at lines 2349-2387 omits `codec_type:` from the HCM typed_config
+   block. The `envoy-config` schema marks this field required; Task 6 hit
+   `missing field 'codec_type' at line 10 column 9` empirically on an
+   analogous omission. All 3 precedent backstops include `codec_type: HTTP1`;
+   fixture 0017 includes it. Added immediately after `stat_prefix: ingress_http`
+   in the HCM typed_config — consistent with all existing precedents. No
+   production code was changed to accommodate this.
+
+2. **`Stdio::piped()` on stderr (NOT `Stdio::null()`).** The PLAN skeleton
+   (lines 2401-2402) uses `Stdio::null()` on stderr. Both the 07.2 and 08.2
+   precedent backstops use `Stdio::piped()` so that envoy-bin startup errors
+   surface in test output on readiness or probe failure. The dispatch
+   discipline note explicitly calls this out as load-bearing. The test dumps
+   stderr via the same pattern as the 08.2 precedent (`admin_drain_listeners.rs`
+   lines 173-180): on readiness timeout AND on probe assertion failure.
+
+3. **`#[tokio::test]` (not `multi_thread`).** The 07.2 precedent uses
+   `#[tokio::test(flavor = "multi_thread")]`. The 08.2 precedent uses
+   `#[tokio::test]`. The PLAN skeleton uses `#[tokio::test]`. The 4
+   sequential RBAC probes do not need multi-thread scheduling; `#[tokio::test]`
+   (single-thread current-thread runtime) is sufficient. Chose `#[tokio::test]`
+   per the PLAN skeleton and the 08.2 precedent.
+
+**Carryforward dispositions.** 09 REVIEW M3 is CLOSED at this commit
+(chain 09 → 10 ENDED for M3). All other carryforwards continue per the
+Task-1 preamble's table; none were engaged at Task 7.
+
+**STATE.md / ROADMAP.md / DECISIONS.md / BEHAVIOR_CONTRACT.md /
+ENVOY_TARGET.md / rust-toolchain.toml diffs at this commit:** None.
+(`DECISIONS.md` ledger head stays at ADR-0034 per PLAN lock-in #41; no
+new ADR projected at Task 7.) No production code was modified. `Cargo.lock`
+diff is empty per PLAN lock-in #45.
 
 ### Task 8 — state-4 phase-done verification + STATE advance to state-5-next
 
