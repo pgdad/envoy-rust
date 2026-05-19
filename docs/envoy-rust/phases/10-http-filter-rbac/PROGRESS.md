@@ -1226,8 +1226,10 @@ b"RBAC: access denied", b"ok\n"]`.
 - MODIFY `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md`
   (this subsection; replaces the `_(Pending Task 7 dispatch.)_` placeholder).
 
-**Total LoC delta:** +253 insertions / 1 deletion (the 1-line placeholder
-replaced) across 2 files.
+**Total LoC delta:** +350 insertions / 1 deletion (the 1-line placeholder
+replaced) across 2 files (+253 from the new test file; +97 from this
+PROGRESS subsection itself, per the Task 6 convention of counting the
+PROGRESS self-edit in the total).
 
 **Tests landed (1 new `#[tokio::test]`: `http_filter_rbac_in_process_backstop`;
 workspace test count 780 → 781).**
