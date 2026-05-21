@@ -45,6 +45,8 @@ test -d docs/envoy-rust && echo EXISTS || echo FRESH
 5. `docs/envoy-rust/BEHAVIOR_CONTRACT.md`
 6. `docs/envoy-rust/SKILL_ROUTING.md`
 
+> Per ADR-0035: `STATE.md` remains a **required full read** at cold-start. Historical narrative relocated out of it (the "Historical reference (preserved …)" stacks and closed-phase Notes subsections) lives in `docs/envoy-rust/STATE_HISTORY.md`, which is **read-on-demand only — NOT a required cold-start read**; consult it solely when following a `STATE.md` pointer back to the relocated detail. (`MISSION.md` and `SKILL_ROUTING.md` are unaffected — they are verbatim copies of §§2–3 and §5 respectively, not §1.)
+
 If any of those files is missing, treat the repo as corrupted. Invoke `superpowers:systematic-debugging` with the specific missing file as the symptom before any other action. Do not attempt to recreate the file from memory — it must be reconstructed from git history or the human must be notified via a `CORRUPTED.md` file at repo root, and you exit.
 
 **Step C — Read the active phase's artifacts.** `STATE.md` names the active phase directory (e.g. `phases/04-http-1.1/`). Read, in full:
