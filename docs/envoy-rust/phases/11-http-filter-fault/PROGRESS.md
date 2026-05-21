@@ -512,3 +512,113 @@ decision).
   +2 from the 42 that landed before Task 4).
 - **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
   (pre-existing unmatched-license-allowance warnings unchanged).
+
+### Task 5 — D8.1 fixture 0018 + Driver::Http2ProbeList harness + Docker wrapper
+
+Lands the differential fixture `0018-http-filter-fault` on an HTTP/2 listener, the new
+`Driver::Http2ProbeList` harness driver, and the Docker-gated wrapper. This is the FIRST
+differential/integration task of phase 11 (Tasks 1–4 were unit-level), and the FIRST
+HTTP-filter-family fixture on an H2 listener. It asserts the `[503, 200, 503, 200]` per-probe
+status sequence + the abort body + the decorated H2 header set bilaterally.
+
+**New harness driver — `Driver::Http2ProbeList`** (`tests/differential/src/lib.rs`): drives a
+sequence of HTTP/2 probes against a single listener address, each probe an independent H2
+request/response cycle via `drive_http2`. The variant is added after `Driver::Http2`. Per SPEC
+§6.1 recommended option (a), it reuses the **codec-agnostic** `Http1Probe` struct directly (no
+new probe struct). The dispatch arm mirrors the `Driver::Http1ProbeList` arm verbatim, swapping
+`drive_http1` → `drive_http2`; the per-probe equivalence cascade (response_status: exact;
+per-probe `expected_status`; `expected_body` byte-exact; `expected_headers`
+set-equal-modulo-allow-list) is copied verbatim because it is an inline block parameterized on
+`expectations` + the per-probe fields (extraction to a shared helper would require threading
+both, with no net DRY win for two call sites). The new variant is also added to the
+listener-protocol classifier (grouped with `Http2` / `Http1ProbeList` under `"PORT"`) — the only
+other exhaustive `match Driver` site in non-test code. A parse round-trip test
+(`http2_probe_list_round_trips_from_yaml`) is the TDD anchor: written failing
+(`non-exhaustive patterns` + `no variant`), then green after the variant + arms landed.
+
+**Fixture `0018-http-filter-fault`** (4 files): `envoy.yaml` / `envoy-rust.yaml` mirror fixture
+0009's `codec_type: HTTP2` HCM shape + fixture 0017's per-side YAML asymmetry (upstream: admin
+block port 0 + `0.0.0.0:{{PORT}}` bind + `generate_request_id: false`; envoy-rust: no admin, no
+`generate_request_id`, `127.0.0.1:{{PORT}}` bind). The HCM filter chain is
+`[envoy.filters.http.fault, envoy.filters.http.router]`; the fault `abort` block fires at a
+deterministic 100% (`numerator: 100, denominator: HUNDRED`) gated by a single `HeaderMatcher` on
+`x-fault` (`string_match: { exact: abort }`). The config shape was verified against the
+envoy-config `FaultConfig` / `FaultAbort` / `FractionalPercent` / `HeaderMatcher` schemas landed
+at Task 1 (the `string_match: { exact: abort }` + `name` HeaderMatcher shape is exactly the shape
+the Task-1 unit test exercises). `expectations.yaml` uses `Driver::Http2ProbeList` with 4
+per-probe `Http1Probe` entries.
+
+**Bilateral D6 validation (closes 09 REVIEW M2 end-to-end):** the 2 abort probes (statuses 1 + 3)
+exercise the phase-11 D6 `decorate_filter_synth_response_h2` helper (Task 4) end-to-end against
+BOTH proxies — envoy-rust's helper must decorate the filter-emitted 503 + body
+(`"fault filter abort"`, 18 bytes) with the standard H2 header set `{server, content-length,
+content-type, date}` (NO `connection` — H2-forbidden hop-by-hop) so the
+set-equal-modulo-allow-list diff passes against upstream Envoy v1.33.0. This is the bilateral
+demonstration that the 09 REVIEW M2 close (Task 4) is real, not just unit-tested. The 2
+pass-through probes (statuses 2 + 4) bypass the helper and route to the direct_response 200 /
+`"ok\n"`, demonstrating the helper is filter-agnostic.
+
+**Docker run result — bilateral GREEN.** Docker WAS available locally
+(`docker info` succeeded). `cargo test -p differential --test http_filter_fault`:
+`test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s`.
+The harness logged `envoy-rust listening (http_connection_manager) … codec_type=HTTP2`,
+confirming the H2 listener path. The 4-probe `[503, 200, 503, 200]` burst + abort body + decorated
+H2 header set matched bilaterally against upstream `envoyproxy/envoy:v1.33.0`.
+
+**Tests landed (1 new harness unit test + 1 new fixture):**
+- `tests::http2_probe_list_round_trips_from_yaml` (parse round-trip; TDD anchor).
+- fixture `0018-http-filter-fault` driven by `tests/differential/tests/http_filter_fault.rs`
+  (Docker-gated; bilateral green above).
+
+**Deviations from PLAN sketch (serde-shape adjustments):**
+1. **Type name is `Expectations`, not `FixtureExpectations`.** The PLAN sketch named the top-level
+   type `FixtureExpectations`; the on-disk type is `Expectations` (`tests/differential/src/lib.rs`).
+   Both the round-trip test and the precedent 0017 fixture use `Expectations`.
+2. **The `Equivalence` struct has NO `response_headers` field.** The PLAN's `expectations.yaml`
+   sketch carried a top-level `equivalence.response_headers: set_equal_modulo_allow_list`; the
+   real `Equivalence` struct models only `response_status` + `response_body` (with
+   `#[serde(deny_unknown_fields)]`, so the sketched key would have been REJECTED). The header axis
+   is per-probe via `expected_headers: set_equal_modulo_allow_list` (matching the 0017 precedent).
+   The top-level `equivalence` block therefore carries only `response_status: exact` +
+   `response_body: { kind: byte_exact }`.
+3. **`method` is lowercase (`get`), `kind` is snake_case (`http2_probe_list`).** Per the
+   `Http1Method` / `Driver` `#[serde(rename_all = "snake_case")]` attributes. The PLAN sketch used
+   `GET` / `http2_probe_list`; corrected to `get` to match the precedent 0017 fixture.
+4. **The wrapper does NOT use `mod common;`.** The PLAN Step 8 sketch referenced
+   `mod common;` + `common::run_fixture(...)`; the actual 0017 precedent (`http_filter_rbac.rs`)
+   uses `differential::run_fixture(&dir)` with a `PathBuf` built from `CARGO_MANIFEST_DIR`. The
+   wrapper copies that shape verbatim, swapping only the fixture name. Neither wrapper is
+   `#[ignore]`-gated — the harness self-skips when Docker is unavailable.
+5. **Per-probe cascade copied, not extracted.** The PLAN offered extraction of a shared
+   `assert_probe_equivalence(...)` helper as preferred-if-clean. The cascade is an inline block
+   parameterized on both `expectations` and the per-probe fields; for two call sites the copy is
+   the lower-risk factoring and matches the existing `Http2` (single) vs `Http1ProbeList`
+   structural precedent. Copied verbatim.
+
+**LoC delta (per file, `git diff --numstat` for the modified file; `wc -l` for new files):**
+
+| File | Added | Removed |
+|---|---|---|
+| `tests/differential/src/lib.rs` (variant + classifier arm + dispatch arm + round-trip test) | 147 | 0 |
+| `tests/fixtures/0018-http-filter-fault/envoy.yaml` (new) | 88 | 0 |
+| `tests/fixtures/0018-http-filter-fault/envoy-rust.yaml` (new) | 54 | 0 |
+| `tests/fixtures/0018-http-filter-fault/expectations.yaml` (new) | 62 | 0 |
+| `tests/fixtures/0018-http-filter-fault/README.md` (new) | 99 | 0 |
+| `tests/differential/tests/http_filter_fault.rs` (new) | 33 | 0 |
+| `docs/envoy-rust/phases/11-http-filter-fault/PROGRESS.md` | (this section) | 0 |
+| **Total** | **~483** | **0** |
+
+**5-gate attestation (stable toolchain):**
+
+- **fmt** — PASS. `cargo fmt --all -- --check`: clean (exit 0, no output).
+- **clippy** — PASS. `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  `Finished \`dev\` profile … in 35.06s` with zero warnings (the new variant is added to every
+  exhaustive `match Driver` site, so no non-exhaustive-match error fired).
+- **build** — PASS. `cargo build --workspace --all-targets`: `Finished` clean.
+- **test** — PASS. `cargo test --workspace`: exit 0; all `test result:` lines `0 failed`. The
+  round-trip lib test passed (`tests::http2_probe_list_round_trips_from_yaml … ok`,
+  `1 passed; 0 failed` in the targeted `--lib http2_probe_list` run). The Docker fixture passed
+  bilaterally (see "Docker run result" above).
+- **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
+  (pre-existing unmatched-license-allowance warnings for `MPL-2.0` / `Unicode-DFS-2016` / `Zlib`
+  unchanged).

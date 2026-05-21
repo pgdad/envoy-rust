@@ -1,0 +1,88 @@
+# Phase 11 differential acceptance fixture: drive 4 sequential GET / requests
+# over an HTTP/2 listener through an HCM whose http_filters chain is
+#   [envoy.filters.http.fault, envoy.filters.http.router]
+# The fault filter aborts (503 + body "fault filter abort") any request that
+# carries the `x-fault: abort` header (the abort block is gated by a single
+# HeaderMatcher on `x-fault` string_match exact "abort", at 100% so the
+# select is deterministic — no PRNG). Requests without the header pass through
+# to the direct_response 200 / "ok\n".
+#
+# This is the FIRST HTTP-filter-family fixture on an HTTP/2 listener. It
+# exercises the phase-11 D6 `decorate_filter_synth_response_h2` helper
+# (Task 4) bilaterally on the abort path, validating the 09 REVIEW M2 close
+# end-to-end (the H2 filter-synth writer path is here driven by real H2
+# traffic against both proxies, not just unit-tested).
+#
+# Probe sequence ([503, 200, 503, 200]):
+#   1. x-fault: abort  — ABORT (header gate matches; deterministic 100%)  503
+#   2. (no header)     — PASS-THROUGH to direct_response                  200
+#   3. x-fault: abort  — ABORT (repeats probe 1 to demonstrate determinism;
+#                        the fault select is stateless)                   503
+#   4. (no header)     — PASS-THROUGH (repeats probe 2)                   200
+#
+# Empirical 503 abort response shape (verified at phase-11 state-2 PLAN-write
+# via Docker run of envoyproxy/envoy:v1.33.0 on an H2 listener):
+#   - status 503
+#   - body bytes "fault filter abort" (18 bytes, NO trailing newline)
+#   - 4 standard HTTP/2 response headers: {server, content-length,
+#     content-type, date}  (NO `connection` — H2-forbidden hop-by-hop header)
+# The set_equal_modulo_allow_list disposition compares header SETS modulo the
+# documented allow-list at docs/envoy-rust/BEHAVIOR_CONTRACT.md (`server` +
+# `date` rows cover implementation-identifying / wall-clock divergences; the
+# remaining content-length / content-type headers are value-exact across
+# proxies).
+#
+# Per-side YAML asymmetry follows the fixture-0017 precedent:
+#   - upstream side: admin block (port 0; kernel-ephemeral); bind
+#     0.0.0.0:{{PORT}} (Docker container public bind);
+#     generate_request_id: false (envoy-rust does not inject x-request-id, so
+#     disable upstream injection for header-set parity).
+#   - envoy-rust side: no admin block; bind 127.0.0.1:{{PORT}}; no
+#     generate_request_id field (envoy-rust's HCM config does not model it).
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 0
+node:
+  cluster: phase-11-cluster
+  id: phase-11-envoy
+static_resources:
+  listeners:
+    - name: ingress_http2
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: {{PORT}}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP2
+                generate_request_id: false
+                route_config:
+                  name: default
+                  virtual_hosts:
+                    - name: default
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                http_filters:
+                  - name: envoy.filters.http.fault
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+                      abort:
+                        http_status: 503
+                        percentage: { numerator: 100, denominator: HUNDRED }
+                      headers:
+                        - name: x-fault
+                          string_match: { exact: abort }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []

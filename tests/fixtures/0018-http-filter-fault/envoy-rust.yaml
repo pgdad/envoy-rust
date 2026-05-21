@@ -1,0 +1,54 @@
+# Phase 11 envoy-rust counterpart. Identical HCM body to the upstream side
+# (same http_filters chain [envoy.filters.http.fault with the abort block +
+# x-fault header gate, envoy.filters.http.router], same direct_response
+# {status: 200, body: "ok\n"}, same stat_prefix: ingress_http, same
+# codec_type: HTTP2, clusters: []) modulo the documented per-side asymmetry:
+#   - No `admin` block (envoy-rust harness does not probe admin on
+#     direct_response fixtures).
+#   - Bind address 127.0.0.1:{{PORT}} (envoy-rust is a subprocess on the host;
+#     127.0.0.1 per the fixture-0009/0017 precedent).
+#   - No `generate_request_id` field (envoy-rust's HCM config does not model
+#     it and rejects it via #[serde(deny_unknown_fields)]; envoy-rust does not
+#     inject x-request-id by default so this is a no-op divergence).
+# The {{PORT}} token is harness-substituted to a per-fixture-run port.
+node:
+  cluster: phase-11-cluster
+  id: phase-11-envoy-rust
+static_resources:
+  listeners:
+    - name: ingress_http2
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: {{PORT}}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP2
+                route_config:
+                  name: default
+                  virtual_hosts:
+                    - name: default
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                http_filters:
+                  - name: envoy.filters.http.fault
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+                      abort:
+                        http_status: 503
+                        percentage: { numerator: 100, denominator: HUNDRED }
+                      headers:
+                        - name: x-fault
+                          string_match: { exact: abort }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []

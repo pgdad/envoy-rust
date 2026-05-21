@@ -1,0 +1,62 @@
+# Phase 11: 4-probe sequential burst over an HTTP/2 listener against the HCM
+# filter chain [envoy.filters.http.fault, envoy.filters.http.router]. The
+# fault filter aborts (503 + body "fault filter abort") any request carrying
+# `x-fault: abort`; other requests pass through to the direct_response 200.
+# Both proxies must produce the deterministic status sequence
+# [503, 200, 503, 200] for the 4 probes below.
+#
+#   probe 1 (x-fault: abort) -> 503 abort         body "fault filter abort"
+#   probe 2 (no header)      -> 200 pass-through  body "ok\n"
+#   probe 3 (x-fault: abort) -> 503 abort         body "fault filter abort"
+#   probe 4 (no header)      -> 200 pass-through  body "ok\n"
+#
+# Driver::Http2ProbeList drives each probe over H2 (drive_http2) and applies
+# the per-probe equivalence cascade. The H2 abort header set is {server,
+# content-length, content-type, date} (NO connection — H2-forbidden); the
+# set_equal_modulo_allow_list disposition compares header SETS modulo the
+# BEHAVIOR_CONTRACT.md allow-list (server + date).
+#
+# NB: the top-level `equivalence` block carries only response_status +
+# response_body (the harness Equivalence struct models no response_headers
+# field — the header axis is per-probe via expected_headers).
+driver:
+  kind: http2_probe_list
+  probes:
+    - name: probe-1-abort
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-fault, abort]
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "fault filter abort" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-pass
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers: []
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-abort-again
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-fault, abort]
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "fault filter abort" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-4-pass-again
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers: []
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body:
+    kind: byte_exact

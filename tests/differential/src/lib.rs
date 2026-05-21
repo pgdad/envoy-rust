@@ -121,6 +121,15 @@ pub enum Driver {
         #[serde(default)]
         expected_headers: Option<Http1HeaderRule>,
     },
+    /// 11 NEW: drive a sequence of HTTP/2 probes against a single listener
+    /// address. Each probe runs an independent H2 request/response cycle and
+    /// applies the per-probe equivalence cascade. Mirrors `Http1ProbeList`
+    /// (04.2) but drives over H2 via `drive_http2`. The `Http1Probe` struct is
+    /// codec-agnostic (request shape + per-probe expectations) and is reused
+    /// directly. Per phase-11 SPEC §3 D8.1.
+    Http2ProbeList {
+        probes: Vec<Http1Probe>,
+    },
     /// 06.1 D6.a: drive a sequence of HCM-side `PreRequest`s (so the registry
     /// has counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
     /// Relaxed-ordered counter writes become visible), then perform one or
@@ -1650,6 +1659,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::Http1ProbeList { .. }
         | Driver::Http1WithAccessLog { .. }
         | Driver::Http2 { .. }
+        | Driver::Http2ProbeList { .. }
         // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
         // HCM-shaped drivers. The admin listener is separately substituted
         // via {{ADMIN_PORT}} (see admin_host_port reservation below).
@@ -2193,6 +2203,109 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 // Body. 06.1 Task 13 carryforward: route through
                 // `assert_body_rule` so BodyRule variants dispatch through the
                 // single centralized helper instead of inline `matches!`.
+                if let Some(rule) = &expectations.equivalence.response_body {
+                    assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
+                        .with_context(|| format!("probe {}", probe.name))?;
+                }
+                if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
+                    let expected = body.as_bytes();
+                    if upstream_resp.body != expected {
+                        bail!(
+                            "probe {}: upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                            probe.name,
+                            upstream_resp.body,
+                            expected,
+                        );
+                    }
+                    if subject_resp.body != expected {
+                        bail!(
+                            "probe {}: subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                            probe.name,
+                            subject_resp.body,
+                            expected,
+                        );
+                    }
+                }
+
+                // Headers.
+                if matches!(
+                    probe.expected_headers,
+                    Some(Http1HeaderRule::SetEqualModuloAllowList)
+                ) {
+                    diff_headers(
+                        &upstream_resp.headers,
+                        &subject_resp.headers,
+                        HEADER_ALLOW_LIST,
+                    )
+                    .with_context(|| format!("probe {}: diff_headers", probe.name))?;
+                }
+            }
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+        }
+        // 11 NEW: HTTP/2 probe-list driver. Mirrors Driver::Http1ProbeList
+        // verbatim, swapping drive_http1 → drive_http2 (H2 cleartext
+        // prior-knowledge per drive_http2's handshake). The Http1Probe struct
+        // is codec-agnostic, so the per-probe equivalence cascade is identical.
+        // This is the first HTTP-filter-family fixture on an H2 listener,
+        // exercising the phase-11 D6 decorate_filter_synth_response_h2 helper
+        // bilaterally (closes 09 REVIEW M2). Per phase-11 SPEC §3 D8.1.
+        Driver::Http2ProbeList { probes } => {
+            for probe in probes {
+                let upstream_resp = drive_http2(
+                    upstream_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                )
+                .await
+                .with_context(|| format!("upstream envoy http2 drive (probe {})", probe.name))?;
+                let subject_resp = drive_http2(
+                    subject_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                )
+                .await
+                .with_context(|| format!("envoy-rust http2 drive (probe {})", probe.name))?;
+
+                // Status: envoy ↔ envoy-rust under `response_status: exact`.
+                if matches!(
+                    expectations.equivalence.response_status,
+                    Some(StatusRule::Exact)
+                ) && upstream_resp.status != subject_resp.status
+                {
+                    bail!(
+                        "probe {}: response status mismatch under `response_status: exact`\n  \
+                         upstream: {}\n  subject:  {}",
+                        probe.name,
+                        upstream_resp.status,
+                        subject_resp.status,
+                    );
+                }
+                if let Some(es) = probe.expected_status {
+                    if upstream_resp.status != es {
+                        bail!(
+                            "probe {}: upstream status {} != expected {}",
+                            probe.name,
+                            upstream_resp.status,
+                            es,
+                        );
+                    }
+                    if subject_resp.status != es {
+                        bail!(
+                            "probe {}: subject status {} != expected {}",
+                            probe.name,
+                            subject_resp.status,
+                            es,
+                        );
+                    }
+                }
+
+                // Body. Route through `assert_body_rule` (mirrors the
+                // Http1ProbeList arm).
                 if let Some(rule) = &expectations.equivalence.response_body {
                     assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
                         .with_context(|| format!("probe {}", probe.name))?;
@@ -3835,6 +3948,40 @@ equivalence:
         assert_eq!(probes[1].extra_headers.len(), 1);
         assert_eq!(probes[1].extra_headers[0].0, "X-Foo");
         assert_eq!(probes[1].extra_headers[0].1, "bar");
+    }
+
+    #[test]
+    fn http2_probe_list_round_trips_from_yaml() {
+        // 11 NEW: Driver::Http2ProbeList shape parses round-trip from YAML.
+        // Reuses the codec-agnostic Http1Probe struct directly.
+        let yaml = r#"
+driver:
+  kind: http2_probe_list
+  probes:
+    - name: abort
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-fault, abort]
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "fault filter abort" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body:
+    kind: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::Http2ProbeList { probes } = e.driver else {
+            panic!("expected Http2ProbeList");
+        };
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].name, "abort");
+        assert_eq!(probes[0].expected_status, Some(503));
+        assert_eq!(probes[0].extra_headers.len(), 1);
+        assert_eq!(probes[0].extra_headers[0].0, "x-fault");
+        assert_eq!(probes[0].extra_headers[0].1, "abort");
     }
 
     #[test]
