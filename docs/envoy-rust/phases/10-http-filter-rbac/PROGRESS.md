@@ -1586,6 +1586,18 @@ Task 8 docs-only commit's new HEAD. The Task 7 fixup commit
 commit; the state-4 evidence anchor is CI run `26070911153` against
 `064a8a5`.
 
+> **State-6 fold-in clarification (REVIEW.md §3 M5).** The "11 commits"
+> count above is the phase-10-**task** count (7 substantive Task 1-7 + 3
+> fixup/SHA-record + 1 Task 8 docs-only). The full reviewed range
+> `55abc61..56d381e` contains **14 commits total** — these 11 phase-10
+> commits + **2 non-phase-10 perf-interlude commits** (`2f28bbf`
+> `perf(http1): TCP_NODELAY + per-connection upstream reuse + bench
+> harness` + its fixup `6c24cd1` `fix(http1): cargo fmt + clippy
+> collapsible_if on perf-reuse code`) that interleave between Task 5
+> `c27f2d4` and Task 6 `f8be570`. The 2 perf-interlude commits are NOT
+> part of the phase-10 surface and were NOT assessed by REVIEW.md (see
+> its `Reviewed range` block).
+
 **Carryforward closures landed in phase 10:**
 
 - **09 REVIEW M2** (H2 HCM filter-synth header decoration gap +
@@ -1653,10 +1665,13 @@ anchor CI run, NOT a delta from THIS commit (which is docs-only).
 
 ### Cumulative review backlog across the phase-10 state-3 arc
 
-Approximately **32 review items surfaced** across the 7 substantive
-task commits' two-stage spec-compliance + code-quality reviews; **3
+**34 review items surfaced** across the 7 substantive
+task commits' two-stage spec-compliance + code-quality reviews
+(corrected from the prior approximate `~32` at the state-6 close-out
+per REVIEW.md §3 T3 — the figure now matches the exact per-task
+breakdown below: 31 Minor + 3 Important = 34); **3
 Important closed inline** at 2 fixup commits (Task 6 fixup `8805df7`
-+ Task 7 fixup `064a8a5`); **~29 Minor controller-deferred** per
++ Task 7 fixup `064a8a5`); **31 Minor controller-deferred** per
 `feedback_pick_recommendation`; **0 Critical findings** across the
 entire phase. Per-task breakdown: Task 1: 10 Minor; Task 2: 3 Minor;
 Task 3: 2 Minor; Task 4: 4 Minor; Task 5: 4 Minor; Task 6: 3 Minor
@@ -1702,7 +1717,7 @@ evidence anchor + STATE advance).
 **Total LoC delta at THIS commit** per the Task 6 + Task 7 fixup
 convention (counts the PROGRESS self-edit + STATE.md edits as the
 two file-level deltas — both pure documentation; no source code or
-test code): **+588 insertions / 36 deletions across 2 files** per
+test code): **+588 / -36 across 2 files** per
 `git diff --shortstat 064a8a5..<this-commit>`: +419 / -1 in
 `docs/envoy-rust/phases/10-http-filter-rbac/PROGRESS.md` (state-4
 evidence anchor subsection replacing the line-1289 placeholder) +
