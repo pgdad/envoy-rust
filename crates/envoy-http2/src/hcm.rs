@@ -370,10 +370,12 @@ async fn handle_one_stream(
                 }
             }
         },
-        H2RequestPath::SynthFromDecode(r) => {
-            // 07.1 Task 7: decode-side filter short-circuit. Unreachable
-            // under the Router-only 07.1 chain; lit by 07.2's HeaderMutation.
+        H2RequestPath::SynthFromDecode(mut r) => {
+            // 07.1 Task 7: decode-side filter short-circuit. Phase 11 D6:
+            // decorate the filter-synth response with the standard H2 response
+            // headers (closes 09 REVIEW M2 implementation arm).
             // `upstream_host_for_log_h2` stays None (no proxy attempt).
+            crate::response::decorate_filter_synth_response_h2(&mut r);
             r
         }
     };
@@ -440,6 +442,11 @@ async fn finalize_h2_stream(
                 headers: replacement.headers,
                 body: replacement.body,
             };
+            // Phase 11 D6: decorate the encode-side filter-synth replacement with
+            // the standard H2 response headers (symmetric to the H1 helper's
+            // encode-side wiring). No phase-11 filter takes this path, but future
+            // encode-side-short-circuiting H2 filters inherit it.
+            crate::response::decorate_filter_synth_response_h2(&mut resp);
         }
     }
 

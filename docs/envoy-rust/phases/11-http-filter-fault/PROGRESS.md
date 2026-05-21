@@ -437,3 +437,78 @@ adjustment required.
   +1 from the 69 that landed at Task 2).
 - **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
   (pre-existing unmatched-license-allowance warnings unchanged).
+
+### Task 4 — D6 H2 decorate_filter_synth_response_h2 + 2 wirings + 2 tests
+
+`crates/envoy-http2/src/response.rs` receives `decorate_filter_synth_response_h2`, the H2-side
+peer of H1's `decorate_filter_synth_response` (`crates/envoy-http1/src/hcm.rs:968`). The helper
+is `pub(crate)` and placed immediately before `send_envoy_response`, adjacent to
+`build_http_response`. It is functionally symmetric to the H1 helper in every respect except
+one: it emits NO `connection` header, because `connection` is an H2-forbidden hop-by-hop header
+(RFC 7540 §8.1.2.2) that `build_http_response` would strip anyway via
+`H2_FORBIDDEN_HOP_BY_HOP`. The implementation semantics: `content-length` is always derived
+from `resp.body.len()` and overwrites any existing value (an incorrect filter-set value is never
+forwarded); `server`, `date`, and `content-type` are added only-if-missing (a filter that sets
+its own value wins). `date` is sourced from `envoy_http1::date::now_imf_fixdate()` (the same
+cached-second variant the H1 helper uses).
+
+`crates/envoy-http2/src/hcm.rs` receives the 2 wirings. The decode-side arm
+`H2RequestPath::SynthFromDecode(r)` (previously line 373) is updated to `(mut r)` and calls
+`crate::response::decorate_filter_synth_response_h2(&mut r)` before returning `r`. The
+encode-side arm `Decision::StopAndSend(replacement)` (inside `finalize_h2_stream`, previously
+line 436) calls `crate::response::decorate_filter_synth_response_h2(&mut resp)` immediately
+after constructing the replacement `Response`. The `mut` on `r` in the decode arm is justified
+by the `&mut r` borrow on the next line; clippy's `-D warnings` gate confirmed no
+`unused_mut` warning.
+
+**09 REVIEW M2 implementation-arm close:** This task closes the 09 REVIEW M2 implementation arm
+(the H2 HCM filter-synth decoration gap). The documentation arm closed at phase-10 D5 via the
+ADR-0033 Consequences amendment at `docs/envoy-rust/DECISIONS.md:699`, which explicitly named
+"the next HTTP-filter-family phase exercising filters bilaterally on H2" (i.e. this phase 11
+D6) as the M2 implementation close site. The phase-09 PROGRESS Commit C forward-reference
+records that H1's `decorate_filter_synth_response` helper first landed under ADR-0033 Commit C
+— the H2 writer path now reaches parity. **After this task, the 09 → 10 → 11 M2 chain ENDS.**
+No new ADR was required (the close shape is ordinary deliverable work, not an architectural
+decision).
+
+**Tests landed (2 new; envoy-http2 lib 42 → 44 passed, 43 → 45 running including 1 pre-existing ignored):**
+- `response::tests::decorate_h2_adds_standard_headers_when_filter_provides_none`
+- `response::tests::decorate_h2_preserves_filter_headers_and_overwrites_content_length`
+
+**Deviations from PLAN:**
+1. **`cargo fmt` reformatted two spans** in `response.rs`: the
+   `if !resp.headers.iter().any(...)` predicate (split across 4 lines per rustfmt's
+   line-length limit) and the `assert!(name("connection").is_none(), ...)` test assertion
+   (split to 3-arg form). No semantic change; reformatted with `cargo fmt --all` before
+   the fmt-gate check.
+2. **PLAN template used `DEFAULT_SERVER_NAME`/`DEFAULT_CONTENT_TYPE` symbolically (lock-in
+   #23).** These consts are private and unexported from `crates/envoy-http1/src/hcm.rs:21-22`.
+   Per lock-in #23, the helper instead uses the literal values `"envoy-rust"` and `"text/plain"`
+   + `envoy_http1::date::now_imf_fixdate()` — exactly the same convention already used in the
+   `synth_h2_502()` helper (`hcm.rs:562-563`) and the H2 proxy arm (`hcm.rs:347,356`). This is
+   NOT a divergence: the literals match the H1 helper's const values and the existing envoy-http2
+   convention. Adding a `pub` to the H1 consts would be an out-of-scope third-file edit; the
+   lock-in #23 directive was followed exactly.
+
+**LoC delta (per file, `git diff --numstat`):**
+
+| File | Added | Removed |
+|---|---|---|
+| `crates/envoy-http2/src/response.rs` | 102 | 0 |
+| `crates/envoy-http2/src/hcm.rs` | 10 | 3 |
+| `docs/envoy-rust/phases/11-http-filter-fault/PROGRESS.md` | (this section) | 0 |
+| **Total** | **~112** | **3** |
+
+**5-gate attestation (stable toolchain):**
+
+- **fmt** — PASS. `cargo fmt --all -- --check` reported two formatting drifts (line-length
+  wrapping in helper + test assertion); fixed with `cargo fmt --all`, re-check clean.
+- **clippy** — PASS. `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  `Finished` with zero warnings (the `mut r` in the decode arm is justified by `&mut r` usage;
+  no `unused_mut` warning).
+- **build** — PASS. `cargo build --workspace --all-targets`: `Finished` clean.
+- **test** — PASS. `cargo test --workspace`: all test results ok; no failures.
+  envoy-http2 lib: `test result: ok. 44 passed; 0 failed; 1 ignored` (2 new `decorate_h2` tests;
+  +2 from the 42 that landed before Task 4).
+- **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
+  (pre-existing unmatched-license-allowance warnings unchanged).

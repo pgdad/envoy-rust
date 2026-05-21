@@ -49,6 +49,47 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
         .map_err(|_| Http2Error::MalformedH2HeaderBlock)
 }
 
+/// Decorate a filter-synth H2 response with the standard response headers,
+/// symmetric to H1's `decorate_filter_synth_response` (`crates/envoy-http1/src/hcm.rs:968`)
+/// — minus `connection`, which is an H2-forbidden hop-by-hop header stripped by
+/// `build_http_response` per `H2_FORBIDDEN_HOP_BY_HOP` (RFC 7540 §8.1.2.2).
+///
+/// Adds `content-length` always (overwritten from `resp.body.len()`); adds
+/// `server` / `date` / `content-type` only-if-missing (a filter that sets its
+/// own value wins). Closes the 09 REVIEW M2 implementation arm (phase 11 D6):
+/// the H1 writer path has decorated filter-synth responses since 09 ADR-0033
+/// Commit C; this brings the H2 writer path to parity.
+pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response) {
+    // content-length: always derived from body.len(); overwrite if present.
+    let cl_value = resp.body.len().to_string();
+    let mut cl_set = false;
+    for (k, v) in resp.headers.iter_mut() {
+        if k.eq_ignore_ascii_case("content-length") {
+            *v = cl_value.clone();
+            cl_set = true;
+            break;
+        }
+    }
+    if !cl_set {
+        resp.headers.push(("content-length".to_string(), cl_value));
+    }
+    // server / date / content-type: add only-if-missing. NO connection (H2-forbidden).
+    let standards: [(&str, String); 3] = [
+        ("server", "envoy-rust".to_string()),
+        ("date", envoy_http1::date::now_imf_fixdate()),
+        ("content-type", "text/plain".to_string()),
+    ];
+    for (name, value) in standards {
+        if !resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            resp.headers.push((name.to_string(), value));
+        }
+    }
+}
+
 /// Drive the actual H2 response emission. Sends the response head via
 /// `send_response`, then the body via `send_data(end_of_stream=true)`.
 ///
@@ -164,5 +205,66 @@ mod tests {
             matches!(err, Http2Error::MalformedH2HeaderBlock),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn decorate_h2_adds_standard_headers_when_filter_provides_none() {
+        let mut resp = Response {
+            status: 503,
+            reason: None,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"fault filter abort"),
+        };
+        super::decorate_filter_synth_response_h2(&mut resp);
+        let name = |n: &str| -> Option<&str> {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(name("content-length"), Some("18"));
+        assert_eq!(name("server"), Some("envoy-rust"));
+        assert_eq!(name("content-type"), Some("text/plain"));
+        let date = name("date").expect("date header added");
+        assert!(!date.is_empty(), "date empty: {date:?}");
+        // H2: NO connection header (H2-forbidden hop-by-hop).
+        assert!(
+            name("connection").is_none(),
+            "connection must NOT be added on H2"
+        );
+        // 4 standard headers; no more, no fewer (filter contributed 0).
+        assert_eq!(resp.headers.len(), 4, "headers: {:?}", resp.headers);
+    }
+
+    #[test]
+    fn decorate_h2_preserves_filter_headers_and_overwrites_content_length() {
+        let mut resp = Response {
+            status: 503,
+            reason: None,
+            headers: vec![
+                ("server".to_string(), "my-proxy".to_string()),
+                ("content-length".to_string(), "10".to_string()),
+                ("x-fault-policy".to_string(), "phase-11".to_string()),
+            ],
+            body: Bytes::from_static(b"fault filter abort"),
+        };
+        super::decorate_filter_synth_response_h2(&mut resp);
+        let name = |n: &str| -> Option<String> {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.clone())
+        };
+        // Filter's server wins (only-if-missing for server).
+        assert_eq!(name("server").as_deref(), Some("my-proxy"));
+        // content-length always overwritten to body.len() = 18.
+        assert_eq!(name("content-length").as_deref(), Some("18"));
+        // date + content-type added (filter didn't provide).
+        assert!(name("date").is_some());
+        assert_eq!(name("content-type").as_deref(), Some("text/plain"));
+        // Non-standard header preserved verbatim.
+        assert_eq!(name("x-fault-policy").as_deref(), Some("phase-11"));
+        // Still no connection.
+        assert!(name("connection").is_none());
     }
 }
