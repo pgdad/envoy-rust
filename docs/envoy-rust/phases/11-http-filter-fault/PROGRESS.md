@@ -622,3 +622,95 @@ H2 header set matched bilaterally against upstream `envoyproxy/envoy:v1.33.0`.
 - **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
   (pre-existing unmatched-license-allowance warnings for `MPL-2.0` / `Unicode-DFS-2016` / `Zlib`
   unchanged).
+
+### Task 6 — D8.2 fuzz corpus seed hcm_fault_filter.yaml
+
+Extends the `parse_bootstrap` fuzz corpus from 17 seeds → 18 by adding the fault-filter bootstrap
+shape as a named YAML seed. The seed is structurally identical to `hcm_rbac_filter.yaml` (the
+phase-10 RBAC precedent) except the HCM `codec_type` changes from `HTTP1` → `HTTP2` and the
+`http_filters[0]` block changes from the RBAC filter to the fault abort filter. No RBAC residue
+remains (`x-rbac-pass`, `403`, `access denied`, `rbac` strings are absent).
+
+**Seed shape (`hcm_fault_filter.yaml`):**
+
+```yaml
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+static_resources:
+  listeners:
+  - name: ingress_http
+    address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_http
+          codec_type: HTTP2
+          http_filters:
+          - name: envoy.filters.http.fault
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault
+              abort:
+                http_status: 503
+                percentage: { numerator: 100, denominator: HUNDRED }
+              headers:
+              - name: x-fault
+                string_match: { exact: abort }
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          route_config:
+            name: local
+            virtual_hosts:
+            - name: default
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                direct_response: { status: 200, body: { inline_string: "ok\n" } }
+```
+
+**3-files-same-commit discipline:** per the hard project lesson (a seed without the `.gitignore`
+allow-list entry is gitignored-and-lost; a seed without the SUCCESS-array entry is untested),
+all three files land in the same commit: the seed itself, the `.gitignore` allow-list extension,
+and the `bootstrap.rs` SUCCESS-array extension. The PROGRESS subsection (this file) is the
+fourth path in the same commit.
+
+**Tests landed:**
+
+The `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array extends from 17 entries to 18 by
+adding `"fuzz/corpus/parse_bootstrap/hcm_fault_filter.yaml"` immediately after the
+`hcm_rbac_filter.yaml` entry. The test result:
+
+```
+test bootstrap::tests::fuzz_corpus_seeds_parse_or_reject_cleanly ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 249 filtered out; finished in 0.02s
+```
+
+**Deviations from PLAN:** None. The seed shape, `.gitignore` allow-list insertion point, and
+SUCCESS-array placement all matched the PLAN sketch exactly. The listener `name: ingress_http`
+was kept (per the PLAN's "prefer faithfulness to the precedent" recommendation).
+
+**LoC delta (per file, `git diff --numstat`):**
+
+| File | Added | Removed |
+|---|---|---|
+| `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_fault_filter.yaml` (new) | 35 | 0 |
+| `crates/envoy-config/fuzz/.gitignore` | 1 | 0 |
+| `crates/envoy-config/src/bootstrap.rs` | 1 | 0 |
+| `docs/envoy-rust/phases/11-http-filter-fault/PROGRESS.md` | (this section) | 0 |
+| **Total** | **~37** | **0** |
+
+**5-gate attestation (stable toolchain):**
+
+- **fmt** — PASS. `cargo fmt --all -- --check`: clean (exit 0, no output).
+- **clippy** — PASS. `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  `Finished \`dev\` profile … in 54.80s` with zero warnings (no production code touched; only test
+  data and the test SUCCESS array).
+- **build** — PASS. `cargo build --workspace --all-targets`: `Finished` clean.
+- **test** — PASS. `cargo test --workspace`: all `test result:` lines `ok. N passed; 0 failed`.
+  envoy-config lib corpus test: `ok. 1 passed; 0 failed` (targeted run above).
+- **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
+  (pre-existing unmatched-license-allowance warnings for `MPL-2.0` / `Unicode-DFS-2016` / `Zlib`
+  unchanged).
