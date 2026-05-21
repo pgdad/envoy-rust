@@ -295,3 +295,76 @@ check then sub-validate) wires it in. The four schema types are re-exported alph
   workspace. envoy-config lib: `test result: ok. 250 passed; 0 failed` (the 11 new fault_tests).
 - **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
   (the unmatched-license-allowance warnings are pre-existing, unchanged from phase 10).
+
+### Task 2 — D4 FaultFilter runtime + D7 stats wiring + D7.1 BEHAVIOR_CONTRACT row
+
+`crates/envoy-filter/src/fault.rs` lands the `FaultFilter` runtime filter following the
+`rbac.rs` + `local_rate_limit.rs` sibling-filter precedent. The decode path implements the
+gate-then-select logic: `header_gate_matches` (AND semantics over `Vec<HeaderMatcher>`; empty
+gate ⇒ all requests) is checked first, then `abort_selects` (the build-time-lowered
+`FractionalPercent::selects_deterministic()` bool). When both are true, `aborts_injected.inc()`
+fires and `Decision::StopAndSend(FilterResponse { status: abort_status, reason: None, headers:
+vec![], body: Bytes::from_static(b"fault filter abort") })` is returned. `encode_headers` is a
+no-op (decode-only filter at phase-11 scope). `build_from_config` registers the
+`http.{hcm_stat_prefix}.fault.aborts_injected` counter via the standard `StatsRegistry::register_counter` +
+`map_err(FilterError::InvalidConfig)` chain matching the `RbacFilter` precedent.
+
+`crates/envoy-filter/src/lib.rs` gains `pub mod fault;` (alphabetically between `error` and
+`header_mutation`) and `pub use fault::FaultFilter;` (alphabetically between `FilterError` and
+`HeaderMutationFilter`). The re-export satisfies clippy's dead-code gate: `FaultFilter` is
+`pub` at the crate root, so the type itself is considered reachable. The methods and helper
+function are `pub(crate)` and not yet wired into `HttpFilterInstance` dispatch (that is Task 3),
+so `#[allow(dead_code)]` attributes are placed on the impl block, the struct fields, the
+`FAULT_ABORT_BODY` const, and `header_gate_matches` — the established pre-wiring posture for
+transient task-boundary gaps. Task 3 removes these suppression attributes when it wires the
+dispatch arm.
+
+The `docs/envoy-rust/BEHAVIOR_CONTRACT.md` "Stat-name mapping" section gains the `**11 entries
+(Fault filter):**` block immediately after the RBAC entries, one row:
+`http.<hcm_stat_prefix>.fault.aborts_injected` (value-exact; §6.2-verified).
+
+**Tests landed (5 new; envoy-filter lib 64 → 69):**
+- `abort_100_percent_no_gate_aborts_every_request`
+- `abort_0_percent_never_aborts`
+- `header_gate_match_aborts_miss_passes`
+- `aborts_injected_counter_increments_once_per_abort_only`
+- `encode_headers_is_noop`
+
+**Deviations from PLAN:**
+1. **`#[allow(dead_code)]` attributes added** on the impl block, all four struct fields,
+   `FAULT_ABORT_BODY`, and `header_gate_matches`. The PLAN's spec noted "the `pub use` keeps
+   it from being dead-code" — but that applies only to the `FaultFilter` type itself; the
+   `pub(crate)` methods + private helper are only called from the test module until Task 3
+   wires the dispatch. Without the allow-attributes `cargo clippy -D warnings` fails. This is
+   the correct pre-wiring posture; the attributes are transient (removed at Task 3). The PLAN
+   did not anticipate the per-method granularity of rustc's dead_code lint.
+2. **Test helpers adjusted from verbatim spec** (3 changes; see report). The spec's verbatim
+   tests assumed `FilterRequest: Default`, `registry.counter_value(name)`, and
+   `serde_yaml::from_str` for `header_matcher_exact`. All three differ from the actual APIs
+   (confirmed by reading `types.rs`, `registry.rs`, and `rbac.rs` before writing tests).
+   Adjustments: (a) `req()` uses explicit struct fields (no `Default`); (b) counter-read uses
+   idempotent `registry.register_counter(name).expect(...).value()` matching the `rbac.rs`
+   precedent; (c) `header_matcher_exact` uses direct struct construction
+   (`HeaderMatcherMode::StringMatch(StringMatcher { ... })`) matching `rbac.rs`.
+
+**LoC delta (per file, `git diff --numstat` + new-file count):**
+
+| File | Added | Removed |
+|---|---|---|
+| `crates/envoy-filter/src/fault.rs` (new) | 214 | 0 |
+| `crates/envoy-filter/src/lib.rs` | 2 | 0 |
+| `docs/envoy-rust/BEHAVIOR_CONTRACT.md` | 6 | 0 |
+| `docs/envoy-rust/phases/11-http-filter-fault/PROGRESS.md` | (this section) | 0 |
+| **Total** | **~280** | **0** |
+
+**5-gate attestation (stable toolchain):**
+
+- **fmt** — PASS. `cargo fmt --all -- --check` clean after one `cargo fmt --all` pass (rustfmt
+  reformatted the `assert!(matches!(...))` call in `header_gate_match_aborts_miss_passes`).
+- **clippy** — PASS. `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  `Finished` with zero errors after adding `#[allow(dead_code)]` suppression attributes.
+- **build** — PASS. `cargo build --workspace --all-targets`: `Finished` clean.
+- **test** — PASS. `cargo test --workspace`: all test results ok; no failures.
+  envoy-filter lib: `test result: ok. 69 passed; 0 failed` (5 new fault tests).
+- **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
+  (pre-existing unmatched-license-allowance warnings unchanged).
