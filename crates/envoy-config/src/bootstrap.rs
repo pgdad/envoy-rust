@@ -439,6 +439,73 @@ pub struct HttpFilter {
     pub typed_config: HttpFilterTypedConfig,
 }
 
+/// `envoy.extensions.filters.http.fault.v3.HTTPFault` config (abort path).
+/// Phase 11 supports the abort block + optional header-match gate; delay,
+/// response_rate_limit, max_active_faults, and downstream-controlled faults
+/// all defer per phase-11 SPEC §4 (rejected by `deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FaultConfig {
+    pub abort: FaultAbort,
+    #[serde(default)]
+    pub headers: Vec<HeaderMatcher>,
+}
+
+/// `envoy.extensions.filters.http.fault.v3.FaultAbort` (abort block).
+/// `grpc_status` + `header_abort` defer per SPEC §4.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FaultAbort {
+    pub http_status: u16,
+    pub percentage: FractionalPercent,
+}
+
+/// `envoy.type.v3.FractionalPercent`. A general shared config type (the first
+/// percent type in envoy-config); authored to be reusable by future filters
+/// that take a fractional percentage.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FractionalPercent {
+    pub numerator: u32,
+    #[serde(default = "default_denominator")]
+    pub denominator: DenominatorType,
+}
+
+impl FractionalPercent {
+    /// Phase-11 deterministic select: `true` iff 100% (`numerator ==
+    /// denominator.value()`), `false` iff 0% (`numerator == 0`). The validator
+    /// (`validate_fault_config`) guarantees `numerator ∈ {0, denominator.value()}`,
+    /// so this is a pure boolean — no per-request randomness, no PRNG. Fractional
+    /// percentage defers per SPEC §4 + §5.6.
+    pub fn selects_deterministic(&self) -> bool {
+        self.numerator == self.denominator.value()
+    }
+}
+
+/// `envoy.type.v3.FractionalPercent.DenominatorType`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DenominatorType {
+    Hundred,
+    TenThousand,
+    Million,
+}
+
+impl DenominatorType {
+    /// The integer denominator this variant represents.
+    pub fn value(self) -> u32 {
+        match self {
+            DenominatorType::Hundred => 100,
+            DenominatorType::TenThousand => 10_000,
+            DenominatorType::Million => 1_000_000,
+        }
+    }
+}
+
+fn default_denominator() -> DenominatorType {
+    DenominatorType::Hundred
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "@type", deny_unknown_fields)]
 pub enum HttpFilterTypedConfig {
@@ -457,6 +524,9 @@ pub enum HttpFilterTypedConfig {
 
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC")]
     Rbac(RbacConfig),
+
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault")]
+    Fault(FaultConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -1909,6 +1979,14 @@ pub(crate) fn validate_http_filters(
                 }
                 validate_rbac_config(cfg, listener_name)?;
             }
+            crate::HttpFilterTypedConfig::Fault(cfg) => {
+                if f.name != "envoy.filters.http.fault" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_fault_config(cfg, listener_name)?;
+            }
         }
     }
 
@@ -2071,6 +2149,42 @@ fn validate_rbac_config(
                 1,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Phase 11: validate the fault filter config. Rejects invalid abort status
+/// codes, out-of-range percentages, and (per phase-11 deterministic-only scope)
+/// fractional percentages. The optional `headers` gate reuses the 04.2
+/// `HeaderMatcher` (no parse-time validation beyond deserialize).
+fn validate_fault_config(
+    cfg: &crate::FaultConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if !(100..=599).contains(&cfg.abort.http_status) {
+        return Err(crate::ConfigError::InvalidFaultAbortStatus {
+            listener: listener_name.to_string(),
+            status: cfg.abort.http_status,
+        });
+    }
+    let denominator = cfg.abort.percentage.denominator.value();
+    let numerator = cfg.abort.percentage.numerator;
+    // Out-of-range check FIRST: numerator > denominator is an operator typo,
+    // reported distinctly from the fractional rejection.
+    if numerator > denominator {
+        return Err(crate::ConfigError::FaultPercentageOutOfRange {
+            listener: listener_name.to_string(),
+            numerator,
+            denominator,
+        });
+    }
+    // Deterministic-only: numerator must be 0 (0%) or == denominator (100%).
+    if numerator != 0 && numerator != denominator {
+        return Err(crate::ConfigError::UnsupportedFractionalFaultPercentage {
+            listener: listener_name.to_string(),
+            numerator,
+            denominator,
+        });
     }
     Ok(())
 }
@@ -7989,6 +8103,235 @@ rules:
             filter.name = "envoy.filters.http.something_else".to_string();
             let filters = vec![filter, router_filter()];
             let err = validate_http_filters(&filters, "ingress_http").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::UnsupportedHttpFilter { .. }),
+                "err: {err:?}"
+            );
+        }
+    }
+
+    mod fault_tests {
+        use super::*;
+        use crate::{
+            ConfigError, DenominatorType, FaultAbort, FaultConfig, FractionalPercent, HttpFilter,
+            HttpFilterTypedConfig,
+        };
+
+        fn router_filter() -> HttpFilter {
+            HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(crate::RouterConfig {}),
+            }
+        }
+
+        // ── schema deserialization ─────────────────────────────────────────
+
+        #[test]
+        fn fault_config_parses_full_abort_with_header_gate() {
+            let yaml = r#"
+abort:
+  http_status: 503
+  percentage: { numerator: 100, denominator: HUNDRED }
+headers:
+- name: x-fault
+  string_match: { exact: abort }
+"#;
+            let cfg: FaultConfig = serde_yaml::from_str(yaml).expect("parses");
+            assert_eq!(cfg.abort.http_status, 503);
+            assert_eq!(cfg.abort.percentage.numerator, 100);
+            assert_eq!(cfg.abort.percentage.denominator, DenominatorType::Hundred);
+            assert_eq!(cfg.headers.len(), 1);
+        }
+
+        #[test]
+        fn fault_config_denominator_defaults_to_hundred() {
+            let yaml = r#"
+abort:
+  http_status: 503
+  percentage: { numerator: 0 }
+"#;
+            let cfg: FaultConfig = serde_yaml::from_str(yaml).expect("parses");
+            assert_eq!(cfg.abort.percentage.denominator, DenominatorType::Hundred);
+            assert!(cfg.headers.is_empty());
+        }
+
+        #[test]
+        fn fault_config_rejects_unknown_field() {
+            let yaml = r#"
+abort:
+  http_status: 503
+  percentage: { numerator: 100 }
+delay: { fixed_delay: 5s }
+"#;
+            let err = serde_yaml::from_str::<FaultConfig>(yaml).unwrap_err();
+            assert!(format!("{err}").contains("delay"), "err: {err}");
+        }
+
+        #[test]
+        fn denominator_type_value_maps_correctly() {
+            assert_eq!(DenominatorType::Hundred.value(), 100);
+            assert_eq!(DenominatorType::TenThousand.value(), 10_000);
+            assert_eq!(DenominatorType::Million.value(), 1_000_000);
+        }
+
+        #[test]
+        fn fractional_percent_selects_deterministic() {
+            let p100 = FractionalPercent {
+                numerator: 100,
+                denominator: DenominatorType::Hundred,
+            };
+            let p0 = FractionalPercent {
+                numerator: 0,
+                denominator: DenominatorType::Hundred,
+            };
+            let p_full_million = FractionalPercent {
+                numerator: 1_000_000,
+                denominator: DenominatorType::Million,
+            };
+            assert!(p100.selects_deterministic());
+            assert!(!p0.selects_deterministic());
+            assert!(p_full_million.selects_deterministic());
+        }
+
+        // ── validator: positive ────────────────────────────────────────────
+
+        #[test]
+        fn validate_accepts_fault_abort_100_percent() {
+            let fault = HttpFilter {
+                name: "envoy.filters.http.fault".to_string(),
+                typed_config: HttpFilterTypedConfig::Fault(FaultConfig {
+                    abort: FaultAbort {
+                        http_status: 503,
+                        percentage: FractionalPercent {
+                            numerator: 100,
+                            denominator: DenominatorType::Hundred,
+                        },
+                    },
+                    headers: vec![],
+                }),
+            };
+            assert!(validate_http_filters(&[fault, router_filter()], "ingress").is_ok());
+        }
+
+        #[test]
+        fn validate_accepts_fault_abort_0_percent() {
+            let fault = HttpFilter {
+                name: "envoy.filters.http.fault".to_string(),
+                typed_config: HttpFilterTypedConfig::Fault(FaultConfig {
+                    abort: FaultAbort {
+                        http_status: 503,
+                        percentage: FractionalPercent {
+                            numerator: 0,
+                            denominator: DenominatorType::Hundred,
+                        },
+                    },
+                    headers: vec![],
+                }),
+            };
+            assert!(validate_http_filters(&[fault, router_filter()], "ingress").is_ok());
+        }
+
+        // ── validator: negative ────────────────────────────────────────────
+
+        #[test]
+        fn validate_rejects_invalid_abort_status() {
+            let fault = HttpFilter {
+                name: "envoy.filters.http.fault".to_string(),
+                typed_config: HttpFilterTypedConfig::Fault(FaultConfig {
+                    abort: FaultAbort {
+                        http_status: 999,
+                        percentage: FractionalPercent {
+                            numerator: 100,
+                            denominator: DenominatorType::Hundred,
+                        },
+                    },
+                    headers: vec![],
+                }),
+            };
+            let err = validate_http_filters(&[fault, router_filter()], "ingress").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidFaultAbortStatus { status: 999, .. }
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_percentage_out_of_range() {
+            let fault = HttpFilter {
+                name: "envoy.filters.http.fault".to_string(),
+                typed_config: HttpFilterTypedConfig::Fault(FaultConfig {
+                    abort: FaultAbort {
+                        http_status: 503,
+                        percentage: FractionalPercent {
+                            numerator: 200,
+                            denominator: DenominatorType::Hundred,
+                        },
+                    },
+                    headers: vec![],
+                }),
+            };
+            let err = validate_http_filters(&[fault, router_filter()], "ingress").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::FaultPercentageOutOfRange {
+                        numerator: 200,
+                        denominator: 100,
+                        ..
+                    }
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_fractional_percentage() {
+            let fault = HttpFilter {
+                name: "envoy.filters.http.fault".to_string(),
+                typed_config: HttpFilterTypedConfig::Fault(FaultConfig {
+                    abort: FaultAbort {
+                        http_status: 503,
+                        percentage: FractionalPercent {
+                            numerator: 50,
+                            denominator: DenominatorType::Hundred,
+                        },
+                    },
+                    headers: vec![],
+                }),
+            };
+            let err = validate_http_filters(&[fault, router_filter()], "ingress").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::UnsupportedFractionalFaultPercentage {
+                        numerator: 50,
+                        denominator: 100,
+                        ..
+                    }
+                ),
+                "err: {err:?}"
+            );
+        }
+
+        #[test]
+        fn validate_rejects_name_typed_config_mismatch() {
+            let fault = HttpFilter {
+                name: "envoy.filters.http.WRONG".to_string(),
+                typed_config: HttpFilterTypedConfig::Fault(FaultConfig {
+                    abort: FaultAbort {
+                        http_status: 503,
+                        percentage: FractionalPercent {
+                            numerator: 100,
+                            denominator: DenominatorType::Hundred,
+                        },
+                    },
+                    headers: vec![],
+                }),
+            };
+            let err = validate_http_filters(&[fault, router_filter()], "ingress").unwrap_err();
             assert!(
                 matches!(err, ConfigError::UnsupportedHttpFilter { .. }),
                 "err: {err:?}"

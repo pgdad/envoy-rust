@@ -90,6 +90,16 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::Rbac(cfg) => Ok(HttpFilterInstance::Rbac(
                 RbacFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
             )),
+            envoy_config::HttpFilterTypedConfig::Fault(_cfg) => {
+                // Phase 11 Task 1 transient bridge — a later task replaces this
+                // with the proper HttpFilterInstance::Fault(FaultFilter) dispatch
+                // once the FaultFilter runtime lands. Mirrors the phase-10 Task 1
+                // Rbac bridge precedent.
+                Err(FilterError::UnsupportedFilterType {
+                    position: 0,
+                    name: hf.name.clone(),
+                })
+            }
         }
     }
 

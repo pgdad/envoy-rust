@@ -10,17 +10,18 @@ pub mod matcher;
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, Bootstrap,
     CertificateValidationContext, Cluster, ClusterType, CodecType, CommonTlsContext, DataSource,
-    DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint, ExplicitHttpConfig,
-    FileAccessLog, FilterChain, FilterChainMatch, HeaderMatcher, HeaderMatcherMode,
-    HeaderMutationConfig, HeaderMutationEntry, HeaderValue, HeaderValueOption,
-    Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
-    HttpFilterTypedConfig, HttpProtocolOptions, HttpStatus, Int64Range, LbEndpoint, LbPolicy,
-    Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter,
-    Node, Permission, PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Route,
-    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, Rules, SafeRegex,
-    SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
-    TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
-    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
+    DenominatorType, DirectResponse, DnsLookupFamily, DownstreamTlsContext, Endpoint,
+    ExplicitHttpConfig, FaultAbort, FaultConfig, FileAccessLog, FilterChain, FilterChainMatch,
+    FractionalPercent, HeaderMatcher, HeaderMatcherMode, HeaderMutationConfig, HeaderMutationEntry,
+    HeaderValue, HeaderValueOption, Http1ProtocolOptions, Http2ProtocolOptions,
+    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpProtocolOptions,
+    HttpStatus, Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalRateLimitConfig,
+    LocalityLbEndpoints, Mutations, NetworkFilter, Node, Permission, PermissionSet, Policy,
+    Principal, PrincipalSet, RbacConfig, Route, RouteAction, RouteAction_Route, RouteConfiguration,
+    RouteMatch, RouterConfig, Rules, SafeRegex, SocketAddress, StaticResources, StringMatcher,
+    StringMatcherMode, TcpProxyConfig, TlsCertificate, TokenBucket, TransportSocket,
+    TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext,
+    VirtualHost, parse_duration,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
@@ -365,6 +366,36 @@ pub enum ConfigError {
         listener: String,
         policy_name: String,
         depth: u32,
+    },
+
+    /// Phase 11: fault filter `abort.http_status` outside the syntactic HTTP
+    /// status band (100..=599).
+    #[error(
+        "listener {listener:?}: fault abort http_status {status} is not a valid HTTP status code (must be 100-599)"
+    )]
+    InvalidFaultAbortStatus { listener: String, status: u16 },
+
+    /// Phase 11: fault filter `abort.percentage.numerator` exceeds its denominator.
+    #[error(
+        "listener {listener:?}: fault abort percentage numerator {numerator} exceeds denominator {denominator}"
+    )]
+    FaultPercentageOutOfRange {
+        listener: String,
+        numerator: u32,
+        denominator: u32,
+    },
+
+    /// Phase 11: fault filter fractional percentage (0 < numerator < denominator)
+    /// is not supported — phase-11 scope is deterministic 0%/100% only (a
+    /// fractional per-request abort is non-differential-testable per the
+    /// differential contract; SPEC §4 + §5.6).
+    #[error(
+        "listener {listener:?}: fault abort fractional percentage {numerator}/{denominator} is unsupported (deterministic 0% or 100% only)"
+    )]
+    UnsupportedFractionalFaultPercentage {
+        listener: String,
+        numerator: u32,
+        denominator: u32,
     },
 }
 

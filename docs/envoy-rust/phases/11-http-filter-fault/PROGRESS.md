@@ -214,3 +214,84 @@ Grouped summary:
 ## State-3 execution log
 
 _(Appended per-task by the state-3 subagent dispatch. Empty at state-2 PLAN-write.)_
+
+### Task 1 — D1 envoy-config schema + D2 validator + D3 eval helper
+
+Extends `crates/envoy-config` with the abort-path fault config surface and its parse-time
+gate. Four new schema items land in `bootstrap.rs`: `FaultConfig` (`abort: FaultAbort` +
+`#[serde(default)] headers: Vec<HeaderMatcher>`), `FaultAbort` (`http_status: u16` +
+`percentage: FractionalPercent`), `FractionalPercent` (`numerator: u32` +
+`#[serde(default = "default_denominator")] denominator: DenominatorType`), and the fieldless
+`DenominatorType` enum (`HUNDRED`/`TEN_THOUSAND`/`MILLION` via `SCREAMING_SNAKE_CASE`). All
+struct items carry `#[serde(deny_unknown_fields)]`; the unit-variant enum does not (meaningless
+there) and uses `rename_all` instead. `FractionalPercent` + `DenominatorType` are authored as
+general shared types (the first percent types in envoy-config), reusable by future filters.
+
+The D3 deterministic-percentage eval helper is co-located as
+`FractionalPercent::selects_deterministic(&self) -> bool` (returns `numerator ==
+denominator.value()`), backed by `DenominatorType::value(self) -> u32` (100 / 10_000 /
+1_000_000) and the `default_denominator()` serde-default fn (`DenominatorType::Hundred`). The
+helper is a pure boolean — no PRNG — because the validator guarantees `numerator ∈ {0,
+denominator.value()}`.
+
+The D2 validator adds three `ConfigError` variants in `lib.rs` (`InvalidFaultAbortStatus`,
+`FaultPercentageOutOfRange`, `UnsupportedFractionalFaultPercentage`) and the
+`validate_fault_config` sub-validator in `bootstrap.rs`. Check order is load-bearing: (1)
+`http_status ∈ 100..=599`; (2) `numerator > denominator` → `FaultPercentageOutOfRange` (the
+operator-typo case, which MUST precede the fractional check); (3) `numerator != 0 && numerator
+!= denominator` → `UnsupportedFractionalFaultPercentage` (the deterministic-only scope gate per
+SPEC §4 + §5.6). The `Fault(FaultConfig)` variant joins `HttpFilterTypedConfig` after `Rbac`,
+and a dispatch arm in `validate_http_filters` (mirroring the `Rbac` arm: name-vs-typed_config
+check then sub-validate) wires it in. The four schema types are re-exported alphabetically from
+`lib.rs`. No `error.rs` edit (SPEC correction #1).
+
+**Tests landed (11 new; envoy-config lib 239 → 250):**
+- `fault_config_parses_full_abort_with_header_gate`
+- `fault_config_denominator_defaults_to_hundred`
+- `fault_config_rejects_unknown_field`
+- `denominator_type_value_maps_correctly`
+- `fractional_percent_selects_deterministic`
+- `validate_accepts_fault_abort_100_percent`
+- `validate_accepts_fault_abort_0_percent`
+- `validate_rejects_invalid_abort_status`
+- `validate_rejects_percentage_out_of_range`
+- `validate_rejects_fractional_percentage`
+- `validate_rejects_name_typed_config_mismatch`
+
+**Deviations from PLAN:**
+1. **No `error.rs` edit** — as the PLAN itself directs (correction #1). Recorded for completeness.
+2. **`crates/envoy-filter/src/instance.rs` interim bridge arm (1 file beyond the PLAN's "exactly
+   two files").** Adding the `Fault` variant to the closed `HttpFilterTypedConfig` enum makes the
+   exhaustive `match` in `HttpFilterInstance::build` non-exhaustive, breaking the workspace build
+   (and the clippy/build gates). The fix mirrors the phase-10 Task 1 precedent verbatim (commit
+   `3fbe9f5`): a transient arm returning `FilterError::UnsupportedFilterType { position: 0, name:
+   hf.name.clone() }` with a comment deferring to the FaultFilter-runtime task. The PLAN's
+   "exactly two files" scope was an oversight; this is the established, required move.
+3. **`Serialize` added to all 4 fault schema derives.** The PLAN's verbatim Step-4 block derived
+   only `Deserialize`, but `HttpFilterTypedConfig` derives `Serialize`, so its variant payloads
+   must too (compile error otherwise). Matches the precedent of every existing variant config
+   (`RbacConfig`, `RouterConfig`, etc.).
+
+**LoC delta (per file, `git diff --numstat`):**
+
+| File | Added | Removed |
+|---|---|---|
+| `crates/envoy-config/src/bootstrap.rs` | 343 | 0 |
+| `crates/envoy-config/src/lib.rs` | 42 | 11 |
+| `crates/envoy-filter/src/instance.rs` | 10 | 0 |
+| **Total** | **395** | **11** |
+
+(The `lib.rs` 11 removals are re-flow of the re-export block + the `FaultPercentageOutOfRange` /
+`UnsupportedFractionalFaultPercentage` `#[error(...)]` attributes that `cargo fmt` wrapped.)
+
+**5-gate attestation (stable toolchain):**
+
+- **fmt** — PASS. `cargo fmt --all -- --check` clean after one `cargo fmt --all` pass (rustfmt
+  wrapped two long `#[error(...)]` attribute strings).
+- **clippy** — PASS. `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  `Finished` with zero warnings (after the instance.rs bridge arm closed the non-exhaustive match).
+- **build** — PASS. `cargo build --workspace --all-targets`: `Finished` clean.
+- **test** — PASS. `cargo test --workspace`: 559 passed; 0 failed; 1 ignored across the
+  workspace. envoy-config lib: `test result: ok. 250 passed; 0 failed` (the 11 new fault_tests).
+- **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
+  (the unmatched-license-allowance warnings are pre-existing, unchanged from phase 10).
