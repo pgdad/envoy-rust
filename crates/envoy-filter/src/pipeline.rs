@@ -153,6 +153,47 @@ mod tests {
         assert!(matches!(decision, Decision::Continue));
     }
 
+    #[test]
+    fn build_from_config_wires_fault_then_router() {
+        use envoy_config::{
+            DenominatorType, FaultAbort, FaultConfig, FractionalPercent, HttpFilter,
+            HttpFilterTypedConfig,
+        };
+        let registry = Arc::new(StatsRegistry::new());
+        let filters = vec![
+            HttpFilter {
+                name: "envoy.filters.http.fault".to_string(),
+                typed_config: HttpFilterTypedConfig::Fault(FaultConfig {
+                    abort: FaultAbort {
+                        http_status: 503,
+                        percentage: FractionalPercent {
+                            numerator: 100,
+                            denominator: DenominatorType::Hundred,
+                        },
+                    },
+                    headers: vec![],
+                }),
+            },
+            HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(envoy_config::RouterConfig {}),
+            },
+        ];
+        let mut pipeline = FilterPipeline::build_from_config(&filters, &registry, "ingress_http")
+            .expect("builds fault + router pipeline");
+        // 100% abort with no gate → every request is short-circuited with 503.
+        let mut req = FilterRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        match pipeline.decode_headers(&mut req) {
+            Decision::StopAndSend(resp) => assert_eq!(resp.status, 503),
+            Decision::Continue => panic!("expected fault abort, got Continue"),
+        }
+    }
+
     fn test_request() -> FilterRequest {
         FilterRequest {
             method: "GET".to_string(),

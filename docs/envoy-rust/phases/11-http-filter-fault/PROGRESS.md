@@ -368,3 +368,72 @@ The `docs/envoy-rust/BEHAVIOR_CONTRACT.md` "Stat-name mapping" section gains the
   envoy-filter lib: `test result: ok. 69 passed; 0 failed` (5 new fault tests).
 - **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
   (pre-existing unmatched-license-allowance warnings unchanged).
+
+### Task 3 — D5 HttpFilterInstance::Fault variant + dispatch
+
+`crates/envoy-filter/src/instance.rs` receives the fifth production variant and its three
+dispatch arms, completing the "rejected → supported" move established by the Task-1 transient
+bridge. The `use crate::fault::FaultFilter;` import joins the existing use-block alphabetically
+(between `error` and `header_mutation`). The `Fault(FaultFilter)` variant lands between
+`Rbac(RbacFilter)` and the `#[cfg(feature = "test-util")]` block, with a doc-comment mirroring
+the `Rbac` variant's style. The Task-1 transient bridge arm (which returned
+`FilterError::UnsupportedFilterType`) is replaced by the real build arm:
+`HttpFilterInstance::Fault(FaultFilter::build_from_config(cfg, registry, hcm_stat_prefix)?)`.
+The decode and encode dispatch arms mirror the `Rbac` arm shapes exactly, with `resp_arg` used
+as the encode parameter name to match all existing encode arms.
+
+`crates/envoy-filter/src/fault.rs` receives the anticipated dead-code sweep: all 7
+`#[allow(dead_code)]` attributes placed at Task 2 are removed, along with the "until then"
+comments that described the pre-wiring state. With the dispatch arms in place, every previously
+suppressed item (`FAULT_ABORT_BODY`, the 4 struct fields, the impl block, and
+`header_gate_matches`) is now genuinely reachable via `build_from_config` / `decode_headers` /
+`encode_headers`. Clippy's `-D warnings` flag enforces this: any remaining unnecessary
+`#[allow(dead_code)]` attribute would itself trigger an `unused_attributes` lint failure.
+
+The integration test is placed in `pipeline.rs` (the home of all `FilterPipeline::build_from_config`
+integration tests, confirmed by spot-check before writing). It constructs a 2-filter chain
+(`Fault` at 100% abort + no gate, then `Router`) and drives a `GET /` request through
+`decode_headers`, asserting `Decision::StopAndSend` with `resp.status == 503`. `FilterRequest`
+is constructed with explicit fields (no `Default` impl) matching the `req()` helper in
+`fault.rs`'s own test module. `cargo fmt --all` reformatted the `build_from_config` call
+from the 3-line indent form used in the initial edit to a 2-line form — the only formatting
+adjustment required.
+
+**Tests landed (1 new; envoy-filter lib 69 → 70):**
+- `pipeline::tests::build_from_config_wires_fault_then_router`
+
+**Deviations from PLAN:**
+1. **`FilterRequest::default()` → explicit construction.** The PLAN draft test used
+   `crate::FilterRequest::default()`, which does not compile (`FilterRequest` has no `Default`
+   impl). Replaced with explicit field construction `FilterRequest { method: "GET".to_string(),
+   path: "/".to_string(), headers: vec![], body: None }`, confirmed by reading `types.rs`.
+2. **`fault.rs` 7×`#[allow(dead_code)]` sweep makes Task 3 a 2-file change.** The PLAN's
+   "Files:" line listed only `instance.rs`, but the Task Description (Critical Adjustment #2)
+   mandated removal of the 7 transient dead-code attributes from `fault.rs` as an anticipated,
+   self-enforcing clippy-driven follow-up. This closes the Task-2 M1 minor (attributes placed
+   as a pre-wiring bridge, explicitly scoped to Task 3 removal). Not scope creep — the task
+   description calls this out verbatim as a "MANDATED, anticipated cross-file edit."
+
+**LoC delta (per file, `git diff --numstat`):**
+
+| File | Added | Removed |
+|---|---|---|
+| `crates/envoy-filter/src/fault.rs` | 0 | 14 |
+| `crates/envoy-filter/src/instance.rs` | 11 | 10 |
+| `crates/envoy-filter/src/pipeline.rs` | 41 | 0 |
+| `docs/envoy-rust/phases/11-http-filter-fault/PROGRESS.md` | (this section) | 0 |
+| **Total** | **~52** | **24** |
+
+**5-gate attestation (stable toolchain):**
+
+- **fmt** — PASS. `cargo fmt --all -- --check` reported one-line drift (the
+  `build_from_config` call indent); fixed with `cargo fmt --all`, re-check clean.
+- **clippy** — PASS. `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  `Finished` with zero warnings (removal of dead_code attrs verified no `unused_attributes`
+  or `dead_code` lints remain).
+- **build** — PASS. `cargo build --workspace --all-targets`: `Finished` clean.
+- **test** — PASS. `cargo test --workspace`: all test results ok; no failures.
+  envoy-filter lib: `test result: ok. 70 passed; 0 failed` (1 new pipeline integration test;
+  +1 from the 69 that landed at Task 2).
+- **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
+  (pre-existing unmatched-license-allowance warnings unchanged).

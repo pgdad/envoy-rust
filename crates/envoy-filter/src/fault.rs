@@ -19,32 +19,20 @@ use crate::types::{FilterRequest, FilterResponse};
 
 /// Upstream Envoy v1.33's source-hardcoded fault-abort body (18 bytes;
 /// §6.2-verified at phase-11 state-2 PLAN-write against `envoyproxy/envoy:v1.33.0`).
-// Task 3 wires FaultFilter into HttpFilterInstance dispatch; until then the
-// const + struct fields are only read by the test module.
-#[allow(dead_code)]
 const FAULT_ABORT_BODY: &[u8] = b"fault filter abort";
 
 /// The `envoy.filters.http.fault` runtime filter (abort path).
 #[derive(Debug, Clone)]
 pub struct FaultFilter {
-    // Fields are read by build_from_config + decode_headers; Task 3 wires those
-    // into the dispatch path. Until then suppress the pre-wiring dead_code lint.
-    #[allow(dead_code)]
     abort_status: u16,
     /// `true` iff the percentage is 100% (per `FractionalPercent::selects_deterministic`);
     /// computed once at build time — no per-request randomness.
-    #[allow(dead_code)]
     abort_selects: bool,
     /// Optional gate; empty ⇒ the fault applies to all requests.
-    #[allow(dead_code)]
     header_gate: Vec<envoy_config::HeaderMatcher>,
-    #[allow(dead_code)]
     aborts_injected: Arc<Counter>,
 }
 
-// Task 3 wires FaultFilter into HttpFilterInstance dispatch; until then the
-// pub(crate) methods are only called by the test module below.
-#[allow(dead_code)]
 impl FaultFilter {
     /// Lower an `envoy_config::FaultConfig` into the runtime filter + register
     /// the abort counter under `http.{hcm_stat_prefix}.fault.aborts_injected`.
@@ -87,8 +75,6 @@ impl FaultFilter {
 
 /// All listed matchers must match (AND semantics) per upstream. An empty gate
 /// returns `true` (`Iterator::all` over an empty slice) — no gate ⇒ all requests.
-// Called only from decode_headers; suppressed until Task 3 wires decode_headers.
-#[allow(dead_code)]
 fn header_gate_matches(gate: &[envoy_config::HeaderMatcher], req: &FilterRequest) -> bool {
     gate.iter().all(|m| m.matches(&req.headers))
 }

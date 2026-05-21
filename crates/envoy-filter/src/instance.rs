@@ -18,6 +18,7 @@ use std::sync::Arc;
 use envoy_stats::StatsRegistry;
 
 use crate::error::FilterError;
+use crate::fault::FaultFilter;
 use crate::header_mutation::HeaderMutationFilter;
 use crate::local_rate_limit::LocalRateLimitFilter;
 use crate::pipeline::Decision;
@@ -35,6 +36,11 @@ pub enum HttpFilterInstance {
     /// decision matrix; 2 stat counters registered under
     /// `http.{hcm_stat_prefix}.rbac.{allowed,denied}` at build time).
     Rbac(RbacFilter),
+    /// Phase-11 Task 3: the `envoy.filters.http.fault` filter (decode-side
+    /// abort path; short-circuits matching requests with the configured HTTP
+    /// status; 1 stat counter registered under
+    /// `http.{hcm_stat_prefix}.fault.aborts_injected` at build time).
+    Fault(FaultFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -90,16 +96,9 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::Rbac(cfg) => Ok(HttpFilterInstance::Rbac(
                 RbacFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
             )),
-            envoy_config::HttpFilterTypedConfig::Fault(_cfg) => {
-                // Phase 11 Task 1 transient bridge — a later task replaces this
-                // with the proper HttpFilterInstance::Fault(FaultFilter) dispatch
-                // once the FaultFilter runtime lands. Mirrors the phase-10 Task 1
-                // Rbac bridge precedent.
-                Err(FilterError::UnsupportedFilterType {
-                    position: 0,
-                    name: hf.name.clone(),
-                })
-            }
+            envoy_config::HttpFilterTypedConfig::Fault(cfg) => Ok(HttpFilterInstance::Fault(
+                FaultFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
+            )),
         }
     }
 
@@ -109,6 +108,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::HeaderMutation(f) => f.decode_headers(req),
             HttpFilterInstance::LocalRateLimit(f) => f.decode_headers(req),
             HttpFilterInstance::Rbac(f) => f.decode_headers(req),
+            HttpFilterInstance::Fault(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -124,6 +124,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::HeaderMutation(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::LocalRateLimit(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Rbac(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::Fault(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
