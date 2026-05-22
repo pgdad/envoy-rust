@@ -1,0 +1,31 @@
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      common_lb_config:
+        healthy_panic_threshold: { value: 0 }
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 2
+          http_health_check:
+            path: /healthz
+            expected_statuses:
+              - { start: 200, end: 201 }
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: localhost
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
