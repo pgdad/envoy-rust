@@ -804,3 +804,124 @@ strings remain (swept the whole file).
 - **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
   (pre-existing unmatched-license-allowance warnings for `MPL-2.0` / `Unicode-DFS-2016` / `Zlib`
   unchanged).
+
+### Task 8 — state-4 phase-done verification + STATE advance to state-5-next
+
+**Commit:** _(this commit; SHA emitted at `git commit` time)_
+**Parent:** `4cea2de` — `phase 11: task 7 — D8.3 in-process backstop (H1; with 503-probe header assertion)` (the last state-3 implementation task; the exact code state this gate verifies).
+
+**Work summary.** Docs-only commit at this HEAD materializes the `BOOTSTRAP_PROMPT.md` §7.5 phase-done gate evidence for phase 11 and advances STATE.md to state-5-next. The §7.5 phase-done gate (a)–(e) are all GREEN at the predecessor HEAD `4cea2de00729a66c1b646488b6c0a94d226bf97a` (Task 7) per **CI run `26266998953`** (conclusion `success`, completed `2026-05-22T03:39:42Z`, wall ~2m 30s) — AND were independently re-run locally at this state-4 session (Docker available, so the full 18-fixture bilateral differential suite + a local h2spec run were exercised directly, not deferred to CI). Gate (f) (`REVIEW.md` approved) defers to state 5 per `BOOTSTRAP_PROMPT.md` §5.1.
+
+This commit mirrors the phase-10 Task 8 / 09 Task 8 (`a5ebddd`) / 08.2 Task 11 (`cade4b0`) state-4-reached precedents — docs-only PROGRESS append (state-4 evidence anchor) + STATE.md status / next-skill / last-commit / last-updated rewrites, no production code or test changes. The Task 7 predecessor CI run was GREEN on first push at HEAD `4cea2de`, so no in-flight fix is required — Task 8 lands as a pure docs-only 1-commit shape. 2 files modified (PROGRESS.md state-4 evidence anchor + STATE.md advance); no production code; no test code; no fixture changes; no Cargo.toml/Cargo.lock changes; no DECISIONS.md / BEHAVIOR_CONTRACT.md / ENVOY_TARGET.md / rust-toolchain.toml changes; preserves all prior STATE.md subsections verbatim per D-3.5 (append-only) + D-3.4 (context isolation).
+
+**Phase 11 touched the H2 writer path (Task 4 `decorate_filter_synth_response_h2`), so per SPEC §6.8 the state-4 gate explicitly re-confirms h2spec ≥95% — the decoration must not regress H2 framing.** Re-confirmed: **99.31%** (baseline; unchanged), both via CI (`h2spec_pass_rate_gate ... ok`) and a local h2spec 2.6.0 run (see gate (c) below).
+
+### CI evidence anchor (state-4)
+
+**CI run:** `26266998953` — `https://github.com/pgdad/envoy-rust/actions/runs/26266998953`.
+**HEAD SHA:** `4cea2de00729a66c1b646488b6c0a94d226bf97a` (Task 7 — the predecessor of THIS commit; the exact code state verified, since Task 8 is docs-only).
+**Conclusion:** `success`.
+**Created at:** `2026-05-22T03:37:12Z`.
+**Completed at:** `2026-05-22T03:39:42Z` (overall run; both jobs).
+**Wall:** ~2m 30s.
+**Workflow:** `ci` (.github/workflows/ci.yml).
+
+Both CI jobs GREEN:
+
+- **`build + test + lint`** OK — job ID `77312346317`
+  (`https://github.com/pgdad/envoy-rust/actions/runs/26266998953/job/77312346317`);
+  started `2026-05-22T03:37:15Z` → completed `2026-05-22T03:39:41Z`, wall ~2m 26s. All steps green: `install Rust` → `cargo cache` → `fmt` → `clippy` → `build` → `install h2spec` (v2.6.0 pinned) → `test (includes differential harness → Docker)` (the load-bearing step running `cargo test --workspace` with all 18 Docker-gated differential integration buckets `1 passed` each + all in-process `envoy-bin` integration buckets + all lib buckets + the h2spec conformance gate; 0 failed across the workspace) → `install cargo-deny` → `cargo deny check`.
+- **`fuzz (parse_bootstrap, 30s)`** OK — job ID `77312346325`
+  (`https://github.com/pgdad/envoy-rust/actions/runs/26266998953/job/77312346325`);
+  started `2026-05-22T03:37:16Z` → completed `2026-05-22T03:39:19Z`, wall ~2m 3s. `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` ran clean: **`Done 228789 runs in 31 second(s)`** at `2026-05-22T03:39:12.7282991Z`; the Task 6 seed `hcm_fault_filter.yaml` is in corpus + listed in the `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (Task 6 commit `eeee9cf`); no crash.
+
+### §7.5 phase-done gate — six gates
+
+| Gate | Disposition | Evidence |
+|---|---|---|
+| **(a)** Fixture 0018-http-filter-fault green | **PASS** | CI job 77312346317, `test (includes differential harness → Docker)` step at `2026-05-22T03:38:57.5547431Z`: `test http_filter_fault_fixture ... ok`. Re-run LOCALLY (Docker available) bilaterally vs `envoyproxy/envoy:v1.33.0`: `test http_filter_fault_fixture ... ok` (status sequence `[503, 200, 503, 200]` + body `"fault filter abort"` (18 bytes) on abort probes + the H2 standard header set `{server, content-length, content-type, date}` (no `connection`) via `decorate_filter_synth_response_h2`). |
+| **(b)** 17 pre-existing fixtures (0001-0017) green simultaneously | **PASS** | Same CI job + step: all 17 pre-existing Docker-gated wrapper binaries pass alongside 0018 in a single `cargo test --workspace`. Re-confirmed LOCALLY: `cargo test -p differential --tests` → all 18 fixture wrappers `1 passed; 0 failed` SIMULTANEOUSLY (full table below). |
+| **(c)** h2spec ≥95% (re-confirm — phase 11 touched the H2 writer path) | **PASS** | **99.31%** (baseline 99.31%, unchanged). CI `h2spec_pass_rate_gate ... ok` at `2026-05-22T03:39:28.9300637Z`. Re-confirmed LOCALLY with h2spec 2.6.0 (the CI-pinned version): `h2spec: passed=144 failed=1 total=145 pass_rate=0.9931`, `h2spec_pass_rate_gate ... ok` (exit 0). The 1 failure is the single allowlisted known-failure (3.5/2 invalid-preface); the gate's regression check passed — no new framing regression introduced by the Task-4 H2 decoration. |
+| **(d)** parse_bootstrap fuzz clean for short-budget CI run | **PASS** | CI `fuzz (parse_bootstrap, 30s)` job 77312346325 (wall ~2m 3s). Task 6's `hcm_fault_filter.yaml` seed in corpus + listed in `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (Task 6 commit `eeee9cf`). **`Done 228789 runs in 31 second(s)`** — no crash. Locally, the 18-success-seed corpus replays cleanly via `bootstrap::tests::fuzz_corpus_seeds_parse_or_reject_cleanly ... ok`. |
+| **(e)** Stable-toolchain gates (fmt / clippy / build / test / deny) | **PASS** | All 5 GREEN in CI job 77312346317. Re-run LOCALLY at this state-4 session (HEAD `4cea2de`): fmt exit 0, clippy exit 0, build exit 0, `cargo test --workspace` **803 passed / 0 failed / 2 ignored** (matches CI exactly), deny `advisories ok, bans ok, licenses ok, sources ok` (full quoted output below). |
+| **(f)** REVIEW.md approved | **CLOSE-at-state-5-REVIEW.md** | State-5 session writes REVIEW.md per `superpowers:requesting-code-review` scoped to the range `477a42d..<this commit's HEAD>` (`477a42d` = the phase-11 state-2 PLAN-write commit). |
+
+#### (a)/(b) all 18 differential fixtures green simultaneously (LOCAL bilateral re-run)
+
+Docker was available at this state-4 session, so the full bilateral differential suite was re-run LOCALLY against `envoyproxy/envoy:v1.33.0` (208MB, present), not merely deferred to CI. `cargo test -p differential --tests` (EXIT 0):
+
+| Wrapper test binary | Fixture | Result |
+|---|---|---|
+| `tests/echo.rs` | 0001-tcp-echo | `1 passed; 0 failed` |
+| `tests/admin_ready.rs` | 0002-static-admin-ready | `1 passed; 0 failed` |
+| `tests/tcp_proxy.rs` | 0003-tcp-proxy | `1 passed; 0 failed` |
+| `tests/tls_downstream.rs` | 0004-tls-downstream | `1 passed; 0 failed` |
+| `tests/tls_upstream.rs` | 0005-tls-upstream | `1 passed; 0 failed` |
+| `tests/tls_sni.rs` | 0006-tls-sni | `1 passed; 0 failed` |
+| `tests/http1_direct_response.rs` | 0007-http1-direct-response | `1 passed; 0 failed` |
+| `tests/http1_router_upstream.rs` | 0008-http1-router-upstream | `1 passed; 0 failed` |
+| `tests/http2_direct_response.rs` | 0009-http2-direct-response | `1 passed; 0 failed` |
+| `tests/http2_router_upstream.rs` | 0010-http2-router-upstream | `1 passed; 0 failed` |
+| `tests/admin_stats_prometheus.rs` | 0011-admin-stats-prometheus | `1 passed; 0 failed` |
+| `tests/access_log_file_sink.rs` | 0012-access-log-file-sink | `1 passed; 0 failed` |
+| `tests/http_filter_header_mutation.rs` | 0013-http-filter-header-mutation | `1 passed; 0 failed` |
+| `tests/admin_config_dump_server_info.rs` | 0014-admin-config-dump-server-info | `1 passed; 0 failed` |
+| `tests/admin_drain_listeners.rs` | 0015-admin-drain-listeners | `1 passed; 0 failed` |
+| `tests/http_filter_local_rate_limit.rs` | 0016-http-filter-local-rate-limit | `1 passed; 0 failed` |
+| `tests/http_filter_rbac.rs` | 0017-http-filter-rbac | `1 passed; 0 failed` |
+| `tests/http_filter_fault.rs` | **0018-http-filter-fault** (NEW Phase 11; H2 listener) | `1 passed; 0 failed` |
+
+The `differential` lib bucket itself (`unittests src/lib.rs`) runs `107 passed; 0 failed; 1 ignored`. Fixture 0018 is the **first HTTP-filter-family fixture on an H2 listener** — the 2 abort probes (statuses 1+3) exercise the Task-4 `decorate_filter_synth_response_h2` helper end-to-end against both proxies (the bilateral demonstration that the 09 REVIEW M2 close is real); the 2 pass-through probes (statuses 2+4) route to the direct_response 200.
+
+#### (c) h2spec ≥95% re-confirmation (REQUIRED — SPEC §6.8)
+
+Phase 11 touched the H2 writer path at Task 4 (`decorate_filter_synth_response_h2`), so SPEC §6.8 requires explicit h2spec re-confirmation. **Result: 99.31% — the baseline, unchanged; no framing regression.**
+
+CI (`build + test + lint` job 77312346317, h2spec 2.6.0 pinned `linux_amd64`):
+```
+2026-05-22T03:39:28.9300637Z test h2spec_pass_rate_gate ... ok
+```
+
+Local re-run (h2spec 2.6.0 `darwin_amd64`, the CI-pinned version, run against `envoy-bin` on a local HTTP/2 listener):
+```
+h2spec: passed=144 failed=1 total=145 pass_rate=0.9931
+test h2spec_pass_rate_gate ... ok
+EXIT=0
+```
+The single failure is the lone allowlisted known-failure (`3.5/2` invalid-preface); the gate's anti-regression check (`regressed on unlisted tests`) passed clean. (Note: a transient `3.8/1 GOAWAY` "connection reset by peer" flake appeared on one local run under the Rosetta-translated `darwin_amd64` binary + macOS loopback timing, then cleared on re-run to the exact baseline 99.31%; CI's `linux_amd64` run is consistently green. The flake is a local-environment artifact, not a phase-11 regression — the verified code state is byte-identical to the green CI run.)
+
+#### (d) parse_bootstrap fuzz clean
+
+`parse_bootstrap` is the only fuzz target in phase 11's scope (Task 6 added the seed `hcm_fault_filter.yaml` to the existing corpus, mirroring the 09/10 Task-6 cadence; no new fuzz target). CI `fuzz (parse_bootstrap, 30s)` job 77312346325 ran `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` GREEN: **`Done 228789 runs in 31 second(s)`** — no crash. In-tree corroboration via `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly` (the 18-success-seed SUCCESS-walk; `hcm_fault_filter.yaml` listed per Task 6 commit `eeee9cf`) — runs `... ok` under the local `cargo test --workspace`.
+
+#### (e) cargo fmt / clippy / build / test / deny all clean (LOCAL re-run at state-4)
+
+Local re-run of all 5 stable-toolchain gates at HEAD `4cea2de`:
+```
+$ cargo fmt --all -- --check
+FMT_EXIT=0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+CLIPPY_EXIT=0
+
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+BUILD_EXIT=0
+
+$ cargo test --workspace 2>&1 | grep -E "^test result:" | awk '{p+=$4;f+=$6;i+=$8} END {print "passed:",p,"failed:",f,"ignored:",i}'
+passed: 803 failed: 0 ignored: 2
+
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
+DENY_EXIT=0
+```
+The `cargo deny check` emits 3 pre-existing benign `unmatched license allowance` warnings (`MPL-2.0` / `Unicode-DFS-2016` / `Zlib`) — unchanged from the phase-10 baseline. The workspace test count **803** matches the CI run exactly. The +22 delta over the phase-10 Task 8 baseline (781) is the phase-11 state-3 arc: Task 1 schema/validator/eval unit tests + Task 2 FaultFilter runtime tests + Task 3 instance/pipeline tests + Task 4 the 2 `decorate_h2` unit tests + Task 5 the differential round-trip parse test + Task 6 SUCCESS-array entry (exercised by an existing test) + Task 7 the in-process backstop test.
+
+#### (f) REVIEW.md approved
+
+**Deferred to state 5** (this is the state-4 commit; per `BOOTSTRAP_PROMPT.md` §5.1 "one state per session", REVIEW.md lands at the next session via `superpowers:requesting-code-review` scoped to the range `477a42d..<this commit's HEAD>`, where `477a42d` is the phase-11 state-2 PLAN-write commit — the project's standard reviewed range for closing-phase REVIEWs, spanning the full phase-11 implementation arc Tasks 1-8).
+
+### Deviations from PLAN
+
+**None.** Task 8 lands as a pure docs-only 1-commit shape per the PLAN-prescribed Task 8 steps + the 10/09/08.2 state-4-reached precedent. The predecessor Task 7 CI run at HEAD `4cea2de` was GREEN on first push; no in-flight fix is folded. The only enrichment over the PLAN sketch (which permitted relying on CI for the Docker suite + h2spec) is that **Docker was available locally**, so the full 18-fixture bilateral differential suite AND a local h2spec 2.6.0 run were exercised directly at this state-4 session — strictly stronger evidence than the CI-only fallback. No production code change, no test change, no fixture change — only `docs/envoy-rust/STATE.md` + this PROGRESS file are edited.
