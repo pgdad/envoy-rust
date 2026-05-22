@@ -63,6 +63,16 @@ pub struct Cluster {
     /// time as `cluster.<name>.upstream_rq_5xx`. Exposed via
     /// `upstream_rq_5xx()`.
     pub(crate) upstream_rq_5xx: Arc<envoy_stats::Counter>,
+    /// 12.1 (parent-12 D3/D5): per-endpoint active-health-check state, aligned by
+    /// index with `endpoints`. `None` when the cluster has no `health_checks`
+    /// configured (the §5.4 inert-when-unconfigured invariant) — `pick()` is then
+    /// byte-for-byte phase-02 round-robin. `Some` carries one `Arc<EndpointHealth>`
+    /// per (resolved) endpoint; the 12.2 probe task mutates them while `pick()`
+    /// reads them.
+    pub(crate) endpoint_health: Option<Vec<Arc<crate::EndpointHealth>>>,
+    /// 12.1 (parent-12 D5): `common_lb_config.healthy_panic_threshold` percentage
+    /// (default 50.0). Read by `pick()` only when `endpoint_health` is `Some`.
+    pub(crate) panic_threshold: f64,
 }
 
 impl Cluster {
@@ -123,16 +133,44 @@ impl Cluster {
         }
     }
 
-    /// Picks the next endpoint in round-robin order. `Relaxed` ordering is
-    /// sufficient because no other observation depends on a happens-before
-    /// relationship with the cursor update (SPEC §6 signpost 3).
+    /// Picks the next endpoint in round-robin order. When the cluster has no
+    /// active health checks (`endpoint_health` is `None`) this is exactly the
+    /// phase-02 round-robin (the §5.4 inert-when-unconfigured invariant). When
+    /// health checks are configured, unhealthy endpoints are excluded and the
+    /// panic threshold (§6.2 item-3) is honored. `Relaxed` ordering is
+    /// sufficient for the cursor and the health reads (single-writer per
+    /// endpoint; no happens-before dependency).
     fn pick(&self) -> Option<SocketAddr> {
         if self.endpoints.is_empty() {
             // `from_bootstrap` rejects empty clusters; this is defense-in-depth.
             return None;
         }
+        let total = self.endpoints.len();
+        let health = match &self.endpoint_health {
+            None => {
+                let i = self.cursor.fetch_add(1, Ordering::Relaxed);
+                return Some(self.endpoints[i % total]);
+            }
+            Some(h) => h,
+        };
+        let healthy_count = health.iter().filter(|h| h.is_healthy()).count();
+        let healthy_percent = 100.0 * (healthy_count as f64) / (total as f64);
+        // Panic threshold (strictly-below): route over ALL endpoints when the
+        // healthy fraction is below the threshold. `value: 0` disables panic
+        // (`0.0 < 0.0` is false), so a 0-healthy cluster falls through to None.
+        if healthy_percent < self.panic_threshold {
+            let i = self.cursor.fetch_add(1, Ordering::Relaxed);
+            return Some(self.endpoints[i % total]);
+        }
+        // Round-robin over the healthy endpoints only.
+        let healthy_idx: Vec<usize> = (0..total).filter(|&i| health[i].is_healthy()).collect();
+        if healthy_idx.is_empty() {
+            // No healthy endpoints + panic not engaged → None → the pre-built
+            // synth-503 path fires (unchanged at 12.1; body reconciliation is 12.2).
+            return None;
+        }
         let i = self.cursor.fetch_add(1, Ordering::Relaxed);
-        Some(self.endpoints[i % self.endpoints.len()])
+        Some(self.endpoints[healthy_idx[i % healthy_idx.len()]])
     }
 }
 
@@ -144,11 +182,12 @@ pub struct ClusterHandle {
 }
 
 impl ClusterHandle {
-    /// Returns the next endpoint in round-robin order.
-    ///
-    /// Returns `None` only when the cluster is empty — which `from_bootstrap`
-    /// rejects at construction time, so this is effectively infallible in
-    /// phase 02. `Option<_>` is preserved for phase-06+ health checking.
+    /// Returns the next endpoint to use, in round-robin order. Returns `None`
+    /// when the cluster configures active health checks and has no healthy
+    /// endpoints with panic mode not engaged (12.1), or when the cluster is
+    /// empty (`from_bootstrap` rejects empty clusters — defense-in-depth).
+    /// Without health checks the cluster always yields an endpoint (the
+    /// inert-when-unconfigured round-robin).
     pub fn pick_endpoint(&self) -> Option<SocketAddr> {
         self.inner.pick()
     }
@@ -448,6 +487,37 @@ pub async fn from_bootstrap(
                 cluster: cfg.name.clone(),
                 message: e.to_string(),
             })?;
+        // 12.1 (parent-12 D3/D5/D6): if the cluster configures an active health
+        // check (validator guarantees 0 or 1), build per-endpoint EndpointHealth
+        // (all starting Unhealthy) + register the membership_healthy gauge. No
+        // health checks ⇒ endpoint_health: None ⇒ pick() is phase-02 round-robin.
+        let (endpoint_health, panic_threshold) = if let Some(hc) = cfg.health_checks.first() {
+            let membership_healthy = registry
+                .register_gauge(&format!("cluster.{}.membership_healthy", cfg.name))
+                .map_err(|e| ClusterError::StatsRegistration {
+                    cluster: cfg.name.clone(),
+                    message: e.to_string(),
+                })?;
+            let health: Vec<Arc<crate::EndpointHealth>> = endpoints
+                .iter()
+                .map(|_| {
+                    Arc::new(crate::EndpointHealth::new(
+                        hc.healthy_threshold,
+                        hc.unhealthy_threshold,
+                        Arc::clone(&membership_healthy),
+                    ))
+                })
+                .collect();
+            let panic_threshold = cfg
+                .common_lb_config
+                .as_ref()
+                .and_then(|c| c.healthy_panic_threshold.as_ref())
+                .map(|p| p.value)
+                .unwrap_or(50.0);
+            (Some(health), panic_threshold)
+        } else {
+            (None, 50.0)
+        };
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
             endpoints,
@@ -457,6 +527,8 @@ pub async fn from_bootstrap(
             cx_active,
             upstream_rq_total,
             upstream_rq_5xx,
+            endpoint_health,
+            panic_threshold,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -509,6 +581,8 @@ mod tests {
                 cx_active,
                 upstream_rq_total,
                 upstream_rq_5xx,
+                endpoint_health: None,
+                panic_threshold: 50.0,
             }),
         }
     }
@@ -800,6 +874,8 @@ admin:
             upstream_rq_5xx: registry
                 .register_counter("cluster.backend.upstream_rq_5xx")
                 .expect("counter registers"),
+            endpoint_health: None,
+            panic_threshold: 50.0,
         };
         assert_eq!(c.name(), "backend");
     }
@@ -1336,6 +1412,180 @@ admin:
             cx_active.value(),
             0,
             "gauge returns to 0 after all guards drop",
+        );
+    }
+
+    // ── 12.1: health-aware pick() tests ─────────────────────────────────
+
+    /// 12.1: build a ClusterHandle whose endpoints carry EndpointHealth, all
+    /// starting Unhealthy, with the given panic threshold. Returns the handle +
+    /// the per-endpoint EndpointHealth Arcs so tests can drive transitions.
+    fn mk_handle_with_health(
+        name: &str,
+        endpoints: Vec<SocketAddr>,
+        healthy_threshold: u32,
+        unhealthy_threshold: u32,
+        panic_threshold: f64,
+    ) -> (ClusterHandle, Vec<Arc<crate::EndpointHealth>>) {
+        let registry = envoy_stats::StatsRegistry::new();
+        let cx_total = registry
+            .register_counter(&format!("cluster.{name}.upstream_cx_total"))
+            .unwrap();
+        let cx_active = registry
+            .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
+            .unwrap();
+        let upstream_rq_total = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_total"))
+            .unwrap();
+        let upstream_rq_5xx = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
+            .unwrap();
+        let gauge = registry
+            .register_gauge(&format!("cluster.{name}.membership_healthy"))
+            .unwrap();
+        let health: Vec<Arc<crate::EndpointHealth>> = endpoints
+            .iter()
+            .map(|_| {
+                Arc::new(crate::EndpointHealth::new(
+                    healthy_threshold,
+                    unhealthy_threshold,
+                    Arc::clone(&gauge),
+                ))
+            })
+            .collect();
+        let handle = ClusterHandle {
+            inner: Arc::new(Cluster {
+                name: name.to_string(),
+                endpoints,
+                cursor: AtomicUsize::new(0),
+                upstream_protocol: UpstreamProtocol::default(),
+                cx_total,
+                cx_active,
+                upstream_rq_total,
+                upstream_rq_5xx,
+                endpoint_health: Some(health.clone()),
+                panic_threshold,
+            }),
+        };
+        (handle, health)
+    }
+
+    #[test]
+    fn pick_excludes_unhealthy_endpoints() {
+        let eps = mk_endpoints(2);
+        // panic disabled (value 0) so a partially-unhealthy set does not panic-route.
+        let (handle, health) = mk_handle_with_health("b", eps.clone(), 1, 1, 0.0);
+        // Make endpoint 0 healthy, endpoint 1 stays unhealthy.
+        health[0].record_success();
+        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        assert!(
+            picks.iter().all(|&p| p == eps[0]),
+            "only the healthy endpoint is picked: {picks:?}"
+        );
+    }
+
+    #[test]
+    fn pick_round_robins_over_noncontiguous_healthy_subset() {
+        let eps = mk_endpoints(3);
+        // panic disabled; mark endpoints 0 and 2 healthy, leave 1 unhealthy.
+        // This stresses healthy_idx = [0, 2] and the modulo over a >1-element,
+        // non-contiguous healthy index set (off-by-one guard for the remap).
+        let (handle, health) = mk_handle_with_health("b", eps.clone(), 1, 1, 0.0);
+        health[0].record_success();
+        health[2].record_success();
+        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        assert_eq!(
+            picks,
+            vec![eps[0], eps[2], eps[0], eps[2]],
+            "round-robins over the healthy subset {{0,2}}, never the unhealthy endpoint 1: {picks:?}"
+        );
+    }
+
+    #[test]
+    fn pick_returns_none_when_no_healthy_and_panic_disabled() {
+        let eps = mk_endpoints(2);
+        let (handle, _health) = mk_handle_with_health("b", eps, 1, 1, 0.0);
+        // All endpoints start Unhealthy; panic disabled → None.
+        assert!(handle.pick_endpoint().is_none());
+    }
+
+    #[test]
+    fn pick_panics_to_all_when_below_threshold() {
+        let eps = mk_endpoints(2);
+        // default 50% panic threshold; 0 healthy → 0% < 50% → panic → round-robin ALL.
+        let (handle, _health) = mk_handle_with_health("b", eps.clone(), 1, 1, 50.0);
+        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        assert_eq!(
+            picks,
+            vec![eps[0], eps[1], eps[0], eps[1]],
+            "panic mode round-robins over all endpoints"
+        );
+    }
+
+    #[test]
+    fn pick_does_not_panic_at_exactly_the_threshold() {
+        let eps = mk_endpoints(2);
+        // 1 of 2 healthy = 50% ; threshold 50 ; 50 < 50 is false → no panic → only healthy.
+        let (handle, health) = mk_handle_with_health("b", eps.clone(), 1, 1, 50.0);
+        health[0].record_success();
+        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        assert!(
+            picks.iter().all(|&p| p == eps[0]),
+            "strictly-below: 50% is not < 50% so no panic: {picks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_bootstrap_no_health_checks_pick_unchanged() {
+        // Regression-equivalence: a cluster with no health_checks behaves exactly
+        // as phase-02 round-robin (endpoint_health is None).
+        let mgr = build_cluster_mgr(THREE_ENDPOINT_YAML).await;
+        let handle = mgr.get("backend").expect("cluster");
+        let picks: Vec<SocketAddr> = (0..3).map(|_| handle.pick_endpoint().unwrap()).collect();
+        assert_eq!(
+            picks,
+            vec![
+                "127.0.0.1:10001".parse().unwrap(),
+                "127.0.0.1:10002".parse().unwrap(),
+                "127.0.0.1:10003".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn from_bootstrap_with_health_checks_starts_all_unhealthy() {
+        // A configured-HC cluster (panic disabled) with no probe task → all
+        // endpoints start Unhealthy → pick() returns None (the 12.2 task drives them).
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      common_lb_config:
+        healthy_panic_threshold: { value: 0 }
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz }
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: localhost, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        let mgr = build_cluster_mgr(yaml).await;
+        let handle = mgr.get("hc_backend").expect("cluster");
+        assert!(
+            handle.pick_endpoint().is_none(),
+            "all endpoints start unhealthy + panic disabled"
         );
     }
 
