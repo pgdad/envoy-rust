@@ -714,3 +714,93 @@ was kept (per the PLAN's "prefer faithfulness to the precedent" recommendation).
 - **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
   (pre-existing unmatched-license-allowance warnings for `MPL-2.0` / `Unicode-DFS-2016` / `Zlib`
   unchanged).
+
+### Task 7 — D8.3 in-process backstop (H1 path; with 503-probe header assertion)
+
+Lands the in-process backstop for the fault filter abort path as a new test file
+`crates/envoy-bin/tests/http_filter_fault.rs`. It boots `envoy-bin` as a subprocess with a
+synthesized fault bootstrap on an ephemeral **HTTP/1.1** listener and asserts the abort
+semantics over 4 sequential GET probes. This complements the H2 differential fixture 0018
+(Task 5) — both codecs are now covered across the two test tiers (in-process backstop for H1,
+Docker differential for H2). The subprocess discipline (`tokio::process::Command` +
+`.kill_on_drop(true)` + `stdout: Stdio::null()` + `stderr: Stdio::piped()`) is copied verbatim
+from the phase-10 `http_filter_rbac.rs` backstop precedent (read in full via the `Read` tool
+before authoring, per lock-in #35; 09 REVIEW M3 closed at phase 10 and now the standing pattern).
+
+**Backstop shape.** Synthesized bootstrap: `node` block + `admin` on `{admin_port}` + a single
+listener `ingress_http` on `127.0.0.1:{listener_port}` with an HCM (`stat_prefix: ingress_http`,
+`codec_type: HTTP1`) carrying `http_filters: [envoy.filters.http.fault, envoy.filters.http.router]`
+and a `route_config` with one virtual_host (`domains: ["*"]`) → one route (`match: { prefix: "/" }`)
+→ `direct_response: { status: 200, body: { inline_string: "ok\n" } }`, `clusters: []`. The fault
+filter is configured `abort: { http_status: 503, percentage: { numerator: 100, denominator: HUNDRED } }`
+gated on `headers: [- name: x-fault, string_match: { exact: abort }]`. The probe sequence is
+`[abort, pass, abort, pass]`: probes 0 and 2 send `x-fault: abort` and expect `503` +
+body `"fault filter abort"` (18 bytes, §6.2-verified against `crates/envoy-filter/src/fault.rs`
+and `crates/envoy-http2/src/response.rs`); probes 1 and 3 send no `x-fault` header and pass
+through to the router → `direct_response` `200` + body `"ok\n"`.
+
+**H1-vs-H2 5-vs-4-header distinction (heeds-and-closes 10 REVIEW M1).** Phase-10 REVIEW M1
+flagged that the RBAC backstop omitted the per-probe standard-header presence assertion on the
+error probes without disclosing it. Per SPEC §6.4 option (a), this backstop proactively closes
+that gap for phase 11: on each `503` probe it asserts the presence of the **5** standard
+HTTP/1.1 headers `[server, date, content-length, content-type, connection]`. This is the **H1**
+path — the H1 `decorate_filter_synth_response` (`crates/envoy-http1/src/hcm.rs`) adds all 5
+including `connection` (verified at the decorate site). The **H2** differential fixture 0018
+asserts only **4** of these (WITHOUT `connection`, since H2 has no `connection` header). Both
+codec paths' header-decoration semantics are therefore covered: 5 headers on H1, 4 on H2.
+
+**Test landed + passing output:**
+
+```
+     Running tests/http_filter_fault.rs (target/debug/deps/http_filter_fault-7b10a0778905df43)
+
+running 1 test
+test http_filter_fault_in_process_backstop ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+```
+
+The single test internally asserts the `[503, 200, 503, 200]` status sequence + bodies
+`["fault filter abort", "ok\n", "fault filter abort", "ok\n"]` + the 5-header presence on the two
+`503` probes; all green.
+
+**Deviations from the PLAN sketch:**
+
+1. **Probe helper extended to return headers.** The RBAC precedent's `probe` helper returned only
+   `(status, body)`. Per the PLAN's explicit instruction, the helper is renamed `http1_get` and
+   extended to ALSO parse and return the response headers as `Vec<(String, String)>` (parsed from
+   the response head between the status line and the `\r\n\r\n` terminator) — the 503-probe
+   header-presence assertion needs them.
+2. **stderr is `Stdio::piped()`, not `Stdio::null()`.** Matching the RBAC backstop precedent (and
+   the 07.2 / 08.2 precedents before it), stderr is piped so envoy-bin startup/runtime errors
+   surface in test output on readiness or assertion failure. The PLAN sketch's `Stdio` comment
+   lists `null()` for stdout (kept) but the diagnostic-piped stderr is the load-bearing,
+   precedent-faithful choice.
+3. **`codec_type: HTTP1` is included.** The fault fuzz seed `hcm_fault_filter.yaml` (Task 6) uses
+   `HTTP2`, but this is the H1 path so `HTTP1` is used (matching the RBAC backstop). `codec_type`
+   is a required envoy-config schema field (the RBAC backstop hit `missing field 'codec_type'`
+   empirically), so it is included.
+
+ZERO RBAC residue: no `x-rbac-pass`, `403`, `RBAC: access denied`, `rbac`, or `pass_with_header`
+strings remain (swept the whole file).
+
+**LoC delta (per file, `git diff --numstat`):**
+
+| File | Added | Removed |
+|---|---|---|
+| `crates/envoy-bin/tests/http_filter_fault.rs` (new) | 282 | 0 |
+| `docs/envoy-rust/phases/11-http-filter-fault/PROGRESS.md` | (this section) | 0 |
+| **Total** | **282 + this section** | **0** |
+
+**5-gate attestation (stable toolchain):**
+
+- **fmt** — PASS. `cargo fmt --all -- --check`: clean (exit 0, no output).
+- **clippy** — PASS. `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  `Finished \`dev\` profile … in 5.08s` with zero warnings.
+- **build** — PASS. `cargo build --workspace --all-targets`: `Finished` clean.
+- **test** — PASS. `cargo test --workspace`: all `test result:` lines `ok. N passed; 0 failed`;
+  the new backstop `ok. 1 passed; 0 failed`. One pre-existing `#[ignore]` Docker fixture
+  self-skips (`44 passed; 0 failed; 1 ignored`).
+- **deny** — PASS. `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`
+  (pre-existing unmatched-license-allowance warnings for `MPL-2.0` / `Unicode-DFS-2016` / `Zlib`
+  unchanged).
