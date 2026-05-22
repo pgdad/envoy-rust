@@ -1681,6 +1681,9 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                 validate_http2_protocol_options_ranges(h2_opts)?;
             }
         }
+        // 12.1: validate the cluster's active-HC config (HTTP-only, 0-or-1) +
+        // common_lb_config panic threshold.
+        validate_health_checks(cluster)?;
     }
 
     // Per-listener invariants.
@@ -2408,6 +2411,72 @@ fn is_valid_rfc7230_token(s: &str) -> bool {
 ///
 /// Mutates nothing; returns the first error encountered (validator-wide
 /// convention).
+/// 12.1 (parent-12 D2): validate a cluster's `health_checks` + `common_lb_config`.
+/// Returns the first error encountered (validator-wide convention). HTTP-only,
+/// 0-or-1; TCP/gRPC/custom checkers are rejected (the schema's
+/// `http_health_check: Option<_>` surfaces a non-HTTP checker as
+/// `UnsupportedHealthCheckType`; `deny_unknown_fields` rejects unknown checker keys).
+fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
+    if cluster.health_checks.len() > 1 {
+        return Err(crate::ConfigError::UnsupportedMultipleHealthChecks {
+            cluster: cluster.name.clone(),
+        });
+    }
+    if let Some(hc) = cluster.health_checks.first() {
+        let http = hc.http_health_check.as_ref().ok_or_else(|| {
+            crate::ConfigError::UnsupportedHealthCheckType {
+                cluster: cluster.name.clone(),
+            }
+        })?;
+        if hc.healthy_threshold < 1 {
+            return Err(crate::ConfigError::InvalidHealthCheckThreshold {
+                cluster: cluster.name.clone(),
+                field: "healthy_threshold",
+            });
+        }
+        if hc.unhealthy_threshold < 1 {
+            return Err(crate::ConfigError::InvalidHealthCheckThreshold {
+                cluster: cluster.name.clone(),
+                field: "unhealthy_threshold",
+            });
+        }
+        for (field, raw) in [("timeout", &hc.timeout), ("interval", &hc.interval)] {
+            match parse_duration(raw) {
+                Ok(d) if !d.is_zero() => {}
+                _ => {
+                    return Err(crate::ConfigError::InvalidHealthCheckTiming {
+                        cluster: cluster.name.clone(),
+                        field,
+                    });
+                }
+            }
+        }
+        if http.path.is_empty() {
+            return Err(crate::ConfigError::EmptyHealthCheckPath {
+                cluster: cluster.name.clone(),
+            });
+        }
+        for range in &http.expected_statuses {
+            if range.start >= range.end {
+                return Err(crate::ConfigError::InvalidInt64Range {
+                    start: range.start,
+                    end: range.end,
+                });
+            }
+        }
+    }
+    if let Some(clb) = &cluster.common_lb_config
+        && let Some(p) = &clb.healthy_panic_threshold
+        && !(0.0..=100.0).contains(&p.value)
+    {
+        return Err(crate::ConfigError::InvalidPanicThreshold {
+            cluster: cluster.name.clone(),
+            value: p.value,
+        });
+    }
+    Ok(())
+}
+
 fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigError> {
     for entry in access_logs {
         if entry.name != "envoy.access_loggers.file" {
@@ -8517,6 +8586,213 @@ admin:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
 "#;
         assert!(crate::parse_bootstrap(yaml).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // 12.1 Task 2: validate_health_checks tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a single-cluster bootstrap YAML wrapping a `health_checks:` block.
+    fn hc_yaml(health_checks_block: &str, common_lb_config_block: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+{common_lb_config_block}
+{health_checks_block}
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: {{ socket_address: {{ address: localhost, port_value: 7000 }} }}
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
+"#
+        )
+    }
+
+    const VALID_HC: &str = r#"      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check:
+            path: /healthz"#;
+
+    #[test]
+    fn validate_accepts_well_formed_health_check() {
+        assert!(crate::parse_bootstrap(&hc_yaml(VALID_HC, "")).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_multiple_health_checks() {
+        let two = r#"      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz }
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz2 }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(two, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedMultipleHealthChecks { ref cluster } if cluster == "hc_backend"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_http_checker() {
+        let no_http = r#"      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1"#;
+        let err = crate::parse_bootstrap(&hc_yaml(no_http, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedHealthCheckType { ref cluster } if cluster == "hc_backend"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_threshold() {
+        let zero = r#"      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 0
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(zero, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::InvalidHealthCheckThreshold { ref cluster, field } if cluster == "hc_backend" && field == "healthy_threshold"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_unhealthy_threshold() {
+        let zero = r#"      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 0
+          http_health_check: { path: /healthz }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(zero, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::InvalidHealthCheckThreshold { ref cluster, field } if cluster == "hc_backend" && field == "unhealthy_threshold"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_subsecond_decimal_duration() {
+        // §6.2 item-6: parse_duration rejects "0.5s" → surfaces as InvalidHealthCheckTiming.
+        let half = r#"      health_checks:
+        - timeout: 0.5s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(half, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::InvalidHealthCheckTiming { ref cluster, field } if cluster == "hc_backend" && field == "timeout"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_duration() {
+        let zero = r#"      health_checks:
+        - timeout: 0s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(zero, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::InvalidHealthCheckTiming { ref cluster, field } if cluster == "hc_backend" && field == "timeout"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_interval_duration() {
+        let zero = r#"      health_checks:
+        - timeout: 1s
+          interval: 0s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(zero, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::InvalidHealthCheckTiming { ref cluster, field } if cluster == "hc_backend" && field == "interval"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_path() {
+        let empty = r#"      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: "" }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(empty, "")).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::EmptyHealthCheckPath { ref cluster } if cluster == "hc_backend"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_inverted_expected_status_range() {
+        let bad = r#"      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check:
+            path: /healthz
+            expected_statuses:
+              - { start: 300, end: 200 }"#;
+        let err = crate::parse_bootstrap(&hc_yaml(bad, "")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidInt64Range {
+                    start: 300,
+                    end: 200
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_panic_threshold() {
+        let clb = "      common_lb_config:\n        healthy_panic_threshold: { value: 150 }";
+        let err = crate::parse_bootstrap(&hc_yaml(VALID_HC, clb)).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::InvalidPanicThreshold { ref cluster, value } if cluster == "hc_backend" && value == 150.0),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_zero_panic_threshold() {
+        let clb = "      common_lb_config:\n        healthy_panic_threshold: { value: 0 }";
+        assert!(crate::parse_bootstrap(&hc_yaml(VALID_HC, clb)).is_ok());
     }
 }
 

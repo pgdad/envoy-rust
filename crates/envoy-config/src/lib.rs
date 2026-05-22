@@ -398,6 +398,43 @@ pub enum ConfigError {
         numerator: u32,
         denominator: u32,
     },
+
+    /// 12.1: cluster has more than one `health_checks` entry (phase-12 supports 0 or 1).
+    #[error(
+        "cluster '{cluster}' has more than one health_checks entry; phase 12 supports at most one"
+    )]
+    UnsupportedMultipleHealthChecks { cluster: String },
+
+    /// 12.1: cluster's health check has no `http_health_check` (TCP/gRPC/custom defer).
+    #[error(
+        "cluster '{cluster}' health check is not an http_health_check; phase 12 supports HTTP health checks only"
+    )]
+    UnsupportedHealthCheckType { cluster: String },
+
+    /// 12.1: `healthy_threshold` or `unhealthy_threshold` is zero (must be >= 1).
+    #[error("cluster '{cluster}' health check {field} must be >= 1")]
+    InvalidHealthCheckThreshold {
+        cluster: String,
+        field: &'static str,
+    },
+
+    /// 12.1: `timeout`/`interval` failed `parse_duration` or parsed to zero.
+    /// §6.2 item-6: a sub-second decimal `0.5s` fails `parse_duration` and surfaces here.
+    #[error(
+        "cluster '{cluster}' health check {field} is not a positive integer-second duration (e.g. `1s`)"
+    )]
+    InvalidHealthCheckTiming {
+        cluster: String,
+        field: &'static str,
+    },
+
+    /// 12.1: `http_health_check.path` is empty.
+    #[error("cluster '{cluster}' http_health_check.path must be non-empty")]
+    EmptyHealthCheckPath { cluster: String },
+
+    /// 12.1: `common_lb_config.healthy_panic_threshold.value` is outside [0.0, 100.0].
+    #[error("cluster '{cluster}' healthy_panic_threshold value {value} is outside [0.0, 100.0]")]
+    InvalidPanicThreshold { cluster: String, value: f64 },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
