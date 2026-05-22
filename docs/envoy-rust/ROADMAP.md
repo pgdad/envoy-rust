@@ -81,6 +81,10 @@ least_request, random, ring_hash, maglev, subset LB, locality-weighted LB, prior
 
 Active health checks HTTP/TCP/gRPC/custom, outlier detection variants, circuit breakers, retries + hedging, per-protocol connection pooling.
 
+| id | title | depends-on | status | sub-phases | summary |
+|---|---|---|---|---|---|
+| 12 | active HTTP health checking (cluster health_checks) + endpoint ejection + fixture 0019 (engages 06.3 REVIEW I2 synthetic-backend) | 02 04 | planned | — | fixture 0019-upstream-active-health-check green; envoy-cluster gains per-endpoint EndpointHealth state machine + pick() unhealthy-exclusion + panic-threshold honoring; new active HTTP health-check task (recommended new envoy-health crate; reuses envoy-http1::Client) probes Cluster.health_checks per interval and drives healthy/unhealthy thresholds; envoy-config gains HealthCheck + HttpHealthCheck + CommonLbConfig + Percent schema + ~4-6 ConfigError variants (TCP/gRPC/custom + multiple health checks rejected per minimum-viable scope); cluster.<name>.health_check.* + membership_healthy stats; first synthetic-backend harness primitive (06.3 REVIEW I2 down-payment; full I2 closure remains with connection pooling); LIKELY SPLIT into 12.1 + 12.2 at state-2 PLAN-write per ~1800-2200 LoC estimate |
+
 ### HTTP/3 + QUIC family
 
 quinn transport, downstream H3 listener, upstream H3 cluster, `h3spec` gate.
