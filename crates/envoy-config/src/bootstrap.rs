@@ -80,6 +80,16 @@ pub struct Cluster {
     ///     validate_http2_protocol_options_ranges; same checks as listener-side).
     #[serde(default)]
     pub typed_extension_protocol_options: Option<TypedExtensionProtocolOptions>,
+    /// 12.1 (parent-12 D1): OPTIONAL active HTTP health checks. Phase-12 supports
+    /// exactly 0 or 1, HTTP-only (validator-enforced). Empty ⇒ the cluster's
+    /// endpoints are implicitly healthy and `pick()` is phase-02 round-robin
+    /// (the §5.4 inert-when-unconfigured invariant).
+    #[serde(default)]
+    pub health_checks: Vec<HealthCheck>,
+    /// 12.1 (parent-12 D1): OPTIONAL common LB config; phase-12 consumes only
+    /// `healthy_panic_threshold`.
+    #[serde(default)]
+    pub common_lb_config: Option<CommonLbConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -1080,6 +1090,64 @@ pub struct DirectResponse {
 pub struct Int64Range {
     pub start: i64,
     pub end: i64,
+}
+
+/// 12.1 (parent-12 D1): per-cluster active HTTP health check. Phase-12 supports
+/// exactly 0 or 1 entry per cluster, HTTP-only (the validator rejects >1 and
+/// non-HTTP checkers). Reuses `parse_duration` for `timeout`/`interval` and
+/// `Int64Range` for `expected_statuses`. The probe task that consumes this lands
+/// in 12.2 (the `envoy-health` crate).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheck {
+    /// Per-probe response timeout; parsed via `parse_duration` (integer s/ms/us).
+    pub timeout: String,
+    /// Interval between probes; parsed via `parse_duration`.
+    pub interval: String,
+    /// Consecutive successes to mark an endpoint Healthy.
+    pub healthy_threshold: u32,
+    /// Consecutive failures to mark an endpoint Unhealthy.
+    pub unhealthy_threshold: u32,
+    /// The HTTP checker. Optional at the schema level so a config omitting it
+    /// (or carrying a deferred TCP/gRPC checker, which `deny_unknown_fields`
+    /// rejects) surfaces as `ConfigError::UnsupportedHealthCheckType` at
+    /// validate time rather than a bare serde missing-field error. The
+    /// validator (Task 2) requires it present.
+    #[serde(default)]
+    pub http_health_check: Option<HttpHealthCheck>,
+}
+
+/// 12.1 (parent-12 D1): the HTTP health-check probe shape.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpHealthCheck {
+    /// REQUIRED probe path (e.g. `/healthz`); validator rejects empty.
+    pub path: String,
+    /// OPTIONAL `:authority`/`Host` on the probe; defaults to the cluster name
+    /// per upstream (§6.2 item-5). Consumed by the 12.2 probe task.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// OPTIONAL accepted status ranges; default = exactly 200 (§6.2 item-5).
+    /// Reuses `Int64Range` (half-open `[start, end)`).
+    #[serde(default)]
+    pub expected_statuses: Vec<Int64Range>,
+}
+
+/// 12.1 (parent-12 D1): the subset of `common_lb_config` phase-12 consumes.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CommonLbConfig {
+    /// Default 50% per upstream; `{ value: 0 }` disables panic routing.
+    #[serde(default)]
+    pub healthy_panic_threshold: Option<Percent>,
+}
+
+/// 12.1 (parent-12 D1): upstream `type.v3.Percent { value: double }` (§6.2 item-3).
+/// Distinct from the phase-11 `FractionalPercent` (numerator/denominator).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Percent {
+    pub value: f64,
 }
 
 /// Reference to a regex pattern. Held both as the original String (for
@@ -8338,6 +8406,117 @@ delay: { fixed_delay: 5s }
                 "err: {err:?}"
             );
         }
+    }
+
+    // ── 12.1 Task 1: D1 health-check schema tests ────────────────────────────
+
+    #[test]
+    fn parses_cluster_with_http_health_check_and_panic_threshold() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      common_lb_config:
+        healthy_panic_threshold: { value: 0 }
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 2
+          http_health_check:
+            path: /healthz
+            expected_statuses:
+              - { start: 200, end: 201 }
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: localhost, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("valid");
+        let cluster = &bootstrap.static_resources.clusters[0];
+        assert_eq!(cluster.health_checks.len(), 1);
+        let hc = &cluster.health_checks[0];
+        assert_eq!(hc.timeout, "1s");
+        assert_eq!(hc.interval, "1s");
+        assert_eq!(hc.healthy_threshold, 1);
+        assert_eq!(hc.unhealthy_threshold, 2);
+        let http = hc.http_health_check.as_ref().expect("http checker present");
+        assert_eq!(http.path, "/healthz");
+        assert_eq!(
+            http.expected_statuses,
+            vec![crate::Int64Range {
+                start: 200,
+                end: 201
+            }]
+        );
+        assert!(http.host.is_none());
+        let clb = cluster
+            .common_lb_config
+            .as_ref()
+            .expect("common_lb_config present");
+        assert_eq!(clb.healthy_panic_threshold.as_ref().unwrap().value, 0.0);
+    }
+
+    #[test]
+    fn cluster_without_health_checks_defaults_to_empty_vec_and_none() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("valid");
+        let cluster = &bootstrap.static_resources.clusters[0];
+        assert!(cluster.health_checks.is_empty());
+        assert!(cluster.common_lb_config.is_none());
+    }
+
+    #[test]
+    fn cluster_rejects_unknown_health_check_field() {
+        // deny_unknown_fields rejects TCP/gRPC checkers + deferred upstream knobs.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          tcp_health_check: {}
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        assert!(crate::parse_bootstrap(yaml).is_err());
     }
 }
 

@@ -707,6 +707,8 @@ admin:
                     transport_socket: None,
                     dns_lookup_family: None,
                     typed_extension_protocol_options: None,
+                    health_checks: vec![],
+                    common_lb_config: None,
                 }],
             },
         };
@@ -750,6 +752,8 @@ admin:
             transport_socket: None,
             dns_lookup_family: None,
             typed_extension_protocol_options: None,
+            health_checks: vec![],
+            common_lb_config: None,
         };
         let bootstrap = Bootstrap {
             node: None,
