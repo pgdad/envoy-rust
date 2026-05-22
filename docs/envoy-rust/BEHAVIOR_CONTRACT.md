@@ -122,6 +122,12 @@ value wins.
 |---|---|---|
 | `http.<hcm_stat_prefix>.fault.aborts_injected` | value-exact | Counter; one increment per request the filter aborts (the header gate matches AND the deterministic percentage selects at 100%). Both proxies emit one increment per aborted request at the abort decision site in `FaultFilter::decode_headers` (synchronously, before constructing the `Decision::StopAndSend(FilterResponse)` abort). Never increments on pass-through (gate miss OR 0% percentage). Upstream Envoy v1.33 emits the same name at the `http.<hcm_stat_prefix>.fault.*` namespace per the §6.2 empirical verification at phase-11 state-2 PLAN-write (`http.ingress_http.fault.aborts_injected: 4` after 4 aborts). The `<hcm_stat_prefix>` is sourced from the parent HCM's `stat_prefix` (the fault filter has no `stat_prefix` field of its own — same threading as RBAC at phase 10). |
 
+**12.1 entries (active health checking):**
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `cluster.<name>.membership_healthy` | value-exact (steady state) | Gauge; the count of currently-healthy endpoints in the cluster. Registered at `from_bootstrap` time only when the cluster configures `health_checks`; updated inline at each `EndpointHealth` Healthy/Unhealthy flip (one source of truth, NOT polled — the 08.2 `server.live` pattern). At 12.1, with no probe task, a configured-HC cluster's gauge reads its initial value 0 (all endpoints start Unhealthy per §6.2 item-1); 12.2's probe task drives it to the converged steady state. Inert when `health_checks` is unconfigured (no such gauge registered). The 3 `cluster.<name>.health_check.{attempt,success,failure}` counters defer to 12.2 where the probe task increments them (12.1 D6 lock-in). |
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments

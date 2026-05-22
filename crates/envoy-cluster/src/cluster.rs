@@ -1553,6 +1553,75 @@ admin:
     }
 
     #[tokio::test]
+    async fn from_bootstrap_registers_membership_healthy_gauge_at_zero() {
+        // D6: a configured-HC cluster registers cluster.<name>.membership_healthy;
+        // it reads 0 at construction (all endpoints start Unhealthy). The 3
+        // health_check.{attempt,success,failure} counters defer to 12.2.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check: { path: /healthz }
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: localhost, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("build");
+        // Assert the gauge was registered by from_bootstrap (snapshot reflects
+        // real registrations; register_gauge below is idempotent and returns the
+        // same Arc, so the value read is the live one — but presence must be
+        // proven via the snapshot, since register_gauge would otherwise create a
+        // fresh 0-valued gauge and mask a missing registration).
+        assert!(
+            registry
+                .snapshot()
+                .iter()
+                .any(|(name, _)| name == "cluster.hc_backend.membership_healthy"),
+            "from_bootstrap must register the membership_healthy gauge"
+        );
+        let gauge = registry
+            .register_gauge("cluster.hc_backend.membership_healthy")
+            .expect("gauge");
+        assert_eq!(gauge.value(), 0, "all endpoints start Unhealthy");
+    }
+
+    #[tokio::test]
+    async fn from_bootstrap_no_health_checks_registers_no_membership_gauge() {
+        // Inert-when-unconfigured: no membership_healthy gauge for a plain cluster.
+        let mgr_registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let bootstrap = envoy_config::parse_bootstrap(THREE_ENDPOINT_YAML).expect("parse");
+        let _mgr = from_bootstrap(&bootstrap, Arc::clone(&mgr_registry))
+            .await
+            .expect("build");
+        let has_gauge = mgr_registry
+            .snapshot()
+            .iter()
+            .any(|(name, _)| name == "cluster.backend.membership_healthy");
+        assert!(
+            !has_gauge,
+            "no membership gauge when health_checks unconfigured"
+        );
+    }
+
+    #[tokio::test]
     async fn from_bootstrap_with_health_checks_starts_all_unhealthy() {
         // A configured-HC cluster (panic disabled) with no probe task → all
         // endpoints start Unhealthy → pick() returns None (the 12.2 task drives them).
