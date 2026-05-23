@@ -875,4 +875,107 @@ in-process-codec backstop (no fixture; no regressions on 0001-0019);
 vacuously — backstop is H1 codec only by design); (d) no new fuzz
 seed (deferred to Task 7).
 
+### Task 7 — D-corpus `parse_bootstrap` seed `hcm_upstream_active_health_check.yaml` (corpus 19 → 20)
+
+Three coupled edits — **all in ONE commit** (the 09/10/11/12.1 Task-6
+lesson: a seed without the `.gitignore` allow-list entry is
+gitignored-and-lost; without the SUCCESS-array entry is untested):
+
+  1. **Created** `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml`
+     — the verbatim PLAN Step-1 YAML. Exercises the FULL fixture-0019
+     bootstrap shape: HCM (`codec_type: HTTP1`, `stat_prefix:
+     ingress_http`, route_config with `match: { prefix: "/" }` →
+     `cluster: hc_backend`) + `envoy.filters.http.router` + STRICT_DNS
+     cluster `hc_backend` with `dns_lookup_family: V4_ONLY` +
+     `common_lb_config.healthy_panic_threshold: { value: 0 }`
+     (panic-disabled) + `health_checks` block (`timeout: 1s`,
+     `interval: 1s`, both thresholds 1, `http_health_check.path:
+     /healthz`, `expected_statuses: [{ start: 200, end: 201 }]`) +
+     `load_assignment` single endpoint at `localhost:7000` + `admin`
+     ephemeral at `127.0.0.1:9901`.
+  2. **Modified** `crates/envoy-config/fuzz/.gitignore` — appended
+     `!corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml`
+     immediately after the existing 12.1
+     `!corpus/parse_bootstrap/cluster_health_check.yaml` allow-list
+     line (mirrors the 12.1 Task-6 precedent format).
+  3. **Modified** `crates/envoy-config/src/bootstrap.rs` — extended
+     the `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS-seed
+     slice with `"fuzz/corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml",`
+     placed immediately after the 12.1 `cluster_health_check.yaml`
+     entry (the existing array is keep-order-as-added rather than
+     strictly alphabetical, so this placement mirrors the convention).
+
+**Pre-implementation grep audit (per the 12.2 state-3 doctrine):**
+  - `cat crates/envoy-config/fuzz/.gitignore` → confirmed the existing
+    25-line `corpus/parse_bootstrap/*` + 24 allow-list entries shape;
+    the 12.1 `cluster_health_check.yaml` entry is line 25 (last in the
+    allow-list before `artifacts/` + `target/`).
+  - `grep -n 'fuzz_corpus_seeds_parse_or_reject_cleanly\|cluster_health_check'
+    crates/envoy-config/src/bootstrap.rs` →
+    `3518:fn fuzz_corpus_seeds_parse_or_reject_cleanly` (the SUCCESS
+    array runs 3522-3540, REJECT array 3548-3551, minimal.yaml line
+    3564); `3540:` is the 12.1 entry to mirror.
+  - `ls crates/envoy-config/fuzz/corpus/parse_bootstrap/*.yaml` → 24
+    existing `.yaml` seeds (Tasks 1-12.1's full inventory); the new
+    file is the 25th seed file, the 20th in the SUCCESS array (19
+    success + 3 reject + 1 minimal = 23 array-tracked + 2 fuzz-corpus
+    auxiliary like `tls_overlapping_sni_reject.yaml` already
+    reject-array-tracked → confirmed 24-yaml + 1-new = 25 yamls total,
+    of which 20 are SUCCESS-array-tracked post-Task-7).
+
+**Non-redundancy vs 12.1's `cluster_health_check.yaml`:** the 12.1
+seed is a header-only HC bootstrap (cluster + `health_checks` block,
+NO HCM listener — purely exercises the cluster-level schema's
+acceptance of `health_checks`). THIS seed exercises the FULL
+fixture-0019 shape: HCM + router + HC-configured cluster +
+panic-disabled + route gating — the first SUCCESS-array seed that
+exercises HCM routing PLUS active HC simultaneously, the
+parse-time mirror of the fixture-0019 + Task-6 backstop runtime
+contract.
+
+**Verifications (pre-commit):**
+  - `git check-ignore crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml`
+    → exit **1** (NOT ignored — the `.gitignore` allow-list entry won
+    against the `corpus/parse_bootstrap/*` deny).
+  - `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly`
+    → `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 264
+    filtered out; finished in 0.01s` — the new seed parses via
+    `parse_bootstrap` (Task 7 lands as a SUCCESS seed, not a REJECT
+    seed).
+
+5 stable-toolchain gates clean locally:
+  - `cargo build --workspace --all-targets` → `Finished dev profile …
+    in 1m 18s` (cold cache rebuild after prior phase work).
+  - `cargo clippy --workspace --all-targets --all-features -- -D
+    warnings` → `Finished` clean.
+  - `cargo fmt --all -- --check` → clean (no diff; pure YAML +
+    `.gitignore` text edits + one-line `bootstrap.rs` array entry).
+  - `cargo test --workspace --no-fail-fast` → 72 result lines, 71 ok
+    + 1 FAILED (the Task-5 Docker-gated `upstream_active_health_check_fixture`
+    flaked with `health-aware-http1-backend did not become ready` —
+    a `cargo run`-spawn race under parallel-workspace IO load).
+    **Re-ran in isolation** (`cargo test -p differential --test
+    upstream_active_health_check`) → `1 passed; 0 failed; 0 ignored;
+    finished in 7.42s`. **Effective count: 844 / 0 / 2** (matches the
+    contract baseline; the parent task's stated 844/0/2 unchanged).
+    Verified the failure is environmental, NOT introduced by Task 7's
+    pure-data edits (a YAML file, a `.gitignore` line, a string
+    literal in an array cannot affect runtime helper-backend boot),
+    by stash-roundtrip against clean HEAD `e259f70`: differential-lib
+    tests PASS at clean HEAD (`cargo test -p differential --lib --
+    --test-threads=1` → `107 passed; 0 failed; 1 ignored`) AND PASS
+    WITH Task 7 edits applied (same 107/0/1).
+
+**No new ADR**; no STATE.md / ROADMAP.md / DECISIONS edit (per the
+state-3 cadence — deferred to Task 8 state-4 phase-done verification).
+
+§7.5 gates (a)/(b)/(c)/(d): (a) the new seed is a SUCCESS-array
+parse_bootstrap corpus extension only (no fixture; no regression on
+0001-0019); (b) `cargo test --workspace` test count grows +0 (no
+new `#[test]` functions — the array extension feeds existing
+`fuzz_corpus_seeds_parse_or_reject_cleanly`, which still reports as
+1 test); (c) no H2 touch (h2spec ≥95% holds vacuously — no protocol
+code touched); (d) corpus grows 19 → 20 SUCCESS seeds for
+`parse_bootstrap` fuzz.
+
 

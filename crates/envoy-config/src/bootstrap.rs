@@ -3538,6 +3538,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/hcm_rbac_filter.yaml",
             "fuzz/corpus/parse_bootstrap/hcm_fault_filter.yaml",
             "fuzz/corpus/parse_bootstrap/cluster_health_check.yaml",
+            "fuzz/corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml",
         ] {
             let path = format!("{root}/{fname}");
             let yaml =

@@ -23,5 +23,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/hcm_rbac_filter.yaml
 !corpus/parse_bootstrap/hcm_fault_filter.yaml
 !corpus/parse_bootstrap/cluster_health_check.yaml
+!corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml
 artifacts/
 target/
