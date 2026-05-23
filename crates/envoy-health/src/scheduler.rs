@@ -258,4 +258,48 @@ admin:
             tokio::time::timeout(std::time::Duration::from_secs(3), scheduler.shutdown()).await;
         assert!(dur.is_ok(), "shutdown returned within 3s");
     }
+
+    #[tokio::test]
+    async fn registers_three_counters_per_hc_cluster() {
+        let bootstrap = parse_bootstrap(HC_BOOTSTRAP).expect("parse");
+        let registry = Arc::new(StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("build"),
+        );
+        let cancel = CancellationToken::new();
+        let _scheduler =
+            Scheduler::spawn(&bootstrap, cluster_mgr, registry.clone(), cancel).expect("scheduler");
+        let snapshot = registry.snapshot();
+        for kind in ["attempt", "success", "failure"] {
+            let name = format!("cluster.hc_backend.health_check.{kind}");
+            assert!(
+                snapshot.iter().any(|(n, _)| n == &name),
+                "registry must contain {name}; snapshot = {snapshot:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registers_no_counters_when_no_hc_configured() {
+        let bootstrap = parse_bootstrap(NO_HC_BOOTSTRAP).expect("parse");
+        let registry = Arc::new(StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("build"),
+        );
+        let cancel = CancellationToken::new();
+        let _scheduler =
+            Scheduler::spawn(&bootstrap, cluster_mgr, registry.clone(), cancel).expect("scheduler");
+        let snapshot = registry.snapshot();
+        for kind in ["attempt", "success", "failure"] {
+            let name = format!("cluster.plain.health_check.{kind}");
+            assert!(
+                !snapshot.iter().any(|(n, _)| n == &name),
+                "registry must NOT contain {name} (no HC configured)"
+            );
+        }
+    }
 }

@@ -341,4 +341,55 @@ posture in `scheduler.rs:86-92` between `.expect()` and `continue`; a one-liner
 note that `ProbeError`'s `Debug` is the live consumer via `tracing::debug!`)
 deferred to the 12.2 state-5 review per the 12.1 carryforward discipline.
 
+### Task 2 — D7 health_check.{attempt,success,failure} BEHAVIOR_CONTRACT 12.2 block + M4 12.1 fold-in + registration-assertion tests
+
+Appended the **`**12.2 entries (active health checking — counters):**`** block to
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md`'s `## Stat-name mapping` section AFTER
+the existing `**12.1 entries (active health checking):**` block (preserved
+verbatim modulo the single Equivalence-cell edit below); 3 new rows for
+`cluster.<name>.health_check.{attempt,success,failure}` — each carries
+`Equivalence: name-required, value-may-differ` per timing-dependence (independent
+`tokio::time::interval` schedules from independent process-start instants yield
+divergent elapsed-probe counts over a fixed test window; value-exact is not
+feasible without timing-tolerance opt-in, which phase 12 does NOT take). The
+3 rows trace the registration site (`Scheduler::spawn` only when the cluster
+configures `health_checks`), the `.success` boundary (status ∈
+`expected_statuses`, default exactly 200, half-open `Int64Range`), and the
+`.failure` fold-in (status outside `expected_statuses` OR connect failure OR
+per-probe `tokio::time::timeout` elapsed OR malformed response — the
+network-failure-class results fold into `failure` at phase-12 scope; the dedicated
+`network_failure` sub-counter defers per parent SPEC §4).
+
+**M4 fold-in** (PLAN lock-in #7; the natural revisit site where the gauge becomes
+driven): edited ONLY the `cluster.<name>.membership_healthy` row's Equivalence
+cell — `value-exact (steady state)` → `value-exact (12.2 steady state; reads 0
+at 12.1)`. Rationale column unchanged. Closes the 12.1 REVIEW M4
+self-containment carryforward in-phase per the 12.1 carryforward discipline.
+
+**2 new registration-attestation tests** appended to `crates/envoy-health/src/scheduler.rs`
+`#[cfg(test)] mod tests` (reusing the `HC_BOOTSTRAP` + `NO_HC_BOOTSTRAP` YAML
+constants Task 1 landed): `registers_three_counters_per_hc_cluster` asserts all
+3 `cluster.hc_backend.health_check.{attempt,success,failure}` counter names
+land in `registry.snapshot()`; `registers_no_counters_when_no_hc_configured`
+asserts the 3 names are ABSENT for the no-HC cluster (`plain`). Both used the
+`registry.snapshot().iter().any(|(n, _)| n == &name)` presence-check pattern
+(matches the 12.1 D6 `membership_healthy` test's hardened form — never
+false-passes against idempotent re-register). Both PASS immediately at this
+task because Task 1's `Scheduler::spawn` already registers the 3 counters at
+the per-configured-HC-cluster entry of the bootstrap walk (the substance of
+this task is the contract extension; the tests are attestations of the
+already-landed registration logic, per PLAN Task 2 Step 2).
+
+`cargo test -p envoy-health` → `test result: ok. 8 passed; 0 failed; 0 ignored`
+(+2 over Task 1 baseline 6: the 2 new `scheduler::tests::registers_*` tests).
+`cargo test --workspace` → **840 passed / 0 failed / 2 ignored** (+2 over
+Task 1 baseline 838 — exactly the 2 new tests; no other crate touched). 5
+stable-toolchain gates clean locally: `cargo build --workspace --all-targets`
+`Finished`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+`Finished`; `cargo fmt --all -- --check` clean; full-workspace tests as above.
+No production code change beyond the 2 test functions (Task 1's registration
+logic intact). No ADR. No Cargo.toml. No STATE.md. No ROADMAP edit. §7.5
+gates (a)/(b)/(c)/(d) hold vacuously at this task (no new fixture; pre-existing
+18 unaffected; no H2 touch; no new fuzz seed).
+
 
