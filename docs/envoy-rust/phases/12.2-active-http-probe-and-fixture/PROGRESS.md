@@ -238,3 +238,107 @@ unchanged per their existing named-owner dispositions.
 ---
 
 <!-- state-3 task subsections append below this line -->
+
+## Phase-12.2 state-3 execution arc (Tasks 1-8)
+
+All eight tasks dispatched to fresh subagents with two-stage review per
+`feedback_execution_style` + the 06.x → 12.1 cadence; TDD per task; one commit per
+task. `cargo fmt --all -- --check` clean at every per-task close (06.1 R-9). No
+ADR landed (lock-in #2; ledger head stays ADR-0037, next available ADR-0038).
+
+### Task 1 — D4 envoy-health crate + periodic probe task + ClusterHandle accessor + envoy-bin wiring + M2 contract
+
+Created the new `envoy-health` workspace crate (`crates/envoy-health/{Cargo.toml,
+src/{lib.rs,error.rs,probe.rs,scheduler.rs}}`) — the project's FIRST
+periodic-background primitive. Clean DAG: `envoy-health → {envoy-cluster,
+envoy-http1, envoy-config, envoy-stats, tokio, tokio-util, bytes, tracing,
+thiserror}` (no cycle — `envoy-cluster` does NOT depend on `envoy-http1`, and
+`envoy-health` sits ABOVE both — verified by `cargo build --workspace` clean).
+**Zero new top-level Cargo dep** (lock-in #4 — every dep is either an
+already-permitted foundation or an existing workspace path-dep).
+`#![forbid(unsafe_code)]` on the new crate root (D-3.8). Added workspace member
+in alphabetical position adjacent to `envoy-filter`.
+
+`Scheduler::spawn(&Bootstrap, Arc<ClusterManager>, Arc<StatsRegistry>,
+CancellationToken) -> Result<Scheduler, HealthError>` walks `bootstrap.static_resources.clusters`,
+takes the first (validator-guaranteed sole) `health_checks` entry, registers the
+3 `cluster.<n>.health_check.{attempt,success,failure}` counters per
+configured-HC cluster, re-parses `interval`/`timeout` via `envoy_config::parse_duration`
+(defense-in-depth — the 12.1 D2 validator already accepted them; identical-result
+on success), and spawns EXACTLY ONE `tokio::spawn`-ed `probe_loop` per (cluster,
+endpoint) pair via the new `ClusterHandle::health_probe_targets()` accessor (the
+single-writer-per-endpoint topology the 12.1 REVIEW M2 contract requires; closed
+at this crate's API boundary per the new ~11-LoC `EndpointHealth` API-boundary
+contract comment in `crates/envoy-cluster/src/health.rs`). `Scheduler::shutdown()`
+cancels the shared `CancellationToken` then awaits every `JoinHandle` — clean
+drain via the `tokio::select!` cancel branch.
+
+`probe_loop` (the periodic primitive): `tokio::time::interval(interval_dur)` with
+`MissedTickBehavior::Delay` + `tokio::select!` on `cancel.cancelled()` + `ticker.tick()`;
+per tick, `attempt.inc()` then `probe_once` then `success.inc()` +
+`endpoint_health.record_success()` OR `failure.inc()` +
+`endpoint_health.record_failure()`. `probe_once`: `Client::connect(addr, host)` +
+`ClientStream::send_request(Request { method: "GET", path, version: Http11, headers: vec![], body: None })`
+wrapped in `tokio::time::timeout(probe_timeout, ...)`. Success criterion: empty
+`expected_statuses` → exactly 200; non-empty → `(r.start..r.end).contains(&(status as i64))`
+across the union (lock-in #10).
+
+The probe omits an explicit `Host:` header — `Client::connect` captures `host` at
+connect time and `send_request` injects it when the outgoing `Request.headers`
+does not already carry one (the existing client de-dup contract). The `host`
+defaults to `http_health_check.host.unwrap_or(cluster_name)` per lock-in #9.
+
+`ClusterHandle::health_probe_targets() -> Option<Vec<(SocketAddr, Arc<EndpointHealth>)>>`
+zips `self.inner.endpoints` with `self.inner.endpoint_health.as_ref()?` (clean
+`None` on no-HC; the §5.4 inert-when-unconfigured invariant). Internal fields
+stay `pub(crate)`.
+
+`envoy-bin` wiring: added `envoy-health = { path = "../envoy-health" }` path-dep;
+constructed the scheduler after the `cluster_mgr` build site (`crates/envoy-bin/src/main.rs:128`)
+with the existing `signal_token` `CancellationToken`; `health_scheduler.shutdown().await`
+on the runtime drain path after `set.join_next().await` completes (line ~415).
+
+**M2 single-writer-contract comment** landed on `EndpointHealth` per PLAN lock-in
+#6 + Task 1 Step 8: ~11 LoC API-boundary contract explicitly stating that callers
+obtaining an `Arc<EndpointHealth>` from `health_probe_targets()` MUST NOT call
+`record_*` themselves and MUST NOT hand the `Arc` to additional writer tasks;
+naming the violation consequence (concurrent load-modify-store races on `state`
+may double-increment/decrement the membership gauge); pointing at the scheduler
+boundary as the verification site. Closes the 12.1 REVIEW M2 forward-correctness
+verification at the API boundary.
+
+**6 unit tests** in `envoy-health`: `probe::tests::{empty_expected_statuses_accepts_only_200,
+half_open_range_excludes_end, multi_range_union}` + `scheduler::tests::{spawns_one_task_per_hc_endpoint,
+spawns_zero_tasks_when_no_hc_configured, shutdown_terminates_all_tasks}`. The
+`spawns_one_task_per_hc_endpoint` test ATTESTS the single-writer topology
+(`assert_eq!(scheduler.task_count(), 2)` on a 2-endpoint HC cluster). `cargo test -p envoy-health` →
+`test result: ok. 6 passed; 0 failed; 0 ignored`.
+
+§7.5 gates (a)/(b)/(c)/(d) hold vacuously at this task (no new fixture; pre-existing 18
+unaffected; no H2 touch; no new fuzz seed). (e) the 5 stable-toolchain gates clean
+locally at this commit: `cargo build --workspace --all-targets` `Finished`;
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` `Finished`;
+`cargo fmt --all -- --check` clean; `cargo test --workspace` → **838 passed / 0 failed / 2 ignored**
+(+6 over the 12.1 baseline 832 — exactly the 6 new `envoy-health` tests);
+`cargo deny check` `advisories ok, bans ok, licenses ok, sources ok` (benign
+unmatched-license-allowance notices unchanged from prior phases).
+
+Spec ✅ (the implementation matches PLAN lock-ins #4 + #5 + #6 + #9 + #10 + #11
++ #12 + #13 verbatim modulo the `Request` struct shape — the PLAN sketched
+`host: String` field but the actual on-disk `envoy_http1::codec::Request` carries
+`version: HttpVersion`, `bytes_consumed: usize` instead, with the `Host:` header
+injected by `Client::connect` at connect time; the implementation correctly uses
+the on-disk shape, with an inline rustdoc note on `probe_once` explaining the
+contract). Code-quality **Approved with one in-phase amend** — the reviewer
+surfaced one Important finding (early `?` propagation in `envoy-bin`'s drain
+loop short-circuited `health_scheduler.shutdown().await` on the error-exit
+path) recovered IN-PHASE via amend per the 12.1 in-phase-recovery cadence:
+hoisted the first error into a local `first_err: Option<anyhow::Error>` so the
+scheduler drain runs on BOTH clean-exit and error-exit paths before the error
+propagates. Re-ran the 5 stable-toolchain gates clean post-amend (build,
+clippy, fmt, test, deny). Two awareness-only Minors (asymmetric defense-in-depth
+posture in `scheduler.rs:86-92` between `.expect()` and `continue`; a one-liner
+note that `ProbeError`'s `Debug` is the live consumer via `tracing::debug!`)
+deferred to the 12.2 state-5 review per the 12.1 carryforward discipline.
+
+

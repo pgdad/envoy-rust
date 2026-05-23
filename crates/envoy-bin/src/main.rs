@@ -126,6 +126,19 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
             .context("building cluster manager")?,
     );
 
+    // 12.2 (parent-12 D4): spawn active-HC probe tasks for every cluster
+    // carrying `health_checks`. Cancellation wired to the existing signal
+    // token so SIGTERM/SIGINT triggers clean shutdown of every probe task at
+    // its next `tokio::select!` boundary. The scheduler holds JoinHandles
+    // until `shutdown().await` on the runtime drain path below.
+    let health_scheduler = envoy_health::Scheduler::spawn(
+        &bootstrap,
+        std::sync::Arc::clone(&cluster_mgr),
+        std::sync::Arc::clone(&registry),
+        token.clone(),
+    )
+    .context("building active-HC scheduler")?;
+
     // 03.2: per-cluster Arc<UpstreamTls> construction. Build once at startup
     // and reuse across all per-connection invocations of `handle`. The
     // validator already rejected DownstreamTlsContext on a cluster's
@@ -394,8 +407,27 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         });
     }
 
+    // Collect the first error from the listener/admin task set without
+    // short-circuiting the scheduler drain. We capture the first error and
+    // propagate it AFTER `health_scheduler.shutdown().await` so the probe
+    // tasks always drain cleanly on BOTH clean-exit and error-exit paths.
+    let mut first_err: Option<anyhow::Error> = None;
     while let Some(res) = set.join_next().await {
-        res.context("task panicked")??;
+        let outcome = res.context("task panicked").and_then(|inner| inner);
+        if let Err(e) = outcome
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
+    }
+    // 12.2 (parent-12 D4): drain the active-HC scheduler on BOTH clean-exit
+    // and error-exit paths. The signal token cancellation has already
+    // propagated through `tokio::select!` exits in the per-(cluster, endpoint)
+    // `probe_loop`s; `shutdown().await` joins every JoinHandle before
+    // envoy-bin returns (clean tokio task drain).
+    health_scheduler.shutdown().await;
+    if let Some(e) = first_err {
+        return Err(e);
     }
     tracing::info!("envoy-rust exited cleanly");
     Ok(())

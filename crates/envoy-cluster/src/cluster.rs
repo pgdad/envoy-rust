@@ -232,6 +232,26 @@ impl ClusterHandle {
     pub fn upstream_rq_5xx(&self) -> &Arc<envoy_stats::Counter> {
         self.inner.upstream_rq_5xx()
     }
+
+    /// 12.2 (parent-12 D4): per-endpoint health-probe targets when this
+    /// cluster configures active health checks. Yields one (addr,
+    /// EndpointHealth) pair per resolved endpoint that the `envoy-health`
+    /// probe task drives (one task per pair; single-writer-per-endpoint
+    /// per the 12.1 REVIEW M2 forward-correctness contract closed at
+    /// `envoy-health`'s API boundary). Returns `None` when the cluster
+    /// has no `health_checks` configured (the §5.4 inert-when-unconfigured
+    /// invariant — no probe task should spawn).
+    pub fn health_probe_targets(&self) -> Option<Vec<(SocketAddr, Arc<crate::EndpointHealth>)>> {
+        let health = self.inner.endpoint_health.as_ref()?;
+        Some(
+            self.inner
+                .endpoints
+                .iter()
+                .copied()
+                .zip(health.iter().map(Arc::clone))
+                .collect(),
+        )
+    }
 }
 
 /// The cluster registry, keyed by cluster name. Built once via

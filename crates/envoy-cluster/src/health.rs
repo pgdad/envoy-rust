@@ -18,6 +18,17 @@ const HEALTHY: u8 = 1;
 /// other for a given endpoint; `pick()` reads `is_healthy()` concurrently with
 /// `Relaxed` loads (no happens-before dependency — the `cluster.rs` `pick()`
 /// cursor `Relaxed` precedent).
+///
+/// **API-boundary contract (12.1 REVIEW M2; closed at 12.2):** the live
+/// production writer of every `EndpointHealth` is the `envoy-health::Scheduler`
+/// probe task spawned per (cluster, endpoint); callers obtaining an
+/// `Arc<EndpointHealth>` from `ClusterHandle::health_probe_targets()` (12.2)
+/// MUST NOT call `record_success`/`record_failure` themselves and MUST NOT
+/// hand the `Arc` to additional writer tasks. Violating this contract makes
+/// the `Relaxed`-ordering soundness assumption invalid (concurrent
+/// load-modify-store races on `state` may double-increment/decrement the
+/// membership gauge). Tests + the 12.2 review verify the contract at the
+/// scheduler boundary.
 #[derive(Debug)]
 pub struct EndpointHealth {
     state: AtomicU8,

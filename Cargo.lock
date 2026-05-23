@@ -359,6 +359,7 @@ dependencies = [
  "envoy-admin",
  "envoy-cluster",
  "envoy-config",
+ "envoy-health",
  "envoy-http1",
  "envoy-http2",
  "envoy-listener",
@@ -412,6 +413,21 @@ dependencies = [
  "serde_yaml",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "envoy-health"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "envoy-cluster",
+ "envoy-config",
+ "envoy-http1",
+ "envoy-stats",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2016,6 +2032,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
