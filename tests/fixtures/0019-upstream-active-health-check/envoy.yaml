@@ -1,0 +1,84 @@
+# Phase 12.2 differential acceptance fixture: assert post-convergence
+# active-HC steady state on an H1 listener.
+#
+# Topology:
+#   - downstream: HTTP/1.1 listener on {{PORT}} -> HCM -> router -> cluster `hc_backend`
+#   - upstream  : a synthetic health-aware backend at {{BACKEND_HOST}}:{{BACKEND_PORT}}
+#                 returning 200 on `/` and 503 on `/healthz`
+#   - cluster   : active HTTP HC every 1s, `unhealthy_threshold: 1`, path `/healthz`,
+#                 panic disabled (`healthy_panic_threshold: { value: 0 }`)
+#
+# After ~3 s + margin both proxies converge: the sole endpoint is ejected
+# (probes hit `/healthz` -> 503 -> Unhealthy) -> `pick() -> None` ->
+# synth-503 with body `no healthy upstream` (19 bytes, ADR-0037).
+# Driver: `Driver::Http1AfterSettle` (settle 3500 ms, then GET /).
+#
+# This is the FIRST Upstream-robustness-family fixture and the FIRST
+# fixture exercising synth-503 from the no-healthy-upstream arm (the
+# `hcm.rs:582` arm; vs synth_status (502 connect-fail) at the connect-fail
+# arm). The bilateral assertion is status 503 + body byte-exact + the 5
+# standard HTTP/1.1 headers via set-equal-modulo-allow-list.
+#
+# Integer-second durations per parent §6.2 item-6 (both proxies' duration
+# parsers accept `1s` only — Envoy rejects `500ms`; envoy-rust rejects
+# `0.5s`).
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 0
+node:
+  cluster: phase-12-cluster
+  id: phase-12-envoy
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: {{PORT}}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                codec_type: HTTP1
+                stat_prefix: ingress_http
+                generate_request_id: false
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: hc_backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: hc_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      common_lb_config:
+        healthy_panic_threshold: { value: 0 }
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          http_health_check:
+            path: /healthz
+            expected_statuses:
+              - { start: 200, end: 201 }
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: {{BACKEND_HOST}}
+                      port_value: {{BACKEND_PORT}}

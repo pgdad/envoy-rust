@@ -130,6 +130,25 @@ pub enum Driver {
     Http2ProbeList {
         probes: Vec<Http1Probe>,
     },
+    /// 12.2 NEW: settle-then-drive H1 variant. Sleeps `settle_ms`
+    /// past active-HC convergence (≥ `interval × unhealthy_threshold +
+    /// timeout + margin`), then drives ONE Http1 request and applies the
+    /// existing 5-axis equivalence cascade. The fixture asserts the
+    /// post-convergence STEADY STATE, not a transient. Phase 12 does NOT
+    /// opt into Timing tolerances (the settle_ms is a harness mechanic,
+    /// not a compared latency bound — BEHAVIOR_CONTRACT.md §Timing).
+    Http1AfterSettle {
+        settle_ms: u64,
+        method: Http1Method,
+        path: String,
+        host: String,
+        #[serde(default)]
+        expected_status: Option<u16>,
+        #[serde(default)]
+        expected_body: Option<Http1BodyRule>,
+        #[serde(default)]
+        expected_headers: Option<Http1HeaderRule>,
+    },
     /// 06.1 D6.a: drive a sequence of HCM-side `PreRequest`s (so the registry
     /// has counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
     /// Relaxed-ordered counter writes become visible), then perform one or
@@ -1658,6 +1677,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::Http1 { .. }
         | Driver::Http1ProbeList { .. }
         | Driver::Http1WithAccessLog { .. }
+        | Driver::Http1AfterSettle { .. }
         | Driver::Http2 { .. }
         | Driver::Http2ProbeList { .. }
         // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
@@ -1701,9 +1721,28 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // backend in a binding outside the proxies' lifetime ensures the child
     // process outlives the fixture run; Drop fires after `run_fixture`'s
     // returns paths.
+    //
+    // 12.2 Task 5 (D7.2): fixture `0019-upstream-active-health-check` is the
+    // FIRST consumer of `{{BACKEND_PORT}}` that needs an HTTP/1.1 health-aware
+    // backend (`HealthAwareHttp1Backend` — 200 on `/`, 503 on `/healthz`)
+    // instead of the default TCP-echo backend (`TcpProxyBackend`). Per PLAN
+    // Task 5 Step 8: follow `0008-http1-router-upstream`'s `Http1EchoBackend`
+    // arm verbatim, substituting `HealthAwareHttp1Backend` — the principle is
+    // backend-struct substitution at the same dispatch site. Since the
+    // existing harness is template-marker-driven (single
+    // `{{BACKEND_PORT}}` token → single backend), the per-fixture dispatch
+    // here is keyed on the fixture directory name to keep the existing
+    // `{{BACKEND_PORT}}` consumers (fixtures 0003/0004/0005/0006/0013/0014)
+    // unchanged on `TcpProxyBackend`.
+    let fixture_name = fixture_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     let needs_backend = upstream_template.contains("{{BACKEND_PORT}}")
         || subject_template.contains("{{BACKEND_PORT}}");
-    let _backend = if needs_backend {
+    let needs_health_aware_backend =
+        needs_backend && fixture_name == "0019-upstream-active-health-check";
+    let _backend = if needs_backend && !needs_health_aware_backend {
         Some(
             backend::TcpProxyBackend::spawn()
                 .await
@@ -1712,7 +1751,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     } else {
         None
     };
-    let backend_port_str = _backend.as_ref().map(|b| b.port().to_string());
+    let _health_aware_backend: Option<crate::backend::HealthAwareHttp1Backend> =
+        if needs_health_aware_backend {
+            Some(
+                crate::backend::HealthAwareHttp1Backend::spawn()
+                    .await
+                    .context("spawning HealthAwareHttp1Backend")?,
+            )
+        } else {
+            None
+        };
+    let backend_port_str = match (&_backend, &_health_aware_backend) {
+        (Some(b), _) => Some(b.port().to_string()),
+        (_, Some(b)) => Some(b.port().to_string()),
+        _ => None,
+    };
 
     // 03.2 Task 9: spawn a TlsEchoBackend if either template needs one.
     // Same alive-keeper binding-order discipline as `_backend` above — the
@@ -2131,6 +2184,97 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             }
 
             // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
+            if matches!(
+                expected_headers,
+                Some(Http1HeaderRule::SetEqualModuloAllowList)
+            ) {
+                diff_headers(
+                    &upstream_resp.headers,
+                    &subject_resp.headers,
+                    HEADER_ALLOW_LIST,
+                )
+                .context("diff_headers (set_equal_modulo_allow_list)")?;
+            }
+        }
+        // 12.2 NEW: Driver::Http1AfterSettle — sleep `settle_ms` past
+        // active-HC convergence, then drive ONE Http1 request via the same
+        // helper + equivalence cascade the single-probe `Driver::Http1` arm
+        // uses. The settle_ms is a harness mechanic (not a compared latency
+        // bound — phase 12 does NOT opt into Timing tolerances per
+        // BEHAVIOR_CONTRACT.md §Timing). The fixture asserts the
+        // post-convergence STEADY STATE, not a transient. See PLAN
+        // lock-in #20.
+        Driver::Http1AfterSettle {
+            settle_ms,
+            method,
+            path,
+            host,
+            expected_status,
+            expected_body,
+            expected_headers,
+        } => {
+            tracing::debug!(
+                settle_ms,
+                "Driver::Http1AfterSettle: sleeping for active-HC settle"
+            );
+            tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+
+            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[])
+                .await
+                .context("upstream envoy http1 drive (after settle)")?;
+            let subject_resp = drive_http1(subject_addr, method, path, host, &[])
+                .await
+                .context("envoy-rust http1 drive (after settle)")?;
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+
+            // Status: envoy ↔ envoy-rust under `response_status: exact`.
+            if matches!(
+                expectations.equivalence.response_status,
+                Some(StatusRule::Exact)
+            ) && upstream_resp.status != subject_resp.status
+            {
+                bail!(
+                    "response status mismatch under `response_status: exact`\n  \
+                     upstream: {}\n  subject:  {}",
+                    upstream_resp.status,
+                    subject_resp.status,
+                );
+            }
+            if let Some(es) = expected_status {
+                if upstream_resp.status != *es {
+                    bail!(
+                        "upstream status {} != expected {}",
+                        upstream_resp.status,
+                        es,
+                    );
+                }
+                if subject_resp.status != *es {
+                    bail!("subject status {} != expected {}", subject_resp.status, es,);
+                }
+            }
+
+            if let Some(rule) = &expectations.equivalence.response_body {
+                assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
+            }
+            if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
+                let expected = body.as_bytes();
+                if upstream_resp.body != expected {
+                    bail!(
+                        "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                        upstream_resp.body,
+                        expected,
+                    );
+                }
+                if subject_resp.body != expected {
+                    bail!(
+                        "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                        subject_resp.body,
+                        expected,
+                    );
+                }
+            }
+
             if matches!(
                 expected_headers,
                 Some(Http1HeaderRule::SetEqualModuloAllowList)

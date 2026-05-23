@@ -1,0 +1,33 @@
+# Phase 12.2 fixture-0019 expectations: assert post-convergence steady state
+# on the H1 listener after a 3.5s settle past active-HC convergence.
+#
+# Driver `http1_after_settle` (12.2 NEW; PLAN lock-in #20) sleeps `settle_ms`
+# milliseconds, then drives ONE `GET /` and applies the same 5-axis
+# equivalence cascade the single-probe `http1` driver uses.
+#
+# settle_ms = 3500 ms ≥ interval × unhealthy_threshold + timeout + margin
+#                       (= 1000 × 1 + 1000 + 1500 = 3500ms).
+#
+# expected_body byte-exact "no healthy upstream" (19 bytes per ADR-0037 /
+# `synth_no_healthy_upstream`); expected_headers
+# `set_equal_modulo_allow_list` compares the response header SETS across
+# proxies modulo the documented allow-list (server + date diverge per the
+# 04.1 rows; content-length / content-type / connection are value-exact).
+# The 5 standard HTTP/1.1 headers (server, date, content-length,
+# content-type, connection) are the assert-present set per Task 5 Step 6
+# (the README documents the header roster explicitly).
+driver:
+  kind: http1_after_settle
+  settle_ms: 3500
+  method: get
+  path: "/"
+  host: "hc_backend"
+  expected_status: 503
+  expected_body:
+    kind: byte_exact
+    body: "no healthy upstream"
+  expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body:
+    kind: byte_exact

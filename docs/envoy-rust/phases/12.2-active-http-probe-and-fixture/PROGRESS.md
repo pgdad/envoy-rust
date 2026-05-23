@@ -554,4 +554,180 @@ above; `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 PLAN-verbatim text). §7.5 gates (a)/(b)/(c)/(d) hold vacuously at this task
 (no new fixture; pre-existing 18 unaffected; no H2 touch; no new fuzz seed).
 
+### Task 5 — D7.2 fixture 0019-upstream-active-health-check + `Driver::Http1AfterSettle` + Docker wrapper
+
+**The FIRST Upstream-robustness-family differential fixture** and the **FIRST
+fixture to drive synth-503 from the no-healthy-upstream arm bilaterally** (the
+H1 HCM `hcm.rs:582` arm via `synth_no_healthy_upstream`, ADR-0037 / Task 3).
+The discriminating bilateral observable: **status 503 + body byte-exact
+`no healthy upstream` (19 bytes) + the 5 standard HTTP/1.1 headers**
+(`server`, `date`, `content-length`, `content-type`, `connection`) via
+`set_equal_modulo_allow_list`. Driver variant `Driver::Http1AfterSettle`
+(PLAN lock-in #20).
+
+Five surfaces:
+
+(1) **New `Driver::Http1AfterSettle` variant** in
+`tests/differential/src/lib.rs` (appended after `Driver::Http2ProbeList`).
+Carries `settle_ms: u64`, `method: Http1Method`, `path: String`,
+`host: String`, optional `expected_status: Option<u16>`,
+`expected_body: Option<Http1BodyRule>`, `expected_headers:
+Option<Http1HeaderRule>`. Phase 12 does NOT opt into Timing tolerances
+(the `settle_ms` is a harness mechanic, not a compared latency bound —
+BEHAVIOR_CONTRACT.md §Timing).
+
+(2) **Port-template arm extension** — added `Driver::Http1AfterSettle { .. }`
+to the `"PORT"` group alongside `Http1`, `Http1ProbeList`,
+`Http1WithAccessLog`, etc. (PLAN lock-in #21 — no new template tag needed).
+
+(3) **Dispatch arm in `run_fixture`** — sleeps `settle_ms` via
+`tokio::time::sleep(Duration::from_millis(*settle_ms))`, then drives both
+proxies with `drive_http1(addr, method, path, host, &[])` (mirroring the
+existing 5-arg `Driver::Http1` signature; the PLAN's Step 2 sketch's
+7-arg form was schematic — the actual signature is 5 args, with status
+/ body / headers asserted after the call). The post-drive equivalence
+cascade reproduces `Driver::Http1`'s body verbatim: `response_status:
+exact` (envoy ↔ envoy-rust), per-driver `expected_status` (each side
+independently), `equivalence.response_body` via `assert_body_rule`,
+per-driver `Http1BodyRule::ByteExact` (each side independently), and
+`Http1HeaderRule::SetEqualModuloAllowList` via `diff_headers` against
+the established `HEADER_ALLOW_LIST`.
+
+(4) **Backend dispatcher hookup** — the existing `_backend = TcpProxyBackend`
+arm (template-marker-driven on `{{BACKEND_PORT}}`) is now fixture-name-aware:
+when `fixture_dir.file_name() == "0019-upstream-active-health-check"`, the
+harness spawns `HealthAwareHttp1Backend::spawn().await?` (the Task 4 / D7.1
+helper) instead of `TcpProxyBackend::spawn()` and surfaces ITS `port()` into
+the `BACKEND_PORT` template + `host.docker.internal` (upstream side) /
+`127.0.0.1` (subject side) for `BACKEND_HOST`. The 7 prior `{{BACKEND_PORT}}`
+consumers (fixtures 0003/0004/0005/0006/0013/0014; 0015 README-only) stay on
+`TcpProxyBackend`. Per PLAN Task 5 Step 8 explicit ack ("exact edit site is
+harness-evolution-dependent; locate at task time"), this fixture-name dispatch
+is the cleanest substitution: the existing harness's per-backend dispatch is
+template-marker-driven (1 marker → 1 backend), and the new fixture re-uses
+`{{BACKEND_PORT}}` per PLAN Step 3/4 fixture YAMLs verbatim, so the marker
+keying widens with a fixture-name guard rather than introducing a new
+template tag.
+
+(5) **New fixture `tests/fixtures/0019-upstream-active-health-check/`** with 4
+files per PLAN Steps 3-6:
+  - **`envoy.yaml`** — admin block (`port_value: 0` kernel-ephemeral), node
+    block (cluster `phase-12-cluster`, id `phase-12-envoy`), HCM
+    `codec_type: HTTP1` on `0.0.0.0:{{PORT}}`, `generate_request_id: false`,
+    STRICT_DNS cluster `hc_backend` (`dns_lookup_family: V4_ONLY` per
+    05.4 ADR-0024/0025/0026), `common_lb_config.healthy_panic_threshold:
+    { value: 0 }` (panic DISABLED — the discriminating mechanism that lets
+    `pick()` return `None` instead of falling back to the panic-all-endpoints
+    pick), `health_checks` with `interval: 1s, timeout: 1s,
+    healthy_threshold: 1, unhealthy_threshold: 1` (integer-second durations
+    per §6.2 item-6 — the only form both proxy parsers accept) and
+    `http_health_check: { path: /healthz, expected_statuses: [{ start: 200,
+    end: 201 }] }`, single endpoint at `{{BACKEND_HOST}}:{{BACKEND_PORT}}`.
+  - **`envoy-rust.yaml`** — identical modulo per-side surface: no admin block,
+    bind `127.0.0.1:{{PORT}}`, no `generate_request_id` field (envoy-rust's
+    HCM config does not model it and would `deny_unknown_fields`-reject it).
+    The cluster + health-check + endpoint blocks are character-identical to
+    the upstream side.
+  - **`expectations.yaml`** — `driver: { kind: http1_after_settle, settle_ms:
+    3500, method: get, path: /, host: hc_backend, expected_status: 503,
+    expected_body: { kind: byte_exact, body: "no healthy upstream" },
+    expected_headers: set_equal_modulo_allow_list }`. The `expected_headers`
+    uses the existing `Http1HeaderRule::SetEqualModuloAllowList` unit-variant
+    scalar form (matching the fixture-0008/0018 grammar precedent); the
+    PLAN Step 5 sketch's `SetEqualModuloAllowList: required: [...]` map
+    form is not the current `Http1HeaderRule` serde shape, so the 5-header
+    required-set roster lives in the README as the documented assert-present
+    set rather than as a YAML field. `settle_ms = 3500` satisfies
+    `interval × unhealthy_threshold + timeout + margin = 1000 × 1 + 1000 +
+    1500` per PLAN lock-in #20.
+  - **`README.md`** — per PLAN Task 5 Step 6 verbatim, with explicit
+    cross-reference to `synth_no_healthy_upstream` / ADR-0037 / the
+    `hcm.rs:582` arm + `HealthAwareHttp1Backend` (Task 4 / D7.1 / the
+    06.3 REVIEW I2 down-payment).
+
+(6) **New Docker-gated wrapper** `tests/differential/tests/upstream_active_health_check.rs`
+per PLAN Step 7 verbatim — a single `#[tokio::test] async fn
+upstream_active_health_check_fixture()` that constructs the fixture-dir
+path from `CARGO_MANIFEST_DIR` and calls `differential::run_fixture(&dir)`.
+Mirrors the fixture-0018 `http_filter_fault.rs` wrapper shape (PLAN
+lock-in #22).
+
+**Docker available locally** — the fixture ran end-to-end bilaterally:
+`cargo test -p differential --test upstream_active_health_check
+upstream_active_health_check_fixture` → **PASS** in **8.41s**
+(3.5s settle + Docker upstream-Envoy container startup + envoy-rust
+subprocess start + `GET /` drive + equivalence cascade). The envoy-rust
+side log line `WARN no healthy endpoint for cluster — returning 503
+cluster=hc_backend` confirms the `pick() -> None` arm fired bilaterally
+(both proxies converged to ejecting the sole endpoint after probing
+`/healthz` → 503 → Unhealthy, then synth-503 on the data-plane `GET /`).
+
+Pre-implementation greps (per the agent contract pre-implementation
+verification step):
+  - `grep -n 'enum Driver\|Driver::' tests/differential/src/lib.rs` → 60+
+    matches; Driver enum declared `:39`, port-template arm `:1655`, dispatch
+    arms `:2061+`.
+  - `grep -n 'Http1EchoBackend\|0008-http1-router' tests/differential/src/lib.rs`
+    → fixture-0008 backend spawn at `:1763` via the template-marker
+    `{{HTTP1_BACKEND_PORT}}` path (not fixture-name-keyed); the existing
+    pattern is template-marker-driven, so the Task-5 Step-8 "exact edit
+    site is harness-evolution-dependent" note is real — the cleanest
+    substitution gates the existing `{{BACKEND_PORT}}` arm on fixture name.
+  - `grep -n 'fn drive_http1' tests/differential/src/lib.rs` → `:1161`
+    confirms 5-arg signature `(addr, &Http1Method, &str, &str,
+    &[(String, String)]) -> Result<DriveHttp1Result>`, validating the
+    Step-2 sketch's parameter-passing deviation (the PLAN-writer note
+    in Step 2 itself acknowledged the schematic form).
+  - `cat tests/differential/tests/http_filter_fault.rs` → confirmed
+    fixture-0018 wrapper shape (matched verbatim by the new wrapper).
+  - `cat tests/fixtures/0008-http1-router-upstream/expectations.yaml` →
+    confirmed the existing `kind: http1` + `expected_headers:
+    set_equal_modulo_allow_list` grammar (matched by the new fixture-0019
+    expectations.yaml).
+  - `cat tests/fixtures/0018-http-filter-fault/envoy.yaml` → confirmed
+    the most-recent envoy.yaml admin/node/HCM/clusters layout.
+
+**No new ADR** (PLAN lock-in #2 standing — ADR ledger head ADR-0037 at
+12.2 start; next free ADR-0038; nothing this task warrants one). **No
+STATE.md / ROADMAP.md edit** at this task (deferred to Task 8 state-4
+phase-done verification per the standing state-3 cadence). **No
+BEHAVIOR_CONTRACT.md edit** (deferred to per-task scope; Task 5 is
+fixture surface, not new behavior).
+
+5 stable-toolchain gates clean locally:
+  - `cargo build --workspace --all-targets` `Finished dev profile … in 38.24s`
+    — the new Driver variant + dispatch arm + backend-dispatcher fixture-name
+    hookup + fixture wrapper all compile.
+  - `cargo test --workspace` baseline **841 / 0 / 2 → 842 / 0 / 2**
+    (the new wrapper test adds +1 pass — `upstream_active_health_check_fixture`
+    in the differential integration test binary). One earlier
+    parallel-test contention flake run tripped 4 host-environment-sensitive
+    tests (`backend::tests::http1_echo_backend_spawns_and_echoes`,
+    `subject::tests::starts_and_shuts_down_envoy_rust`,
+    `tests::drive_http2_round_trip_against_in_process_listener`,
+    `tests::drive_admin_scrape_round_trips_against_envoy_bin_admin`) when
+    multiple test binaries spawn helper subprocesses concurrently — all 4
+    passed deterministically when re-run in isolation
+    (`cargo test -p differential --lib -- --test-threads=1 <test1> <test2>
+    <test3> <test4>` → 4 passed / 0 failed) AND the very next full
+    `cargo test --workspace` invocation returned `EXIT 0` with the
+    expected 842 / 0 / 2 tally (all 4 flakes vacuously passing in the
+    second run). These are pre-existing host-load-dependent flakes (NOT
+    a Task 5 regression — `drive_http1`, the `Driver::Http1AfterSettle`
+    dispatch, and the fixture YAMLs are not in any of the 4 flaky tests'
+    call graphs).
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+    `Finished` clean.
+  - `cargo fmt --all -- --check` clean.
+  - **Docker-gated bilateral run** `cargo test -p differential --test
+    upstream_active_health_check upstream_active_health_check_fixture` →
+    **PASS** in 8.41s (bilateral synth-503 + `no healthy upstream` body
+    + `WARN no healthy endpoint for cluster` log line confirming envoy-rust
+    side `pick() -> None`).
+
+§7.5 gates (a)/(b)/(c)/(d): (a) the new fixture is the FIRST under
+0019, no regressions on 0001-0018; (b) `cargo test --workspace`
+baseline differential count grows +1 wrapper; (c) no H2 touch (h2spec
+≥95% holds vacuously); (d) no new fuzz seed (deferred to Task 7).
+
 
