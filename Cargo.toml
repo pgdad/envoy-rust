@@ -16,6 +16,7 @@ members = [
     "crates/envoy-tls",
     "tests/conformance/h2spec",
     "tests/differential",
+    "tests/helpers/health-aware-http1-backend",
     "tests/helpers/http1-echo-server",
     "tests/helpers/http2-echo-server",
     "tests/helpers/tcp-echo-server",

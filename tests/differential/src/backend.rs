@@ -238,6 +238,78 @@ impl Drop for Http1EchoBackend {
     }
 }
 
+/// 12.2 D7.1 (06.3 REVIEW I2 down-payment): synthetic health-aware HTTP/1.1
+/// backend. Serves 200 on `/` and 503 on `/healthz` by default — the
+/// discriminating signal for the active-HC differential fixture. Runs on
+/// the host bridge network via testcontainers' `cargo run`-equivalent
+/// pattern (the existing helper-binary lifecycle in this module).
+pub struct HealthAwareHttp1Backend {
+    child: tokio::process::Child,
+    port: u16,
+}
+
+impl HealthAwareHttp1Backend {
+    /// 12.2: spawn the helper backend binary as a tokio subprocess (NOT a
+    /// Docker container — the backend runs on the host alongside the
+    /// differential harness; the Docker-running envoy + envoy-rust dial
+    /// `host.docker.internal:port` per the existing 04.3 / 05.3 helper
+    /// pattern). `kill_on_drop(true)` per 09 REVIEW M3 standing discipline.
+    pub async fn spawn() -> Result<Self> {
+        let port = crate::reserve_port()?;
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("locating workspace root"))?;
+        let helper_manifest = manifest.join("tests/helpers/health-aware-http1-backend/Cargo.toml");
+        let child = tokio::process::Command::new(env!("CARGO"))
+            .arg("run")
+            .arg("--quiet")
+            .arg("--manifest-path")
+            .arg(&helper_manifest)
+            .arg("--")
+            .arg("--port")
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning health-aware-http1-backend")?;
+        // Brief readiness poll: connect to 127.0.0.1:port with retry up to ~3s.
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .context("parsing readiness-probe addr")?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("health-aware-http1-backend did not become ready");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(Self { child, port })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Address from inside a Docker container running on the host bridge
+    /// network. Matches the existing `Http1EchoBackend` convention.
+    pub fn container_host(&self) -> &'static str {
+        "host.docker.internal"
+    }
+}
+
+impl Drop for HealthAwareHttp1Backend {
+    fn drop(&mut self) {
+        // kill_on_drop(true) handles the SIGKILL; this Drop is a no-op
+        // anchor for the lifecycle contract (matches Http1EchoBackend).
+        let _ = self.child.start_kill();
+    }
+}
+
 /// Spawns the workspace's `http2-echo-server` helper on an ephemeral
 /// 127.0.0.1 port and waits until an H2C handshake against it completes.
 ///

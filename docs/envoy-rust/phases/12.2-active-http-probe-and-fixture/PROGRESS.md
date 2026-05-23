@@ -458,3 +458,93 @@ because their call sites still go through `synth_status`. §7.5 gates
 18 unaffected; no H2 touch; no new fuzz seed).
 
 
+### Task 4 — D7.1 synthetic health-aware HTTP/1.1 backend (06.3 REVIEW I2 **down-payment**) + `HealthAwareHttp1Backend` harness primitive
+
+Landed the project's FIRST synthetic-backend harness primitive — the
+infrastructure 06.3 REVIEW I2 named for the "upstream-robustness family" close
+site. **This task is the DOWN-PAYMENT, NOT full I2 closure** (PLAN lock-in #19;
+SPEC §3 D7.1 final paragraph): the per-class `downstream_rq_3xx/4xx/5xx`
++ `cluster.<name>.upstream_rq_5xx` wire coverage + the `upstream_cx_total`
+`value-exact` tightening remain TIED TO CONNECTION POOLING per the 06.3 REVIEW
+§3 disposition. PROGRESS attributes the down-payment honestly — no over-claim
+of full closure.
+
+Three deliverables landed atomically:
+
+(1) **New workspace helper crate** `tests/helpers/health-aware-http1-backend/`
+(`Cargo.toml` + `src/main.rs`, ~96 LoC main). A small hand-rolled HTTP/1.1
+server (NO framework — the project's D-3.2 forbidden-list forbids axum / warp
+/ hyper here; backend stays transparent so no hidden header behavior pollutes
+the differential signal). Dependencies: ONLY `anyhow + bytes + httparse +
+tokio + tracing + tracing-subscriber` (all already present in workspace; no
+new top-level Cargo dep per PLAN lock-in #19 implicit + Task 4 Step 2). CLI
+flags: `--port` (required) + `--healthz-status` (default 503) + `--data-status`
+(default 200) + `--data-body` (default `"ok\n"`). Per-path dispatch: `/healthz`
+→ `cfg.healthz_status` with empty body (the discriminating health-check
+signal); anything else → `(cfg.data_status, cfg.data_body)`. Response shape
+hand-rolled via `format!`: status line + 5 standard HTTP/1.1 response headers
+in canonical order (`server: health-aware-http1-backend` / `content-length: N`
+/ `content-type: text/plain` / `connection: close`) per Task 4 Step 3
+verbatim. `#![forbid(unsafe_code)]` per the project safety discipline. Bound
+**`0.0.0.0:port`** (NOT 127.0.0.1) per the 05.4 ADR-0024/0025/0026 helper-bind
+discipline so Docker containers on the bridge network can reach it via
+`host.docker.internal:port`. Connection: close per response (the active-HC
+probe uses a fresh connection per probe, matching the parent-12 §6.2 item-5
+empirical wire shape).
+
+(2) **New `HealthAwareHttp1Backend` struct + `spawn()` + `port()` +
+`container_host()` methods** appended to `tests/differential/src/backend.rs`
+immediately after the existing `Http1EchoBackend` block (post-edit lines
+~241-301). Spawn shape per 09 REVIEW M3 subprocess discipline:
+`tokio::process::Command::new(env!("CARGO")) .arg("run") .arg("--quiet")
+.arg("--manifest-path") .arg(<helper Cargo.toml path>) .arg("--") .arg("--port")
+.arg(port) .stdout(Stdio::null()) .stderr(Stdio::piped())
+.kill_on_drop(true) .spawn()`. The workspace-root lookup uses
+`env!("CARGO_MANIFEST_DIR").ancestors().nth(2)` to climb from
+`tests/differential` → `tests` → `<workspace-root>`. Brief readiness poll:
+`tokio::net::TcpStream::connect("127.0.0.1:port")` with 100ms retry, 3s
+deadline (matches Http1EchoBackend's posture but uses a fresh TCP connect
+loop rather than the shared `wait_accept_ready` helper — keeps the new struct
+self-contained for the harness primitive). `port()` returns the reserved
+ephemeral port; `container_host()` returns `"host.docker.internal"` matching
+the Http1EchoBackend convention (ADR-0015). The `Drop` impl is the
+documented no-op anchor — `kill_on_drop(true)` handles the SIGKILL; the
+`Drop::drop` calls `self.child.start_kill()` as a belt-and-suspenders,
+mirroring Http1EchoBackend. ONE micro-deviation from the PLAN-verbatim code:
+the readiness-probe addr construction `("127.0.0.1", port).into()` does NOT
+type-check (no `From<(&str, u16)> for SocketAddr` in std); used
+`format!("127.0.0.1:{port}").parse().context(...)?` instead, matching the
+existing Http1EchoBackend / TcpProxyBackend / TlsEchoBackend precedent
+verbatim. No semantic change.
+
+(3) **Workspace `members`** in root `Cargo.toml` extended with
+`"tests/helpers/health-aware-http1-backend",` in alphabetical position
+immediately before `"tests/helpers/http1-echo-server",` (Task 4 Step 1).
+Cargo.lock auto-updated for the new workspace member (`tokio` features needed
+by the helper were already locked; no new top-level resolver-level
+dependencies).
+
+`reserve_port` signature confirmed at `tests/differential/src/lib.rs:743` —
+`pub fn reserve_port() -> Result<u16>` per pre-implementation grep; call site
+adopted as-is. Pre-edit grep on `Http1EchoBackend` (mirrored struct) confirmed
+the existing block at `tests/differential/src/backend.rs:170-239` with the
+struct + `spawn` + `port` + `container_host` + `Drop` shape Task 4 Step 4
+reproduces; the new `HealthAwareHttp1Backend` lands as a sibling
+immediately after, before the next-existing `Http2EchoBackend` block (now
+~`:305`).
+
+NO new tests this task — the helper exercises its behavior via the
+fixture 0019 (Task 5) + the in-process backstop (Task 6). NO BEHAVIOR_CONTRACT
+edit. NO new ADR (PLAN lock-in #2 standing). NO STATE.md edit. NO ROADMAP
+edit. `cargo test --workspace` → **841 passed / 0 failed / 2 ignored**
+(unchanged from Task 3 baseline — exactly as expected since no new tests).
+5 stable-toolchain gates clean locally: `cargo build --workspace
+--all-targets` `Finished` (the new helper builds; the backend.rs extension
+compiles); `cargo build -p health-aware-http1-backend` `Finished` (the new
+helper binary builds standalone); `cargo test --workspace` 841/0/2 as
+above; `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+`Finished` clean; `cargo fmt --all -- --check` clean (no fmt drift on the
+PLAN-verbatim text). §7.5 gates (a)/(b)/(c)/(d) hold vacuously at this task
+(no new fixture; pre-existing 18 unaffected; no H2 touch; no new fuzz seed).
+
+

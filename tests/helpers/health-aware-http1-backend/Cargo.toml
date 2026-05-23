@@ -1,0 +1,18 @@
+[package]
+name = "health-aware-http1-backend"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "health-aware-http1-backend"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+httparse = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
