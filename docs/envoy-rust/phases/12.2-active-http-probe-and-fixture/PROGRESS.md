@@ -475,9 +475,16 @@ Three deliverables landed atomically:
 (`Cargo.toml` + `src/main.rs`, ~96 LoC main). A small hand-rolled HTTP/1.1
 server (NO framework — the project's D-3.2 forbidden-list forbids axum / warp
 / hyper here; backend stays transparent so no hidden header behavior pollutes
-the differential signal). Dependencies: ONLY `anyhow + bytes + httparse +
+the differential signal). Dependencies: ONLY `anyhow + httparse +
 tokio + tracing + tracing-subscriber` (all already present in workspace; no
-new top-level Cargo dep per PLAN lock-in #19 implicit + Task 4 Step 2). CLI
+new top-level Cargo dep per PLAN lock-in #19 implicit + Task 4 Step 2).
+**In-phase amend** (code-quality review Important finding): dropped the
+unused `bytes = "1"` line from the helper Cargo.toml — `grep` confirmed no
+`use bytes::` or `bytes::` reference in `src/main.rs` (the `as_bytes()`
+calls are `&str` methods, not `bytes::Bytes` API). The unused dep would
+have bloated the helper's transitive graph against the 06.1 R-9 / cargo-deny
+minimal-transitive discipline. Re-ran the 5 stable-toolchain gates clean
+post-amend. CLI
 flags: `--port` (required) + `--healthz-status` (default 503) + `--data-status`
 (default 200) + `--data-body` (default `"ok\n"`). Per-path dispatch: `/healthz`
 → `cfg.healthz_status` with empty body (the discriminating health-check
