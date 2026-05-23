@@ -730,4 +730,149 @@ fixture surface, not new behavior).
 baseline differential count grows +1 wrapper; (c) no H2 touch (h2spec
 ≥95% holds vacuously); (d) no new fuzz seed (deferred to Task 7).
 
+### Task 6 — D7.3 in-process H1 backstop (both convergence directions; 5-header presence assertion on 503 per 10 REVIEW M1)
+
+**The FIRST in-process backstop for active HTTP health checking** and the
+**FIRST H1-codec backstop to assert BOTH convergence directions for the
+active-HC state machine** without the Docker bilateral framework. New
+crate-bound integration test file
+`crates/envoy-bin/tests/upstream_active_health_check.rs` (~250 LoC,
+shape copied verbatim from the phase-10/11 `http_filter_*.rs` backstop
+precedents per 09 REVIEW M3 disposition + the 10 + 11 backstop
+precedent docrine).
+
+Two `#[tokio::test]` functions exercise the two directions:
+
+  - **`unhealthy_endpoint_returns_synth_503_no_healthy_upstream`** —
+    the synthetic backend's `/healthz` returns 503 ⇒ after a 3500ms
+    settle (≥ `interval` 1s + `timeout` 1s + margin), the round-trip
+    `GET /` against the envoy-bin listener returns status **503** + body
+    byte-exact **`no healthy upstream`** (19 bytes, ADR-0037) + the
+    **5 standard HTTP/1.1 response headers** `{server, date,
+    content-length, content-type, connection}` — header-presence is
+    asserted by name AND `content-length` is asserted equal to `"19"`
+    (closes the 10 REVIEW M1 lesson for the new file).
+  - **`healthy_endpoint_passes_through_to_backend`** —
+    `/healthz` returns 200 ⇒ after the same 3500ms settle, `GET /`
+    pass-through returns status **200** + the backend data-path body
+    `ok\n`.
+
+Both tests run end-to-end in ~5s each (helper-backend boot + envoy-bin
+boot + 3.5s settle + probe round-trip). Each test reserves two
+ephemeral ports via `reserve_port()` (bind `127.0.0.1:0`, take
+`local_addr().port()`, drop the listener — same shape as the 07.2 +
+08.2 + 10 + 11 precedents), then probes both endpoints via
+`wait_ready()` (exponential-backoff TCP-connect probe up to 10s
+budget) before the settle window.
+
+**Subprocess discipline (09 REVIEW M3 + the standing 10/11
+precedent):** both subprocess spawns (helper backend +
+`env!("CARGO_BIN_EXE_envoy-bin")`) use `tokio::process::Command`
+with `.kill_on_drop(true)`, `stdout(Stdio::null())`, and
+`stderr(Stdio::piped())`. The per-test `_backend` + `_envoy` Child
+bindings are NOT bound to `_` (which would drop immediately) — they
+are bound to named `_backend` / `_envoy` so their `Drop` (which
+fires `kill_on_drop` ⇒ SIGKILL) runs AFTER the test body. The helper
+backend is the Task-4 `health-aware-http1-backend` binary, located
+via `env!("CARGO_MANIFEST_DIR").ancestors().nth(2)` (climbs
+`crates/envoy-bin` → `crates` → workspace root) → joined with
+`tests/helpers/health-aware-http1-backend/Cargo.toml`, and spawned
+through `env!("CARGO") run --quiet --manifest-path <…> --
+--port <p> --healthz-status <s> --data-status 200 --data-body
+"ok\n"`.
+
+**Bootstrap shape inside `spawn_envoy_bin`:** the bootstrap is a
+**STATIC cluster (not STRICT_DNS)** — the in-process test points at
+`127.0.0.1` directly, no DNS layer involved. Single endpoint at
+`127.0.0.1:{backend_port}`. HCM `codec_type: HTTP1` +
+`envoy.filters.http.router`. `health_checks` block: `timeout: 1s` +
+`interval: 1s` + `healthy_threshold: 1` + `unhealthy_threshold: 1` +
+`http_health_check.path: /healthz` + `expected_statuses: [{start:
+200, end: 201}]`. `common_lb_config.healthy_panic_threshold: {value:
+0}` (panic disabled). `admin.address.socket_address: {address:
+127.0.0.1, port_value: 0}` (admin enabled with ephemeral port,
+matching the precedent backstops). YAML literal `{` / `}`
+characters are doubled (`{{` / `}}`) in the `format!()` template
+per Rust format-string rules. Bootstrap is written through
+`tempfile::NamedTempFile::new()` (the existing `tempfile = "3"`
+dev-dep at `crates/envoy-bin/Cargo.toml` line 39; no new dep added);
+the tempfile path is forgotten via `std::mem::forget(tmp)` so the
+file persists until the short-lived test process exits.
+
+**Pre-implementation grep audit (per the 12.2 state-3 doctrine):**
+  - `grep -n 'tempfile' crates/envoy-bin/Cargo.toml` →
+    `39:tempfile = "3"` — already in dev-dependencies; no
+    Cargo.toml edit required.
+  - `ls crates/envoy-bin/tests/` → 17 existing backstop files
+    (including `http_filter_rbac.rs`, `http_filter_fault.rs`,
+    `http1_router_upstream.rs`, etc.) — the new file is the 18th.
+  - `grep -rn 'CARGO_BIN_EXE_envoy-bin\|kill_on_drop' crates/envoy-bin/tests/`
+    → 36 hits across 13 existing files; the `tokio::process::Command +
+    .kill_on_drop(true)` pattern is consistent throughout.
+  - `head crates/envoy-bin/tests/http_filter_rbac.rs` → confirmed
+    `use std::net::{SocketAddr, TcpListener as StdListener}` + `use
+    tokio::io::{AsyncReadExt, AsyncWriteExt}` + `use
+    tokio::net::TcpStream` + `reserve_port()` + `wait_ready_result`
+    shape — matched verbatim by the new file (`wait_ready` rather than
+    `wait_ready_result` since this file does not need the early-result
+    variant).
+  - `ls tests/helpers/health-aware-http1-backend/Cargo.toml` →
+    confirmed Task-4 helper crate path resolves correctly via the
+    `ancestors().nth(2)` climb.
+
+**One PLAN-text drift caught + minimum-fix applied:** the verbatim
+PLAN Task 6 Step 1 text used `("127.0.0.1", port).into()` to form
+`SocketAddr` values, but `(&str, u16)` only implements
+`ToSocketAddrs` (used by `TcpListener::bind` / `TcpStream::connect`)
+— there is no `From<(&str, u16)>` impl on `SocketAddr`. Compile
+error `E0277` × 6. The minimum-impact fix: at 4 call-sites in the
+two test bodies, parse via `let backend_addr: SocketAddr =
+format!("127.0.0.1:{backend_port}").parse().unwrap()` + same for
+`listener_addr` — the exact pattern used at
+`http_filter_rbac.rs:190` (`let listener_addr: SocketAddr =
+format!("127.0.0.1:{listener_port}").parse().unwrap();`). All other
+PLAN content carried over verbatim. Both tests then PASS on the
+first run (no further iteration).
+
+**No new ADR** (PLAN lock-in #2 standing — ADR ledger head ADR-0037
+at 12.2 start; next free ADR-0038; nothing this task warrants one).
+**No STATE.md / ROADMAP.md edit** at this task (deferred to Task 8
+state-4 phase-done verification per the standing state-3 cadence).
+**No BEHAVIOR_CONTRACT.md edit** (no new behavior — the backstop
+asserts behavior already contracted in §15.4 / §15.5 / §15.6 / §15.7
+landed in Tasks 1-4).
+
+5 stable-toolchain gates clean locally:
+  - `cargo build --workspace --all-targets` `Finished dev profile …
+    in 6.88s` — the new backstop file compiles after the 4-callsite
+    minimum-fix.
+  - `cargo test -p envoy-bin --test upstream_active_health_check
+    -- --nocapture` →
+    ```
+    test unhealthy_endpoint_returns_synth_503_no_healthy_upstream ... ok
+    test healthy_endpoint_passes_through_to_backend ... ok
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured;
+    0 filtered out; finished in 4.63s
+    ```
+    Per-test ~5s (deterministic with the helper-backend + envoy-bin
+    build cache warm).
+  - `cargo test --workspace` baseline **842 / 0 / 2 → 844 / 0 / 2**
+    (the +2 are the two new `#[tokio::test]` functions in the new
+    integration test binary).
+  - `cargo clippy --workspace --all-targets --all-features -- -D
+    warnings` `Finished` clean.
+  - `cargo fmt --all -- --check` clean (after one `cargo fmt --all`
+    pass adjusted formatting on two minor sites: the `status_line
+    .split_whitespace().nth(1).unwrap().parse().unwrap()` chain and
+    the `tmp.write_all(bootstrap.as_bytes()).expect(...)` call were
+    multi-lined, and the 5-string header array was rewrapped onto
+    one-per-line — none of these change semantics).
+
+§7.5 gates (a)/(b)/(c)/(d): (a) the new file is an
+in-process-codec backstop (no fixture; no regressions on 0001-0019);
+(b) `cargo test --workspace` count grows +2 (the two new
+`#[tokio::test]` fns); (c) no H2 touch (h2spec ≥95% holds
+vacuously — backstop is H1 codec only by design); (d) no new fuzz
+seed (deferred to Task 7).
+
 
