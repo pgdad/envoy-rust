@@ -978,4 +978,84 @@ new `#[test]` functions — the array extension feeds existing
 code touched); (d) corpus grows 19 → 20 SUCCESS seeds for
 `parse_bootstrap` fuzz.
 
+### Task 8 — state-4 phase-done verification + STATE advance to state-5-next — THIS commit
+
+Docs-only (PROGRESS + STATE). The §7.5 (a)–(e) gate was run fresh
+locally per `superpowers:verification-before-completion` (evidence
+quoted below) at HEAD `39e55a5` + this docs commit; STATE advanced
+to state-5-next. Mirrors the 12.1 Task 7 state-4 verification commit
+`f5ec8d2` shape exactly (the freshest precedent), with one
+differential: the 12.2 state-4 quotes the **load-bearing 19-fixture
+green-simultaneously** evidence (12.2 ships the new fixture 0019 +
+the synth-503 body reconciliation + the periodic-probe primitive,
+unlike 12.1's regression-equivalence vacuous gate).
+
+**§7.5 gate evidence (fresh local run at HEAD `39e55a5` + this docs commit):**
+
+- **(e) 5 stable-toolchain gates — all clean:**
+  - `cargo build --workspace --all-targets` → `Finished dev profile [unoptimized + debuginfo] target(s) in 7.72s` (warm cache).
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished dev profile [unoptimized + debuginfo] target(s) in 1m 13s`, no warnings.
+  - `cargo fmt --all -- --check` → clean (exit 0; no diff).
+  - `cargo test --workspace` → **844 passed / 0 failed / 2 ignored** (72 test-result lines aggregated; 12.1 baseline 832/0/2 + 12 new 12.2 tests: Task 1 ×7 envoy-health unit + ×2 envoy-cluster accessor; Task 2 ×3 counter/registration; Task 3 ×2 synth helper + body assertion; Task 4 backend helper unit; Task 6 backstop both-directions integration).
+  - `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (the `Unicode-DFS-2016` + `Zlib` license-not-encountered notices are harmless unmatched-allowance warnings, unchanged from prior phases).
+
+- **(a)/(b) 19 Docker-gated differential fixtures green simultaneously — the load-bearing 12.2 differential proof:**
+  `cargo test -p differential -- --include-ignored` → **21 test-result lines aggregated; 127 passed / 0 failed / 0 ignored** (108 lib + 19 Docker-gated fixtures + the doc-tests line), bilaterally vs `envoyproxy/envoy:v1.33.0`. All 19 fixtures green:
+  - `0001-tcp-echo` (`echo_fixture` 2.59s), `0002-static-admin-ready` (`admin_ready_fixture` 0.95s), `0003-tcp-proxy` (`tcp_proxy_fixture` 0.90s), `0004-tls-downstream` (`tls_downstream_fixture` 1.01s), `0005-tls-upstream` (`tls_upstream_fixture` 2.79s), `0006-tls-sni` (`tls_sni_fixture` 3.08s), `0007-http1-direct-response` (`http1_direct_response_fixture` 1.07s), `0008-http1-router-upstream` (`http1_router_upstream_fixture` 0.88s), `0009-http2-direct-response` (`http2_direct_response_fixture` 2.53s), `0010-http2-router-upstream` (`http2_router_upstream` 0.89s), `0011-admin-stats-prometheus` (`admin_stats_prometheus` 2.47s), `0012-access-log-file-sink` (`access_log_file_sink` 0.87s), `0013-http-filter-header-mutation` (`http_filter_header_mutation_fixture` 2.50s), `0014-admin-config-dump-server-info` (`admin_config_dump_server_info` 0.89s), `0015-admin-drain-listeners` (`admin_drain_listeners` 0.88s), `0016-http-filter-local-rate-limit` (`http_filter_local_rate_limit_fixture` 2.68s), `0017-http-filter-rbac` (`http_filter_rbac_fixture` 2.83s), `0018-http-filter-fault` (`http_filter_fault_fixture` 2.74s), **`0019-upstream-active-health-check` (`upstream_active_health_check_fixture` 6.33s)**.
+  This is the load-bearing 12.2 proof: the new fixture 0019 (Task 5) lands GREEN alongside the 18 pre-existing fixtures (`0001-0018`) simultaneously vs `envoyproxy/envoy:v1.33.0`. Confirms (a) fixture 0019's settle-then-probe sequence converges bilaterally + (b) the synth-503 body reconciliation (Task 3 `synth_no_healthy_upstream` at `hcm.rs:582`) + the periodic probe task (Task 1 `envoy-health::Scheduler::spawn`) + the 3 new counters (Task 2) do not regress any pre-existing fixture (the machinery is correctly inert when `health_checks` is unconfigured per SPEC §5.4).
+
+- **(c) h2spec ≥95% — held vacuously (no H2-codec touch in 12.2):**
+  `git diff --name-only 6a3b332..HEAD | grep envoy-http2 || echo "no H2 touch"` → `no H2 touch`. 12.2 modified zero files in `crates/envoy-http2/` (the periodic probe uses `envoy-http1::Client`; the fixture 0019 + backstop are H1-listener; the synth-503 reconciliation is in `crates/envoy-http1/src/hcm.rs`). The parent-05 baseline 99.31% is unaffected; no local h2spec re-run needed (per the 12.1 state-4 + parent-11 SPEC §6.8 vacuous-hold precedent).
+
+- **(d) `parse_bootstrap` fuzz on the 20-seed corpus — clean:**
+  `cd crates/envoy-config && cargo +nightly fuzz run parse_bootstrap -- -runs=200000` → `Done 200000 runs in 17 second(s)`, 0 crashes, exit 0 (cov 13414, ft 36698, corp 3485/2007Kb at completion; cov +111 / ft +2002 / corpus +281 entries vs the 12.1 state-4 baseline of cov 13303 — the new `hcm_upstream_active_health_check.yaml` seed (Task 7) materially extended coverage, as expected for a first-of-kind HCM + router + HC-configured-cluster + panic-disabled + route-gating seed).
+
+- **(a) fixture 0019** was verified at Task 5 bilaterally with Docker locally; the `cargo test -p differential -- --include-ignored` re-run in step (b) at THIS commit re-confirms.
+
+**Carryforward closures ratified at this state-4:** **M2** (the 12.1 REVIEW
+`EndpointHealth` `Relaxed`-ordering single-writer-per-endpoint
+forward-correctness-verification dependency) — folded in at Task 1 via the
+`crates/envoy-cluster/src/health.rs` API-boundary single-writer-contract
+comment AND the `Scheduler::spawn` topology (one `JoinHandle` per (cluster,
+endpoint) pair; verified by 12.2 state-5 review). **M4** (the
+`cluster.<name>.membership_healthy` BEHAVIOR_CONTRACT Equivalence-column
+self-containment) — folded in at Task 2 via the contract-row cell edit at the
+natural revisit site (where the gauge becomes driven by the live probe task).
+**06.3 REVIEW I2** — DOWN-PAYMENT landed at Task 4 (`HealthAwareHttp1Backend`
++ `health-aware-http1-backend` helper crate); NOT full closure (the residual
+per-class `downstream_rq_3xx/4xx/5xx` + `cluster.<name>.upstream_rq_5xx` wire
+coverage + the `cluster.<name>.upstream_cx_total` `value-exact` tightening
+stays tied to **connection pooling** per the 06.3 REVIEW §3 disposition; the
+PROGRESS Task 4 + Task 5 + Task 6 subsections attribute the down-payment
+honestly per D-3.4).
+
+**ADR posture:** No ADR landed in the 12.2 state-3 execution (PLAN lock-in
+#2). ADR-0037 (the no-healthy-upstream body bytes pinning) was pinned at the
+parent-12 split `4f9ba04`; 12.2 D6.2 IMPLEMENTS it at Task 3 (the
+`synth_no_healthy_upstream` helper + `hcm.rs:582` arm), not re-decides.
+DECISIONS.md ledger head stays **ADR-0037**; project-cumulative ADR count 38;
+next available **ADR-0038**.
+
+**Review-surfaced fixes folded into the task commits (recovered in-phase per
+the two-stage-review discipline):** Task 1 amend (rationale clarification + a
+documentation correctness fix), Task 4 follow-up `9ce6d61` (code-quality
+Important: dropped the unused `bytes` dep from the `health-aware-http1-backend`
+helper). All other per-task review findings dispositioned at the task; zero
+Critical / zero Important carried to state 5.
+
+**Two amend / follow-up commits in the state-3 arc:** (1) **Task 1 amend**
+(at the Task-1 commit `50c001c` itself; rationale clarification per the
+two-stage-review discipline). (2) **Task 4 follow-up `9ce6d61`** (a separate
+commit, NOT an amend; landed AFTER Task 4 `c2c5335` because the helper
+crate's `Cargo.toml` `bytes` dep was unused — the code-quality reviewer's
+Important finding; dropped the dep; clippy + build + test re-confirmed clean).
+
+**Next:** state 5 — `superpowers:requesting-code-review` over the range
+`6a3b332..` (the 8 task commits + the Task 4 follow-up `9ce6d61`) →
+`docs/envoy-rust/phases/12.2-active-http-probe-and-fixture/REVIEW.md`. The
+state-5 reviewer dispositions: the live awareness-only minors from the
+state-3 reviews (each Task's deferred-minor inventory captured in the
+per-Task subsections above) + verifies M2's `Scheduler::spawn`
+one-task-per-(cluster, endpoint) topology bilaterally.
+
 
