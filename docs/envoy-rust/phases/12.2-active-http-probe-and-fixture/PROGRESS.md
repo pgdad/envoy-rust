@@ -393,3 +393,68 @@ gates (a)/(b)/(c)/(d) hold vacuously at this task (no new fixture; pre-existing
 18 unaffected; no H2 touch; no new fuzz seed).
 
 
+### Task 3 — D6.2 `synth_no_healthy_upstream` helper + `hcm.rs:582` arm reconciles to 19-byte body per ADR-0037 + BEHAVIOR_CONTRACT Response-body subsection
+
+Added the dedicated `synth_no_healthy_upstream(close: bool) -> Response`
+helper to `crates/envoy-http1/src/hcm.rs` immediately adjacent to the existing
+`synth_status` function (PLAN Task 3 Step 3; lock-in #14). The new helper
+mirrors `synth_status`'s 5-standard-header shape EXACTLY (same `headers::SERVER`
+/ `DATE` / `CONTENT_LENGTH` / `CONTENT_TYPE` / `CONNECTION` constants in
+canonical order; same `DEFAULT_SERVER_NAME` / `DEFAULT_CONTENT_TYPE` constants;
+same `connection_value(close)` + `now_imf_fixdate()` helpers) but substitutes
+`body: Bytes::from_static(b"no healthy upstream")` (19 bytes; hex `6e 6f 20
+68 65 61 6c 74 68 79 20 75 70 73 74 72 65 61 6d`; no trailing newline) and
+`content-length: body.len().to_string()` (which evaluates to `"19"`; the
+`body.len()` form keeps the helper future-edit-safe). The body byte sequence
+matches upstream Envoy v1.33.0's no-healthy-upstream wire shape (parent-12
+§6.2 item-2 empirical-verification locked at split `4f9ba04`).
+
+EXACTLY ONE call-site change (PLAN Task 3 Step 4; lock-in #15): the `else`
+arm of `if cluster.pick_endpoint().is_some()` at `crates/envoy-http1/src/hcm.rs`
+(was `:582`; now `:585` after the comment expansion) — `outgoing = synth_status(503,
+close);` → `outgoing = synth_no_healthy_upstream(close);`. The other 3
+`synth_status` call sites remain untouched: the connect-fail 502 at `:524`,
+the send-fail 502 at `:568`, and the helper definition itself + the
+`synth_400` / `synth_404` / `synth_501` trampolines all keep their existing
+empty-body `synth_status` shape (phase-04.3 wire shape preserved). Pre-edit
+grep showed the 4 `synth_status` call-site invariant (helper def + 3 call
+sites = 4 occurrences in proxy code); post-edit grep confirms the no-healthy
+arm now calls `synth_no_healthy_upstream` and the other 3 call sites are
+intact per PLAN Task 3 Step 4 lock-in #15.
+
+New `## Response body — no-healthy-upstream synth-503` subsection appended
+to `docs/envoy-rust/BEHAVIOR_CONTRACT.md` AFTER the `## Equivalence matrix`
+horizontal rule + BEFORE `## Header allow-list` (PLAN Task 3 Step 5; lock-ins
+#16 + #18). The subsection documents the 5-standard-header set, the byte-exact
+19-byte body, the hex encoding, and the reachability path (HCM H1 `hcm.rs:582`
+arm + cluster has `health_checks` configured AND all endpoints unhealthy AND
+panic not engaged). Explicitly distinguishes the new helper's path from the
+connect-fail 502 + send-fail 502 paths which keep the empty `synth_status`
+body.
+
+New unit test `synth_no_healthy_upstream_emits_19_byte_body_and_5_headers`
+appended to `crates/envoy-http1/src/hcm.rs` `#[cfg(test)] mod tests` (PLAN
+Task 3 Step 1). Asserts: `status == 503`; `body.as_ref() == b"no healthy
+upstream"`; `body.len() == 19`; the 5 standard headers in canonical order
+(`server, date, content-length, content-type, connection`); `content-length`
+value `"19"`. Followed strict TDD: wrote test → ran red (`cannot find function
+synth_no_healthy_upstream in module super`) → added helper → ran green.
+
+`cargo test -p envoy-http1 synth_no_healthy_upstream` → `test result: ok.
+1 passed; 0 failed`. `cargo test -p envoy-http1` → `test result: ok. 71
+passed; 0 failed; 0 ignored` (+1 over Task 2 baseline 70: exactly the new
+test). `cargo test --workspace` → **841 passed / 0 failed / 2 ignored**
+(+1 over Task 2 baseline 840 — exactly the new test; no other crate touched
+its test count). 5 stable-toolchain gates clean locally: `cargo build
+--workspace --all-targets` `Finished`; `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` `Finished`; `cargo fmt --all -- --check` clean
+(applied `cargo fmt` once to collapse the `header_names` let-binding to a
+single line); `cargo test -p envoy-http1` as above; full-workspace tests as
+above. No new ADR. No Cargo.toml. No STATE.md. No ROADMAP edit. The
+pre-existing HCM unit tests that exercise the connect-fail 502 + send-fail
+502 + other `synth_status` paths stay green — their bodies remain empty
+because their call sites still go through `synth_status`. §7.5 gates
+(a)/(b)/(c)/(d) hold vacuously at this task (no new fixture; pre-existing
+18 unaffected; no H2 touch; no new fuzz seed).
+
+

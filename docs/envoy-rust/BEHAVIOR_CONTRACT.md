@@ -24,6 +24,19 @@
 
 ---
 
+## Response body — no-healthy-upstream synth-503
+
+> Authored per phase 12.2 SPEC §2.2 + ADR-0037. The H1 HCM per-request
+> dispatch path returns a synthetic 503 when `Cluster::pick()` yields
+> `None` — both proxies emit it with identical wire shape on the same
+> active-HC eviction.
+
+| Reachability path | Equivalence disposition |
+|---|---|
+| `pick() -> None` (HCM H1 `hcm.rs:582` arm; cluster has `health_checks` configured AND all endpoints unhealthy AND panic not engaged) | Status 503; body byte-exact `no healthy upstream` (19 bytes, hex `6e 6f 20 68 65 61 6c 74 68 79 20 75 70 73 74 72 65 61 6d`, NO trailing newline); 5 standard HTTP/1.1 response headers `{server, date, content-length: 19, content-type, connection}`. Emitted via the dedicated `synth_no_healthy_upstream` helper adjacent to `synth_status` — the helper is used ONLY on this path. The connect-fail 502 + send-fail 502 paths keep `synth_status`'s empty body (phase-04.3 wire shape). |
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**

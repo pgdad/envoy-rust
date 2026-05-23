@@ -575,11 +575,14 @@ async fn serve_connection(
                         }
                     } else {
                         // No healthy endpoint available for this cluster.
+                        // 12.2 (parent-12 D6.2 / ADR-0037): emit the 19-byte
+                        // `no healthy upstream` body to match upstream Envoy
+                        // v1.33.0's wire shape on the same path.
                         tracing::warn!(
                             cluster = %cluster.name(),
                             "no healthy endpoint for cluster — returning 503",
                         );
-                        outgoing = synth_status(503, close);
+                        outgoing = synth_no_healthy_upstream(close);
                     }
                 }
             },
@@ -924,6 +927,36 @@ fn synth_status(status: u16, close: bool) -> Response {
             (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
             (headers::DATE.to_string(), now_imf_fixdate()),
             (headers::CONTENT_LENGTH.to_string(), "0".to_string()),
+            (
+                headers::CONTENT_TYPE.to_string(),
+                DEFAULT_CONTENT_TYPE.to_string(),
+            ),
+            (
+                headers::CONNECTION.to_string(),
+                connection_value(close).to_string(),
+            ),
+        ],
+        body,
+    }
+}
+
+/// 12.2 (parent-12 D6.2 per ADR-0037): no-healthy-upstream synth-503 response.
+/// Mirrors `synth_status`'s 5-header shape but emits the 19-byte body
+/// `no healthy upstream` (hex `6e 6f 20 68 65 61 6c 74 68 79 20 75 70 73 74
+/// 72 65 61 6d`; no trailing newline) matching upstream Envoy v1.33.0's
+/// no-healthy-upstream wire shape (§6.2 item-2; locked at parent-12 split
+/// `4f9ba04`; ADR-0037). Used ONLY at the `pick() -> None` arm of HCM's
+/// per-request dispatch (`hcm.rs:582` in this file); the connect-fail 502
+/// and other synth paths keep `synth_status`'s empty body.
+fn synth_no_healthy_upstream(close: bool) -> Response {
+    let body = Bytes::from_static(b"no healthy upstream");
+    Response {
+        status: 503,
+        reason: None,
+        headers: vec![
+            (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
+            (headers::DATE.to_string(), now_imf_fixdate()),
+            (headers::CONTENT_LENGTH.to_string(), body.len().to_string()),
             (
                 headers::CONTENT_TYPE.to_string(),
                 DEFAULT_CONTENT_TYPE.to_string(),
@@ -3006,6 +3039,37 @@ static_resources:
             "encode StopAndSend substitutes: {resp}"
         );
         assert!(resp.ends_with("teapot\n"), "substituted body: {resp}");
+    }
+
+    #[test]
+    fn synth_no_healthy_upstream_emits_19_byte_body_and_5_headers() {
+        // 12.2 D6.2 / ADR-0037: the no-healthy-upstream synth-503 emits the
+        // 19-byte body `no healthy upstream` (matching upstream Envoy v1.33.0
+        // per parent-12 §6.2 item-2). Mirrors `synth_status` 5-standard-header
+        // shape modulo body + content-length.
+        let resp = super::synth_no_healthy_upstream(true);
+        assert_eq!(resp.status, 503);
+        assert_eq!(resp.body.as_ref(), b"no healthy upstream");
+        assert_eq!(resp.body.len(), 19, "exact byte count per ADR-0037");
+        let header_names: Vec<&str> = resp.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            header_names,
+            vec![
+                headers::SERVER,
+                headers::DATE,
+                headers::CONTENT_LENGTH,
+                headers::CONTENT_TYPE,
+                headers::CONNECTION,
+            ],
+            "5 standard HTTP/1.1 headers in canonical order"
+        );
+        let cl = resp
+            .headers
+            .iter()
+            .find(|(n, _)| n == headers::CONTENT_LENGTH)
+            .map(|(_, v)| v.as_str())
+            .expect("content-length present");
+        assert_eq!(cl, "19", "content-length matches body length");
     }
 
     #[tokio::test]
