@@ -1225,3 +1225,111 @@ ADR** (the helper keep-alive extension is a `#[cfg(test)]`-domain
 fix; the cluster per-class deferral is documented inline in
 `expectations.yaml` + here, not at the ADR layer). ADR ledger head
 stays **ADR-0038**.
+
+## Task 8 — in-process H1 backstop (D9.3)
+
+Task 8 lands the **cheap in-process subprocess-driven backstop** for
+the H1-pool-reuse + per-class counter property fixture 0020 verifies
+bilaterally. The new test
+`crates/envoy-bin/tests/upstream_connection_pooling.rs::pool_reuses_upstream_conn_and_counts_per_class`
+mirrors the `upstream_active_health_check.rs` 12.2-era backstop shape
+verbatim (`reserve_port` / `wait_ready` / `spawn_envoy_bin` /
+`spawn_backend` / per-conn-close discipline) and adapts the workload
+to a single downstream H1 keep-alive conn driving 10 sequential
+GETs (4× `/`, 1× `/301`, 2× `/404`, 3× `/500`). On every non-2xx
+response the test additionally asserts the **5 standard HTTP/1.1
+header presence pin** (10 REVIEW M1: `server`, `date`, `content-length`,
+`content-type`, `connection`, case-insensitive). After the
+downstream conn is dropped + a 200ms settle, the test GETs `/stats`
+from envoy-bin's admin port and assert-pins the same 9 counter rows
+fixture 0020's `expectations.yaml` pins — including the two
+load-bearing pool-reuse counters
+`cluster.backend_cluster.upstream_cx_total = 1` +
+`cluster.backend_cluster.upstream_cx_http1_total = 1` (THE
+discriminating-observable per parent-13 SPEC §6.2 item-iv; under a
+per-call `Client::connect` regression these counters would read 10
+instead of 1).
+
+**Test shape:**
+
+- `#[tokio::test(flavor = "multi_thread")]` (3 concurrent
+  subprocesses live in the test arena: helper backend + envoy-bin +
+  the test driver itself).
+- `#![forbid(unsafe_code)]` at file head per workspace doctrine.
+- Spawns `health-aware-http1-backend` via `cargo run --quiet
+  --manifest-path <workspace>/tests/helpers/health-aware-http1-backend/Cargo.toml
+  -- --port <p> --per-path /301=301,/404=404,/500=500`; 30s readiness
+  budget matches the differential harness's `HealthAwareHttp1Backend::spawn`
+  budget (12.2 state-5 review Cluster B I2 — cold cargo build of
+  the helper may take >10s).
+- Spawns `envoy-bin` via `env!("CARGO_BIN_EXE_envoy-bin")` against a
+  synthesized YAML bootstrap (STATIC cluster — NOT STRICT_DNS — for
+  zero DNS-lookup hop; admin block at the reserved admin port;
+  `circuit_breakers.thresholds[0]: { priority: DEFAULT,
+  max_connections: 4 }` matching fixture 0020's topology; NO
+  `health_checks` block — Task 8 tests pool reuse directly, not
+  active HC). Bootstrap written to a leaked `tempfile::NamedTempFile`
+  (the same persist-via-leak idiom `upstream_active_health_check.rs`
+  uses).
+- 3 helper functions (`reserve_port`, `wait_ready`, `spawn_backend`)
+  copied verbatim from `upstream_active_health_check.rs`; the
+  `spawn_envoy_bin` signature is extended to take an explicit
+  `admin_port` (the reference test uses `port_value: 0`).
+- New `http1_keep_alive_request(stream: &mut TcpStream, path: &str)`
+  helper: writes one request on the existing stream, reads the
+  status line + headers + `Content-Length`-bounded body, leaves the
+  conn open for the next request. `Content-Length`-bounded drain so
+  pipelined slack stays untouched (the test issues one request at a
+  time on the same conn). 5s timeouts on header + body reads.
+- `assert_5_standard_headers_present(headers, path, status)` —
+  the 10 REVIEW M1 per-probe roster pin (case-insensitive).
+- `scrape_admin_stats(addr) -> HashMap<String, u64>` — fresh
+  TCP conn to admin, GET `/stats`, parse `<name>: <value>` text rows
+  where `<value>` parses as `u64` into a map.
+- `assert_stat(stats, name, expected)` — small crisp-error helper
+  used 9 times for the pinned counter rows.
+
+**Targeted gates** (controller verifies workspace + deny separately —
+**no `cargo test --workspace` run, no `cargo deny check` run, no
+push** by this subagent):
+
+- `cargo build -p envoy-bin --all-targets` →
+  `Finished `dev` profile [unoptimized + debuginfo] target(s)` (clean).
+- `cargo test -p envoy-bin --test upstream_connection_pooling --
+  --nocapture` →
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;
+  0 filtered out; finished in 1.34s` (the new test passed on its
+  first untweaked run — bootstrap + workload + stat-scrape compose
+  cleanly against the live envoy-bin admin output).
+- `cargo clippy -p envoy-bin --all-targets --all-features --
+  -D warnings` → `Finished` (zero warnings — one initial
+  `clippy::collapsible_if` finding on the `if let .. { if let .. }`
+  stat-parse chain was rewritten to the `if let .. && let ..` chain
+  the lint suggests).
+- `cargo fmt --all -- --check` → clean (post a one-time `cargo fmt
+  -p envoy-bin` rewrap of two long signatures `rustfmt` flagged).
+
+**Files touched** (2):
+
+- `crates/envoy-bin/tests/upstream_connection_pooling.rs` — new test
+  file (full Task 8 backstop).
+- `docs/envoy-rust/phases/13.1-h1-pool-and-fixture/PROGRESS.md` —
+  this Task 8 section.
+
+**No PLAN deviation.** The implementation follows the PLAN spec
+verbatim — bootstrap shape, workload sequence, stat-row assertions,
+5-standard-header check, helper subprocess discipline, the `flavor
+= "multi_thread"` choice, the `multi_thread` rationale, the
+`port_value` substitution, the `STATIC`-cluster + no-`health_checks`
+choice, the `kill_on_drop(true)` + `Stdio::null()`/`Stdio::piped()`
+discipline. The two PLAN-anticipated adaptations did not surface
+(no admin-port collision, no `large_enum_variant` clippy finding);
+the one minor clippy finding (`collapsible_if` on the stat-parse
+chain) was anticipated by `Anticipated adaptations`'s framing and
+resolved by the lint's own suggested rewrite.
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new
+ADR** (this is a `#[cfg(test)]`-domain backstop; the property it
+asserts is the same one fixture 0020 + the Task 3-5 pool
+implementation lock in at the production layer). ADR ledger head
+stays **ADR-0038**.
