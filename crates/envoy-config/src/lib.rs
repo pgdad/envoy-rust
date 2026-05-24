@@ -9,7 +9,7 @@ pub mod matcher;
 
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, Bootstrap,
-    CertificateValidationContext, Cluster, ClusterType, CodecType, CommonLbConfig,
+    CertificateValidationContext, CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig,
     CommonTlsContext, DataSource, DenominatorType, DirectResponse, DnsLookupFamily,
     DownstreamTlsContext, Endpoint, ExplicitHttpConfig, FaultAbort, FaultConfig, FileAccessLog,
     FilterChain, FilterChainMatch, FractionalPercent, HeaderMatcher, HeaderMatcherMode,
@@ -19,10 +19,10 @@ pub use bootstrap::{
     LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints,
     Mutations, NetworkFilter, Node, Percent, Permission, PermissionSet, Policy, Principal,
     PrincipalSet, RbacConfig, Route, RouteAction, RouteAction_Route, RouteConfiguration,
-    RouteMatch, RouterConfig, Rules, SafeRegex, SocketAddress, StaticResources, StringMatcher,
-    StringMatcherMode, TcpProxyConfig, TlsCertificate, TokenBucket, TransportSocket,
-    TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext,
-    VirtualHost, parse_duration,
+    RouteMatch, RouterConfig, RoutingPriority, Rules, SafeRegex, SocketAddress, StaticResources,
+    StringMatcher, StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket,
+    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
+    UpstreamTlsContext, VirtualHost, parse_duration,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.

@@ -803,6 +803,7 @@ admin:
                     typed_extension_protocol_options: None,
                     health_checks: vec![],
                     common_lb_config: None,
+                    circuit_breakers: None,
                 }],
             },
         };
@@ -848,6 +849,7 @@ admin:
             typed_extension_protocol_options: None,
             health_checks: vec![],
             common_lb_config: None,
+            circuit_breakers: None,
         };
         let bootstrap = Bootstrap {
             node: None,

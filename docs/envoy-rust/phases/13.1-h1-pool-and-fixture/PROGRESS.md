@@ -81,3 +81,101 @@ This is a PLAN-writer recommendation; the state-3 controller may reorganize with
 ---
 
 *(State-3 task subsections append below as each task closes — `### Task 1 — ...` through `### Task 10 — state-4 phase-done verification + STATE advance`.)*
+
+---
+
+## Task 1 — envoy-config `Cluster.circuit_breakers` schema (D1)
+
+Extended `envoy-config` with the per-cluster circuit-breaker schema per PLAN
+Task 1 + parent-13 SPEC D1 + §6.2 item-(i) (locked findings: shape
+`circuit_breakers.thresholds[<i>].{priority?, max_connections?}`; priority
+defaults DEFAULT and is omitted in `/config_dump` when DEFAULT; max_connections
+default 1024). **Schema only at this commit** — the `validate_circuit_breakers`
+sub-validator + the 3 rejection `ConfigError` variants land at Task 2 (D2).
+
+**3 new types** added to `crates/envoy-config/src/bootstrap.rs` alongside
+`HealthCheck` / `CommonLbConfig`:
+
+- `CircuitBreakers { thresholds: Vec<Thresholds> }` — top-level block.
+  `#[serde(deny_unknown_fields)]`. Derives
+  `Debug, Clone, Serialize, Deserialize, PartialEq`.
+- `Thresholds { priority: Option<RoutingPriority>, max_connections: Option<u32> }` —
+  one entry. Both fields `Option` with
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+  `#[serde(deny_unknown_fields)]` — this is what rejects the parent-13 SPEC §4
+  phase-13-deferred fields (`max_pending_requests`, `max_requests`,
+  `max_retries`, `max_connection_pools`, `track_remaining`, `retry_budget`) at
+  parse time without an explicit validator arm per-field.
+- `RoutingPriority { Default, High }` — derives
+  `Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq`.
+  `#[serde(deny_unknown_fields, rename_all = "SCREAMING_SNAKE_CASE")]` so
+  `Default` → `"DEFAULT"` / `High` → `"HIGH"` on the wire (matches the upstream
+  Envoy proto-JSON enum projection verified at §6.2 item-(i)). Task 2's
+  validator rejects `High` explicitly with a clear error; for now the schema
+  accepts both variants symmetrically.
+
+**`Cluster` struct extension** at `crates/envoy-config/src/bootstrap.rs:91+`:
+new `pub circuit_breakers: Option<CircuitBreakers>` field added immediately
+after `common_lb_config` with
+`#[serde(default, skip_serializing_if = "Option::is_none")]` — `None` means
+defaults (PLAN lock-in #2 — the §5.4 default-enabled-pool reads
+`max_connections: 1024` per upstream Envoy v1.33). The `skip_serializing_if`
+preserves the 08.1 `/config_dump` regression-equivalence for the 18 existing
+non-circuit-breakers-configured clusters (they continue to round-trip without an
+emitted `circuit_breakers: null` field).
+
+**`lib.rs` re-exports** extended at `crates/envoy-config/src/lib.rs:9+`:
+appended `CircuitBreakers`, `RoutingPriority`, `Thresholds` alphabetically into
+the existing `pub use bootstrap::{...}` block — kept the established
+alphabetical-by-segment grouping.
+
+**Defense-in-depth by-hand `envoy_config::Cluster` test constructors** at
+`crates/envoy-cluster/src/cluster.rs:806, :852` extended with
+`circuit_breakers: None,` after the existing `common_lb_config: None,` line
+(PLAN Task 1 Step 4 — verified by `grep -n 'common_lb_config: None,'
+crates/envoy-cluster/src/cluster.rs` returning exactly these 2 hits, both inside
+`#[test]` constructors building `envoy_config::Cluster` literals; **no
+production-code site touched**, no `pub(crate)` visibility widening).
+
+**3 new TDD-first unit tests** in `crates/envoy-config/src/bootstrap.rs::tests`:
+
+- `cluster_circuit_breakers_parses_minimal_shape` — the positive path: YAML
+  `circuit_breakers.thresholds[0].{priority: DEFAULT, max_connections: 4}`
+  round-trips to `Some(CircuitBreakers { thresholds: [Thresholds { priority:
+  Some(RoutingPriority::Default), max_connections: Some(4) }] })`.
+- `cluster_circuit_breakers_omitted_yields_none` — schema-is-optional: a YAML
+  cluster with no `circuit_breakers` key parses to
+  `circuit_breakers: None` (preserves the 18 existing fixtures' parse behavior).
+- `cluster_circuit_breakers_rejects_phase13_deferred_threshold_fields` — the
+  `deny_unknown_fields` proof: a YAML cluster with
+  `thresholds[0].max_pending_requests: 5` fails to parse with an `unknown field`
+  error mentioning `max_pending_requests` (asserts the error message contains
+  either the field name or the literal `"unknown field"` substring — robust
+  against the exact phrasing of `serde_yaml`'s error reporter).
+
+TDD discipline: wrote all 3 tests first; ran `cargo test -p envoy-config --
+cluster_circuit_breakers` to verify they failed with the expected compile/parse
+errors; then implemented the 3 types + the `Cluster` field + the `lib.rs`
+re-exports + the by-hand constructor extensions; re-ran to verify pass.
+
+**No new top-level Cargo dep** — schema uses only existing-pulled `serde` +
+`serde_yaml`. **No `unsafe` introduced.** **No new ADR** — PLAN lock-in #16
+holds (the schema additions are ordinary structure; the rejection-style choices
+defer to Task 2's `ConfigError` variants). DECISIONS.md ledger head stays
+**ADR-0038**; next available **ADR-0039**.
+
+`§7.5` gates (a)/(b)/(c)/(d) hold vacuously at this task (no new differential
+fixture; pre-existing 19 unaffected — verified at Task 4's full-fixture
+regression-equivalence pass; no H2-codec touch; no new fuzz seed — the
+`cluster_circuit_breakers.yaml` corpus seed lands at Task 9). (e) the 5
+stable-toolchain gates clean locally at this commit:
+
+- `cargo build --workspace --all-targets` → `Finished \`dev\` profile [unoptimized + debuginfo] target(s)` (incremental clean).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished` (zero warnings).
+- `cargo fmt --all -- --check` → clean (no diff).
+- `cargo test --workspace` → **847 passed / 0 failed / 2 ignored** across 72 result lines (+3 over the 12.2 baseline 844 — exactly the 3 new `cluster_circuit_breakers_*` tests; no existing-test regression).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (benign unmatched-license-allowance notices unchanged from prior phases).
+
+Spec ✅ (the implementation matches PLAN Task 1 Steps 1-7 + lock-in #16
+verbatim; no scope creep — the validator + the 3 `ConfigError` variants are
+held back to Task 2 per PLAN ordering).

@@ -90,6 +90,11 @@ pub struct Cluster {
     /// `healthy_panic_threshold`.
     #[serde(default)]
     pub common_lb_config: Option<CommonLbConfig>,
+    /// 13.1 D1 (parent-13 D1): per-cluster circuit-breaker configuration.
+    /// `None` means defaults (the §5.4 default-enabled-pool reads
+    /// `max_connections: 1024` per upstream Envoy v1.33). See `CircuitBreakers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breakers: Option<CircuitBreakers>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -1148,6 +1153,41 @@ pub struct CommonLbConfig {
 #[serde(deny_unknown_fields)]
 pub struct Percent {
     pub value: f64,
+}
+
+/// 13.1 D1 (parent-13 D1): per-cluster circuit-breaker thresholds. At
+/// phase-13 scope ONLY `thresholds[0].{priority?, max_connections?}` are
+/// supported; the phase-13-deferred fields per parent SPEC §4 (`max_pending_requests`,
+/// `max_requests`, `max_retries`, `max_connection_pools`, `track_remaining`,
+/// `retry_budget`) are rejected by `deny_unknown_fields`. The validator at
+/// `validate_circuit_breakers` (Task 2) enforces at-most-one entry + DEFAULT-only
+/// priority + non-zero max_connections.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitBreakers {
+    #[serde(default)]
+    pub thresholds: Vec<Thresholds>,
+}
+
+/// 13.1 D1: a single circuit-breaker threshold entry. See `CircuitBreakers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Thresholds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<RoutingPriority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+}
+
+/// 13.1 D1: Envoy `RoutingPriority` enum. Phase-13 supports DEFAULT only; the
+/// validator rejects HIGH explicitly (the only other variant in upstream
+/// Envoy v1.33). Serializes/deserializes as `"DEFAULT"` / `"HIGH"` per the
+/// upstream proto JSON enum convention.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RoutingPriority {
+    Default,
+    High,
 }
 
 /// Reference to a regex pattern. Held both as the original String (for
@@ -8795,6 +8835,104 @@ admin:
     fn validate_accepts_zero_panic_threshold() {
         let clb = "      common_lb_config:\n        healthy_panic_threshold: { value: 0 }";
         assert!(crate::parse_bootstrap(&hc_yaml(VALID_HC, clb)).is_ok());
+    }
+
+    // --- 13.1 D1: Cluster.circuit_breakers schema ---
+
+    #[test]
+    fn cluster_circuit_breakers_parses_minimal_shape() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: pooled
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 4
+      load_assignment:
+        cluster_name: pooled
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8080 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parse");
+        let cluster = &bootstrap.static_resources.clusters[0];
+        let cb = cluster
+            .circuit_breakers
+            .as_ref()
+            .expect("circuit_breakers present");
+        assert_eq!(cb.thresholds.len(), 1);
+        assert_eq!(
+            cb.thresholds[0].priority,
+            Some(crate::RoutingPriority::Default)
+        );
+        assert_eq!(cb.thresholds[0].max_connections, Some(4));
+    }
+
+    #[test]
+    fn cluster_circuit_breakers_omitted_yields_none() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parse");
+        assert!(
+            bootstrap.static_resources.clusters[0]
+                .circuit_breakers
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cluster_circuit_breakers_rejects_phase13_deferred_threshold_fields() {
+        // deny_unknown_fields rejects max_pending_requests etc.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - max_connections: 1
+            max_pending_requests: 5
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_pending_requests") || msg.contains("unknown field"),
+            "expected unknown-field error mentioning max_pending_requests; got: {msg}"
+        );
     }
 }
 
