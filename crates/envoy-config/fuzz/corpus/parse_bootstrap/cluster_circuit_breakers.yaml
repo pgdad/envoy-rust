@@ -1,0 +1,25 @@
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: pooled_cluster
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 4
+      load_assignment:
+        cluster_name: pooled_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8080
