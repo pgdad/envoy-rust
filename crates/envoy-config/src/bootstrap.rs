@@ -1724,6 +1724,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
         // 12.1: validate the cluster's active-HC config (HTTP-only, 0-or-1) +
         // common_lb_config panic threshold.
         validate_health_checks(cluster)?;
+        validate_circuit_breakers(cluster)?; // 13.1 D2
     }
 
     // Per-listener invariants.
@@ -2513,6 +2514,42 @@ fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
             cluster: cluster.name.clone(),
             value: p.value,
         });
+    }
+    Ok(())
+}
+
+/// 13.1 D2 (parent-13 D2): validate a cluster's `circuit_breakers` block.
+/// At phase-13 scope: at-most-one thresholds entry; DEFAULT priority only (or absent);
+/// non-zero `max_connections`. Phase-13-deferred threshold fields per parent SPEC §4
+/// are rejected by `deny_unknown_fields` automatically at parse time.
+fn validate_circuit_breakers(cluster: &Cluster) -> Result<(), crate::ConfigError> {
+    let Some(cb) = cluster.circuit_breakers.as_ref() else {
+        return Ok(());
+    };
+    if cb.thresholds.len() > 1 {
+        return Err(
+            crate::ConfigError::UnsupportedMultipleCircuitBreakerThresholds {
+                cluster: cluster.name.clone(),
+            },
+        );
+    }
+    if let Some(t) = cb.thresholds.first() {
+        if let Some(priority) = t.priority
+            && priority != crate::RoutingPriority::Default
+        {
+            return Err(crate::ConfigError::UnsupportedCircuitBreakerPriority {
+                cluster: cluster.name.clone(),
+                priority,
+            });
+        }
+        if let Some(value) = t.max_connections
+            && value == 0
+        {
+            return Err(crate::ConfigError::InvalidMaxConnections {
+                cluster: cluster.name.clone(),
+                value,
+            });
+        }
     }
     Ok(())
 }
@@ -8932,6 +8969,135 @@ admin:
         assert!(
             msg.contains("max_pending_requests") || msg.contains("unknown field"),
             "expected unknown-field error mentioning max_pending_requests; got: {msg}"
+        );
+    }
+
+    // --- 13.1 D2: validate_circuit_breakers ---
+
+    #[test]
+    fn validate_circuit_breakers_accepts_minimal() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 4
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        crate::parse_bootstrap(yaml).expect("parses and validates");
+    }
+
+    #[test]
+    fn validate_circuit_breakers_rejects_multiple_thresholds() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - max_connections: 1
+          - max_connections: 2
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedMultipleCircuitBreakerThresholds { ref cluster }
+                    if cluster == "c"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_circuit_breakers_rejects_high_priority() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: HIGH
+            max_connections: 1
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedCircuitBreakerPriority { ref cluster, priority: crate::RoutingPriority::High }
+                    if cluster == "c"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_circuit_breakers_rejects_zero_max_connections() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - max_connections: 0
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidMaxConnections { ref cluster, value: 0 }
+                    if cluster == "c"
+            ),
+            "got {err:?}"
         );
     }
 }

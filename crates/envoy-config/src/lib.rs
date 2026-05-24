@@ -435,6 +435,31 @@ pub enum ConfigError {
     /// 12.1: `common_lb_config.healthy_panic_threshold.value` is outside [0.0, 100.0].
     #[error("cluster '{cluster}' healthy_panic_threshold value {value} is outside [0.0, 100.0]")]
     InvalidPanicThreshold { cluster: String, value: f64 },
+
+    /// 13.1 D2: `circuit_breakers.thresholds` carries >1 entry. Phase-13 supports
+    /// exactly 0 or 1 entry (DEFAULT priority only). Multi-priority circuit-breaking
+    /// defers per parent SPEC §4.
+    #[error(
+        "cluster '{cluster}' carries multiple circuit_breakers.thresholds entries — phase-13 supports at most one (DEFAULT priority only)"
+    )]
+    UnsupportedMultipleCircuitBreakerThresholds { cluster: String },
+
+    /// 13.1 D2: `circuit_breakers.thresholds[0].priority` is non-DEFAULT.
+    /// Phase-13 supports DEFAULT only. HIGH priority defers per parent SPEC §4.
+    #[error(
+        "cluster '{cluster}' carries circuit_breakers.thresholds[0].priority = {priority:?} — phase-13 supports DEFAULT only"
+    )]
+    UnsupportedCircuitBreakerPriority {
+        cluster: String,
+        priority: crate::RoutingPriority,
+    },
+
+    /// 13.1 D2: `circuit_breakers.thresholds[0].max_connections: 0` is structurally
+    /// meaningless — it would prevent any upstream connection. Reject explicitly.
+    #[error(
+        "cluster '{cluster}' carries circuit_breakers.thresholds[0].max_connections = {value} — must be >= 1"
+    )]
+    InvalidMaxConnections { cluster: String, value: u32 },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

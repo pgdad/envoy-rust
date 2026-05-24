@@ -179,3 +179,96 @@ stable-toolchain gates clean locally at this commit:
 Spec ✅ (the implementation matches PLAN Task 1 Steps 1-7 + lock-in #16
 verbatim; no scope creep — the validator + the 3 `ConfigError` variants are
 held back to Task 2 per PLAN ordering).
+
+---
+
+## Task 2 — `envoy-config` `validate_circuit_breakers` + 3 `ConfigError` variants (D2)
+
+Lands the Phase-13 D2 deliverable per PLAN Task 2: 3 new `ConfigError` variants
+and a `validate_circuit_breakers` sub-validator wired at `parse_bootstrap`'s
+cluster-validation loop, immediately after the 12.1 `validate_health_checks`
+call. The validator enforces the phase-13 scope of `Cluster.circuit_breakers`
+(landed at Task 1): at-most-one `thresholds` entry; DEFAULT priority only (or
+absent); non-zero `max_connections`. Phase-13-deferred threshold fields
+(`max_pending_requests`, `max_requests`, `max_retries`, `max_connection_pools`,
+`track_remaining`, `retry_budget` — parent SPEC §4) are rejected at parse time
+by Task 1's `deny_unknown_fields`, so the validator only handles the
+in-scope-but-invalid cases. Mirrors the 12.1 health-check validator's
+"first-error-wins" + per-cluster string-name discipline.
+
+**3 new `ConfigError` variants** in `crates/envoy-config/src/lib.rs:439+` (the
+12.1 health-check variant group's immediate neighborhood at file-tail):
+
+- `UnsupportedMultipleCircuitBreakerThresholds { cluster: String }` —
+  `circuit_breakers.thresholds.len() > 1`. Multi-priority circuit-breaking
+  defers per parent SPEC §4 (phase-13 supports DEFAULT only).
+- `UnsupportedCircuitBreakerPriority { cluster: String, priority:
+  RoutingPriority }` — `thresholds[0].priority` is non-`Default`. The only
+  other variant defined in upstream Envoy v1.33 is `High`, which is rejected
+  explicitly (per Task 1 lock-in: `RoutingPriority` is a closed 2-variant enum
+  + `deny_unknown_fields`, so any non-DEFAULT-non-HIGH spelling fails at parse
+  time before this validator runs).
+- `InvalidMaxConnections { cluster: String, value: u32 }` —
+  `thresholds[0].max_connections == 0`. Structurally meaningless (would
+  prevent any upstream connection); reject explicitly with a clear diagnostic
+  rather than letting the pool quietly stall.
+
+**`validate_circuit_breakers` sub-validator** at
+`crates/envoy-config/src/bootstrap.rs:2525`: early-returns `Ok(())` when
+`cluster.circuit_breakers.is_none()` (preserving the 18 existing
+non-circuit-breakers-configured clusters' validator behavior — no false
+rejections), then dispatches the 3 rejection arms in order (multi-thresholds →
+non-DEFAULT priority → zero `max_connections`), then `Ok(())` at the tail.
+Wired at `parse_bootstrap`'s cluster-validation loop at
+`crates/envoy-config/src/bootstrap.rs:1727`, the line immediately after
+`validate_health_checks(cluster)?;`. The 2-arm `if let Some(...) && cond`
+collapsed pattern (clippy `collapsible_if` clean) matches the 12.1 panic-threshold
+code style at the same site.
+
+**4 new TDD-first unit tests** in `crates/envoy-config/src/bootstrap.rs::tests`,
+grouped under a `// --- 13.1 D2: validate_circuit_breakers ---` section banner
+immediately after the Task 1 13.1 D1 section:
+
+- `validate_circuit_breakers_accepts_minimal` — positive: a YAML cluster with
+  `thresholds[0].{priority: DEFAULT, max_connections: 4}` parses + validates
+  via `crate::parse_bootstrap` (full end-to-end through the
+  `parse_bootstrap` → `bootstrap::validate` path; not a unit-level call on
+  `validate_circuit_breakers`).
+- `validate_circuit_breakers_rejects_multiple_thresholds` — negative: 2
+  thresholds entries yield
+  `ConfigError::UnsupportedMultipleCircuitBreakerThresholds { cluster: "c" }`.
+- `validate_circuit_breakers_rejects_high_priority` — negative:
+  `thresholds[0].priority: HIGH` yields
+  `ConfigError::UnsupportedCircuitBreakerPriority { cluster: "c", priority:
+  RoutingPriority::High }`.
+- `validate_circuit_breakers_rejects_zero_max_connections` — negative:
+  `thresholds[0].max_connections: 0` yields
+  `ConfigError::InvalidMaxConnections { cluster: "c", value: 0 }`.
+
+TDD discipline: wrote all 4 tests first; ran `cargo test -p envoy-config --
+validate_circuit_breakers` to verify 3 of them failed with compile errors
+(missing `ConfigError` variants) and the positive test also failed for the
+same enum-resolution reason; then added the 3 variants + the validator + the
+call-site wiring; re-ran to verify all 4 pass + no envoy-config regression.
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new ADR** —
+PLAN lock-in #16 holds (the variants + validator are routine extensions of the
+established envoy-config error-discipline; no new architectural decision).
+DECISIONS.md ledger head stays **ADR-0038**; next available **ADR-0039**.
+
+Targeted gates clean at this commit:
+
+- `cargo build -p envoy-config --all-targets` → `Finished` (incremental clean).
+- `cargo clippy -p envoy-config --all-targets --all-features -- -D warnings` →
+  `Finished` (zero warnings; required collapsing two `if let Some(...) { if cond
+  { ... } }` blocks into `if let Some(...) && cond { ... }` per clippy
+  `collapsible_if`, matching the 12.1 panic-threshold pattern).
+- `cargo fmt --all -- --check` → clean (no diff; rustfmt rewrapped one long
+  `#[error("...")]` attribute to a multi-line form, applied via `cargo fmt`).
+- `cargo test -p envoy-config` → **272 passed / 0 failed / 0 ignored**
+  (+4 over Task 1's envoy-config baseline 268 — exactly the 4 new
+  `validate_circuit_breakers_*` tests; no existing-test regression). The
+  controller verifies the full `cargo test --workspace` + `cargo deny check`
+  gates separately (out-of-scope for subagent execution).
+
+Spec ✅ (matches PLAN Task 2 Steps 1-7 verbatim).
