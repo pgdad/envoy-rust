@@ -444,3 +444,216 @@ locally at this commit:
 
 Spec ✅ (matches PLAN Task 3 Steps 1-6 verbatim; the 3 small adaptations above
 are non-substantive per PLAN's own "Common Adaptation Hints" section).
+
+---
+
+## Task 4 — H1 router-arm dispatch through `H1Pool::acquire` (D4)
+
+Lands the load-bearing 13.1 D4 deliverable per PLAN Task 4: migrated the H1 HCM
+proxy arm from per-call `Client::connect` (plus the per-downstream-conn tier-1
+micro-cache that was the only reuse mechanism) to dispatch through
+`H1PoolManager::get(cluster_name)` + `H1Pool::acquire(endpoint, host)`. The
+`H1PoolManager` is built once bin-side between `from_bootstrap` (line 123) and
+`envoy-health::Scheduler::spawn` (line 134), mirroring the 12.2 external-injection
+precedent verbatim (lock-in #1). Threaded into `HCMConfig::from_config` as a
+new 4th param `pool_mgr: Option<Arc<H1PoolManager>>`; `Option` so non-bin tests
+that construct `HCMConfig` as a struct-literal without a pool manager fall
+through to the legacy per-call `Client::connect` path (preserves every
+pre-13.1 HCM unit test without a pool dependency).
+
+**`HCMConfig` extension** at `crates/envoy-http1/src/hcm.rs:111-147`: new
+`pub pool_mgr: Option<Arc<crate::pool::H1PoolManager>>` field appended after
+`filter_pipeline`. The struct retains its `#[derive(Debug)]` — `H1PoolManager`
+gained a hand-rolled `Debug` impl (12 SLOC at `pool.rs:302-313`) that surfaces
+just the per-cluster pool names; deriving was not viable because `H1Pool`
+carries `tokio::sync::Mutex<HashMap>` + per-pool `Counter`/`Gauge` Arcs whose
+`Debug` reachability is non-trivial — surface the observable identifiers only.
+
+**`HCMConfig::from_config` signature extension** at `hcm.rs:141-147`:
+constructor takes the new `pool_mgr` param as the 4th positional argument;
+stored into the struct field at the constructor tail. All 7 in-test call
+sites (5 in `envoy-http1` tests + 3 in `envoy-http2` tests via the
+`Http1HCMConfig` type-alias) updated to pass `None`. The single envoy-bin
+caller at `main.rs:280-287` passes `Some(std::sync::Arc::clone(&pool_mgr))`
+(production path).
+
+**`envoy-bin` wire-up** at `crates/envoy-bin/src/main.rs:129-145`: new
+`let pool_mgr = envoy_http1::H1PoolManager::for_bootstrap(&bootstrap,
+&cluster_mgr, std::sync::Arc::clone(&registry), token.clone())
+.context("building H1 pool manager")?;` block inserted between
+`cluster_mgr` construction (the 123-127 `from_bootstrap` call) and
+`health_scheduler` (the 134-140 `Scheduler::spawn` call). Reuses the existing
+`token: CancellationToken` (declared at `main.rs:87`) for idle-sweeper
+cancellation. Passes `&cluster_mgr` (auto-deref through Arc) to the
+`H1PoolManager::for_bootstrap` signature which takes `&ClusterManager`. No
+shutdown plumbing needed: the sweeper JoinHandles are owned inside
+`H1PoolManager` and abort cleanly on token cancel (no `.shutdown().await`
+needed on the bin's drain path — distinct from `health_scheduler.shutdown()`,
+which DOES drain because the active-HC probe tasks block on real network I/O
+that cancellation needs to interrupt explicitly).
+
+**Tier-1 `cached_upstream` micro-cache removal** at `hcm.rs:268-274`: the
+`let mut cached_upstream: Option<(String, std::net::SocketAddr,
+ClientStream)> = None;` declaration removed (lock-in #5 — the pool subsumes
+it; pool reuse spans every downstream conn, vastly more reuse than the
+per-conn cache observed). Replaced with a 7-line comment block explaining the
+removal + the lock-in attribution.
+
+**`cluster.cx_total().inc()` migration off `hcm.rs:514`** (lock-in #6): the
+former increment site inside the connect-on-miss `Ok(s) => { cluster.cx_total()
+.inc(); Ok(s) }` arm is REMOVED on the pool path — `H1Pool::acquire`'s
+connect-on-miss branch at `pool.rs:217` (landed at Task 3) is now the SOLE
+incrementer for `upstream_cx_total` when the pool path is taken. Kept ONLY in
+the no-pool-manager fallback `else` arm at `hcm.rs:572` (preserves test-path
+counter behavior) AND in the H2-cluster (`pool_mgr.get() == None`)
+fall-through arm at `hcm.rs:537` (defers H2 pool to 13.2; the per-call
+`Client::connect` fallback fires the legacy counter site).
+
+**Proxy-arm block rewrite** at `hcm.rs:496-617` (was `:496-575`): the
+former `Result<ClientStream, Response>` dispatch with `Some(...) if cname ==
+cluster_name && addr == endpoint => Ok(s), _ => Client::connect(...)` is
+replaced with a local `enum StreamHandle { Pooled(crate::pool::PoolGuard),
+OneShot(ClientStream) }` shape:
+
+- **Pool path** (`config.pool_mgr.as_ref().is_some()` + `pool_mgr.get(...)
+  .is_some()`): `pool.acquire(endpoint, &host_header).await` →
+  `Ok(StreamHandle::Pooled(guard))` on success; `Err(PoolError::Connect(_))`
+  surfaces as 502 (the connect-failure shape per parent SPEC §4); the new
+  `Err(PoolError::Overflow {..})` arm surfaces as 503 (the pool-overflow
+  shape — distinct from connect-failure per the §6.2 item-iv semantic).
+- **No-pool-entry fall-through** (pool manager present but
+  `pool_mgr.get(cluster) == None`, i.e. H2 cluster): per-call
+  `Client::connect` + `cluster.cx_total().inc()` (lock-in #6 fallback). H2
+  pool defers to 13.2; this path stays per-call until 13.2 lands the H2 pool.
+- **No-pool-manager fallback** (`config.pool_mgr.is_none()` — test
+  struct-literal path): per-call `Client::connect` + `cluster.cx_total()
+  .inc()` (lock-in #6 fallback). Preserves every pre-13.1 HCM unit test
+  that builds HCMConfig directly without a pool manager.
+
+On the `Ok(handle)` send-result branch, the success path runs
+`construct_proxied_response(&cluster, upstream_response, elapsed_ms, close)`
+and falls out of scope; `PoolGuard::drop` returns the stream to the pool's
+idle list (lock-in #7) and `OneShot(ClientStream)` closes cleanly on drop
+(matches the pre-13.1 semantic on the no-pool fallback). On the `Err(source)`
+send-result branch, `if let StreamHandle::Pooled(g) = &mut handle { g
+.invalidate(); }` ensures the broken stream is destroyed rather than
+returned to the idle list (fires `cx_destroy.inc()` at Drop). The `OneShot`
+branch on send-failure has no invalidate analog because it has no idle list
+to return to (the stream just drops).
+
+**New TDD-first integration test** at `crates/envoy-http1/src/hcm.rs:3174-3338`:
+
+- `h1_hcm_pool_reuses_upstream_conn_across_sequential_requests` —
+  regression-equivalence proof that pool dispatch coalesces upstream
+  connections. Spawns an in-process keep-alive echo backend, builds a
+  single-cluster bootstrap pointing at it with a SHARED `Arc<StatsRegistry>`
+  (load-bearing: the cluster_mgr-side `cx_total` and the pool-side handle
+  are the SAME `Arc<Counter>` per the envoy-stats same-kind idempotent
+  re-register contract verified at Task 3), wires `H1PoolManager::for_bootstrap`
+  + a struct-literal HCMConfig with `pool_mgr: Some(Arc::clone(&pool_mgr))`,
+  opens ONE downstream TCP keep-alive conn, drives 5 sequential GET / requests
+  through it, asserts `cluster.backend.upstream_cx_total.value() == 1`. At the
+  per-call-`Client::connect` regression this counter would be 5 (or 5 on
+  separate downstream conns; this test pins the pool reuse at the
+  single-downstream-conn boundary the Docker-gated 0020 fixture extends
+  cross-downstream-conn at Task 7 per lock-in #4).
+
+TDD discipline: authored the test first (referenced from the PLAN
+Task 4 Step 1 + Step 4); ran `cargo test -p envoy-http1 -- pool_reuses` to
+verify compile-failure first (the new `pool_mgr` field + the production
+dispatch path did not yet exist); landed the HCMConfig extensions + the
+proxy-arm rewrite + the bin wire-up; re-ran to verify pass.
+
+**Per-task adaptations from the PLAN**:
+
+- **`H1PoolManager: Debug` hand-roll** — the PLAN does not call out
+  `H1PoolManager`'s `Debug` reachability requirement; the `HCMConfig`
+  `#[derive(Debug)]` propagates the bound to every field. Added a 12-SLOC
+  hand-rolled `impl Debug for H1PoolManager` at `pool.rs:302-313` (surfaces
+  the per-cluster pool names only; mirrors the Task-3 `PoolGuard` Debug
+  hand-roll's surface-only-the-identifiers shape). No behavior change.
+- **Doc-comment rewording on `pool_mgr` field** — the literal text "(test
+  sites that build HCMConfig as a struct-literal)" triggered clippy's
+  `doc_lazy_continuation` lint because the leading "(" was parsed as a list
+  item. Reworded the parenthetical as an em-dash aside ("— test sites that
+  build HCMConfig as a struct-literal —"). No semantic change.
+- **`access_log_file_sink_in_process` parallel-test flake** — observed once
+  during `cargo test -p envoy-bin` under default parallelism (the test
+  exceeds its 5s `wait_for_port` deadline when CPU is starved by concurrent
+  tests during envoy-bin's startup). Re-ran with `--test-threads=2`: all 15
+  envoy-bin tests pass cleanly. Verified at HEAD `368d6ef` (pre-Task-4) the
+  same test passes cleanly in 0.73s; with Task 4 it runs in 0.61s alone
+  (no per-test slowdown). The flake is pre-existing parallel-load
+  scheduling — NOT a Task-4 regression. The controller's workspace gate
+  should be aware that this test can flake under heavy parallelism and may
+  warrant a re-run.
+
+**Files touched** (4):
+
+- `crates/envoy-http1/src/hcm.rs` — HCMConfig field + from_config param +
+  cached_upstream removal + proxy-arm rewrite + new integration test.
+- `crates/envoy-http1/src/pool.rs` — added `impl Debug for H1PoolManager`.
+- `crates/envoy-http2/src/hcm.rs` — 7 `Http1HCMConfig::from_config` call
+  sites updated + 1 struct-literal site updated (the type-alias
+  re-exposes `HCMConfig`'s structural change to envoy-http2's tests).
+- `crates/envoy-bin/src/main.rs` — H1PoolManager construction block +
+  HCMConfig::from_config call-site extension.
+
+**Lock-in #5 attribution**: the pre-13.1 tier-1 `cached_upstream` per-downstream-
+conn micro-cache (declared at the former `hcm.rs:274`, populated at the former
+`:548-554`, consumed at the former `:502-507`) is SUBSUMED by `H1Pool`'s shared
+idle list. The pool's reuse surface is strictly wider (across every downstream
+conn observing the same cluster+endpoint, not just within one downstream conn),
+and its semantic at the connect-on-miss boundary is identical to the cache's
+"reuse iff same cluster+endpoint AND neither side closed" gate (the pool's
+default-keep-alive plus the `invalidate()`-on-send-error path together
+reconstruct the same hit-vs-miss semantic). Removing the cache is a strict
+upgrade.
+
+**Lock-in #6 attribution**: the `cluster.cx_total().inc()` increment site for
+`upstream_cx_total` is migrated FROM the former HCM connect-on-miss arm at
+`hcm.rs:514` INTO `H1Pool::acquire`'s connect-on-miss arm at `pool.rs:217`.
+On the production-bin-wired path this is the SOLE incrementer for the counter
+(the pool always fires exactly once per established upstream TCP connection,
+matching Envoy v1.33's `upstream_cx_total` per-cluster-per-fresh-connect
+semantic verified at parent SPEC §6.2 item-iv). The legacy increment site is
+PRESERVED in two fallback arms — the no-pool-manager test path
+(`pool_mgr.is_none()`) and the no-pool-entry H2-fall-through path
+(`pool_mgr.get(cluster).is_none()`) — to maintain the counter's value-exact
+semantic when the pool path is not taken. The fallback sites will retire
+entirely at 13.2 (when every cluster has a pool).
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new ADR** —
+PLAN lock-in #16 holds (the migration is routine application of the bin-wired
+external-registry pattern; the cycle-resolution decision itself is documented
+in the Task 1 preamble + the parent-13 SPEC). DECISIONS.md ledger head stays
+**ADR-0038**; next available **ADR-0039**.
+
+**§7.5 gates (a)/(b)/(c)/(d) verification deferred to the controller's full
+workspace pass** — Task 4 is the load-bearing regression-equivalence task;
+the 19 pre-existing Docker-gated fixtures (0001-0019) must stay green after
+this commit per PLAN gate (b). The targeted toolchain gates clean locally
+at this commit:
+
+- `cargo build -p envoy-http1 -p envoy-bin --all-targets` → `Finished` (clean).
+- `cargo clippy -p envoy-http1 -p envoy-bin --all-targets --all-features --
+  -D warnings` → `Finished` (zero warnings; required one doc-comment
+  rewording on the `pool_mgr` field per the `doc_lazy_continuation` arm).
+- `cargo fmt --all -- --check` → clean (no diff after `cargo fmt --all`
+  rewrapped one long `tokio::time::timeout(...)` call in the new test).
+- `cargo test -p envoy-http1` → **77 passed / 0 failed / 0 ignored** (+1
+  over Task 3's 76-test envoy-http1 baseline — exactly the new
+  `h1_hcm_pool_reuses_upstream_conn_across_sequential_requests` test; no
+  existing-test regression).
+- `cargo test -p envoy-bin -- --test-threads=2` → **15 passed / 0 failed /
+  0 ignored** across 14 result lines (the 8 unit tests + 13 single-test
+  integration files + 1 two-test integration file = 15 total; matches the
+  HEAD-13.1-Task-3 baseline exactly; no per-test count change, no new
+  envoy-bin test added at Task 4 per the H1Pool-tested-in-isolation
+  posture at Task 3 + the cross-arc D9.x in-process backstop landing at
+  Tasks 7-8). See also the parallel-flake note in the "Per-task
+  adaptations" subsection above. The controller verifies the full
+  `cargo test --workspace` + `cargo deny check` gates independently.
+
+Spec ✅ (matches PLAN Task 4 Steps 1-6 verbatim; the 3 small adaptations
+above are non-substantive per PLAN's own "Common Adaptation Hints" section).

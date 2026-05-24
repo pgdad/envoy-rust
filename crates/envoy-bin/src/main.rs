@@ -126,6 +126,22 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
             .context("building cluster manager")?,
     );
 
+    // 13.1 Task 4 (D4): build the shared `H1PoolManager` once after
+    // `cluster_mgr` and before any HCMConfig consumer. One H1 pool per
+    // H1-protocol cluster (default-enabled per lock-in #2); H2-protocol
+    // clusters defer their pool to 13.2. Mirrors the 12.2
+    // `envoy-health::Scheduler` external-injection precedent (lock-in #1);
+    // threaded into every `HCMConfig::from_config` below as
+    // `Some(Arc::clone(&pool_mgr))`. The idle-sweeper tasks owned by the
+    // manager abort cleanly on `token` cancel.
+    let pool_mgr = envoy_http1::H1PoolManager::for_bootstrap(
+        &bootstrap,
+        &cluster_mgr,
+        std::sync::Arc::clone(&registry),
+        token.clone(),
+    )
+    .context("building H1 pool manager")?;
+
     // 12.2 (parent-12 D4): spawn active-HC probe tasks for every cluster
     // carrying `health_checks`. Cancellation wired to the existing signal
     // token so SIGTERM/SIGINT triggers clean shutdown of every probe task at
@@ -281,6 +297,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         hcm_cfg,
                         std::sync::Arc::clone(&cluster_mgr),
                         std::sync::Arc::clone(&registry),
+                        Some(std::sync::Arc::clone(&pool_mgr)),
                     )
                     .await?,
                 );

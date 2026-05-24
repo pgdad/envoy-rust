@@ -299,6 +299,19 @@ pub struct H1PoolManager {
     _sweepers: Vec<tokio::task::JoinHandle<()>>,
 }
 
+// Hand-rolled `Debug` (rather than `#[derive]`): `H1Pool`'s internal
+// `tokio::sync::Mutex` + per-pool `Counter`/`Gauge` Arcs aren't reflected
+// here — surface only the per-cluster pool names so that the parent
+// `HCMConfig` `#[derive(Debug)]` (which carries `pool_mgr` as an
+// `Option<Arc<H1PoolManager>>` at 13.1 Task 4) keeps compiling.
+impl std::fmt::Debug for H1PoolManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H1PoolManager")
+            .field("clusters", &self.pools.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl H1PoolManager {
     /// Build the pool registry from the parsed bootstrap + the constructed
     /// `ClusterManager` (the latter is the source of the existing `Arc<Counter>`

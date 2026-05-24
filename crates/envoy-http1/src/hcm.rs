@@ -136,6 +136,14 @@ pub struct HCMConfig {
     /// is effectively a no-op (Router is zero-state); the clone shape is
     /// structural for 07.2's HeaderMutation per-stream cloning.
     pub filter_pipeline: Arc<envoy_filter::FilterPipeline>,
+    /// 13.1 Task 4: optional shared `H1PoolManager`. When `Some`, the H1
+    /// proxy arm in `serve_connection` dispatches via `pool_mgr.get(cluster)`
+    /// plus `H1Pool::acquire(endpoint, host)` — the production path; envoy-bin
+    /// constructs the manager after `cluster_mgr` and threads it in here.
+    /// When `None` — test sites that build HCMConfig as a struct-literal —
+    /// the proxy arm falls back to a per-call `Client::connect`, preserving
+    /// every pre-13.1 HCM unit test without a pool dependency.
+    pub pool_mgr: Option<Arc<crate::pool::H1PoolManager>>,
 }
 
 impl HCMConfig {
@@ -143,6 +151,7 @@ impl HCMConfig {
         cfg: &HttpConnectionManagerConfig,
         cluster_mgr: Arc<envoy_cluster::ClusterManager>,
         registry: Arc<envoy_stats::StatsRegistry>,
+        pool_mgr: Option<Arc<crate::pool::H1PoolManager>>,
     ) -> Result<Self, Http1Error> {
         // The validator (envoy-config Task 2) has already enforced shape.
         // This constructor is `Result<>` for forward-compat with 04.3's
@@ -194,6 +203,7 @@ impl HCMConfig {
             stats,
             access_log: access_log_sinks,
             filter_pipeline,
+            pool_mgr,
         })
     }
 }
@@ -265,13 +275,12 @@ async fn serve_connection(
     mut downstream: TcpStream,
 ) -> Result<(), Http1Error> {
     let mut buf = BytesMut::with_capacity(READ_BUFFER_INITIAL_CAPACITY);
-    // Tier-1 upstream connection reuse: hold one upstream stream across
-    // requests on this downstream connection. Reused only when the next
-    // request targets the same cluster + endpoint AND neither side asked
-    // to close. Dropped (and replaced with a fresh connect) on mismatch or
-    // on any send/recv error. cx_total is only incremented on actual
-    // fresh connects — reuses leave it alone (matches Envoy's stat).
-    let mut cached_upstream: Option<(String, std::net::SocketAddr, ClientStream)> = None;
+    // 13.1 Task 4: the per-connection tier-1 micro-cache (a single cached
+    // `(cluster, endpoint, ClientStream)` reused on the next request) was
+    // removed at Task 4 and SUBSUMED by `H1Pool` (lock-in #5). The pool is
+    // shared across every downstream connection — it observes more reuse
+    // than the per-conn cache ever could — and its `cx_total.inc()` fires
+    // on the SAME connect-on-miss boundary the old cache hit (lock-in #6).
     loop {
         // 1. Try parsing what's already in the buffer (for keep-alive
         //    second-and-later requests where bytes from the previous read
@@ -493,26 +502,77 @@ async fn serve_connection(
 
                         let start = std::time::Instant::now();
 
-                        // Tier-1 upstream reuse. Either a cached stream
-                        // (for the same cluster+endpoint) or a fresh connect
-                        // produces the ClientStream we'll send on; a connect
-                        // error short-circuits to a 502 synth response. Modeled
-                        // as Result so every downstream branch provably
-                        // assigns `outgoing`.
-                        let stream_or_synth: Result<ClientStream, Response> = match cached_upstream
-                            .take()
+                        // 13.1 Task 4 (D4): dispatch through `H1Pool::acquire`
+                        // when a pool manager is configured (the production
+                        // path, lock-in #1). Tests that build HCMConfig as a
+                        // struct-literal without a pool manager fall back to
+                        // per-call `Client::connect` (preserves every pre-13.1
+                        // HCM unit test). `cx_total.inc()` lives inside
+                        // `H1Pool::acquire`'s connect-on-miss branch (Task 3,
+                        // lock-in #6); the fallback `else` arm below keeps the
+                        // legacy `cluster.cx_total().inc()` site since the
+                        // pool's increment doesn't fire on this path.
+                        enum StreamHandle {
+                            Pooled(crate::pool::PoolGuard),
+                            OneShot(ClientStream),
+                        }
+                        let stream_or_synth: Result<StreamHandle, Response> = if let Some(
+                            pool_mgr,
+                        ) =
+                            config.pool_mgr.as_ref()
                         {
-                            Some((cname, addr, s)) if cname == cluster_name && addr == endpoint => {
-                                Ok(s)
+                            match pool_mgr.get(&cluster_name) {
+                                Some(pool) => match pool.acquire(endpoint, &host_header).await {
+                                    Ok(guard) => Ok(StreamHandle::Pooled(guard)),
+                                    Err(crate::pool::PoolError::Connect(source)) => {
+                                        tracing::warn!(
+                                            cluster = %cluster.name(),
+                                            addr = %endpoint,
+                                            error = ?source,
+                                            "upstream connect failed (pool) — returning 502",
+                                        );
+                                        Err(synth_status(502, close))
+                                    }
+                                    Err(crate::pool::PoolError::Overflow { .. }) => {
+                                        tracing::warn!(
+                                            cluster = %cluster.name(),
+                                            "pool overflow — returning 503",
+                                        );
+                                        Err(synth_status(503, close))
+                                    }
+                                },
+                                None => {
+                                    // No pool entry for this cluster (e.g.,
+                                    // an H2-protocol cluster — H2 pools defer
+                                    // to 13.2). Fall through to per-call
+                                    // connect on this request.
+                                    match Client::connect(endpoint, &host_header).await {
+                                        Ok(s) => {
+                                            cluster.cx_total().inc();
+                                            Ok(StreamHandle::OneShot(s))
+                                        }
+                                        Err(source) => {
+                                            tracing::warn!(
+                                                cluster = %cluster.name(),
+                                                addr = %endpoint,
+                                                error = ?source,
+                                                "upstream connect failed — returning 502",
+                                            );
+                                            Err(synth_status(502, close))
+                                        }
+                                    }
+                                }
                             }
-                            _ => match Client::connect(endpoint, &host_header).await {
+                        } else {
+                            // No pool manager wired (test path; struct-literal
+                            // HCMConfig with `pool_mgr: None`). Per-call connect;
+                            // `cx_total.inc()` stays on this fallback arm — the
+                            // pool's increment site (Task 3) only fires when the
+                            // pool path is taken.
+                            match Client::connect(endpoint, &host_header).await {
                                 Ok(s) => {
-                                    // 06.1 D4.b: per-cluster `upstream_cx_total`
-                                    // counter incremented once per established
-                                    // upstream TCP connection. Reused streams
-                                    // skip this — matches Envoy's semantic.
                                     cluster.cx_total().inc();
-                                    Ok(s)
+                                    Ok(StreamHandle::OneShot(s))
                                 }
                                 Err(source) => {
                                     tracing::warn!(
@@ -523,42 +583,40 @@ async fn serve_connection(
                                     );
                                     Err(synth_status(502, close))
                                 }
-                            },
+                            }
                         };
 
                         match stream_or_synth {
-                            Ok(mut client_stream) => {
-                                match client_stream.send_request(out_req).await {
+                            Ok(mut handle) => {
+                                let send_result = match &mut handle {
+                                    StreamHandle::Pooled(g) => {
+                                        g.stream_mut().send_request(out_req).await
+                                    }
+                                    StreamHandle::OneShot(s) => s.send_request(out_req).await,
+                                };
+                                match send_result {
                                     Ok(upstream_response) => {
                                         let elapsed_ms = start.elapsed().as_millis();
-                                        // Decide reuse BEFORE construct_proxied_response
-                                        // consumes upstream_response. Cache iff
-                                        // both sides allow keep-alive.
-                                        let upstream_close =
-                                            upstream_response.headers.iter().any(|(n, v)| {
-                                                n.eq_ignore_ascii_case(headers::CONNECTION)
-                                                    && v.eq_ignore_ascii_case("close")
-                                            });
                                         outgoing = crate::router::construct_proxied_response(
                                             &cluster,
                                             upstream_response,
                                             elapsed_ms,
                                             close,
                                         );
-                                        if !close && !upstream_close {
-                                            cached_upstream = Some((
-                                                cluster_name.clone(),
-                                                endpoint,
-                                                client_stream,
-                                            ));
-                                        }
+                                        // PoolGuard's Drop returns the stream to
+                                        // the pool's idle list on the success path
+                                        // (lock-in #7); the OneShot ClientStream
+                                        // closes cleanly on drop here.
                                     }
                                     Err(source) => {
-                                        // No retry on tier-1: a stale cached
-                                        // stream surfaces as 502. nginx's default
-                                        // keepalive_timeout (75s) makes this rare
-                                        // under benchmark traffic; future tiers
-                                        // add half-close validation + retry.
+                                        // On send/recv failure with a pooled
+                                        // guard, invalidate so Drop destroys
+                                        // the stream + fires `cx_destroy` rather
+                                        // than returning a half-broken stream to
+                                        // the idle list.
+                                        if let StreamHandle::Pooled(g) = &mut handle {
+                                            g.invalidate();
+                                        }
                                         tracing::warn!(
                                             cluster = %cluster.name(),
                                             addr = %endpoint,
@@ -1149,6 +1207,7 @@ static_resources:
             // `hcm_config_with_access_log` instead.
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1228,6 +1287,7 @@ static_resources:
             stats: mk_stats("x"),
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1269,6 +1329,7 @@ static_resources:
             stats: mk_stats("x"),
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1338,6 +1399,7 @@ static_resources:
             stats: mk_stats("x"),
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -1424,6 +1486,7 @@ static_resources:
             stats: mk_stats("test"),
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 virtual_hosts: vec![VirtualHost {
@@ -1722,6 +1785,7 @@ static_resources:
             stats: mk_stats("ingress_http"),
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -2003,7 +2067,7 @@ static_resources:
             }],
         };
         let hcm_config = Arc::new(
-            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry))
+            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry), None)
                 .await
                 .expect("HCMConfig builds"),
         );
@@ -2070,7 +2134,7 @@ static_resources:
             }],
         };
         let hcm_config = Arc::new(
-            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry))
+            HCMConfig::from_config(&envoy_cfg, cluster_mgr, Arc::clone(&registry), None)
                 .await
                 .expect("HCMConfig builds"),
         );
@@ -2311,6 +2375,7 @@ static_resources:
             stats: mk_stats("ingress_http"),
             access_log: sinks,
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -2505,6 +2570,7 @@ static_resources:
             stats,
             access_log: sinks,
             filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -2710,7 +2776,7 @@ static_resources:
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         let cluster_mgr = cluster_mgr_empty().await;
         let envoy_cfg = task6_envoy_hcm_config();
-        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry)
+        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
             .await
             .expect("HCMConfig::from_config succeeds with single Router");
         // No public accessor to inspect filters.len(); verify via clone shape.
@@ -2728,7 +2794,7 @@ static_resources:
         let cluster_mgr = cluster_mgr_empty().await;
         let mut envoy_cfg = task6_envoy_hcm_config();
         envoy_cfg.http_filters.clear();
-        let result = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry).await;
+        let result = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None).await;
         match result {
             Err(Http1Error::FilterPipeline(envoy_filter::FilterError::EmptyChain)) => {}
             other => panic!("expected FilterPipeline(EmptyChain), got {other:?}"),
@@ -2748,7 +2814,7 @@ static_resources:
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         let cluster_mgr = cluster_mgr_empty().await;
         let envoy_cfg = task6_envoy_hcm_config();
-        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry)
+        let hcm_cfg = HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
             .await
             .expect("HCMConfig::from_config succeeds with single Router");
         let arc1 = Arc::clone(&hcm_cfg.filter_pipeline);
@@ -2778,6 +2844,7 @@ static_resources:
             stats: mk_stats("ingress_http"),
             access_log: vec![],
             filter_pipeline: pipeline,
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -2882,6 +2949,7 @@ static_resources:
             stats: mk_stats("ingress_http"),
             access_log: vec![],
             filter_pipeline: pipeline,
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -2914,6 +2982,7 @@ static_resources:
             stats: mk_stats("ingress_http"),
             access_log: vec![sink],
             filter_pipeline: pipeline,
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 virtual_hosts: vec![VirtualHost {
@@ -3098,6 +3167,178 @@ static_resources:
         assert!(
             logged.contains(" 200 "),
             "access log captured post-encode status: {logged:?}"
+        );
+    }
+
+    // ── 13.1 Task 4: H1Pool dispatch integration ──────────────────────────
+
+    /// 13.1 Task 4 (D4): regression-equivalence proof that the H1 proxy arm
+    /// dispatches through `H1Pool::acquire()`. Drives 5 sequential GET
+    /// requests through a single downstream H1 keep-alive connection against
+    /// an in-process echo backend; asserts the SHARED `cluster.<name>.upstream_cx_total`
+    /// counter == 1 (not 5). At the per-call-`Client::connect` regression
+    /// this counter would be 5; the pool path coalesces all 5 onto a single
+    /// upstream TCP connection (lock-in #6: `cx_total.inc()` fires inside
+    /// `H1Pool::acquire`'s connect-on-miss only).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_hcm_pool_reuses_upstream_conn_across_sequential_requests() {
+        // Echo backend that handles many sequential requests on the same
+        // socket (keep-alive). Modeled on `pool.rs::echo_backend()`.
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = backend_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            let _ = sock
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n")
+                                .await;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Build a single-cluster bootstrap pointed at the backend port.
+        // SHARED registry so the cluster_mgr-side `upstream_cx_total` and the
+        // pool-side handles are the SAME `Arc<Counter>` (idempotent re-register
+        // per envoy-stats's same-kind contract; verified at Task 3).
+        let yaml = format!(
+            r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: {backend_port} }} }} }}
+"#
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("cluster mgr"),
+        );
+        let pool_token = tokio_util::sync::CancellationToken::new();
+        let pool_mgr = crate::pool::H1PoolManager::for_bootstrap(
+            &bootstrap,
+            &cluster_mgr,
+            Arc::clone(&registry),
+            pool_token.clone(),
+        )
+        .expect("pool manager builds");
+
+        // Build the HCMConfig with the SHARED pool manager wired in
+        // (production-path; the production codepath the bin takes).
+        let hcm_config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: Arc::clone(&cluster_mgr),
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: Some(Arc::clone(&pool_mgr)),
+            route_config: Arc::new(RouteConfiguration {
+                name: "rc".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                        }),
+                    }],
+                }],
+            }),
+        });
+
+        // Re-register the shared cx_total handle for assertion.
+        let cx_total = registry
+            .register_counter("cluster.backend.upstream_cx_total")
+            .expect("cx_total re-register (idempotent)");
+
+        // Spawn the HCM accept loop on an ephemeral port; one downstream
+        // socket, 5 sequential keep-alive requests.
+        let hcm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hcm_addr = hcm_listener.local_addr().unwrap();
+        let hcm_handle = tokio::spawn(async move {
+            let (sock, _) = hcm_listener.accept().await.unwrap();
+            let _ = serve_connection(hcm_config, sock).await;
+        });
+
+        let mut client = TcpStream::connect(hcm_addr).await.unwrap();
+        for i in 0..5 {
+            // keep-alive requests (no `Connection: close`).
+            let req = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+            client
+                .write_all(req)
+                .await
+                .unwrap_or_else(|e| panic!("write request #{i} failed: {e}"));
+            // Read exactly one response: read until we see the end of the
+            // response head (CRLFCRLF) — the response is CL: 0 so head-end
+            // == response-end.
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0usize;
+            loop {
+                let n =
+                    tokio::time::timeout(StdDuration::from_secs(2), client.read(&mut buf[total..]))
+                        .await
+                        .unwrap_or_else(|_| panic!("read response #{i} timed out"))
+                        .unwrap_or_else(|e| panic!("read response #{i} failed: {e}"));
+                if n == 0 {
+                    panic!("server closed before response #{i} fully read");
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let resp = String::from_utf8_lossy(&buf[..total]);
+            assert!(
+                resp.starts_with("HTTP/1.1 200 OK"),
+                "request #{i} expected 200: {resp}"
+            );
+        }
+        drop(client);
+        let _ = hcm_handle.await;
+        pool_token.cancel();
+
+        // The load-bearing assertion: 5 requests, 1 upstream TCP connection.
+        // Pre-13.1 (tier-1 per-conn cache, scoped to ONE downstream conn) this
+        // would also be 1 on the SAME downstream socket — but the pool wins
+        // ACROSS downstream connections too (verified end-to-end in the
+        // Docker-gated 0020 fixture at Task 7). This unit test pins the
+        // per-conn reuse property at the crate boundary.
+        assert_eq!(
+            cx_total.value(),
+            1,
+            "expected exactly ONE upstream TCP connection across 5 sequential keep-alive requests \
+             (got {}); the H1Pool dispatch path should coalesce reuse onto a single connect-on-miss",
+            cx_total.value(),
         );
     }
 }

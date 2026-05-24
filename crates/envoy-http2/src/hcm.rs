@@ -638,7 +638,7 @@ mod tests {
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
                 .await
                 .expect("build HCM config"),
         )
@@ -779,7 +779,7 @@ static_resources:
         };
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
                 .await
                 .expect("build HCM config"),
         )
@@ -924,7 +924,7 @@ static_resources:
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         let config = Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
                 .await
                 .unwrap(),
         );
@@ -1200,7 +1200,7 @@ static_resources:
         };
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let config = Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, Arc::clone(&registry))
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, Arc::clone(&registry), None)
                 .await
                 .expect("HCMConfig builds"),
         );
@@ -1281,7 +1281,7 @@ static_resources:
         };
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
-        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
             .await
             .expect("build HCM config");
         built.access_log = sinks;
@@ -1620,7 +1620,7 @@ static_resources:
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
                 .await
                 .expect("build HCM config"),
         )
@@ -1694,7 +1694,7 @@ static_resources:
         let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
         let registry = Arc::new(envoy_stats::StatsRegistry::new());
         Arc::new(
-            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry)
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
                 .await
                 .expect("build HCM config"),
         )
@@ -1719,6 +1719,7 @@ static_resources:
             ),
             access_log: vec![],
             filter_pipeline: pipeline,
+            pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 virtual_hosts: vec![VirtualHost {
