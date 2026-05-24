@@ -494,11 +494,17 @@ async fn serve_connection(
                         // `addr:port` rendering envoy uses.
                         upstream_host_for_log = Some(endpoint.to_string());
 
-                        // 06.3 D15.3.b: RAII guard increments
-                        // `cluster.<name>.upstream_cx_active` at the start of the
-                        // proxy arm and decrements via Drop at scope exit, covering
-                        // both success and error close paths uniformly.
-                        let _cx_guard = cluster.cx_active_guard();
+                        // 06.3 D15.3.b: `cluster.<name>.upstream_cx_active`
+                        // RAII guard. 13.1 Task 4 code-quality fold-in: the
+                        // guard is now wired BELOW (after `StreamHandle` is
+                        // built) so it only fires on the `OneShot` arms — the
+                        // pool path owns its own `ConnGaugeGuard` inside
+                        // `PoolGuard` (pool.rs::PoolGuard::_cx_active_guard),
+                        // which shares the SAME `Arc<Gauge>` via the registry's
+                        // idempotent same-kind contract. An outer-scope guard
+                        // here would double-count cx_active on every pool-path
+                        // in-flight request (regression test:
+                        // `h1_hcm_pool_path_does_not_double_count_cx_active`).
 
                         let start = std::time::Instant::now();
 
@@ -534,6 +540,19 @@ async fn serve_connection(
                                         Err(synth_status(502, close))
                                     }
                                     Err(crate::pool::PoolError::Overflow { .. }) => {
+                                        // Minor #2 (code-quality fold-in):
+                                        // overflow means NO connect was
+                                        // attempted (the pool refused the
+                                        // acquire before reaching
+                                        // `Client::connect`), so `cx_total`
+                                        // intentionally does NOT increment on
+                                        // this arm — symmetric with the
+                                        // `PoolError::Connect` arm above
+                                        // where the connect failed and
+                                        // `cx_total` also doesn't fire
+                                        // (lock-in #6: `cx_total.inc()`
+                                        // lives inside the pool's
+                                        // connect-on-miss success path).
                                         tracing::warn!(
                                             cluster = %cluster.name(),
                                             "pool overflow — returning 503",
@@ -586,6 +605,28 @@ async fn serve_connection(
                             }
                         };
 
+                        // 13.1 Task 4 code-quality fold-in: cx_active guard
+                        // only fires on the `OneShot` arms (`PoolError::*`
+                        // and `Ok(Pooled)` are skipped). The Pooled arm's
+                        // `PoolGuard` already owns a `ConnGaugeGuard` against
+                        // the SAME `Arc<Gauge>` (pool.rs:183, 219) — an
+                        // outer-scope guard would double-count cx_active
+                        // for every in-flight pool-path request.
+                        //
+                        // Declared BEFORE `match stream_or_synth` so that the
+                        // `OneShot` `ClientStream` (moved into `handle` by
+                        // the match) drops FIRST (closing the upstream TCP
+                        // connection), then `_cx_guard` drops, firing the
+                        // gauge decrement after the stream is gone — the
+                        // correct ordering for an `active` gauge.
+                        let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> =
+                            match &stream_or_synth {
+                                Ok(StreamHandle::OneShot(_)) => Some(cluster.cx_active_guard()),
+                                // `Pooled` carries its own guard;
+                                // `Err(_)` means no connect was reached.
+                                _ => None,
+                            };
+
                         match stream_or_synth {
                             Ok(mut handle) => {
                                 let send_result = match &mut handle {
@@ -614,6 +655,13 @@ async fn serve_connection(
                                         // the stream + fires `cx_destroy` rather
                                         // than returning a half-broken stream to
                                         // the idle list.
+                                        //
+                                        // Minor #4 (code-quality fold-in):
+                                        // on the OneShot arm there's no pool
+                                        // to protect — the `ClientStream`
+                                        // simply drops at scope exit, closing
+                                        // the upstream TCP connection cleanly
+                                        // (no `invalidate()` analogue needed).
                                         if let StreamHandle::Pooled(g) = &mut handle {
                                             g.invalidate();
                                         }
@@ -3340,5 +3388,200 @@ static_resources:
              (got {}); the H1Pool dispatch path should coalesce reuse onto a single connect-on-miss",
             cx_total.value(),
         );
+    }
+
+    /// 13.1 Task 4 code-quality fold-in regression: an in-flight pool-path
+    /// request must report `cluster.<name>.upstream_cx_active == 1`, not 2.
+    ///
+    /// Pre-fix shape: an outer-scope `let _cx_guard = cluster.cx_active_guard()`
+    /// in the HCM proxy arm fired BEFORE the pool dispatch, and the pool's
+    /// `PoolGuard` (pool.rs::PoolGuard::_cx_active_guard, built via
+    /// `acquire_cx_active_guard`) ALSO fired against the SAME `Arc<Gauge>`
+    /// (the registry's idempotent same-kind re-register hands back the same
+    /// `Arc`). Result: every in-flight pool-path request reported double the
+    /// real cx_active. Steady-state at-rest was correct (paired inc/dec), but
+    /// any live `/stats` scrape during traffic was 2×.
+    ///
+    /// This test asserts cx_active == 1 (NOT 2) WHILE the upstream request
+    /// is in flight, by driving a slow backend that accepts + reads the
+    /// request bytes but holds the response open behind a `oneshot::Sender`.
+    /// We scrape cx_active.value() during the in-flight window, then release
+    /// the response and assert the post-Drop steady state (cx_active == 0).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_hcm_pool_path_does_not_double_count_cx_active() {
+        use tokio::sync::oneshot;
+
+        // Slow backend: accepts ONE connection, reads the request, then
+        // waits on a oneshot before writing the response. This pins one
+        // request "in flight" while we scrape cx_active.
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            // Read until end-of-head (CRLFCRLF). The test issues a single
+            // body-less GET so head-end == request-end.
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Hold the response until the test releases us.
+            let _ = release_rx.await;
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n",
+                )
+                .await;
+        });
+
+        // Single-cluster bootstrap pointed at the slow backend port.
+        // SHARED registry so the HCM-side and pool-side cx_active handles
+        // are the SAME `Arc<Gauge>` (same as the precedent test above).
+        let yaml = format!(
+            r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: {backend_port} }} }} }}
+"#
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("cluster mgr"),
+        );
+        let pool_token = tokio_util::sync::CancellationToken::new();
+        let pool_mgr = crate::pool::H1PoolManager::for_bootstrap(
+            &bootstrap,
+            &cluster_mgr,
+            Arc::clone(&registry),
+            pool_token.clone(),
+        )
+        .expect("pool manager builds");
+
+        let hcm_config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: Arc::clone(&cluster_mgr),
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: Some(Arc::clone(&pool_mgr)),
+            route_config: Arc::new(RouteConfiguration {
+                name: "rc".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                        }),
+                    }],
+                }],
+            }),
+        });
+
+        // Re-register the SHARED cx_active handle for assertion.
+        let cx_active = registry
+            .register_gauge("cluster.backend.upstream_cx_active")
+            .expect("cx_active re-register (idempotent)");
+
+        // Spawn the HCM accept loop on an ephemeral port; one downstream
+        // socket, one request that the backend holds open.
+        let hcm_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hcm_addr = hcm_listener.local_addr().unwrap();
+        let hcm_handle = tokio::spawn(async move {
+            let (sock, _) = hcm_listener.accept().await.unwrap();
+            let _ = serve_connection(hcm_config, sock).await;
+        });
+
+        let mut client = TcpStream::connect(hcm_addr).await.unwrap();
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        client.write_all(req).await.expect("write request");
+
+        // Wait for the request to land at the backend and the pool's
+        // connect-on-miss to fire its cx_active.inc(). 200ms is generous
+        // for an in-process TCP loopback hop.
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+        // LOAD-BEARING assertion (the regression we're guarding):
+        // cx_active must be 1 (the pool-owned guard inside PoolGuard) —
+        // not 2 (pool-owned guard + an outer HCM-scope guard, which was
+        // the pre-fix bug).
+        let live = cx_active.value();
+        assert_eq!(
+            live, 1,
+            "expected cx_active == 1 (pool-owned guard only) during in-flight \
+             pool-path request; got {live} — outer HCM-scope `cx_active_guard()` \
+             is double-counting against the same Arc<Gauge> the pool already \
+             holds (pre-fix regression).",
+        );
+
+        // Release the backend response so the request can complete and
+        // the pool returns the stream to the idle list (the PoolGuard's
+        // cx_active_guard drops here).
+        let _ = release_tx.send(());
+
+        // Read the response to drive the HCM through the encode-write path.
+        let mut buf = vec![0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            let n = tokio::time::timeout(StdDuration::from_secs(2), client.read(&mut buf[total..]))
+                .await
+                .expect("read response timeout")
+                .expect("read response error");
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let resp = String::from_utf8_lossy(&buf[..total]);
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "expected 200: {resp}");
+
+        drop(client);
+        let _ = hcm_handle.await;
+
+        // Post-completion steady state: cx_active back to 0. The stream
+        // returns to the pool's idle list; the PoolGuard's `_cx_active_guard`
+        // drops on return-to-idle path (pool.rs::PoolGuard::Drop).
+        // Allow a brief tick for the Drop to land.
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert_eq!(
+            cx_active.value(),
+            0,
+            "expected cx_active == 0 after request completion + PoolGuard drop \
+             (got {})",
+            cx_active.value(),
+        );
+
+        pool_token.cancel();
     }
 }

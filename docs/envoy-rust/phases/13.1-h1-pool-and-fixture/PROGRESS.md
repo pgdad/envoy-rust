@@ -657,3 +657,110 @@ at this commit:
 
 Spec ✅ (matches PLAN Task 4 Steps 1-6 verbatim; the 3 small adaptations
 above are non-substantive per PLAN's own "Common Adaptation Hints" section).
+
+### Code-quality review fold-in (post-commit `490bb96`)
+
+Post-landing code-quality review caught a metrics-correctness regression
+introduced by Task 4: **`cluster.<name>.upstream_cx_active` is double-counted
+on the pool path while a request is in flight.** Fixed in a separate commit.
+
+**Root cause.** Two `cx_active.inc()` sites fire against the SAME
+`Arc<Gauge>` for every pool-path request:
+
+1. The HCM proxy arm at the former `hcm.rs:501` ran `let _cx_guard =
+   cluster.cx_active_guard();` unconditionally (the 06.3 D15.3.b site),
+   firing `cx_active.inc()` BEFORE the pool dispatch.
+2. `H1Pool::acquire` ALSO fires `self.cx_active.inc()` against the same
+   `Arc<Gauge>` on BOTH the reuse path (`pool.rs:183`,
+   `acquire_cx_active_guard`) AND the connect-on-miss path (`pool.rs:219`),
+   into the `PoolGuard._cx_active_guard` field. The pool's `cx_active`
+   handle is re-registered against the registry's idempotent same-kind
+   contract at `pool.rs:350-351` (same registry name
+   `cluster.<name>.upstream_cx_active` → same `Arc<Gauge>`).
+
+Net: every in-flight pool-path request reported `cx_active.value() == 2N`
+where `N` is the true in-flight count. Steady-state at-rest was correct
+(paired inc/dec on both guards), but any `/stats` scrape during traffic
+was doubled. No existing test caught this — the Task-4 pool-reuse test
+only asserted `cx_total == 1`.
+
+**Fix (reviewer's recommended option (a)).** Relocate the HCM-level
+`_cx_guard` so it only fires on the `StreamHandle::OneShot` arms; the
+pool path's `PoolGuard` already owns its own `ConnGaugeGuard` field, so
+let the pool own the gauge lifecycle on the pool path.
+
+Mechanically at `crates/envoy-http1/src/hcm.rs:~501`: removed the
+unconditional outer `let _cx_guard = cluster.cx_active_guard();` (replaced
+the line with a comment block explaining the relocation). Added a
+conditional declaration AFTER the `stream_or_synth: Result<StreamHandle,
+Response>` is built but BEFORE the `match stream_or_synth { Ok(mut handle)
+=> ... }` consumes it:
+
+```rust
+let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> =
+    match &stream_or_synth {
+        Ok(StreamHandle::OneShot(_)) => Some(cluster.cx_active_guard()),
+        _ => None, // Pooled owns its guard; Err means no connect occurred
+    };
+```
+
+Drop ordering: `_cx_guard` declared BEFORE the consuming `match` ⇒ drops
+LAST (Rust drops in reverse declaration order). So on the OneShot success
+path the `ClientStream` (moved into `handle` by the match) closes first,
+then `_cx_guard` drops, firing `cx_active.dec()` after the upstream TCP
+connection is gone — the correct ordering for an `active` gauge.
+
+**Regression test** at `crates/envoy-http1/src/hcm.rs::tests`:
+
+- `h1_hcm_pool_path_does_not_double_count_cx_active` — drives ONE
+  pool-path request through the HCM with a slow backend that holds the
+  response open behind a `tokio::sync::oneshot::Sender`. Scrapes
+  `cx_active.value()` WHILE the request is in flight and asserts `== 1`
+  (NOT 2). Then releases the response and asserts `cx_active == 0` after
+  PoolGuard drops the stream back to the idle list. TDD discipline:
+  authored the test, temporarily reverted the fix to verify the test
+  fails with `cx_active == 2` (output: `assertion left == right failed:
+  left: 2, right: 1`), restored the fix, verified the test passes.
+
+**Minor #2 + Minor #4 comment additions (cheap fold-ins):**
+
+- **Minor #2** at `hcm.rs::PoolError::Overflow` arm (~`hcm.rs:545`):
+  added a comment explaining why no `cx_total.inc()` fires on this arm
+  (overflow means NO connect was attempted; the pool refused the acquire
+  before reaching `Client::connect` — symmetric with the `PoolError::Connect`
+  arm where the connect failed and `cx_total` also doesn't fire per
+  lock-in #6).
+- **Minor #4** at `hcm.rs` `send_result::Err(_)` arm (the OneShot side
+  of the `if let StreamHandle::Pooled(g) = &mut handle` check): added a
+  comment clarifying that the OneShot stream simply drops cleanly on the
+  send-error path — no pool to protect, no `invalidate()` analog needed.
+
+Skipped Minor #3 (StreamHandle scoped fine), Minor #5 (cluster_name
+clone deferrable to a future micro-optimization pass), and Minor #6
+(PROGRESS already clear) per the reviewer's "Optional minor cleanups"
+section.
+
+**Targeted gates re-run post-fix** (controller verifies workspace +
+deny separately):
+
+- `cargo build -p envoy-http1 --all-targets` → `Finished` (clean).
+- `cargo clippy -p envoy-http1 --all-targets --all-features -- -D warnings`
+  → `Finished` (zero warnings).
+- `cargo fmt --all -- --check` → clean (after one `cargo fmt --all`
+  rewrap on the new test's `tokio::time::timeout` line).
+- `cargo test -p envoy-http1` → **78 passed / 0 failed / 0 ignored**
+  (+1 over the Task-4-landed 77-test baseline — exactly the new
+  `h1_hcm_pool_path_does_not_double_count_cx_active` test; no
+  existing-test regression).
+
+**Files touched** (2):
+
+- `crates/envoy-http1/src/hcm.rs` — relocated `_cx_guard` to OneShot-only
+  conditional + Minor #2 + Minor #4 comments + new regression test.
+- `docs/envoy-rust/phases/13.1-h1-pool-and-fixture/PROGRESS.md` — this
+  fold-in subsection.
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new ADR**
+(metrics-correctness fix is a routine application of the lock-in #6
+"pool owns the gauge lifecycle" principle; ADR ledger head stays
+**ADR-0038**).
