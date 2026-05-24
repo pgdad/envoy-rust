@@ -516,4 +516,48 @@ mod tests {
         token.cancel();
         let _ = sweeper.await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_pool_manager_registers_cx_destroy_and_cx_http1_total_per_h1_cluster() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c1
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("cluster mgr");
+        let token = CancellationToken::new();
+        let _pool_mgr =
+            H1PoolManager::for_bootstrap(&bootstrap, &mgr, Arc::clone(&registry), token)
+                .expect("pool mgr");
+        let snapshot = registry.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|(n, _)| n == "cluster.c1.upstream_cx_destroy"),
+            "expected cluster.c1.upstream_cx_destroy in registry; got: {:?}",
+            snapshot.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            snapshot
+                .iter()
+                .any(|(n, _)| n == "cluster.c1.upstream_cx_http1_total"),
+            "expected cluster.c1.upstream_cx_http1_total in registry; got: {:?}",
+            snapshot.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        );
+    }
 }

@@ -764,3 +764,88 @@ deny separately):
 (metrics-correctness fix is a routine application of the lock-in #6
 "pool owns the gauge lifecycle" principle; ADR ledger head stays
 **ADR-0038**).
+
+## Task 5 — H1 pool stats wiring + BEHAVIOR_CONTRACT rows (D7-H1)
+
+Task 5 is the documentation + registration-presence-test deliverable
+for the 2 H1-pool-introduced counters (the counter `register_counter`
+calls themselves already landed at Task 3 inside
+`H1PoolManager::for_bootstrap`, verified at commit `368d6ef` —
+`crates/envoy-http1/src/pool.rs` lines `register_counter(... cluster.<n>.upstream_cx_destroy)`
++ `register_counter(... cluster.<n>.upstream_cx_http1_total)`).
+
+**BEHAVIOR_CONTRACT rows landed** (2; appended as the new
+`**13.1 entries (H1 connection pool):**` block, inserted between the
+existing `**12.2 entries (active health checking — counters):**`
+block and the `**06.1 Prometheus exposition shape divergence**`
+block):
+
+1. `cluster.<name>.upstream_cx_destroy` — `value-exact (0-failures case)`
+   (3 eviction paths documented: idle-sweeper, `PoolGuard::invalidate()`,
+   connect-failure rollback; fixture-window disposition: 0 for both
+   proxies under the no-forced-close 60s-idle-timeout regime).
+2. `cluster.<name>.upstream_cx_http1_total` — `value-exact`
+   (one increment per H1 connect-on-miss; under fixture-0020's 10
+   sequential keep-alive requests, both proxies emit 1 — full pool
+   reuse).
+
+**Explicit non-tightening (13.2 D7.1 deferral)**: the existing
+`cluster.<name>.upstream_cx_total` row at
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md:89` (the 06.1 initial entry)
+**STAYS `name-required, value-may-differ` at 13.1** per:
+
+- **PLAN architecture lock-in #3** (the row-tightening defers to
+  13.2 to fire only when both H1 + H2 pools tighten uniformly,
+  since the existing row mentions no protocol carve-out and tightening
+  at 13.1 would falsify the still-per-call-incrementing H2 surface).
+- **13.1 SPEC §3 D7** (the BEHAVIOR_CONTRACT D7 obligation at 13.1
+  scope is the 2 NEW rows above; the existing-row tightening is the
+  **13.2 D7.1 deliverable** — the **06.3 REVIEW I2 (b) full-closure
+  site**).
+
+This deferral is named explicitly in the new
+`cluster.<name>.upstream_cx_http1_total` row body itself, so the
+contract reader at 13.1 sees the rationale inline (rather than only
+in the deferred-SPEC).
+
+**Registration-presence test added** (1; new `tokio::test` at the
+end of `crates/envoy-http1/src/pool.rs::tests`):
+
+- `h1_pool_manager_registers_cx_destroy_and_cx_http1_total_per_h1_cluster`
+  — parses a minimal inline bootstrap YAML with one STATIC H1 cluster
+  `c1`, drives `envoy_cluster::from_bootstrap` → `H1PoolManager::for_bootstrap`,
+  then asserts that both `cluster.c1.upstream_cx_destroy` AND
+  `cluster.c1.upstream_cx_http1_total` are present in
+  `registry.snapshot()`. Test result: **`ok` (1 passed)**.
+
+**Targeted gates** (controller verifies workspace + deny separately):
+
+- `cargo build -p envoy-http1 --all-targets` → `Finished` (clean).
+- `cargo clippy -p envoy-http1 --all-targets --all-features -- -D warnings`
+  → `Finished` (zero warnings).
+- `cargo fmt --all -- --check` → clean (after one `cargo fmt --all`
+  rewrap on the new test's long `H1PoolManager::for_bootstrap(...)`
+  call line + the 2 `snapshot.iter().any(...)` assert args).
+- `cargo test -p envoy-http1 -- h1_pool_manager_registers` →
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;
+  78 filtered out`.
+- `cargo test -p envoy-http1` → **79 passed / 0 failed / 0 ignored**
+  (+1 over Task 4's 78-test baseline — exactly the new
+  `h1_pool_manager_registers_cx_destroy_and_cx_http1_total_per_h1_cluster`
+  test; no existing-test regression).
+
+**Files touched** (3):
+
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md` — appended the new
+  `**13.1 entries (H1 connection pool):**` block (2 rows) between
+  the 12.2 health-check-counters block and the 06.1 Prometheus
+  divergence block.
+- `crates/envoy-http1/src/pool.rs` — added the
+  `h1_pool_manager_registers_cx_destroy_and_cx_http1_total_per_h1_cluster`
+  test at the end of `#[cfg(test)] mod tests`.
+- `docs/envoy-rust/phases/13.1-h1-pool-and-fixture/PROGRESS.md` —
+  this Task 5 section.
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new
+ADR** (BEHAVIOR_CONTRACT row addition is routine 13.1 D7-H1
+bookkeeping; ADR ledger head stays **ADR-0038**).
