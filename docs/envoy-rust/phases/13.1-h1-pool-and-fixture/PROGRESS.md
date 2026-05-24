@@ -1333,3 +1333,61 @@ ADR** (this is a `#[cfg(test)]`-domain backstop; the property it
 asserts is the same one fixture 0020 + the Task 3-5 pool
 implementation lock in at the production layer). ADR ledger head
 stays **ADR-0038**.
+
+---
+
+## Task 9 — `parse_bootstrap` fuzz seed `cluster_circuit_breakers.yaml` (D11)
+
+Mechanical 3-sibling-file edit per PLAN lock-in #12: extends the
+`parse_bootstrap` fuzz corpus's SUCCESS array (20 → 21 entries) with
+a seed exercising the new 13.1 D1 + D2 `Cluster.circuit_breakers`
+schema landed at Tasks 1-2.
+
+**Files touched** (3 in the Task 9 commit `8f14d5c`; this PROGRESS
+subsection lands in a follow-up commit at the controller's parallel
+Edit-vs-commit race — PROGRESS append slipped the Task 9 commit, the
+follow-up restores the close-out narrative; no production-code drift
+between the two commits):
+
+- `crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_circuit_breakers.yaml`
+  (NEW) — `STRICT_DNS` cluster `pooled_cluster` with
+  `circuit_breakers.thresholds[0].{priority: DEFAULT, max_connections: 4}`
+  pointing at a single endpoint at `127.0.0.1:8080`. Bootstrap header
+  shape mirrors the existing `cluster_health_check.yaml` precedent
+  (admin block on `0.0.0.0:9901`; `static_resources.listeners: []`;
+  one cluster).
+- `crates/envoy-config/fuzz/.gitignore` — appended one allow-list line
+  `!corpus/parse_bootstrap/cluster_circuit_breakers.yaml` after the
+  12.2 `hcm_upstream_active_health_check.yaml` entry (matches the
+  established alphabetical-by-topic-group placement convention).
+- `crates/envoy-config/src/bootstrap.rs::tests::fuzz_corpus_seeds_parse_or_reject_cleanly`
+  — extended the SUCCESS array at `:3618` with the new entry
+  `"fuzz/corpus/parse_bootstrap/cluster_circuit_breakers.yaml"`.
+
+**Controller-direct landing** (NOT subagent-dispatched): Task 9 is
+mechanically 5 lines of edits (1 YAML CREATE + 1 `.gitignore` line +
+1 SUCCESS-array line) against a PLAN that ships verbatim content,
+with zero subjective judgment required. Per `feedback_execution_style`
+the state-3 controller MAY take direct action when subagent overhead
+exceeds task complexity; per `feedback_pick_recommendation` the
+obvious-recommendation cadence applies here. Documented honestly
+per D-3.4.
+
+**Targeted gates clean at Task 9 commit `8f14d5c`:**
+
+- `cargo test -p envoy-config -- fuzz_corpus_seeds` → `test result:
+  ok. 1 passed; 0 failed; 0 ignored; 0 measured; 271 filtered out;
+  finished in 0.01s` (the seed parses cleanly via the new
+  `Cluster.circuit_breakers` schema + validator landed at Tasks 1-2).
+- `cargo clippy -p envoy-config --all-targets --all-features --
+  -D warnings` → `Finished` (zero warnings).
+- `cargo fmt --all -- --check` → clean (no diff).
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new
+ADR** (corpus seed is bookkeeping; no architectural decision). ADR
+ledger head stays **ADR-0038**.
+
+**Optional short-budget nightly fuzz**: deferred to Task 10's
+state-4 verification, which runs the `cargo +nightly fuzz run
+parse_bootstrap` for the standard 200000-runs budget across the now-21-seed
+SUCCESS corpus per PLAN Task 10 Step 4.
