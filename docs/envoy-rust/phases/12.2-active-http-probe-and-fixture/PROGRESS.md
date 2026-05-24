@@ -1144,4 +1144,211 @@ again, the 30s bump is insufficient and a deeper investigation
 (systematic-debugging) is required — likely a further bump (60s, 120s)
 or an explicit pre-build step in the test setup.
 
+**CI confirmation (recorded post-commit `b1cb25c`):** CI run
+`26348699615` for HEAD `b1cb25c` settled `completed / success` in
+2m19s — the 30s readiness deadline successfully accommodates the
+CI cold-build path (`Compiling health-aware-http1-backend` is
+observed completing well before the deadline elapses on the new
+cold cargo target/). The §7.5 (a)+(b) sub-gates are now closed
+bilaterally (local + CI). State-5 review proceeds.
+
+### Task 8 state-5 review fold-in — Cluster B I1+I2 + Cluster A M1 — THIS commit
+
+**State-3 re-entry per `BOOTSTRAP_PROMPT.md` §5.2** (review feedback
+re-entry point: state-5 surfaced Important findings → re-enter step 3,
+NOT step 4). The phase-12.2 state-5 code-review session dispatched a
+3-cluster subagent pass over the reviewed range `6a3b332..b1cb25c`
+mirroring the 12.1 state-5 REVIEW precedent's deliverable-cohesion
+slice: Cluster A (Tasks 1–3 — periodic-probe primitive + synth-503
+reconciliation), Cluster B (Tasks 4–6 + Task 8 follow-up — synthetic-
+backend harness + fixture 0019 + in-process backstop), Cluster C
+(Task 7 + docs — fuzz seed + cross-doc consistency + PLAN-lock-in
+audit). Cluster A returned `Ready to merge: Yes` with 0 Critical /
+0 Important / 4 Minor; Cluster C returned `Ready to merge: Yes` with
+0 Critical / 0 Important / 4 Minor; **Cluster B returned `Ready to
+merge: With fixes` with 0 Critical / 2 Important / 6 Minor**.
+
+The 2 Important findings (both 1-2 line mechanical fixes, both
+mirroring the Task 8 follow-up cadence) fold in at THIS commit:
+
+- **Cluster B I1 — `HealthAwareHttp1Backend::spawn` stderr pipe-drain
+  deadlock landmine.** `tests/differential/src/backend.rs:273` used
+  `Stdio::piped()` without ever draining the pipe; under
+  `RUST_LOG=debug`/`=trace` the helper's `tracing` output would fill
+  the ~64 KB pipe buffer and block the helper's next `write`,
+  silently freezing the helper while the readiness loop and the
+  active-HC probe both observe a non-responsive backend. The 4
+  sibling backends in the same file (`TcpProxyBackend` `:38`,
+  `TlsEchoBackend` `:124`, `Http1EchoBackend` `:197`, `Http2EchoBackend`
+  `:343`) all use `Stdio::inherit()` precisely to avoid this — the
+  fix flips `HealthAwareHttp1Backend` to match its 4 siblings.
+  In-line code comment names the divergence rationale vs the
+  in-process backstop's `Stdio::piped()` convention (the backstop
+  drains via the test runner on test-process exit; the differential
+  harness does not have that mechanic, so inherit is the safe
+  posture).
+
+- **Cluster B I2 — In-process backstop `wait_ready` budget undersized
+  vs the cold-build helper compile.** `crates/envoy-bin/tests/
+  upstream_active_health_check.rs:193` and `:235` (the unhealthy +
+  healthy direction tests) called `wait_ready(backend_addr,
+  Duration::from_secs(10))`. Same root cause as the Task 8 follow-up
+  (cold `cargo run --manifest-path` of `health-aware-http1-backend`
+  exceeds 3s — and can exceed 10s) — the backstop currently passes
+  on CI only because the differential test (Docker-gated) runs first
+  and warms the cargo cache. Test execution order is not a stable
+  contract; matching the harness budget (30s, set at the Task 8
+  follow-up) at the backstop's helper-readiness poll closes the
+  latent race. Both `:193` and `:235` bumped to `Duration::from_secs(30)`
+  with in-line comments referencing the Task 8 follow-up rationale.
+  The `wait_ready(listener_addr, ...)` calls (`:197`, `:239`) stay
+  at 10s — `envoy-bin` is the test crate's own `CARGO_BIN_EXE_envoy-bin`
+  (built ahead of test by `cargo build --workspace --all-targets`,
+  not via `cargo run --manifest-path`), so the cold-build asymmetry
+  doesn't apply to its readiness poll.
+
+**Cluster A M1 fold-in (opportunistic, recommended in Cluster A's
+review):** dropped the unused `bytes = "1"` dep from
+`crates/envoy-health/Cargo.toml:17`. Workspace-wide
+`grep -rn "use bytes\|bytes::" crates/envoy-health/src/` returned
+empty (the dep was declared per PLAN lock-in #4's Cargo.toml sketch
+but the implementation never reached for it — the probe constructs
+the `envoy_http1::codec::Request` with `body: None`, no `bytes::Bytes`
+materialization). Precisely mirrors the Task 4 follow-up `9ce6d61`
+which dropped the same unused `bytes` dep from
+`tests/helpers/health-aware-http1-backend`.
+
+**Cluster A M3 (PROGRESS deviation note, recommended in Cluster A's
+review):** Task 1's `crates/envoy-health/src/lib.rs:26-31` `pub use`
+shape deviates from PLAN lock-in #4's sketch (`pub use scheduler::*;
++ pub use probe::*;`) in the SAFER direction — tighter named
+re-exports (`pub use error::HealthError;` + `pub use
+scheduler::Scheduler;`; `probe` stays `mod`-private; `probe_loop` /
+`ProbeError` correctly stay `pub(crate)`). No functional change; less
+public surface area. Recorded here per D-3.4 (context isolation —
+PLAN deviations belong on the timeline). Cluster A confirmed the
+deviation is correct + improves encapsulation.
+
+**Other state-5 review findings deferred to REVIEW.md §4 carryforward
+inventory (per the standing in-phase-recovery discipline that defers
+all awareness-only Minors to the REVIEW.md cross-phase inventory):**
+
+- Cluster A M2: `Scheduler::task_count()` is `pub` despite being
+  doc-labeled "test helper" (file: `scheduler.rs:133`). Suggested
+  `#[doc(hidden)]` or `pub(crate)` + `#[cfg(test)]` accessor. Defer
+  to REVIEW.md §4 as a surface-hygiene Minor; no in-phase action
+  (the first periodic-background-primitive surface sets precedent
+  for future schedulers; the cleanup is opportunistic, not gating).
+
+- Cluster A M4: `scheduler.rs:91`
+  `.expect("HC-configured cluster has health_probe_targets")` is
+  sound under the current structural invariant but is un-tested
+  negatively. Defer to REVIEW.md §4 as a forward-correctness-noted
+  Minor; no in-phase action.
+
+- Cluster B M1: helper `parse_args()` indexes `args[i + 1]` without
+  bounds check — `--port` without value panics. Pre-existing
+  in-phase reviewer Minor.
+
+- Cluster B M2: helper `status_reason()` defaults to `"OK"` for
+  non-200/503 statuses (misleading reason phrase if a future
+  fixture configures `--data-status 502`). Pre-existing in-phase
+  reviewer Minor.
+
+- Cluster B M3: `http1_get()` hand-rolled parser in the backstop
+  silently drops malformed header lines + assumes `": "` (with
+  space) framing. Pre-existing in-phase reviewer Minor (Task 6
+  reviewer flagged).
+
+- Cluster B M4: `HealthAwareHttp1Backend::Drop` lacks the sibling
+  2s-poll/50ms-sleep deterministic-exit wait that
+  `Http1EchoBackend::Drop` carries (`backend.rs:307-313` vs `:225-239`).
+  Comment claims "matches Http1EchoBackend" but doesn't; both work
+  (kill_on_drop=true delivers SIGKILL regardless). New Minor surfaced
+  at this state-5 review. Defer to REVIEW.md §4.
+
+- Cluster B M5: `tests/fixtures/0019-upstream-active-health-check/`
+  `envoy.yaml` vs `envoy-rust.yaml` are not literally byte-identical
+  (envoy.yaml carries `admin:` + `0.0.0.0` bind + `generate_request_id:
+  false`; envoy-rust.yaml binds `127.0.0.1` and omits the other two).
+  This matches the project-wide convention (verified vs fixture 0008);
+  the SPEC §3 D7.1 wording "identical" should be read as "identical
+  for the differential surface, modulo the established per-proxy
+  boilerplate divergences." Awareness-only narrative Minor.
+
+- Cluster B M6: `HealthAwareHttp1Backend::Drop`'s explicit
+  `start_kill()` is redundant given `kill_on_drop(true)` is already
+  set at spawn. Style-only Minor.
+
+- Cluster C M-C-1: PROGRESS Task 7 line-number drift (SUCCESS array
+  cited as `3522-3540` on-disk reads `3522-3541`, etc.). Cosmetic
+  narrative Minor.
+
+- Cluster C M-C-2: PROGRESS Task 7 corpus-inventory arithmetic
+  ("19 success + 3 reject + 1 minimal + 2 fuzz-corpus auxiliary")
+  is mildly tangled (the actual reconciliation is 20 success + 3
+  reject + 1 `let minimal =` + 1 `include_str!` = 25 entries
+  matching the 25 tracked seeds). Substantive claim (all seeds
+  tested, no orphan) holds; narrative-finishing-touch Minor.
+
+- Cluster C M-C-3: STATE.md `:13` Active phase paragraph uses
+  "THIS commit" wording from the state-4 verification commit
+  `8dbea41`; intentionally stale per the Task 8 follow-up posture
+  (STATE.md does not re-advance at follow-up commits). State-5
+  commit naturally refreshes the Active phase paragraph and
+  supersedes it.
+
+- Cluster C M-C-4: PROGRESS Task 8 §7.5 (e) per-task new-test
+  attribution arithmetic slightly off (Task 1 lands 6 envoy-health
+  unit tests + 2 cluster accessor tests, not "7 + 2"; Task 2
+  lands 2 registration tests, not "3"; Task 3 lands 1 synth test,
+  not "2"; aggregate 832 → 844 = +12 confirmed). Narrative finishing-
+  touch Minor.
+
+**Carryforward closures ratified at state-5 (post-fold-in):** M2 + M4
+(12.1 REVIEW carryforwards) — folded in at Task 1 + Task 2 + verified
+bilaterally by Cluster A. 06.3 REVIEW I2 down-payment — verified
+honestly attributed by Cluster B (PROGRESS lines 215-224 + 461-469 +
+1024-1029 explicitly call out "DOWN-PAYMENT, NOT full I2 closure").
+
+**ADR posture at THIS commit.** No ADR. The state-5 review surfaced
+no decision-grade finding; the I1 + I2 + A-M1 fixes are mechanical
+test-infrastructure adjustments + a dead-dep drop. DECISIONS.md
+ledger head stays **ADR-0037**; next available **ADR-0038**.
+
+**STATE.md posture at THIS commit.** Unchanged at THIS commit (the
+state-5 commit advances STATE to state-5-complete / state-6-next as
+a separate REVIEW.md-bearing commit after CI green). Per the 12.1
+state-5 / phase-11 state-5 precedent, the state-5 commit lands:
+(1) `docs/envoy-rust/phases/12.2-active-http-probe-and-fixture/REVIEW.md`
+(the new doc carrying the §1-§8 verdict + the cluster-disposition
+table + the §7.5 (a)-(e) gate re-attestation), (2) `STATE.md`
+4-top-pointer rewrites + the `### Phase-12.2 state-5 code review`
+Notes subsection appended, (3) PROGRESS Task 8 state-5 close-out
+subsection. NO ROADMAP edit at state-5 (row `12.2` stays `in-progress`
+until state-6).
+
+**Local-gate re-confirmation post-fold-in (5 stable-toolchain gates
+clean at THIS commit):**
+
+- `cargo build --workspace --all-targets` → `Finished dev profile
+  [unoptimized + debuginfo] target(s) in 1m 11s` (incremental rebuild
+  of `differential` + `envoy-bin` for the edits).
+- `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` → `Finished dev profile [unoptimized + debuginfo]
+  target(s) in 1m 07s`, no warnings.
+- `cargo fmt --all -- --check` → clean (exit 0; no diff).
+- `cargo test --workspace` → **844 passed / 0 failed / 2 ignored**
+  (unchanged from Task 8 baseline — the fold-in changes test
+  infrastructure budgets + drops an unused dep; no test logic
+  change).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources
+  ok` (the pre-existing harmless `Unicode-DFS-2016` + `Zlib`
+  unmatched-license warnings unchanged).
+
+**§7.5 gate disposition post-fold-in.** The CI gate must re-attest
+on the fold-in commit. If CI settles `success`, the state-5 commit
+(REVIEW.md + STATE advance) lands next. If CI settles `failure`,
+the in-phase recovery iterates per the same Task 8-follow-up cadence.
+
 

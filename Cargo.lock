@@ -419,7 +419,6 @@ dependencies = [
 name = "envoy-health"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "envoy-cluster",
  "envoy-config",
  "envoy-http1",

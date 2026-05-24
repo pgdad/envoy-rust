@@ -270,7 +270,17 @@ impl HealthAwareHttp1Backend {
             .arg("--port")
             .arg(port.to_string())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            // 12.2 state-5 review Cluster B I1: stderr is `inherit` (NOT `piped`)
+            // matching the 4 sibling backends in this file (TcpProxyBackend,
+            // TlsEchoBackend, Http1EchoBackend, Http2EchoBackend). Piped-without-
+            // drain risks a pipe-buffer deadlock if the helper ever emits more
+            // than ~64 KB of stderr (e.g. under RUST_LOG=debug). Inherit surfaces
+            // any helper diagnostics on the test process's terminal and cannot
+            // block. The backstop at `crates/envoy-bin/tests/upstream_active_
+            // health_check.rs` uses `piped` per its own file-level convention
+            // (drained on test-process exit by the test runner) — this divergence
+            // is intentional, not an oversight.
+            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .context("spawning health-aware-http1-backend")?;

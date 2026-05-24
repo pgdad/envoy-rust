@@ -190,7 +190,14 @@ async fn unhealthy_endpoint_returns_synth_503_no_healthy_upstream() {
     let backend_addr: SocketAddr = format!("127.0.0.1:{backend_port}").parse().unwrap();
     let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
     let _backend = spawn_backend(backend_port, 503).await;
-    wait_ready(backend_addr, Duration::from_secs(10))
+    // 12.2 state-5 review Cluster B I2: 30s budget matches the differential
+    // harness's `HealthAwareHttp1Backend::spawn` readiness deadline (the Task 8
+    // follow-up `b1cb25c` set that to 30s for the CI cold-build asymmetry —
+    // `cargo run --manifest-path` may take >10s to compile the helper on a cold
+    // cargo target/). The backstop currently passes because the differential
+    // tests run first and warm the cargo cache, but test execution order is not
+    // a stable contract; matching the harness budget closes the latent race.
+    wait_ready(backend_addr, Duration::from_secs(30))
         .await
         .expect("backend ready");
     let _envoy = spawn_envoy_bin(listener_port, backend_port).await;
@@ -232,7 +239,9 @@ async fn healthy_endpoint_passes_through_to_backend() {
     let backend_addr: SocketAddr = format!("127.0.0.1:{backend_port}").parse().unwrap();
     let listener_addr: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
     let _backend = spawn_backend(backend_port, 200).await;
-    wait_ready(backend_addr, Duration::from_secs(10))
+    // 12.2 state-5 review Cluster B I2: 30s budget — see the symmetric comment
+    // in `unhealthy_endpoint_returns_synth_503_no_healthy_upstream` above.
+    wait_ready(backend_addr, Duration::from_secs(30))
         .await
         .expect("backend ready");
     let _envoy = spawn_envoy_bin(listener_port, backend_port).await;
