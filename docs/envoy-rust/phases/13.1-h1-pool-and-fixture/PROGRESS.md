@@ -849,3 +849,127 @@ end of `crates/envoy-http1/src/pool.rs::tests`):
 **No new top-level Cargo dep.** **No `unsafe` introduced.** **No new
 ADR** (BEHAVIOR_CONTRACT row addition is routine 13.1 D7-H1
 bookkeeping; ADR ledger head stays **ADR-0038**).
+
+---
+
+## Task 6 — configurable-status backend `--per-path` flag (D8)
+
+Task 6 is a **test-helper-only** extension to the synthetic
+`health-aware-http1-backend` (the 12.2 D7.1 primitive at
+`tests/helpers/health-aware-http1-backend/src/main.rs`). It adds the
+`--per-path PATH=STATUS[,PATH=STATUS,...]` CLI flag + deterministic
+per-class body bytes per **PLAN-time lock-in #11**, in support of
+fixture 0020 (landing at Task 7) driving the per-class
+`downstream_rq_{2,3,4,5}xx` counter coverage that completes the **06.3
+REVIEW I2 (a) full-closure surface**. **No production code is
+touched** at this task; the helper is consumed by `#[cfg(test)]`-only
+sites going forward.
+
+**Helper extension shape:**
+
+- New `parse_per_path(s: &str) -> Result<HashMap<String, u16>>`
+  module-scope function — splits on `,`, trims, skips empty
+  fragments, splits each entry on `=`, parses the right side as `u16`,
+  surfacing both the missing-`=` case and the non-numeric-status case
+  through `anyhow::with_context` chains (so `cargo run` failures stay
+  human-readable). Module scope (not nested in `parse_args`) so the
+  `#[cfg(test)]` block can call it through `use super::*;`.
+- New `per_class_body(status: u16) -> &'static [u8]` module-scope
+  function — deterministic per-class bytes: `301 → b"moved\n"`,
+  `404 → b"not found\n"`, `500 → b"server error\n"`,
+  `503 → b"service unavailable\n"`; all other codes fall through to
+  the empty byte-slice (defensive default that the unit test pins
+  via the `200` case — fixture 0020 depends on this determinism for
+  `Content-Length`-equality assertions across both proxy responses).
+- `Config` extended with `per_path: HashMap<String, u16>` after
+  `data_body`; the existing `#[derive(Debug, Clone)]` covers the new
+  field by blanket — no extra trait work.
+- `parse_args` extended with the `--per-path` arm (initialises
+  `per_path = HashMap::new()` alongside the existing defaults; on the
+  arm, calls `parse_per_path(&args[i + 1])?`) — unknown flag handling
+  via the existing `bail!("unknown arg: {other}")` arm is preserved.
+- `serve` request-dispatch chain rewritten as a 3-arm `if-let / else
+  if / else`: **per-path lookup first** (per-path mapping wins —
+  matches the PLAN spec verbatim), then the `/healthz` special-case,
+  then the default-path arm. Per-path response bodies come from
+  `per_class_body(s).to_vec()` — `Vec<u8>` cloning preserved to match
+  the existing data-path's `cfg.data_body.clone()` shape (no
+  borrow-shape regression in the `serve` writer).
+- `status_reason` extended with 3 new arms (`301 → "Moved
+  Permanently"`, `404 → "Not Found"`, `500 → "Internal Server
+  Error"`) alongside the existing 200/503; the `_ => "OK"` fall-through
+  is preserved so unknown codes still produce wire-valid HTTP/1.1
+  status lines.
+- The header doc-comment's `CLI:` block is extended with the
+  `--per-path PATH=STATUS[,PATH=STATUS,...]` line + a sentence noting
+  that per-path takes precedence over the `/healthz` special-case and
+  bodies are deterministic per-class.
+
+**3 new TDD-first unit tests** in
+`tests/helpers/health-aware-http1-backend/src/main.rs::tests` (the
+helper's first `#[cfg(test)] mod tests` block):
+
+- `parse_per_path_parses_multiple_entries` — positive path: parses
+  `"/301=301,/404=404,/500=500"` into the expected 3-entry
+  `HashMap<String, u16>` with the right key/value pairs (and asserts
+  `len() == 3`).
+- `parse_per_path_rejects_malformed` — error path: asserts
+  `parse_per_path("notakvpair").is_err()` (the missing-`=` case) and
+  `parse_per_path("/x=notanumber").is_err()` (the non-numeric-status
+  case).
+- `per_class_body_returns_deterministic_bytes` — pins all 4 mapped
+  status codes (301/404/500/503) and the empty-body fall-through
+  (`200`) byte-for-byte; this is the **fixture-0020 determinism
+  contract**.
+
+TDD discipline: wrote all 3 tests first; ran `cargo test --bin
+health-aware-http1-backend` to verify they failed (8 `E0425
+cannot find function 'parse_per_path'/'per_class_body'` errors, as
+expected); then implemented the 2 helpers + the `Config` field + the
+`parse_args` arm + the `serve` per-path-wins dispatch + the
+`status_reason` extension + the doc-comment CLI-block extension;
+re-ran to verify pass.
+
+**Targeted gates** (controller verifies workspace + deny separately —
+**no `cargo test --workspace` run, no `cargo deny check` run, no
+push** by this subagent):
+
+- `cargo test --bin health-aware-http1-backend` →
+  `test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured;
+  0 filtered out` (the 3 new tests; the helper had no prior
+  `#[cfg(test)]` block).
+- `cargo build --bin health-aware-http1-backend` → `Finished`
+  (clean).
+- `cargo clippy --bin health-aware-http1-backend --all-features --
+  -D warnings` → `Finished` (zero warnings — the new `if let
+  Some(&s) = cfg.per_path.get(&path) { ... } else if path ==
+  "/healthz"` chain stays under the `collapsible_if` lint because the
+  arms are heterogeneous, not nested-`if`s).
+- `cargo fmt --all -- --check` → clean (no diff; the `parse_per_path`
+  function fits within the 100-column width without rewrap).
+
+**Files touched** (2):
+
+- `tests/helpers/health-aware-http1-backend/src/main.rs` — added
+  `HashMap` import, `Config.per_path` field, `--per-path` arg arm,
+  `parse_per_path` + `per_class_body` module-scope functions,
+  per-path-wins dispatch in `serve`, 3 new `status_reason` arms,
+  extended doc-comment, and the `#[cfg(test)] mod tests` block with
+  the 3 unit tests.
+- `docs/envoy-rust/phases/13.1-h1-pool-and-fixture/PROGRESS.md` —
+  this Task 6 section.
+
+**No PLAN deviation.** Implementation follows the PLAN Steps 1-6
+verbatim (the test-block code, the `parse_per_path` / `per_class_body`
+function bodies, the `Config` extension shape, the `serve` dispatch
+chain, the `status_reason` extension — all copied from the PLAN spec
+without modification). The only minor adaptation was a one-line
+re-wrap of the `per_class_body` doc-comment (3 lines instead of the
+PLAN's 2) to keep each line under the workspace rustdoc-style width
+budget — no semantic change.
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new
+ADR** (the helper is a `#[cfg(test)]`-domain primitive; the lock-in
+that gave rise to the per-class bytes — PLAN lock-in #11 — is
+documented in the helper's `per_class_body` doc-comment for future
+fixture authors). ADR ledger head stays **ADR-0038**.

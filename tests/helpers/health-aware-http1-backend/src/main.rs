@@ -9,11 +9,17 @@
 //! CLI:
 //!   health-aware-http1-backend --port <PORT> [--healthz-status 503]
 //!     [--data-status 200] [--data-body "ok\n"]
+//!     [--per-path PATH=STATUS[,PATH=STATUS,...]]
+//!
+//! `--per-path` (13.1 D8) takes precedence over the `/healthz` special-case and
+//! over the default-path arm; bodies for per-path responses are deterministic
+//! per-class bytes (see `per_class_body`).
 //!
 //! All response shaping is hand-rolled (no framework) so the backend stays
 //! transparent — no hidden header behavior. Connection: close per response
 //! (the active-HC probe uses a fresh connection per probe).
 
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
@@ -27,6 +33,7 @@ struct Config {
     healthz_status: u16,
     data_status: u16,
     data_body: Vec<u8>,
+    per_path: HashMap<String, u16>,
 }
 
 #[tokio::main]
@@ -54,6 +61,7 @@ fn parse_args() -> Result<Config> {
     let mut healthz_status: u16 = 503;
     let mut data_status: u16 = 200;
     let mut data_body: Vec<u8> = b"ok\n".to_vec();
+    let mut per_path: HashMap<String, u16> = HashMap::new();
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -74,6 +82,10 @@ fn parse_args() -> Result<Config> {
                 data_body = args[i + 1].as_bytes().to_vec();
                 i += 2;
             }
+            "--per-path" => {
+                per_path = parse_per_path(&args[i + 1])?;
+                i += 2;
+            }
             other => bail!("unknown arg: {other}"),
         }
     }
@@ -82,7 +94,42 @@ fn parse_args() -> Result<Config> {
         healthz_status,
         data_status,
         data_body,
+        per_path,
     })
+}
+
+/// 13.1 D8: parse `--per-path` flag value: `PATH=STATUS[,PATH=STATUS,...]`.
+/// Returns a map; on malformed input returns Err.
+fn parse_per_path(s: &str) -> Result<HashMap<String, u16>> {
+    let mut out = HashMap::new();
+    for entry in s.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (path, status) = entry
+            .split_once('=')
+            .with_context(|| format!("per-path entry missing '=': {entry:?}"))?;
+        let status: u16 = status
+            .parse()
+            .with_context(|| format!("per-path status not numeric: {status:?}"))?;
+        out.insert(path.to_string(), status);
+    }
+    Ok(out)
+}
+
+/// 13.1 D8: deterministic per-class body bytes per PLAN-time lock-in #11.
+/// 2xx → empty body (preserves existing `--data-body` semantics; per-path 2xx is unusual);
+/// 3xx → `"moved\n"`; 4xx-404 → `"not found\n"`; 5xx-500 → `"server error\n"`;
+/// 5xx-503 → `"service unavailable\n"`. Other codes → empty body (defensive default).
+fn per_class_body(status: u16) -> &'static [u8] {
+    match status {
+        301 => b"moved\n",
+        404 => b"not found\n",
+        500 => b"server error\n",
+        503 => b"service unavailable\n",
+        _ => b"",
+    }
 }
 
 async fn serve(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
@@ -105,7 +152,10 @@ async fn serve(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     let mut req = httparse::Request::new(&mut headers_storage);
     req.parse(&buf[..head_end])?;
     let path = req.path.unwrap_or("/").to_string();
-    let (status, body): (u16, Vec<u8>) = if path == "/healthz" {
+    let (status, body): (u16, Vec<u8>) = if let Some(&s) = cfg.per_path.get(&path) {
+        // 13.1 D8: per-path mapping wins.
+        (s, per_class_body(s).to_vec())
+    } else if path == "/healthz" {
         (cfg.healthz_status, Vec::new())
     } else {
         (cfg.data_status, cfg.data_body.clone())
@@ -125,7 +175,40 @@ async fn serve(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
 fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        301 => "Moved Permanently",
+        404 => "Not Found",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_per_path_parses_multiple_entries() {
+        let m = parse_per_path("/301=301,/404=404,/500=500").expect("parse");
+        assert_eq!(m.get("/301"), Some(&301u16));
+        assert_eq!(m.get("/404"), Some(&404u16));
+        assert_eq!(m.get("/500"), Some(&500u16));
+        assert_eq!(m.len(), 3);
+    }
+
+    #[test]
+    fn parse_per_path_rejects_malformed() {
+        assert!(parse_per_path("notakvpair").is_err());
+        assert!(parse_per_path("/x=notanumber").is_err());
+    }
+
+    #[test]
+    fn per_class_body_returns_deterministic_bytes() {
+        assert_eq!(per_class_body(301), b"moved\n".as_slice());
+        assert_eq!(per_class_body(404), b"not found\n".as_slice());
+        assert_eq!(per_class_body(500), b"server error\n".as_slice());
+        assert_eq!(per_class_body(503), b"service unavailable\n".as_slice());
+        // Other codes fall through to the empty body (deterministic; tests rely on this).
+        assert_eq!(per_class_body(200), b"".as_slice());
     }
 }
