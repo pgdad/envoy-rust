@@ -13,6 +13,7 @@ mod cluster;
 mod health;
 
 pub use cluster::{
-    Cluster, ClusterError, ClusterHandle, ClusterManager, UpstreamProtocol, from_bootstrap,
+    Cluster, ClusterError, ClusterHandle, ClusterManager, ConnGaugeGuard, UpstreamProtocol,
+    from_bootstrap,
 };
 pub use health::EndpointHealth;

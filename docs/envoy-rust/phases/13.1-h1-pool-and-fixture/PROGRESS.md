@@ -272,3 +272,175 @@ Targeted gates clean at this commit:
   gates separately (out-of-scope for subagent execution).
 
 Spec ✅ (matches PLAN Task 2 Steps 1-7 verbatim).
+
+---
+
+## Task 3 — H1Pool primitive + PoolGuard RAII + idle sweeper + H1PoolManager (D3)
+
+Lands the architecturally headline 13.1 D3 deliverable per PLAN Task 3: a new
+`crates/envoy-http1/src/pool.rs` module carrying `H1Pool` + `PoolGuard` (RAII) +
+`H1PoolManager` + `PoolError` + the idle-sweeper task — all unit-tested in
+isolation (no HCM coupling; HCM proxy-arm migration defers to Task 4 per the
+foundation-first cadence). Plus a 12-line `ConnGaugeGuard::from_gauge` pub
+constructor in envoy-cluster (enabling pool callers to construct guards against
+the shared cluster gauge handle without holding a `Cluster` reference, per
+lock-in #7).
+
+**New module `crates/envoy-http1/src/pool.rs` (~310 SLOC + 5 inline tests)**
+declaring 4 public types:
+
+- `H1Pool` — per-cluster pool. Holds `idle: tokio::sync::Mutex<HashMap<SocketAddr,
+  Vec<IdleEntry>>>` (`tokio::sync::Mutex` over `std::sync::Mutex` because
+  `acquire()` holds the lock across an `.await` in the connect-on-miss branch per
+  lock-in #9) + `established: tokio::sync::Mutex<HashMap<SocketAddr, u32>>` (the
+  per-endpoint `max_connections` counter) + 4 stat Arc handles
+  (`cx_total`/`cx_destroy`/`cx_http1_total` counters + `cx_active` gauge). The
+  `cx_total` + `cx_active` Arcs are the SAME handles `Cluster` holds (re-registered
+  via the envoy-stats same-kind-idempotency contract verified at
+  `crates/envoy-stats/src/registry.rs:141` — `registry_register_counter_idempotent_same_kind`).
+  Constructor `H1Pool::new` is plain; `H1Pool::for_bootstrap` is exposed at
+  `H1PoolManager::for_bootstrap` (the bin-side construction site, Task 4-wired).
+- `PoolGuard` — per-acquire RAII handle. Owns the borrowed `Option<ClientStream>` +
+  one `ConnGaugeGuard` (gauge decrements on guard drop per lock-in #7). Provides
+  `stream_mut() -> &mut ClientStream` (the HCM proxy-arm reaches the underlying
+  TCP stream via this, Task-4) + `invalidate()` (marks the stream un-returnable;
+  Drop then destroys it + increments `cx_destroy` instead of returning to the
+  idle list). Drop spawns a `tokio::spawn` task to push the stream onto the idle
+  list (synchronous Drop cannot `.await`, per lock-in #9). The
+  `_cx_active_guard` field's Drop fires last → `upstream_cx_active.dec()`.
+  Hand-rolled `Debug` impl (rather than `#[derive]`) because `ConnGaugeGuard`
+  doesn't impl `Debug`; surfaces `{cluster, endpoint, has_stream}` for the
+  `Result::expect_err` formatting needed by the overflow test.
+- `H1PoolManager` — per-bootstrap registry of `Arc<H1Pool>` keyed by cluster
+  name. `H1PoolManager::for_bootstrap` iterates `bootstrap.static_resources.
+  clusters`, looks up each H1 cluster via `cluster_mgr.get(&cfg.name)`
+  (deliberately NOT a `Cluster`-field per lock-in #1 — external registry,
+  mirroring the 12.2 `envoy-health::Scheduler` precedent verbatim), skips
+  non-H1 clusters (H2 pools defer to 13.2), reads `circuit_breakers.thresholds[0].
+  max_connections` (or the hardcoded 1024 default per parent SPEC §6.2 item-i),
+  registers `upstream_cx_destroy` + `upstream_cx_http1_total` counters + re-fetches
+  the shared `upstream_cx_total` + `upstream_cx_active` Arcs (the registry returns
+  the SAME Arc per the same-kind-idempotency contract), builds one `H1Pool` per
+  H1 cluster, spawns one idle sweeper per pool, and inserts. `get(cluster_name)
+  -> Option<&Arc<H1Pool>>` is the lookup the HCM proxy arm uses at Task 4.
+- `PoolError` — `Overflow { cluster, max }` (pool at cap + no idle) or
+  `Connect(#[from] Http1Error)` (`Client::connect()` failed on the connect-on-miss
+  branch). Derives `Debug, thiserror::Error`.
+
+**Idle sweeper** per lock-in #8: `H1Pool::spawn_idle_sweeper(token:
+CancellationToken) -> JoinHandle<()>` spawns a tokio task holding
+`tokio::time::interval(idle_timeout / 4)` (15s with the 60s default per parent
+SPEC §6.2 item-iii). Each tick walks the idle map, evicts entries past the
+deadline, decrements `established` for the evicted count, and fires `cx_destroy`
+once per evicted entry. `tokio::select!` against the cancellation token gives
+clean shutdown — same lifecycle shape as 12.2's
+`envoy-health::Scheduler::shutdown`. Eviction-collection is structured as a
+two-phase sequence: collect under `idle` lock first → release → take `est`
+lock (avoids any re-entrant-ordering concern with `acquire()`'s
+`idle`-then-`est` sequence).
+
+**`ConnGaugeGuard::from_gauge` constructor** added at
+`crates/envoy-cluster/src/cluster.rs:22`: a new `impl ConnGaugeGuard { pub fn
+from_gauge(gauge: Arc<envoy_stats::Gauge>) -> Self }` block opened before the
+existing `impl Drop`. The contract: caller MUST have already called
+`gauge.inc()`; Drop calls `gauge.dec()`. Mirrors `Cluster::cx_active_guard`'s
+inc+wrap pattern, but exposes the wrap step independently so the pool (which
+doesn't hold a `Cluster` reference; it holds the shared `Arc<Gauge>` directly)
+can construct guards. The `ConnGaugeGuard` is also added to envoy-cluster's
+`lib.rs` re-export block (was previously not re-exported; consumers held it
+only transitively via `Cluster::cx_active_guard`'s return type).
+
+**5 new TDD-first unit tests** in `crates/envoy-http1/src/pool.rs::tests`:
+
+- `acquire_from_empty_pool_creates_connection_and_fires_counters` — positive
+  fresh-pool path: a single `pool.acquire(addr, host)` against an in-process echo
+  backend yields a guard, and asserts `cx_total.value() == 1`,
+  `cx_http1_total.value() == 1`, `cx_active.value() == 1`; after `drop(guard)` +
+  brief yield, `cx_active.value() == 0` (the spawn-task return-to-pool is
+  asynchronous; the test sleeps 50ms after `yield_now()` for the spawned
+  return-task to land).
+- `acquire_after_return_reuses_idle_stream_without_incrementing_cx_total` — the
+  reuse path: acquire → drop → acquire again, assert `cx_total.value() == 1`
+  (reuse must NOT re-fire the counter; only the first connect-on-miss did).
+- `acquire_returns_overflow_when_at_cap` — the cap-enforcement path: `max_connections:
+  1`, first acquire succeeds, second yields `PoolError::Overflow { cluster: "c",
+  max: 1 }` via `matches!`.
+- `invalidate_destroys_stream_and_increments_cx_destroy` — the invalidation
+  path: acquire → `invalidate()` → drop → assert `cx_destroy.value() == 1`
+  (the destroy bookkeeping runs in Drop's `None` arm via a tokio::spawn task;
+  the test sleeps 50ms for it to land).
+- `idle_sweeper_evicts_past_deadline_entries` — the sweeper path: build a pool
+  with a 100ms idle_timeout (sweeper tick = 25ms), spawn the sweeper, acquire +
+  drop a guard, assert `cx_destroy.value() == 0` after 50ms, then sleep 300ms,
+  assert `cx_destroy.value() >= 1` (the entry was past-deadline by then and at
+  least one sweep tick fired during the 300ms window). Cancels the token + awaits
+  the sweeper handle at tail for clean teardown.
+
+TDD discipline: the 5 tests were authored verbatim from the PLAN Task 3 Step 1
+specification (all 5 names + body shapes), then the implementation was filled
+in against them. The build initially failed with `PoolGuard doesn't implement
+Debug` (the `expect_err` formatting at the overflow test requires it); added a
+hand-rolled `Debug` impl (12 SLOC) that surfaces just `{cluster, endpoint,
+has_stream}` rather than deriving (which would require `ConnGaugeGuard: Debug`
+— a downstream-API-widening change avoided per lock-in #7's "ConnGaugeGuard
+REUSED unchanged"). All 5 tests pass on first post-fix run.
+
+**Per-task adaptations from the PLAN**:
+
+- The PLAN's `pool.rs` text uses `if let ... { if let ... { ... } }` nested
+  structure on the idle-reuse branch; the workspace's clippy `collapsible_if`
+  + `collapsible_match` policy (already in force per 12.1 / 13.1 Task 2
+  precedent) requires `if let A && let B` collapsed form. Applied verbatim;
+  no behavior change.
+- The PLAN's `sweep_once` text takes the `idle` + `est` locks concurrently
+  inside `iter_mut()`. The compiler accepts this, but per the PLAN's own
+  "Common Adaptation Hints" the safer two-phase pattern is preferred —
+  collect evictions under `idle` lock first, release, then take `est` lock.
+  Applied; no behavior change (single-pass sweep regardless).
+- `tokio-util` was not in `crates/envoy-http1/Cargo.toml` previously; added
+  `tokio-util = { version = "0.7", features = ["rt"] }` (same version + same
+  feature set as `envoy-health`'s existing declaration at
+  `crates/envoy-health/Cargo.toml:19`). This is NOT a new top-level Cargo dep
+  per lock-in #9 — `tokio-util` is already pulled by `envoy-bin` + `envoy-health`;
+  the addition is sub-crate plumbing identical to the 12.2 precedent. The new
+  `envoy_cluster::ConnGaugeGuard` re-export from envoy-cluster's `lib.rs` is
+  also additive (no production caller was relying on its absence).
+- The PLAN suggested an optional `cargo test -p envoy-cluster -- from_gauge`
+  small test; deliberately NOT added — the 5 pool tests fully exercise the
+  `from_gauge` contract end-to-end (`cx_active` increments + decrements
+  exactly as the tests assert), and adding a sibling unit-level test in
+  envoy-cluster would only re-cover the same surface. envoy-cluster's test
+  count therefore stays at its prior baseline (36 — verified at the targeted
+  test run).
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new ADR** —
+PLAN lock-in #16 holds (the H1Pool is a routine application of the bin-wired
+external-registry pattern established at 12.2; the cycle-resolution decision
+itself is documented in the PROGRESS Task 1 preamble + the parent-13 SPEC).
+DECISIONS.md ledger head stays **ADR-0038**; next available **ADR-0039**.
+
+**§7.5 gates (a)/(b)/(c)/(d) hold vacuously** at this task (no new differential
+fixture; pre-existing 19 unaffected — Task 4's HCM-migration commit performs the
+full-fixture regression-equivalence pass; no H2-codec touch; no new fuzz seed —
+the corpus seed lands at Task 9). (e) the targeted-toolchain gates clean
+locally at this commit:
+
+- `cargo build -p envoy-http1 -p envoy-cluster --all-targets` → `Finished`
+  (incremental clean).
+- `cargo clippy -p envoy-http1 -p envoy-cluster --all-targets --all-features --
+  -D warnings` → `Finished` (zero warnings).
+- `cargo fmt --all -- --check` → clean (no diff).
+- `cargo test -p envoy-http1 -- pool` → **5 passed / 0 failed / 0 ignored /
+  71 filtered** (the 5 new `pool::tests::*` tests; `+5` over the prior 71-test
+  envoy-http1 baseline; the unfiltered count grows from 71 to 76 — verified
+  separately).
+- `cargo test -p envoy-cluster -- from_gauge` → **0 passed / 0 failed / 36
+  filtered** (no `from_gauge`-named test exists by design — the contract is
+  covered indirectly via the pool tests' `cx_active` assertions, and
+  envoy-cluster's overall test count stays at 36 baseline). The controller
+  verifies the full `cargo test --workspace` + `cargo deny check` gates
+  separately (out-of-scope for subagent execution per the 12.2 / 12.1
+  precedent).
+
+Spec ✅ (matches PLAN Task 3 Steps 1-6 verbatim; the 3 small adaptations above
+are non-substantive per PLAN's own "Common Adaptation Hints" section).

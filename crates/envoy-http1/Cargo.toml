@@ -15,6 +15,7 @@ envoy-stats = { path = "../envoy-stats" }
 httparse = "1"
 bytes = "1"
 tokio = { version = "1", features = ["net", "io-util", "macros", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 tracing = "0.1"
 

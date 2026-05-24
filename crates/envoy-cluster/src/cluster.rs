@@ -19,6 +19,17 @@ pub struct ConnGaugeGuard {
     gauge: Arc<envoy_stats::Gauge>,
 }
 
+impl ConnGaugeGuard {
+    /// 13.1 D3: construct a guard from a pre-incremented `Arc<Gauge>` handle.
+    /// The caller MUST have called `gauge.inc()` already; Drop calls `gauge.dec()`.
+    /// Mirrors `Cluster::cx_active_guard()`'s `inc + wrap` pattern, exposed for
+    /// `envoy-http1::H1Pool` (which doesn't hold a `Cluster` reference but
+    /// shares the `Arc<Gauge>` via the StatsRegistry's same-kind-idempotency).
+    pub fn from_gauge(gauge: Arc<envoy_stats::Gauge>) -> Self {
+        Self { gauge }
+    }
+}
+
 impl Drop for ConnGaugeGuard {
     fn drop(&mut self) {
         self.gauge.dec();
