@@ -200,7 +200,12 @@ impl Http1EchoBackend {
             .with_context(|| format!("spawning {} --port {port}", bin.display()))?;
 
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
-        wait_accept_ready(addr, Duration::from_secs(1))
+        // Backstop 30s readiness deadline (was 1s) — CI cold-build budget per
+        // the 12.2 Task 8 follow-up b1cb25c precedent (HealthAwareHttp1Backend
+        // 3s → 30s bump for the same flake class; CI run 26361106477 RED on
+        // backend::tests::http1_echo_backend_spawns_and_echoes with the
+        // identical "never became accept-ready" signature).
+        wait_accept_ready(addr, Duration::from_secs(30))
             .await
             .with_context(|| format!("http1-echo-server never became accept-ready on {addr}"))?;
 
