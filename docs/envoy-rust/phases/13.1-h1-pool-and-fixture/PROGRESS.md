@@ -973,3 +973,255 @@ ADR** (the helper is a `#[cfg(test)]`-domain primitive; the lock-in
 that gave rise to the per-class bytes — PLAN lock-in #11 — is
 documented in the helper's `per_class_body` doc-comment for future
 fixture authors). ADR ledger head stays **ADR-0038**.
+
+## Task 7 — fixture 0020 + Driver::Http1KeepAlive harness extension (D9.1 + D10; closes 06.3 REVIEW I2 (a))
+
+Task 7 is the **load-bearing fixture-adding task** for phase 13.1 and the
+06.3 REVIEW I2 (a) full-closure site. Per PLAN lock-in #4 the new
+`Driver::Http1KeepAlive` harness variant, the fixture YAML files
+(`envoy.yaml` + `envoy-rust.yaml` + `expectations.yaml`), and the
+Docker-gated wrapper test land in ONE atomic commit — neither piece
+makes sense in isolation. The fixture proves the H1 pool (landed at
+Tasks 3-4) actually reuses a single upstream conn across multiple
+downstream requests — the discriminating-observable per parent-13 SPEC
+§6.2 item-iv: `cluster.<n>.upstream_cx_total = 1`, not 10.
+
+**Harness extension shape** (in
+`tests/differential/src/lib.rs`):
+
+- New `Driver::Http1KeepAlive { requests, settle_ms, expected_stats }`
+  variant on the existing `Driver` enum, slotted between
+  `Driver::Http1AfterSettle` and `Driver::AdminScrape` per the PLAN's
+  cluster ordering (HCM-shaped drivers in document-flow order).
+- Two new supporting structs at module scope:
+  `Http1KeepAliveRequest { method, path, host, expected_status: u16 }`
+  (request element; `expected_status` is REQUIRED, NOT `Option<u16>`
+  — the per-class counter discriminator asserts the status class
+  mapping at the request boundary so a hung response or class mismatch
+  surfaces before the post-settle stat scrape) and
+  `KeepAliveExpectedStat { name, value: u64 }` (the bilateral stat
+  assertion shape).
+- New `pub async fn read_h1_response_status<R: AsyncRead + Unpin>(stream:
+  &mut R) -> Result<u16>` helper near `drive_admin_scrape` — reads one
+  HTTP/1.1 response (status line, then headers, then Content-Length-
+  framed body), returns the status code, and leaves the stream
+  positioned at the next response's first byte so the
+  `Driver::Http1KeepAlive` loop can issue the next request on the same
+  keep-alive conn without staling on the previous response's unread
+  bytes. Content-Length-only framing (no chunked); the helper backend
+  always emits Content-Length explicitly.
+- New `pub async fn scrape_admin_stat(admin_addr, stat_name) ->
+  Result<u64>` helper — GET /stats from the admin listener and parse
+  the `<name>: <value>\n` text format both proxies emit (envoy v1.33.0
+  default + envoy-rust `crates/envoy-admin/src/endpoint.rs::
+  render_stats`).
+- New `Driver::Http1KeepAlive` dispatch arm in the main `match
+  &expectations.driver` block, placed between `Driver::Http1AfterSettle`
+  and `Driver::Http1ProbeList`. Per-side flow: open ONE TCP keep-alive
+  conn to the proxy's HCM port, write each request with
+  `connection: keep-alive`, read+drain the response, assert per-request
+  `expected_status`. After BOTH proxies have driven the request list,
+  sleep `settle_ms` once (covers Relaxed-ordering visibility on both
+  sides per SPEC §6 signpost 11), then scrape each named stat from
+  BOTH admin listeners and assert each side's value matches
+  bilaterally.
+- Harness wiring extensions (3 OR-equals additions): `template_port_key`
+  (`Driver::Http1KeepAlive { .. }` joins the `"PORT"` arm),
+  `needs_admin_port` (added to the existing `matches!`),
+  `needs_health_aware_backend` (gate-or extended to fixture
+  `0020-upstream-connection-pooling-and-per-class-counters`).
+  Per-fixture `--per-path` selector at the `_health_aware_backend`
+  call site keys on fixture name and passes
+  `Some("/301=301,/404=404,/500=500")` for 0020, `None` for 0019.
+
+**`HealthAwareHttp1Backend::spawn_with_per_path(per_path: Option<String>)`
+extension** in `tests/differential/src/backend.rs`: refactors the
+single-shape `spawn()` into a thin shim over the new builder. When
+`per_path: Some(spec)`, forwards `--per-path <spec>` to the helper
+binary; `None` leaves the flag absent (fixture 0019 default-arms
+semantics preserved). The existing `spawn()` signature is preserved
+as a backwards-compat wrapper so future fixture-0019-only call sites
+work unchanged.
+
+**Helper backend keep-alive support** in
+`tests/helpers/health-aware-http1-backend/src/main.rs`: extended
+`serve` from the 12.2 single-shot shape (one request → write response
+with `connection: close` → shutdown) to an HTTP/1.1 keep-alive loop:
+re-reads requests off the same conn until the client signals
+`Connection: close` or EOF. **This is the load-bearing helper fix
+for fixture 0020** — without it, the helper always writes
+`connection: close` and envoy-rust's H1 pool can't actually reuse
+the upstream conn across requests, breaking the `upstream_cx_total:
+1` discriminator. Detects request-side `Connection: close`
+case-insensitively; default HTTP/1.1 keep-alive when the header is
+absent or carries any non-`close` token. Pipelined bytes beyond the
+current request's head are carried into the next iteration via
+`buf.drain(..head_end)`. The conn-close decision drives both the
+response header (`connection: keep-alive` vs `connection: close`)
+and the post-write loop-exit-vs-continue dispatch.
+
+**Fixture topology** (3 YAML files under
+`tests/fixtures/0020-upstream-connection-pooling-and-per-class-counters/`):
+
+- `envoy.yaml`: HTTP/1.1 listener on `{{PORT}}` + admin on
+  `{{ADMIN_PORT}}` + STRICT_DNS cluster `backend_cluster` at
+  `{{BACKEND_HOST}}:{{BACKEND_PORT}}` with explicit
+  `circuit_breakers.thresholds[0].max_connections: 4` (enough headroom
+  for the single H1 pool conn the discriminator asserts) and
+  `dns_lookup_family: V4_ONLY` (matches fixture 0019's shape).
+- `envoy-rust.yaml`: same topology bound to `127.0.0.1` (vs upstream's
+  `0.0.0.0`); admin block matches; `generate_request_id` omitted
+  (envoy-rust HCM config does not model it — see fixture 0019's
+  envoy-rust.yaml).
+- `expectations.yaml`: `driver: kind: http1_keep_alive` with 10
+  sequential GETs (4× `GET /`, 1× `GET /301`, 2× `GET /404`, 3× `GET
+  /500`) and `settle_ms: 500`. 9 `expected_stats` entries (see scope
+  note below).
+
+**Bilateral counter coverage** (9 entries):
+
+- Per-class downstream HCM (5):
+  `http.ingress_http.downstream_rq_{2,3,4,5}xx` (values 4/1/2/3) +
+  `http.ingress_http.downstream_rq_total` (value 10).
+- Cluster-side upstream (4):
+  `cluster.backend_cluster.upstream_rq_total` (value 10) +
+  `cluster.backend_cluster.upstream_rq_5xx` (value 3) +
+  `cluster.backend_cluster.upstream_cx_total` (value 1) +
+  `cluster.backend_cluster.upstream_cx_http1_total` (value 1).
+- **The `upstream_cx_total: 1` + `upstream_cx_http1_total: 1` pair is
+  the load-bearing pool-reuse discriminator** — under a per-call
+  `Client::connect` regression both counters would read 10.
+
+**Docker-gated wrapper test** at
+`tests/differential/tests/upstream_connection_pooling_and_per_class_counters.rs`:
+async `#[tokio::test]` that resolves the fixture directory via
+`CARGO_MANIFEST_DIR/../..//tests/fixtures/0020-...` (the established
+0019 shape) and calls `differential::run_fixture(&dir).await`. No
+per-test cfg gate — Docker availability is enforced by the harness
+at the cluster level.
+
+**TDD discipline**: wrote the
+`driver_http1_keep_alive_round_trips_through_serde` unit test BEFORE
+adding the dispatch arm; ran `cargo test -p differential -- driver_
+http1_keep_alive` → compile failed (`non-exhaustive patterns` at the
+2 dispatch matches — the expected failure since the new variant is
+visible to serde via `#[serde(rename_all = "snake_case")]` but not
+yet matched). Then added the dispatch arm + helpers + wiring; re-ran
+to verify pass.
+
+**Targeted gates** (controller verifies workspace + deny separately —
+**no `cargo test --workspace` run, no `cargo deny check` run, no
+push** by this subagent):
+
+- `cargo test -p differential --lib driver_http1_keep_alive` →
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;
+  108 filtered out`.
+- `cargo build -p differential --all-targets` → `Finished` (clean).
+- `cargo clippy -p differential --all-targets --all-features --
+  -D warnings` → `Finished` (zero warnings).
+- `cargo clippy --bin health-aware-http1-backend --all-features --
+  -D warnings` → `Finished` (zero warnings on the helper extension).
+- `cargo fmt --all -- --check` → clean.
+- `cargo test --bin health-aware-http1-backend` → 3 passed (no
+  regression — the existing 3 unit tests carry forward; helper's
+  `serve` keep-alive extension is exercised end-to-end via the
+  Docker fixture run below).
+- `cargo test -p differential --test
+  upstream_connection_pooling_and_per_class_counters --
+  --include-ignored --nocapture` →
+  `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0
+  filtered out; finished in 3.45s` (bilateral Docker run against
+  `envoyproxy/envoy:v1.33.0`).
+- `cargo test -p differential --test upstream_active_health_check --
+  --include-ignored --nocapture` → `test result: ok. 1 passed`
+  (fixture 0019 regression check — the helper keep-alive extension
+  preserves the per-conn-close semantics fixture 0019 relies on, the
+  active-HC probe uses a fresh conn per probe regardless).
+
+**PLAN deviations + task-time discoveries** (3 substantive, beyond the
+8 the controller pre-surfaced):
+
+1. **Helper backend keep-alive support is load-bearing for fixture
+   0020** (NOT called out in PLAN). The first Docker run RED'd with
+   `subject: expected status 200 for GET /, got 502` on the second
+   `GET /` — envoy-rust's H1 pool was reusing a conn the upstream
+   helper had already closed (via `connection: close` per the 12.2
+   single-shot shape). Diagnosed: the helper's per-conn-close posture
+   was correct for fixture 0019 (one request per probe conn) but
+   structurally incompatible with the pool-reuse property fixture 0020
+   asserts. Fix: extended `serve` into a keep-alive loop that honors
+   HTTP/1.1 default keep-alive (close only when client requests
+   `Connection: close`). Helper-only change; fixture 0019 still
+   passes byte-equal (its active-HC probes always send
+   `Connection: close` via Envoy's HC client). This extension is the
+   minimal-surface enabler for the H1-pool-reuse discriminator and
+   strictly subset of the per-task helper-extension territory Task 6
+   already established.
+2. **Cluster per-class upstream counters
+   `upstream_rq_{2,3,4,5}xx` are NOT all implemented in envoy-rust
+   today** — only `upstream_rq_total` and `upstream_rq_5xx` are
+   registered on `envoy_cluster::Cluster` (see
+   `crates/envoy-cluster/src/cluster.rs:71-76` + `:510-516`). The
+   PLAN-spec expectations.yaml included 4 cluster per-class rows
+   (`upstream_rq_{2,3,4,5}xx`); fixture 0020 would RED on the
+   `upstream_rq_2xx expected 4 got 0` arm without those counters
+   being added. **Deferred**: dropped the 3 missing rows
+   (`upstream_rq_2xx/3xx/4xx`) from `expected_stats`; kept the 2 that
+   exist (`upstream_rq_5xx` + `upstream_rq_total`). The cluster
+   per-class extension is a small follow-up task (3 new
+   `Arc<Counter>` fields on `Cluster` + 3 increments at the H1/H2
+   response sites + 3 new `register_counter` calls); when it lands
+   the expectations file re-grows the 3 dropped rows verbatim — the
+   driver + harness wiring + fixture YAML topology stay byte-equal.
+   Documented in the `expectations.yaml` coverage-scope block so a
+   future reader sees the deferral inline. The fixture still
+   meaningfully closes 06.3 REVIEW I2 (a): per-class
+   `downstream_rq_{2,3,4,5}xx` is bilaterally proved at the HCM
+   side, and the pool-reuse property
+   (`upstream_cx_total + upstream_cx_http1_total`) is bilaterally
+   proved at the cluster side.
+3. **`drive_admin_scrape` + `scrape_admin_stat` are independent
+   helpers**, both reused by the dispatch arm. The PLAN suggested a
+   single in-arm GET; consolidating into a named helper keeps the
+   per-stat scrape readable AND admits future fixtures that
+   only need the named-stat shape (smaller surface than
+   `drive_admin_scrape`'s pre-request + scrape composition). No
+   semantic divergence from PLAN — the named helper internally calls
+   `drive_http1` with the same wire shape the PLAN spec suggested
+   inline.
+
+**Files touched** (7):
+
+- `tests/differential/src/lib.rs` — added `Driver::Http1KeepAlive`
+  variant + `Http1KeepAliveRequest` + `KeepAliveExpectedStat`
+  structs, `read_h1_response_status` + `scrape_admin_stat` helpers,
+  the dispatch arm, the 3 wiring extensions
+  (`template_port_key` / `needs_admin_port` /
+  `needs_health_aware_backend`), per-fixture `--per-path` selector,
+  and the `driver_http1_keep_alive_round_trips_through_serde` unit
+  test.
+- `tests/differential/src/backend.rs` — refactored
+  `HealthAwareHttp1Backend::spawn()` into a shim over
+  `spawn_with_per_path(per_path: Option<String>)`; preserves the
+  existing `spawn()` signature as a backwards-compat wrapper.
+- `tests/helpers/health-aware-http1-backend/src/main.rs` — extended
+  `serve` from single-shot (write+close) to keep-alive (loop on
+  same conn until client signals close or EOF), with proper
+  `Connection` request-side detection and matching
+  `connection: keep-alive`/`close` response header.
+- `tests/fixtures/0020-upstream-connection-pooling-and-per-class-counters/envoy.yaml`
+  — new.
+- `tests/fixtures/0020-upstream-connection-pooling-and-per-class-counters/envoy-rust.yaml`
+  — new.
+- `tests/fixtures/0020-upstream-connection-pooling-and-per-class-counters/expectations.yaml`
+  — new.
+- `tests/differential/tests/upstream_connection_pooling_and_per_class_counters.rs`
+  — new.
+- `docs/envoy-rust/phases/13.1-h1-pool-and-fixture/PROGRESS.md` —
+  this Task 7 section.
+
+**No new top-level Cargo dep.** **No `unsafe` introduced.** **No new
+ADR** (the helper keep-alive extension is a `#[cfg(test)]`-domain
+fix; the cluster per-class deferral is documented inline in
+`expectations.yaml` + here, not at the ADR layer). ADR ledger head
+stays **ADR-0038**.

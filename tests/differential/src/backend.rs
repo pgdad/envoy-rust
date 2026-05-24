@@ -259,21 +259,41 @@ impl HealthAwareHttp1Backend {
     /// differential harness; the Docker-running envoy + envoy-rust dial
     /// `host.docker.internal:port` per the existing 04.3 / 05.3 helper
     /// pattern). `kill_on_drop(true)` per 09 REVIEW M3 standing discipline.
+    ///
+    /// 13.1 Task 7: thin shim over `spawn_with_per_path(None)` so fixture
+    /// 0019's default-arms semantics (200 on `/`, 503 on `/healthz`) carry
+    /// forward unchanged while fixture 0020 opts into per-path status
+    /// mapping via the new helper.
     pub async fn spawn() -> Result<Self> {
+        Self::spawn_with_per_path(None).await
+    }
+
+    /// 13.1 Task 7 / D10: spawn the helper backend with an optional
+    /// `--per-path PATH=STATUS[,PATH=STATUS,...]` value. `None` → no
+    /// `--per-path` arg (fixture 0019 path); `Some(spec)` → forwards
+    /// `--per-path <spec>` to the helper so each request status reflects
+    /// the configured per-path arm (fixture 0020 path; the helper's
+    /// per-path arm wins over the `/healthz` special-case + the default
+    /// arm per `health-aware-http1-backend/src/main.rs`).
+    pub async fn spawn_with_per_path(per_path: Option<String>) -> Result<Self> {
         let port = crate::reserve_port()?;
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .ok_or_else(|| anyhow::anyhow!("locating workspace root"))?;
         let helper_manifest = manifest.join("tests/helpers/health-aware-http1-backend/Cargo.toml");
-        let child = tokio::process::Command::new(env!("CARGO"))
-            .arg("run")
+        let mut cmd = tokio::process::Command::new(env!("CARGO"));
+        cmd.arg("run")
             .arg("--quiet")
             .arg("--manifest-path")
             .arg(&helper_manifest)
             .arg("--")
             .arg("--port")
-            .arg(port.to_string())
+            .arg(port.to_string());
+        if let Some(spec) = per_path.as_deref() {
+            cmd.arg("--per-path").arg(spec);
+        }
+        let child = cmd
             .stdout(std::process::Stdio::null())
             // 12.2 state-5 review Cluster B I1: stderr is `inherit` (NOT `piped`)
             // matching the 4 sibling backends in this file (TcpProxyBackend,

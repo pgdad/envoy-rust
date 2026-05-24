@@ -1,0 +1,58 @@
+# Phase 13.1 fixture-0020 expectations: H1 pool reuse + per-class counter
+# bilateral coverage. Closes 06.3 REVIEW I2 (a) — the wire-level per-class
+# counter property at the bilateral seam.
+#
+# Driver `http1_keep_alive` (13.1 D10): single downstream keep-alive conn
+# driving 10 sequential GETs spanning 2xx/3xx/4xx/5xx; 500ms settle past
+# the last request; bilateral admin stat scrape on 10 counter values.
+#
+# Per parent-13 SPEC §6.2 item-iv + lock-in #4: upstream_cx_total: 1
+# because the H1 pool (landed at Tasks 3-4) coalesces all 10 upstream
+# requests onto the single first-acquire conn (the discriminating-
+# observable; under a per-call `Client::connect` regression this counter
+# would read 10). `cx_http1_total` tracks the same site under the
+# per-codec stat split (lock-in #3 namespacing). The two-counter pair
+# is the load-bearing pool-reuse property.
+#
+# Coverage scope:
+#   - Per-class downstream HCM counters (5):
+#       downstream_rq_{2,3,4,5}xx + downstream_rq_total
+#       — fixture proves both proxies bin every status class identically.
+#   - Cluster-side upstream counters (4):
+#       upstream_rq_total + upstream_rq_5xx + upstream_cx_total +
+#       upstream_cx_http1_total
+#       — the H1-pool-reuse property + the only available per-class
+#       cluster-counter (5xx) bilaterally.
+#
+# Cluster per-class 2xx/3xx/4xx coverage is DEFERRED: envoy-rust's
+# `Cluster` struct (envoy-cluster/src/cluster.rs:71-76) only carries
+# `upstream_rq_total` + `upstream_rq_5xx` today. Filed at PROGRESS Task 7
+# (the deviation note); the upstream-per-class extension is a 1-task
+# follow-up (3 new counters on `Cluster`, increments at the H1/H2
+# response sites). When that lands, this expectations file will re-grow
+# the 3 dropped rows — the driver + harness wiring + fixture YAML
+# topology stay byte-equal.
+driver:
+  kind: http1_keep_alive
+  requests:
+    - { method: GET, path: /,    host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /,    host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /,    host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /,    host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /301, host: backend_cluster, expected_status: 301 }
+    - { method: GET, path: /404, host: backend_cluster, expected_status: 404 }
+    - { method: GET, path: /404, host: backend_cluster, expected_status: 404 }
+    - { method: GET, path: /500, host: backend_cluster, expected_status: 500 }
+    - { method: GET, path: /500, host: backend_cluster, expected_status: 500 }
+    - { method: GET, path: /500, host: backend_cluster, expected_status: 500 }
+  settle_ms: 500
+  expected_stats:
+    - { name: http.ingress_http.downstream_rq_2xx,             value: 4 }
+    - { name: http.ingress_http.downstream_rq_3xx,             value: 1 }
+    - { name: http.ingress_http.downstream_rq_4xx,             value: 2 }
+    - { name: http.ingress_http.downstream_rq_5xx,             value: 3 }
+    - { name: http.ingress_http.downstream_rq_total,           value: 10 }
+    - { name: cluster.backend_cluster.upstream_rq_5xx,         value: 3 }
+    - { name: cluster.backend_cluster.upstream_rq_total,       value: 10 }
+    - { name: cluster.backend_cluster.upstream_cx_total,       value: 1 }
+    - { name: cluster.backend_cluster.upstream_cx_http1_total, value: 1 }

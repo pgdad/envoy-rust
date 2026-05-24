@@ -149,6 +149,28 @@ pub enum Driver {
         #[serde(default)]
         expected_headers: Option<Http1HeaderRule>,
     },
+    /// 13.1 D10: drive N sequential HTTP/1.1 requests over a SINGLE downstream
+    /// keep-alive conn. The discriminating-observable shape per parent-13 §2
+    /// item-iv: with separate per-request conns, upstream_cx_total: N. With
+    /// this driver, upstream_cx_total: 1 (full pool reuse via the H1 pool
+    /// landed at 13.1 Tasks 3-4). After all requests + a `settle_ms` sleep,
+    /// scrapes named admin stats and asserts byte-equal bilaterally.
+    ///
+    /// The harness runs both proxies sequentially (upstream first, then
+    /// subject), using a single TCP keep-alive conn per side. Each request
+    /// drains its response (status line + headers + Content-Length body)
+    /// so the next request on the same conn starts at a clean boundary.
+    /// After both sides have driven all requests, the harness sleeps
+    /// `settle_ms` (covers stat-write visibility per SPEC §6 signpost 11),
+    /// then scrapes each named stat from BOTH admin listeners and asserts
+    /// the value matches bilaterally.
+    Http1KeepAlive {
+        requests: Vec<Http1KeepAliveRequest>,
+        #[serde(default)]
+        settle_ms: u64,
+        #[serde(default)]
+        expected_stats: Vec<KeepAliveExpectedStat>,
+    },
     /// 06.1 D6.a: drive a sequence of HCM-side `PreRequest`s (so the registry
     /// has counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
     /// Relaxed-ordered counter writes become visible), then perform one or
@@ -242,6 +264,38 @@ pub struct PreRequest {
     pub path: String,
     pub host: String,
     pub port_key: String,
+}
+
+/// 13.1 D10: one HTTP/1.1 request in a `Driver::Http1KeepAlive` sequence.
+/// Carries the request shape (`method` + `path` + `host`) and the
+/// per-request `expected_status` the harness asserts before reading the
+/// next request from the same keep-alive conn. `expected_status` is
+/// REQUIRED (not `Option<u16>` like the single-shot `Driver::Http1`) —
+/// the per-class counter discriminator fixture 0020 asserts the response
+/// status mapping (2xx/3xx/4xx/5xx) so a hung response or class mismatch
+/// surfaces at the request boundary rather than only at the post-settle
+/// stat scrape.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Http1KeepAliveRequest {
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub expected_status: u16,
+}
+
+/// 13.1 D10: bilateral stat assertion for
+/// `Driver::Http1KeepAlive::expected_stats`. Each entry names an admin-
+/// listener stat (e.g. `cluster.backend_cluster.upstream_cx_total`) and
+/// the exact integer value BOTH proxies must emit at scrape time. The
+/// harness scrapes both `/stats` endpoints after the post-request
+/// `settle_ms` and asserts each side's value equals `value` independently
+/// — cross-side consistency follows from transitivity.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KeepAliveExpectedStat {
+    pub name: String,
+    pub value: u64,
 }
 
 /// 08.2 Task 7 (D16): a single admin-side action issued BEFORE the
@@ -1453,6 +1507,112 @@ pub async fn drive_admin_scrape(
         .with_context(|| format!("admin scrape GET {path}"))
 }
 
+/// 13.1 D10 Task 7: read one HTTP/1.1 response from `stream` (status
+/// line, then headers, then Content-Length-framed body), return the
+/// status code, and leave the stream positioned at the next response's
+/// first byte so the caller's `Driver::Http1KeepAlive` loop can issue
+/// the next request on the same keep-alive conn without staling on the
+/// previous response's unread bytes.
+///
+/// The helper assumes Content-Length framing exclusively (no
+/// `Transfer-Encoding: chunked`); the configurable-status backend
+/// always emits Content-Length explicitly per
+/// `tests/helpers/health-aware-http1-backend/src/main.rs` and the H1
+/// router-arm pool path writes Content-Length-framed responses too. If
+/// a future driver needs chunked handling, mirror `drive_http1`'s
+/// chunked decoding cascade.
+pub async fn read_h1_response_status<R>(stream: &mut R) -> Result<u16>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    // Read up to and including the status line terminator ("\r\n").
+    let mut status_line: Vec<u8> = Vec::with_capacity(64);
+    let mut prev = 0u8;
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            bail!("EOF before status line complete");
+        }
+        status_line.push(byte[0]);
+        if prev == b'\r' && byte[0] == b'\n' {
+            break;
+        }
+        prev = byte[0];
+    }
+    // Read headers until the blank line ("\r\n\r\n") that terminates them.
+    let mut header_buf: Vec<u8> = Vec::with_capacity(512);
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            bail!("EOF before headers complete");
+        }
+        header_buf.push(byte[0]);
+        if header_buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    // Parse Content-Length (case-insensitive) — default to 0 if absent.
+    let headers_str = std::str::from_utf8(&header_buf).unwrap_or("");
+    let mut cl: usize = 0;
+    for line in headers_str.split("\r\n") {
+        let (name, value) = match line.split_once(':') {
+            Some(p) => p,
+            None => continue,
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            cl = value.trim().parse().unwrap_or(0);
+            break;
+        }
+    }
+    // Drain the body so the next request on this keep-alive conn starts
+    // at a clean response boundary.
+    if cl > 0 {
+        let mut body = vec![0u8; cl];
+        stream.read_exact(&mut body).await?;
+    }
+    // Parse the status from the captured status line
+    // (`HTTP/1.1 <status> <reason>\r\n`).
+    let status_line_str = std::str::from_utf8(&status_line)
+        .with_context(|| format!("status line is not UTF-8: {status_line:?}"))?;
+    let parts: Vec<&str> = status_line_str.split_whitespace().collect();
+    if parts.len() < 2 {
+        bail!("malformed status line: {status_line_str:?}");
+    }
+    let status: u16 = parts[1]
+        .parse()
+        .with_context(|| format!("parsing status code {:?}", parts[1]))?;
+    Ok(status)
+}
+
+/// 13.1 D10 Task 7: GET `/stats` from the admin listener at `admin_addr`
+/// and return the value of the named stat as `u64`. Returns 0 if the
+/// stat is absent (Envoy's text-format `/stats` endpoint omits names
+/// that have not been registered; envoy-rust matches per
+/// `crates/envoy-admin/src/endpoint.rs::render_stats`).
+///
+/// Both proxies emit the same `<name>: <value>\n` per-line shape so the
+/// per-line parse here is shared across the bilateral assertion.
+pub async fn scrape_admin_stat(admin_addr: SocketAddr, stat_name: &str) -> Result<u64> {
+    let resp = drive_http1(admin_addr, &Http1Method::Get, "/stats", "admin.local", &[])
+        .await
+        .with_context(|| format!("GET /stats from {admin_addr}"))?;
+    let body = std::str::from_utf8(&resp.body).context("/stats body is not UTF-8")?;
+    for line in body.lines() {
+        if let Some((name, value)) = line.split_once(": ")
+            && name.trim() == stat_name
+        {
+            return value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("parsing stat value {value:?} for {stat_name}"));
+        }
+    }
+    Ok(0)
+}
+
 /// 08.2 Task 7 (D16): issue a POST against an admin listener at `path`
 /// and assert the response status equals `expected_status`. Used by
 /// the `Driver::AdminScrape::pre_admin_actions` dispatch arm to drive
@@ -1678,6 +1838,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::Http1ProbeList { .. }
         | Driver::Http1WithAccessLog { .. }
         | Driver::Http1AfterSettle { .. }
+        // 13.1 D10: Http1KeepAlive's HCM listener uses {{PORT}} like
+        // the other HCM-shaped drivers; the admin listener is wired via
+        // {{ADMIN_PORT}} (see needs_admin_port below).
+        | Driver::Http1KeepAlive { .. }
         | Driver::Http2 { .. }
         | Driver::Http2ProbeList { .. }
         // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
@@ -1693,9 +1857,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // listener port and does not need a separate reservation). Mirrors
     // the existing `_backend` / `_tls_backend` cadence: the reservation
     // happens once at run_fixture start so kvs and dispatch both see it.
-    let needs_admin_port = matches!(&expectations.driver, Driver::AdminScrape { .. })
-        && (upstream_template.contains("{{ADMIN_PORT}}")
-            || subject_template.contains("{{ADMIN_PORT}}"));
+    // 13.1 D10: `Driver::Http1KeepAlive` also needs the admin listener
+    // exposed for the post-settle bilateral stat scrape (fixture 0020's
+    // per-class counter assertion territory). Same template-marker discipline
+    // — only reserve the host admin port when one of the YAMLs references
+    // `{{ADMIN_PORT}}`.
+    let needs_admin_port = matches!(
+        &expectations.driver,
+        Driver::AdminScrape { .. } | Driver::Http1KeepAlive { .. }
+    ) && (upstream_template.contains("{{ADMIN_PORT}}")
+        || subject_template.contains("{{ADMIN_PORT}}"));
     let admin_host_port: Option<u16> = if needs_admin_port {
         Some(reserve_port().context("reserving admin host port for Driver::AdminScrape")?)
     } else {
@@ -1740,8 +1911,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         .unwrap_or("");
     let needs_backend = upstream_template.contains("{{BACKEND_PORT}}")
         || subject_template.contains("{{BACKEND_PORT}}");
-    let needs_health_aware_backend =
-        needs_backend && fixture_name == "0019-upstream-active-health-check";
+    // 13.1 D9.1 / Task 7: fixture 0020 reuses `HealthAwareHttp1Backend` but
+    // needs the helper's per-path status mapping
+    // (`/301=301,/404=404,/500=500`) to span 2xx/3xx/4xx/5xx classes so the
+    // post-settle bilateral counter scrape covers every class. The helper's
+    // `--per-path` flag landed at Task 6 (D8); the gate keys on
+    // fixture-directory name (mirrors the 0019 dispatch shape).
+    let needs_health_aware_backend = needs_backend
+        && (fixture_name == "0019-upstream-active-health-check"
+            || fixture_name == "0020-upstream-connection-pooling-and-per-class-counters");
     let _backend = if needs_backend && !needs_health_aware_backend {
         Some(
             backend::TcpProxyBackend::spawn()
@@ -1753,8 +1931,18 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let _health_aware_backend: Option<crate::backend::HealthAwareHttp1Backend> =
         if needs_health_aware_backend {
+            // 13.1 D10: fixture 0020 needs per-path status mapping so each
+            // GET drives a deterministic 2xx/3xx/4xx/5xx response class.
+            // Fixture 0019 keeps the default-arms semantics (200 on `/`,
+            // 503 on `/healthz`).
+            let per_path =
+                if fixture_name == "0020-upstream-connection-pooling-and-per-class-counters" {
+                    Some("/301=301,/404=404,/500=500".to_string())
+                } else {
+                    None
+                };
             Some(
-                crate::backend::HealthAwareHttp1Backend::spawn()
+                crate::backend::HealthAwareHttp1Backend::spawn_with_per_path(per_path)
                     .await
                     .context("spawning HealthAwareHttp1Backend")?,
             )
@@ -2286,6 +2474,130 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 )
                 .context("diff_headers (set_equal_modulo_allow_list)")?;
             }
+        }
+        // 13.1 D10 / Task 7: drive N sequential HTTP/1.1 requests over a
+        // SINGLE downstream keep-alive conn against BOTH proxies in turn,
+        // then sleep `settle_ms` past the last request + scrape named
+        // admin stats and assert each side's value matches bilaterally.
+        //
+        // The discriminating-observable shape per parent-13 §2 item-iv:
+        // with separate per-request conns, `upstream_cx_total: N`. Under
+        // the H1 pool landed at 13.1 Tasks 3-4, `upstream_cx_total: 1` —
+        // all N requests reuse the single first-acquire conn. Fixture
+        // 0020 also asserts the 8 per-class downstream/upstream counters
+        // (downstream_rq_{2,3,4,5}xx + upstream_rq_{2,3,4,5}xx +
+        // downstream_rq_total + upstream_rq_total) to close the 06.3
+        // REVIEW I2 (a) wire-level per-class counter property at the
+        // bilateral seam.
+        //
+        // Per-side dispatch shape mirrors `Driver::Http1AfterSettle`
+        // (single-shot) for the request shape, and `Driver::AdminScrape`
+        // for the admin-port plumbing (`upstream.host_admin_port()` +
+        // `admin_host_port`). The settle sleep fires ONCE after both
+        // proxies have driven all requests; both sides converge under
+        // the same Relaxed-ordering visibility budget.
+        Driver::Http1KeepAlive {
+            requests,
+            settle_ms,
+            expected_stats,
+        } => {
+            use tokio::io::AsyncWriteExt;
+            let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http1KeepAlive requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
+                )
+            })?;
+            let subject_admin_port = admin_host_port.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http1KeepAlive requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
+                )
+            })?;
+            let upstream_admin_addr: SocketAddr =
+                format!("127.0.0.1:{upstream_admin_port}").parse()?;
+            let subject_admin_addr: SocketAddr =
+                format!("127.0.0.1:{subject_admin_port}").parse()?;
+            wait_accept_ready(upstream_admin_addr, budget)
+                .await
+                .context("upstream admin listener never became accept-ready")?;
+            wait_accept_ready(subject_admin_addr, budget)
+                .await
+                .context("envoy-rust admin listener never became accept-ready")?;
+
+            // For each proxy, open ONE TCP keep-alive conn and issue the
+            // full `requests` sequence on it. Drain each response's
+            // Content-Length body before issuing the next so the stream
+            // starts at a clean boundary; assert the per-request status
+            // matches `expected_status` so a hung response or class
+            // mismatch surfaces at the request boundary (not only at the
+            // post-settle scrape).
+            for (side_name, proxy_addr) in &[("upstream", upstream_addr), ("subject", subject_addr)]
+            {
+                let mut stream = tokio::net::TcpStream::connect(*proxy_addr)
+                    .await
+                    .with_context(|| format!("{side_name}: connecting to proxy {proxy_addr}"))?;
+                for req in requests {
+                    let wire = format!(
+                        "{} {} HTTP/1.1\r\nhost: {}\r\nconnection: keep-alive\r\n\r\n",
+                        req.method, req.path, req.host,
+                    );
+                    stream.write_all(wire.as_bytes()).await.with_context(|| {
+                        format!("{side_name}: writing request {} {}", req.method, req.path)
+                    })?;
+                    stream.flush().await.with_context(|| {
+                        format!("{side_name}: flushing request {} {}", req.method, req.path)
+                    })?;
+                    let resp_status =
+                        read_h1_response_status(&mut stream)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "{side_name}: reading response for {} {}",
+                                    req.method, req.path
+                                )
+                            })?;
+                    anyhow::ensure!(
+                        resp_status == req.expected_status,
+                        "{side_name}: expected status {} for {} {}, got {}",
+                        req.expected_status,
+                        req.method,
+                        req.path,
+                        resp_status,
+                    );
+                }
+                drop(stream);
+            }
+
+            // Single post-request settle: covers stat-write visibility on
+            // BOTH sides under the same Relaxed-ordering budget (SPEC §6
+            // signpost 11). A fixture-time bump may be needed if a future
+            // counter site lands behind a longer happens-before chain.
+            tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+
+            for stat in expected_stats {
+                let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
+                    .await
+                    .with_context(|| format!("upstream scraping stat {}", stat.name))?;
+                let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
+                    .await
+                    .with_context(|| format!("subject scraping stat {}", stat.name))?;
+                anyhow::ensure!(
+                    upstream_value == stat.value,
+                    "upstream stat {} expected {} got {}",
+                    stat.name,
+                    stat.value,
+                    upstream_value,
+                );
+                anyhow::ensure!(
+                    subject_value == stat.value,
+                    "subject stat {} expected {} got {}",
+                    stat.name,
+                    stat.value,
+                    subject_value,
+                );
+            }
+
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
         }
         Driver::Http1ProbeList { probes } => {
             // Iterate probes; per-probe equivalence cascade mirrors the
@@ -3407,6 +3719,50 @@ mod tests {
             .expect_err("must reject unknown nested field");
         let msg = err.to_string();
         assert!(msg.contains("unknown field"), "unexpected: {msg}");
+    }
+
+    /// 13.1 D10 Task 7: `Driver::Http1KeepAlive` round-trips through the
+    /// snake_case-tagged serde representation. Asserts the new variant
+    /// alongside the `Http1KeepAliveRequest` and `KeepAliveExpectedStat`
+    /// substructs parse from the on-disk YAML shape fixture 0020 uses
+    /// (snake_case `kind:` discriminator per the `Driver` enum's
+    /// `#[serde(tag = "kind", rename_all = "snake_case")]` attribute).
+    #[test]
+    fn driver_http1_keep_alive_round_trips_through_serde() {
+        let yaml = r#"
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /
+      host: backend_cluster
+      expected_status: 200
+  settle_ms: 100
+  expected_stats:
+    - name: cluster.backend_cluster.upstream_cx_total
+      value: 1
+"#;
+        let exp: crate::Expectations = serde_yaml::from_str(yaml).expect("yaml parses");
+        let Driver::Http1KeepAlive {
+            requests,
+            settle_ms,
+            expected_stats,
+        } = exp.driver
+        else {
+            panic!("expected Driver::Http1KeepAlive");
+        };
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/");
+        assert_eq!(requests[0].host, "backend_cluster");
+        assert_eq!(requests[0].expected_status, 200);
+        assert_eq!(settle_ms, 100);
+        assert_eq!(expected_stats.len(), 1);
+        assert_eq!(
+            expected_stats[0].name,
+            "cluster.backend_cluster.upstream_cx_total"
+        );
+        assert_eq!(expected_stats[0].value, 1);
     }
 
     #[test]

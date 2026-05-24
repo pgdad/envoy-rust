@@ -133,43 +133,86 @@ fn per_class_body(status: u16) -> &'static [u8] {
 }
 
 async fn serve(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
-    let mut buf = vec![0u8; 8192];
-    let mut filled = 0;
-    let head_end = loop {
-        let n = stream.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            bail!("EOF before headers complete");
+    // 13.1 Task 7 (D9.1): HTTP/1.1 keep-alive support. The 12.2 D7.1
+    // single-shot shape (one request, write response with
+    // `connection: close`, shutdown) was fine for fixture 0019's
+    // active-HC probe (one request per conn) but breaks fixture 0020's
+    // H1-pool-reuse assertion (the H1 pool needs the backend to keep
+    // the upstream conn alive across N requests so `upstream_cx_total`
+    // can read 1 instead of N — the discriminating observable per
+    // parent-13 SPEC §6.2 item-iv).
+    //
+    // Policy: HTTP/1.1 default is keep-alive UNLESS the request carries
+    // `Connection: close`. When the request says close (or signals EOF
+    // between requests), the loop exits and the helper shuts down the
+    // conn. Otherwise the response carries `connection: keep-alive` and
+    // the loop reads the next request on the same conn.
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    loop {
+        // Read until we have a full request head (`\r\n\r\n` terminator).
+        let head_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                // Clean EOF between requests — peer closed; this is fine.
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                bail!("EOF before headers complete");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > 8192 {
+                bail!("request headers too large");
+            }
+        };
+        let mut headers_storage = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers_storage);
+        req.parse(&buf[..head_end])?;
+        let path = req.path.unwrap_or("/").to_string();
+        // Detect request-side `Connection: close` (case-insensitive). HTTP/1.1
+        // default is keep-alive when the header is absent or carries any
+        // non-`close` token (e.g. `keep-alive`).
+        let request_wants_close = req.headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("connection")
+                && std::str::from_utf8(h.value)
+                    .map(|s| s.eq_ignore_ascii_case("close"))
+                    .unwrap_or(false)
+        });
+        // Drop the consumed bytes from the buffer; any pipelined bytes
+        // beyond `head_end` carry forward into the next request's window.
+        buf.drain(..head_end);
+        let (status, body): (u16, Vec<u8>) = if let Some(&s) = cfg.per_path.get(&path) {
+            // 13.1 D8: per-path mapping wins.
+            (s, per_class_body(s).to_vec())
+        } else if path == "/healthz" {
+            (cfg.healthz_status, Vec::new())
+        } else {
+            (cfg.data_status, cfg.data_body.clone())
+        };
+        let conn_value = if request_wants_close {
+            "close"
+        } else {
+            "keep-alive"
+        };
+        let resp = format!(
+            "HTTP/1.1 {status} {reason}\r\nserver: health-aware-http1-backend\r\ncontent-length: {len}\r\ncontent-type: text/plain\r\nconnection: {conn_value}\r\n\r\n",
+            status = status,
+            reason = status_reason(status),
+            len = body.len(),
+        );
+        stream.write_all(resp.as_bytes()).await?;
+        if !body.is_empty() {
+            stream.write_all(&body).await?;
         }
-        filled += n;
-        if let Some(pos) = buf[..filled].windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
+        stream.flush().await?;
+        if request_wants_close {
+            let _ = stream.shutdown().await;
+            return Ok(());
         }
-        if filled == buf.len() {
-            bail!("request headers too large");
-        }
-    };
-    let mut headers_storage = [httparse::EMPTY_HEADER; 32];
-    let mut req = httparse::Request::new(&mut headers_storage);
-    req.parse(&buf[..head_end])?;
-    let path = req.path.unwrap_or("/").to_string();
-    let (status, body): (u16, Vec<u8>) = if let Some(&s) = cfg.per_path.get(&path) {
-        // 13.1 D8: per-path mapping wins.
-        (s, per_class_body(s).to_vec())
-    } else if path == "/healthz" {
-        (cfg.healthz_status, Vec::new())
-    } else {
-        (cfg.data_status, cfg.data_body.clone())
-    };
-    let resp = format!(
-        "HTTP/1.1 {status} {reason}\r\nserver: health-aware-http1-backend\r\ncontent-length: {len}\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\n",
-        status = status,
-        reason = status_reason(status),
-        len = body.len(),
-    );
-    stream.write_all(resp.as_bytes()).await?;
-    stream.write_all(&body).await?;
-    let _ = stream.shutdown().await;
-    Ok(())
+    }
 }
 
 fn status_reason(status: u16) -> &'static str {
