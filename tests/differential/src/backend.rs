@@ -274,11 +274,13 @@ impl HealthAwareHttp1Backend {
             .kill_on_drop(true)
             .spawn()
             .context("spawning health-aware-http1-backend")?;
-        // Brief readiness poll: connect to 127.0.0.1:port with retry up to ~3s.
+        // Brief readiness poll: connect to 127.0.0.1:port with retry up to ~30s
+        // (CI cold-build budget; the helper binary may take >10s to compile via
+        // `cargo run --manifest-path` on a cold cargo target/).
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
             .parse()
             .context("parsing readiness-probe addr")?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
                 break;

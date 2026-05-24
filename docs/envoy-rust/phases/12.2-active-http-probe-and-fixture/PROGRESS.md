@@ -1058,4 +1058,90 @@ state-3 reviews (each Task's deferred-minor inventory captured in the
 per-Task subsections above) + verifies M2's `Scheduler::spawn`
 one-task-per-(cluster, endpoint) topology bilaterally.
 
+### Task 8 follow-up — CI cold-build readiness-deadline fix — THIS commit
+
+**CI failure root cause (deterministic, NOT a flake).** CI run
+`26345311915` for HEAD `8dbea41` (the Task 8 state-4 verification commit)
+settled `completed / failure` in 1m48s on the `build + test + lint` job —
+the `differential::tests::upstream_active_health_check_fixture` test
+panicked with `health-aware-http1-backend did not become ready` at
+`tests/differential/tests/upstream_active_health_check.rs:28:10`,
+total runtime 3.05s (matches the 3-second readiness deadline at
+`tests/differential/src/backend.rs:281`). CI runs for HEAD commits
+`cc8e531` (Task 5), `e259f70` (Task 6), `39e55a5` (Task 7), and
+`8dbea41` (Task 8) are ALL `completed / failure` with the same
+signature — a 4-commit-in-a-row deterministic CI red, not a flake.
+Locally the helper binary is pre-cached by `cargo build --workspace
+--all-targets` so the readiness poll completes near-instantly; on CI's
+cold cargo target/ path the test's `cargo run --manifest-path
+tests/helpers/health-aware-http1-backend/Cargo.toml` triggers a fresh
+compile of the helper binary that consistently exceeds 3s (the CI log
+for run `26345311915` shows "Compiling health-aware-http1-backend"
+landing well after the 3s readiness deadline elapsed). The state-4
+verification (Task 8 PROGRESS subsection above) ran on the locally
+warm-cached path and missed this CI-cold-build asymmetry.
+
+**Fix (mechanical, low-risk).** One-line edit at
+`tests/differential/src/backend.rs:281`: bump the
+`HealthAwareHttp1Backend::spawn()` readiness deadline from
+`Duration::from_secs(3)` to `Duration::from_secs(30)` (~10× margin for
+CI cold-build budget; matches the in-process backstop's 10s
+`wait_ready` default budget shape at
+`crates/envoy-bin/tests/upstream_active_health_check.rs`). The
+companion comment at `:277` updated from "Brief readiness poll: connect
+to 127.0.0.1:port with retry up to ~3s." → "Brief readiness poll:
+connect to 127.0.0.1:port with retry up to ~30s (CI cold-build budget;
+the helper binary may take >10s to compile via `cargo run
+--manifest-path` on a cold cargo target/)." No other code change.
+
+**In-phase recovery framing.** State-3 re-entry equivalent per
+`BOOTSTRAP_PROMPT.md` §5.2 — but this is a state-4-gate CI-red issue
+(the §7.5 (a)+(b) sub-gates require CI-green at HEAD, and the Task 8
+state-4 verification mis-attested those gates because the local
+verification path was warm-cached), NOT a state-5 REVIEW.md feedback
+re-entry. Same procedural shape, same recovery cadence. **Landed as a
+follow-up commit rather than amend-and-force-push** (Task 8 was already
+pushed to origin; the system safety protocol forbids force-push to
+main; mirrors the Task 4 follow-up `9ce6d61` precedent which used the
+identical follow-up shape for an in-phase code-quality fix).
+
+**Local-gate re-confirmation post-fix (5 stable-toolchain gates clean
+at THIS commit):**
+
+- `cargo build --workspace --all-targets` → `Finished dev profile
+  [unoptimized + debuginfo] target(s) in 1m 00s` (one differential
+  recompile for the edited backend.rs).
+- `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` → `Finished dev profile [unoptimized + debuginfo]
+  target(s) in 58.52s`, no warnings.
+- `cargo fmt --all -- --check` → clean (exit 0; no diff).
+- `cargo test --workspace` → **844 passed / 0 failed / 2 ignored**
+  (unchanged from Task 8 baseline — the bump is a constant-only edit
+  in test infrastructure, no test logic change).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources
+  ok` (the pre-existing `Unicode-DFS-2016` + `Zlib` unmatched-license
+  warnings remain, harmless).
+
+**STATE.md posture.** STATE.md was already advanced to state-5-next at
+the Task 8 commit `8dbea41`; THIS follow-up does NOT re-advance — it
+only appends PROGRESS. The state-5 review session (NEXT session)
+operates over the reviewed range `6a3b332..HEAD` (now the 8 task
+commits + the Task 4 follow-up `9ce6d61` + the Task 8 state-4 docs
+commit `8dbea41` + THIS Task 8 CI-fix follow-up commit).
+
+**ADR posture.** No ADR landed (the readiness-deadline bump is a
+mechanical environmental fix to test infrastructure, not a contract
+decision). DECISIONS.md ledger head stays **ADR-0037**; next available
+**ADR-0038**.
+
+**§7.5 gate re-attestation (deferred to CI confirmation).** The local
+gates above hold; the CI gate that the Task 8 state-4 verification
+mis-attested (§7.5 (b) — pre-existing differential fixtures green
+simultaneously) re-attests via the CI run on THIS commit. If CI
+settles `success`, the §7.5 (a)+(b) sub-gates are closed bilaterally
+(local + CI); the state-5 review proceeds. If CI settles `failure`
+again, the 30s bump is insufficient and a deeper investigation
+(systematic-debugging) is required — likely a further bump (60s, 120s)
+or an explicit pre-build step in the test setup.
+
 
