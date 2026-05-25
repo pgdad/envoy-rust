@@ -112,10 +112,30 @@ impl Drop for PoolGuard {
     fn drop(&mut self) {
         let pool = Arc::clone(&self.pool);
         let endpoint = self.endpoint;
-        match self.stream.take() {
+        let stream = self.stream.take();
+        // 13.1 state-5 fold-in (REVIEW Cluster A I1): guard `tokio::spawn`
+        // behind `Handle::try_current()`. Without a current runtime
+        // (process shutdown mid-drain, `#[tokio::test]` runtime exit
+        // before all guards drop, panic-during-test), `tokio::spawn`
+        // panics with "there is no reactor running" — which would mask
+        // the actual shutdown / test-failure cause. On Err we drop the
+        // stream synchronously (its own Drop closes the TCP socket) and
+        // skip the async return-to-pool + established-decrement
+        // bookkeeping — the runtime is gone, the pool is about to be
+        // dropped, so the bookkeeping is moot. `cx_destroy.inc()` on the
+        // invalidate path stays synchronous (counter inc does not need a
+        // runtime). `_cx_active_guard`'s Drop still fires at field-drop
+        // time → upstream_cx_active.dec().
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            if stream.is_none() {
+                pool.cx_destroy.inc();
+            }
+            return;
+        };
+        match stream {
             Some(stream) => {
                 // Return-to-pool: synchronous Drop cannot .await, so spawn.
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     let mut idle = pool.idle.lock().await;
                     idle.entry(endpoint).or_default().push(IdleEntry {
                         stream,
@@ -126,7 +146,7 @@ impl Drop for PoolGuard {
             None => {
                 // Destroy path (invalidated): decrement established + count destroy.
                 pool.cx_destroy.inc();
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     let mut est = pool.established.lock().await;
                     if let Some(n) = est.get_mut(&endpoint) {
                         *n = n.saturating_sub(1);
@@ -243,7 +263,14 @@ impl H1Pool {
         token: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let pool = Arc::clone(self);
-        let interval_period = pool.idle_timeout / SWEEPER_DIVISOR;
+        // 13.1 state-5 fold-in (REVIEW Cluster A I2): clamp interval to ≥1ms.
+        // `tokio::time::interval(Duration::ZERO)` panics; today
+        // `DEFAULT_IDLE_TIMEOUT = 60s` makes `idle_timeout / SWEEPER_DIVISOR =
+        // 15s` (safe), but `H1Pool::new` accepts `idle_timeout: Duration`
+        // publicly and SPEC §2 item-iii defers a future config-driven knob —
+        // defensive clamp so a zero/sub-4ns idle_timeout cannot crash the
+        // sweeper.
+        let interval_period = (pool.idle_timeout / SWEEPER_DIVISOR).max(Duration::from_millis(1));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval_period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -559,5 +586,52 @@ admin:
             "expected cluster.c1.upstream_cx_http1_total in registry; got: {:?}",
             snapshot.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    /// 13.1 state-5 fold-in (REVIEW Cluster A I1): dropping a `PoolGuard`
+    /// outside any tokio runtime must NOT panic. Pre-fix, `tokio::spawn`
+    /// in `Drop` panicked with "there is no reactor running" when a guard
+    /// outlived its runtime. Post-fix, `Handle::try_current()` returns
+    /// `Err` and Drop completes synchronously (stream + ConnGaugeGuard
+    /// drop in place; the async return-to-pool / established-decrement
+    /// is skipped).
+    #[test]
+    fn pool_guard_drop_outside_runtime_does_not_panic() {
+        // Build the pool + acquire a guard inside a short-lived runtime.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (pool, _cx_total, _cx_destroy, _cx_http1_total, cx_active) =
+            rt.block_on(async { mk_pool("c", 4, Duration::from_secs(60)) });
+        let addr = rt.block_on(echo_backend());
+        let guard = rt.block_on(pool.acquire(addr, "h")).expect("acquire");
+        assert_eq!(cx_active.value(), 1);
+        // Shut the runtime down BEFORE dropping the guard. The runtime is
+        // now gone — Drop must not panic.
+        drop(rt);
+        drop(guard); // would panic pre-fix on tokio::spawn
+        // _cx_active_guard's Drop still fires synchronously → gauge decrements.
+        assert_eq!(
+            cx_active.value(),
+            0,
+            "cx_active decrements via synchronous ConnGaugeGuard::Drop even without runtime"
+        );
+    }
+
+    /// 13.1 state-5 fold-in (REVIEW Cluster A I2): a zero or sub-4ns
+    /// `idle_timeout` must not panic the sweeper. Pre-fix,
+    /// `tokio::time::interval(Duration::ZERO)` panicked at sweeper spawn;
+    /// post-fix the interval is clamped to ≥1ms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_idle_sweeper_with_zero_idle_timeout_does_not_panic() {
+        let (pool, _cx_total, _cx_destroy, _cx_http1_total, _cx_active) =
+            mk_pool("c", 4, Duration::ZERO);
+        let token = CancellationToken::new();
+        let sweeper = pool.spawn_idle_sweeper(token.clone());
+        // Let the sweeper tick at least once with the clamped 1ms interval.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        token.cancel();
+        sweeper.await.expect("sweeper must exit cleanly, not panic");
     }
 }

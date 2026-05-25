@@ -1576,3 +1576,126 @@ in the title** (no ADR landed at the state-4 verification commit).
 
 Spec ✅ — matches PLAN Task 10 Steps 1-8 + the 12.2 state-4 commit
 precedent.
+
+---
+
+## Task 10 state-5 review fold-in — close A-I1 + A-I2 + access-log flake mitigation
+
+Per `BOOTSTRAP_PROMPT.md` §5.2 (review feedback re-entry to state 3
+for mechanical fixes), this commit closes the 2 Important findings
+surfaced by the 13.1 state-5 3-cluster code review pass +
+opportunistically lands the recommended Minor-track access-log
+flake mitigation per the prompt's "recommended posture" guidance.
+Mirrors the 12.2 state-5 fold-in commit `adc50b7` cadence (in-phase
+recovery via a NEW commit — NOT amend-and-force-push per the
+standing git-amend safety protocol).
+
+**Cluster A I1 (PoolGuard::Drop tokio::spawn runtime-availability
+guard) — CLOSED.** Pre-fix `crates/envoy-http1/src/pool.rs:118` +
+`:129` called `tokio::spawn` unconditionally inside `Drop`. If a
+`PoolGuard` was ever dropped after the tokio runtime shut down
+(e.g. fast SIGTERM mid-drain, a guard outliving an `#[tokio::test]`
+runtime exit before all guards drop, panic-during-test), the spawn
+would panic with `"there is no reactor running"` — which would mask
+the actual shutdown / test-failure cause. Post-fix, the Drop impl
+first calls `tokio::runtime::Handle::try_current()`; on `Err`, it
+drops the stream synchronously (its own Drop closes the TCP socket)
+and skips the async return-to-pool / established-decrement
+bookkeeping — the runtime is gone, the pool is about to be dropped,
+so the bookkeeping is moot. `cx_destroy.inc()` on the invalidate
+path stays synchronous (counter inc does not need a runtime).
+`_cx_active_guard`'s Drop still fires at field-drop time →
+`upstream_cx_active.dec()`. New TDD regression test
+`pool_guard_drop_outside_runtime_does_not_panic` builds the pool +
+acquires a guard inside a short-lived `Builder::new_current_thread`
+runtime, drops the runtime, THEN drops the guard — pre-fix this
+would panic; post-fix the test passes + `cx_active` correctly
+decrements to 0.
+
+**Cluster A I2 (sweeper interval clamp ≥1ms) — CLOSED.** Pre-fix
+`pool.rs:246` computed `interval_period = pool.idle_timeout /
+SWEEPER_DIVISOR` (= idle_timeout / 4). Today the only producer is
+`DEFAULT_IDLE_TIMEOUT = 60s` → 15s (safe), but `H1Pool::new`
+accepts `idle_timeout: Duration` publicly and SPEC §2 item-iii
+defers a future config-driven knob. A `Duration::ZERO` or sub-4ns
+`idle_timeout` would cause `tokio::time::interval(Duration::ZERO)`
+to panic at sweeper spawn. Post-fix, the interval is clamped to
+`.max(Duration::from_millis(1))` — one-line defensive guard. New
+TDD regression test
+`spawn_idle_sweeper_with_zero_idle_timeout_does_not_panic`
+constructs a pool with `idle_timeout: Duration::ZERO`, spawns the
+sweeper, sleeps 10ms (the clamped interval ticks at least once),
+cancels the token, and asserts the sweeper exits cleanly without
+panic.
+
+**Access-log flake mitigation (REVIEW §4 Minor M-track) — LANDED.**
+Per the prompt's "recommended posture" referencing the 12.2
+state-5 Task 8 follow-up `b1cb25c` precedent (the CI cold-cache
+readiness-deadline bump). CI run `26375100437` at predecessor HEAD
+`13bb5cc` (Task 9 PROGRESS close-out) failed on
+`access_log_file_sink` with `envoy=1 envoy-rust=0 line count
+mismatch` — an environmental flake where envoy-rust's
+fire-and-forget access-log emit task hadn't flushed when the
+harness's post-exists 100ms sleep elapsed. CI run `26377609763` at
+HEAD `592d9e7` (the state-4 commit) settled GREEN, confirming the
+flake was transient — not a regression from Tasks 8/9. The fix at
+`tests/differential/src/lib.rs:2876-2899` replaces the
+"wait-for-files-to-EXIST" loop with a "wait-for-files-to-be-NON-EMPTY"
+loop, closing the race deterministically while preserving the
+existing 5s budget. The harness still applies the final 100ms
+OS-flush yield as belt-and-suspenders for any in-flight bytes that
+crossed the metadata-len threshold but haven't fully landed. No
+new TDD regression test — the race is environmental (depends on
+the OS scheduler + disk pressure) and not deterministically
+reproducible; the structural fix + the existing
+`access_log_file_sink` CI re-attestation are the verification.
+
+**Cluster A I3 (spurious-overflow race under concurrent
+acquire/release) — DEFERRED to 13.2** per the reviewer's own
+recommendation. The cleanest fix is to make Drop's return-to-pool
+synchronous via `try_lock` or a lock-free per-endpoint slot —
+that's a non-trivial design choice that should be made jointly
+with the H2 pool's analogous path at 13.2. Documented as
+carryforward `A-I3 → 13.2 D5/D6` in REVIEW.md §4.
+
+**§7.5 gate re-attestation (all GREEN on a fresh local run at
+THIS commit):**
+
+- `cargo build --workspace --all-targets` → `Finished` in 10.92s (warm).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  → `Finished` in 1m 33s, zero warnings.
+- `cargo fmt --all -- --check` → clean (no diff).
+- `cargo test --workspace` → **867 passed / 0 failed / 2 ignored
+  across 74 result lines** (+2 over the state-4 baseline 865 = the
+  2 new A-I1 + A-I2 regression tests).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok,
+  sources ok` (benign unmatched-license-allowance notices
+  unchanged from prior phases).
+- `cargo test -p envoy-http1 --lib pool` → 10 passed / 0 failed /
+  0 ignored (the 8 prior pool tests + the 2 new A-I1 + A-I2
+  regression tests). Verifies the fold-in doesn't regress any
+  prior pool test.
+
+**Files touched at THIS commit (3):**
+
+- `crates/envoy-http1/src/pool.rs` — Drop runtime-availability
+  guard (A-I1) + sweeper interval clamp (A-I2) + 2 new TDD
+  regression tests in the existing `#[cfg(test)] mod tests` block.
+- `tests/differential/src/lib.rs` — access-log loop's exists-only
+  predicate replaced with non-empty predicate (REVIEW §4 mitigation).
+- `docs/envoy-rust/phases/13.1-h1-pool-and-fixture/PROGRESS.md` —
+  this fold-in subsection.
+
+**No production-code change beyond the 3 named fixes; no
+BEHAVIOR_CONTRACT / SPEC / PLAN / DECISIONS change; no Cargo.toml /
+Cargo.lock change; no ROADMAP change** (row `13.1` stays
+`in-progress`); no ENVOY_TARGET.md / rust-toolchain.toml change;
+no `unsafe` introduced. **No `[ADR-NNNN]` bracket in the title**
+(no ADR landed at the fold-in). DECISIONS.md ledger head stays
+**ADR-0038**; next available **ADR-0039**.
+
+Spec ✅ — closes A-I1 + A-I2 mechanically per §5.2; lands the
+recommended access-log flake mitigation per the prompt's posture +
+the 12.2 state-5 follow-up precedent. Next session writes
+REVIEW.md attesting "Approved with M-track follow-ups" with both
+Importants marked CLOSED at this fold-in commit.

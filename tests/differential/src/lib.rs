@@ -2873,19 +2873,33 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 }
             }
 
-            // Access-log files. Wait up to 5s for both files to appear (the
-            // synchronous-after-write dispatch should have emitted before the
-            // response completed, but flush timing is best-effort).
+            // Access-log files. Wait up to 5s for both files to be NON-EMPTY
+            // (the fire-and-forget access-log emit task on envoy-rust runs
+            // after the response completes, so post-exists the file may still
+            // be empty for tens of ms while the OS buffers the write). 13.1
+            // state-5 fold-in (REVIEW §4 access-log flake mitigation):
+            // previously the loop waited for files to EXIST, which was racy —
+            // CI run `26375100437` at HEAD `13bb5cc` failed with `envoy=1
+            // envoy-rust=0` because envoy-rust's path existed (the FileSink
+            // creates the file at open time) but the emit task had not yet
+            // flushed when the harness reached the post-exists 100ms sleep.
+            // Polling for non-empty contents closes the race deterministically.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
             let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
-            while std::time::Instant::now() < deadline {
-                if envoy_path.exists() && envoy_rust_path.exists() {
+            loop {
+                let both_nonempty = envoy_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                    && envoy_rust_path
+                        .metadata()
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false);
+                if both_nonempty || std::time::Instant::now() >= deadline {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            // One final yield to let the OS flush.
+            // One final yield to let the OS flush any in-flight bytes that
+            // crossed the metadata-len threshold but haven't fully landed.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
