@@ -114,31 +114,84 @@ impl H2PoolGuard {
 
 impl Drop for H2PoolGuard {
     fn drop(&mut self) {
-        // Decrement active_streams on the entry. If we just went from 1
-        // → 0, mark the entry idle for the sweeper.
-        let prev = self.entry.active_streams.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(prev >= 1, "H2PoolGuard::drop with active_streams == 0");
-        if prev == 1 {
-            *self.entry.last_idle.lock() = Some(Instant::now());
-        }
+        // Two distinct paths — see the comments below. The split is
+        // load-bearing: the INVALIDATE path must serialize the
+        // `active_streams.fetch_sub` AND the list-eviction under the
+        // SAME `connections` lock that `acquire()`'s Phase-1 walker
+        // takes, otherwise a TOCTOU race lets a concurrent acquire
+        // claim a slot on an entry we're about to evict (Task 1
+        // code-quality review CRITICAL fix).
         if self.invalidated {
-            // Remove the entry from the per-endpoint list. Connections and
-            // established are separate `parking_lot::Mutex`es — locking is
-            // synchronous; no `.await`.
-            {
-                let mut conns = self.pool.connections.lock();
-                if let Some(list) = conns.get_mut(&self.endpoint) {
-                    list.retain(|e| !Arc::ptr_eq(e, &self.entry));
-                }
+            // INVALIDATE PATH (race-critical):
+            //
+            // Take the `connections` lock BEFORE decrementing
+            // `active_streams`. A Phase-1 walker in `acquire()` holds
+            // this same lock while iterating the per-endpoint list and
+            // CAS'ing on each entry's `active_streams` — so while we
+            // hold the lock here, no walker can reach this entry's CAS
+            // site. Under the lock we (1) decrement `active_streams`,
+            // (2) retain the entry out of the per-endpoint list. Once
+            // the entry is gone from the list, a future walker can no
+            // longer see it. Walkers already inside the lock either
+            // already passed this entry (their CAS happened pre-evict;
+            // benign — see the analysis below) or hadn't reached it
+            // yet (post-retain they'll skip the now-absent entry).
+            //
+            // Concretely, the pre-fix race was:
+            //   T_B `fetch_sub` (no lock) → potentially 0
+            //   T_A grabs `connections` lock, CAS'es this entry 0→1
+            //       (claims a slot), releases lock
+            //   T_B grabs `connections` lock, retains entry out of
+            //       list, decrements `established` — but T_A still
+            //       holds an `H2PoolGuard` against the orphaned entry,
+            //       with `cx_destroy` falsely fired and
+            //       `max_connections` accounting off-by-one.
+            // Post-fix: T_B holds the lock for the entire decrement +
+            // retain, so T_A's CAS cannot land between them.
+            let mut conns = self.pool.connections.lock();
+            let prev = self.entry.active_streams.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(prev >= 1, "H2PoolGuard::drop with active_streams == 0");
+            if let Some(list) = conns.get_mut(&self.endpoint) {
+                list.retain(|e| !Arc::ptr_eq(e, &self.entry));
             }
+            drop(conns);
+            // `established` + `cx_destroy` are pool-level book-keeping;
+            // they don't gate slot-claim, so we can release `connections`
+            // before taking `established`.
             {
                 let mut est = self.pool.established.lock();
                 if let Some(n) = est.get_mut(&self.endpoint) {
                     *n = n.saturating_sub(1);
                 }
             }
-            // Counter inc is sync — no runtime needed.
             self.pool.cx_destroy.inc();
+        } else {
+            // RETURN-TO-POOL PATH (no eviction):
+            //
+            // No `connections` lock needed — we're not evicting the
+            // entry, just releasing one stream slot back to its
+            // multiplex pool. `active_streams.fetch_sub` outside any
+            // lock is benign:
+            //   * If a concurrent Phase-1 walker CAS'es this entry's
+            //     `active_streams` from N to N+1 before our fetch_sub
+            //     lands, the final value is the same and no eviction
+            //     happens — fine.
+            //   * The `last_idle` write (only when `prev == 1`, i.e. we
+            //     transitioned to 0) is benign by the sweeper's
+            //     early-return: `sweep_once` checks
+            //     `active_streams.load() > 0` BEFORE consulting
+            //     `last_idle`, so a stale `Some(now)` written after a
+            //     concurrent claim already bumped `active_streams`
+            //     back to ≥1 never causes spurious eviction.
+            //   * `acquire()`'s `try_claim_stream_slot` writes
+            //     `last_idle = None` AFTER a successful 0→1 CAS, but
+            //     even without that the sweeper's `active_streams != 0`
+            //     check is the load-bearing guard.
+            let prev = self.entry.active_streams.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(prev >= 1, "H2PoolGuard::drop with active_streams == 0");
+            if prev == 1 {
+                *self.entry.last_idle.lock() = Some(Instant::now());
+            }
         }
         // _cx_active_guard's Drop fires here → upstream_cx_active.dec().
     }

@@ -192,3 +192,28 @@ Lands the architecturally headline 13.2 D5 deliverable per PLAN Task 1: a new `c
 **New envoy-cluster surface (`cx_active_arc`):** The accessor returns a borrow `&Arc<envoy_stats::Gauge>` (not a clone) so the debug-assert site doesn't unnecessarily bump the Arc refcount. Mirrors the existing `cx_total()` accessor's borrow shape. Doc-commented to name the A-M2 closure as the consumer + the single-bootstrap-per-process invariant as the load-bearing precondition.
 
 **Commit SHA:** `1c954cf` (final HEAD after the single Task 1 commit; the PROGRESS subsection was folded in via `git commit --amend` so the SHA is self-referential — one commit per task per the 13.1 cadence).
+
+### Task 1 fold-in — code-quality review closures
+
+Follow-up commit appended after `f692b53` (Task 1's main commit). Addresses two findings from the code-quality reviewer running against `f692b53`:
+
+- **CRITICAL: H2 `H2PoolGuard::drop` invalidate-path TOCTOU race — CLOSED.** The pre-fix Drop ran `active_streams.fetch_sub` OUTSIDE the `connections` lock and then took the lock to retain the entry out of the per-endpoint list. Between the unlocked decrement and the lock acquisition, a concurrent Phase-1 walker in `acquire()` (which holds the `connections` lock while iterating + CAS'ing) could observe `active_streams` already decremented (potentially to 0), claim a slot via CAS, build an `H2PoolGuard` against the entry, and release the lock — at which point our Drop would proceed to evict the entry, decrement `established`, and fire `cx_destroy`, leaving the concurrent acquirer holding a guard against an orphaned entry, breaking `max_connections` accounting and falsely firing `cx_destroy`. Post-fix: the invalidate branch takes the `connections` lock BEFORE `fetch_sub` and holds it across both the decrement and the `retain`, so no Phase-1 walker can claim a slot on an entry we're about to evict. The non-invalidate (return-to-pool) branch keeps the original lock-free `fetch_sub` — analysis written into the Drop body comment shows the residual race is benign by virtue of the sweeper's `active_streams != 0` early-return + `try_claim_stream_slot`'s `last_idle = None` write after CAS-success.
+- **IMPORTANT: H1 race-regression test strengthening — CLOSED.** Added a NEW H1 pool test `pool_acquire_after_concurrent_release_1000_iterations_zero_spurious_overflows` (kept the existing 32-iter structural test alongside it). Same drop_task.await shape as the existing test but at 1000 iterations — probabilistically exercises the pre-fix race window (the `tokio::spawn`-from-Drop deferred established-decrement). Pre-fix, the spawn-from-Drop's inner task could lag behind the outer `drop_task.await`'s return; at 1000 iterations the missed-decrement window would have surfaced reliably. Post-fix sync Drop produces 0 spurious Overflows over all 1000 iterations (test completes in ~90ms on a modern dev box). The H2 race-fix correctness is structurally covered by the CRITICAL fix above + the existing `invalidate_evicts_entry_and_increments_cx_destroy` + `pool_acquire_after_concurrent_release_does_not_yield_spurious_overflow` tests (the H2 race window is now structurally closed by the lock ordering in Drop — a probabilistic test is not load-bearing on the H2 side).
+
+**Files touched:**
+
+- `crates/envoy-http2/src/pool.rs` — `Drop for H2PoolGuard` rewritten with the invalidate vs. return-to-pool path split; extensive comment block in the Drop body documenting the race + the fix's correctness argument (the analysis verifying that a concurrent Phase-1 walker cannot reach the to-be-evicted entry's CAS site while we hold the `connections` lock).
+- `crates/envoy-http1/src/pool.rs` — new test `pool_acquire_after_concurrent_release_1000_iterations_zero_spurious_overflows` added alongside the existing 32-iter test.
+- `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` — this subsection.
+
+**Per-gate clean outputs (touched crates):**
+
+- `cargo build -p envoy-http1 -p envoy-http2 --all-targets` — `Finished \`dev\` profile`, no warnings.
+- `cargo clippy -p envoy-http1 -p envoy-http2 --all-targets --all-features -- -D warnings` — `Finished \`dev\` profile`, no diagnostics.
+- `cargo fmt --all -- --check` — exit 0.
+- `cargo test -p envoy-http1 --lib` — `test result: ok. 83 passed; 0 failed; 0 ignored` (net +1 from the new 1000-iter stress test).
+- `cargo test -p envoy-http2 --lib` — `test result: ok. 53 passed; 0 failed; 1 ignored` (unchanged from `f692b53`; the existing tests cover the fixed Drop semantics structurally).
+
+**Test count delta:** envoy-http1 pool tests 9 → 10 (net +1). envoy-http2 pool tests unchanged.
+
+**Commit SHA:** to be filled in by the appended commit (will be self-referential after fold-in).

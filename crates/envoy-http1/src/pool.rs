@@ -678,6 +678,56 @@ admin:
         }
     }
 
+    /// 13.2 Task 1 fold-in (code-quality review IMPORTANT): the
+    /// existing structural test
+    /// (`pool_acquire_after_concurrent_release_does_not_yield_spurious_overflow`)
+    /// runs 32 iterations and asserts the happens-before invariant
+    /// after `drop_task.await`. The reviewer correctly observed that
+    /// invariant alone would also hold under async Drop AS LONG AS the
+    /// spawned drop task completes its full body before its `await`
+    /// returns. Pre-fix, `drop(g1)` inside the spawned closure
+    /// INTERNALLY spawned a SECOND task (via the
+    /// `Handle::try_current()` branch) to do the established-decrement
+    /// — so the outer `drop_task.await` could return BEFORE the
+    /// established-decrement landed; with low iteration counts that
+    /// race window was easy to miss. THIS test runs the SAME shape at
+    /// 1000 iterations to make the pre-fix race window probabilistically
+    /// detectable. Post-fix Drop is fully synchronous (no inner spawn)
+    /// so the 1000-iter loop must produce 0 spurious Overflows.
+    ///
+    /// Runtime: well under 10s on a modern dev box (the echo_backend
+    /// returns each response in microseconds; the pool's parking_lot
+    /// locks are uncontended).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pool_acquire_after_concurrent_release_1000_iterations_zero_spurious_overflows() {
+        let addr = echo_backend().await;
+        let (pool, _cx_total, _cx_destroy, _cx_http1_total, _cx_active) =
+            mk_pool("stress", 1, Duration::from_secs(60));
+        let mut spurious_overflows = 0;
+        for _ in 0..1000 {
+            let pool_a = Arc::clone(&pool);
+            let pool_b = Arc::clone(&pool);
+            // Pre-acquire + invalidate so the drop runs the destroy-path
+            // (decrement established) — the path the A-I3 race lived on.
+            let mut g1 = pool_a.acquire(addr, "h").await.expect("pre-acquire");
+            g1.invalidate();
+            let drop_task = tokio::spawn(async move {
+                drop(g1);
+            });
+            let _ = drop_task.await;
+            match pool_b.acquire(addr, "h").await {
+                Ok(_g2) => { /* expected post-fix */ }
+                Err(PoolError::Overflow { .. }) => spurious_overflows += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(
+            spurious_overflows, 0,
+            "post-fix sync Drop must produce 0 spurious Overflows over 1000 iterations \
+             (saw {spurious_overflows} — race window not fully closed)"
+        );
+    }
+
     /// 13.1 state-5 fold-in (REVIEW Cluster A I2): a zero or sub-4ns
     /// `idle_timeout` must not panic the sweeper. Pre-fix,
     /// `tokio::time::interval(Duration::ZERO)` panicked at sweeper spawn;
