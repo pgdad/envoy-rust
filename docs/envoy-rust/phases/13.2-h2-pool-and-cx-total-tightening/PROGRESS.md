@@ -258,7 +258,7 @@ reuse end-to-end through the HCM dispatch path.
 
 - **Lock-in #7 (H1-cluster-in-H2-HCM stays untouched):** APPLIED. The `UpstreamProtocol::Http1` arm at `hcm.rs:273-284` retains its per-call `envoy_http1::Client::connect` + `cluster.cx_total().inc()` + outer `cx_active_guard` via the conditional `Some(cluster.cx_active_guard())` branch. No migration.
 
-- **Lock-in #8 (outer `_cx_guard` relocation):** APPLIED. The unconditional `let _cx_guard = cluster.cx_active_guard();` at `hcm.rs:269` (pre-edit) is replaced by a `match cluster.upstream_protocol() { Http1 => Some(cluster.cx_active_guard()), Http2 => None }` block. The H1 arm continues to hold the gauge guard for the full dispatch scope; the H2 arm holds `None` because the `H2PoolGuard` owns its own `ConnGaugeGuard` internally (lock-in #8 mirrors the 13.1 Task 4 code-quality fold-in on the H1 HCM). When the H2-arm pool is `None` (test paths), the per-call `Client::connect` fallthrough does NOT increment `cx_active` either — matches the 13.1 H1 HCM's `OneShot`-arm semantic (cx_total fires; cx_active does not, because the pre-13.1 H2-arm code did not hold a guard either).
+- **Lock-in #8 (outer `_cx_guard` relocation):** APPLIED. The unconditional `let _cx_guard = cluster.cx_active_guard();` at `hcm.rs:269` (pre-edit) is replaced by a `match cluster.upstream_protocol() { Http1 => Some(cluster.cx_active_guard()), Http2 => None }` block. The H1 arm continues to hold the gauge guard for the full dispatch scope; the H2 arm holds `None` because the `H2PoolGuard` owns its own `ConnGaugeGuard` internally (lock-in #8 mirrors the 13.1 Task 4 code-quality fold-in on the H1 HCM verbatim). When the H2-arm pool is `None` (test paths only; production never reaches this branch), the per-call `Client::connect` fallthrough does NOT increment `cx_active` — this is a behavior change relative to pre-Task-2 (which fired via the unconditional outer guard). No existing test asserts cx_active during in-flight H2 dispatch on the test path, so no test breakage. Production semantic is preserved: envoy-bin always wires `Some(h2_pool_mgr)`, so the production path fires cx_active exactly once per request via the `H2PoolGuard`'s internal `ConnGaugeGuard`.
 
 **envoy-bin wiring detail:**
 
@@ -287,4 +287,34 @@ reuse end-to-end through the HCM dispatch path.
 
 3. The test helper `spawn_h2_hcm` retains its `Arc<Http1HCMConfig>` signature (vs. `Arc<HCMConfig>`) because all 18 existing test sites already pass `Http1HCMConfig` to it. The wrap happens INSIDE the helper (`HCM::new(Arc::new(HCMConfig::wrap(config, None)))`), preserving the existing call sites unchanged. The new pool-reuse integration test bypasses this helper (it needs `Some(pool_mgr)`) and constructs its own accept loop inline.
 
-**Commit SHA:** `3aa787c` (final HEAD after the single Task 2 commit; the PROGRESS subsection was folded in via `git commit --amend` so the SHA is self-referential — one commit per task per the 13.1 cadence).
+**Commit SHA:** `07006b4` (final HEAD after the single Task 2 commit; the PROGRESS subsection was folded in via `git commit --amend` so the SHA is self-referential — one commit per task per the 13.1 cadence).
+
+---
+
+### Task 2 fold-in — code-quality review documentation correction
+
+Follow-up commit appended after `07006b4` (Task 2's main commit). Addresses one IMPORTANT documentation finding from the code-quality reviewer:
+
+**IMPORTANT: Misleading cx_active fallthrough comment — CORRECTED.** The comment block at `crates/envoy-http2/src/hcm.rs` around the outer `_cx_guard` relocation (lock-in #8) incorrectly claimed that the H2-arm pool-None fallthrough "matches the 13.1 H1 HCM's `OneShot`-arm semantic (cx_total fires; cx_active does not, because the pre-13.1 H2-arm code did not hold a guard either)". Both parenthetical justifications were wrong:
+
+1. The H1 HCM's OneShot arm DOES fire cx_active (`crates/envoy-http1/src/hcm.rs` uses `Some(cluster.cx_active_guard())` on the OneShot arm).
+2. The pre-Task-2 H2 hcm.rs held an UNCONDITIONAL outer guard (baseline `ae8d7cf`, line 269: `let _cx_guard = cluster.cx_active_guard();`) — NOT an absent guard.
+
+The corrected comment now accurately states: pre-Task-2 the outer guard fired unconditionally for both protocol arms; post-Task-2, H2-arm-pool-None is a TEST-PATH-ONLY behavior change (cx_active count goes from 1 to 0 per request on that path). Production semantic is unchanged (envoy-bin always wires `Some(h2_pool_mgr)`, so the production path fires cx_active via the `H2PoolGuard`'s internal `ConnGaugeGuard`). No existing test asserts cx_active on the pool-None test path, so no test breakage; if a future test requires it, an explicit `Some(cluster.cx_active_guard())` in the pool-None arm is the fix.
+
+The parallel Task 2 lock-in #8 paragraph in this PROGRESS.md subsection is corrected with the same framing. The Task 2 commit SHA cosmetic (`3aa787c` pre-amend → `07006b4` actual HEAD) is also corrected in the Task 2 subsection above.
+
+**Net effect:** production semantic unchanged; test-path cx_active divergence honestly documented; no code change.
+
+**Files touched:**
+
+- `crates/envoy-http2/src/hcm.rs` — comment block rewrite at the `_cx_guard` relocation site.
+- `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` — this fold-in subsection + Task 2 lock-in #8 paragraph correction + SHA correction.
+
+**Per-gate clean outputs:**
+
+- `cargo build -p envoy-http2` — Finished, no warnings.
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- `cargo test -p envoy-http2 --lib` — `test result: ok. 54 passed; 0 failed; 1 ignored`.
+
+**Commit SHA:** `caf3f14` (fold-in commit; self-referential after amend below — Task 2 original `07006b4` + this fold-in `caf3f14`).

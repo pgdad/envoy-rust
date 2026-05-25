@@ -290,22 +290,30 @@ async fn handle_one_stream(
                     body: envoy_req.body.clone(),
                 };
 
-                // 13.2 D6 lock-in #8: the H1-cluster-in-H2-HCM arm at the
-                // `UpstreamProtocol::Http1` branch below stays per-call
-                // (lock-in #7) and needs the cluster's `upstream_cx_active`
-                // RAII guard. The `UpstreamProtocol::Http2` arm dispatches
-                // through the H2 pool when wired — the `H2PoolGuard` owns
-                // its own `ConnGaugeGuard` internally, so adding the outer
-                // guard on that path would double-count `cx_active`. The
-                // conditional `Option<ConnGaugeGuard>` mirrors the 13.1
-                // Task 4 code-quality fold-in fix on the H1 HCM verbatim.
+                // 13.2 D6 lock-in #8: Outer `_cx_guard` relocation. Pre-Task-2 the
+                // guard fired UNCONDITIONALLY for both protocol arms. Post-Task-2:
                 //
-                // When `h2_pool_mgr` is `None` (test paths) on the H2 arm,
-                // the per-call fallthrough path does NOT increment
-                // `cx_active` either — matches the 13.1 H1 HCM's
-                // `OneShot`-arm semantic (cx_total fires; cx_active does
-                // not, because the pre-13.1 H2-arm code did not hold a
-                // guard either).
+                // * H1 arm (cross-protocol H1-cluster-in-H2-HCM, lock-in #7): the
+                //   arm stays per-call, so the outer guard is Some — cx_active
+                //   fires once per request via the outer guard (preserved
+                //   pre-Task-2 semantic).
+                //
+                // * H2 arm with pool wired (PRODUCTION path; envoy-bin always passes
+                //   Some(h2_pool_mgr)): the outer guard is None — cx_active fires
+                //   once per request via the PoolGuard's internal ConnGaugeGuard
+                //   (lock-in #6). Adding the outer guard here would double-count.
+                //   This mirrors the 13.1 Task 4 code-quality fold-in on the H1 HCM
+                //   verbatim.
+                //
+                // * H2 arm with pool None (TEST path only; production never reaches
+                //   this branch): the outer guard is None AND there is no inner
+                //   PoolGuard, so cx_active does NOT fire on this request. This is
+                //   a behavior change relative to pre-Task-2 (which would have
+                //   fired via the unconditional outer guard). No existing test
+                //   asserts cx_active during in-flight H2 dispatch on the test
+                //   path, so no test breakage. If a future test needs cx_active to
+                //   fire on the pool-None path, add an explicit `Some(cluster.
+                //   cx_active_guard())` in the pool-None arm.
                 let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> =
                     match cluster.upstream_protocol() {
                         envoy_cluster::UpstreamProtocol::Http1 => Some(cluster.cx_active_guard()),
