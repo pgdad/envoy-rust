@@ -1596,10 +1596,14 @@ pub async fn drive_http2_keep_alive(
     }
     .await;
 
-    // Drop `send_request` BEFORE aborting `conn_handle` — dropping releases
-    // the last SendRequest reference, signalling the h2 `Connection` future
-    // to begin a clean GOAWAY shutdown. Mirrors `drive_http2`'s teardown
-    // (line 1438-1440) verbatim.
+    // Teardown mirrors `drive_http2`'s shape verbatim. `drop(send_request)`
+    // releases the last SendRequest handle, so the h2 `Connection` future's
+    // inbound channel closes — drop-before-abort is hygienic ordering. The
+    // load-bearing step is `conn_handle.abort()`: it synchronously preempts
+    // the Connection future so this helper returns as soon as the response
+    // is drained, without tying test wall-time to peer-side GOAWAY hygiene
+    // (the future is never polled again post-abort, so no clean GOAWAY
+    // round-trip fires).
     drop(send_request);
     conn_handle.abort();
     let _ = conn_handle.await;

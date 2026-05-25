@@ -475,4 +475,34 @@ All other ADR-0039 reshaped scope items (1: fixture YAMLs with `codec_type: HTTP
 
 **Commit SHA:** `6f2845f` (pre-amend; published HEAD may shift to the post-amend SHA per the per-task SHA-amend pattern).
 
+---
+
+### Task 5 fold-in — code-quality review documentation correction (teardown comment)
+
+Follow-up commit appended after `1ade3ef` (Task 5's main commit — the actual published HEAD post-amend of the pre-amend `6f2845f` cited in the Task 5 subsection above). Addresses one IMPORTANT documentation finding from the code-quality reviewer:
+
+**IMPORTANT: Misleading H2 teardown comment in `drive_http2_keep_alive` — CORRECTED.** The comment block at `tests/differential/src/lib.rs:1599-1602` introduced by the Task 5 helper claimed that `drop(send_request)` "signal[s] the h2 `Connection` future to begin a clean GOAWAY shutdown". The reviewer correctly noted: the very next line is `conn_handle.abort()`, which synchronously preempts the Connection future — the dropped-SendRequest GOAWAY path cannot fire because the future is never polled again post-abort. The comment overstated what actually happens at runtime.
+
+The sibling helper `drive_http2` at `tests/differential/src/lib.rs:1467-1471` (landed at an earlier phase) has the honest framing: it states that aborting makes the helper return as soon as the response is drained, without claiming GOAWAY hygiene. The Task 5 helper now mirrors that framing verbatim modulo phrasing:
+
+- `drop(send_request)` releases the last SendRequest handle (the h2 `Connection` future's inbound channel closes); drop-before-abort is hygienic ordering.
+- `conn_handle.abort()` is the load-bearing teardown step — synchronously preempts the Connection future so the helper returns as soon as the response is drained, without tying test wall-time to peer-side GOAWAY round-trips.
+- The post-abort future is never polled again, so no clean GOAWAY round-trip fires (the corrected comment names this explicitly).
+
+**Net effect:** documentation honesty correction; no functional code change (the `drop(send_request); conn_handle.abort(); let _ = conn_handle.await;` sequence is byte-identical pre-and-post fold-in).
+
+**Files touched:**
+
+- `tests/differential/src/lib.rs` — comment block rewrite at the `drive_http2_keep_alive` teardown site (lines 1599-1606 post-rewrite; 4 lines → 8 lines).
+- `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` — this fold-in subsection.
+
+**Per-gate clean outputs:**
+
+- `cargo build -p differential` — Finished, no warnings.
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- `cargo clippy -p differential --all-targets --all-features -- -D warnings` — no diagnostics.
+- `cargo test -p differential --lib` (single-threaded) — same 109 passed (no test-count delta; comment-only change).
+
+**Commit SHA:** fold-in commit appended below.
+
 *(Tasks 6-8 append below at subsequent task-arc commits within this state-3-resume session.)*
