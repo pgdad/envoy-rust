@@ -557,4 +557,40 @@ Lands the in-process subprocess-scope backstop for the H2-pool-reuse property at
 
 **Commit SHA:** `73f7c2c` (pre-amend; published HEAD may shift to the post-amend SHA per the per-task SHA-amend pattern that's run since Task 1).
 
+---
+
+### Task 6 fold-in — code-quality review documentation closures (discriminating-power caveat + backend-ready justification)
+
+Follow-up commit appended after Task 6's main commit. Addresses two IMPORTANT documentation findings from the code-quality reviewer over the Task 6 diff; no functional code change.
+
+**Finding 1 — discriminating-power caveat (docstring addition).** The Task 6 main subsection above already names the discriminating-power gap in a `**Discriminating-power note**` paragraph, but the gap was NOT named at the in-code surface (the module-level docstring of `crates/envoy-bin/tests/upstream_h2_connection_pooling.rs`). A future maintainer reading the test file alone would not see the caveat. Closed by appending one short paragraph to the module docstring (after the H2-standard-header-omission paragraph that ends at line 46), naming: (a) the bilateral `upstream_cx_total = 1` + `upstream_cx_http2_total = 1` assertion does NOT independently discriminate stream-multiplex from a serial acquire+release of one pooled conn 5 times (the same counter pair would fire 1 + 1 either way); (b) the bilateral evidence for the multiplex property lives at fixture 0021 + the Task 5 `drive_http2_keep_alive` driver; (c) this backstop's role is exclusively the in-process round-trip evidence (envoy-bin reachability + stat wiring); (d) state-5 review may revisit if a stronger in-process observable becomes available. Tone consistent with the existing module-doc paragraphs per D-3.4 cold-readability.
+
+**Finding 2 — backend-ready justification REWRITTEN (the spec's prior rationale was empirically false).** The Task 6 main commit landed `wait_ready` with a TCP-only readiness probe — the doc comment justified it by referring to the H2-handshake-readiness check being "checked separately at the H2-driver site … TCP readiness is the gating signal here, matching `http2_router_upstream.rs`'s pattern". The prior subagent's BLOCKED escalation flagged a *spec-supplied* rationale (the spec proposed "the H2 pool retries on handshake fail" as the justification) as empirically false — `crates/envoy-http2/src/pool.rs::acquire` is one-shot; there is no retry-on-handshake-fail branch. The controller's re-plan disposition selected option (1) — proceed with a revised rationale that uses the empirically-correct fact pattern the prior subagent uncovered. The rewritten comment now names the 5 verified observations:
+
+1. The helper's accept loop is poll-immediate after `TcpListener::bind` — no async work between bind and `listener.accept().await`. Verified by direct read of `tests/helpers/http2-echo-server/src/main.rs:99-122` (the `loop { tokio::select! { _ = shutdown => break, accept_result = listener.accept() => match ... } }` block immediately following `let listener = TcpListener::bind(...).await?` at line 99).
+2. The kernel buffers SYNs at the listening socket between bind and userspace `accept()` — incoming TCP connections aren't lost during the brief poll-then-accept window (standard SOCK_STREAM listen-backlog semantics).
+3. The h2 client preface at `crates/envoy-http2/src/client.rs:42-56` uses a ~10ms detection window that ONLY fails on immediate H2-incompatible bytes; it does NOT wait for the server's SETTINGS frame — verified at the `Box::pin(connection); tokio::select! { biased; conn_result = ..., _ = tokio::time::sleep(Duration::from_millis(10)) => { /* normal */ } }` block. The client doesn't block waiting for the helper's own h2 server-handshake to complete; the connection task is spawned as long as the connection future is `Poll::Pending` after 10ms.
+4. Empirical: the test passes in ~2s without flake; if the race were practically reachable, it would surface as `upstream_cx_total != 1` on first attempt.
+5. The differential precedent at `tests/differential/src/backend.rs:424-447` (`wait_h2_accept_ready`) is the stronger guarantee available IF flake ever surfaces — the rewritten comment names its existence + line numbers for the future maintainer.
+
+The spec's prior rationale ("pool retries on handshake fail") is REMOVED from the comment entirely; the empirically-correct 5-observation rationale REPLACES it. Honest correction per the project's append-only doctrine.
+
+**Net effect:** documentation honesty correction + cold-readability discriminating-power caveat at the in-code surface; no functional code change (the TCP-only `wait_ready` helper body is byte-identical pre-and-post fold-in; the test runtime is unchanged).
+
+**Files touched:**
+
+- `crates/envoy-bin/tests/upstream_h2_connection_pooling.rs` — module docstring discriminating-power caveat append (finding 1) + `wait_ready` helper doc comment rewrite (finding 2).
+- `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` — this fold-in subsection.
+
+**Per-gate clean outputs:**
+
+- `cargo build -p envoy-bin` — Finished, no warnings.
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- `cargo clippy -p envoy-bin --all-targets --all-features -- -D warnings` — no diagnostics.
+- `cargo test -p envoy-bin --test upstream_h2_connection_pooling -- --nocapture` — `1 passed; 0 failed`.
+
+**Commit SHA:** fold-in commit appended below.
+
+---
+
 *(Tasks 7-8 append below at subsequent task-arc commits within this state-3-resume session.)*

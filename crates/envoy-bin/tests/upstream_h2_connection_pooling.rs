@@ -44,6 +44,18 @@
 //! check has no analog. The discipline is preserved on the H1 side
 //! (`upstream_connection_pooling.rs:131-146`); no carry-forward to the
 //! H2 sibling is meaningful.
+//!
+//! **Discriminating-power caveat:** the bilateral assertion
+//! `upstream_cx_total = 1` and `upstream_cx_http2_total = 1` proves the
+//! H2 pool reuses ONE upstream conn across all 5 dispatches, but it does
+//! NOT independently discriminate stream-multiplex from a hypothetical
+//! regression that serially acquires and releases a single pooled conn
+//! 5 times (the same counter pair would fire 1 and 1 either way). The
+//! bilateral evidence for the multiplex property lives at fixture 0021
+//! together with the Task 5 `drive_http2_keep_alive` driver; this
+//! backstop is the in-process round-trip evidence (envoy-bin
+//! reachability and stat wiring). State-5 review may revisit if a
+//! stronger in-process observable becomes available.
 
 #![forbid(unsafe_code)]
 
@@ -68,11 +80,25 @@ fn reserve_port() -> u16 {
 }
 
 /// Wait for TCP-accept readiness on `addr` within `budget`. Identical
-/// shape to the H1 sibling's `wait_ready`. H2 handshake readiness is
-/// checked separately at the H2-driver site (the proxy's H2 listener
-/// accepts TCP first, then completes the HTTP/2 preface — TCP readiness
-/// is the gating signal here, matching `http2_router_upstream.rs`'s
-/// pattern).
+/// shape to the H1 sibling's `wait_ready`.
+///
+/// Backend H2-handshake-readiness probe is NOT required here. The
+/// helper's accept loop is poll-immediate after `TcpListener::bind`
+/// (no async work between bind and `listener.accept().await` — see
+/// `tests/helpers/http2-echo-server/src/main.rs:99-122`), and the
+/// kernel buffers SYNs at the listening socket between bind and
+/// userspace `accept()`, so incoming TCP connections aren't lost
+/// during the brief poll-then-accept window. The h2 client preface
+/// at `crates/envoy-http2/src/client.rs:42-56` uses a ~10ms detection
+/// window that ONLY fails on immediate H2-incompatible bytes; it does
+/// NOT wait for the server's SETTINGS frame, so the helper's own h2
+/// server-handshake doesn't have to be ready in <10ms — the client
+/// doesn't block waiting for it. Empirically the test passes in ~2s
+/// with no flake; if the race were practically reachable, it would
+/// surface as `upstream_cx_total != 1` on first attempt. If a future
+/// flake does surface, the differential harness's `wait_h2_accept_ready`
+/// at `tests/differential/src/backend.rs:424-447` shows the
+/// h2-handshake-ready probe pattern that can be borrowed here.
 async fn wait_ready(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
     let deadline = Instant::now() + budget;
     let mut delay = Duration::from_millis(50);
