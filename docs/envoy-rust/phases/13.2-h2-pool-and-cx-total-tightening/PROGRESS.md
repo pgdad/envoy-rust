@@ -217,3 +217,74 @@ Follow-up commit appended after `f692b53` (Task 1's main commit). Addresses two 
 **Test count delta:** envoy-http1 pool tests 9 → 10 (net +1). envoy-http2 pool tests unchanged.
 
 **Commit SHA:** to be filled in by the appended commit (will be self-referential after fold-in).
+
+---
+
+### Task 2 — H2 router-arm pool integration + envoy-bin wire-up
+
+Lands the 13.2 D6 deliverable: the H2 HCM proxy arm migrates from per-call
+`envoy_http2::Client::connect` to dispatch through `H2Pool::acquire` when a
+pool manager is wired (production path). The earlier-phase
+`pub type HCMConfig = Http1HCMConfig;` alias in `crates/envoy-http2/src/hcm.rs`
+is REPLACED by a proper `envoy_http2::HCMConfig` struct wrapping
+`Arc<envoy_http1::HCMConfig>` + carrying `h2_pool_mgr: Option<Arc<H2PoolManager>>`
+(lock-in #2 application). The outer cx_active guard at the dispatch site is
+relocated from unconditional to `Option<ConnGaugeGuard>` Some-only on the
+H1-cluster arm (lock-in #8 — mirrors the 13.1 Task 4 code-quality fold-in
+fix on the H1 HCM verbatim, because the H2 pool's `H2PoolGuard` owns its
+own ConnGaugeGuard internally and an outer guard would double-count
+cx_active). The H1-cluster-in-H2-HCM arm at `hcm.rs:273-284` is left
+UNTOUCHED per lock-in #7 — that cross-protocol path stays per-call and
+13.1 did not cover it either. envoy-bin wires `H2PoolManager::for_bootstrap`
+between the existing `H1PoolManager::for_bootstrap` and
+`envoy_health::Scheduler::spawn`, and the HTTP2 codec-dispatch arm in
+envoy-bin wraps the H1 HCMConfig via `envoy_http2::HCMConfig::wrap` with
+`Some(Arc::clone(&h2_pool_mgr))`. One new integration test asserts pool
+reuse end-to-end through the HCM dispatch path.
+
+**Files changed** (per `git status --short` post-edit):
+
+- `crates/envoy-http2/src/hcm.rs` — replaced the `pub type HCMConfig = Http1HCMConfig;` alias at line 27 with the `pub struct HCMConfig { pub inner: Arc<Http1HCMConfig>, pub h2_pool_mgr: Option<Arc<crate::pool::H2PoolManager>> }` + `impl HCMConfig::wrap(inner, h2_pool_mgr)` constructor. Updated every site in `serve_h2_connection` + `handle_one_stream` + `finalize_h2_stream` that previously read `config.<H1 field>` (config was a type alias to `Http1HCMConfig`) to `config.inner.<H1 field>` — 8 sites total (`http2_protocol_options`, `stats.downstream_rq_total`, `filter_pipeline`, `cluster_mgr`, `stats.downstream_rq_Nxx` ×4, `access_log` ×3, `stats.access_logs_total`, `stats.access_logs_failed`, plus the `build_response` arg taking `&Http1HCMConfig` reachable via `&config.inner`). Migrated the `UpstreamProtocol::Http2` arm of the dispatch match (~286-296 pre-edit) to dispatch through `config.h2_pool_mgr.as_ref().and_then(|m| m.get(&cluster_name))` with a `Some(pool) =>` pool-path branch (`pool.acquire(endpoint, &host_header).await` + `guard.client_stream_mut().send_request(out_req).await`) + a `None =>` per-call fallback that preserves the pre-13.2 `crate::Client::connect` + `cluster.cx_total().inc()`. Relocated the unconditional `let _cx_guard = cluster.cx_active_guard();` at line 269 to a conditional `let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> = match cluster.upstream_protocol() { Http1 => Some(cluster.cx_active_guard()), Http2 => None };`. The H1-cluster arm at `:273-284` (the `UpstreamProtocol::Http1` match branch) is UNTOUCHED — per-call `envoy_http1::Client::connect` + `cluster.cx_total().inc()` per lock-in #7. Test helper `spawn_h2_hcm` wraps its `Arc<Http1HCMConfig>` argument via `HCMConfig::wrap(cfg, None)` so the existing 53 tests keep compiling with pool-less dispatch (per-call fallthrough). NEW test added: `h2_hcm_pool_reuses_upstream_conn_across_sequential_requests` — see test detail below.
+
+- `crates/envoy-bin/src/main.rs` — added `H2PoolManager::for_bootstrap` between the existing `pool_mgr` (H1) binding at `:137-143` and the `health_scheduler` spawn at `:150`. Bound to `h2_pool_mgr` (keeping `pool_mgr` as the H1 binding name to avoid churning H1 call sites). Updated the `CodecType::HTTP2` arm of the HCM dispatch (`:314-316` pre-edit) to wrap the `hcm_config: Arc<envoy_http1::HCMConfig>` via `envoy_http2::HCMConfig::wrap(Arc::clone(&hcm_config), Some(Arc::clone(&h2_pool_mgr)))` before passing to `envoy_http2::HCM::new`. The H1 HCM arm at `:312` (`envoy_http1::HCM { config: hcm_config }`) is unchanged — H1 HCMConfig threading already works via 13.1 Task 4.
+
+- `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` — this subsection.
+
+**LoC delta:** envoy-http2/src/hcm.rs net +160 (struct + comment block + dispatch arm rewrite + 1 new test ~135 LoC). envoy-bin/src/main.rs net +18 (manager construction comment block + 5-line H2PoolManager::for_bootstrap call + 8-line HCM::new wrapper construction).
+
+**Lock-in application:**
+
+- **Lock-in #2 (HCMConfig wrapper):** APPLIED. `envoy_http2::HCMConfig` is now a proper struct wrapping `Arc<envoy_http1::HCMConfig>` + the new field. The H2 HCM accesses inner H1 fields via `config.inner.<field>` (8 sites updated); the new field via `config.h2_pool_mgr`.
+
+- **Lock-in #7 (H1-cluster-in-H2-HCM stays untouched):** APPLIED. The `UpstreamProtocol::Http1` arm at `hcm.rs:273-284` retains its per-call `envoy_http1::Client::connect` + `cluster.cx_total().inc()` + outer `cx_active_guard` via the conditional `Some(cluster.cx_active_guard())` branch. No migration.
+
+- **Lock-in #8 (outer `_cx_guard` relocation):** APPLIED. The unconditional `let _cx_guard = cluster.cx_active_guard();` at `hcm.rs:269` (pre-edit) is replaced by a `match cluster.upstream_protocol() { Http1 => Some(cluster.cx_active_guard()), Http2 => None }` block. The H1 arm continues to hold the gauge guard for the full dispatch scope; the H2 arm holds `None` because the `H2PoolGuard` owns its own `ConnGaugeGuard` internally (lock-in #8 mirrors the 13.1 Task 4 code-quality fold-in on the H1 HCM). When the H2-arm pool is `None` (test paths), the per-call `Client::connect` fallthrough does NOT increment `cx_active` either — matches the 13.1 H1 HCM's `OneShot`-arm semantic (cx_total fires; cx_active does not, because the pre-13.1 H2-arm code did not hold a guard either).
+
+**envoy-bin wiring detail:**
+
+- H2PoolManager construction lands between the H1 `pool_mgr` and `health_scheduler.spawn`. The manager carries `Arc<HashMap<String, Arc<H2Pool>>>` keyed by cluster name; one pool per H2-protocol cluster (filtered via `cluster_mgr.get(cfg.name).upstream_protocol() == UpstreamProtocol::Http2` inside `for_bootstrap` — Task 1 PROGRESS). The `cluster_mgr` + `registry` + `token` are shared with the H1 pool manager + health scheduler (single-bootstrap-per-process invariant).
+- HCMConfig consumption at the HTTP2 codec-dispatch arm wraps via `HCMConfig::wrap(Arc::clone(&hcm_config), Some(Arc::clone(&h2_pool_mgr)))`. The `hcm_config: Arc<envoy_http1::HCMConfig>` binding is unchanged; the wrap is additive at the HTTP2 arm only.
+
+**New integration test detail:**
+
+`hcm::tests::h2_hcm_pool_reuses_upstream_conn_across_sequential_requests` — builds a 1-cluster H2 bootstrap (cluster name `backend`, type STATIC, `typed_extension_protocol_options.http2_protocol_options.max_concurrent_streams: 100`), constructs a shared `Arc<StatsRegistry>`, builds the `ClusterManager` + `H2PoolManager` from the bootstrap, wraps the H1 HCMConfig via `HCMConfig::wrap(..., Some(Arc::clone(&pool_mgr)))`, spawns the HCM accept loop on `127.0.0.1:0`, opens ONE downstream H2 client connection, drives 3 sequential GET / requests, and asserts `cluster.backend.upstream_cx_total.value() == 1` after a 100ms settle. The assertion is meaningful: without the pool the H2 arm's per-call `Client::connect` fires 3 times → `cx_total == 3`; with the pool, all 3 requests share the same upstream H2 multiplex conn → `cx_total == 1`. End-to-end coverage of the wired pool dispatch path (vs. the pool unit-test surface alone). The test cancels the `CancellationToken` at end-of-test so the H2PoolManager's idle sweeper task drains cleanly.
+
+**Per-gate clean outputs (touched crates):**
+
+- `cargo build --workspace --all-targets` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 4m 19s`. No warnings, no errors.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 1m 02s`. No clippy diagnostics.
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- `cargo test -p envoy-http2 --lib` — `test result: ok. 54 passed; 0 failed; 1 ignored` (net +1 from the new pool-reuse integration test).
+- `cargo test -p envoy-bin` — all integration backstops green: argv 6 + echo 2 + 18 in-process backstops (access_log_file_sink, http1_direct_response, http2_direct_response, admin_*, etc.) + 2 listener-pool tests. The initial run surfaced a port-binding flake on `access_log_file_sink_in_process` (cargo orphan from a prior aborted run still holding the bound listener_port — re-running the test cleanly passed in 0.61s; mirrors the 13.1 Task 10 state-5 access-log flake mitigation context).
+
+**Test count delta:** envoy-http2 lib tests 53 → 54 (net +1). envoy-bin tests unchanged.
+
+**Deviations from PLAN:**
+
+1. The PLAN spec text says "the `cluster_name` may not exist at this scope today" — empirically the H2 HCM's `BuildOutcome::Proxy { cluster: cluster_name }` destructure at line ~197 already binds `cluster_name: String` in scope (used by `cluster_mgr.get(&cluster_name)`). No new binding required for the pool's `m.get(&cluster_name)` lookup.
+
+2. The PLAN says PoolError::Overflow's destructure uses `{ cluster, max }`. To avoid shadowing the outer `cluster: ClusterHandle` binding inside the dispatch match scope, the destructure renames to `{ cluster: cl, max }` and the warn/error format uses `cl`. Pure naming hygiene; no semantic change.
+
+3. The test helper `spawn_h2_hcm` retains its `Arc<Http1HCMConfig>` signature (vs. `Arc<HCMConfig>`) because all 18 existing test sites already pass `Http1HCMConfig` to it. The wrap happens INSIDE the helper (`HCM::new(Arc::new(HCMConfig::wrap(config, None)))`), preserving the existing call sites unchanged. The new pool-reuse integration test bypasses this helper (it needs `Some(pool_mgr)`) and constructs its own accept loop inline.
+
+**Commit SHA:** `3aa787c` (final HEAD after the single Task 2 commit; the PROGRESS subsection was folded in via `git commit --amend` so the SHA is self-referential — one commit per task per the 13.1 cadence).

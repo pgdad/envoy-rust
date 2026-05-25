@@ -142,6 +142,21 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     )
     .context("building H1 pool manager")?;
 
+    // 13.2 Task 2 (D6): build the shared `H2PoolManager` once after
+    // `pool_mgr` (H1) and before any HCMConfig consumer. One H2 pool per
+    // H2-protocol cluster (default-enabled per lock-in #3). Mirrors the
+    // 13.1 H1 cycle-resolution pattern (lock-in #1); threaded into every
+    // H2 `HCMConfig::wrap` below as `Some(Arc::clone(&h2_pool_mgr))`. The
+    // idle-sweeper tasks owned by the manager abort cleanly on `token`
+    // cancel.
+    let h2_pool_mgr = envoy_http2::H2PoolManager::for_bootstrap(
+        &bootstrap,
+        &cluster_mgr,
+        std::sync::Arc::clone(&registry),
+        token.clone(),
+    )
+    .context("building H2 pool manager")?;
+
     // 12.2 (parent-12 D4): spawn active-HC probe tasks for every cluster
     // carrying `health_checks`. Cancellation wired to the existing signal
     // token so SIGTERM/SIGINT triggers clean shutdown of every probe task at
@@ -312,7 +327,19 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                             std::sync::Arc::new(envoy_http1::HCM { config: hcm_config })
                         }
                         envoy_config::CodecType::HTTP2 => {
-                            std::sync::Arc::new(envoy_http2::HCM::new(hcm_config))
+                            // 13.2 Task 2 (D6, lock-in #2): wrap the H1
+                            // HCMConfig in the new `envoy_http2::HCMConfig`
+                            // struct, threading the H2 pool manager. The
+                            // H2 HCM's dispatch arm uses
+                            // `config.h2_pool_mgr` for proxy upstream
+                            // dispatch; H1 inner fields are accessed via
+                            // `config.inner.<field>`.
+                            std::sync::Arc::new(envoy_http2::HCM::new(std::sync::Arc::new(
+                                envoy_http2::HCMConfig::wrap(
+                                    std::sync::Arc::clone(&hcm_config),
+                                    Some(std::sync::Arc::clone(&h2_pool_mgr)),
+                                ),
+                            )))
                         }
                         envoy_config::CodecType::HTTP3 => {
                             anyhow::bail!(

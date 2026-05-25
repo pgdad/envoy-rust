@@ -21,10 +21,36 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tokio::net::TcpStream;
 
-/// Re-export of envoy_http1::HCMConfig under the envoy-http2 namespace.
-/// Per cross-sub-phase architectural rule 2 the configuration is identical
-/// across H1 and H2; only runtime dispatch differs.
-pub type HCMConfig = Http1HCMConfig;
+/// 13.2 D6 (lock-in #2): H2 HCMConfig wraps the H1 HCMConfig (the actual
+/// config blob carrying routes/filters/listener-side H2 protocol options)
+/// and adds an optional H2 pool manager. The earlier-phase
+/// `pub type HCMConfig = Http1HCMConfig` alias is REPLACED by this struct
+/// at 13.2 because the `h2_pool_mgr` type lives in envoy-http2 — adding
+/// the field directly to `envoy_http1::HCMConfig` would invert the
+/// existing envoy-http2 → envoy-http1 dep direction.
+///
+/// The H2 HCM's `serve_h2_connection` + `handle_one_stream` access
+/// `config.inner.<H1 field>` for the H1-side data + `config.h2_pool_mgr`
+/// for the new field. Test paths construct via `HCMConfig::wrap(inner,
+/// None)` (no pool); production paths wire via
+/// `HCMConfig::wrap(inner, Some(Arc::clone(&h2_pool_mgr)))` at envoy-bin.
+pub struct HCMConfig {
+    pub inner: Arc<Http1HCMConfig>,
+    pub h2_pool_mgr: Option<Arc<crate::pool::H2PoolManager>>,
+}
+
+impl HCMConfig {
+    /// Wrap an existing H1 HCMConfig with an optional H2 pool manager.
+    /// `h2_pool_mgr` is `None` on test paths (the test constructs the
+    /// HCMConfig wrapper directly without pool wiring) and `Some(...)`
+    /// on production paths (envoy-bin always wires the pool manager).
+    pub fn wrap(
+        inner: Arc<Http1HCMConfig>,
+        h2_pool_mgr: Option<Arc<crate::pool::H2PoolManager>>,
+    ) -> Self {
+        Self { inner, h2_pool_mgr }
+    }
+}
 
 /// HTTP/2 cleartext (H2C prior-knowledge) HCM. Implements
 /// `envoy_listener::ConnectionHandler`.
@@ -59,7 +85,7 @@ async fn serve_h2_connection(
 ) -> Result<(), Http2Error> {
     // Thread the listener-side Http2ProtocolOptions (carried on HCMConfig per
     // the 05.2 extension) through to the codec's h2::server::Builder.
-    let mut h2_conn = build_h2_server(config.http2_protocol_options.as_ref())
+    let mut h2_conn = build_h2_server(config.inner.http2_protocol_options.as_ref())
         .handshake(downstream)
         .await
         .map_err(|source| Http2Error::H2Handshake { source })?;
@@ -112,7 +138,7 @@ async fn handle_one_stream(
     // increment in `serve_connection`). Per SPEC §6 signpost 5 the
     // increment fires at the entry of the per-stream handler, BEFORE the
     // route walk + dispatch. Counts attempts including malformed bodies.
-    config.stats.downstream_rq_total.inc();
+    config.inner.stats.downstream_rq_total.inc();
 
     // 06.2 Task 7: capture arrival time-points before the body drain so
     // the access-log's %START_TIME% and %DURATION% tokens cover the full
@@ -145,7 +171,7 @@ async fn handle_one_stream(
     // per-stream cloning per ADR-0031). Boundary conversion
     // `envoy_http1::codec::Request` ↔ `envoy_filter::FilterRequest` via
     // `mem::take` + write-back (same shape as Task 6 at envoy-http1).
-    let mut pipeline = (*config.filter_pipeline).clone();
+    let mut pipeline = (*config.inner.filter_pipeline).clone();
     let mut filter_req = envoy_filter::FilterRequest {
         method: std::mem::take(&mut envoy_req.method),
         path: std::mem::take(&mut envoy_req.path),
@@ -170,7 +196,9 @@ async fn handle_one_stream(
     let request_path = match decode_decision {
         envoy_filter::Decision::Continue => {
             H2RequestPath::Match(build_response(
-                &config, &envoy_req, /* close = */ false,
+                &config.inner,
+                &envoy_req,
+                /* close = */ false,
             ))
         }
         envoy_filter::Decision::StopAndSend(filter_resp) => {
@@ -202,6 +230,7 @@ async fn handle_one_stream(
                 // bootstrap; the .expect() is defense-in-depth (mirrors
                 // envoy-http1/src/hcm.rs:215-218).
                 let cluster = config
+                    .inner
                     .cluster_mgr
                     .get(&cluster_name)
                     .expect("validator ensures cluster present");
@@ -261,12 +290,27 @@ async fn handle_one_stream(
                     body: envoy_req.body.clone(),
                 };
 
-                // 06.3 D15.3.b: RAII guard increments
-                // `cluster.<name>.upstream_cx_active` before either protocol arm
-                // connects and decrements via Drop at scope exit, covering both
-                // success and error close paths uniformly. A single guard covers
-                // both the H1 and H2 arms of the match below.
-                let _cx_guard = cluster.cx_active_guard();
+                // 13.2 D6 lock-in #8: the H1-cluster-in-H2-HCM arm at the
+                // `UpstreamProtocol::Http1` branch below stays per-call
+                // (lock-in #7) and needs the cluster's `upstream_cx_active`
+                // RAII guard. The `UpstreamProtocol::Http2` arm dispatches
+                // through the H2 pool when wired — the `H2PoolGuard` owns
+                // its own `ConnGaugeGuard` internally, so adding the outer
+                // guard on that path would double-count `cx_active`. The
+                // conditional `Option<ConnGaugeGuard>` mirrors the 13.1
+                // Task 4 code-quality fold-in fix on the H1 HCM verbatim.
+                //
+                // When `h2_pool_mgr` is `None` (test paths) on the H2 arm,
+                // the per-call fallthrough path does NOT increment
+                // `cx_active` either — matches the 13.1 H1 HCM's
+                // `OneShot`-arm semantic (cx_total fires; cx_active does
+                // not, because the pre-13.1 H2-arm code did not hold a
+                // guard either).
+                let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> =
+                    match cluster.upstream_protocol() {
+                        envoy_cluster::UpstreamProtocol::Http1 => Some(cluster.cx_active_guard()),
+                        envoy_cluster::UpstreamProtocol::Http2 => None,
+                    };
 
                 let start = Instant::now();
                 let upstream_resp_result = match cluster.upstream_protocol() {
@@ -284,14 +328,60 @@ async fn handle_one_stream(
                         }
                     }
                     envoy_cluster::UpstreamProtocol::Http2 => {
-                        match crate::Client::connect(endpoint, &host_header).await {
-                            Ok(mut s) => {
-                                // 06.1 D4.b: per-cluster upstream_cx_total
-                                // increment on successful upstream H2 connect.
-                                cluster.cx_total().inc();
-                                s.send_request(out_req).await.map_err(|e| format!("{e}"))
+                        // 13.2 D6: dispatch via the H2 pool when wired; fall
+                        // through to per-call connect when `h2_pool_mgr` is
+                        // None (test paths). On the pool path,
+                        // `cluster.cx_total().inc()` fires inside
+                        // `H2Pool::acquire`'s connect-on-miss branch (Task
+                        // 1, lock-in #6) — so we do NOT increment it again
+                        // here. On the fallthrough per-call path the
+                        // pre-13.2 `cluster.cx_total().inc()` site is
+                        // preserved.
+                        match config
+                            .h2_pool_mgr
+                            .as_ref()
+                            .and_then(|m| m.get(&cluster_name))
+                        {
+                            Some(pool) => match pool.acquire(endpoint, &host_header).await {
+                                Ok(mut guard) => guard
+                                    .client_stream_mut()
+                                    .send_request(out_req)
+                                    .await
+                                    .map_err(|e| format!("{e}")),
+                                Err(crate::pool::PoolError::Connect(source)) => {
+                                    tracing::warn!(
+                                        cluster = %cluster.name(),
+                                        addr = %endpoint,
+                                        error = ?source,
+                                        "H2 pool connect failed",
+                                    );
+                                    Err(format!("{source}"))
+                                }
+                                Err(crate::pool::PoolError::Overflow { cluster: cl, max }) => {
+                                    tracing::warn!(
+                                        cluster = %cl,
+                                        max = %max,
+                                        "H2 pool overflow",
+                                    );
+                                    Err(format!(
+                                        "H2 pool overflow at cluster '{cl}' \
+                                         (max_connections={max})",
+                                    ))
+                                }
+                            },
+                            None => {
+                                // No pool wired (test paths). Per-call
+                                // connect + per-call cx_total.inc()
+                                // preserves the pre-13.2 behavior for
+                                // pool-less HCMConfig wrappers.
+                                match crate::Client::connect(endpoint, &host_header).await {
+                                    Ok(mut s) => {
+                                        cluster.cx_total().inc();
+                                        s.send_request(out_req).await.map_err(|e| format!("{e}"))
+                                    }
+                                    Err(e) => Err(format!("{e}")),
+                                }
                             }
-                            Err(e) => Err(format!("{e}")),
                         }
                     }
                 };
@@ -465,14 +555,13 @@ async fn finalize_h2_stream(
     // 06.3 D15.3.a NEW — symmetric per-response-class HCM counter increment
     // on the H2 path. `response_status_for_log` is a local derived post-encode
     // from `resp` (see the comment block above); it reflects whichever branch
-    // (Continue or StopAndSend) determined the final response. The
-    // `envoy_http2::HCMConfig` type alias makes `config.stats.downstream_rq_Nxx`
-    // resolve via the envoy_http1::HCMStats struct.
+    // (Continue or StopAndSend) determined the final response. 13.2 D6: the
+    // `HCMConfig` wrapper now hosts the H1 stats via `config.inner.stats`.
     match response_status_for_log / 100 {
-        2 => config.stats.downstream_rq_2xx.inc(),
-        3 => config.stats.downstream_rq_3xx.inc(),
-        4 => config.stats.downstream_rq_4xx.inc(),
-        5 => config.stats.downstream_rq_5xx.inc(),
+        2 => config.inner.stats.downstream_rq_2xx.inc(),
+        3 => config.inner.stats.downstream_rq_3xx.inc(),
+        4 => config.inner.stats.downstream_rq_4xx.inc(),
+        5 => config.inner.stats.downstream_rq_5xx.inc(),
         _ => {}
     }
 
@@ -480,7 +569,7 @@ async fn finalize_h2_stream(
     // H1 factored join-point per parent-06 SPEC §3 D3.2 + PLAN-write
     // SPEC correction 2. Lands AFTER send_envoy_response returns
     // (covering both empty-body and non-empty-body emit branches).
-    if !config.access_log.is_empty() {
+    if !config.inner.access_log.is_empty() {
         let duration = req_arrival_instant.elapsed();
         let record = envoy_accesslog::AccessLogRecord {
             start_time: req_arrival_systime,
@@ -504,13 +593,14 @@ async fn finalize_h2_stream(
         // await so failures do NOT deflate access_logs_total (parent SPEC §6
         // Rule 4 fire-and-forget posture).
         config
+            .inner
             .stats
             .access_logs_total
-            .add(config.access_log.len() as u64);
-        for sink in &config.access_log {
+            .add(config.inner.access_log.len() as u64);
+        for sink in &config.inner.access_log {
             if let Err(err) = sink.emit(&record).await {
                 // 06.3 D15.3.e NEW: count emission failures alongside the warn.
-                config.stats.access_logs_failed.inc();
+                config.inner.stats.access_logs_failed.inc();
                 tracing::warn!(error = ?err, "access log emission failed");
             }
         }
@@ -651,7 +741,10 @@ mod tests {
     async fn spawn_h2_hcm(config: Arc<Http1HCMConfig>) -> (std::net::SocketAddr, TestServer) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let hcm = HCM::new(config);
+        // 13.2 D6: wrap the H1 HCMConfig with the new envoy_http2 HCMConfig
+        // (pool manager `None` on test paths — the H2 dispatch arm falls
+        // back to per-call connect when no pool is wired).
+        let hcm = HCM::new(Arc::new(HCMConfig::wrap(config, None)));
         let h = tokio::spawn(async move {
             loop {
                 let (stream, _peer) = match listener.accept().await {
@@ -1057,6 +1150,159 @@ static_resources:
             let _ = body.flow_control().release_capacity(chunk.len());
         }
         assert_eq!(body_bytes.as_ref(), b"h2-upstream-ok");
+    }
+
+    /// 13.2 Task 2 (D6): drive N sequential requests through the H2 HCM
+    /// configured with an `H2PoolManager`. Assert that `cluster.cx_total`
+    /// increments only once (= one upstream conn for the whole sequence).
+    /// The H2 pool's stream-multiplexing semantic acquires N stream slots
+    /// on the single upstream conn; `cx_total` fires only at
+    /// connect-on-miss (lock-in #6, Task 1).
+    ///
+    /// Mirrors the H1 pool integration test shape at
+    /// `crates/envoy-http1/src/hcm.rs::tests` (the 13.1 sibling test) —
+    /// exercises the wired pool dispatch path end-to-end through the H2
+    /// HCM (`UpstreamProtocol::Http2` arm) rather than the pool unit-test
+    /// surface alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_hcm_pool_reuses_upstream_conn_across_sequential_requests() {
+        // Spawn an H2 upstream that handles many streams on one TCP conn.
+        // `spawn_upstream_h2_server` accepts a single TCP connection and
+        // loops `conn.accept()` over all streams on it — exactly the
+        // multiplexing shape we need to assert pool reuse.
+        let (upstream_addr, _upstream_handle) = spawn_upstream_h2_server(b"h2-pool-ok").await;
+
+        // Build the cluster manager + shared registry from a YAML
+        // bootstrap so the H2 pool manager can register cluster-side
+        // stats (cx_destroy + cx_http2_total) against the same registry
+        // the cluster manager already populated (single-bootstrap-per-
+        // process invariant: see `H2PoolManager::for_bootstrap`).
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let yaml = format!(
+            r#"
+node: {{ id: x, cluster: y }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: {addr}
+                      port_value: {port}
+      typed_extension_protocol_options:
+        "envoy.extensions.upstreams.http.v3.HttpProtocolOptions":
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_concurrent_streams: 100
+"#,
+            addr = upstream_addr.ip(),
+            port = upstream_addr.port(),
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse bootstrap");
+        let cluster_mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("from_bootstrap"),
+        );
+
+        // Build the H2 pool manager against the same bootstrap + registry.
+        let token = tokio_util::sync::CancellationToken::new();
+        let pool_mgr = crate::pool::H2PoolManager::for_bootstrap(
+            &bootstrap,
+            &cluster_mgr,
+            Arc::clone(&registry),
+            token.clone(),
+        )
+        .expect("H2PoolManager::for_bootstrap");
+
+        // Build the inner H1 HCMConfig (proxies "/" to "backend") and
+        // wrap it with the pool manager.
+        let inner = synth_h2_hcm_config_proxy(Arc::clone(&cluster_mgr)).await;
+        let hcm_config = Arc::new(HCMConfig::wrap(
+            Arc::clone(&inner),
+            Some(Arc::clone(&pool_mgr)),
+        ));
+
+        // Re-register cx_total against the shared registry (idempotent
+        // same-kind contract: returns the same Arc).
+        let cx_total = registry
+            .register_counter("cluster.backend.upstream_cx_total")
+            .expect("cx_total registers");
+        assert_eq!(cx_total.value(), 0, "starts at zero");
+
+        // Spawn the HCM accept loop manually (the existing `spawn_h2_hcm`
+        // helper wraps with `pool: None`; we need to thread the wired
+        // wrapper through `HCM::new`).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hcm = HCM::new(hcm_config);
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let hcm_clone = hcm.clone();
+                tokio::spawn(async move {
+                    let _ = hcm_clone.handle(stream).await;
+                });
+            }
+        });
+        let _server = TestServer {
+            handle: server_handle,
+        };
+
+        // Open ONE downstream H2 client connection and drive 3 sequential
+        // requests through it. The HCM accepts each stream on a fresh
+        // upstream pool acquire; pool reuse on the H2 dispatch path means
+        // all 3 acquires share the SAME upstream connection (cx_total
+        // fires exactly once).
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        for _ in 0..3 {
+            let req = http::Request::builder()
+                .method("GET")
+                .uri("http://test.example/")
+                .body(())
+                .unwrap();
+            let (response_fut, _) = send_request.send_request(req, true).unwrap();
+            let resp = response_fut.await.expect("response");
+            assert_eq!(resp.status().as_u16(), 200);
+            // Drain body to let the stream fully complete + the pool
+            // guard drop fire (returning the stream slot to the pool).
+            let (_parts, mut body) = resp.into_parts();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.unwrap();
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+        }
+
+        // Brief settle so the spawned handle_one_stream tasks' pool
+        // releases land before we read the counter. Mirrors the
+        // 100ms posture of `h2_hcm_increments_upstream_rq_total_on_200`.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            cx_total.value(),
+            1,
+            "3 sequential requests through the wired H2 pool must share ONE upstream conn; \
+             cx_total fires only at connect-on-miss",
+        );
+
+        // Drain the pool manager (clean shutdown of the idle sweeper task).
+        token.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread")]
