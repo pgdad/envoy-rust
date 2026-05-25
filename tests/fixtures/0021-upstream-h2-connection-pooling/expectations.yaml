@@ -1,0 +1,37 @@
+# Phase 13.2 fixture-0021 expectations (per ADR-0039 topology pivot):
+# H2 pool reuse + the new `upstream_cx_http2_total` counter row.
+# Combined with 13.1's fixture 0020 (H1 pool reuse + the 06.3 REVIEW I2
+# (a) closure) + 13.2 D7.1's `upstream_cx_total` BEHAVIOR_CONTRACT row
+# tightening, this completes the parent-13 H1/H2 connection-pooling
+# deliverable.
+#
+# Driver `http2_keep_alive` (ADR-0039 new variant; mirrors 13.1 D10's
+# `http1_keep_alive` shape verbatim modulo codec): single downstream
+# H2 connection driving 5 sequential single-stream GETs to /; 500ms
+# settle past the last response; bilateral admin stat scrape on the
+# H2-pool-reuse counters.
+#
+# Per parent-13 SPEC §6.2 item-iv + lock-in #5 (preserved under the
+# ADR-0039 pivot): upstream_cx_total: 1 because the H2 pool reuses
+# the single upstream H2 conn across all 5 requests as 5 multiplexed
+# streams (the downstream side multiplexes 5 streams over 1 H2 conn;
+# the upstream pool dispatches each of the 5 stream-dispatches over
+# the same 1 pooled upstream H2 conn). `upstream_cx_http2_total: 1`
+# tracks the same site at the per-codec stat split (13.2 D7.2). Both
+# counters under the tightened `value-exact` BEHAVIOR_CONTRACT row
+# disposition (13.2 D7.1).
+driver:
+  kind: http2_keep_alive
+  requests:
+    - { method: GET, path: /, host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /, host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /, host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /, host: backend_cluster, expected_status: 200 }
+    - { method: GET, path: /, host: backend_cluster, expected_status: 200 }
+  settle_ms: 500
+  expected_stats:
+    - { name: http.ingress_http.downstream_rq_2xx,             value: 5 }
+    - { name: http.ingress_http.downstream_rq_total,           value: 5 }
+    - { name: cluster.backend_cluster.upstream_rq_total,       value: 5 }
+    - { name: cluster.backend_cluster.upstream_cx_total,       value: 1 }
+    - { name: cluster.backend_cluster.upstream_cx_http2_total, value: 1 }

@@ -171,6 +171,40 @@ pub enum Driver {
         #[serde(default)]
         expected_stats: Vec<KeepAliveExpectedStat>,
     },
+    /// 13.2 Task 5 (ADR-0039 topology pivot): drive N sequential single-stream
+    /// HTTP/2 requests over a SINGLE downstream H2 connection. The
+    /// architectural sibling of `Http1KeepAlive` (13.1 D10), exercising the
+    /// H2-pool surface end-to-end after the H2-listener × H1-cluster
+    /// configuration was rejected at parse time by the 06.3 D14.3 gate per
+    /// ADR-0028 (the H1-listener × H2-cluster path is deferred). With this
+    /// driver and an H2 upstream cluster, `upstream_cx_total: 1` (one
+    /// upstream H2 conn multiplexing N streams) — the discriminating
+    /// observable matches the H1 sibling under the value-exact disposition.
+    /// `upstream_cx_http2_total: 1` tracks the same site under the
+    /// per-codec stat split (13.2 D7.2).
+    ///
+    /// The harness opens ONE TCP conn to each proxy's downstream H2 listener,
+    /// runs `h2::client::handshake` to obtain a `SendRequest<Bytes>`, drives
+    /// the H2 `Connection` future on a background tokio task, and for each
+    /// request: clones `SendRequest`, builds an `http::Request<()>`, calls
+    /// `send_request(req, /*end_of_stream=*/ true)` (GET-only — no body),
+    /// awaits the `ResponseFuture`, drains the response body. Sequential
+    /// (await each fully before the next) means N multiplexed streams share
+    /// ONE downstream H2 conn — which exercises the upstream H2 pool's
+    /// stream-multiplex path on the cluster side.
+    ///
+    /// `Http1KeepAliveRequest` + `KeepAliveExpectedStat` are reused directly:
+    /// both substructs are codec-agnostic (method + path + host +
+    /// expected_status; stat-name + value) — mirrors the 11 D8.1 precedent
+    /// where `Driver::Http2ProbeList` reuses `Http1Probe` verbatim under the
+    /// same codec-agnostic argument.
+    Http2KeepAlive {
+        requests: Vec<Http1KeepAliveRequest>,
+        #[serde(default)]
+        settle_ms: u64,
+        #[serde(default)]
+        expected_stats: Vec<KeepAliveExpectedStat>,
+    },
     /// 06.1 D6.a: drive a sequence of HCM-side `PreRequest`s (so the registry
     /// has counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
     /// Relaxed-ordered counter writes become visible), then perform one or
@@ -1446,6 +1480,133 @@ pub async fn drive_http2(
     })
 }
 
+/// 13.2 Task 5 (ADR-0039): drive N sequential single-stream HTTP/2 requests
+/// over ONE downstream H2 conn opened to `proxy_addr`. Mirrors `drive_http2`
+/// (single-shot) but holds the `SendRequest<Bytes>` across N requests so all
+/// streams share the same downstream H2 conn — the discriminating-observable
+/// shape per parent-13 SPEC §6.2 item-iv.
+///
+/// Per-request flow (mirrors `drive_http2`'s body verbatim modulo the loop):
+///   1. Clone `SendRequest` (it is `Clone` to support per-stream multiplex).
+///   2. Build `http::Request<()>` with absolute-form URI so `:authority` is
+///      populated (matches `drive_http2`'s absolute-URI shape).
+///   3. `send_request(req, /*end_of_stream=*/ true)` — GET-only, no body.
+///   4. Await `ResponseFuture`, assert status equals `expected_status`, drain
+///      the response body with best-effort flow-control window release.
+///
+/// The connection-driving `tokio::spawn` (the H2 `Connection` future) is
+/// retained across all requests and aborted once the response loop completes,
+/// matching `drive_http2`'s teardown shape — the server (echo backend OR
+/// proxy) will not necessarily close the socket on its own, so an explicit
+/// abort avoids tying test wall-time to peer-close.
+///
+/// `side_name` ("upstream" / "subject") is for error context — request errors
+/// surface the failing side at the request boundary so a hung response on
+/// only one side is named immediately.
+pub async fn drive_http2_keep_alive(
+    proxy_addr: SocketAddr,
+    requests: &[Http1KeepAliveRequest],
+    side_name: &str,
+) -> Result<()> {
+    use tokio::net::TcpStream;
+
+    let tcp = TcpStream::connect(proxy_addr)
+        .await
+        .with_context(|| format!("{side_name}: connecting to proxy {proxy_addr}"))?;
+    let (send_request, conn) = h2::client::handshake(tcp)
+        .await
+        .with_context(|| format!("{side_name}: H2 handshake against proxy {proxy_addr}"))?;
+
+    // Drive the H2 `Connection` future in the background across all N
+    // requests. Mirrors `drive_http2`'s shape — abort + await at the end.
+    let conn_handle = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let drive_result: Result<()> = async {
+        for req in requests {
+            // Per-stream clone of `SendRequest` — h2 derives `Clone` precisely
+            // to support multiplexed stream issuance from one connection.
+            // Sequential await means we never have multiple in-flight streams,
+            // but cloning is the documented multiplex idiom and the binding
+            // ADR-0039 scope item #4 names this shape explicitly.
+            let mut sr = send_request.clone();
+
+            // Absolute-form URI so the h2 codec populates :authority. Mirrors
+            // `drive_http2` line 1389-1391 verbatim.
+            let uri: http::Uri = format!("http://{}{}", req.host, req.path)
+                .parse()
+                .with_context(|| {
+                    format!(
+                        "{side_name}: URI parse for {} {} (host={})",
+                        req.method, req.path, req.host
+                    )
+                })?;
+            let request = http::Request::builder()
+                .method(req.method.as_str())
+                .uri(uri)
+                .body(())
+                .with_context(|| {
+                    format!(
+                        "{side_name}: building H2 request {} {}",
+                        req.method, req.path
+                    )
+                })?;
+
+            let (response_fut, _send_stream) = sr
+                .send_request(request, /*end_of_stream=*/ true)
+                .with_context(|| {
+                    format!(
+                        "{side_name}: H2 send_request for {} {}",
+                        req.method, req.path
+                    )
+                })?;
+            let resp = response_fut.await.with_context(|| {
+                format!(
+                    "{side_name}: awaiting H2 response for {} {}",
+                    req.method, req.path
+                )
+            })?;
+            let status = resp.status().as_u16();
+            anyhow::ensure!(
+                status == req.expected_status,
+                "{side_name}: expected status {} for {} {}, got {}",
+                req.expected_status,
+                req.method,
+                req.path,
+                status,
+            );
+
+            // Drain the response body so the stream completes cleanly before
+            // we issue the next request. Mirrors `drive_http2`'s flow-control
+            // release cadence verbatim — best-effort release because errors
+            // here will also surface on the next `data().await`.
+            let mut body_stream = resp.into_body();
+            while let Some(chunk) = body_stream.data().await {
+                let chunk = chunk.with_context(|| {
+                    format!("{side_name}: H2 body data for {} {}", req.method, req.path)
+                })?;
+                body_stream
+                    .flow_control()
+                    .release_capacity(chunk.len())
+                    .ok();
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    // Drop `send_request` BEFORE aborting `conn_handle` — dropping releases
+    // the last SendRequest reference, signalling the h2 `Connection` future
+    // to begin a clean GOAWAY shutdown. Mirrors `drive_http2`'s teardown
+    // (line 1438-1440) verbatim.
+    drop(send_request);
+    conn_handle.abort();
+    let _ = conn_handle.await;
+
+    drive_result
+}
+
 /// 06.1 D6.c: drive a sequence of HCM-side `PreRequest`s (so the registry has
 /// counters incremented), sleep ~50ms (per SPEC §6 signpost 11 to let
 /// Relaxed-ordered counter writes become visible to the scrape), then scrape
@@ -1842,6 +2003,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // the other HCM-shaped drivers; the admin listener is wired via
         // {{ADMIN_PORT}} (see needs_admin_port below).
         | Driver::Http1KeepAlive { .. }
+        // 13.2 Task 5 (ADR-0039): Http2KeepAlive's downstream H2 listener
+        // also uses {{PORT}}; the admin port plumbing mirrors the H1
+        // sibling (see needs_admin_port below).
+        | Driver::Http2KeepAlive { .. }
         | Driver::Http2 { .. }
         | Driver::Http2ProbeList { .. }
         // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
@@ -1864,7 +2029,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // `{{ADMIN_PORT}}`.
     let needs_admin_port = matches!(
         &expectations.driver,
-        Driver::AdminScrape { .. } | Driver::Http1KeepAlive { .. }
+        Driver::AdminScrape { .. } | Driver::Http1KeepAlive { .. } | Driver::Http2KeepAlive { .. }
     ) && (upstream_template.contains("{{ADMIN_PORT}}")
         || subject_template.contains("{{ADMIN_PORT}}"));
     let admin_host_port: Option<u16> = if needs_admin_port {
@@ -2571,6 +2736,86 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // BOTH sides under the same Relaxed-ordering budget (SPEC §6
             // signpost 11). A fixture-time bump may be needed if a future
             // counter site lands behind a longer happens-before chain.
+            tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+
+            for stat in expected_stats {
+                let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
+                    .await
+                    .with_context(|| format!("upstream scraping stat {}", stat.name))?;
+                let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
+                    .await
+                    .with_context(|| format!("subject scraping stat {}", stat.name))?;
+                anyhow::ensure!(
+                    upstream_value == stat.value,
+                    "upstream stat {} expected {} got {}",
+                    stat.name,
+                    stat.value,
+                    upstream_value,
+                );
+                anyhow::ensure!(
+                    subject_value == stat.value,
+                    "subject stat {} expected {} got {}",
+                    stat.name,
+                    stat.value,
+                    subject_value,
+                );
+            }
+
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+        }
+        // 13.2 Task 5 (ADR-0039): the H2 sibling of `Http1KeepAlive`. Each
+        // proxy gets ONE downstream H2 conn (TCP + h2::client::handshake),
+        // N sequential single-stream requests via cloned `SendRequest`,
+        // then a settle sleep + bilateral admin stat scrape.
+        //
+        // The discriminating observable under fixture 0021's H2 upstream
+        // cluster: `cluster.<name>.upstream_cx_total: 1` +
+        // `cluster.<name>.upstream_cx_http2_total: 1` because the H2 pool
+        // (Task 2's integration) reuses the single first-acquire upstream
+        // H2 conn across all N downstream-stream → upstream-stream
+        // dispatches. With a per-call upstream-`Client::connect` regression
+        // this counter would be N and the fixture would fail RED.
+        //
+        // Architectural shape per ADR-0039 + parent-13 SPEC §6.2 item-iv:
+        // the discriminating-observable bilateral validation is preserved
+        // under the H2-downstream + H2-upstream topology (instead of the
+        // PLAN's H1-downstream + H2-upstream topology, which is rejected
+        // at parse time by the 06.3 D14.3 gate per ADR-0028).
+        Driver::Http2KeepAlive {
+            requests,
+            settle_ms,
+            expected_stats,
+        } => {
+            let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http2KeepAlive requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
+                )
+            })?;
+            let subject_admin_port = admin_host_port.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http2KeepAlive requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
+                )
+            })?;
+            let upstream_admin_addr: SocketAddr =
+                format!("127.0.0.1:{upstream_admin_port}").parse()?;
+            let subject_admin_addr: SocketAddr =
+                format!("127.0.0.1:{subject_admin_port}").parse()?;
+            wait_accept_ready(upstream_admin_addr, budget)
+                .await
+                .context("upstream admin listener never became accept-ready")?;
+            wait_accept_ready(subject_admin_addr, budget)
+                .await
+                .context("envoy-rust admin listener never became accept-ready")?;
+
+            for (side_name, proxy_addr) in &[("upstream", upstream_addr), ("subject", subject_addr)]
+            {
+                drive_http2_keep_alive(*proxy_addr, requests, side_name).await?;
+            }
+
+            // Single post-request settle: covers stat-write visibility on
+            // BOTH sides under the same Relaxed-ordering budget (SPEC §6
+            // signpost 11). Mirrors the H1 sibling at `Driver::Http1KeepAlive`.
             tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
 
             for stat in expected_stats {
@@ -3777,6 +4022,58 @@ driver:
             "cluster.backend_cluster.upstream_cx_total"
         );
         assert_eq!(expected_stats[0].value, 1);
+    }
+
+    /// 13.2 Task 5 (ADR-0039): `Driver::Http2KeepAlive` round-trips through
+    /// the snake_case-tagged serde representation. Asserts the new variant
+    /// reuses `Http1KeepAliveRequest` + `KeepAliveExpectedStat` verbatim
+    /// (the codec-agnostic substructs — same precedent as `Http2ProbeList`
+    /// reusing `Http1Probe` at 11 D8.1). The kind tag is
+    /// `http2_keep_alive` per the `Driver` enum's
+    /// `#[serde(tag = "kind", rename_all = "snake_case")]` attribute.
+    #[test]
+    fn driver_http2_keep_alive_round_trips_through_serde() {
+        let yaml = r#"
+driver:
+  kind: http2_keep_alive
+  requests:
+    - method: GET
+      path: /
+      host: backend_cluster
+      expected_status: 200
+  settle_ms: 500
+  expected_stats:
+    - name: cluster.backend_cluster.upstream_cx_total
+      value: 1
+    - name: cluster.backend_cluster.upstream_cx_http2_total
+      value: 1
+"#;
+        let exp: crate::Expectations = serde_yaml::from_str(yaml).expect("yaml parses");
+        let Driver::Http2KeepAlive {
+            requests,
+            settle_ms,
+            expected_stats,
+        } = exp.driver
+        else {
+            panic!("expected Driver::Http2KeepAlive");
+        };
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/");
+        assert_eq!(requests[0].host, "backend_cluster");
+        assert_eq!(requests[0].expected_status, 200);
+        assert_eq!(settle_ms, 500);
+        assert_eq!(expected_stats.len(), 2);
+        assert_eq!(
+            expected_stats[0].name,
+            "cluster.backend_cluster.upstream_cx_total"
+        );
+        assert_eq!(expected_stats[0].value, 1);
+        assert_eq!(
+            expected_stats[1].name,
+            "cluster.backend_cluster.upstream_cx_http2_total"
+        );
+        assert_eq!(expected_stats[1].value, 1);
     }
 
     #[test]
