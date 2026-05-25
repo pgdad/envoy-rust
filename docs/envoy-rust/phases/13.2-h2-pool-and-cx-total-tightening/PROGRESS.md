@@ -660,4 +660,62 @@ Per `BOOTSTRAP_PROMPT.md` §5 state 5 + `SKILL_ROUTING.md`, the next session —
 
 ---
 
-*(Task 8 appends below at the state-6 close-out commit — the closing-sub-phase invariant flips ROADMAP rows `13.2` AND parent-13 `13` `in-progress → done` SIMULTANEOUSLY. The state-5 code-review session intervenes between this state-4 commit and Task 8 per the §5 state machine.)*
+*(Task 8 appended below at the state-6 close-out commit per the closing-sub-phase invariant. The state-5 code-review session at `0d8b1c2` (REVIEW.md verdict `Approved with M-track follow-ups`; zero Critical / zero Important post-aggregation; 13 active Minor carryforwards — all awareness-only) intervened between this state-4 verification commit and Task 8 per the §5 state machine.)*
+
+### Task 8 — state-6 close-out commit (closing-sub-phase + parent-13 close)
+
+Docs-only state-6 CLOSING-sub-phase close-out commit per `BOOTSTRAP_PROMPT.md` §5 state 6 + §5.3 commit-message format + the **closing-sub-phase close-out** cadence (mirrors the 02.2 `cc8a64a` + 03.2 `97df2dc` + 07.2 `c7b0a36` + 08.2 `b40ad9b` + 12.2 `3ec7fb9` closing-sub-phase precedents verbatim for the ROADMAP row-flip-pair shape — the closing sub-phase commit flips BOTH the sub-phase row AND its parent-row simultaneously; the freshest CLOSING-sub-phase precedent is the 12.2 state-6 close-out commit `3ec7fb9`, mirrored verbatim here for the file-set + the STATE.md 4-top-pointer rewrite + the `### Phase-NN.N rollovers` Notes subsection cadence).
+
+Lands controller-direct per the closing-sub-phase docs-only convention + `feedback_execution_style` mid-arc latitude (the close-out is a docs-only ROADMAP row-flip pair + STATE 4-top-pointer rewrite + this PROGRESS Task 8 append; subagent overhead exceeds task scope; mirrors the 13.1 / 12.2 / 12.1 / phase-11 close-out cadence verbatim).
+
+**Commit title (per 13.2 SPEC §8 + ADR-0039 attribution):**
+
+```
+phase 13.2: H2 connection pool + upstream_cx_total tightening to value-exact + fixture 0021 + parent-13 close (06.3 REVIEW I2 FULLY CLOSED) [parent 13 done] [ADR-0039]
+```
+
+The `[parent 13 done]` tag is the closing-sub-phase row-flip-pair marker (mirrors 12.2's `[parent 12 done]` at `3ec7fb9`). The `[ADR-0039]` bracket attributes the topology-pivot ADR landed in the 13.2 lifecycle at state-3-partial closure `e2b8d1b` (ADR-0039 itself ratified there for the fixture-0021 H1-listener × H2-cluster → H2-listener × H2-cluster + new `Driver::Http2KeepAlive` reshape; ADR-0028 carried forward per ADR-0039 Consequences with closure path documented).
+
+**Files touched at THIS commit (3):**
+
+- **MODIFY** `docs/envoy-rust/ROADMAP.md` — atomic single-commit row-flip pair: row `13.2` `status: in-progress → done` AND parent row `13` `status: in-progress → done` SIMULTANEOUSLY (the closing-sub-phase invariant). Neither row flips alone at this commit. `summary` columns unchanged on both rows; rows `00`-`12.2` + `13.1` untouched.
+- **MODIFY** `docs/envoy-rust/STATE.md` — advance the 4 top pointers (Active phase `13.2` state-5-complete / state-6-next → `awaiting next planning` with directory pointing to closed `13.2` + closed sibling `13.1` + closed parent `13`; Next expected skill `state-6 close-out [no specific skill]` → `superpowers:brainstorming` for the next planning session; Last commit / Last updated rewrites) + append a `### Phase-13.2 rollovers` Notes subsection at end of Notes (mirrors the `### Phase-12.2 rollovers` + `### Phase-13.1 rollovers` precedents verbatim for the rollover-narrative shape). All prior subsections preserved verbatim per D-3.5 (append-only) + D-3.4 (context isolation); prior state-5 narrative demoted to `_Historical_`.
+- **MODIFY** `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` (this file) — append this Task 8 subsection (the recommended controller's call per `feedback_pick_recommendation`; the 13.2 PLAN's Task 8 explicitly names the state-6 close-out as its own task; D-3.4 closure-narrative cold-readability). The 12.2 + 13.1 close-out precedents both included a final PROGRESS Task subsection (12.2 Task 8 PROGRESS was the state-4 verification subsection landed at `39e55a5` not the close-out itself; 13.1 had no separate Task PROGRESS at the close-out since Task 10 was the state-4 verification at `592d9e7`); 13.2 explicitly names Task 8 = the state-6 close-out per the 13.2 PLAN, so the subsection lands at THIS commit.
+
+**No production code change at THIS commit; no test/fixture/Cargo/DECISIONS/BEHAVIOR_CONTRACT/SPEC/PLAN/REVIEW change; no ENVOY_TARGET.md / rust-toolchain.toml change (D-3.7 / D-3.9 unchanged); no `unsafe` introduced.** No new ADR (ledger head stays **ADR-0039**; project-cumulative ADR count 40; next available **ADR-0040**); state-6 commits NEVER land ADRs.
+
+**Phase 13.2 closed + parent phase 13 closed.** The 5 carved parent-13 deliverables (D5 H2Pool primitive + D6 H2 router-arm pool integration + D7.1 `upstream_cx_total` row tightening + D7.2 `upstream_cx_http2_total` row + D9.1-H2 fixture 0021 + D9.3-H2 in-process H2 backstop) landed end-to-end across Tasks 1–7 (`f692b53` → `76e4b82`) + 4 in-phase fold-in commits (Task 1 `ae8d7cf` CRITICAL — H2 invalidate-Drop TOCTOU race close; Task 2 `ef6deda` IMPORTANT — cx_active fallthrough comment correction; Task 5 `f7cd908` IMPORTANT — H2 teardown honesty correction; Task 6 `2fef8ad` 2× IMPORTANT — discriminating-power caveat + backend-ready justification) + state-3-partial closure `e2b8d1b` (ADR-0039 topology pivot) + state-5 code review `0d8b1c2` (REVIEW.md `Approved with M-track follow-ups`). The cumulative 13.2 lifecycle arc since state-2 PLAN-write `8c7d8a2` is **14 total commits** (`8c7d8a2..HEAD`).
+
+**THE FULL 06.3 REVIEW I2 CARRYFORWARD CLOSES AT THIS COMMIT.** Combined with 13.1's I2 (a) closure at fixture 0020 (the 13.1 state-6 close-out `9d8e9ca`'s explicit attribution) + 13.2's I2 (b) closure at Task 4 `4ab2c61` (the BEHAVIOR_CONTRACT `cluster.<name>.upstream_cx_total` row tightening to `value-exact (H1+H2 clusters under the harness's single-downstream-keep-alive-conn driver); name-required, value-may-differ (TCP-proxy clusters carved out per parent-13 SPEC §4)`), the 7-phase-old 06.3 REVIEW I2 carryforward is **FULLY CLOSED** at parent-13 close per the closing-sub-phase invariant. PROGRESS attributes this closure re-attribution honestly per D-3.4.
+
+**Carryforward dispositions ratified at state-6 (re-attribution of state-4 + state-5 ratifications, plus the new closure attribution at parent-13 close):**
+
+- **06.3 REVIEW I2 (FULL)** — **FULLY CLOSED at THIS commit** per the closing-sub-phase invariant. Combines:
+  - **(a)** 13.1 fixture 0020 per-class HCM `downstream_rq_{2,3,4,5}xx` + cluster `upstream_rq_5xx` bilateral assertions (CLOSED at 13.1 Task 7 `ec50093`; re-attributed at 13.1 state-6 close-out `9d8e9ca`).
+  - **(b)** 13.2 D7.1 `cluster.<name>.upstream_cx_total` BEHAVIOR_CONTRACT row tightening to `value-exact (H1+H2)` (CLOSED at 13.2 Task 4 `4ab2c61`; re-attributed at THIS state-6 close-out).
+- **13.1 REVIEW Cluster A-I3** (spurious-overflow race) — FULLY CLOSED jointly across H1+H2 at 13.2 Task 1 `f692b53` + Task 1 fold-in `ae8d7cf` (joint sync-`parking_lot::Mutex` switch + the H2 invalidate-Drop TOCTOU race close).
+- **13.1 REVIEW Cluster A-M1 + A-M2 + A-M4** (3 Cluster A Minors) — CLOSED opportunistically at 13.2 Task 1 (rename `_sweepers` → `sweepers` + `pub async fn shutdown(self)` on both managers + `Arc::ptr_eq` debug-assert at the gauge wiring site + improved `.expect` message naming the single-bootstrap-per-process invariant).
+- **ADR-0028** (H1-listener × H2-cluster dispatch deferral) — **REMAINS OPEN** per ADR-0039 Consequences. Closure path documented (extract `envoy-http2::Client` to a new `envoy-http-client` crate to break the dep cycle; ~300-400 LoC; foundations grant + new crate; out of 13.2 scope). Named owner: a follow-up phase.
+- **All other carryforwards** (13.1 A-M3 + A-M5 + B-M1..B-M3 + C-M1..C-M4; 12.2 11 active Minors; 12.1 M1+M3; phase-11 M1-M8; earlier-phase residuals) carry forward unchanged per their named-owner dispositions.
+- **13.2 state-5 13 new Minor carryforwards** (A-M1..A-M5, B-M1..B-M4, C-M1..C-M4) — all carry forward unchanged per REVIEW.md §4 named-owner dispositions; NONE folds in at THIS close-out per the standing 13.1 + 12.2 + 12.1 + phase-11 docs-only close-out precedent.
+
+**Parent-13 closure milestones at THIS commit:**
+
+- **2 closed phases (12 + 13)** in the Upstream-robustness family — phase 12 closed at `3ec7fb9` (12.2 state-6 close-out; the FIRST Upstream-robustness phase closed) + phase 13 closed at THIS commit (the SECOND).
+- **Foundation periodic-background primitive triad complete** — 12.2 `envoy-health::Scheduler` (active HC probe task) + 13.1 `H1Pool::spawn_idle_sweeper` + 13.2 `H2Pool::spawn_idle_sweeper`; all three sharing identical `tokio_util::sync::CancellationToken` cancellation discipline + `pub async fn shutdown(self)` on the H1+H2 pool managers post-13.1-A-M1 close at 13.2 Task 1.
+- **Per-protocol upstream connection pooling complete for H1 + H2** — `crates/envoy-http1/src/pool.rs` (13.1) + `crates/envoy-http2/src/pool.rs` (13.2) with cycle-free external pool manager registries (`H1PoolManager` + `H2PoolManager` as siblings to `ClusterManager`, not fields on `Cluster`; mirrors the 12.2 `envoy-health::Scheduler` precedent). TCP-proxy pooling carved out for a follow-up phase per the BEHAVIOR_CONTRACT row's explicit carve-out (the `crates/envoy-tcp/src/lib.rs:108` per-call `cx_total.inc()` site stays untouched; existing TCP fixtures keep the pre-13.2 presence-only assertion); H3/QUIC pooling defers to the HTTP/3 family.
+- **HCMConfig wrapper struct at `crates/envoy-http2/src/hcm.rs:27-53`** — replaces the prior `pub type HCMConfig = Http1HCMConfig` type alias with a proper struct carrying `Arc<envoy_http1::HCMConfig>` inner + `Option<Arc<H2PoolManager>>`; cycle-free (envoy-http1 does NOT depend on envoy-http2); H1-cluster-in-H2-HCM cross-protocol arm at `hcm.rs:325-337` STAYS UNTOUCHED per ADR-0028 deferral.
+- **3 new pool stat rows** in BEHAVIOR_CONTRACT.md — `cluster.<name>.upstream_cx_destroy` (13.1) + `cluster.<name>.upstream_cx_http1_total` (13.1) + `cluster.<name>.upstream_cx_http2_total` (13.2); together enumerate the per-protocol breakdown of `upstream_cx_total`.
+- **The `cluster.<name>.upstream_cx_total` row** tightened to `value-exact (H1+H2)` with explicit TCP-proxy carve-out (13.2 D7.1; FULL 06.3 REVIEW I2 (b) closure).
+- **21 Docker-gated fixtures (0001-0021) green simultaneously bilaterally** vs `envoyproxy/envoy:v1.33.0` at CI run `26414774250` HEAD `2fef8ad` `completed/success` 2m37s + CI run `26416786136` HEAD `76e4b82` `completed/success` 2m53s + CI run `26418453713` HEAD `0d8b1c2` `completed/success` 2m38s. h2spec ≥95% held at parent-05 baseline 99.31% bilaterally (13.2's H2 surface touches are upstream-client-side only — pool integration via `HCMConfig::wrap` + H2 router-arm pool migration; h2spec runs against the H2 listener / downstream framer, which 13.2 doesn't touch).
+- **ADR-0039 ratified** at state-3-partial closure `e2b8d1b` for the fixture-0021 topology pivot; **ADR-0028 carried forward** per ADR-0039 Consequences with closure path documented.
+
+**CI re-validation at THIS commit:** the close-out CI run re-validates the docs-only edits through the 5 stable-toolchain gates. Anticipate `completed/success` ~2-3 min on first attempt (docs-only; no test surface change). If CI flakes on the pre-existing `envoy-accesslog::file_sink::tests::file_sink_writes_one_record` UNIT test (as it did on the Task 7 state-4 commit's initial run), rerun once; this is the documented pre-existing flake from the access-log family and is not a regression.
+
+**Per `BOOTSTRAP_PROMPT.md` §5 state 0 + `SKILL_ROUTING.md`, the next session enters a fresh phase-0 brainstorm** — invokes `superpowers:brainstorming` to pick + draft the next ROADMAP row from §9 (planner-controller's call which family). After the brainstorm lands a ROADMAP row + creates the phase directory + writes `SPEC.md`, the state machine advances to state 2 (`superpowers:writing-plans`).
+
+**Commit SHA:** lands at this state-6 close-out commit (self-referential after this PROGRESS subsection is committed).
+
+---
+
+*(Phase 13.2 closed. Parent phase 13 closed. The FULL 06.3 REVIEW I2 carryforward closes at this commit. The next session re-derives via `BOOTSTRAP_PROMPT.md` §1 Step D into `superpowers:brainstorming` for the next feature-family phase pick.)*
