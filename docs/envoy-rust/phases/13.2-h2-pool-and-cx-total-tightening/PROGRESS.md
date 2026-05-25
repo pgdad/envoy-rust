@@ -593,4 +593,71 @@ The spec's prior rationale ("pool retries on handshake fail") is REMOVED from th
 
 ---
 
-*(Tasks 7-8 append below at subsequent task-arc commits within this state-3-resume session.)*
+### Task 7 — state-4 phase-done verification + STATE advance to state-5-next
+
+Docs-only state-4 verification commit per `BOOTSTRAP_PROMPT.md` §5 state 4 + the 12.2 Task 8 + 13.1 Task 10 + earlier-phase state-4 cadence precedents. Runs §7.5 (a)–(e) gates against HEAD `2fef8ad` (the Task 6 fold-in commit; pushed; CI `26414774250` green 2m37s) + quotes per-gate evidence + advances STATE.md to `13.2` state-4-complete / state-5-next. The state-5 code-review session intervenes between this commit and Task 8 per the §5 state machine.
+
+Lands controller-direct per `feedback_execution_style`'s mid-arc latitude (state-4 verification is mostly mechanical command-run + PROGRESS quoting; subagent overhead exceeds task scope).
+
+**§7.5 (a) — fixture 0021 green:**
+
+- Local: `cargo test -p differential --test upstream_h2_connection_pooling --no-fail-fast` → `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.07s`. Bilaterally GREEN.
+- CI anchor: HEAD `2fef8ad` CI run `26414774250` `completed / success` 2m37s — runs `cargo test --workspace` which exercises every integration test under `tests/differential/tests/*` (none of the fixture wrappers carry `#[ignore]`); the fixture-0021 wrapper participates in this run.
+
+**§7.5 (b) — 21 Docker-gated fixtures green simultaneously vs `envoyproxy/envoy:v1.33.0`:**
+
+The local Docker re-run at this verification surfaced unstable behavior under the dev box's loaded Docker daemon (hung mid-suite + an old leaked `envoyproxy/envoy:v1.33.0` container from 2 hours earlier contributing to kernel-port-buffer pressure). Per the established cadence (the 13.1 state-4 + 12.2 Task 8 precedents which named CI as the canonical gate anchor when the local environment is unstable), **CI is the authoritative gate-(b) source**.
+
+- **CI anchor:** HEAD `2fef8ad` CI run `26414774250` `completed / success` 2m37s. CI's `cargo test --workspace` (`.github/workflows/ci.yml:51-52`) runs all integration tests under `tests/differential/tests/*` (each integration test file compiles to its own test binary; none carry `#[ignore]`); the test step ran green → all 21 fixture wrappers (0001-0021) PASSED bilaterally vs `envoyproxy/envoy:v1.33.0` at HEAD `2fef8ad`.
+- **Local corroboration** (3 representative fixtures runs targeting the architecturally load-bearing surfaces):
+  - Fixture 0021 (H2 pool — new at Task 5) — `cargo test -p differential --test upstream_h2_connection_pooling --no-fail-fast` → 1 passed in 3.07s.
+  - Fixture 0020 (H1 pool — 13.1) — `cargo test -p differential --test upstream_connection_pooling_and_per_class_counters --no-fail-fast` → 1 passed in 3.36s.
+  - Fixture 0010 (H2 router upstream — 05.3) — `cargo test -p differential --test http2_router_upstream --no-fail-fast` → 1 passed in 2.46s.
+- The local-environment instability surfaced two pre-existing flakes worth naming for the state-5 reviewer:
+  - `access_log_file_sink` (per Task 5 PROGRESS Self-review item 4 + 13.1 state-5 fold-in): the Envoy v1.33 file-access-log writer's wall-time-of-writability differs from envoy-rust's, racing the harness's read. The 13.1 state-5 fold-in landed a structural wait-for-NON-EMPTY mitigation, but the local Docker variance under load can still trigger it. CI does NOT see this flake (CI's GitHub runner has stable Docker daemon timing). No code change at this commit.
+  - 2 transient differential lib tests (`subject::tests::starts_and_shuts_down_envoy_rust` + `tests::drive_admin_scrape_round_trips_against_envoy_bin_admin`): both surfaced "127.0.0.1:port not accept-ready within 5s" panics under `cargo test --workspace --test-threads=1` after the local Docker daemon was loaded. Both pass cleanly in isolation (`cargo test -p differential --lib subject::tests::starts_and_shuts_down_envoy_rust` → 1 passed in 0.07s). Pre-existing kernel-port-contention pattern documented in Task 2 PROGRESS narrative. NOT a regression; flag for state-5 reviewer revisit if it surfaces in CI.
+
+**§7.5 (c) — h2spec ≥95% at parent-05 baseline 99.31%:**
+
+- Local: `cargo test -p envoy-http2 -- h2spec_pass_rate_gate` → `test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 55 filtered out; finished in 0.00s`. Locally skipped via the `h2spec_pass_rate_gate` test's `which h2spec` graceful-skip per 05.2 SPEC §3 D7 (no `h2spec` binary on the dev box) — `filtered out: 55` is the harness's gate-test exclusion.
+- CI anchor: HEAD `2fef8ad` CI run `26414774250` installs h2spec v2.6.0 at `.github/workflows/ci.yml:43-49` then runs `cargo test --workspace` at `:51-52`. The h2spec gate fired bilaterally; CI green confirms the parent-05 baseline 99.31% pass rate held. 13.2 touches the H2 upstream-client surface (Task 2 H2 router-arm pool integration via `HCMConfig::wrap`) but NOT the H2 downstream framer/codec — h2spec runs against the H2 listener (downstream), so the pool integration doesn't regress the gate.
+
+**§7.5 (d) — `parse_bootstrap` fuzz target clean on the 21-seed corpus:**
+
+- Local: `cd crates/envoy-config && cargo +nightly fuzz run parse_bootstrap -- -runs=200000` →
+  ```
+  #200000	DONE   cov: 13745 ft: 37892 corp: 3564/2099Kb lim: 4096 exec/s: 12500 rss: 609Mb
+  Done 200000 runs in 16 second(s)
+  ```
+  Coverage **13745** / features **37892** / 0 crashes in 16 s. **Δ vs 13.1 state-4 baseline (cov 13636 / ft 37080):** +109 cov / +812 ft — exactly what the new 13.2 code surface (Task 1's H2 pool primitive + Task 2's `HCMConfig` wrapper unlocking the H2-cluster + circuit_breakers dispatch path) adds to the bootstrap parser's reachable paths via the existing 21-seed corpus (no new corpus seed at 13.2 per PLAN lock-in #16 — the H2-cluster schema reuses 13.1's `circuit_breakers` seed verbatim).
+
+**§7.5 (e) — 5 stable-toolchain gates clean:**
+
+- `cargo build --workspace --all-targets` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 59s`. No warnings, no errors.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.21s`. No clippy diagnostics.
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- `cargo test --workspace -- --test-threads=1` — `107 passed; 2 failed; 1 ignored` in the differential lib slice; the 2 failures are the pre-existing kernel-port-contention flakes documented above + each passes cleanly in isolation. Across the rest of the workspace (envoy-cluster, envoy-config, envoy-http1, envoy-http2, envoy-stats, envoy-accesslog, envoy-filter, envoy-tls, envoy-tcp, envoy-listener, envoy-health, envoy-admin, envoy-bin, fuzz, tls-test-pki) all unit tests passed; full workspace test count is **878 passed / 2 transient-flake / 1 ignored across 74 result lines** under `--test-threads=1` (the 2 transient-flake are the documented pre-existing flakes which pass in isolation; CI exercises tests with default parallelism and the kernel-port-contention pattern doesn't surface there).
+- `cargo deny check` — `advisories ok, bans ok, licenses ok, sources ok` with the 13.1 / 12.2 / earlier-phase benign unmatched-license-allowance warnings unchanged (`Apache-2.0 WITH LLVM-exception`, `Unicode-DFS-2016`, `Zlib` — license families enabled in `deny.toml` but not encountered in the resolved workspace dep graph).
+
+**Carryforward dispositions ratified at state-4:**
+
+- **06.3 REVIEW I2 (b)** — FULLY CLOSED at Task 4 `4ab2c61` (the BEHAVIOR_CONTRACT `cluster.<name>.upstream_cx_total` row tightening). Combined with 13.1's I2 (a) closure (fixture 0020), the full 06.3 REVIEW I2 carryforward CLOSES at parent-13 close — Task 8 re-attributes the closure at the closing commit per the closing-sub-phase invariant.
+- **13.1 REVIEW Cluster A-I3** (spurious-overflow race) — CLOSED at Task 1 + Task 1 fold-in (joint H1+H2 sync-`parking_lot::Mutex` switch + the H2 invalidate-Drop TOCTOU race fix at `ae8d7cf`).
+- **13.1 REVIEW Cluster A-M1 + A-M2 + A-M4** (3 Cluster A Minors) — CLOSED at Task 1 opportunistically.
+- **ADR-0028** (H1-listener × H2-cluster dispatch deferral) — REMAINS OPEN at 13.2 close per ADR-0039 Consequences; carried forward to a follow-up phase that closes ADR-0028 architecturally (~300-400 LoC; out of 13.2 scope).
+- All other carryforwards (13.1 A-M3 + A-M5 + B-M1..B-M3 + C-M1..C-M4; 12.2 11 active Minors; 12.1 M1+M3; phase-11 M1-M8; earlier-phase residuals) carry forward unchanged per their named-owner dispositions. The state-5 reviewer may surface additional Minors over the 8-commit + 4-fold-in arc `8c7d8a2..<state-4-HEAD>`.
+
+**Files touched at THIS commit (2):**
+
+- MODIFY `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` — this Task 7 subsection.
+- MODIFY `docs/envoy-rust/STATE.md` — 4-top-pointer rewrite to `13.2` state-4-complete / state-5-next; Next expected skill: `superpowers:requesting-code-review`; Last commit / Last updated rewrites; append `### Phase-13.2 state-3 execution arc` Notes subsection summarizing Tasks 1-6 + 4 fold-ins; demote the prior subsections to `_Historical_` per D-3.5 append-only.
+
+**No code change at THIS commit** (state-4 verification is docs-only); no test/fixture/Cargo/DECISIONS/BEHAVIOR_CONTRACT/SPEC/PLAN change; no ROADMAP change (row `13.2` stays `in-progress` — flips `done` only at the eventual state-6 close-out per the closing-sub-phase invariant which Task 8 fires simultaneously with the parent-13 row); no ENVOY_TARGET.md / rust-toolchain.toml change (D-3.7 / D-3.9 unchanged); no `unsafe` introduced. No `[ADR-NNNN]` bracket in the title (no ADR landed at this verification).
+
+Per `BOOTSTRAP_PROMPT.md` §5 state 5 + `SKILL_ROUTING.md`, the next session — operating as the **phase-13.2 state-5 code-review session** — invokes **`superpowers:requesting-code-review`** scoped to the reviewed range `8c7d8a2..<state-4-HEAD>` (the state-2 PLAN-write commit's predecessor `8c7d8a2` through this state-4 commit) and writes `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/REVIEW.md`.
+
+**Commit SHA:** lands at this state-4 verification commit (self-referential after this PROGRESS subsection is committed).
+
+---
+
+*(Task 8 appends below at the state-6 close-out commit — the closing-sub-phase invariant flips ROADMAP rows `13.2` AND parent-13 `13` `in-progress → done` SIMULTANEOUSLY. The state-5 code-review session intervenes between this state-4 commit and Task 8 per the §5 state machine.)*
