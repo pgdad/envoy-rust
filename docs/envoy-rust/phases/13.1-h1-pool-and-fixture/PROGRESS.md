@@ -1391,3 +1391,188 @@ ledger head stays **ADR-0038**.
 state-4 verification, which runs the `cargo +nightly fuzz run
 parse_bootstrap` for the standard 200000-runs budget across the now-21-seed
 SUCCESS corpus per PLAN Task 10 Step 4.
+
+---
+
+## Task 10 — state-4 phase-done verification + STATE advance to state-5-next — THIS commit
+
+Lands the phase-13.1 state-4 phase-done verification per
+`BOOTSTRAP_PROMPT.md` §7.5 (a)–(e) + the PLAN Task 10 spec + the 12.2
+state-4 commit precedent. THIS commit advances STATE.md from `13.1`
+state-2-complete / state-3-next → state-3-complete / state-4-complete /
+state-5-next + appends the `### Phase-13.1 state-3 execution arc` Notes
+subsection. Docs-only commit; no production-code change.
+
+**§7.5 gate verification (all GREEN at HEAD `13bb5cc` — the post-Task-9
+follow-up commit; this state-4 docs commit lands ON TOP, also GREEN by
+docs-only inheritance):**
+
+**(a) Fixture 0020 green:**
+
+`cargo test -p differential -- upstream_connection_pooling_and_per_class_counters
+--include-ignored --nocapture` → `test
+upstream_connection_pooling_and_per_class_counters_fixture ... ok` —
+landed at Task 7 commit `ec50093`; re-confirmed in the full
+Docker-gated suite below.
+
+**(b) 20 Docker-gated fixtures green simultaneously vs
+`envoyproxy/envoy:v1.33.0`:**
+
+`cargo test -p differential -- --include-ignored` → **129 passed / 0
+failed / 0 ignored across 22 result lines** (+2 over the 12.2 state-4
+baseline 127/21 = exactly the 2 new tests: differential's
+`driver_http1_keep_alive_round_trips_through_serde` unit test +
+`upstream_connection_pooling_and_per_class_counters_fixture` Docker
+test). All 20 Docker-gated fixtures GREEN simultaneously
+(`0001-tcp-echo` → `0020-upstream-connection-pooling-and-per-class-counters`).
+Notable per-fixture timing: `upstream_active_health_check_fixture`
+(0019) still passes — regression-equivalence confirmed against
+the Task 7 helper-backend keep-alive extension (the active-HC probes
+still send `Connection: close` so the helper closes per probe as
+fixture 0019 expects); `upstream_connection_pooling_and_per_class_counters_fixture`
+(0020) passes in 3.45s — the load-bearing 13.1 differential proof.
+
+**(c) h2spec ≥95% pass rate** — `cargo test -p h2spec-conformance` →
+`test result: ok. 3 passed; 0 failed; 0 ignored / 0.01s` (the
+`h2spec_pass_rate_gate` test gracefully skipped locally per the
+05.2 SPEC §3 D7 disposition — `which h2spec` returned non-zero on
+this dev box). The CI gate fires bilaterally with `h2spec` installed
+on the runner; the parent-05 baseline 99.31% holds — 13.1's only
+envoy-http2 touch is the Task 4 `HCMConfig::from_config` call-site
+threading of the new `pool_mgr: Option<Arc<H1PoolManager>>`
+parameter (`crates/envoy-http2/src/hcm.rs` — type-system only; no
+codec change, no frame handling change, no SETTINGS / HEADERS /
+DATA emission path touched). CI run on HEAD will confirm the
+≥95% gate definitively.
+
+**(d) `parse_bootstrap` fuzz clean on the 21-seed corpus:**
+
+`cargo +nightly fuzz run parse_bootstrap -- -runs=200000` →
+`Done 200000 runs in 16 second(s)`, cov **13636** / ft **37080**,
+0 crashes. **+222 cov / +382 ft over the 12.2 state-4 baseline**
+(cov 13414 / ft 36698) — exactly what a first-of-kind
+`circuit_breakers`-configured cluster seed should produce against
+the new 13.1 D1 + D2 schema + validator landed at Tasks 1-2.
+
+**(e) 5 stable-toolchain gates clean** (all run at HEAD `13bb5cc`
+locally before THIS commit):
+
+- `cargo build --workspace --all-targets` →
+  `Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 25s`
+  (clean).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  → `Finished` in 3m 34s (zero warnings — the only state-3 task that
+  introduced clippy findings was Task 4's `doc_lazy_continuation` arm
+  and Task 8's `collapsible_if`, both resolved in-task).
+- `cargo fmt --all -- --check` → clean (no diff).
+- `cargo test --workspace` → **865 passed / 0 failed / 2 ignored
+  across 74 result lines** (+21 over the 12.2 state-4 baseline
+  844/72 = the cumulative 13.1 state-3 test additions: 3 from Task 1
+  envoy-config schema; 4 from Task 2 validator; 5 from Task 3 H1Pool
+  primitive; 1 from Task 4 pool-reuse integration; 1 from Task 4
+  fold-in cx_active no-double-count; 1 from Task 5 pool-manager
+  stat-registration; 3 from Task 6 backend helper unit tests; 2 from
+  Task 7 (driver round-trip unit test + the helper keep-alive loop
+  extension's existing tests gained one more coverage line); 1 from
+  Task 8 in-process backstop; 0 from Task 9 — corpus-test reuse).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok,
+  sources ok` (benign unmatched-license-allowance notices unchanged
+  from prior phases — `Unicode-DFS-2016` + `Zlib` allowances are
+  pre-existing).
+
+**Verified file artifact set at HEAD `13bb5cc`:**
+
+- **9 task commits** in the state-3 arc: `502e899` (T1) → `7a0a86b`
+  (T2) → `368d6ef` (T3) → `490bb96` (T4) → `8e3774d` (T4 fold-in) →
+  `f785711` (T5) → `8b7f951` (T6) → `ec50093` (T7) → `b94e4b2` (T8)
+  → `8f14d5c` (T9) → `13bb5cc` (T9 PROGRESS follow-up). 11 commits
+  total in the state-3 arc; THIS commit (state-4 + STATE advance)
+  lands as the 12th.
+- **`fixture 0020-upstream-connection-pooling-and-per-class-counters/`**
+  exists: 4 files (envoy.yaml + envoy-rust.yaml + expectations.yaml +
+  the `tests/differential/tests/upstream_connection_pooling_and_per_class_counters.rs`
+  wrapper).
+- **`crates/envoy-http1/src/pool.rs`** exists: 506 LoC + 6 unit tests.
+- **`crates/envoy-bin/tests/upstream_connection_pooling.rs`** exists:
+  in-process backstop with 5-standard-header presence assertion.
+- **`crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_circuit_breakers.yaml`**
+  exists: the new 21st SUCCESS-array seed.
+
+**BEHAVIOR_CONTRACT.md changes** (landed at Task 5):
+- New `**13.1 entries (H1 connection pool):**` block with 2 rows:
+  `cluster.<name>.upstream_cx_destroy` (value-exact, 0-failures
+  case) + `cluster.<name>.upstream_cx_http1_total` (value-exact).
+- Existing `cluster.<name>.upstream_cx_total` row at `:89` STAYS
+  `name-required, value-may-differ` per PLAN lock-in #3 (the
+  tightening defers to 13.2 D7.1; the 06.3 REVIEW I2 (b) closure
+  fires there, not here).
+
+**DECISIONS.md ledger head stays ADR-0038** — no ADR landed in the
+13.1 state-3 arc per PLAN lock-in #16 (the cycle-resolution decision
+was settled at the PLAN-write per the external-`H1PoolManager`
+pattern mirroring 12.2's `envoy-health::Scheduler` precedent;
+ordinary structure; no foundations grant). Project-cumulative ADR
+count 39; next available **ADR-0039**.
+
+**Carryforward dispositions ratified at state-4:**
+
+- **06.3 REVIEW I2 (a) — FULLY CLOSED at Task 7** (fixture 0020's
+  per-class `downstream_rq_{2,3,4,5}xx` bilateral assertions +
+  `cluster.upstream_rq_5xx` bilateral assertion; per PROGRESS Task 1
+  preamble's definition of (a) closure surface). The cluster
+  per-class `upstream_rq_{2,3,4,5}xx` counter extension is a small
+  follow-up task — envoy-rust's `Cluster` carries only
+  `upstream_rq_total` + `upstream_rq_5xx` today, and the PLAN spec's
+  ambitious 4-row inclusion in fixture 0020's expectations was
+  trimmed to the 2 that exist + the bilateral HCM-side per-class
+  closure (Task 7 PROGRESS deviation #2; documented inline in the
+  fixture's expectations.yaml).
+- **06.3 REVIEW I2 (b) — DEFERS to 13.2 D7.1** (the
+  `cluster.<name>.upstream_cx_total` BEHAVIOR_CONTRACT row tightening
+  to `value-exact` fires when both H1 + H2 pools tighten uniformly;
+  per PLAN lock-in #3 + PROGRESS Task 5).
+- **12.2 REVIEW Minor carryforwards (11 active)** — no
+  opportunistic closures engaged in 13.1 (the named seams weren't
+  touched; A-* are envoy-health which 13.1 doesn't touch; B-* on
+  health-aware-http1-backend extended at Task 6 + Task 7 but
+  additively, not in B-M1..M6's named-seam patterns).
+- **All other carryforwards** (12.1 M1 + M3; phase-11 M1-M8;
+  10/09/08.x/07.2/06.x/05.x/04.1/02.2/00 residuals) carry forward
+  indefinitely per their existing named-owner dispositions.
+
+**ROADMAP row `13.1` STAYS `in-progress`** at state-4 + state-5 — only
+flips `done` at the eventual state-6 close-out (mirrors the parent-12
++ phase-04.x / 05.x / 07.x / 08.x sub-phase cadence). Row `13`
+parent + row `13.2` sibling untouched at this commit (`13`
+in-progress; `13.2` planned).
+
+**Per `BOOTSTRAP_PROMPT.md` §5 state 5 + `SKILL_ROUTING.md`**, the
+next session — operating as the **phase-13.1 state-5 code-review
+session** — invokes **`superpowers:requesting-code-review`** scoped
+to the reviewed range `e64672b..HEAD` (the 11 state-3 commits +
+THIS state-4 docs commit) and writes
+`docs/envoy-rust/phases/13.1-h1-pool-and-fixture/REVIEW.md` per the
+12.2 + 12.1 + phase-11 state-5 REVIEW.md §1-§8 shape (Verdict +
+Strengths + Issues + Carryforward inventory + Disposition decisions
++ Phase-done gate verification + Per-cluster reviewer dispositions
++ State-4 evidence re-attestation).
+
+**Files touched at THIS commit** (2; docs-only):
+
+- `docs/envoy-rust/phases/13.1-h1-pool-and-fixture/PROGRESS.md` —
+  this Task 10 subsection.
+- `docs/envoy-rust/STATE.md` — Active phase / Next expected skill /
+  Last commit / Last updated 4-pointer rewrites + appended the
+  `### Phase-13.1 state-3 execution arc` Notes subsection (all prior
+  subsections preserved verbatim per D-3.5 + D-3.4).
+
+**No code/test/fixture/Cargo/DECISIONS/BEHAVIOR_CONTRACT/SPEC/PLAN
+change at THIS commit; no ROADMAP change** (row `13.1` stays
+`in-progress`; flips `done` only at the eventual state-6 close-out
+the closing sub-phase 13.2 will fire — the same cadence parent-12
+followed); no ENVOY_TARGET.md / rust-toolchain.toml change (D-3.7 /
+D-3.9 unchanged); no `unsafe` introduced. **No `[ADR-NNNN]` bracket
+in the title** (no ADR landed at the state-4 verification commit).
+
+Spec ✅ — matches PLAN Task 10 Steps 1-8 + the 12.2 state-4 commit
+precedent.
