@@ -505,4 +505,56 @@ The sibling helper `drive_http2` at `tests/differential/src/lib.rs:1467-1471` (l
 
 **Commit SHA:** fold-in commit appended below.
 
-*(Tasks 6-8 append below at subsequent task-arc commits within this state-3-resume session.)*
+---
+
+### Task 6 — in-process H2 backstop (D9.3-H2)
+
+Lands the in-process subprocess-scope backstop for the H2-pool-reuse property at `crates/envoy-bin/tests/upstream_h2_connection_pooling.rs`. Sibling of the 13.1 H1 backstop at `crates/envoy-bin/tests/upstream_connection_pooling.rs` (landed at phase 13.1 Task 8); mirrors its shape verbatim modulo H2-specific substitutions (per ADR-0039 topology pivot).
+
+**Files changed (2; total +363 + PROGRESS subsection):**
+
+- **NEW** `crates/envoy-bin/tests/upstream_h2_connection_pooling.rs` (+363 lines) — in-process H2 backstop. Spawns the `http2-echo-server` helper (phase 05.3 workspace member; no `--per-path` flag — the helper always 200-echos) + spawns `envoy-bin` with a synthesized bootstrap (HCM `codec_type: HTTP2` downstream + STATIC `backend_cluster` with `typed_extension_protocol_options.envoy.extensions.upstreams.http.v3.HttpProtocolOptions.explicit_http_config.http2_protocol_options: {}` upstream — per ADR-0039 to avoid the `ConfigError::Http2ClusterFromHttp1Listener` gate at `crates/envoy-config/src/bootstrap.rs:1997-2016`). Drives 5 sequential `GET /` streams over ONE downstream H2 conn via `h2::client::handshake` + cloned `SendRequest<()>` (mirroring `drive_http2_keep_alive` at `tests/differential/src/lib.rs:1506-1612`, adapted + inlined). Settles 500ms (matches fixture 0021's `settle_ms: 500`), scrapes admin `/stats`, asserts the 5 fixture-0021 stat rows verbatim: `http.ingress_http.downstream_rq_2xx: 5`, `http.ingress_http.downstream_rq_total: 5`, `cluster.backend_cluster.upstream_rq_total: 5`, `cluster.backend_cluster.upstream_cx_total: 1` (THE H2-pool-reuse property), `cluster.backend_cluster.upstream_cx_http2_total: 1` (the 13.2 D7.2 per-codec split).
+- **MODIFIED** `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` (this subsection).
+
+**Topology decision (per ADR-0039):** H2 downstream + H2 upstream. The PLAN's original H1-downstream × H2-upstream topology is rejected at parse time by the 06.3 D14.3 gate (`ConfigError::Http2ClusterFromHttp1Listener` — ADR-0028 deferral). Verified by direct read of `crates/envoy-config/src/bootstrap.rs:1997-2016` (the gate fires for `CodecType::HTTP1 | CodecType::AUTO` × any cluster with `http2_protocol_options` set). The backstop's bootstrap uses `codec_type: HTTP2` matching the Task 5 fixture-0021 pivot.
+
+**Driver shape (per binding scope item (a)):** Open ONE TCP conn to the downstream H2 listener via `tokio::net::TcpStream::connect`, run `h2::client::handshake` to obtain `SendRequest<()>`, drive the H2 `Connection` future on a background `tokio::spawn`, and for each of 5 requests: clone `SendRequest`, build `http::Request<()>` with absolute-form URI (`http://backend_cluster/` — so `:authority` is populated; mirrors `drive_http2`'s URI shape), `send_request(req, /*end_of_stream=*/ true)` (GET-only — no body), await the response with a 10s per-stream timeout, assert `status == 200`, drain the response body with best-effort flow-control window release. Teardown drops `send_request` then aborts the conn-driving spawn (mirrors the Task 5 fold-in's corrected teardown comment: post-abort the conn future is never polled again, so no clean GOAWAY round-trip fires — that's intentional).
+
+**Substitution checklist vs the H1 sibling backstop:**
+
+1. Backend: `http2-echo-server` (workspace member) via `cargo run --quiet --manifest-path .../tests/helpers/http2-echo-server/Cargo.toml -- --port N`. No `--per-path` flag (helper always 200-echos).
+2. Bootstrap cluster: `typed_extension_protocol_options.envoy.extensions.upstreams.http.v3.HttpProtocolOptions.explicit_http_config.http2_protocol_options: {}` (H2 upstream).
+3. Bootstrap listener: `codec_type: HTTP2` (H2 downstream — per ADR-0039).
+4. Driver: ONE H2 conn + 5 sequential cloned-`SendRequest` streams.
+5. Workload: 5 GETs to `/`, all expecting 200.
+6. Settle: 500ms (matches fixture 0021, vs the H1 sibling's 200ms).
+7. Stat assertions: 5 rows (vs the H1 sibling's 9; the per-class `2xx/3xx/4xx/5xx` H1 split is collapsed to all-2xx here).
+8. 5-standard-header check: **OMITTED** at the H2 surface. H2 has no concept of the H1 standard header roster (`server`/`date`/`content-length`/`content-type`/`connection`); the H1 sibling's check is a per-non-2xx discipline that does not translate to H2 — and the fixture-0021 workload is all-2xx so the H1 check would not fire anyway. Discipline is preserved on the H1 side; no carry-forward to the H2 sibling is meaningful. The omission is documented inline in the backstop's module-level docstring.
+9. Subprocess discipline: `tokio::process::Command + kill_on_drop(true) + Stdio::null()/piped()` (verbatim mirror of the H1 sibling — per 09 REVIEW M3 disposition). Backend / envoy-bin readiness budgets 30s / 10s.
+
+**Discriminating-power note (per binding scope's self-review hook):** `upstream_cx_total: 1` proves the H2 pool reuses ONE upstream conn but does NOT independently prove the upstream multiplexes ALL 5 streams onto that conn (a regression where each downstream stream serialized to a separate upstream 1-stream conn-acquire-release cycle would still yield `upstream_cx_total: 1` under pool reuse). Per the binding scope's `feedback_pick_recommendation` SKIP disposition: the backstop's role is exclusively the in-process round-trip evidence; the fixture is the bilateral evidence; the discriminating-power gap is named here for state-5 code review revisit. The optional concurrent-stream extension (which would discriminate stream-multiplex vs serial-cycle paths) is also SKIPped per the PLAN's `feedback_pick_recommendation` — sequential-stream test captures the pool-reuse property at the scope of this backstop.
+
+**Deviations from PLAN (1 minor):**
+
+- Step 7 of the PLAN substitution checklist names "5-standard-header presence assertion preserved on any non-2xx response (none expected; the discipline carries forward)". OMITTED per substitution-item 8 above — H2 has no H1 standard-header roster, the check has no semantic analog at the H2 surface, and the all-2xx workload would never trigger it anyway. Documented inline in the backstop's module docstring. The H1 sibling's check is preserved as-is at `crates/envoy-bin/tests/upstream_connection_pooling.rs:131-146`; the discipline lives on the H1 side, no carry-forward to H2 is meaningful.
+
+**Per-gate clean outputs:**
+
+- `cargo build --workspace --all-targets` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 48.78s` (no warnings).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 46.91s` (no diagnostics).
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- `cargo test -p envoy-bin --test upstream_h2_connection_pooling -- --nocapture` — `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s` (pass within ~2s end-to-end including `cargo run --quiet --manifest-path` overhead for the warm-cached `http2-echo-server` helper).
+- `cargo test -p envoy-bin --tests` — see below; full envoy-bin backstop suite green (19 backstops pre-Task-6 → 20 post-Task-6).
+
+**Per-gate notes:** the initial cold-cache run of the targeted `cargo test -p envoy-bin upstream_h2_connection_pooling` panicked on backend readiness — the cargo subprocess overhead exceeded the 30s budget on first invocation after `cargo build --workspace --all-targets` had touched files (invalidating cargo's run-cache). Subsequent runs with warm caches complete the full backstop in <3s. The H1 sibling has the identical 30s budget and the identical cargo-subprocess shape; both are stable under warm-cache cadence (CI runs after the workspace build step has finished, so cargo's run cache is warm). This is environmental shape, not a regression. The 30s budget matches the binding scope's "backend readiness budget 30s".
+
+**Continuation-session re-verification (warm-cache, post-Task-5 fold-in HEAD `f7cd908`):**
+- `cargo build --workspace --all-targets` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s` (warm-cache no-op rebuild; no warnings).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.20s` (warm-cache; no diagnostics).
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- `cargo test -p envoy-bin --test upstream_h2_connection_pooling -- --nocapture` — `test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.04s`.
+- `cargo test -p envoy-bin --tests` — all 21 test-binary result lines green (20 backstop binaries; the envoy-bin lib has 8 unit tests; upstream_active_health_check has 2). No regressions; no failures; no skips. The targeted H2 backstop finishes in 1.34s under the full-suite cadence (warm-cached helper artifact). Includes a clean run of `upstream_connection_pooling` (H1 sibling — 0.62s) and `access_log_file_sink_in_process` (the Task 2 narrative's documented kernel-port-contention test — green this run).
+
+**Commit SHA:** `73f7c2c` (pre-amend; published HEAD may shift to the post-amend SHA per the per-task SHA-amend pattern that's run since Task 1).
+
+*(Tasks 7-8 append below at subsequent task-arc commits within this state-3-resume session.)*
