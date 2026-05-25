@@ -317,4 +317,31 @@ The parallel Task 2 lock-in #8 paragraph in this PROGRESS.md subsection is corre
 - `cargo fmt --all -- --check` — exit 0; no diff.
 - `cargo test -p envoy-http2 --lib` — `test result: ok. 54 passed; 0 failed; 1 ignored`.
 
-**Commit SHA:** `caf3f14` (fold-in commit; self-referential after amend below — Task 2 original `07006b4` + this fold-in `caf3f14`).
+**Commit SHA:** `ef6deda` (fold-in commit — Task 2 original `07006b4` + this fold-in `ef6deda`).
+
+---
+
+### Task 3 — D7.2 BEHAVIOR_CONTRACT row for `cluster.<name>.upstream_cx_http2_total`
+
+Docs-only addition under the existing "13.1 entries (H1 connection pool)" subsection at `docs/envoy-rust/BEHAVIOR_CONTRACT.md:158`. New `**13.2 entries (H2 connection pool):**` heading + 1 row sibling to the H1 entry. Disposition `value-exact`. Rationale documents:
+
+- Increment site: H2 pool's `acquire()` connect-on-miss branch at `crates/envoy-http2/src/pool.rs::H2Pool::acquire` (registered at Task 1; consumed at Task 2). Same site as the existing `cluster.<name>.upstream_cx_total` for H2 clusters.
+- Under fixture 0021's single-downstream-keep-alive-conn driver issuing 5 sequential requests → both proxies emit 1 (single upstream H2 conn multiplexing 5 stream slots).
+- Default `max_concurrent_streams = 100` per RFC 7540 §6.5.2 (the `DEFAULT_MAX_CONCURRENT_STREAMS` const at `pool.rs:42`). The fixture's 5-request workload stays well under this cap, so the bilateral value is deterministic 1.
+- Registration scope: only for clusters whose `upstream_protocol()` is `Http2` (gated at `H2PoolManager::for_bootstrap`).
+- Sibling structure: `upstream_cx_http1_total` + `upstream_cx_http2_total` together enumerate the per-protocol breakdown of `upstream_cx_total`.
+
+**Files touched (1):**
+
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md` — appends 1 new `**13.2 entries (H2 connection pool):**` subsection between the existing 13.1 H1-pool entries (lines 152-157) and the 06.1 Prometheus-divergence subsection (post-modification line 168).
+
+**Carryforward attribution:** none at this task.
+
+**Per-gate clean outputs:**
+
+- `cargo fmt --all -- --check` — exit 0; no diff.
+- Doc-only; no test or build impact.
+
+**Lands controller-direct** per PLAN architecture lock-in #17's mid-arc latitude clause — docs-only single-row addition; subagent overhead exceeds task scope.
+
+**Commit SHA:** `5c27b3d`.
