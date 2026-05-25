@@ -144,6 +144,18 @@ impl Cluster {
         }
     }
 
+    /// 13.2 D5: shared accessor for the per-cluster `upstream_cx_active`
+    /// gauge handle. Returns the cached `Arc<Gauge>` registered at
+    /// `from_bootstrap` time. Used by `H1PoolManager::for_bootstrap` and
+    /// `H2PoolManager::for_bootstrap` to `debug_assert!(Arc::ptr_eq(...))`
+    /// that the gauge handle the pool acquired from
+    /// `StatsRegistry::register_gauge` is the SAME `Arc` the cluster holds
+    /// (single-bootstrap-per-process invariant — closes 13.1 REVIEW
+    /// Cluster A-M2). Mirrors `cx_total()`'s borrow shape.
+    pub fn cx_active_arc(&self) -> &Arc<envoy_stats::Gauge> {
+        &self.cx_active
+    }
+
     /// Picks the next endpoint in round-robin order. When the cluster has no
     /// active health checks (`endpoint_health` is `None`) this is exactly the
     /// phase-02 round-robin (the §5.4 inert-when-unconfigured invariant). When
@@ -228,6 +240,15 @@ impl ClusterHandle {
     /// ergonomic reach. See `Cluster::cx_active_guard` for usage contract.
     pub fn cx_active_guard(&self) -> ConnGaugeGuard {
         self.inner.cx_active_guard()
+    }
+
+    /// 13.2 D5: delegates to `Cluster::cx_active_arc`. The pool managers'
+    /// `for_bootstrap` debug-assert site holds a `ClusterHandle`; this
+    /// mirrors the accessor for ergonomic reach. Closes 13.1 REVIEW
+    /// Cluster A-M2 (the `Arc::ptr_eq` debug-assert at the gauge wiring
+    /// site).
+    pub fn cx_active_arc(&self) -> &Arc<envoy_stats::Gauge> {
+        self.inner.cx_active_arc()
     }
 
     /// 06.3 D15.3.c: delegates to `Cluster::upstream_rq_total`. Response-

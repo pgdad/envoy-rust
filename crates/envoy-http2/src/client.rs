@@ -70,11 +70,17 @@ impl Client {
 /// (the channel to the spawned connection task) and the host string captured
 /// at connect time (used as the synthesized `:authority` pseudo-header default
 /// if the outgoing request doesn't carry an explicit `Host:` header). Mirrors
-/// `envoy_http1::ClientStream`'s shape; one `ClientStream` owns one TCP
-/// connection per parent-05 SPEC §4 (no pooling).
+/// `envoy_http1::ClientStream`'s shape; one underlying TCP connection per
+/// `Client::connect` invocation, but the `SendRequest<Bytes>` handle is `Clone`
+/// (per h2 v0.4 — that's the multiplexing-enabling property) so cloning a
+/// `ClientStream` shares the same connection across many concurrent streams.
+/// 13.2 D5 widened the field visibility to `pub(crate)` + added `Clone` so the
+/// per-stream `H2PoolGuard` (`envoy_http2::pool::H2PoolGuard`) can hold a fresh
+/// `SendRequest` clone — see `crates/envoy-http2/src/pool.rs`.
+#[derive(Clone)]
 pub struct ClientStream {
-    send_request: h2::client::SendRequest<Bytes>,
-    host: String,
+    pub(crate) send_request: h2::client::SendRequest<Bytes>,
+    pub(crate) host: String,
 }
 
 impl std::fmt::Debug for ClientStream {

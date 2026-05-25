@@ -21,6 +21,7 @@ pub mod client;
 pub mod codec;
 mod error;
 pub mod hcm;
+pub mod pool;
 pub mod request;
 pub mod response;
 
@@ -43,5 +44,6 @@ pub use client::{Client, ClientStream};
 pub use codec::build_h2_server;
 pub use error::Http2Error;
 pub use hcm::{HCM, HCMConfig};
+pub use pool::H2PoolManager;
 pub use request::http_to_envoy_request;
 pub use response::{build_http_response, send_envoy_response};

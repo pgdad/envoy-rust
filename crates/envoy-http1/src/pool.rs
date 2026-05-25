@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 /// Phase-13 hardcoded H1 pool defaults (§5.4 + §2 item-iii deferral).
@@ -47,11 +46,17 @@ pub struct H1Pool {
     cluster_name: String,
     max_connections: u32,
     idle_timeout: Duration,
-    /// Per-endpoint idle list. `tokio::sync::Mutex` because `acquire()`
-    /// holds the lock across an `.await` in the connect-on-miss branch.
-    idle: Mutex<HashMap<SocketAddr, Vec<IdleEntry>>>,
+    /// Per-endpoint idle list. 13.2 A-I3 closure: switched from
+    /// `tokio::sync::Mutex` to `parking_lot::Mutex` so the per-acquire
+    /// `acquire()` and the per-release `Drop` paths are both synchronous
+    /// — the spurious-overflow race between concurrent acquire/release
+    /// (originally diagnosed under the async-Mutex `tokio::spawn`-in-Drop
+    /// shape) is eliminated structurally. `acquire()` no longer holds the
+    /// lock across an `.await`; the connect step happens after the lock
+    /// is released.
+    idle: parking_lot::Mutex<HashMap<SocketAddr, Vec<IdleEntry>>>,
     /// Per-endpoint total established conn count (idle + in-flight).
-    established: Mutex<HashMap<SocketAddr, u32>>,
+    established: parking_lot::Mutex<HashMap<SocketAddr, u32>>,
     /// Per-cluster `upstream_cx_total` — shared Arc with `Cluster.cx_total`
     /// (the same `envoy_stats::Counter` handle; pool's `acquire()` connect-on-miss
     /// is the SOLE incrementer at 13.1 per lock-in #6).
@@ -110,51 +115,33 @@ impl PoolGuard {
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        let pool = Arc::clone(&self.pool);
-        let endpoint = self.endpoint;
-        let stream = self.stream.take();
-        // 13.1 state-5 fold-in (REVIEW Cluster A I1): guard `tokio::spawn`
-        // behind `Handle::try_current()`. Without a current runtime
-        // (process shutdown mid-drain, `#[tokio::test]` runtime exit
-        // before all guards drop, panic-during-test), `tokio::spawn`
-        // panics with "there is no reactor running" — which would mask
-        // the actual shutdown / test-failure cause. On Err we drop the
-        // stream synchronously (its own Drop closes the TCP socket) and
-        // skip the async return-to-pool + established-decrement
-        // bookkeeping — the runtime is gone, the pool is about to be
-        // dropped, so the bookkeeping is moot. `cx_destroy.inc()` on the
-        // invalidate path stays synchronous (counter inc does not need a
-        // runtime). `_cx_active_guard`'s Drop still fires at field-drop
-        // time → upstream_cx_active.dec().
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            if stream.is_none() {
-                pool.cx_destroy.inc();
-            }
-            return;
-        };
-        match stream {
+        // 13.2 A-I3 closure: Drop is synchronous. The pool's mutexes are
+        // `parking_lot::Mutex` so the return-to-pool + destroy paths run
+        // in-place without spawning. Eliminates the spurious-overflow
+        // race that the original `tokio::spawn`-in-Drop shape produced
+        // under concurrent acquire/release (the async return-to-pool
+        // could race the next acquire's connect-on-miss cap-check).
+        // `_cx_active_guard`'s Drop fires at field-drop time →
+        // upstream_cx_active.dec().
+        match self.stream.take() {
             Some(stream) => {
-                // Return-to-pool: synchronous Drop cannot .await, so spawn.
-                handle.spawn(async move {
-                    let mut idle = pool.idle.lock().await;
-                    idle.entry(endpoint).or_default().push(IdleEntry {
-                        stream,
-                        last_returned: Instant::now(),
-                    });
+                // Return-to-pool: synchronous push into the idle list.
+                let mut idle = self.pool.idle.lock();
+                idle.entry(self.endpoint).or_default().push(IdleEntry {
+                    stream,
+                    last_returned: Instant::now(),
                 });
             }
             None => {
-                // Destroy path (invalidated): decrement established + count destroy.
-                pool.cx_destroy.inc();
-                handle.spawn(async move {
-                    let mut est = pool.established.lock().await;
-                    if let Some(n) = est.get_mut(&endpoint) {
-                        *n = n.saturating_sub(1);
-                    }
-                });
+                // Destroy path (invalidated): increment cx_destroy + decrement
+                // established. Both are synchronous (counter inc + sync lock).
+                self.pool.cx_destroy.inc();
+                let mut est = self.pool.established.lock();
+                if let Some(n) = est.get_mut(&self.endpoint) {
+                    *n = n.saturating_sub(1);
+                }
             }
         }
-        // _cx_active_guard's Drop fires here → upstream_cx_active.dec().
     }
 }
 
@@ -175,8 +162,8 @@ impl H1Pool {
             cluster_name,
             max_connections,
             idle_timeout,
-            idle: Mutex::new(HashMap::new()),
-            established: Mutex::new(HashMap::new()),
+            idle: parking_lot::Mutex::new(HashMap::new()),
+            established: parking_lot::Mutex::new(HashMap::new()),
             cx_total,
             cx_destroy,
             cx_http1_total,
@@ -192,9 +179,10 @@ impl H1Pool {
         endpoint: SocketAddr,
         host: &str,
     ) -> Result<PoolGuard, PoolError> {
-        // Try idle reuse first (synchronous pop under lock).
+        // Try idle reuse first (synchronous pop under lock). 13.2 A-I3
+        // closure: `parking_lot::Mutex` — no `.await` at lock acquisition.
         {
-            let mut idle = self.idle.lock().await;
+            let mut idle = self.idle.lock();
             if let Some(list) = idle.get_mut(&endpoint)
                 && let Some(entry) = list.pop()
             {
@@ -211,7 +199,7 @@ impl H1Pool {
         }
         // Connect-on-miss: enforce cap.
         {
-            let mut est = self.established.lock().await;
+            let mut est = self.established.lock();
             let n = est.entry(endpoint).or_insert(0);
             if *n >= self.max_connections {
                 return Err(PoolError::Overflow {
@@ -226,7 +214,7 @@ impl H1Pool {
             Ok(s) => s,
             Err(e) => {
                 // Roll back the established count.
-                let mut est = self.established.lock().await;
+                let mut est = self.established.lock();
                 if let Some(n) = est.get_mut(&endpoint) {
                     *n = n.saturating_sub(1);
                 }
@@ -277,19 +265,19 @@ impl H1Pool {
             loop {
                 tokio::select! {
                     _ = token.cancelled() => return,
-                    _ = tick.tick() => pool.sweep_once().await,
+                    _ = tick.tick() => pool.sweep_once(),
                 }
             }
         })
     }
 
-    async fn sweep_once(self: &Arc<Self>) {
+    fn sweep_once(self: &Arc<Self>) {
         let now = Instant::now();
         // Collect evictions under `idle` lock first, then take `est` lock.
         // Separating the two locks avoids any chance of re-entrant ordering
         // issues with `acquire()`'s `idle`-then-`est` sequence.
         let evictions: Vec<(SocketAddr, u32)> = {
-            let mut idle = self.idle.lock().await;
+            let mut idle = self.idle.lock();
             let mut evictions: Vec<(SocketAddr, u32)> = Vec::new();
             for (endpoint, list) in idle.iter_mut() {
                 let before = list.len();
@@ -304,7 +292,7 @@ impl H1Pool {
         if evictions.is_empty() {
             return;
         }
-        let mut est = self.established.lock().await;
+        let mut est = self.established.lock();
         for (endpoint, evicted) in evictions {
             if let Some(n) = est.get_mut(&endpoint) {
                 *n = n.saturating_sub(evicted);
@@ -322,8 +310,12 @@ impl H1Pool {
 pub struct H1PoolManager {
     pools: HashMap<String, Arc<H1Pool>>,
     /// Idle-sweeper JoinHandles, one per pool. Owned for lifetime parity with
-    /// envoy-bin's `health_scheduler.shutdown().await`; aborted on token cancel.
-    _sweepers: Vec<tokio::task::JoinHandle<()>>,
+    /// envoy-bin's `health_scheduler.shutdown().await`; aborted on token
+    /// cancel OR explicit `shutdown()`. 13.2 A-M1 closure: field renamed
+    /// `_sweepers → sweepers` (the underscore prefix is no longer correct
+    /// — the field is read by `shutdown()`); paired with the new
+    /// `pub async fn shutdown(self)` method below.
+    sweepers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 // Hand-rolled `Debug` (rather than `#[derive]`): `H1Pool`'s internal
@@ -354,9 +346,12 @@ impl H1PoolManager {
         let mut pools: HashMap<String, Arc<H1Pool>> = HashMap::new();
         let mut sweepers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for cfg in &bootstrap.static_resources.clusters {
-            let handle = cluster_mgr
-                .get(&cfg.name)
-                .expect("cluster present in mgr (built from same bootstrap)");
+            // 13.2 A-M4 closure: improved `.expect` message naming the
+            // single-bootstrap-per-process invariant explicitly.
+            let handle = cluster_mgr.get(&cfg.name).expect(
+                "H1PoolManager::for_bootstrap requires cluster_mgr built from the same \
+                 bootstrap (single-bootstrap-per-process invariant)",
+            );
             if handle.upstream_protocol() != envoy_cluster::UpstreamProtocol::Http1 {
                 continue;
             }
@@ -376,6 +371,17 @@ impl H1PoolManager {
                 registry.register_counter(&format!("cluster.{}.upstream_cx_total", cfg.name))?;
             let cx_active =
                 registry.register_gauge(&format!("cluster.{}.upstream_cx_active", cfg.name))?;
+            // 13.2 A-M2 closure: assert the gauge handle the pool just
+            // got from the registry is the SAME Arc the cluster holds.
+            // Holds under the single-bootstrap-per-process invariant
+            // (the same `registry` was passed to both `from_bootstrap`
+            // and `for_bootstrap`).
+            debug_assert!(
+                Arc::ptr_eq(&cx_active, handle.cx_active_arc()),
+                "H1PoolManager: cx_active Arc mismatch for cluster '{}' — \
+                 single-bootstrap-per-process invariant violated",
+                cfg.name
+            );
             let pool = H1Pool::new(
                 cfg.name.clone(),
                 max_connections,
@@ -388,16 +394,23 @@ impl H1PoolManager {
             sweepers.push(pool.spawn_idle_sweeper(token.clone()));
             pools.insert(cfg.name.clone(), pool);
         }
-        Ok(Arc::new(Self {
-            pools,
-            _sweepers: sweepers,
-        }))
+        Ok(Arc::new(Self { pools, sweepers }))
     }
 
     /// Look up the pool for `cluster_name`. Returns `None` if no H1 cluster
     /// with that name exists.
     pub fn get(&self, cluster_name: &str) -> Option<&Arc<H1Pool>> {
         self.pools.get(cluster_name)
+    }
+
+    /// 13.2 A-M1 closure: explicit shutdown path. Aborts every sweeper
+    /// handle + awaits each. Mirrors `envoy_health::Scheduler::shutdown`'s
+    /// posture. Consumes `self`.
+    pub async fn shutdown(mut self) {
+        for handle in self.sweepers.drain(..) {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 
@@ -588,35 +601,81 @@ admin:
         );
     }
 
-    /// 13.1 state-5 fold-in (REVIEW Cluster A I1): dropping a `PoolGuard`
-    /// outside any tokio runtime must NOT panic. Pre-fix, `tokio::spawn`
-    /// in `Drop` panicked with "there is no reactor running" when a guard
-    /// outlived its runtime. Post-fix, `Handle::try_current()` returns
-    /// `Err` and Drop completes synchronously (stream + ConnGaugeGuard
-    /// drop in place; the async return-to-pool / established-decrement
-    /// is skipped).
-    #[test]
-    fn pool_guard_drop_outside_runtime_does_not_panic() {
-        // Build the pool + acquire a guard inside a short-lived runtime.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (pool, _cx_total, _cx_destroy, _cx_http1_total, cx_active) =
-            rt.block_on(async { mk_pool("c", 4, Duration::from_secs(60)) });
-        let addr = rt.block_on(echo_backend());
-        let guard = rt.block_on(pool.acquire(addr, "h")).expect("acquire");
-        assert_eq!(cx_active.value(), 1);
-        // Shut the runtime down BEFORE dropping the guard. The runtime is
-        // now gone — Drop must not panic.
-        drop(rt);
-        drop(guard); // would panic pre-fix on tokio::spawn
-        // _cx_active_guard's Drop still fires synchronously → gauge decrements.
+    /// 13.2 A-I3 closure: post-mutex-switch, Drop is synchronous — an
+    /// acquired-then-dropped stream is back in the idle list immediately
+    /// (no `tokio::spawn` round-trip), so the very next `acquire()` on
+    /// the same endpoint reuses it without re-firing `cx_total`. The
+    /// pre-fix `tokio::spawn`-in-Drop shape required a `tokio::time::sleep`
+    /// between drop and re-acquire to observe reuse; the post-fix shape
+    /// does NOT.
+    ///
+    /// REPLACES the pre-13.2 `pool_guard_drop_outside_runtime_does_not_panic`
+    /// test — that scenario (drop after runtime exit) is now structurally
+    /// unreachable: sync Drop never spawns, so there's no "no reactor
+    /// running" panic to guard against.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pool_guard_drop_is_synchronous_and_returns_to_pool_immediately() {
+        let addr = echo_backend().await;
+        let (pool, cx_total, _cx_destroy, _cx_http1_total, _cx_active) =
+            mk_pool("c", 4, Duration::from_secs(60));
+        let g1 = pool.acquire(addr, "h").await.expect("first acquire");
+        assert_eq!(cx_total.value(), 1, "cx_total fires on first connect");
+        drop(g1);
+        // No yield_now, no sleep — sync Drop already returned the stream
+        // to idle. The next acquire MUST reuse without bumping cx_total.
+        let _g2 = pool.acquire(addr, "h").await.expect("immediate re-acquire");
         assert_eq!(
-            cx_active.value(),
-            0,
-            "cx_active decrements via synchronous ConnGaugeGuard::Drop even without runtime"
+            cx_total.value(),
+            1,
+            "immediate re-acquire after sync Drop must reuse idle stream (cx_total unchanged)"
         );
+    }
+
+    /// 13.2 A-I3 race regression: under the synchronous parking_lot
+    /// Mutex, an `invalidate()`-flagged guard whose `drop_task` has
+    /// joined MUST have run its destroy-path bookkeeping
+    /// (established-decrement + cx_destroy.inc) by the time the join
+    /// returns. The follow-up acquire therefore sees
+    /// `established < max_connections` and succeeds.
+    ///
+    /// Pre-fix, the `tokio::spawn` in `Drop` deferred the
+    /// established-decrement: even after `drop_task.await` returned, the
+    /// spawned async closure had not yet run, so the next acquire could
+    /// see `established == max_connections` and return spurious Overflow.
+    /// Post-fix, Drop is fully synchronous — the decrement lands BEFORE
+    /// Drop returns; `drop_task.await` is a structural happens-before
+    /// boundary for the established-decrement, not just for the guard's
+    /// scope exit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pool_acquire_after_concurrent_release_does_not_yield_spurious_overflow() {
+        let addr = echo_backend().await;
+        let (pool, _cx_total, _cx_destroy, _cx_http1_total, _cx_active) =
+            mk_pool("c", 1, Duration::from_secs(60));
+        for i in 0..32 {
+            let pool_a = Arc::clone(&pool);
+            let pool_b = Arc::clone(&pool);
+            // First guard — mark invalidate so its Drop drives the
+            // destroy-path (decrement established) rather than the
+            // return-to-idle path. This is the path that was previously
+            // deferred via `tokio::spawn` and that the A-I3 spurious
+            // Overflow originated from.
+            let mut g1 = pool_a.acquire(addr, "h").await.expect("pre-acquire");
+            g1.invalidate();
+            // Drop the guard on a separate task and AWAIT its
+            // completion. Under sync Drop, established is decremented
+            // synchronously inside `drop(g1)` — so by the time the join
+            // returns, the slot is structurally free.
+            let drop_task = tokio::spawn(async move {
+                drop(g1);
+            });
+            let _ = drop_task.await;
+            // Follow-up acquire on the same endpoint must succeed.
+            let result = pool_b.acquire(addr, "h").await;
+            assert!(
+                result.is_ok(),
+                "iter {i}: expected acquire after sync Drop to succeed, got {result:?}"
+            );
+        }
     }
 
     /// 13.1 state-5 fold-in (REVIEW Cluster A I2): a zero or sub-4ns
