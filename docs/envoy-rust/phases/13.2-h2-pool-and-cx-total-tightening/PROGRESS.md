@@ -344,4 +344,34 @@ Docs-only addition under the existing "13.1 entries (H1 connection pool)" subsec
 
 **Lands controller-direct** per PLAN architecture lock-in #17's mid-arc latitude clause — docs-only single-row addition; subagent overhead exceeds task scope.
 
-**Commit SHA:** `5c27b3d`.
+**Commit SHA:** `5c27b3d` (pre-amend; published HEAD `ab0e62f` per the per-task SHA-amend pattern that's run since Task 1).
+
+---
+
+### Task 4 — D7.1 `upstream_cx_total` BEHAVIOR_CONTRACT row tightening (06.3 REVIEW I2 (b) FULL CLOSURE)
+
+Docs-only D7.1 deliverable. Tightens the existing `cluster.<name>.upstream_cx_total` row at `docs/envoy-rust/BEHAVIOR_CONTRACT.md:89` (06.1 initial entry) from `name-required, value-may-differ` to **`value-exact` (H1 + H2 clusters under the harness's single-downstream-keep-alive-conn driver); name-required, value-may-differ (TCP-proxy clusters — TCP pool defers to a follow-up phase per parent-13 SPEC §4)**.
+
+**The named carryforward closure attribution lands here.** 06.3 REVIEW I2 (b) had been carried forward through 7+ phases (06 → 07 → 08 → 09 → 10 → 11 → 12 → 13.1) awaiting both H1 and H2 connection pooling to land before the row could tighten uniformly. With Task 1's H2 pool primitive + Task 2's router-arm integration in place, the bilateral H1/H2 pool architecture is established and the row tightens consistently across both protocols. Combined with 13.1's I2 (a) closure (fixture 0020's per-class `downstream_rq_{2,3,4,5}xx` + cluster `upstream_rq_5xx` bilateral assertions), **the full 06.3 REVIEW I2 carryforward closes at the phase-13 close** (Task 8 will re-attribute at the parent-13 close commit per the closing-sub-phase invariant).
+
+Tightened row's new rationale documents:
+
+- Increment site relocation: H1 → `crates/envoy-http1/src/pool.rs::H1Pool::acquire` connect-on-miss branch (per 13.1 Task 3); H2 → `crates/envoy-http2/src/pool.rs::H2Pool::acquire` connect-on-miss branch (per 13.2 Task 1 + 2). One source of truth per protocol.
+- TCP-proxy carve-out: `crates/envoy-tcp/src/lib.rs:108` per-call increment site stays untouched until TCP pooling lands in a follow-up phase. Existing TCP fixtures (0001/0003/0004/0005/0006) have presence-only assertions, so the carve-out is benign.
+- Conditional-on-driver nuance: the value-exact disposition holds when the harness driver reuses a downstream keep-alive conn (the 13.1 `Driver::Http1KeepAlive` shape; the H1 + H2 fixture wrappers select this driver). Multi-downstream-conn workloads would emit N upstream conns regardless of pool — explicit per parent-13 SPEC §6.2 item-iv.
+- Explicit 06.3 REVIEW I2 (b) closure attribution + the combined-with-13.1 full I2 closure note.
+
+**Files touched (1):**
+
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md` — line 89's Equivalence + Rationale columns rewritten in place; no surrounding-rows change.
+
+**Carryforward attribution:** **06.3 REVIEW I2 (b) FULLY CLOSED at this commit.** Combined with 13.1 fixture 0020's I2 (a) closure, the full 06.3 REVIEW I2 carryforward closes at parent-13 close (Task 8). PROGRESS Task 8 will re-attribute the full closure at the closing commit per D-3.4.
+
+**Per-gate clean outputs:**
+
+- `cargo fmt --all -- --check` — exit 0; no diff (markdown-only change).
+- Doc-only; no test or build impact.
+
+**Lands controller-direct** per PLAN architecture lock-in #17's mid-arc latitude clause — docs-only single-row tightening; subagent overhead exceeds task scope. The closure attribution mirrors the 13.1 Task 5 D7-row pattern verbatim modulo the broader I2 (b) framing.
+
+**Commit SHA:** `e4ca33f` (pre-amend; published HEAD may shift to the post-amend SHA per the per-task SHA-amend pattern).
