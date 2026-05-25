@@ -375,3 +375,57 @@ Tightened row's new rationale documents:
 **Lands controller-direct** per PLAN architecture lock-in #17's mid-arc latitude clause — docs-only single-row tightening; subagent overhead exceeds task scope. The closure attribution mirrors the 13.1 Task 5 D7-row pattern verbatim modulo the broader I2 (b) framing.
 
 **Commit SHA:** `e4ca33f` (pre-amend; published HEAD may shift to the post-amend SHA per the per-task SHA-amend pattern).
+
+
+---
+
+### Task 5 first-attempt — architectural-blocker discovery + topology-pivot ADR (ADR-0039); session closes here at state-3-partial
+
+The 13.2 state-3 controller dispatched the Task 5 implementer subagent (per `feedback_execution_style`) with the PLAN's prescribed Task 5 shape (downstream H1 listener + H2 upstream cluster + the 13.1-landed `Driver::Http1KeepAlive` reused VERBATIM). The implementer reported `NEEDS_CONTEXT` with a named architectural blocker:
+
+- envoy-rust's `envoy-config` validator at `crates/envoy-config/src/bootstrap.rs:1997-2016` raises `ConfigError::Http2ClusterFromHttp1Listener` when an HCM with `codec_type: HTTP1` (or `AUTO`) routes to a cluster whose `typed_extension_protocol_options` selects HTTP/2 upstream. This is the 06.3 D14.3 parse-time gate; the doctrinal reference is ADR-0028 (option B at `docs/envoy-rust/DECISIONS.md:513` — deferred the H1-listener × H2-cluster dispatch path because the H2 client lives in `envoy-http2`, which depends on `envoy-http1`; adding `envoy-http2` as a path-dep of `envoy-http1` would form a Cargo cycle).
+- The PLAN's prescribed fixture-0021 topology IS exactly the rejected configuration: HCM `codec_type: HTTP1` + cluster `typed_extension_protocol_options.envoy.extensions.upstreams.http.v3.HttpProtocolOptions.explicit_http_config.http2_protocol_options: {}`.
+- The implementer landed all 6 PLAN-prescribed Task 5 artifacts cleanly (3 fixture YAMLs + 1 Docker wrapper + 1 harness `_h2_echo_backend` discriminator arm at `tests/differential/src/lib.rs:1920-1956` + the existing `Http2EchoBackend` helper from 13.1 carried forward). The 5 stable-toolchain gates passed. The Docker-gated wrapper test then FAILED with envoy-rust emitting the named `ConfigError::Http2ClusterFromHttp1Listener` error message.
+- The implementer reverted all Task 5 artifacts (workspace restored to HEAD `4ab2c61`; working tree clean modulo the pre-existing untracked `crates/envoy-config/fuzz/Cargo.lock`). No commit was made.
+
+The controller verified the blocker directly:
+- `crates/envoy-config/src/bootstrap.rs:2011` raises `ConfigError::Http2ClusterFromHttp1Listener` exactly per the implementer's report.
+- `crates/envoy-config/src/lib.rs:265-267` defines the variant + the user-facing error message ("H1-listener × H2-cluster dispatch is deferred per ADR-0028").
+
+**Disposition — pick per `feedback_pick_recommendation`:** **Option (b) — topology pivot to H2-downstream-listener + H2-upstream-cluster + new `Driver::Http2KeepAlive` harness driver.** Ratified at **ADR-0039** (landed at this commit).
+
+- Option (a) — closing ADR-0028 — was rejected for 13.2 scope (foundations grant; new crate; ~300-400 LoC; fragments the closing-sub-phase atomic scope).
+- Option (c) — defer fixture 0021 entirely — was rejected because it materially weakens the 06.3 REVIEW I2 (b) closure attribution at Task 4 + Task 8 (no bilateral fixture asserting the value-exact disposition on H2 clusters).
+- Option (b) — preserves the discriminating-observable bilateral validation: N downstream H2 multiplexed streams over single downstream H2 conn → 1 upstream H2 conn (N streams shared). The bilateral assertion `cluster.backend_cluster.upstream_cx_total: 1` + `cluster.backend_cluster.upstream_cx_http2_total: 1` still discriminates pooled-from-per-call. The new `Driver::Http2KeepAlive` is a ~150-200 LoC additive harness driver mirroring `Driver::Http1KeepAlive`'s shape verbatim modulo the codec layer.
+
+**Reshaped Task 5 scope** (binds the next session's resumption):
+1. **Fixture 0021 envoy.yaml + envoy-rust.yaml** — downstream HCM `codec_type: HTTP2` (NOT `HTTP1`); cluster keeps `typed_extension_protocol_options.http2_protocol_options` + `circuit_breakers.thresholds[0].max_connections: 4`. All other fields preserved per the PLAN's prescription (route table + router filter + STRICT_DNS + dns_lookup_family + bind addresses).
+2. **expectations.yaml** — driver kind `http2_keep_alive` (the new variant per ADR-0039); 5 sequential single-stream requests over one downstream H2 conn; `settle_ms: 500`; same 5 expected_stats as the PLAN: `http.ingress_http.downstream_rq_2xx: 5`, `http.ingress_http.downstream_rq_total: 5`, `cluster.backend_cluster.upstream_rq_total: 5`, `cluster.backend_cluster.upstream_cx_total: 1`, `cluster.backend_cluster.upstream_cx_http2_total: 1`.
+3. **`Driver::Http2KeepAlive` variant** at `tests/differential/src/lib.rs` — mirrors `Driver::Http1KeepAlive`'s shape verbatim (requests Vec; settle_ms; expected_stats). New dispatch arm.
+4. **`drive_http2_keep_alive` helper** — opens one H2 conn (h2::client::handshake); issues N sequential streams via cloned `SendRequest<Bytes>` (the Clone landed at Task 1 Step 3); asserts each response's status; bilateral admin-stat scrape after settle.
+5. **Harness `_h2_echo_backend` discriminator arm** — at `tests/differential/src/lib.rs::run_fixture`, add the third arm for fixture 0021 spawning `crate::backend::Http2EchoBackend` (already exists at `tests/differential/src/backend.rs:357-422` — no addition needed).
+6. **Docker wrapper test** at `tests/differential/tests/upstream_h2_connection_pooling.rs` — unchanged from the PLAN's prescription.
+
+**Session pacing — state-3-partial / state-3-resume-at-Task-5-next:**
+
+Per `BOOTSTRAP_PROMPT.md` §5.1 ("State-3 execution may span multiple sessions; the controller may close at any task boundary"), this session closes at the Task 4 boundary. Tasks 1-4 + Task 1 fold-in + Task 2 fold-in are committed at HEAD post-this-commit. Tasks 5-8 (with the ADR-0039 reshaped Task 5 + Tasks 6/7/8 unchanged) defer to the next session. The next-session cold-start reads this PROGRESS subsection + ADR-0039 as the source of truth for the reshaped Task 5 scope; the PLAN.md is preserved verbatim per the project's append-only doctrine.
+
+**Files touched at this state-3-partial commit (3):**
+
+- `docs/envoy-rust/DECISIONS.md` — appends ADR-0039 ratifying the topology pivot.
+- `docs/envoy-rust/phases/13.2-h2-pool-and-cx-total-tightening/PROGRESS.md` — this Task 5 first-attempt subsection (the architectural finding + disposition + reshaped Task 5 scope).
+- `docs/envoy-rust/STATE.md` — advance the 4 top pointers to state-3-partial / state-3-resume-at-Task-5-next + append the `### Phase-13.2 state-3 partial arc (Tasks 1-4 landed; Task 5 ADR-0039 pivot)` Notes subsection.
+
+**Per-gate clean outputs at HEAD `4ab2c61` (verified by the controller before this commit):**
+
+- `cargo build --workspace --all-targets` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 46.39s`.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — `Finished `dev` profile [unoptimized + debuginfo] target(s) in 43.80s` (no warnings).
+- `cargo fmt --all -- --check` — exit 0; no diff.
+
+**Carryforward attribution:** ADR-0028 (H1-listener × H2-cluster dispatch deferral) REMAINS OPEN at 13.2 close; carried forward to a follow-up phase per ADR-0039 Consequences.
+
+**Commit SHA:** lands at the ADR-0039 commit (added below).
+
+---
+
+*(Tasks 5-8 will append below at the next session's state-3 resumption. Task 5 reshaped per ADR-0039 above.)*
