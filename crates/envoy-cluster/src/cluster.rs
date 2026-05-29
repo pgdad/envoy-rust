@@ -836,6 +836,7 @@ admin:
                     health_checks: vec![],
                     common_lb_config: None,
                     circuit_breakers: None,
+                    outlier_detection: None, // 14.1 D1
                 }],
             },
         };
@@ -882,6 +883,7 @@ admin:
             health_checks: vec![],
             common_lb_config: None,
             circuit_breakers: None,
+            outlier_detection: None, // 14.1 D1
         };
         let bootstrap = Bootstrap {
             node: None,

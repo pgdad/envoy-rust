@@ -95,6 +95,11 @@ pub struct Cluster {
     /// `max_connections: 1024` per upstream Envoy v1.33). See `CircuitBreakers`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breakers: Option<CircuitBreakers>,
+    /// 14.1 D1 (parent-14 D1): per-cluster outlier-detection configuration.
+    /// `None` (the §5.3 inert-when-unconfigured invariant — preserves 21-fixture
+    /// regression-equivalence).
+    #[serde(default)]
+    pub outlier_detection: Option<OutlierDetection>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -1188,6 +1193,58 @@ pub struct Thresholds {
 pub enum RoutingPriority {
     Default,
     High,
+}
+
+/// 14.1 D1 (parent-14 D1): per-cluster outlier-detection configuration.
+/// `None` means outlier detection is disabled for the cluster — the per-endpoint
+/// `EndpointEjection` state machine is NOT constructed, `Cluster::pick()` short-
+/// circuits to the 12.1 health-only filter, and no outlier-detection stats register.
+///
+/// Phase-14 minimum-viable scope: `consecutive_5xx` + `consecutive_gateway_failure`
+/// detectors only. The following parent-§4 deferred fields are rejected by
+/// `deny_unknown_fields` per ADR-0041 §6.2 item-1 (Envoy v1.33.0 accepts them; envoy-rust
+/// at phase-14 scope does not):
+///   - `success_rate_*` (success_rate_minimum_hosts, success_rate_request_volume,
+///     success_rate_stdev_factor)
+///   - `failure_percentage_*` (failure_percentage_threshold,
+///     failure_percentage_minimum_hosts, failure_percentage_request_volume)
+///   - `consecutive_local_origin_failure`
+///   - `split_external_local_origin_errors`
+///   - `enforcing_*` (enforcing_consecutive_5xx, enforcing_consecutive_gateway_failure,
+///     enforcing_success_rate, enforcing_failure_percentage, etc.)
+///   - `max_ejection_time` + `max_ejection_time_jitter`
+///
+/// Envoy v3 defaults (§6.2 item-1, captured at parent-14 state-2 split commit):
+/// `consecutive_5xx=5, consecutive_gateway_failure=5, interval=10s,
+/// base_ejection_time=30s, max_ejection_percent=10`.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OutlierDetection {
+    /// Threshold of consecutive 5xx responses that triggers an ejection (Envoy default 5).
+    /// `None` ⇒ the detector is treated as not-configured (no ejections from this detector).
+    #[serde(default)]
+    pub consecutive_5xx: Option<u32>,
+    /// Threshold of consecutive 502/503/504 responses that triggers an ejection
+    /// (Envoy default 5). Sibling of `consecutive_5xx`. `None` ⇒ disabled.
+    #[serde(default)]
+    pub consecutive_gateway_failure: Option<u32>,
+    /// Interval between sweeper runs (Envoy default `10s`). Parsed via
+    /// `parse_duration` (integer s / ms / us; sub-second decimals rejected).
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// Base ejection duration applied at first ejection (Envoy default `30s`). Parsed
+    /// via `parse_duration`. Phase-14 does NOT implement Envoy's documented
+    /// `base_ejection_time * num_ejections` multiplier — at minimum-viable scope the
+    /// effective ejection-duration is exactly `base_ejection_time` regardless of
+    /// repeat count (the multiplier defers per parent SPEC §4; §6.2 item-5 finding).
+    #[serde(default)]
+    pub base_ejection_time: Option<String>,
+    /// Maximum percentage of a cluster's endpoints that may be simultaneously ejected
+    /// (Envoy default 10). Range `0..=100` enforced by `validate_outlier_detection`.
+    /// `0` disables ejection entirely (cap == 0 ⇒ every threshold-crossing increments
+    /// `ejections_overflow`).
+    #[serde(default)]
+    pub max_ejection_percent: Option<u32>,
 }
 
 /// Reference to a regex pattern. Held both as the original String (for
@@ -9100,6 +9157,99 @@ admin:
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn parses_cluster_with_outlier_detection_minimum_viable() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: od_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection:
+        consecutive_5xx: 5
+        consecutive_gateway_failure: 5
+        interval: 10s
+        base_ejection_time: 30s
+        max_ejection_percent: 100
+      load_assignment:
+        cluster_name: od_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("valid");
+        let cluster = &bootstrap.static_resources.clusters[0];
+        let od = cluster
+            .outlier_detection
+            .as_ref()
+            .expect("outlier_detection present");
+        assert_eq!(od.consecutive_5xx, Some(5));
+        assert_eq!(od.consecutive_gateway_failure, Some(5));
+        assert_eq!(od.interval.as_deref(), Some("10s"));
+        assert_eq!(od.base_ejection_time.as_deref(), Some("30s"));
+        assert_eq!(od.max_ejection_percent, Some(100));
+    }
+
+    #[test]
+    fn cluster_without_outlier_detection_defaults_to_none() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: plain_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: plain_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("valid");
+        assert!(
+            bootstrap.static_resources.clusters[0]
+                .outlier_detection
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn outlier_detection_rejects_unknown_fields() {
+        // success_rate_minimum_hosts is one of the parent §4 deferred fields rejected
+        // by deny_unknown_fields per ADR-0041 §6.2 item-1.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: od_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection:
+        consecutive_5xx: 5
+        success_rate_minimum_hosts: 5
+      load_assignment:
+        cluster_name: od_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
     }
 }
 
