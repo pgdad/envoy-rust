@@ -665,6 +665,75 @@ pub async fn from_bootstrap(
         } else {
             (None, 50.0)
         };
+        // 14.1 D5/D6 (parent-14 D3/D5/D6): if the cluster configures outlier_detection,
+        // build the cluster-level state (per-endpoint EndpointEjection Vec +
+        // max_ejection_percent + ejections_overflow). Envoy v3 defaults (§6.2 item-1):
+        //   consecutive_5xx=5, consecutive_gateway_failure=5, interval=10s,
+        //   base_ejection_time=30s, max_ejection_percent=10.
+        // The interval + base_ejection_time fields are validator-checked but consumed
+        // ONLY at 14.2 D7 (sweeper); 14.1 reads only the detector thresholds + cap.
+        let outlier_detection = if let Some(od_cfg) = cfg.outlier_detection.as_ref() {
+            let consecutive_5xx_threshold = od_cfg.consecutive_5xx.unwrap_or(5);
+            let consecutive_gateway_failure_threshold =
+                od_cfg.consecutive_gateway_failure.unwrap_or(5);
+            let max_ejection_percent = od_cfg.max_ejection_percent.unwrap_or(10);
+            let mk_counter = |suffix: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
+                registry
+                    .register_counter(&format!(
+                        "cluster.{}.outlier_detection.{}",
+                        cfg.name, suffix
+                    ))
+                    .map_err(|e| ClusterError::StatsRegistration {
+                        cluster: cfg.name.clone(),
+                        message: e.to_string(),
+                    })
+            };
+            let mk_gauge = |suffix: &str| -> Result<Arc<envoy_stats::Gauge>, ClusterError> {
+                registry
+                    .register_gauge(&format!(
+                        "cluster.{}.outlier_detection.{}",
+                        cfg.name, suffix
+                    ))
+                    .map_err(|e| ClusterError::StatsRegistration {
+                        cluster: cfg.name.clone(),
+                        message: e.to_string(),
+                    })
+            };
+            let stats = crate::EndpointEjectionStats {
+                ejections_active: mk_gauge("ejections_active")?,
+                ejections_enforced_total: mk_counter("ejections_enforced_total")?,
+                ejections_detected_consecutive_5xx: mk_counter(
+                    "ejections_detected_consecutive_5xx",
+                )?,
+                ejections_enforced_consecutive_5xx: mk_counter(
+                    "ejections_enforced_consecutive_5xx",
+                )?,
+                ejections_detected_consecutive_gateway_failure: mk_counter(
+                    "ejections_detected_consecutive_gateway_failure",
+                )?,
+                ejections_enforced_consecutive_gateway_failure: mk_counter(
+                    "ejections_enforced_consecutive_gateway_failure",
+                )?,
+            };
+            let ejections_overflow = mk_counter("ejections_overflow")?;
+            let endpoints_state: Vec<Arc<crate::EndpointEjection>> = endpoints
+                .iter()
+                .map(|_| {
+                    Arc::new(crate::EndpointEjection::new(
+                        consecutive_5xx_threshold,
+                        consecutive_gateway_failure_threshold,
+                        stats.clone(),
+                    ))
+                })
+                .collect();
+            Some(OutlierDetectionState {
+                endpoints: endpoints_state,
+                max_ejection_percent,
+                ejections_overflow,
+            })
+        } else {
+            None
+        };
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
             endpoints,
@@ -676,7 +745,7 @@ pub async fn from_bootstrap(
             upstream_rq_5xx,
             endpoint_health,
             panic_threshold,
-            outlier_detection: None, // 14.1 D5 — Task 5 wires the configured-OD arm
+            outlier_detection,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -2168,6 +2237,128 @@ admin:
         let od = handle.inner.outlier_detection.as_ref().unwrap();
         let stats_active = &od.endpoints[0];
         let _ = stats_active;
+    }
+
+    // ---- 14.1 Task 5: from_bootstrap configured-OD stats wiring ----
+
+    const OD_CLUSTER_YAML: &str = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: od_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection:
+        consecutive_5xx: 5
+        consecutive_gateway_failure: 5
+        interval: 10s
+        base_ejection_time: 30s
+        max_ejection_percent: 10
+      load_assignment:
+        cluster_name: od_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7001 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+
+    #[tokio::test]
+    async fn from_bootstrap_registers_7_outlier_detection_stats_when_configured() {
+        let bootstrap = envoy_config::parse_bootstrap(OD_CLUSTER_YAML).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let snapshot = registry.snapshot();
+        let names: Vec<&str> = snapshot.iter().map(|(n, _)| n.as_str()).collect();
+        // Each of the 7 must be present (1 gauge + 6 counters).
+        for stat in &[
+            "cluster.od_backend.outlier_detection.ejections_active",
+            "cluster.od_backend.outlier_detection.ejections_enforced_total",
+            "cluster.od_backend.outlier_detection.ejections_overflow",
+            "cluster.od_backend.outlier_detection.ejections_detected_consecutive_5xx",
+            "cluster.od_backend.outlier_detection.ejections_enforced_consecutive_5xx",
+            "cluster.od_backend.outlier_detection.ejections_detected_consecutive_gateway_failure",
+            "cluster.od_backend.outlier_detection.ejections_enforced_consecutive_gateway_failure",
+        ] {
+            assert!(names.contains(stat), "{stat} not registered; got {names:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn from_bootstrap_omits_outlier_detection_stats_when_unconfigured() {
+        // The 14.1 SPEC §5.3 + acceptance gate (b): a cluster WITHOUT outlier_detection
+        // configures no outlier-detection stats.
+        let yaml = SINGLE_ENDPOINT_YAML; // existing const — no outlier_detection
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let snapshot = registry.snapshot();
+        for (name, _) in &snapshot {
+            assert!(
+                !name.contains("outlier_detection"),
+                "unconfigured cluster MUST NOT register outlier-detection stats; got {name}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn from_bootstrap_outlier_detection_active_gauge_reads_zero_at_construct() {
+        let bootstrap = envoy_config::parse_bootstrap(OD_CLUSTER_YAML).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        // Presence must be proven via the snapshot (register_gauge below is idempotent
+        // and returns the live Arc — but would otherwise create a fresh 0-valued gauge
+        // and mask a missing registration). Established 12.1 membership_healthy pattern.
+        assert!(
+            registry
+                .snapshot()
+                .iter()
+                .any(|(n, _)| n == "cluster.od_backend.outlier_detection.ejections_active"),
+            "ejections_active gauge must be registered by from_bootstrap",
+        );
+        let gauge = registry
+            .register_gauge("cluster.od_backend.outlier_detection.ejections_active")
+            .expect("gauge present");
+        assert_eq!(gauge.value(), 0, "no ejections at construct (§6.2 item-3)");
+    }
+
+    #[tokio::test]
+    async fn from_bootstrap_outlier_detection_uses_envoy_defaults_when_omitted() {
+        // outlier_detection: {} ⇒ all detector / cap fields default per §6.2 item-1.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: od
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection: {}
+      load_assignment:
+        cluster_name: od
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let handle = mgr.get("od").expect("cluster present");
+        let od = handle.inner.outlier_detection.as_ref().expect("OD wired");
+        assert_eq!(od.max_ejection_percent, 10, "Envoy default 10");
     }
 }
 
