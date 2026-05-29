@@ -36,6 +36,22 @@ impl Drop for ConnGaugeGuard {
     }
 }
 
+/// 14.1 D5/D6: cluster-level outlier-detection state, owned by `Cluster` when the
+/// cluster's `outlier_detection` block is configured. `None` ⇒ outlier detection is
+/// disabled for the cluster (§5.3 inert-when-unconfigured invariant; the 21 existing
+/// fixtures stay green).
+///
+/// The per-endpoint `EndpointEjection` handles are aligned by index with
+/// `Cluster.endpoints`. The cluster-level `ejections_overflow` counter increments at
+/// `Cluster::record_response`'s cap-met arm per ADR-0041 §6.2 item-2 (overflow re-fires
+/// per detection-tick, NOT once-per-host).
+#[derive(Debug)]
+pub(crate) struct OutlierDetectionState {
+    pub(crate) endpoints: Vec<Arc<crate::EndpointEjection>>,
+    pub(crate) max_ejection_percent: u32,
+    pub(crate) ejections_overflow: Arc<envoy_stats::Counter>,
+}
+
 /// A configured upstream cluster. Owns the static endpoint list and the
 /// round-robin `AtomicUsize` cursor. Constructed by `from_bootstrap` only;
 /// external code works through `ClusterHandle`.
@@ -84,6 +100,11 @@ pub struct Cluster {
     /// 12.1 (parent-12 D5): `common_lb_config.healthy_panic_threshold` percentage
     /// (default 50.0). Read by `pick()` only when `endpoint_health` is `Some`.
     pub(crate) panic_threshold: f64,
+    /// 14.1 D5/D6 (parent-14 D3/D5/D6): per-cluster outlier-detection state. `None`
+    /// when the cluster's `outlier_detection` config block is absent — the §5.3
+    /// inert-when-unconfigured invariant. `pick()`'s fast path bypasses entirely
+    /// when this AND `endpoint_health` are both `None`.
+    pub(crate) outlier_detection: Option<OutlierDetectionState>,
 }
 
 impl Cluster {
@@ -157,43 +178,110 @@ impl Cluster {
     }
 
     /// Picks the next endpoint in round-robin order. When the cluster has no
-    /// active health checks (`endpoint_health` is `None`) this is exactly the
-    /// phase-02 round-robin (the §5.4 inert-when-unconfigured invariant). When
-    /// health checks are configured, unhealthy endpoints are excluded and the
-    /// panic threshold (§6.2 item-3) is honored. `Relaxed` ordering is
-    /// sufficient for the cursor and the health reads (single-writer per
-    /// endpoint; no happens-before dependency).
+    /// active health checks AND no outlier detection (`endpoint_health` and
+    /// `outlier_detection` are both `None`) this is exactly the phase-02
+    /// round-robin (the §5.4 / §5.3 inert-when-unconfigured invariant). When at
+    /// least one filter is configured, eligibility is the AND-composition of
+    /// "healthy" (12.1 active HC) AND "not-ejected" (14.1 outlier detection) —
+    /// a `None` filter is vacuously `true` for every endpoint. The panic
+    /// threshold (§6.2 item-3) is honored against the eligible fraction.
+    /// `Relaxed` ordering is sufficient for the cursor and the health / ejection
+    /// reads (single-writer per endpoint; no happens-before dependency).
     fn pick(&self) -> Option<SocketAddr> {
         if self.endpoints.is_empty() {
             // `from_bootstrap` rejects empty clusters; this is defense-in-depth.
             return None;
         }
         let total = self.endpoints.len();
-        let health = match &self.endpoint_health {
-            None => {
-                let i = self.cursor.fetch_add(1, Ordering::Relaxed);
-                return Some(self.endpoints[i % total]);
-            }
-            Some(h) => h,
-        };
-        let healthy_count = health.iter().filter(|h| h.is_healthy()).count();
-        let healthy_percent = 100.0 * (healthy_count as f64) / (total as f64);
-        // Panic threshold (strictly-below): route over ALL endpoints when the
-        // healthy fraction is below the threshold. `value: 0` disables panic
-        // (`0.0 < 0.0` is false), so a 0-healthy cluster falls through to None.
-        if healthy_percent < self.panic_threshold {
+        // Fast path: nothing configured → phase-02 round-robin (byte-for-byte).
+        if self.endpoint_health.is_none() && self.outlier_detection.is_none() {
             let i = self.cursor.fetch_add(1, Ordering::Relaxed);
             return Some(self.endpoints[i % total]);
         }
-        // Round-robin over the healthy endpoints only.
-        let healthy_idx: Vec<usize> = (0..total).filter(|&i| health[i].is_healthy()).collect();
-        if healthy_idx.is_empty() {
-            // No healthy endpoints + panic not engaged → None → the pre-built
+        // Slow path: at least one filter is configured. Eligibility = healthy AND
+        // not-ejected (either filter being `None` is treated as `true`).
+        let health = self.endpoint_health.as_ref();
+        let ejection = self.outlier_detection.as_ref().map(|od| &od.endpoints);
+        let is_eligible = |i: usize| -> bool {
+            let healthy = match health {
+                None => true,
+                Some(h) => h[i].is_healthy(),
+            };
+            let not_ejected = match ejection {
+                None => true,
+                Some(e) => !e[i].is_ejected(),
+            };
+            healthy && not_ejected
+        };
+        let eligible_count = (0..total).filter(|&i| is_eligible(i)).count();
+        let eligible_percent = 100.0 * (eligible_count as f64) / (total as f64);
+        // Panic threshold (strictly-below): route over ALL endpoints when the
+        // eligible fraction is below the threshold. `value: 0` disables panic
+        // (`0.0 < 0.0` is false), so a 0-eligible cluster falls through to None.
+        if eligible_percent < self.panic_threshold {
+            let i = self.cursor.fetch_add(1, Ordering::Relaxed);
+            return Some(self.endpoints[i % total]);
+        }
+        // Round-robin over the eligible endpoints only.
+        let eligible_idx: Vec<usize> = (0..total).filter(|&i| is_eligible(i)).collect();
+        if eligible_idx.is_empty() {
+            // No eligible endpoints + panic not engaged → None → the pre-built
             // synth-503 path fires (unchanged at 12.1; body reconciliation is 12.2).
             return None;
         }
         let i = self.cursor.fetch_add(1, Ordering::Relaxed);
-        Some(self.endpoints[healthy_idx[i % healthy_idx.len()]])
+        Some(self.endpoints[eligible_idx[i % eligible_idx.len()]])
+    }
+
+    /// 14.1 D3 (parent-14 D3/D4): record an upstream response status against an
+    /// endpoint's outlier-detection state machine, enforcing the cluster-level
+    /// `max_ejection_percent` cap. Declared at 14.1; the production caller (the H1+H2
+    /// router-arm response-receipt hook) wires at 14.2 D4. At 14.1 this method is
+    /// exercised via direct unit tests on `Cluster::record_response`.
+    ///
+    /// **Behavior:**
+    /// - No-op when `outlier_detection.is_none()` (the §5.3 inert invariant).
+    /// - No-op when the endpoint is not in `self.endpoints` (defense-in-depth).
+    /// - Else: delegates to `EndpointEjection::record_response(status)` for counter
+    ///   ticks + threshold detection. On any threshold crossing, computes the cap
+    ///   `floor(host_count * max_ejection_percent / 100)` and counts current ejections.
+    ///   If `active >= cap_count`, increments `ejections_overflow` (per detection-tick
+    ///   per ADR-0041 §6.2 item-2) and returns without ejecting. Else picks the
+    ///   detector that crossed (5xx wins ties per lock-in #15) and calls
+    ///   `EndpointEjection::eject(detector)`.
+    ///
+    /// **Connect-failure synth-status path note:** per ADR-0041 §6.2 item-9, the 14.2
+    /// D4 hook DOES call `record_response` from the connect-failure synth path with
+    /// the synth status (502 / 503), which the classifier automatically treats as
+    /// 5xx + gateway-failure. The `pick() -> None` no-healthy-upstream synth-503 path
+    /// does NOT call `record_response` (no endpoint to attribute) — that decision lives
+    /// at the 14.2 D4 call-site, NOT here.
+    pub fn record_response(&self, endpoint: SocketAddr, status: u16) {
+        let Some(od) = self.outlier_detection.as_ref() else {
+            return; // §5.3 inert
+        };
+        let Some(idx) = self.endpoints.iter().position(|e| *e == endpoint) else {
+            return; // defense-in-depth (lock-in #10)
+        };
+        let state = &od.endpoints[idx];
+        let decision = state.record_response(status);
+        if !decision.any() {
+            return;
+        }
+        let total = self.endpoints.len();
+        let cap_count = (total * od.max_ejection_percent as usize) / 100;
+        let active_count = od.endpoints.iter().filter(|e| e.is_ejected()).count();
+        if active_count >= cap_count {
+            od.ejections_overflow.inc();
+            return;
+        }
+        // 5xx wins ties (lock-in #15) — the parent-14 SPEC's first-named detector.
+        let detector = if decision.crossed_5xx {
+            crate::DetectorType::Consecutive5xx
+        } else {
+            crate::DetectorType::ConsecutiveGatewayFailure
+        };
+        state.eject(detector);
     }
 }
 
@@ -213,6 +301,13 @@ impl ClusterHandle {
     /// inert-when-unconfigured round-robin).
     pub fn pick_endpoint(&self) -> Option<SocketAddr> {
         self.inner.pick()
+    }
+
+    /// 14.1 D3: delegates to `Cluster::record_response`. The 14.2 D4 response-receipt
+    /// hook callers hold a `ClusterHandle`; this mirrors the accessor for ergonomic
+    /// reach. See `Cluster::record_response` for the full behavior contract.
+    pub fn record_response(&self, endpoint: SocketAddr, status: u16) {
+        self.inner.record_response(endpoint, status);
     }
 
     /// Cluster name (delegates to `Cluster::name`). Mirrors `Cluster::name`'s
@@ -581,6 +676,7 @@ pub async fn from_bootstrap(
             upstream_rq_5xx,
             endpoint_health,
             panic_threshold,
+            outlier_detection: None, // 14.1 D5 — Task 5 wires the configured-OD arm
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -635,6 +731,7 @@ mod tests {
                 upstream_rq_5xx,
                 endpoint_health: None,
                 panic_threshold: 50.0,
+                outlier_detection: None,
             }),
         }
     }
@@ -932,6 +1029,7 @@ admin:
                 .expect("counter registers"),
             endpoint_health: None,
             panic_threshold: 50.0,
+            outlier_detection: None,
         };
         assert_eq!(c.name(), "backend");
     }
@@ -1521,6 +1619,7 @@ admin:
                 upstream_rq_5xx,
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
+                outlier_detection: None,
             }),
         };
         (handle, health)
@@ -1789,6 +1888,286 @@ admin:
             3,
             "expected one increment per simulated successful upstream connect",
         );
+    }
+
+    // ── 14.1 D5: outlier-detection pick() AND-composition + record_response ──
+
+    // Test helper: build a Cluster with both 12.1 EndpointHealth AND 14.1 EndpointEjection
+    // state, bypassing from_bootstrap. Both filters share the same endpoints (aligned by
+    // index). Caller chooses which endpoints to mark healthy / ejected via the returned
+    // Arc handles.
+    #[allow(clippy::too_many_arguments)]
+    fn mk_handle_with_health_and_ejection(
+        name: &str,
+        endpoints: Vec<SocketAddr>,
+        healthy_threshold: u32,
+        unhealthy_threshold: u32,
+        panic_threshold: f64,
+        consecutive_5xx_threshold: u32,
+        consecutive_gateway_failure_threshold: u32,
+        max_ejection_percent: u32,
+    ) -> (
+        ClusterHandle,
+        Vec<Arc<crate::EndpointHealth>>,
+        Vec<Arc<crate::EndpointEjection>>,
+    ) {
+        let registry = envoy_stats::StatsRegistry::new();
+        let cx_total = registry
+            .register_counter(&format!("cluster.{name}.upstream_cx_total"))
+            .unwrap();
+        let cx_active = registry
+            .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
+            .unwrap();
+        let upstream_rq_total = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_total"))
+            .unwrap();
+        let upstream_rq_5xx = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
+            .unwrap();
+        let membership = registry
+            .register_gauge(&format!("cluster.{name}.membership_healthy"))
+            .unwrap();
+        let health: Vec<Arc<crate::EndpointHealth>> = endpoints
+            .iter()
+            .map(|_| {
+                Arc::new(crate::EndpointHealth::new(
+                    healthy_threshold,
+                    unhealthy_threshold,
+                    Arc::clone(&membership),
+                ))
+            })
+            .collect();
+        let stats = crate::EndpointEjectionStats {
+            ejections_active: registry
+                .register_gauge(&format!("cluster.{name}.outlier_detection.ejections_active"))
+                .unwrap(),
+            ejections_enforced_total: registry
+                .register_counter(&format!(
+                    "cluster.{name}.outlier_detection.ejections_enforced_total"
+                ))
+                .unwrap(),
+            ejections_detected_consecutive_5xx: registry
+                .register_counter(&format!(
+                    "cluster.{name}.outlier_detection.ejections_detected_consecutive_5xx"
+                ))
+                .unwrap(),
+            ejections_enforced_consecutive_5xx: registry
+                .register_counter(&format!(
+                    "cluster.{name}.outlier_detection.ejections_enforced_consecutive_5xx"
+                ))
+                .unwrap(),
+            ejections_detected_consecutive_gateway_failure: registry
+                .register_counter(&format!(
+                    "cluster.{name}.outlier_detection.ejections_detected_consecutive_gateway_failure"
+                ))
+                .unwrap(),
+            ejections_enforced_consecutive_gateway_failure: registry
+                .register_counter(&format!(
+                    "cluster.{name}.outlier_detection.ejections_enforced_consecutive_gateway_failure"
+                ))
+                .unwrap(),
+        };
+        let ejection: Vec<Arc<crate::EndpointEjection>> = endpoints
+            .iter()
+            .map(|_| {
+                Arc::new(crate::EndpointEjection::new(
+                    consecutive_5xx_threshold,
+                    consecutive_gateway_failure_threshold,
+                    stats.clone(),
+                ))
+            })
+            .collect();
+        let ejections_overflow = registry
+            .register_counter(&format!(
+                "cluster.{name}.outlier_detection.ejections_overflow"
+            ))
+            .unwrap();
+        let od_state = OutlierDetectionState {
+            endpoints: ejection.clone(),
+            max_ejection_percent,
+            ejections_overflow,
+        };
+        let handle = ClusterHandle {
+            inner: Arc::new(Cluster {
+                name: name.to_string(),
+                endpoints,
+                cursor: AtomicUsize::new(0),
+                upstream_protocol: UpstreamProtocol::default(),
+                cx_total,
+                cx_active,
+                upstream_rq_total,
+                upstream_rq_5xx,
+                endpoint_health: Some(health.clone()),
+                panic_threshold,
+                outlier_detection: Some(od_state),
+            }),
+        };
+        (handle, health, ejection)
+    }
+
+    #[test]
+    fn pick_inert_when_neither_filter_configured() {
+        // Acceptance gate (b) regression-equivalence: when both endpoint_health AND
+        // outlier_detection are None, pick() must be byte-for-byte phase-02 round-robin.
+        let endpoints = mk_endpoints(3);
+        let handle = mk_handle("backend", endpoints.clone()); // unchanged 12.1 helper
+        let picks: Vec<SocketAddr> = (0..6).map(|_| handle.pick_endpoint().unwrap()).collect();
+        assert_eq!(
+            picks,
+            vec![
+                endpoints[0],
+                endpoints[1],
+                endpoints[2],
+                endpoints[0],
+                endpoints[1],
+                endpoints[2]
+            ],
+        );
+    }
+
+    #[test]
+    fn pick_excludes_ejected_endpoints() {
+        let eps = mk_endpoints(2);
+        // panic disabled (value 0) + thresholds 1 (immediate ejection on first 500).
+        let (handle, health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 1, 1, 100);
+        // Make both endpoints healthy so the active-HC filter doesn't interfere.
+        health[0].record_success();
+        health[1].record_success();
+        // Eject endpoint 0 directly.
+        ejection[0].eject(crate::DetectorType::Consecutive5xx);
+        // pick() should now only return endpoint 1.
+        for _ in 0..5 {
+            assert_eq!(handle.pick_endpoint().unwrap(), eps[1]);
+        }
+    }
+
+    #[test]
+    fn pick_returns_none_when_all_endpoints_ejected_and_panic_disabled() {
+        let eps = mk_endpoints(2);
+        let (handle, health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 1, 1, 100);
+        health[0].record_success();
+        health[1].record_success();
+        ejection[0].eject(crate::DetectorType::Consecutive5xx);
+        ejection[1].eject(crate::DetectorType::Consecutive5xx);
+        assert!(
+            handle.pick_endpoint().is_none(),
+            "all ejected + panic=0 → None"
+        );
+    }
+
+    #[test]
+    fn pick_panic_routes_over_all_when_eligible_fraction_below_threshold() {
+        let eps = mk_endpoints(2);
+        // panic_threshold 60% (strictly-below): with 50% eligible, panic engages.
+        let (handle, health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 60.0, 1, 1, 100);
+        health[0].record_success();
+        health[1].record_success();
+        ejection[0].eject(crate::DetectorType::Consecutive5xx);
+        // 1 of 2 eligible (50.0 < 60.0) → panic → round-robin over ALL.
+        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        assert_eq!(picks, vec![eps[0], eps[1], eps[0], eps[1]]);
+    }
+
+    #[test]
+    fn pick_and_composes_health_and_ejection_filters() {
+        // 4 endpoints; endpoint 0 unhealthy; endpoint 1 ejected; endpoint 2 BOTH unhealthy
+        // AND ejected; endpoint 3 healthy+not-ejected. Eligible set = {3}.
+        let eps = mk_endpoints(4);
+        let (handle, health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 1, 1, 100);
+        // Mark endpoints 1, 3 healthy. Endpoints 0, 2 stay unhealthy.
+        health[1].record_success();
+        health[3].record_success();
+        // Eject endpoints 1, 2.
+        ejection[1].eject(crate::DetectorType::Consecutive5xx);
+        ejection[2].eject(crate::DetectorType::Consecutive5xx);
+        // Eligible: only endpoint 3.
+        for _ in 0..5 {
+            assert_eq!(handle.pick_endpoint().unwrap(), eps[3]);
+        }
+    }
+
+    #[test]
+    fn cluster_record_response_no_op_when_outlier_detection_unconfigured() {
+        // The §5.3 inert invariant + lock-in #16: record_response on a cluster without
+        // outlier_detection silently returns (no-op; no panic; no stats touched).
+        let eps = mk_endpoints(1);
+        let handle = mk_handle("backend", eps.clone());
+        handle.record_response(eps[0], 500); // must not panic
+        handle.record_response(eps[0], 503);
+        // No assertable side-effect (no OD state) — the test passes iff no panic.
+    }
+
+    #[test]
+    fn cluster_record_response_ejects_endpoint_when_threshold_crossed() {
+        let eps = mk_endpoints(2);
+        let (handle, _health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 2, 2, 100);
+        handle.record_response(eps[0], 500);
+        assert!(!ejection[0].is_ejected(), "1 < threshold 2");
+        handle.record_response(eps[0], 500);
+        assert!(ejection[0].is_ejected(), "2 == threshold 2 → ejected");
+    }
+
+    #[test]
+    fn cluster_record_response_honors_max_ejection_percent_cap() {
+        // 4 endpoints, max_ejection_percent=25 → cap_count = floor(4*25/100) = 1.
+        // First ejection succeeds; subsequent threshold-crossings increment
+        // ejections_overflow (per ADR-0041 §6.2 item-2 — overflow re-fires per
+        // detection-tick).
+        let eps = mk_endpoints(4);
+        let (handle, _health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 1, 1, 25);
+        // Endpoint 0: cross threshold (immediate at threshold=1).
+        handle.record_response(eps[0], 500);
+        assert!(ejection[0].is_ejected());
+        // Endpoint 1: cross threshold; cap met (1 active >= cap 1) → no ejection, but
+        // overflow ticks.
+        handle.record_response(eps[1], 500);
+        assert!(!ejection[1].is_ejected(), "cap met → no eject");
+        // ejections_overflow value should be 1 (one cap-blocked event).
+        let od = handle
+            .inner
+            .outlier_detection
+            .as_ref()
+            .expect("OD configured");
+        assert_eq!(od.ejections_overflow.value(), 1);
+        // Endpoint 2: another threshold-cross under cap → overflow re-fires.
+        handle.record_response(eps[2], 500);
+        assert!(!ejection[2].is_ejected());
+        assert_eq!(
+            od.ejections_overflow.value(),
+            2,
+            "overflow per detection-tick"
+        );
+    }
+
+    #[test]
+    fn cluster_record_response_silent_on_unknown_endpoint() {
+        // Defense-in-depth (lock-in #10): if the caller passes an endpoint not in
+        // self.endpoints, the method returns silently (no panic; no stats touched).
+        let eps = mk_endpoints(1);
+        let (handle, _health, _ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 1, 1, 100);
+        let unknown: SocketAddr = "127.0.0.1:65530".parse().unwrap();
+        handle.record_response(unknown, 500); // must not panic
+    }
+
+    #[test]
+    fn cluster_record_response_picks_5xx_detector_on_ties() {
+        // 503 crosses BOTH thresholds simultaneously at threshold=1. Per lock-in #15,
+        // 5xx wins ties — endpoint ejects with DetectorType::Consecutive5xx.
+        let eps = mk_endpoints(1);
+        let (handle, _health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 1, 1, 100);
+        handle.record_response(eps[0], 503);
+        assert!(ejection[0].is_ejected());
+        let od = handle.inner.outlier_detection.as_ref().unwrap();
+        let stats_active = &od.endpoints[0];
+        let _ = stats_active;
     }
 }
 
