@@ -1,0 +1,26 @@
+static_resources:
+  listeners: []
+  clusters:
+    - name: od_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection:
+        consecutive_5xx: 5
+        consecutive_gateway_failure: 5
+        interval: 10s
+        base_ejection_time: 30s
+        max_ejection_percent: 10
+      load_assignment:
+        cluster_name: od_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 7000
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901

@@ -25,5 +25,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/cluster_health_check.yaml
 !corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml
 !corpus/parse_bootstrap/cluster_circuit_breakers.yaml
+!corpus/parse_bootstrap/cluster_outlier_detection.yaml
 artifacts/
 target/

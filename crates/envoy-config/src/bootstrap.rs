@@ -3729,6 +3729,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/cluster_health_check.yaml",
             "fuzz/corpus/parse_bootstrap/hcm_upstream_active_health_check.yaml",
             "fuzz/corpus/parse_bootstrap/cluster_circuit_breakers.yaml",
+            "fuzz/corpus/parse_bootstrap/cluster_outlier_detection.yaml", // 14.1 D8.2
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
