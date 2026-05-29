@@ -10,10 +10,12 @@
 //! `docs/envoy-rust/phases/02.1-config-cluster/SPEC.md` §§D1, §6 signpost 10.
 
 mod cluster;
+mod ejection;
 mod health;
 
 pub use cluster::{
     Cluster, ClusterError, ClusterHandle, ClusterManager, ConnGaugeGuard, UpstreamProtocol,
     from_bootstrap,
 };
+pub use ejection::{DetectorType, EjectionDecision, EndpointEjection, EndpointEjectionStats};
 pub use health::EndpointHealth;
