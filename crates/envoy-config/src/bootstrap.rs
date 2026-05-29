@@ -1782,6 +1782,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
         // common_lb_config panic threshold.
         validate_health_checks(cluster)?;
         validate_circuit_breakers(cluster)?; // 13.1 D2
+        validate_outlier_detection(cluster)?; // 14.1 D2
     }
 
     // Per-listener invariants.
@@ -2607,6 +2608,60 @@ fn validate_circuit_breakers(cluster: &Cluster) -> Result<(), crate::ConfigError
                 value,
             });
         }
+    }
+    Ok(())
+}
+
+/// 14.1 D2 (parent-14 D2): validate a cluster's `outlier_detection` block.
+/// Returns the first error encountered (validator-wide convention). Reuses
+/// `parse_duration` (`bootstrap.rs:2401`) for `interval` + `base_ejection_time`.
+/// Phase-14-deferred sibling fields (success_rate_*, failure_percentage_*,
+/// consecutive_local_origin_failure, split_external_local_origin_errors,
+/// enforcing_*, max_ejection_time, max_ejection_time_jitter) are rejected
+/// automatically at parse time by `deny_unknown_fields` per ADR-0041 §6.2 item-1.
+fn validate_outlier_detection(cluster: &Cluster) -> Result<(), crate::ConfigError> {
+    let Some(od) = cluster.outlier_detection.as_ref() else {
+        return Ok(());
+    };
+    if let Some(v) = od.consecutive_5xx
+        && v < 1
+    {
+        return Err(crate::ConfigError::InvalidOutlierDetectionThreshold {
+            cluster: cluster.name.clone(),
+            field: "consecutive_5xx",
+        });
+    }
+    if let Some(v) = od.consecutive_gateway_failure
+        && v < 1
+    {
+        return Err(crate::ConfigError::InvalidOutlierDetectionThreshold {
+            cluster: cluster.name.clone(),
+            field: "consecutive_gateway_failure",
+        });
+    }
+    for (field, raw_opt) in [
+        ("interval", od.interval.as_deref()),
+        ("base_ejection_time", od.base_ejection_time.as_deref()),
+    ] {
+        if let Some(raw) = raw_opt {
+            match parse_duration(raw) {
+                Ok(d) if !d.is_zero() => {}
+                _ => {
+                    return Err(crate::ConfigError::InvalidOutlierDetectionTiming {
+                        cluster: cluster.name.clone(),
+                        field,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(v) = od.max_ejection_percent
+        && v > 100
+    {
+        return Err(crate::ConfigError::InvalidMaxEjectionPercent {
+            cluster: cluster.name.clone(),
+            value: v,
+        });
     }
     Ok(())
 }
@@ -9305,5 +9360,167 @@ mod serialize_roundtrip_tests {
         let json = serde_json::to_string(&parsed).expect("minimal serializes");
         assert!(json.contains("\"node\""));
         assert!(json.contains("\"static_resources\""));
+    }
+
+    #[test]
+    fn validate_outlier_detection_accepts_empty_block() {
+        // §6.2 item-1: outlier_detection: {} (all fields absent) is accepted per Envoy v1.33.0.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: od
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection: {}
+      load_assignment:
+        cluster_name: od
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+"#;
+        crate::parse_bootstrap(yaml).expect("empty outlier_detection block accepted");
+    }
+
+    #[test]
+    fn validate_outlier_detection_rejects_zero_consecutive_5xx() {
+        let yaml = build_od_yaml(r#"consecutive_5xx: 0"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidOutlierDetectionThreshold {
+                    ref cluster, field
+                } if cluster == "od" && field == "consecutive_5xx"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn validate_outlier_detection_rejects_zero_consecutive_gateway_failure() {
+        let yaml = build_od_yaml(r#"consecutive_gateway_failure: 0"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidOutlierDetectionThreshold {
+                    ref cluster, field
+                } if cluster == "od" && field == "consecutive_gateway_failure"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn validate_outlier_detection_rejects_zero_interval() {
+        let yaml = build_od_yaml(r#"interval: 0s"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidOutlierDetectionTiming {
+                    ref cluster, field
+                } if cluster == "od" && field == "interval"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn validate_outlier_detection_rejects_subsecond_decimal_interval() {
+        // §6.2 item-6: parse_duration rejects sub-second decimals; surfaces as
+        // InvalidOutlierDetectionTiming.
+        let yaml = build_od_yaml(r#"interval: 0.5s"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidOutlierDetectionTiming {
+                    ref cluster, field
+                } if cluster == "od" && field == "interval"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn validate_outlier_detection_rejects_zero_base_ejection_time() {
+        let yaml = build_od_yaml(r#"base_ejection_time: 0s"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidOutlierDetectionTiming {
+                    ref cluster, field
+                } if cluster == "od" && field == "base_ejection_time"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn validate_outlier_detection_rejects_max_ejection_percent_above_100() {
+        let yaml = build_od_yaml(r#"max_ejection_percent: 101"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::InvalidMaxEjectionPercent {
+                    ref cluster, value: 101
+                } if cluster == "od"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn validate_outlier_detection_accepts_max_ejection_percent_zero() {
+        // Boundary: 0 is in [0,100]; the validator accepts it. (At runtime, cap_count = 0
+        // means every threshold-crossing increments ejections_overflow; that's a Task-4
+        // concern, not Task-2.)
+        let yaml = build_od_yaml(r#"max_ejection_percent: 0"#);
+        crate::parse_bootstrap(&yaml).expect("0 is in [0,100]");
+    }
+
+    #[test]
+    fn validate_outlier_detection_accepts_max_ejection_percent_100() {
+        let yaml = build_od_yaml(r#"max_ejection_percent: 100"#);
+        crate::parse_bootstrap(&yaml).expect("100 is in [0,100]");
+    }
+
+    #[test]
+    fn validate_outlier_detection_accepts_minimum_viable_full_block() {
+        let yaml = build_od_yaml(
+            "consecutive_5xx: 5\n        consecutive_gateway_failure: 5\n        interval: 10s\n        base_ejection_time: 30s\n        max_ejection_percent: 10",
+        );
+        crate::parse_bootstrap(&yaml).expect("Envoy-default block validates");
+    }
+
+    // Helper: build a single-cluster bootstrap YAML with the named outlier_detection body.
+    // Caller-supplied `od_body` is the indented content of the `outlier_detection:` block
+    // (one or more lines, each indented to match the YAML structure).
+    fn build_od_yaml(od_body: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: od
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection:
+        {od_body}
+      load_assignment:
+        cluster_name: od
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: {{ socket_address: {{ address: 127.0.0.1, port_value: 7000 }} }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
+"#
+        )
     }
 }

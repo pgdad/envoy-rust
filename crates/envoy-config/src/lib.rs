@@ -460,6 +460,36 @@ pub enum ConfigError {
         "cluster '{cluster}' carries circuit_breakers.thresholds[0].max_connections = {value} — must be >= 1"
     )]
     InvalidMaxConnections { cluster: String, value: u32 },
+
+    /// 14.1 D2 (parent-14 D2): outlier_detection.consecutive_5xx or
+    /// outlier_detection.consecutive_gateway_failure is zero. Both detector thresholds
+    /// must be >= 1 when present (the validator rejects `0`; absent is fine and means
+    /// the detector is not configured).
+    #[error("cluster '{cluster}' outlier_detection {field} must be >= 1")]
+    InvalidOutlierDetectionThreshold {
+        cluster: String,
+        field: &'static str,
+    },
+
+    /// 14.1 D2: outlier_detection.interval or outlier_detection.base_ejection_time
+    /// failed `parse_duration` or parsed to zero. Integer-second / millisecond /
+    /// microsecond suffixes only (per parse_duration's contract); sub-second decimals
+    /// (e.g. `0.5s`) are rejected (§6.2 item-6).
+    #[error(
+        "cluster '{cluster}' outlier_detection {field} is not a positive integer-unit duration (e.g. `10s`)"
+    )]
+    InvalidOutlierDetectionTiming {
+        cluster: String,
+        field: &'static str,
+    },
+
+    /// 14.1 D2: outlier_detection.max_ejection_percent is outside `[0, 100]`. The
+    /// boundary values 0 and 100 are both accepted (0 ⇒ cap blocks all ejections;
+    /// 100 ⇒ no cap effectively).
+    #[error(
+        "cluster '{cluster}' outlier_detection.max_ejection_percent {value} is outside [0, 100]"
+    )]
+    InvalidMaxEjectionPercent { cluster: String, value: u32 },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
