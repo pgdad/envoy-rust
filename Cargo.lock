@@ -390,6 +390,8 @@ dependencies = [
  "envoy-stats",
  "thiserror",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

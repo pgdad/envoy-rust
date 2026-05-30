@@ -50,6 +50,15 @@ pub(crate) struct OutlierDetectionState {
     pub(crate) endpoints: Vec<Arc<crate::EndpointEjection>>,
     pub(crate) max_ejection_percent: u32,
     pub(crate) ejections_overflow: Arc<envoy_stats::Counter>,
+    /// 14.2 D7 (lock-in #6): the runtime ejection-duration. The D7
+    /// `OutlierEjectionSweeper` un-ejects an endpoint at the next `interval` tick after
+    /// `now - eject_time >= base_ejection_time`. Populated in `from_bootstrap` from the
+    /// parsed `outlier_detection.base_ejection_time` (Envoy v3 default 30s when omitted).
+    pub(crate) base_ejection_time: std::time::Duration,
+    /// 14.2 D7 (lock-in #6): the runtime sweep cadence. Drives the `OutlierEjectionSweeper`'s
+    /// `tokio::time::interval` period. Populated in `from_bootstrap` from the parsed
+    /// `outlier_detection.interval` (Envoy v3 default 10s when omitted).
+    pub(crate) interval: std::time::Duration,
 }
 
 impl OutlierDetectionState {
@@ -307,6 +316,15 @@ impl Cluster {
         // apply `base_ejection_time`.
         *ejected_at = Some(std::time::Instant::now());
     }
+
+    /// 14.2 D7 (lock-in #6/#7): borrow the cluster's runtime outlier-detection state, if
+    /// configured. `None` when the cluster has no `outlier_detection` block (§5.3 inert
+    /// invariant). Consumed by `OutlierManager::for_bootstrap` (via `ClusterHandle::
+    /// inner_outlier_detection_state`) to read the per-endpoint `EndpointEjection` handles +
+    /// the `base_ejection_time` / `interval` Durations for the sweeper.
+    pub(crate) fn outlier_detection_state(&self) -> Option<&OutlierDetectionState> {
+        self.outlier_detection.as_ref()
+    }
 }
 
 /// A handle to a `Cluster` that hands out endpoints via round-robin. Cheaply
@@ -359,6 +377,15 @@ impl ClusterHandle {
     /// public posture per phase-04.3 SPEC §3 D5.
     pub fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    /// 14.2 D7 (lock-in #6/#7): delegates to `Cluster::outlier_detection_state`.
+    /// `OutlierManager::for_bootstrap` walks `ClusterManager::clusters()` and reaches each
+    /// cluster's runtime outlier-detection state through this accessor (mirroring the H1/H2
+    /// pool managers' `cluster_mgr`-walk precedent). `pub(crate)` because the sole consumer
+    /// (`outlier::OutlierManager`) lives in this crate.
+    pub(crate) fn inner_outlier_detection_state(&self) -> Option<&OutlierDetectionState> {
+        self.inner.outlier_detection_state()
     }
 
     /// 05.3 NEW: delegates to `Cluster::upstream_protocol`. Mirrors `name()`'s
@@ -722,6 +749,23 @@ pub async fn from_bootstrap(
             let consecutive_gateway_failure_threshold =
                 od_cfg.consecutive_gateway_failure.unwrap_or(5);
             let max_ejection_percent = od_cfg.max_ejection_percent.unwrap_or(10);
+            // 14.2 D7 (lock-in #6): project the runtime timing Durations from the parsed
+            // config. REUSE `envoy_config::parse_duration` (the same helper 14.1's validator
+            // ran on these fields) so the sweeper never re-parses the bootstrap. The validator
+            // already accepted both fields (or they're absent); on this defense-in-depth parse
+            // a failure falls back to the Envoy v3 default rather than erroring (the validator
+            // is the authoritative gate). Defaults (§6.2 item-1): base_ejection_time = 30s,
+            // interval = 10s.
+            let base_ejection_time = od_cfg
+                .base_ejection_time
+                .as_deref()
+                .and_then(|s| envoy_config::parse_duration(s).ok())
+                .unwrap_or(std::time::Duration::from_secs(30));
+            let interval = od_cfg
+                .interval
+                .as_deref()
+                .and_then(|s| envoy_config::parse_duration(s).ok())
+                .unwrap_or(std::time::Duration::from_secs(10));
             let mk_counter = |suffix: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
                 registry
                     .register_counter(&format!(
@@ -775,6 +819,8 @@ pub async fn from_bootstrap(
                 endpoints: endpoints_state,
                 max_ejection_percent,
                 ejections_overflow,
+                base_ejection_time,
+                interval,
             })
         } else {
             None
@@ -2100,6 +2146,11 @@ admin:
             endpoints: ejection.clone(),
             max_ejection_percent,
             ejections_overflow,
+            // 14.2 D7: timing fields are irrelevant to the `record_response` / `pick()` tests
+            // this helper backs (the sweeper is tested separately in `outlier.rs`); use the
+            // Envoy v3 defaults for representative values.
+            base_ejection_time: std::time::Duration::from_secs(30),
+            interval: std::time::Duration::from_secs(10),
         };
         let handle = ClusterHandle {
             inner: Arc::new(Cluster {
