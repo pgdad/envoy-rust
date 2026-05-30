@@ -170,6 +170,14 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     )
     .context("building active-HC scheduler")?;
 
+    // 14.2 D7 (lock-in #11): the fourth periodic-background primitive. Spawns one ejection
+    // sweeper per cluster that configures outlier_detection; inert (zero sweepers) otherwise.
+    // Mirrors the 12.2 health scheduler + 13.x pool managers: constructed after them, passed
+    // `token.clone()`, and drained via `shutdown().await` on the runtime drain path below.
+    // `for_bootstrap` takes `&ClusterManager`; `&cluster_mgr` (an `Arc<ClusterManager>`)
+    // auto-derefs at the call, matching how the H1/H2 pool managers consume it above.
+    let outlier_mgr = envoy_cluster::OutlierManager::for_bootstrap(&cluster_mgr, token.clone());
+
     // 03.2: per-cluster Arc<UpstreamTls> construction. Build once at startup
     // and reuse across all per-connection invocations of `handle`. The
     // validator already rejected DownstreamTlsContext on a cluster's
@@ -470,6 +478,11 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // `probe_loop`s; `shutdown().await` joins every JoinHandle before
     // envoy-bin returns (clean tokio task drain).
     health_scheduler.shutdown().await;
+    // 14.2 D7 (lock-in #11): drain the outlier-ejection sweepers alongside the health
+    // scheduler on BOTH clean-exit and error-exit paths. The signal token cancellation has
+    // already propagated through each sweeper's `tokio::select!`; `shutdown().await` cancels
+    // its token clone + joins every sweeper task before `cluster_mgr`'s stats handles drop.
+    outlier_mgr.shutdown().await;
     if let Some(e) = first_err {
         return Err(e);
     }
