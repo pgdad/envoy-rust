@@ -67,28 +67,19 @@ driver:
     - { name: cluster.backend_cluster.outlier_detection.ejections_enforced_consecutive_5xx,  value: 1 }
     - { name: cluster.backend_cluster.outlier_detection.ejections_detected_consecutive_5xx,  value: 1 }
     - { name: cluster.backend_cluster.outlier_detection.ejections_overflow,                  value: 0 }
-  # Envoy emits the full outlier-detection stat family (success-rate /
+  # NOTE on the Envoy-only outlier-detection stat family: Envoy emits ~14
+  # additional `cluster.backend_cluster.outlier_detection.*` names that
+  # envoy-rust does NOT emit at minimum-viable scope (the success-rate /
   # failure-percentage / local-origin / consecutive-gateway-failure detector
-  # counter pairs, plus the legacy aliases); envoy-rust emits only the
-  # minimum-viable consecutive-5xx subset asserted above. These additional
-  # Envoy-only names are allowlisted so the bilateral stat-diff does not flag
-  # them. Provenance: the documented deferred set in
-  # docs/envoy-rust/BEHAVIOR_CONTRACT.md (14.1 outlier-detection stat table).
-  # The known "14-claimed-vs-13-enumerated" count discrepancy (carryforward
-  # M8) is reconciled by Task 9; this list reflects the actual documented
-  # deferred names. Task 10 / CI reconciles it against the live Envoy run.
-  allowlist_envoy_only:
-    - cluster.backend_cluster.outlier_detection.ejections_total
-    - cluster.backend_cluster.outlier_detection.ejections_consecutive_5xx
-    - cluster.backend_cluster.outlier_detection.ejections_detected_consecutive_gateway_failure
-    - cluster.backend_cluster.outlier_detection.ejections_enforced_consecutive_gateway_failure
-    - cluster.backend_cluster.outlier_detection.ejections_detected_consecutive_local_origin_failure
-    - cluster.backend_cluster.outlier_detection.ejections_enforced_consecutive_local_origin_failure
-    - cluster.backend_cluster.outlier_detection.ejections_detected_success_rate
-    - cluster.backend_cluster.outlier_detection.ejections_enforced_success_rate
-    - cluster.backend_cluster.outlier_detection.ejections_detected_failure_percentage
-    - cluster.backend_cluster.outlier_detection.ejections_enforced_failure_percentage
-    - cluster.backend_cluster.outlier_detection.ejections_detected_local_origin_success_rate
-    - cluster.backend_cluster.outlier_detection.ejections_enforced_local_origin_success_rate
-    - cluster.backend_cluster.outlier_detection.ejections_detected_local_origin_failure_percentage
-    - cluster.backend_cluster.outlier_detection.ejections_enforced_local_origin_failure_percentage
+  # counter pairs, plus the legacy aliases `ejections_total` /
+  # `ejections_consecutive_5xx`). The `Driver::Http1KeepAlive` stat path
+  # asserts ONLY the named `expected_stats` above and ignores every other
+  # emitted stat — it does NOT perform a full set-diff — so those Envoy-only
+  # names need no allowlist here (unlike the 0011 prometheus-set-diff path,
+  # which DOES use `allowlist_envoy_only`; that key is not a field of the
+  # keep-alive driver and the `Driver` enum's `deny_unknown_fields` would
+  # reject it). The deferred Envoy-only names are documented in this fixture's
+  # README + docs/envoy-rust/BEHAVIOR_CONTRACT.md (14.1 outlier-detection stat
+  # table); Task 9 reconciles the "14-claimed-vs-13-enumerated" count
+  # discrepancy (carryforward M8) and Task 10 / CI verifies against the live
+  # Envoy run.
