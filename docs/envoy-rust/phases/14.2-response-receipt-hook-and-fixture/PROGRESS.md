@@ -244,7 +244,7 @@ Subagent-driven (TDD). Two-stage review: spec ✅ + code-quality Approved.
   no-new-fields test); clippy clean; fmt clean (an initial fmt slip in the reader-call wrapping was
   caught + corrected before the commit was finalized — final tree fmt-clean).
 
-## Task 7 — fixture 0022-upstream-outlier-detection-consecutive-5xx + Docker-gated wrapper — DONE (`ff02056d` + fixups `014c8b43`, `9a228d44`)
+## Task 7 — fixture 0022-upstream-outlier-detection-consecutive-5xx + Docker-gated wrapper — DONE (`ff02056d` + fixups `014c8b43`, `8d06d6fb`)
 
 Subagent-driven + controller fold-ins. Two-stage review: spec ✅ (with deviations noted) + code-quality
 Approved-with-minors; the review-flagged harness gap + doc staleness were closed by the controller in
@@ -344,9 +344,13 @@ constructor; 14.1 had no caller driving ejection), it caught a genuine **product
   `local_origin_success_rate` / `failure_percentage` / `local_origin_failure_percentage` = 10; plus 3
   legacy aliases `ejections_total` / `ejections_consecutive_5xx` / `ejections_success_rate`). Corrected
   "14" → "13" in BOTH `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (the 14.1 outlier-detection stat table) AND
-  `docs/envoy-rust/phases/14.1-endpoint-ejection-and-lb-integration/SPEC.md` §2.2. Zero differential
-  impact (the keep-alive stat path keys on named assertions, not the prose count). The count 13 is
-  corroborated by the Task-7 fixture allowlist enumeration and the original 14.1 REVIEW M8 finding.
+  `docs/envoy-rust/phases/14.1-endpoint-ejection-and-lb-integration/SPEC.md` (§2.1 stat-name mapping +
+  §5.5 stat-namespace lock-in — NOT §2.2, which is the synth-503 section). Zero differential impact (the
+  keep-alive stat path keys on named assertions, not the prose count). The count 13 is corroborated by the
+  Task-7 fixture enumeration and the original 14.1 REVIEW M8 finding. **(State-5-review fixup:** the 14.1
+  SPEC edit + this section-reference correction + the Task-7 fixup-2 SHA `9a228d44`→`8d06d6fb` above landed
+  during the 14.2 state-5 code review — the Task-9 commit `91e8dfad` had edited only BEHAVIOR_CONTRACT.md,
+  leaving the M8 reconciliation half-closed; the review caught it and completed it.)
 
 ### State-3 execution-arc churn note (transparency, D-3.4)
 

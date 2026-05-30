@@ -68,21 +68,26 @@ cap-check sees `active_count == 0 < cap 1` before ejecting.
 - **T6-extended keep-alive driver** — no new harness primitive; Task 6 added
   the per-request body / header-presence / header-absence assertion fields.
 
-## `allowlist_envoy_only` provenance
+## Deferred Envoy-only stat names
 
 Envoy emits the full outlier-detection stat family (success-rate,
 failure-percentage, local-origin, and consecutive-gateway-failure detector
 counter pairs, plus the legacy aliases `ejections_total` /
 `ejections_consecutive_5xx`). envoy-rust emits only the minimum-viable
-consecutive-5xx subset asserted above. The remaining Envoy-only names are
-listed under `allowlist_envoy_only` in `expectations.yaml`.
+consecutive-5xx subset asserted above. The remaining 13 Envoy-only names are
+NOT listed in `expectations.yaml`: this fixture's `Driver::Http1KeepAlive`
+stat path asserts only the named `expected_stats` (no full prometheus
+set-diff), so unasserted Envoy-only names are simply ignored — there is no
+`allowlist_envoy_only` key on the keep-alive driver (that key belongs to the
+prometheus-set-diff `BodyRule`, and the `Driver` enum's `deny_unknown_fields`
+rejects it here).
 
-That list is enumerated from the **documented** deferred set in
+The deferred set is catalogued instead in
 `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (the 14.1 outlier-detection stat table).
-The known "14-claimed-vs-13-enumerated" prose-count discrepancy (carryforward
-M8) is reconciled by phase 14.2 Task 9; the allowlist here reflects the actual
-documented deferred names. The live Envoy emission is observed and reconciled
-against this list at Task 10 (state-4 verification) / in CI.
+The prior "14-claimed-vs-13-enumerated" prose-count discrepancy (carryforward
+M8) is reconciled to **13** by phase 14.2 Task 9. The live Envoy emission is
+observed and reconciled against this list at Task 10 (state-4 verification) /
+in CI.
 
 ## Docker-gated
 

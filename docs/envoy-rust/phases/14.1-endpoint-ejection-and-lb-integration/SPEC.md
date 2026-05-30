@@ -47,7 +47,7 @@ Per the parent-14 SPEC §6.2 9-item empirical verification ratified by ADR-0041,
 | `cluster.<name>.outlier_detection.ejections_detected_consecutive_gateway_failure` | value-exact (0-case at fixture-0022) | Counter. Same shape as the `_consecutive_5xx` sibling. The fixture-0022 backend serves 500 (NOT 502/503/504), so the gateway-failure detector never fires; both proxies emit 0. |
 | `cluster.<name>.outlier_detection.ejections_enforced_consecutive_gateway_failure` | value-exact (0-case at fixture-0022) | Counter. Sibling of `_detected_consecutive_gateway_failure`. 0-case at fixture-0022. |
 
-Envoy emits an additional **14 names** envoy-rust does NOT emit at phase 14 minimum-viable scope (deferred per parent SPEC §4): the `_detected_/_enforced_` pairs for `consecutive_local_origin_failure`, `success_rate`, `local_origin_success_rate`, `failure_percentage`, `local_origin_failure_percentage`; the legacy aliases `ejections_total` + `ejections_consecutive_5xx` + `ejections_success_rate`. The fixture-0022 expectations.yaml uses `allowlist_envoy_only` for these per the established differential-harness pattern (12.2 / 13.x precedent).
+Envoy emits an additional **13 names** envoy-rust does NOT emit at phase 14 minimum-viable scope (deferred per parent SPEC §4): the `_detected_/_enforced_` pairs for `consecutive_local_origin_failure`, `success_rate`, `local_origin_success_rate`, `failure_percentage`, `local_origin_failure_percentage` (= 10); the legacy aliases `ejections_total` + `ejections_consecutive_5xx` + `ejections_success_rate` (= 3). **(14.2 M8 reconciliation: corrected the prior "14" to "13" to match this enumeration.)** Fixture-0022's `Driver::Http1KeepAlive` stat path asserts only the named `expected_stats` (no full prometheus set-diff), so it does NOT carry an `allowlist_envoy_only` key for these — the deferred names are catalogued in `docs/envoy-rust/BEHAVIOR_CONTRACT.md` instead.
 
 **Rows land at D6 (stats wiring) — Task TBD per the 14.1 PLAN-writer's call.**
 
@@ -179,7 +179,7 @@ Phase 14.1 plugs into the same seam phase 12.1 deliberately reserved. The `Clust
 
 ### 5.5 Stat-namespace lock-in per ADR-0041
 
-The 7-name minimum-viable subset (§2.1) is locked by ADR-0041's §6.2 revision; envoy-rust does NOT emit the additional 14 Envoy-side names at phase-14 scope (deferred per parent §4). The fixture-0022 expectations.yaml at 14.2 D8.1 uses `allowlist_envoy_only` for the deferred names.
+The 7-name minimum-viable subset (§2.1) is locked by ADR-0041's §6.2 revision; envoy-rust does NOT emit the additional 13 Envoy-side names at phase-14 scope (deferred per parent §4). The fixture-0022 expectations.yaml at 14.2 D8.1 catalogues the deferred names in `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (its `Driver::Http1KeepAlive` stat path asserts only named stats, so no `allowlist_envoy_only` key applies).
 
 ---
 

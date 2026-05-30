@@ -117,7 +117,10 @@ pub struct Cluster {
     /// reads them.
     pub(crate) endpoint_health: Option<Vec<Arc<crate::EndpointHealth>>>,
     /// 12.1 (parent-12 D5): `common_lb_config.healthy_panic_threshold` percentage
-    /// (default 50.0). Read by `pick()` only when `endpoint_health` is `Some`.
+    /// (default 50.0). Read by `pick()` whenever any eligibility filter is configured —
+    /// `endpoint_health` (active HC) AND/OR `outlier_detection` (14.2). Parsed unconditionally
+    /// in `from_bootstrap` (the 14.2 Task-8 fixup hoisted it out of the health-check branch so
+    /// outlier-detection-only clusters honor it).
     pub(crate) panic_threshold: f64,
     /// 14.1 D5/D6 (parent-14 D3/D5/D6): per-cluster outlier-detection state. `None`
     /// when the cluster's `outlier_detection` config block is absent — the §5.3
