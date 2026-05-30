@@ -406,20 +406,18 @@ async fn outlier_detection_ejects_then_un_ejects() {
     // converges (the active-HC backstop's settle-then-probe precedent,
     // generalized to a bounded poll).
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last_status = 0u16;
-    loop {
+    let final_status = loop {
         let (s, _h, _b) = http1_get_close(hcm_addr, "/").await;
-        last_status = s;
         if s == 200 {
-            break;
+            break s;
         }
         assert!(
             Instant::now() < deadline,
-            "GET / did not converge to 200 after un-eject window; last status {last_status}"
+            "GET / did not converge to 200 after un-eject window; last status {s}"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    assert_eq!(last_status, 200, "un-ejected endpoint serves GET / → 200");
+    };
+    assert_eq!(final_status, 200, "un-ejected endpoint serves GET / → 200");
 
     // The gauge is back to 0 after un-eject (per-endpoint counters reset).
     let stats = scrape_admin_stats(admin_addr).await;
