@@ -1,0 +1,94 @@
+# Phase 14.2 D8.1 fixture-0022 expectations: consecutive-5xx passive
+# outlier-detection ejection + the no-healthy-upstream synth-503 follow-on.
+#
+# Driver `http1_keep_alive` (13.1 D10; extended at 14.2 Task 6 with the
+# per-request `expected_body` / `require_header_present` /
+# `require_header_absent` assertion fields). ONE downstream keep-alive conn
+# drives 4 sequential GET /fail; 500ms settle past the last request; bilateral
+# admin stat scrape on the consecutive-5xx ejection counters.
+#
+# The configurable-status backend is started by the harness with
+# `--per-path /fail=500` (keyed on the fixture directory name), so /fail
+# returns a backend 500 ("server error\n", 13 bytes).
+#
+# Logic (parent-14 SPEC §6.2 item-6):
+#   reqs 1-3: backend 500 -> consecutive_5xx counter 1 -> 2 -> 3. The
+#             threshold (3) is crossed on request 3, ejecting the sole
+#             endpoint. A real upstream responds, so
+#             x-envoy-upstream-service-time is PRESENT.
+#   req 4   : the endpoint is ejected and panic is disabled
+#             (healthy_panic_threshold: { value: 0 }), so the cluster has no
+#             healthy host -> the 12.2 no-healthy-upstream synth-503
+#             ("no healthy upstream", 19 bytes). Locally generated, so
+#             x-envoy-upstream-service-time is ABSENT.
+#
+#   ejections_detected_consecutive_5xx == 1 (single threshold crossing).
+#   ejections_overflow == 0: with one host and max_ejection_percent: 100 the
+#   eject cap is floor(1 * 100%) = 1, and the cap-check sees
+#   active_count == 0 < cap 1 BEFORE ejecting, so the ejection proceeds.
+#
+# CRITICAL serde form (14.2 Task 6): the per-request body rule
+# `Http1BodyRule::ByteExact` serializes as an internally-tagged map
+# `{ kind: byte_exact, body: "..." }`.
+#
+# Integer-second durations (`1s`/`60s`) per §6.2 item-6 — the only duration
+# form both proxy parsers accept.
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /fail
+      host: backend_cluster
+      expected_status: 500
+      expected_body: { kind: byte_exact, body: "server error\n" }
+      require_header_present: x-envoy-upstream-service-time
+    - method: GET
+      path: /fail
+      host: backend_cluster
+      expected_status: 500
+      expected_body: { kind: byte_exact, body: "server error\n" }
+      require_header_present: x-envoy-upstream-service-time
+    - method: GET
+      path: /fail
+      host: backend_cluster
+      expected_status: 500
+      expected_body: { kind: byte_exact, body: "server error\n" }
+      require_header_present: x-envoy-upstream-service-time
+    - method: GET
+      path: /fail
+      host: backend_cluster
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "no healthy upstream" }
+      require_header_absent: x-envoy-upstream-service-time
+  settle_ms: 500
+  expected_stats:
+    - { name: cluster.backend_cluster.outlier_detection.ejections_active,                    value: 1 }
+    - { name: cluster.backend_cluster.outlier_detection.ejections_enforced_total,            value: 1 }
+    - { name: cluster.backend_cluster.outlier_detection.ejections_enforced_consecutive_5xx,  value: 1 }
+    - { name: cluster.backend_cluster.outlier_detection.ejections_detected_consecutive_5xx,  value: 1 }
+    - { name: cluster.backend_cluster.outlier_detection.ejections_overflow,                  value: 0 }
+  # Envoy emits the full outlier-detection stat family (success-rate /
+  # failure-percentage / local-origin / consecutive-gateway-failure detector
+  # counter pairs, plus the legacy aliases); envoy-rust emits only the
+  # minimum-viable consecutive-5xx subset asserted above. These additional
+  # Envoy-only names are allowlisted so the bilateral stat-diff does not flag
+  # them. Provenance: the documented deferred set in
+  # docs/envoy-rust/BEHAVIOR_CONTRACT.md (14.1 outlier-detection stat table).
+  # The known "14-claimed-vs-13-enumerated" count discrepancy (carryforward
+  # M8) is reconciled by Task 9; this list reflects the actual documented
+  # deferred names. Task 10 / CI reconciles it against the live Envoy run.
+  allowlist_envoy_only:
+    - cluster.backend_cluster.outlier_detection.ejections_total
+    - cluster.backend_cluster.outlier_detection.ejections_consecutive_5xx
+    - cluster.backend_cluster.outlier_detection.ejections_detected_consecutive_gateway_failure
+    - cluster.backend_cluster.outlier_detection.ejections_enforced_consecutive_gateway_failure
+    - cluster.backend_cluster.outlier_detection.ejections_detected_consecutive_local_origin_failure
+    - cluster.backend_cluster.outlier_detection.ejections_enforced_consecutive_local_origin_failure
+    - cluster.backend_cluster.outlier_detection.ejections_detected_success_rate
+    - cluster.backend_cluster.outlier_detection.ejections_enforced_success_rate
+    - cluster.backend_cluster.outlier_detection.ejections_detected_failure_percentage
+    - cluster.backend_cluster.outlier_detection.ejections_enforced_failure_percentage
+    - cluster.backend_cluster.outlier_detection.ejections_detected_local_origin_success_rate
+    - cluster.backend_cluster.outlier_detection.ejections_enforced_local_origin_success_rate
+    - cluster.backend_cluster.outlier_detection.ejections_detected_local_origin_failure_percentage
+    - cluster.backend_cluster.outlier_detection.ejections_enforced_local_origin_failure_percentage
