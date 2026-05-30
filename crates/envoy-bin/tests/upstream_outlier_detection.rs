@@ -377,10 +377,27 @@ async fn outlier_detection_ejects_then_un_ejects() {
     }
     drop(down);
 
-    // The 4th request now finds no healthy upstream (the only endpoint is
-    // ejected) ⇒ the 12.2-landed synth-503 (`no healthy upstream`, 19 bytes,
-    // 5 standard headers). Fresh conn — the prior keep-alive conn is gone.
-    let (status, headers, body) = http1_get_close(hcm_addr, "/fail").await;
+    // After the 3rd backend-500 the endpoint is ejected, but the ejection edge
+    // fires from the router-arm `record_response` hook which runs after the
+    // downstream response is written — so the eject may land a beat after the
+    // 3rd response returns. Poll a fresh `GET /fail` until it converges to the
+    // synth-503 (the only endpoint is ejected ⇒ no healthy upstream), up to a
+    // short budget. Each probe is a fresh conn (the prior keep-alive conn is
+    // gone). Once the 12.2-landed synth-503 (`no healthy upstream`, 19 bytes, 5
+    // standard headers) appears, assert its wire shape.
+    let eject_deadline = Instant::now() + Duration::from_secs(10);
+    let (status, headers, body) = loop {
+        let resp = http1_get_close(hcm_addr, "/fail").await;
+        if resp.0 == 503 {
+            break resp;
+        }
+        assert!(
+            Instant::now() < eject_deadline,
+            "endpoint did not eject (GET /fail still {} not 503)",
+            resp.0
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     assert_eq!(status, 503, "post-ejection synth 503 no-healthy-upstream");
     assert_eq!(
         body, b"no healthy upstream",
