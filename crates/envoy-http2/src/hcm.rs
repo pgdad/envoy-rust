@@ -399,6 +399,11 @@ async fn handle_one_stream(
                     Err(e) => {
                         tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
                         let r = synth_h2_502();
+                        // 14.2 D4 (lock-in #9, ADR-0041 §6.2 item-9): the picked endpoint failed
+                        // to connect/send — record the synth-502 (ticks BOTH consecutive_5xx
+                        // AND consecutive_gateway_failure). The no-healthy `pick() -> None` arm
+                        // above does NOT record (no endpoint).
+                        cluster.record_response(endpoint, 502);
                         // Funnel through the unified send + access-log
                         // dispatch site at the bottom of handle_one_stream.
                         return finalize_h2_stream(
@@ -425,6 +430,11 @@ async fn handle_one_stream(
                 if upstream_resp.status / 100 == 5 {
                     cluster.upstream_rq_5xx().inc();
                 }
+
+                // 14.2 D4 (lock-in #9): response-receipt hook (H2 post-dispatch). Fires AFTER
+                // the upstream_rq_* increments and BEFORE the downstream response is built/sent.
+                // Inert when outlier_detection is None (cluster-level is_none() short-circuit).
+                cluster.record_response(endpoint, upstream_resp.status);
 
                 // Build the downstream response: mirror envoy-http1::router::
                 // write_proxied_response's header policy — replace upstream
@@ -1800,6 +1810,109 @@ static_resources:
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 503");
         assert_eq!(rq_5xx.value(), 1, "upstream_rq_5xx must be 1 after 503");
+    }
+
+    /// 14.2 D4 (lock-in #9): the H2 router-proxy arm records the FINAL upstream
+    /// response status against the picked endpoint's outlier-detection state
+    /// (H2 mirror of the H1 test
+    /// `envoy_http1::hcm::tests::h1_router_arm_records_response_and_ejects_after_threshold`).
+    /// With `consecutive_5xx: 1` and an H1 backend (wired as an H1-protocol
+    /// cluster so we control the status) that returns 500, a single proxied
+    /// request crosses the threshold and ejects the endpoint — proving
+    /// `cluster.record_response(endpoint, upstream_resp.status)` fired with the
+    /// 500 on the H2 success arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_router_arm_records_response_and_ejects_after_threshold() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        // Minimal H1 upstream returning 500.
+        let _upstream_handle = tokio::spawn(async move {
+            loop {
+                if let Ok((mut tcp, _)) = upstream_listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = tcp.read(&mut buf).await;
+                    let _ = tcp
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                    let _ = tcp.shutdown().await;
+                }
+            }
+        });
+
+        // Build an H1-protocol cluster (omit the H2 protocol options) with
+        // `outlier_detection { consecutive_5xx: 1 }` so a single 500 ejects.
+        let cluster_mgr = {
+            let yaml = format!(
+                r#"
+node: {{ id: x, cluster: y }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: {addr}
+                      port_value: {port}
+      outlier_detection:
+        consecutive_5xx: 1
+        max_ejection_percent: 100
+"#,
+                addr = upstream_addr.ip(),
+                port = upstream_addr.port(),
+            );
+            let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
+            Arc::new(
+                envoy_cluster::from_bootstrap(
+                    &bootstrap,
+                    Arc::new(envoy_stats::StatsRegistry::new()),
+                )
+                .await
+                .expect("from_bootstrap"),
+            )
+        };
+        // Keep a handle to assert ejection after the request drives through.
+        let cluster = cluster_mgr.get("backend").expect("backend cluster present");
+
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config_proxy(cluster_mgr).await).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status().as_u16(), 500);
+
+        // Drain body to let the stream complete.
+        let (_parts, mut body) = resp.into_parts();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        // Brief settle so the spawned handle_one_stream task's record_response
+        // (and the ejection it triggers) is visible from this thread.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            cluster.is_endpoint_ejected_for_test(0),
+            "D4-H2: record_response(endpoint, 500) ejected the endpoint at threshold 1",
+        );
     }
 
     // ── 07.2 Task 5 (Group D): H2 HCM filter-chain integration tests ─────────
