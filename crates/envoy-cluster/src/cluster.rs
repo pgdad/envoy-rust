@@ -706,11 +706,28 @@ pub async fn from_bootstrap(
                 cluster: cfg.name.clone(),
                 message: e.to_string(),
             })?;
+        // 12.1 (parent-12 D5): `common_lb_config.healthy_panic_threshold` is a
+        // cluster-level load-balancing property independent of active health
+        // checking — it governs `pick()`'s panic-routing for ANY eligibility
+        // filter (12.1 active-HC unhealth AND/OR 14.1 outlier-detection ejection).
+        // It MUST therefore be parsed unconditionally, NOT only when `health_checks`
+        // is configured. (14.2 Task-8 regression: an outlier-detection-only cluster
+        // with `healthy_panic_threshold: {value: 0}` previously fell into the
+        // else-branch default of 50.0, so a freshly-ejected sole endpoint —
+        // 0% eligible < 50% — was re-admitted by panic routing and `pick()` never
+        // returned `None`, suppressing the no-healthy-upstream synth-503.)
+        let panic_threshold = cfg
+            .common_lb_config
+            .as_ref()
+            .and_then(|c| c.healthy_panic_threshold.as_ref())
+            .map(|p| p.value)
+            .unwrap_or(50.0);
         // 12.1 (parent-12 D3/D5/D6): if the cluster configures an active health
         // check (validator guarantees 0 or 1), build per-endpoint EndpointHealth
         // (all starting Unhealthy) + register the membership_healthy gauge. No
-        // health checks ⇒ endpoint_health: None ⇒ pick() is phase-02 round-robin.
-        let (endpoint_health, panic_threshold) = if let Some(hc) = cfg.health_checks.first() {
+        // health checks ⇒ endpoint_health: None ⇒ pick() filters on outlier
+        // detection only (or is phase-02 round-robin if neither is configured).
+        let endpoint_health = if let Some(hc) = cfg.health_checks.first() {
             let membership_healthy = registry
                 .register_gauge(&format!("cluster.{}.membership_healthy", cfg.name))
                 .map_err(|e| ClusterError::StatsRegistration {
@@ -727,15 +744,9 @@ pub async fn from_bootstrap(
                     ))
                 })
                 .collect();
-            let panic_threshold = cfg
-                .common_lb_config
-                .as_ref()
-                .and_then(|c| c.healthy_panic_threshold.as_ref())
-                .map(|p| p.value)
-                .unwrap_or(50.0);
-            (Some(health), panic_threshold)
+            Some(health)
         } else {
-            (None, 50.0)
+            None
         };
         // 14.1 D5/D6 (parent-14 D3/D5/D6): if the cluster configures outlier_detection,
         // build the cluster-level state (per-endpoint EndpointEjection Vec +
@@ -2413,6 +2424,60 @@ admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
 "#;
+
+    /// 14.2 Task 8 regression (root cause of the in-process backstop failure):
+    /// `common_lb_config.healthy_panic_threshold` MUST be honored on a cluster
+    /// that configures `outlier_detection` but NO `health_checks`. Before the fix,
+    /// `from_bootstrap` only parsed `panic_threshold` inside the `health_checks`
+    /// branch and defaulted to `50.0` otherwise — so an OD-only cluster with
+    /// `healthy_panic_threshold: {value: 0}` wrongly got `panic_threshold = 50.0`,
+    /// and once the sole endpoint ejected (`0% eligible < 50%`) panic-routing
+    /// re-admitted it, so `pick()` never returned `None` and the no-healthy-upstream
+    /// synth-503 never fired. Drives the REAL `from_bootstrap` config path.
+    #[tokio::test]
+    async fn from_bootstrap_honors_panic_threshold_zero_without_health_checks() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c1
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      outlier_detection:
+        consecutive_5xx: 1
+        max_ejection_percent: 100
+      common_lb_config:
+        healthy_panic_threshold: { value: 0 }
+      load_assignment:
+        cluster_name: c1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("construct");
+        let handle = mgr.get("c1").expect("cluster c1");
+        let ep = handle
+            .pick_endpoint()
+            .expect("endpoint pickable pre-ejection");
+        // One 500 crosses consecutive_5xx=1 → ejects the sole endpoint.
+        handle.record_response(ep, 500);
+        assert!(
+            handle.is_endpoint_ejected_for_test(0),
+            "endpoint should be ejected after the 500",
+        );
+        // With panic disabled (value 0) and the only endpoint ejected, pick() MUST
+        // yield None (→ the 12.2 no-healthy-upstream synth-503). The bug made this
+        // return Some(ep) because panic_threshold wrongly defaulted to 50.0.
+        assert!(
+            handle.pick_endpoint().is_none(),
+            "panic_threshold=0 + sole endpoint ejected ⇒ pick() == None",
+        );
+    }
 
     #[tokio::test]
     async fn from_bootstrap_registers_7_outlier_detection_stats_when_configured() {
