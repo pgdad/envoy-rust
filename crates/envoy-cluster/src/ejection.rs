@@ -84,6 +84,18 @@ pub struct EndpointEjection {
     consecutive_5xx_threshold: u32,
     /// Sibling threshold for consecutive_gateway_failure.
     consecutive_gateway_failure_threshold: u32,
+    /// 14.2 M4 discharge (lock-in #4): the per-endpoint serialization lock. The
+    /// `Cluster::record_response` compound (record → cap-check → eject) and the 14.2 D7
+    /// sweeper's per-endpoint un-eject each hold this guard for their full duration, so the
+    /// `Relaxed` atomics above are mutated by exactly one writer at a time (the D4 hook fires
+    /// from every in-flight request task and the D7 sweeper is a concurrent writer). The
+    /// `Option<Instant>` payload doubles as the eject-timestamp the sweeper reads to apply
+    /// `base_ejection_time` (§6.2 item-5). `pick()`'s read side stays lock-free
+    /// (`is_ejected()` is a single `Relaxed` `AtomicBool` load). Set by
+    /// `Cluster::record_response` right after `eject`; cleared by the sweeper right after
+    /// `try_un_eject` — NOT inside `eject`/`try_un_eject` (which would self-deadlock with the
+    /// externally-held guard), lock-in #5.
+    pub(crate) ejected_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Per-cluster shared stat handles (see `EndpointEjectionStats`).
     stats: EndpointEjectionStats,
 }
@@ -103,6 +115,7 @@ impl EndpointEjection {
             consecutive_gateway_failure: AtomicU32::new(0),
             consecutive_5xx_threshold,
             consecutive_gateway_failure_threshold,
+            ejected_at: std::sync::Mutex::new(None),
             stats,
         }
     }
@@ -111,6 +124,15 @@ impl EndpointEjection {
     /// candidate-build pass (`Relaxed`-load; matches the cursor's ordering).
     pub fn is_ejected(&self) -> bool {
         self.ejected.load(Ordering::Relaxed)
+    }
+
+    /// 14.2 M5: borrow the per-cluster shared stat handles. Crate-internal + test-only so
+    /// `OutlierDetectionState::stats()` (and the `cluster.rs` tie/enforced-counter tests)
+    /// can read the `_enforced_*` counters without threading the `EndpointEjectionStats`
+    /// through every test-helper return tuple. Production code reads these via the registry.
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> &EndpointEjectionStats {
+        &self.stats
     }
 
     /// Record a response status. Ticks the per-detector counters per the classifier
@@ -439,5 +461,28 @@ mod tests {
         let d = ee.record_response(500);
         assert!(!d.crossed_5xx, "threshold 0 must NOT trigger");
         assert!(!d.crossed_gateway_failure);
+    }
+
+    #[test]
+    fn ejected_at_is_none_until_eject_and_set_after() {
+        // 14.2 M4 / lock-in #5: the `ejected_at` payload is `None` for a never-ejected
+        // endpoint and becomes `Some(Instant)` once the lock-SITE (here, the test standing in
+        // for `Cluster::record_response`) stamps it after `eject`. `eject` itself does NOT
+        // touch `ejected_at` (it would self-deadlock with the externally-held guard).
+        let (ee, _stats) = mk(3, 3);
+        assert!(
+            ee.ejected_at.lock().unwrap().is_none(),
+            "never-ejected ⇒ no timestamp"
+        );
+        for _ in 0..3 {
+            let _ = ee.record_response(500);
+        }
+        ee.eject(DetectorType::Consecutive5xx);
+        *ee.ejected_at.lock().unwrap() = Some(std::time::Instant::now());
+        assert!(
+            ee.ejected_at.lock().unwrap().is_some(),
+            "ejected ⇒ timestamp set"
+        );
+        assert!(ee.is_ejected());
     }
 }

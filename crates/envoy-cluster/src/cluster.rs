@@ -52,6 +52,16 @@ pub(crate) struct OutlierDetectionState {
     pub(crate) ejections_overflow: Arc<envoy_stats::Counter>,
 }
 
+impl OutlierDetectionState {
+    /// 14.2 M5: borrow the per-cluster shared `EndpointEjectionStats`. Every endpoint holds a
+    /// clone of the same `Arc` handles, so the first endpoint's view is the cluster-wide
+    /// aggregate. Crate-internal; used by the `record_response` enforced-counter tests.
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> &crate::EndpointEjectionStats {
+        self.endpoints[0].stats()
+    }
+}
+
 /// A configured upstream cluster. Owns the static endpoint list and the
 /// round-robin `AtomicUsize` cursor. Constructed by `from_bootstrap` only;
 /// external code works through `ClusterHandle`.
@@ -264,11 +274,21 @@ impl Cluster {
             return; // defense-in-depth (lock-in #10)
         };
         let state = &od.endpoints[idx];
+        // 14.2 M4 (lock-in #4): hold the per-endpoint serialization lock across the WHOLE
+        // compound (record → cap-check → eject + stamp) so the `Relaxed` atomics are mutated
+        // by exactly one writer at a time — the D4 hook fires from every in-flight request
+        // task and the D7 sweeper is a concurrent writer. `pick()`'s read side stays
+        // lock-free (`is_ejected()` is a single `Relaxed` load).
+        let mut ejected_at = state.ejected_at.lock().unwrap();
         let decision = state.record_response(status);
         if !decision.any() {
             return;
         }
         let total = self.endpoints.len();
+        // 14.1 M6 (§6.2 item-4): cap_count = floor(total * max_ejection_percent / 100). When
+        // max_ejection_percent == 0 ⇒ cap_count == 0 ⇒ active_count (0) >= cap_count (0) on
+        // the first crossing ⇒ overflow, never ejecting (a deliberate "0% = eject nothing"
+        // edge). Overflow re-fires per detection-tick, NOT once-per-host (§6.2 item-2).
         let cap_count = (total * od.max_ejection_percent as usize) / 100;
         let active_count = od.endpoints.iter().filter(|e| e.is_ejected()).count();
         if active_count >= cap_count {
@@ -282,6 +302,10 @@ impl Cluster {
             crate::DetectorType::ConsecutiveGatewayFailure
         };
         state.eject(detector);
+        // lock-in #5: stamp the eject-timestamp under the held guard (NOT inside `eject`,
+        // which would re-enter the lock and self-deadlock). The 14.2 D7 sweeper reads this to
+        // apply `base_ejection_time`.
+        *ejected_at = Some(std::time::Instant::now());
     }
 }
 
@@ -2226,17 +2250,68 @@ admin:
     }
 
     #[test]
+    fn cluster_record_response_stamps_ejected_at_on_eject() {
+        // 14.2 M4 (lock-in #4/#5): driving `Cluster::record_response` to the eject threshold
+        // both ejects the endpoint AND stamps `ejected_at` under the serialization lock the
+        // compound holds. The stamp is the eject-timestamp the 14.2 D7 sweeper later reads.
+        let eps = mk_endpoints(1);
+        let (handle, _health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 3, 3, 100);
+        for _ in 0..3 {
+            handle.record_response(eps[0], 500);
+        }
+        assert!(ejection[0].is_ejected());
+        assert!(
+            ejection[0].ejected_at.lock().unwrap().is_some(),
+            "M4: record_response stamps ejected_at under the serialization lock"
+        );
+    }
+
+    #[test]
+    fn cluster_record_response_max_ejection_percent_zero_never_ejects() {
+        // 14.1 M6 (§6.2 item-4): max_ejection_percent=0 ⇒ cap_count=0 ⇒ active_count (0) >=
+        // cap_count (0) on the first crossing ⇒ overflow, never ejecting (the deliberate
+        // "0% = eject nothing" edge). The overflow counter ticks exactly once per crossing.
+        let eps = mk_endpoints(1);
+        let (handle, _health, ejection) =
+            mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 3, 3, 0);
+        for _ in 0..3 {
+            handle.record_response(eps[0], 500);
+        }
+        assert!(!ejection[0].is_ejected(), "0% cap ⇒ never ejects");
+        assert!(
+            ejection[0].ejected_at.lock().unwrap().is_none(),
+            "no eject ⇒ no timestamp"
+        );
+        let od = handle.inner.outlier_detection.as_ref().unwrap();
+        assert_eq!(
+            od.ejections_overflow.value(),
+            1,
+            "first crossing at 0% cap overflows exactly once"
+        );
+    }
+
+    #[test]
     fn cluster_record_response_picks_5xx_detector_on_ties() {
-        // 503 crosses BOTH thresholds simultaneously at threshold=1. Per lock-in #15,
-        // 5xx wins ties — endpoint ejects with DetectorType::Consecutive5xx.
+        // M5: a 503 crosses BOTH consecutive_5xx AND consecutive_gateway_failure at
+        // threshold=1; 5xx wins the tie (lock-in #15). Assert the endpoint ejects AND only
+        // the _enforced_consecutive_5xx counter ticks (gateway-failure enforced stays 0).
         let eps = mk_endpoints(1);
         let (handle, _health, ejection) =
             mk_handle_with_health_and_ejection("b", eps.clone(), 1, 1, 0.0, 1, 1, 100);
         handle.record_response(eps[0], 503);
         assert!(ejection[0].is_ejected());
-        let od = handle.inner.outlier_detection.as_ref().unwrap();
-        let stats_active = &od.endpoints[0];
-        let _ = stats_active;
+        let stats = handle.inner.outlier_detection.as_ref().unwrap().stats();
+        assert_eq!(
+            stats.ejections_enforced_consecutive_5xx.value(),
+            1,
+            "5xx wins the tie"
+        );
+        assert_eq!(
+            stats.ejections_enforced_consecutive_gateway_failure.value(),
+            0,
+            "gateway-failure does NOT enforce on a 5xx-won tie"
+        );
     }
 
     // ---- 14.1 Task 5: from_bootstrap configured-OD stats wiring ----
