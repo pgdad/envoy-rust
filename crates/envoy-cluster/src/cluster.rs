@@ -334,6 +334,27 @@ impl ClusterHandle {
         self.inner.record_response(endpoint, status);
     }
 
+    /// 14.2 D4 (cross-crate test fixture): is the endpoint at index `idx`
+    /// currently ejected? Delegates to `EndpointEjection::is_ejected()` for the
+    /// indexed endpoint. Returns `false` when the cluster has no
+    /// `outlier_detection` configured (the §5.3 inert invariant — nothing can
+    /// be ejected). Used by the envoy-http1 / envoy-http2 HCM router-arm
+    /// response-receipt-hook tests to assert that `record_response(endpoint,
+    /// 5xx)` ejected the picked endpoint.
+    ///
+    /// `#[doc(hidden)]` (not `#[cfg(test)]`) because the consumers are tests in
+    /// *other* crates (envoy-http1/envoy-http2), and `#[cfg(test)]` items are
+    /// invisible to downstream crates. Mirrors `ClusterManager::empty()`'s
+    /// cross-crate-test-fixture posture.
+    #[doc(hidden)]
+    pub fn is_endpoint_ejected_for_test(&self, idx: usize) -> bool {
+        self.inner
+            .outlier_detection
+            .as_ref()
+            .map(|od| od.endpoints[idx].is_ejected())
+            .unwrap_or(false)
+    }
+
     /// Cluster name (delegates to `Cluster::name`). Mirrors `Cluster::name`'s
     /// public posture per phase-04.3 SPEC §3 D5.
     pub fn name(&self) -> &str {

@@ -319,7 +319,7 @@ pub struct H1PoolManager {
 }
 
 // Hand-rolled `Debug` (rather than `#[derive]`): `H1Pool`'s internal
-// `tokio::sync::Mutex` + per-pool `Counter`/`Gauge` Arcs aren't reflected
+// `parking_lot::Mutex` + per-pool `Counter`/`Gauge` Arcs aren't reflected
 // here — surface only the per-cluster pool names so that the parent
 // `HCMConfig` `#[derive(Debug)]` (which carries `pool_mgr` as an
 // `Option<Arc<H1PoolManager>>` at 13.1 Task 4) keeps compiling.

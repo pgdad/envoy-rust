@@ -679,6 +679,17 @@ async fn serve_connection(
                                 outgoing = resp;
                             }
                         }
+
+                        // 14.2 D4 (lock-in #9): response-receipt hook (H1). Classify the FINAL
+                        // response status for the picked endpoint AFTER the upstream_rq_*
+                        // increments fire (inside construct_proxied_response on the success arm)
+                        // and BEFORE the downstream write. The connect/send-failure synth-502 +
+                        // pool-overflow synth-503 ALSO record here (the picked endpoint failed;
+                        // 502/503 tick both detectors per ADR-0041 §6.2 item-9, lock-in #3/#10).
+                        // Inert when the cluster has no outlier_detection (record_response
+                        // short-circuits at the cluster-level is_none() check, lock-in #8). The
+                        // no-healthy `else` arm below does NOT call this (no endpoint to attribute).
+                        cluster.record_response(endpoint, outgoing.status);
                     } else {
                         // No healthy endpoint available for this cluster.
                         // 12.2 (parent-12 D6.2 / ADR-0037): emit the 19-byte
@@ -1870,6 +1881,87 @@ static_resources:
             }
         });
         port
+    }
+
+    /// 14.2 D4: build a ClusterManager with a single static cluster `name`
+    /// whose only endpoint is `127.0.0.1:<port>` AND an `outlier_detection`
+    /// block configured with `consecutive_5xx: <c5xx>`. Mirrors
+    /// `cluster_mgr_with_endpoint` plus the `outlier_detection` YAML stanza —
+    /// the same shape the envoy-cluster `from_bootstrap` tests parse. Used by
+    /// the D4 response-receipt-hook test below.
+    ///
+    /// `max_ejection_percent: 100` is REQUIRED for a single-endpoint cluster:
+    /// the cap is `floor(host_count * max_ejection_percent / 100)`, so the
+    /// Envoy default of 10 yields `floor(1 * 10 / 100) = 0` — the only endpoint
+    /// could never be ejected (overflow on the first crossing). 100 yields
+    /// `cap_count = 1`, permitting the single endpoint's ejection.
+    async fn cluster_mgr_with_outlier_detection(
+        name: &str,
+        port: u16,
+        c5xx: u32,
+    ) -> Arc<envoy_cluster::ClusterManager> {
+        let yaml = format!(
+            r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: {name}
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: {name}
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: {port} }} }} }}
+      outlier_detection:
+        consecutive_5xx: {c5xx}
+        max_ejection_percent: 100
+"#
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
+        Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+                .await
+                .expect("cluster mgr"),
+        )
+    }
+
+    /// 14.2 D4 (lock-in #9): the H1 router-proxy arm records the FINAL upstream
+    /// response status against the picked endpoint's outlier-detection state.
+    /// With `consecutive_5xx: 1` and a backend that returns 500, a single
+    /// proxied request crosses the threshold and ejects the endpoint — proving
+    /// `cluster.record_response(endpoint, outgoing.status)` fired with the 500.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_router_arm_records_response_and_ejects_after_threshold() {
+        let upstream_response: &'static [u8] =
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+        let upstream_port = spawn_in_process_upstream(upstream_response).await;
+        let cluster_mgr = cluster_mgr_with_outlier_detection("backend", upstream_port, 1).await;
+        // Keep a handle to assert ejection after the request drives through.
+        let cluster = cluster_mgr.get("backend").expect("backend cluster present");
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+            }),
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+            "first request proxies the backend 500: {s}"
+        );
+        assert!(
+            cluster.is_endpoint_ejected_for_test(0),
+            "D4: record_response(endpoint, 500) ejected the endpoint at threshold 1",
+        );
     }
 
     // NOTE: route_walk_returns_no_healthy_endpoint_when_cluster_empty is
