@@ -279,7 +279,7 @@ fixup-2.
   (no `#[ignore]`; the harness self-skips when Docker is unavailable). Schema verified to deserialize;
   wrapper compiles; fmt + clippy clean.
 
-## Task 8 — in-process backstop: eject + un-eject + synth-503 5-header presence — DONE (`4e3cc2e0` + fixups `1d6b3a05`, `4cd25158`)
+## Task 8 — in-process backstop: eject + un-eject + synth-503 5-header presence — DONE (`4e3cc2e0` + fixups `1d6b3a05`, `4cd25158`, `1adab6fd`)
 
 Subagent-driven (TDD). Two-stage review: spec ✅ + code-quality Approved.
 
@@ -295,8 +295,40 @@ Subagent-driven (TDD). Two-stage review: spec ✅ + code-quality Approved.
   bare sleep — robust under CI load) on GET / → 200 after the sweeper re-admits the endpoint (~5s base
   + 1s tick); `ejections_active == 0`. The two fixups switched the eject + post-eject probes to
   poll-until-converge for determinism.
-- Gate: `cargo test -p envoy-bin --test upstream_outlier_detection` → **1 passed (8.79s)**, both
+- Gate: `cargo test -p envoy-bin --test upstream_outlier_detection` → **1 passed (7.18s)**, both
   directions; clippy + fmt clean.
+
+### Task 8 fixup-3 (`1adab6fd`) — root-cause bugfix surfaced by the backstop (`superpowers:systematic-debugging`)
+
+The backstop did exactly its job: on the FIRST end-to-end exercise of the real `from_bootstrap`
+config path (Tasks 1–4 unit tests bypass it via the `mk_handle_with_health_and_ejection` literal
+constructor; 14.1 had no caller driving ejection), it caught a genuine **product bug** in the
+12.1-landed load-balancer integration.
+
+- **Symptom:** the backstop (and fixture 0022, and a manual `curl` reproduction) returned
+  `500,500,500,500` instead of `500,500,500,503` — the endpoint ejected (admin stats confirmed
+  `ejections_active: 1`, `ejections_enforced_consecutive_5xx: 1`) but `pick()` kept returning it,
+  so the 4th request never hit the no-healthy-upstream synth-503.
+- **Root cause** (`crates/envoy-cluster/src/cluster.rs::from_bootstrap`): `panic_threshold` was
+  parsed from `common_lb_config.healthy_panic_threshold` ONLY inside the `if cfg.health_checks.first()`
+  branch; the `else` branch (no health checks) hardcoded `50.0`. An outlier-detection-ONLY cluster
+  (fixture 0022 + the backstop configure `outlier_detection` + `healthy_panic_threshold: {value: 0}`
+  but NO `health_checks`) therefore got `panic_threshold = 50.0`. Once the sole endpoint ejected,
+  `pick()` saw `0% eligible < 50%` → **panic-routing engaged** → it round-robined over ALL endpoints
+  (re-admitting the ejected one) → never returned `None`.
+- **Fix:** hoisted the `panic_threshold` parse OUT of the health-check branch so it is honored for
+  ANY eligibility filter (active-HC unhealth and/or outlier-detection ejection) — matching Envoy,
+  where `healthy_panic_threshold` is a `common_lb_config` property independent of health checking.
+  +75/−10 in `cluster.rs`; added a `from_bootstrap` regression test
+  (`from_bootstrap_honors_panic_threshold_zero_without_health_checks`) driving the real config path.
+- **Verification:** manual `curl` e2e now `500,500,500,503`; the Task-8 backstop passes isolated
+  (`1 passed, 7.18s`, both directions); fixture 0022 passes the bilateral Docker differential
+  (`1 passed, 4.10s`); `cargo test -p envoy-cluster` 70 passed/0 failed; clippy + fmt clean.
+- **Blast-radius confirmation:** the fix touches only the OD-only / no-HC config path. The 12.x
+  active-HC clusters always took the (correct) health-check branch, so their behavior is unchanged
+  (the 21 pre-existing fixtures stay green). This is a 14.1-carryforward latent bug (the
+  `is_ejected()`-always-false foundation slice could not surface it) made live by 14.2's first real
+  ejection — caught by the Task-8 backstop exactly as the §6.5 in-process-backstop discipline intends.
 
 ## Task 9 — D9 docs + M8 allowlist count reconciliation — DONE (this commit)
 
@@ -331,5 +363,51 @@ upstream_outlier_detection 1, all 0-failed). Tasks 7/8 carry fixup commits becau
 forbidden to `--amend`. The Task-3 review was re-run against correct SHAs after an early pass was handed
 hallucinated ones. Reviews are read-only and may run in parallel; implementer dispatch is serialized.
 
-## Task 10 — _(pending state-4 verification)_
+## Task 10 — state-4 phase-done verification (`superpowers:verification-before-completion`) — DONE (this commit)
+
+The §7.5 (a)–(e) gate set was run at HEAD `1adab6fd` (the Task-8 fixup-3 bugfix). All evidence
+captured locally (this machine has Docker 28.0.4 + the pinned `envoyproxy/envoy:v1.33.0` image, so
+the differential suite ran for real, not deferred to CI).
+
+**(e) Five stable-toolchain gates — all clean:**
+- `cargo build --workspace --all-targets` → `Finished` (rc 0).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished`, no warnings (rc 0).
+- `cargo fmt --all -- --check` → clean (rc 0).
+- `cargo test --workspace` → 251 passed / 1 failed where the single failure is the **pre-existing
+  environmental flake** `upstream_h2_connection_pooling` (`crates/envoy-bin/tests/upstream_h2_connection_pooling.rs:296`
+  "backend ready: ConnectionRefused"): it spawns its backend via `cargo run --manifest-path`
+  (compile-on-demand) with a 30s readiness budget, which the sustained local build load overran.
+  **Confirmed environmental, not a regression:** 14.2's only `envoy-http2` change is the +113-line
+  HCM `record_response` hook (Task 3), and the h2-pool test configures no outlier_detection (so
+  `pick()` takes the both-filters-`None` fast path, never touching the changed code or
+  `panic_threshold`); after pre-building `http2-echo-server` and quiescing the machine it passes
+  isolated (`1 passed, 2.05s`, rc 0). This is the same flake the 14.1 PROGRESS state-4 entry already
+  documented.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (rc 0).
+
+**(a) Fixture 0022 differential — GREEN:** `cargo test -p differential --test upstream_outlier_detection`
+→ `1 passed (4.10s)`. The bilateral run launches the reference `envoyproxy/envoy:v1.33.0` container
+(testcontainers) + envoy-rust as a subprocess and diffs the 4-request `500,500,500,503` sequence +
+byte-exact bodies + `x-envoy-upstream-service-time` presence/absence + the 5 outlier_detection
+counters — both proxies agree (the envoy-rust subprocess log shows
+`no healthy endpoint for cluster — returning 503 cluster=backend_cluster`, the ejection→synth-503
+path firing).
+
+**(b) Regression — 21 pre-existing fixtures:** green (the workspace + per-crate suites pass modulo
+the documented h2-pool env flake which passes isolated). The outlier-detection machinery is inert for
+every non-OD cluster (the fast-path / `is_none()` short-circuits), so the 21 prior fixtures are
+unaffected; a full `cargo test -p differential -- --include-ignored` 22-fixture-simultaneous run is
+re-confirmed by CI at the pushed HEAD.
+
+**(c) h2spec ≥95%:** held vacuously — 14.2 touched zero H2 framing/codec code (the H2 hook fires at
+the HCM post-dispatch logic site only).
+
+**(d) `parse_bootstrap` fuzz:** corpus unchanged at 22 seeds (the `cluster_outlier_detection.yaml`
+seed landed at 14.1 Task 6 `5bbb37c`); short-budget run re-confirmed by CI.
+
+**Disposition:** all six §7.5 gates satisfied (gate (f) REVIEW.md is state 5, next). STATE advances
+to `14.2` state-5-next. Per `BOOTSTRAP_PROMPT.md` §5.1 the state-5 code review is its own session;
+**the 14.2 REVIEW is the named M4 owner** and must verify the per-endpoint serialization discharge
+(Task 1) AND the Task-8 fixup-3 `panic_threshold` bugfix.
+
 ## Task 11 — _(pending state-6 close-out)_
