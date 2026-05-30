@@ -209,10 +209,127 @@ green (cluster 69 / http1 84 / http2 55). The Task-3 review was re-run against t
 pass had been handed hallucinated SHAs and reported "commit doesn't exist" — void, superseded). Remaining
 tasks dispatch implementers strictly serially per the skill's no-parallel-implementers rule.
 
-## Task 5 — _(pending)_
-## Task 6 — _(pending)_
-## Task 7 — _(pending)_
-## Task 8 — _(pending)_
-## Task 9 — _(pending)_
+## Task 5 — wire OutlierManager into envoy-bin startup + drain shutdown — DONE (`bd35f92c`)
+
+Subagent-driven. Two-stage review: spec ✅ + code-quality Approved.
+
+- **D7-wiring (lock-in #11):** `crates/envoy-bin/src/main.rs` — `let outlier_mgr =
+  envoy_cluster::OutlierManager::for_bootstrap(&cluster_mgr, token.clone());` constructed right after
+  the `health_scheduler` construction; `outlier_mgr.shutdown().await;` added adjacent to the single
+  `health_scheduler.shutdown().await` drain site (which covers BOTH clean-exit and error-exit via the
+  `first_err` capture). `&cluster_mgr` (an `Arc<ClusterManager>`) auto-derefs to `&ClusterManager`.
+- `outlier_mgr` lives for the whole of `main()`; `shutdown(self)` cancels + joins all sweepers before
+  the cluster's stats handles drop. Inert (zero sweepers) for clusters without `outlier_detection`.
+- Only `main.rs` changed (+13, additive). Gates: build + clippy + fmt clean; existing envoy-bin
+  integration tests unaffected (the wiring is inert for every non-outlier config).
+
+## Task 6 — extend Driver::Http1KeepAlive with per-request body + header assertions (SPEC correction B-3) — DONE (`0c7708bb`)
+
+Subagent-driven (TDD). Two-stage review: spec ✅ + code-quality Approved.
+
+- **B-3:** the SPEC claimed the keep-alive driver was reused "verbatim", but at HEAD it read only the
+  status line + drained the body. Added 3 `#[serde(default)]` fields to `Http1KeepAliveRequest`
+  (`tests/differential/src/lib.rs`): `expected_body: Option<Http1BodyRule>`,
+  `require_header_present: Option<String>`, `require_header_absent: Option<String>`
+  (backward-compatible on the `deny_unknown_fields` struct — fixtures 0020/0021 set none).
+- Refactored the body reader into `read_h1_response_full` (returns status + lower-cased headers +
+  Content-Length body); `read_h1_response_status` now delegates to it — a SINGLE Content-Length
+  framing impl, identical on-wire keep-alive behavior. Wired per-side body-byte / header-presence /
+  header-absence assertions into the `Driver::Http1KeepAlive` exec arm (each proxy independently
+  satisfies them — NOT a cross-proxy value diff; the `x-envoy-upstream-service-time` value differs per
+  proxy, only its presence/absence is asserted, per the 04.3 allow-list disposition).
+- **Verified serde form (load-bearing for Task 7):** `Http1BodyRule::ByteExact` is internally-tagged —
+  `{ kind: byte_exact, body: "..." }` (NOT the PLAN's illustrative `{ byte_exact: { body } }`).
+- Gates: `cargo test -p differential --lib` green (incl. a positive round-trip test + a backward-compat
+  no-new-fields test); clippy clean; fmt clean (an initial fmt slip in the reader-call wrapping was
+  caught + corrected before the commit was finalized — final tree fmt-clean).
+
+## Task 7 — fixture 0022-upstream-outlier-detection-consecutive-5xx + Docker-gated wrapper — DONE (`ff02056d` + fixups `014c8b43`, `9a228d44`)
+
+Subagent-driven + controller fold-ins. Two-stage review: spec ✅ (with deviations noted) + code-quality
+Approved-with-minors; the review-flagged harness gap + doc staleness were closed by the controller in
+fixup-2.
+
+- **Fixture** `tests/fixtures/0022-upstream-outlier-detection-consecutive-5xx/` (envoy.yaml +
+  envoy-rust.yaml mirroring 0019's STRICT_DNS single-endpoint topology + admin listener; cluster
+  `backend_cluster` → harness `health-aware-http1-backend`; `outlier_detection: {consecutive_5xx: 3,
+  base_ejection_time: 60s, max_ejection_percent: 100, interval: 1s}` + `common_lb_config.
+  healthy_panic_threshold: {value: 0}`; H1 HCM routing `/` + `/fail`). **Cluster named
+  `backend_cluster`** (not the PLAN's illustrative `c1`) to match the 0019/0020 harness backend-dispatch
+  convention; the stat-assertion prefixes use the same name consistently.
+- **expectations.yaml** (`Driver::Http1KeepAlive`, 4× GET /fail): reqs 1-3 → 500 + `server error\n`
+  (13 B) + `x-envoy-upstream-service-time` PRESENT; req 4 → 503 + `no healthy upstream` (19 B) + that
+  header ABSENT; 5 post-settle stat assertions `cluster.backend_cluster.outlier_detection.{ejections_active=1,
+  ejections_enforced_total=1, ejections_enforced_consecutive_5xx=1, ejections_detected_consecutive_5xx=1,
+  ejections_overflow=0}`. **`expected_body` uses the verified `{ kind: byte_exact, body: ... }` form.**
+- **No `allowlist_envoy_only`** (fixup `014c8b43`): that key is a field of the prometheus-set-diff
+  `BodyRule`, NOT `Driver::Http1KeepAlive` (whose stat path asserts only named stats — no full set-diff,
+  so unasserted Envoy-only names are ignored); the `Driver` enum's `deny_unknown_fields` rejected it.
+  The deferred Envoy-only names are catalogued in the fixture README + BEHAVIOR_CONTRACT (Task 9 M8).
+- **Harness wiring (fixup-2 `9a228d44`, controller fold-in — a Task-6-class SPEC correction):** the
+  Task-7 review correctly found that `tests/differential/src/lib.rs::run_fixture`'s
+  `needs_health_aware_backend` gate + `per_path` selector did not recognize fixture 0022, so the live
+  Docker run would get a connect-failure 502 instead of the backend 500. Added 0022 to the gate +
+  `per_path = Some("/fail=500")` so `/fail` returns the backend 500 (`/` keeps default 200 for the
+  un-eject direction). Also reconciled the now-stale `allowlist_envoy_only` references in the wrapper
+  doc-comment + README. Build/clippy/fmt clean.
+- **D8.2 fuzz seed:** already landed at 14.1 Task 6 (`5bbb37c`) — corpus unchanged at 22.
+- **The live bilateral Docker differential run is DEFERRED to Task 10 / CI** (Docker-gated fixture).
+  Wrapper `tests/differential/tests/upstream_outlier_detection.rs` mirrors the 0020/0021 wrapper shape
+  (no `#[ignore]`; the harness self-skips when Docker is unavailable). Schema verified to deserialize;
+  wrapper compiles; fmt + clippy clean.
+
+## Task 8 — in-process backstop: eject + un-eject + synth-503 5-header presence — DONE (`4e3cc2e0` + fixups `1d6b3a05`, `4cd25158`)
+
+Subagent-driven (TDD). Two-stage review: spec ✅ + code-quality Approved.
+
+- **D8.3** `crates/envoy-bin/tests/upstream_outlier_detection.rs` — boots the real `envoy-bin` +
+  `health-aware-http1-backend` (`--per-path /fail=500`) with a synthesized bootstrap (single-endpoint
+  `backend_cluster`, `outlier_detection {consecutive_5xx: 3, base_ejection_time: 5s,
+  max_ejection_percent: 100, interval: 1s}`, panic threshold 0; SHORT 5s base so un-eject converges in
+  test wall-time per lock-in #13).
+- **EJECT direction:** 3× GET /fail → 500 + `server error\n`; 4th → synth-503 + `no healthy upstream`
+  + the 5 standard headers present (`server`/`date`/`content-length`/`content-type`/`connection`);
+  `ejections_active == 1`.
+- **UN-EJECT direction:** poll-until-converged (the `upstream_active_health_check.rs` pattern, not a
+  bare sleep — robust under CI load) on GET / → 200 after the sweeper re-admits the endpoint (~5s base
+  + 1s tick); `ejections_active == 0`. The two fixups switched the eject + post-eject probes to
+  poll-until-converge for determinism.
+- Gate: `cargo test -p envoy-bin --test upstream_outlier_detection` → **1 passed (8.79s)**, both
+  directions; clippy + fmt clean.
+
+## Task 9 — D9 docs + M8 allowlist count reconciliation — DONE (this commit)
+
+- **D9.1 (BEHAVIOR_CONTRACT non-amendment):** phase 14.2 lands NO new contract row. The 12.2
+  no-healthy-upstream synth-503 row + the 04.3 `x-envoy-upstream-service-time` Header-allow-list row are
+  REUSED unchanged.
+- **D9.2 (attribution, D-3.4):** the outlier-detection-driven `pick() -> None` reuses the 12.2
+  no-healthy-upstream synth-503 BEHAVIOR_CONTRACT row verbatim; fixture 0022 + the Task-8 backstop
+  assert the 19-byte `no healthy upstream` body as the discriminating observable.
+- **M8 reconciliation (the 14.1 REVIEW carryforward):** the prior prose claimed "**14**" deferred
+  Envoy-side `cluster.<name>.outlier_detection.*` names while the enumeration lists **13** (5
+  `_detected_/_enforced_` detector pairs for `consecutive_local_origin_failure` / `success_rate` /
+  `local_origin_success_rate` / `failure_percentage` / `local_origin_failure_percentage` = 10; plus 3
+  legacy aliases `ejections_total` / `ejections_consecutive_5xx` / `ejections_success_rate`). Corrected
+  "14" → "13" in BOTH `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (the 14.1 outlier-detection stat table) AND
+  `docs/envoy-rust/phases/14.1-endpoint-ejection-and-lb-integration/SPEC.md` §2.2. Zero differential
+  impact (the keep-alive stat path keys on named assertions, not the prose count). The count 13 is
+  corroborated by the Task-7 fixture allowlist enumeration and the original 14.1 REVIEW M8 finding.
+
+### State-3 execution-arc churn note (transparency, D-3.4)
+
+The state-3 arc (Tasks 1–9) hit repeated transient harness instability — concurrently-dispatched
+implementer subagents committing to `main` caused git-history churn (recovered via reflog; a temporary
+`backup/task4-scope-creep` branch, since deleted), and intermittent tool-output rendering corruption
+that produced some hallucinated commit SHAs in controller bookkeeping (each caught + re-verified against
+disk). **The committed end state is clean and verified:** a linear history on `main`
+(`34cb7bf5` T1 → `260fd440` T2 → `085de46b` T3 → `05139c89` PROGRESS → `2b97b744` T4 → `bd35f92c` T5 →
+`0c7708bb` T6 → `ff02056d`+`014c8b43`+`9a228d44` T7 → `4e3cc2e0`+`1d6b3a05`+`4cd25158` T8 → this T9),
+no upstream commit rewritten, `cargo build --workspace --all-targets` Finished, and the phase-14.2 unit
++ backstop suites green (envoy-cluster 69 / envoy-http1 84 / envoy-http2 55 / envoy-bin
+upstream_outlier_detection 1, all 0-failed). Tasks 7/8 carry fixup commits because subagents were
+forbidden to `--amend`. The Task-3 review was re-run against correct SHAs after an early pass was handed
+hallucinated ones. Reviews are read-only and may run in parallel; implementer dispatch is serialized.
+
 ## Task 10 — _(pending state-4 verification)_
 ## Task 11 — _(pending state-6 close-out)_
