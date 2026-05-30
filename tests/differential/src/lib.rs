@@ -316,6 +316,23 @@ pub struct Http1KeepAliveRequest {
     pub path: String,
     pub host: String,
     pub expected_status: u16,
+    /// 14.2 D8.1a (SPEC correction B-3): optional per-request body-byte
+    /// assertion. Each side's response body independently must equal these
+    /// bytes. Reuses the existing `Http1BodyRule::ByteExact { body }`. Omit
+    /// (the shape fixtures 0020/0021 use) to assert nothing about the body.
+    #[serde(default)]
+    pub expected_body: Option<Http1BodyRule>,
+    /// 14.2 D8.1a: assert this (lower-cased) header NAME is PRESENT on each
+    /// side's response. Only PRESENCE is asserted, not the value — e.g.
+    /// `x-envoy-upstream-service-time` differs per proxy but must exist on
+    /// both, matching the BEHAVIOR_CONTRACT allow-list disposition.
+    #[serde(default)]
+    pub require_header_present: Option<String>,
+    /// 14.2 D8.1a: assert this (lower-cased) header NAME is ABSENT on each
+    /// side's response. The bilateral counterpart of `require_header_present`
+    /// for responses (e.g. local-reply 503s) that must NOT carry the header.
+    #[serde(default)]
+    pub require_header_absent: Option<String>,
 }
 
 /// 13.1 D10: bilateral stat assertion for
@@ -1690,6 +1707,36 @@ pub async fn read_h1_response_status<R>(stream: &mut R) -> Result<u16>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    // 14.2 D8.1a: delegate to `read_h1_response_full` so there is a SINGLE
+    // Content-Length framing/drain implementation. The full reader consumes
+    // exactly the status line + headers + Content-Length body, leaving the
+    // keep-alive conn positioned at the next response's first byte — the
+    // same on-wire behavior this function had before the refactor.
+    let (status, _headers, _body) = read_h1_response_full(stream).await?;
+    Ok(status)
+}
+
+/// 14.2 D8.1a (SPEC correction B-3): like `read_h1_response_status` but also
+/// returns the response headers (names lower-cased) and the
+/// Content-Length-delimited body, so the `Driver::Http1KeepAlive` driver can
+/// assert per-request body bytes + header presence/absence in addition to the
+/// status. Consumes EXACTLY one full response (status line + headers +
+/// Content-Length body) so the keep-alive conn stays correctly positioned for
+/// the next pipelined/sequential request.
+///
+/// Framing scope matches the prior `read_h1_response_status`: Content-Length
+/// exclusively (no `Transfer-Encoding: chunked`), defaulting to a zero-length
+/// body when no `Content-Length` header is present. The configurable-status
+/// backend + the H1 router-arm pool path both emit Content-Length explicitly;
+/// if a future driver needs chunked handling, mirror `drive_http1`'s chunked
+/// decoding cascade.
+#[allow(clippy::type_complexity)]
+pub async fn read_h1_response_full<R>(
+    stream: &mut R,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
     // Read up to and including the status line terminator ("\r\n").
     let mut status_line: Vec<u8> = Vec::with_capacity(64);
@@ -1719,23 +1766,30 @@ where
             break;
         }
     }
-    // Parse Content-Length (case-insensitive) — default to 0 if absent.
+    // Parse headers into (lower-cased name, trimmed value) pairs and pick up
+    // Content-Length (case-insensitive) — default to a 0-length body if absent.
     let headers_str = std::str::from_utf8(&header_buf).unwrap_or("");
+    let mut headers: Vec<(String, String)> = Vec::new();
     let mut cl: usize = 0;
     for line in headers_str.split("\r\n") {
         let (name, value) = match line.split_once(':') {
             Some(p) => p,
             None => continue,
         };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            cl = value.trim().parse().unwrap_or(0);
-            break;
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() {
+            continue;
         }
+        if name.eq_ignore_ascii_case("content-length") {
+            cl = value.parse().unwrap_or(0);
+        }
+        headers.push((name.to_ascii_lowercase(), value.to_string()));
     }
-    // Drain the body so the next request on this keep-alive conn starts
-    // at a clean response boundary.
+    // Read EXACTLY the Content-Length body so the next request on this
+    // keep-alive conn starts at a clean response boundary.
+    let mut body = vec![0u8; cl];
     if cl > 0 {
-        let mut body = vec![0u8; cl];
         stream.read_exact(&mut body).await?;
     }
     // Parse the status from the captured status line
@@ -1749,7 +1803,7 @@ where
     let status: u16 = parts[1]
         .parse()
         .with_context(|| format!("parsing status code {:?}", parts[1]))?;
-    Ok(status)
+    Ok((status, headers, body))
 }
 
 /// 13.1 D10 Task 7: GET `/stats` from the admin listener at `admin_addr`
@@ -2715,15 +2769,13 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     stream.flush().await.with_context(|| {
                         format!("{side_name}: flushing request {} {}", req.method, req.path)
                     })?;
-                    let resp_status =
-                        read_h1_response_status(&mut stream)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "{side_name}: reading response for {} {}",
-                                    req.method, req.path
-                                )
-                            })?;
+                    let (resp_status, resp_headers, resp_body) =
+                        read_h1_response_full(&mut stream).await.with_context(|| {
+                            format!(
+                                "{side_name}: reading response for {} {}",
+                                req.method, req.path
+                            )
+                        })?;
                     anyhow::ensure!(
                         resp_status == req.expected_status,
                         "{side_name}: expected status {} for {} {}, got {}",
@@ -2732,6 +2784,35 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                         req.path,
                         resp_status,
                     );
+                    // 14.2 D8.1a (SPEC correction B-3): optional per-request
+                    // body + header assertions. Each side independently must
+                    // satisfy these (NOT a cross-proxy diff of the values).
+                    if let Some(Http1BodyRule::ByteExact { body }) = &req.expected_body {
+                        anyhow::ensure!(
+                            resp_body == body.as_bytes(),
+                            "{side_name}: body mismatch for {} {} — expected {:?}, got {:?}",
+                            req.method,
+                            req.path,
+                            body.as_bytes(),
+                            resp_body,
+                        );
+                    }
+                    if let Some(h) = &req.require_header_present {
+                        anyhow::ensure!(
+                            resp_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(h)),
+                            "{side_name}: expected header {h} present for {} {}",
+                            req.method,
+                            req.path,
+                        );
+                    }
+                    if let Some(h) = &req.require_header_absent {
+                        anyhow::ensure!(
+                            !resp_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(h)),
+                            "{side_name}: expected header {h} absent for {} {}",
+                            req.method,
+                            req.path,
+                        );
+                    }
                 }
                 drop(stream);
             }
@@ -4026,6 +4107,56 @@ driver:
             "cluster.backend_cluster.upstream_cx_total"
         );
         assert_eq!(expected_stats[0].value, 1);
+    }
+
+    /// 14.2 D8.1a (SPEC correction B-3): the three optional per-request
+    /// body/header assertion fields on `Http1KeepAliveRequest` round-trip
+    /// through serde. Fixture 0022 needs to assert per-request body bytes +
+    /// the presence/absence of `x-envoy-upstream-service-time` bilaterally,
+    /// so the keep-alive request gained `expected_body` (reusing
+    /// `Http1BodyRule::ByteExact`), `require_header_present`, and
+    /// `require_header_absent`. All three are `#[serde(default)]` so the
+    /// existing fixtures (0020/0021) that omit them still deserialize.
+    #[test]
+    fn http1_keep_alive_request_round_trips_body_and_header_assertions() {
+        let yaml = r#"
+method: GET
+path: /fail
+host: c1
+expected_status: 500
+expected_body: { kind: byte_exact, body: "server error\n" }
+require_header_present: x-envoy-upstream-service-time
+"#;
+        let req: Http1KeepAliveRequest = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(req.expected_status, 500);
+        assert!(matches!(
+            req.expected_body,
+            Some(Http1BodyRule::ByteExact { .. })
+        ));
+        assert_eq!(
+            req.require_header_present.as_deref(),
+            Some("x-envoy-upstream-service-time")
+        );
+        assert!(req.require_header_absent.is_none());
+    }
+
+    /// 14.2 D8.1a: a `Http1KeepAliveRequest` that omits all three new fields
+    /// (the shape existing fixtures 0020/0021 use) still deserializes, with
+    /// the new fields defaulting to `None`. Guards the backward-compat
+    /// contract for `#[serde(default)]`.
+    #[test]
+    fn http1_keep_alive_request_without_new_fields_still_parses() {
+        let yaml = r#"
+method: GET
+path: /
+host: backend_cluster
+expected_status: 200
+"#;
+        let req: Http1KeepAliveRequest = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(req.expected_status, 200);
+        assert!(req.expected_body.is_none());
+        assert!(req.require_header_present.is_none());
+        assert!(req.require_header_absent.is_none());
     }
 
     /// 13.2 Task 5 (ADR-0039): `Driver::Http2KeepAlive` round-trips through
