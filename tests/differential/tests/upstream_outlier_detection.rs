@@ -13,14 +13,18 @@
 //! bodies + the presence (reqs 1-3) vs absence (req 4) of
 //! `x-envoy-upstream-service-time`, plus the consecutive-5xx
 //! outlier-detection ejection counters
-//! (`cluster.backend_cluster.outlier_detection.ejections_*`). The remaining
-//! Envoy-only outlier-detection stat names are listed under
-//! `allowlist_envoy_only` in the fixture's expectations.yaml.
+//! (`cluster.backend_cluster.outlier_detection.ejections_*`). The
+//! `Driver::Http1KeepAlive` stat path asserts only the named `expected_stats`
+//! (no full set-diff), so the additional Envoy-only outlier-detection stat
+//! names need no `allowlist_envoy_only` (which is a field of the
+//! prometheus-set-diff driver, not the keep-alive driver); the deferred names
+//! are catalogued in the fixture README + `docs/envoy-rust/BEHAVIOR_CONTRACT.md`.
 //!
 //! Docker-gated by the differential harness at the cluster level (no per-test
 //! cfg gate; the harness skips when `DOCKER_HOST` is unavailable). The
-//! per-path status mapping `/fail=500` is wired by the harness backend spawn,
-//! keyed on the fixture directory name.
+//! per-path status mapping `/fail=500` is wired by the harness backend spawn
+//! (`run_fixture`'s `needs_health_aware_backend` gate), keyed on the fixture
+//! directory name.
 
 use std::path::PathBuf;
 

@@ -2142,7 +2142,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // fixture-directory name (mirrors the 0019 dispatch shape).
     let needs_health_aware_backend = needs_backend
         && (fixture_name == "0019-upstream-active-health-check"
-            || fixture_name == "0020-upstream-connection-pooling-and-per-class-counters");
+            || fixture_name == "0020-upstream-connection-pooling-and-per-class-counters"
+            || fixture_name == "0022-upstream-outlier-detection-consecutive-5xx");
     let _backend = if needs_backend && !needs_health_aware_backend {
         Some(
             backend::TcpProxyBackend::spawn()
@@ -2161,6 +2162,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             let per_path =
                 if fixture_name == "0020-upstream-connection-pooling-and-per-class-counters" {
                     Some("/301=301,/404=404,/500=500".to_string())
+                } else if fixture_name == "0022-upstream-outlier-detection-consecutive-5xx" {
+                    // 14.2 D8.1: fixture 0022 needs `/fail` to return a backend
+                    // 500 ("server error\n", 13 bytes) so the consecutive_5xx
+                    // detector ticks across requests 1-3 and ejects the sole
+                    // endpoint; `/` keeps the default 200 (for the un-eject
+                    // direction, exercised by the in-process backstop). Without
+                    // this per-path arm the backend serves 200 on `/fail` and
+                    // the ejection never fires.
+                    Some("/fail=500".to_string())
                 } else {
                     None
                 };
