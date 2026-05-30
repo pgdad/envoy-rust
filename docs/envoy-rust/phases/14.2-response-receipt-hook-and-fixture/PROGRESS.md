@@ -414,4 +414,58 @@ to `14.2` state-5-next. Per `BOOTSTRAP_PROMPT.md` §5.1 the state-5 code review 
 **the 14.2 REVIEW is the named M4 owner** and must verify the per-endpoint serialization discharge
 (Task 1) AND the Task-8 fixup-3 `panic_threshold` bugfix.
 
-## Task 11 — _(pending state-6 close-out)_
+## Task 11 — state-6 CLOSING-sub-phase close-out (parent-14 close) — DONE (this commit)
+
+The state-5 `REVIEW.md` landed verdict **APPROVED** at `c1b2e022e` (two Important findings — the
+`envoy-cluster` missing-`tokio`-`time`-feature build defect I-1 + the half-closed M8 reconciliation
+I-2 — both resolved in-review and re-verified; the remaining Minors are non-gating with no named
+owner). Per `BOOTSTRAP_PROMPT.md` §5 state 6 + SPEC §9 + PLAN Task 11, THIS commit is the
+**phase-14.2 state-6 CLOSING-sub-phase close-out** — docs-only, no skill invocation (state 6 is the
+deterministic commit/ROADMAP-flip/STATE-advance terminal step).
+
+**The closing-sub-phase row-flip pair (the load-bearing edit):** `docs/envoy-rust/ROADMAP.md` row
+`14.2` `status: planned → done` AND parent row `14` `status: in-progress → done`, flipped
+**SIMULTANEOUSLY in this single commit** per the closing-sub-phase invariant (ROADMAP invariant
+4.1.3 — a phase is `done` only when STATE no longer points at it as active + the close-out lands).
+This mirrors the 02.2 / 03.2 / 07.2 / 08.2 / 12.2 `3ec7fb9` `[parent 12 done]` / 13.2 `96630f9`
+`[parent 13 done]` closing-sub-phase precedents. (Contrast the 14.1 state-6 close-out `b0dea44f`,
+which was a NON-closing sub-phase — it flipped row `14.1` alone, leaving parent `14` `in-progress`.)
+No other ROADMAP row is touched.
+
+**Parent phase 14 is COMPLETE.** Outlier detection (consecutive_5xx + consecutive_gateway_failure)
++ the OutlierEjectionSweeper + fixture 0022 are landed and bilaterally green. Phase 14 is the
+**THIRD closed phase of the Upstream-robustness family** (after parent-12 `3ec7fb9` active health
+checking + parent-13 `96630f9` connection pooling). The four periodic-background primitives are now
+all in place: the 12.2 active-HC scheduler + the 13.1 H1 pool idle sweeper + the 13.2 H2 pool idle
+sweeper + the 14.2 outlier-ejection sweeper, all sharing the identical
+`tokio_util::sync::CancellationToken` cancellation discipline + `pub async fn shutdown(self)`.
+
+**§7.5 gate at close (all six satisfied; the close-out is docs-only so introduces no new code risk):**
+(a) fixture `0022` GREEN bilaterally vs `envoyproxy/envoy:v1.33.0`; (b) the 21 pre-existing fixtures
+inert-unaffected — 22-fixture simultaneous green is CI-confirmed; (c) h2spec ≥95% held vacuously (no
+H2 framing/codec touched); (d) `parse_bootstrap` fuzz corpus unchanged at 22 seeds; (e)
+build/clippy/fmt/`cargo test --workspace`/`cargo deny check` clean (re-attested at state-5 after the
+I-1 `tokio` `time` feature fix); (f) `REVIEW.md` APPROVED. The differential harness runs under Docker
+in CI (`.github/workflows/ci.yml`), so the 22-fixture-green claim is CI-backed at the state-5 run
+`26694528360` (HEAD `c1b2e022e`) + this close-out's own CI run.
+
+**ADR posture:** NO new ADR (a close-out projects none; PLAN lock-in #2; SPEC §9). DECISIONS.md
+ledger head stays **ADR-0041** (count 42); next available **ADR-0042**. The commit title carries
+`[parent 14 done]` but NO `[ADR-NNNN]` bracket. **ADR-0028** (H1-listener × H2-cluster dispatch
+deferral) REMAINS OPEN per ADR-0039 Consequences; named owner is a follow-up foundations-pivot phase
+— NOT 14.2.
+
+**Carryforward dispositions at close (none gate the close-out):** M4 (discharged + verified at the
+state-5 REVIEW), M5/M6 (Task 1), A-M2 (Task 2), M8 (fully reconciled to 13 in-review at state-5) —
+ALL CLOSED across the 14.2 arc (REVIEW.md §6). M1/M2/M3/M7/M9 (14.1 REVIEW) + the inherited
+multi-phase Minor inventory + the state-5-carried Minors (M-c1 `tokio-util` `["rt"]`-feature leanness;
+M-c2 `.lock().unwrap()` poisoning-hardening; M-c3 frozen-record "14"s in append-only/ratified docs) +
+the §6.9 per-class `upstream_rq_{2,3,4}xx` extension + ADR-0028 carry forward unchanged; no named
+owner.
+
+**STATE advanced to "awaiting next planning."** The next session enters §5 state 0/1 for a NEW phase
+(`superpowers:brainstorming`) to add + scope the next phase row from ROADMAP §9 — e.g. another
+Upstream-robustness-family phase (retries + hedging / circuit-breaker-budget expansion / TCP-proxy
+connection pooling per the BEHAVIOR_CONTRACT carve-out) OR a new feature family. This state-6 session
+does NOT brainstorm the next phase — it closes 14.2 + parent-14 and exits (one-state-per-session per
+§5.1).
