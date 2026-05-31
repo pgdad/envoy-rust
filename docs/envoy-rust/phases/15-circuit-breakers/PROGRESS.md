@@ -104,3 +104,29 @@ increment `upstream_cx_total`.
 9. Fuzz seed + BEHAVIOR_CONTRACT stat rows + the overflow-model divergence note.
 10. State-4 verification (incl. isolated-crate builds) + STATE advance.
 11. (later) state-5 review → state-6 close-out.
+
+---
+
+## Task 1 — `envoy-config` schema + validator for `max_pending_requests` (commit `0c46b7bc1`)
+
+**Landed.** `Thresholds` (`crates/envoy-config/src/bootstrap.rs`) gains `max_pending_requests: Option<u32>`
+(`#[serde(default, skip_serializing_if = "Option::is_none")]`) + the `15 D1` doc note;
+`ConfigError::UnsupportedNonZeroMaxPendingRequests { cluster, value }` added in
+`crates/envoy-config/src/lib.rs` near the other circuit-breaker variants;
+`validate_circuit_breakers` rejects `max_pending_requests > 0` (after the `max_connections` check,
+using the surrounding let-chain idiom) while accepting `0`/absent. **C-2 fix:** the existing
+`cluster_circuit_breakers_rejects_phase13_deferred_threshold_fields` test re-pointed from
+`max_pending_requests: 5` → `max_requests: 5` (still proves `deny_unknown_fields` rejects a
+still-deferred field). Two new validator tests added (`cluster_max_pending_requests_zero_accepted`,
+`cluster_max_pending_requests_positive_rejected_by_validator`).
+
+**TDD:** tests written first, confirmed failing (`no field max_pending_requests` /
+`no variant UnsupportedNonZeroMaxPendingRequests`), then implemented to green.
+
+**Verification (quoted):**
+- `cargo test -p envoy-config` → `test result: ok. 287 passed; 0 failed; 0 ignored` (circuit_breaker
+  filter: 7 passed).
+- `cargo build -p envoy-config` (standalone, lock-in #14) → `Finished` (RC 0).
+- `cargo fmt --all -- --check` → clean (RC 0).
+- `git show --stat HEAD` → `2 files changed` (`bootstrap.rs` +89/-…, `lib.rs` +7) — ONLY the two
+  scoped source files.
