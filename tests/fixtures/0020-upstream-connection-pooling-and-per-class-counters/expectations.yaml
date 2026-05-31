@@ -56,3 +56,5 @@ driver:
     - { name: cluster.backend_cluster.upstream_rq_total,       value: 10 }
     - { name: cluster.backend_cluster.upstream_cx_total,       value: 1 }
     - { name: cluster.backend_cluster.upstream_cx_http1_total, value: 1 }
+    - { name: cluster.backend_cluster.upstream_cx_overflow,             value: 0 }
+    - { name: cluster.backend_cluster.circuit_breakers.default.cx_open, value: 0 }
