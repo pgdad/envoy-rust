@@ -307,3 +307,43 @@ directly readable — no admin-scrape race; the §6.3 backstop rationale).
 - `git show --stat HEAD` → `1 file changed, 286 insertions(+)` — only the new test file.
 - **Flakiness control:** generous 400ms hold + bounded poll loops for BOTH edges (the 14.2
   convergence-poll discipline); ran 5× green, no single-shot sleep asserts remain.
+
+---
+
+## Task 9 — Fuzz seed + BEHAVIOR_CONTRACT 3 stat rows + overflow-model divergence note (commit `b1e9f3a07`)
+
+**Landed.** `crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_circuit_breakers.yaml` extended
+IN PLACE: `max_pending_requests: 0` added to the DEFAULT-priority threshold entry (corpus stays 22;
+stays in the SUCCESS set — `0` is accepted; no `.gitignore`/SUCCESS-array edit). `docs/envoy-rust/
+BEHAVIOR_CONTRACT.md` gains a "**15 entries (circuit breakers):**" subsection under Stat-name mapping
+with 3 rows (`upstream_rq_pending_overflow` value-exact; `upstream_cx_overflow` + `circuit_breakers.
+default.cx_open` value-exact-at-0 bilaterally / non-zero in-process only — known divergence) + the
+"Phase-15 overflow-model divergence (ADR-0043 §6.2)" prose note. No duplication of the Task-4
+overflow-503 BODY row (distinct section).
+
+**Verification (quoted):**
+- `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → `1 passed`.
+- `cargo test -p envoy-config` → `289 passed; 0 failed` (287 + the 2 Task-1 validator tests).
+- `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → `2 files changed, 14 insertions(+)` — only the seed + BEHAVIOR_CONTRACT.
+
+---
+
+## State-3 arc boundary — Tasks 1–9 COMPLETE (this session)
+
+All NINE implementation/verification tasks (1–9) landed, one TDD commit + one PROGRESS subsection
+each, dispatched SERIALLY via `superpowers:subagent-driven-development` (`feedback_serial_subagent_dispatch`).
+Commit chain (task commits; each followed by its `…: PROGRESS subsection` docs commit):
+`0c46b7bc1`(T1) · `1e37cf4bc`(T2) · `db3ff1af6`(T3) · `9f284759c`(T4) · `c32f2bfe8`(T5) ·
+`3206e9e02`(T6) · `f4e9b2c1a`(T7) · `8d1f4e6a2`(T8) · `b1e9f3a07`(T9).
+
+**Headline results:** fixture 0023 BILATERALLY GREEN vs real Envoy v1.33.0 (acceptance signal (a));
+fixture 0020 inert-0 assertions bilaterally green (signal (b) for the new stats); in-process backstop
+green on both overflow paths + `cx_open` both edges; all per-crate standalone builds green (lock-in
+#14 satisfied per task). **No ADR-0043 option-(b) fallback needed; no new ADR fired.**
+
+**NEXT SESSION resumes at Task 10** (state-4 phase-done verification per §7.5: workspace
+build/clippy/fmt/test/deny + the 3 standalone crate builds + the 23-fixture Docker differential suite
++ h2spec ≥95% + parse_bootstrap fuzz short-budget, with real CI-run-URL + HEAD-SHA + per-gate quoted
+evidence per §6.6) → then STATE advance to state-5-next. Task 11 (state-5 review → state-6 close) is
+a later session. **Do NOT restart from Task 1.**
