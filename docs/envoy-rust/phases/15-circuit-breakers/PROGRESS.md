@@ -186,3 +186,26 @@ backend: asserts `cx_open==1` at cap, `cx_overflow==1` on the 2nd (overflowing) 
 - `cargo fmt --all -- --check` → clean (RC 0; one fmt-only amend folded into the single commit).
 - `git show --stat HEAD` → `1 file changed` (`pool.rs` +201) — only `pool.rs` (no new enum variant ⇒
   no hcm.rs change this task).
+
+---
+
+## Task 4 — H1 `synth_overflow()` 81-byte body + `x-envoy-overloaded` + router arms + BEHAVIOR_CONTRACT (commit `9f284759c`)
+
+**Landed.** `crates/envoy-http1/src/hcm.rs`: new `synth_overflow(close) -> Response` mirroring
+`synth_no_healthy_upstream` — status 503, byte-exact 81-byte body `upstream connect error or
+disconnect/reset before headers. reset reason: overflow` (no trailing newline), 6 headers
+`{server, date, content-length:81, content-type:text/plain, connection:<close>, x-envoy-overloaded:
+true}`. BOTH router arms refined from the Task-2/3 placeholder `synth_status(503, close)` to
+`synth_overflow(close)` — the `PoolError::Overflow` arm AND the `PoolError::PendingOverflow` arm
+(`tracing::warn!` lines preserved). New test `synth_overflow_emits_81_byte_body_and_x_envoy_overloaded`.
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md`: overflow-503 row added under the response-body synth-503
+section (byte-exact body+status equivalence; `UO` flag is access-log-only → wire surface
+`x-envoy-overloaded`; the extra `connection` header is allow-listed, Envoy omits it).
+
+**Verification (quoted):**
+- `cargo test -p envoy-http1` → `test result: ok. 87 passed; 0 failed; 0 ignored`.
+- `cargo build -p envoy-http1` (standalone, lock-in #14) → `Finished`.
+- `cargo fmt --all -- --check` → clean (RC 0; one self-corrected fmt-dirty/missing-row commit
+  redone into a single clean commit).
+- `git show --stat HEAD` → `2 files changed` (`hcm.rs` +76, `BEHAVIOR_CONTRACT.md` +1). No
+  pre-existing overflow test asserted an empty body (none needed updating).
