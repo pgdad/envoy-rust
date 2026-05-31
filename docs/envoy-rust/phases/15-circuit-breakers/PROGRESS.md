@@ -164,3 +164,25 @@ proves rejection without dialing the backend + counter == 1.
 - `cargo build -p envoy-http1` (standalone, lock-in #14) → `Finished`.
 - `cargo fmt --all -- --check` → clean (RC 0).
 - `git show --stat HEAD` → `2 files changed` (`pool.rs` +132, `hcm.rs` +14) — only envoy-http1.
+
+---
+
+## Task 3 — H1 pool `upstream_cx_overflow` counter + `circuit_breakers.default.cx_open` gauge (commit `db3ff1af6`)
+
+**Landed.** `crates/envoy-http1/src/pool.rs`: `H1Pool` gains `cx_overflow: Option<Arc<envoy_stats::Counter>>`
++ `cx_open: Option<Arc<envoy_stats::Gauge>>` (the same `Option` fallback as Task 2 —
+`Gauge::new()` confirmed `pub(crate)` at `crates/envoy-stats/src/gauge.rs:15`). `cx_overflow.inc()`
+at the cap-check branch (one source of truth, before `Err(Overflow)`). `cx_open.set(1)` after
+`*n += 1` reaches `max_connections` (at-cap inclusive, lock-in #6); `cx_open.set(0)` at ALL THREE
+decrement edges under the held `established` lock (PoolGuard::Drop destroy, connect-failure
+rollback, sweeper eviction). Registered in `for_bootstrap` only when `circuit_breakers.is_some()`.
+New test `cx_overflow_increments_and_cx_open_tracks_cap_edges` drives a hold-capable in-test TCP
+backend: asserts `cx_open==1` at cap, `cx_overflow==1` on the 2nd (overflowing) acquire, and
+`cx_open==0` after the Drop-destroy decrement edge (terminal-0).
+
+**Verification (quoted):**
+- `cargo test -p envoy-http1` → `test result: ok. 86 passed; 0 failed; 0 ignored`.
+- `cargo build -p envoy-http1` (standalone, lock-in #14) → `Finished`.
+- `cargo fmt --all -- --check` → clean (RC 0; one fmt-only amend folded into the single commit).
+- `git show --stat HEAD` → `1 file changed` (`pool.rs` +201) — only `pool.rs` (no new enum variant ⇒
+  no hcm.rs change this task).
