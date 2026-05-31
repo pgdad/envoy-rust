@@ -236,3 +236,29 @@ true`, NO `connection` header per the H2 synth convention, mirroring `synth_h2_5
 **Note (harness):** the implementer reported the harness garbled a large parallel tool batch and
 silently dropped two hcm.rs edits (surfaced as compile errors); re-applied + re-verified green.
 Consistent with `feedback_serial_subagent_dispatch`'s large-parallel-batch caveat.
+
+---
+
+## Task 6 — Bilateral fixture `0023` + Docker-gated wrapper (commit `3206e9e02`)
+
+**Landed (4 files).** `tests/fixtures/0023-upstream-circuit-breaker-max-pending-requests/{envoy.yaml,
+envoy-rust.yaml,expectations.yaml}` + `tests/differential/tests/upstream_circuit_breaker.rs`.
+Mirrors fixture-0020 topology (STRICT_DNS single endpoint → cluster `backend`, H1 HCM listener
+`/`→backend, admin) with the cluster's `circuit_breakers.thresholds: [{priority: DEFAULT,
+max_connections: 1, max_pending_requests: 0}]`. The `expectations.yaml` drives a SINGLE GET via the
+existing `Driver::Http1KeepAlive` (lock-in #11) asserting `expected_status: 503` +
+`expected_body_exact` (the 81-byte overflow body) + `require_headers_present: [x-envoy-overloaded]`
++ `expected_stats` (`upstream_rq_pending_overflow:1`, `upstream_cx_overflow:0`, `upstream_cx_total:0`,
+`circuit_breakers.default.cx_open:0`). Field names audited against `tests/differential/src/lib.rs`
+`Http1KeepAliveRequest` (the 14.2-added `expected_body_exact` / `require_headers_present` fields), not
+guessed. Wrapper mirrors `upstream_connection_pooling_and_per_class_counters.rs`.
+
+**Verification — BILATERAL GREEN (Docker UP, real Envoy v1.33.0):**
+- `cargo test -p differential --test upstream_circuit_breaker -- --nocapture` →
+  `test upstream_circuit_breaker_max_pending_requests ... ok` / `1 passed; 0 failed`. BOTH proxies
+  503 the GET with the byte-exact 81-byte body + `x-envoy-overloaded` + `upstream_rq_pending_overflow:1`;
+  backend never contacted (`upstream_cx_total:0`). **Acceptance signal (a) green.**
+- `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → `4 files changed, 171 insertions(+)` — only the 4 intended files.
+- **No ADR-0043 option-(b) fallback needed** — the overflow-form fixture worked bilaterally on the
+  first green run.
