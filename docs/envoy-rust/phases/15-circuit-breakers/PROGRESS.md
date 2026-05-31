@@ -262,3 +262,22 @@ guessed. Wrapper mirrors `upstream_connection_pooling_and_per_class_counters.rs`
 - `git show --stat HEAD` → `4 files changed, 171 insertions(+)` — only the 4 intended files.
 - **No ADR-0043 option-(b) fallback needed** — the overflow-form fixture worked bilaterally on the
   first green run.
+
+---
+
+## Task 7 — Fixture 0020 inert-0 `upstream_cx_overflow` + `cx_open` assertions (commit `f4e9b2c1a`)
+
+**Landed.** `tests/fixtures/0020-upstream-connection-pooling-and-per-class-counters/expectations.yaml`
+gains two `expected_stats` rows on cluster `echo` (which configures `circuit_breakers.thresholds:
+[{max_connections: 4}]` ⇒ envoy-rust registers both stats via Task 3's `is_some()` gate; Envoy
+always emits them): `cluster.echo.upstream_cx_overflow: 0` + `cluster.echo.circuit_breakers.default.cx_open:
+0`. The sequential single-keep-alive-conn workload never trips the cap ⇒ both read 0 on BOTH proxies.
+
+**Verification — BILATERAL GREEN (Docker UP):**
+- `cargo test -p differential --test upstream_connection_pooling_and_per_class_counters` →
+  `1 passed; 0 failed` (18.43s). **Acceptance signal (b): existing fixture stays green + the two new
+  observability stats validated inert-0 bilaterally.**
+- `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → `1 file changed, 2 insertions(+)` — only 0020's expectations.yaml.
+- No reconciliation needed; named-subset scrape (no `allowlist_envoy_only` required for the unasserted
+  Envoy-side `circuit_breakers.*` siblings, per §0.C finding 6).
