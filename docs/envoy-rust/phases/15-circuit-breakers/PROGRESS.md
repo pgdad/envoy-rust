@@ -130,3 +130,37 @@ still-deferred field). Two new validator tests added (`cluster_max_pending_reque
 - `cargo fmt --all -- --check` → clean (RC 0).
 - `git show --stat HEAD` → `2 files changed` (`bootstrap.rs` +89/-…, `lib.rs` +7) — ONLY the two
   scoped source files.
+
+---
+
+## Task 2 — H1 pool `max_pending_requests:0` reject gate + `upstream_rq_pending_overflow` (commit `1e37cf4bc`)
+
+**Landed.** `crates/envoy-http1/src/pool.rs`: new `PoolError::PendingOverflow { cluster: String }`;
+`H1Pool` gains `max_pending_requests: u32` + `rq_pending_overflow: Option<Arc<envoy_stats::Counter>>`;
+`const DEFAULT_MAX_PENDING_REQUESTS: u32 = 1024`; `acquire()` reject gate fires on the
+connect-on-miss path BEFORE the cap-check (`if self.max_pending_requests == 0 { inc; return
+PendingOverflow }`) per lock-in #7; `for_bootstrap` sources `max_pending_requests` from the config
+and registers `cluster.<name>.upstream_rq_pending_overflow` ONLY when `circuit_breakers.is_some()`
+(inert-when-unconfigured, lock-in #4). New test `acquire_rejects_with_pending_overflow_when_max_pending_requests_zero`
+proves rejection without dialing the backend + counter == 1.
+
+**Two forced deviations (both correct, documented for the state-5 reviewer):**
+1. **`Option<Arc<Counter>>` fallback (NOT the throwaway `Counter::new()`).** `envoy_stats::Counter::new()`
+   is `pub(crate)` (`crates/envoy-stats/src/counter.rs:19`), so the PLAN Step 6 primary
+   (`Arc::new(Counter::new())` throwaway) does not compile from envoy-http1. Used the PLAN-documented
+   `Option` fallback: configured clusters → `Some(register_counter(...))`; unconfigured → `None`.
+   The gate is dead for unconfigured clusters anyway (default 1024). **Carries to Task 3** — the
+   `cx_overflow` Counter + `cx_open` Gauge will need the same `Option` treatment (`Gauge::new()` is
+   likewise expected `pub(crate)`).
+2. **`hcm.rs` also touched (+14 lines).** Adding the `PendingOverflow` enum variant made the H1
+   router `pool.acquire(...)` match non-exhaustive (hard compile break failing the standalone-build
+   gate). Added a MINIMAL `PendingOverflow` arm returning `synth_status(503, close)` (same as the
+   current `Overflow` arm). **This is a placeholder — Task 4 refines BOTH arms to the byte-exact
+   81-byte `synth_overflow` body.** Adding an enum variant matched non-exhaustively in the same
+   crate is incompatible with a strict "pool.rs only" constraint.
+
+**Verification (quoted):**
+- `cargo test -p envoy-http1` → `test result: ok. 85 passed; 0 failed; 0 ignored`.
+- `cargo build -p envoy-http1` (standalone, lock-in #14) → `Finished`.
+- `cargo fmt --all -- --check` → clean (RC 0).
+- `git show --stat HEAD` → `2 files changed` (`pool.rs` +132, `hcm.rs` +14) — only envoy-http1.
