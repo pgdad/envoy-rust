@@ -281,3 +281,29 @@ always emits them): `cluster.echo.upstream_cx_overflow: 0` + `cluster.echo.circu
 - `git show --stat HEAD` → `1 file changed, 2 insertions(+)` — only 0020's expectations.yaml.
 - No reconciliation needed; named-subset scrape (no `allowlist_envoy_only` required for the unasserted
   Envoy-side `circuit_breakers.*` siblings, per §0.C finding 6).
+
+---
+
+## Task 8 — In-process backstop (both overflow paths + `cx_open` both edges) (commit `8d1f4e6a2`)
+
+**Landed.** `crates/envoy-bin/tests/upstream_circuit_breaker.rs` (286 lines, 2 `#[tokio::test]` cases),
+booting envoy-bin via its library entrypoint with a retained `Arc<StatsRegistry>` handle (gauge
+directly readable — no admin-scrape race; the §6.3 backstop rationale).
+- **(a) pending-overflow:** `max_connections:1` + `max_pending_requests:0`, single GET → 503 + exact
+  81-byte body + `x-envoy-overloaded: true` + all 5 standard synth headers present
+  (`server/date/content-length/content-type/connection`) + `upstream_rq_pending_overflow==1` +
+  `upstream_cx_total==0` (backend never contacted).
+- **(b) cx-overflow (in-process only; Envoy serves {200,200}, bilaterally deferred):**
+  `max_connections:1` (default pending) + hold-capable in-test backend (reads, `sleep(400ms)`, 200) +
+  K=2 `tokio::join!` → status multiset `{200,503}` + `upstream_cx_overflow==1` + `cx_open`
+  observed **1 while saturated** (bounded poll, rising edge) and **0 after drain** (terminal-0,
+  falling edge).
+
+**Verification (quoted):**
+- `cargo test -p envoy-bin --test upstream_circuit_breaker` → `2 passed; 0 failed` (1.83s).
+- `cargo build -p envoy-bin` standalone → `Finished`; `cargo test -p envoy-bin` whole-crate → green,
+  no regressions (existing backstops still ok).
+- `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → `1 file changed, 286 insertions(+)` — only the new test file.
+- **Flakiness control:** generous 400ms hold + bounded poll loops for BOTH edges (the 14.2
+  convergence-poll discipline); ran 5× green, no single-shot sleep asserts remain.
