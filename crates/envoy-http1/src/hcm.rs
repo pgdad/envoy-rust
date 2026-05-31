@@ -557,7 +557,7 @@ async fn serve_connection(
                                             cluster = %cluster.name(),
                                             "pool overflow — returning 503",
                                         );
-                                        Err(synth_status(503, close))
+                                        Err(synth_overflow(close))
                                     }
                                     // 15 D3 (Task 2): max_pending_requests:0
                                     // reject-on-establish. Like the cap-overflow
@@ -571,7 +571,7 @@ async fn serve_connection(
                                             cluster = %cluster.name(),
                                             "pending-request overflow (max_pending_requests:0) — returning 503",
                                         );
-                                        Err(synth_status(503, close))
+                                        Err(synth_overflow(close))
                                     }
                                 },
                                 None => {
@@ -1096,6 +1096,42 @@ fn synth_no_healthy_upstream(close: bool) -> Response {
                 headers::CONNECTION.to_string(),
                 connection_value(close).to_string(),
             ),
+        ],
+        body,
+    }
+}
+
+/// 15 D5 (ADR-0043 §6.2 finding 3): the `max_connections` /
+/// `max_pending_requests:0` overflow synth-503. Body is the byte-exact
+/// 81-byte Envoy local-reply `upstream connect error or disconnect/reset
+/// before headers. reset reason: overflow` (no trailing newline). Adds the
+/// `x-envoy-overloaded: true` header — the wire surfacing of Envoy's
+/// access-log-only `UO` response flag — on top of `synth_status`'s 5 standard
+/// HTTP/1.1 headers (6 headers total). Envoy itself omits the `connection`
+/// header on this reply; envoy-rust keeps it (allow-listed by the harness —
+/// the 0019/0022 synth-503 precedent). Called from BOTH the pool cap-overflow
+/// arm AND the pending-overflow arm (`hcm.rs:542`); H1/H2 parity sibling is
+/// `synth_h2_overflow` (Task 5).
+fn synth_overflow(close: bool) -> Response {
+    let body = Bytes::from_static(
+        b"upstream connect error or disconnect/reset before headers. reset reason: overflow",
+    );
+    Response {
+        status: 503,
+        reason: None,
+        headers: vec![
+            (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
+            (headers::DATE.to_string(), now_imf_fixdate()),
+            (headers::CONTENT_LENGTH.to_string(), body.len().to_string()),
+            (
+                headers::CONTENT_TYPE.to_string(),
+                DEFAULT_CONTENT_TYPE.to_string(),
+            ),
+            (
+                headers::CONNECTION.to_string(),
+                connection_value(close).to_string(),
+            ),
+            ("x-envoy-overloaded".to_string(), "true".to_string()),
         ],
         body,
     }
@@ -3293,6 +3329,42 @@ static_resources:
             .map(|(_, v)| v.as_str())
             .expect("content-length present");
         assert_eq!(cl, "19", "content-length matches body length");
+    }
+
+    #[test]
+    fn synth_overflow_emits_81_byte_body_and_x_envoy_overloaded() {
+        // 15 D5 / ADR-0043 §6.2 finding 3: the max_connections /
+        // max_pending_requests:0 overflow synth-503 emits the byte-exact
+        // 81-byte body `upstream connect error or disconnect/reset before
+        // headers. reset reason: overflow` (no trailing newline) + the
+        // `x-envoy-overloaded: true` header (the wire surfacing of Envoy's
+        // access-log-only `UO` response flag).
+        let r = super::synth_overflow(true);
+        assert_eq!(r.status, 503);
+        assert_eq!(
+            r.body.as_ref(),
+            b"upstream connect error or disconnect/reset before headers. reset reason: overflow"
+        );
+        assert_eq!(r.body.len(), 81, "exact byte count per ADR-0043 §6.2");
+        let names: Vec<&str> = r.headers.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("x-envoy-overloaded")),
+            "x-envoy-overloaded header present: {names:?}"
+        );
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-envoy-overloaded") && v == "true"),
+            "x-envoy-overloaded: true"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case("content-length")),
+            "content-length header present: {names:?}"
+        );
     }
 
     #[tokio::test]
