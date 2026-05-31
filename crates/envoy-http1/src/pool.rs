@@ -91,6 +91,30 @@ pub struct H1Pool {
     /// so a throwaway unregistered handle cannot be built here — the `Option`
     /// is the documented fallback per the PLAN Step 6 caveat.)
     rq_pending_overflow: Option<Arc<envoy_stats::Counter>>,
+    /// 15 D4: per-cluster `upstream_cx_overflow` counter (lock-in #5),
+    /// incremented at the SOLE cap-check branch in `acquire()` when the
+    /// per-endpoint `established` count is already at `max_connections`.
+    /// Registered ONLY for clusters whose `circuit_breakers` is configured
+    /// (lock-in #4 — inert-when-unconfigured); `None` otherwise. The increment
+    /// site guards with `if let Some(h) = &self.cx_overflow` so an unconfigured
+    /// cluster never touches it. (`Counter::new()` is `pub(crate)` — the
+    /// `Option` is the documented fallback, mirroring `rq_pending_overflow`.)
+    cx_overflow: Option<Arc<envoy_stats::Counter>>,
+    /// 15 D4: per-cluster `circuit_breakers.default.cx_open` gauge (lock-in #6),
+    /// edge-driven (NOT polled): `set(1)` when an `established` increment makes
+    /// the per-endpoint count reach `max_connections` (at-cap inclusive);
+    /// `set(0)` at each decrement edge that drops below the cap (the
+    /// `PoolGuard::Drop` destroy path, the connect-failure rollback, the
+    /// idle-sweeper eviction). All edge updates run UNDER the held `established`
+    /// lock. Registered ONLY for circuit-breakers-configured clusters
+    /// (inert-when-unconfigured); `None` otherwise — guarded with
+    /// `if let Some(g) = &self.cx_open`. (`Gauge::new()` is `pub(crate)` — the
+    /// `Option` is the documented fallback.) Terminal-0 (returns to 0 after
+    /// drain) so a post-settle scrape is deterministic. NOTE: `cx_open` is a
+    /// per-cluster gauge but `established` is per-endpoint; for the
+    /// single-endpoint fixtures they coincide (multi-endpoint reconciliation
+    /// defers — lock-in #6).
+    cx_open: Option<Arc<envoy_stats::Gauge>>,
 }
 
 /// Per-acquire RAII handle. Owns one `ConnGaugeGuard` (gauge decrements on
@@ -162,6 +186,13 @@ impl Drop for PoolGuard {
                 let mut est = self.pool.established.lock();
                 if let Some(n) = est.get_mut(&self.endpoint) {
                     *n = n.saturating_sub(1);
+                    // 15 D4 (lock-in #6): clear cx_open when this decrement
+                    // drops the per-endpoint count below max_connections.
+                    if *n < self.pool.max_connections {
+                        if let Some(g) = &self.pool.cx_open {
+                            g.set(0);
+                        }
+                    }
                 }
             }
         }
@@ -183,6 +214,8 @@ impl H1Pool {
         cx_http1_total: Arc<envoy_stats::Counter>,
         cx_active: Arc<envoy_stats::Gauge>,
         rq_pending_overflow: Option<Arc<envoy_stats::Counter>>,
+        cx_overflow: Option<Arc<envoy_stats::Counter>>,
+        cx_open: Option<Arc<envoy_stats::Gauge>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             cluster_name,
@@ -196,6 +229,8 @@ impl H1Pool {
             cx_http1_total,
             cx_active,
             rq_pending_overflow,
+            cx_overflow,
+            cx_open,
         })
     }
 
@@ -245,12 +280,23 @@ impl H1Pool {
             let mut est = self.established.lock();
             let n = est.entry(endpoint).or_insert(0);
             if *n >= self.max_connections {
+                // 15 D4 (lock-in #5): cap-hit count — the SOLE cx_overflow site.
+                if let Some(h) = &self.cx_overflow {
+                    h.inc();
+                }
                 return Err(PoolError::Overflow {
                     cluster: self.cluster_name.clone(),
                     max: self.max_connections,
                 });
             }
             *n += 1;
+            // 15 D4 (lock-in #6): at-cap inclusive — set cx_open=1 when this
+            // increment makes the per-endpoint count reach max_connections.
+            if *n >= self.max_connections {
+                if let Some(g) = &self.cx_open {
+                    g.set(1);
+                }
+            }
         }
         // Connect (lock released — connect is the slow path).
         let stream = match Client::connect(endpoint, host).await {
@@ -260,6 +306,13 @@ impl H1Pool {
                 let mut est = self.established.lock();
                 if let Some(n) = est.get_mut(&endpoint) {
                     *n = n.saturating_sub(1);
+                    // 15 D4 (lock-in #6): clear cx_open if the rollback drops
+                    // the per-endpoint count below max_connections.
+                    if *n < self.max_connections {
+                        if let Some(g) = &self.cx_open {
+                            g.set(0);
+                        }
+                    }
                 }
                 return Err(PoolError::Connect(e));
             }
@@ -339,6 +392,13 @@ impl H1Pool {
         for (endpoint, evicted) in evictions {
             if let Some(n) = est.get_mut(&endpoint) {
                 *n = n.saturating_sub(evicted);
+                // 15 D4 (lock-in #6): clear cx_open when eviction drops the
+                // per-endpoint count below max_connections.
+                if *n < self.max_connections {
+                    if let Some(g) = &self.cx_open {
+                        g.set(0);
+                    }
+                }
             }
             for _ in 0..evicted {
                 self.cx_destroy.inc();
@@ -424,6 +484,29 @@ impl H1PoolManager {
             } else {
                 None
             };
+            // 15 D4 (lock-in #4): register upstream_cx_overflow +
+            // circuit_breakers.default.cx_open ONLY when circuit_breakers is
+            // configured (inert-when-unconfigured). `None` otherwise — the
+            // increment/edge sites guard on `Some`. `Counter::new()`/`Gauge::new()`
+            // are pub(crate), so a throwaway unregistered handle can't be built
+            // here; `Option` is the documented fallback (mirrors
+            // rq_pending_overflow).
+            let cx_overflow = if cfg.circuit_breakers.is_some() {
+                Some(
+                    registry
+                        .register_counter(&format!("cluster.{}.upstream_cx_overflow", cfg.name))?,
+                )
+            } else {
+                None
+            };
+            let cx_open = if cfg.circuit_breakers.is_some() {
+                Some(registry.register_gauge(&format!(
+                    "cluster.{}.circuit_breakers.default.cx_open",
+                    cfg.name
+                ))?)
+            } else {
+                None
+            };
             let cx_destroy =
                 registry.register_counter(&format!("cluster.{}.upstream_cx_destroy", cfg.name))?;
             let cx_http1_total = registry
@@ -455,6 +538,8 @@ impl H1PoolManager {
                 cx_http1_total,
                 cx_active,
                 rq_pending_overflow,
+                cx_overflow,
+                cx_open,
             );
             sweepers.push(pool.spawn_idle_sweeper(token.clone()));
             pools.insert(cfg.name.clone(), pool);
@@ -520,6 +605,8 @@ mod tests {
             Arc::clone(&cx_http1_total),
             Arc::clone(&cx_active),
             None,
+            None,
+            None,
         );
         (pool, cx_total, cx_destroy, cx_http1_total, cx_active)
     }
@@ -559,8 +646,81 @@ mod tests {
             cx_http1_total,
             cx_active,
             Some(Arc::clone(&rq_pending_overflow)),
+            None,
+            None,
         );
         (pool, rq_pending_overflow)
+    }
+
+    /// 15 D4: hold-capable in-test backend. Accepts connections and holds
+    /// them open WITHOUT ever responding (so the acquired connection stays
+    /// established + in-flight, keeping the per-endpoint count at the cap).
+    /// Returns the bound address + the `TcpListener`-owning `JoinHandle`
+    /// (the caller binds it to a `_srv` so the accept loop lives for the
+    /// test's duration). Used to drive the `cx_open` at-cap edge.
+    async fn spawn_holding_backend() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((sock, _)) => held.push(sock), // hold open, never respond
+                    Err(_) => return,
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    /// 15 D4: build a pool with a registered `upstream_cx_overflow` counter +
+    /// `circuit_breakers.default.cx_open` gauge (the circuit-breakers-configured
+    /// shape). Returns the pool + both handles so tests can assert the
+    /// cap-overflow + edge-driven gauge semantics.
+    #[allow(clippy::type_complexity)]
+    fn mk_pool_cb(
+        cluster: &str,
+        max_connections: u32,
+    ) -> (
+        Arc<H1Pool>,
+        Arc<envoy_stats::Counter>,
+        Arc<envoy_stats::Gauge>,
+    ) {
+        let registry = envoy_stats::StatsRegistry::new();
+        let cx_total = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_cx_total"))
+            .unwrap();
+        let cx_destroy = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_cx_destroy"))
+            .unwrap();
+        let cx_http1_total = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_cx_http1_total"))
+            .unwrap();
+        let cx_active = registry
+            .register_gauge(&format!("cluster.{cluster}.upstream_cx_active"))
+            .unwrap();
+        let cx_overflow = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_cx_overflow"))
+            .unwrap();
+        let cx_open = registry
+            .register_gauge(&format!(
+                "cluster.{cluster}.circuit_breakers.default.cx_open"
+            ))
+            .unwrap();
+        let pool = H1Pool::new(
+            cluster.to_string(),
+            max_connections,
+            DEFAULT_MAX_PENDING_REQUESTS,
+            Duration::from_secs(60),
+            cx_total,
+            cx_destroy,
+            cx_http1_total,
+            cx_active,
+            None,
+            Some(Arc::clone(&cx_overflow)),
+            Some(Arc::clone(&cx_open)),
+        );
+        (pool, cx_overflow, cx_open)
     }
 
     /// In-process echo backend that responds to each request with a minimal
@@ -656,6 +816,47 @@ mod tests {
             rq_pending_overflow.value(),
             1,
             "upstream_rq_pending_overflow must read 1 after the reject"
+        );
+    }
+
+    /// 15 D4 (lock-ins #5 + #6): `upstream_cx_overflow` increments on a cap-hit
+    /// and `circuit_breakers.default.cx_open` is an edge-driven gauge — `set(1)`
+    /// when an `established` increment reaches `max_connections` (at-cap
+    /// inclusive), `set(0)` at the decrement edges that drop below the cap.
+    /// Drives the `PoolGuard::Drop` destroy path (via `invalidate()`) to confirm
+    /// the gauge returns to terminal-0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cx_overflow_increments_and_cx_open_tracks_cap_edges() {
+        let (backend_addr, _srv) = spawn_holding_backend().await;
+        let (pool, cx_overflow, cx_open) = mk_pool_cb("c", 1);
+        // First acquire connects (the holding backend accepts but never
+        // responds) → established reaches the cap (1) → cx_open set to 1.
+        let mut g1 = pool
+            .acquire(backend_addr, "h")
+            .await
+            .expect("first acquire connects");
+        assert_eq!(cx_open.value(), 1, "cx_open set at cap after first connect");
+        assert_eq!(cx_overflow.value(), 0, "no overflow yet");
+        // Second acquire overflows (no idle stream, established == cap) →
+        // cx_overflow increments; cx_open unchanged (still at cap).
+        let err = pool
+            .acquire(backend_addr, "h")
+            .await
+            .expect_err("second acquire must overflow");
+        assert!(
+            matches!(err, PoolError::Overflow { ref cluster, max: 1 } if cluster == "c"),
+            "expected Overflow, got {err:?}"
+        );
+        assert_eq!(cx_overflow.value(), 1, "cx_overflow ticks on cap-hit");
+        assert_eq!(cx_open.value(), 1, "cx_open still at cap after overflow");
+        // Drive the Drop destroy path: invalidate g1 so its Drop decrements
+        // established below the cap → cx_open returns to terminal-0.
+        g1.invalidate();
+        drop(g1);
+        assert_eq!(
+            cx_open.value(),
+            0,
+            "cx_open returns to 0 at the destroy decrement edge"
         );
     }
 
