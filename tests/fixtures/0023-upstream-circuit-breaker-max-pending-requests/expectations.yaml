@@ -1,0 +1,49 @@
+# Phase 15 fixture-0023 expectations: max_pending_requests:0 reject path
+# (ADR-0043 §6.2 finding 1). A single GET against a `max_pending_requests:0`
+# cluster is rejected by BOTH proxies with a 503 + the byte-exact 81-byte
+# "...reset reason: overflow" local-reply body + `x-envoy-overloaded: true`;
+# the backend is never contacted (`upstream_cx_total: 0`). `upstream_cx_overflow`
+# + `circuit_breakers.default.cx_open` stay inert-0 (no connection demand reaches
+# the cap — the pending-gate fires BEFORE the cap-check). Timing-robust: ONE GET,
+# no concurrency, no slow backend (lock-in #11).
+#
+# Driver `http1_keep_alive` (13.1 D10; extended at 14.2 Task 6 with the
+# per-request `expected_body` / `require_header_present` assertion fields). ONE
+# downstream keep-alive conn drives a single GET /; 200ms settle past the
+# request; bilateral admin stat scrape on the four circuit-breaker counters.
+#
+# CRITICAL serde form (14.2 Task 6): the per-request body rule
+# `Http1BodyRule::ByteExact` serializes as an internally-tagged map
+# `{ kind: byte_exact, body: "..." }`; `require_header_present` takes a single
+# (lower-cased) header NAME (presence-only).
+#
+# Wire-shape note (lock-in #9 / §0.C finding 3): Envoy's overflow-503 carries
+# `{x-envoy-overloaded, content-length:81, content-type:text/plain, date,
+# server:envoy}` (no `connection`); envoy-rust additionally emits a `connection`
+# header on its synth-503. The `Driver::Http1KeepAlive` body+header path asserts
+# the byte-exact body + the PRESENCE of `x-envoy-overloaded` only (it does NOT
+# perform a full header-set diff), so the extra `connection` header is tolerated
+# — the 0019/0022 synth-503 precedent is green with it.
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /
+      host: backend_cluster
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "upstream connect error or disconnect/reset before headers. reset reason: overflow" }
+      require_header_present: x-envoy-overloaded
+  settle_ms: 200
+  expected_stats:
+    - { name: cluster.backend_cluster.upstream_rq_pending_overflow,     value: 1 }
+    - { name: cluster.backend_cluster.upstream_cx_overflow,             value: 0 }
+    - { name: cluster.backend_cluster.upstream_cx_total,                value: 0 }
+    - { name: cluster.backend_cluster.circuit_breakers.default.cx_open, value: 0 }
+  # NOTE on the Envoy-only circuit_breakers.* gauge family (§0.C finding 6):
+  # Envoy always emits ~10 `circuit_breakers.{default,high}.{cx_open,
+  # cx_pool_open,rq_open,rq_pending_open,rq_retry_open}` gauges regardless of
+  # config; envoy-rust emits ONLY `default.cx_open` at phase-15 scope. The
+  # `Driver::Http1KeepAlive` stat path asserts ONLY the named `expected_stats`
+  # above and ignores every other emitted stat (no full set-diff), so those
+  # Envoy-only names need no allowlist here. The deferred siblings are recorded
+  # in docs/envoy-rust/BEHAVIOR_CONTRACT.md (Task 9).
