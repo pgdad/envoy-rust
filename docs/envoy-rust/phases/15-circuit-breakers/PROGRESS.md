@@ -277,7 +277,7 @@ x-envoy-overloaded` (a single string — `Http1KeepAliveRequest.require_header_p
 **Landed.** `tests/fixtures/0020-upstream-connection-pooling-and-per-class-counters/expectations.yaml`
 gains two `expected_stats` rows on cluster `backend_cluster` (which configures `circuit_breakers.thresholds:
 [{max_connections: 4}]` ⇒ envoy-rust registers both stats via Task 3's `is_some()` gate; Envoy
-always emits them): `cluster.echo.upstream_cx_overflow: 0` + `cluster.echo.circuit_breakers.default.cx_open:
+always emits them): `cluster.backend_cluster.upstream_cx_overflow: 0` + `cluster.backend_cluster.circuit_breakers.default.cx_open:
 0`. The sequential single-keep-alive-conn workload never trips the cap ⇒ both read 0 on BOTH proxies.
 
 **Verification — BILATERAL GREEN (Docker UP):**
