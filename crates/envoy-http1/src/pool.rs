@@ -188,10 +188,10 @@ impl Drop for PoolGuard {
                     *n = n.saturating_sub(1);
                     // 15 D4 (lock-in #6): clear cx_open when this decrement
                     // drops the per-endpoint count below max_connections.
-                    if *n < self.pool.max_connections {
-                        if let Some(g) = &self.pool.cx_open {
-                            g.set(0);
-                        }
+                    if *n < self.pool.max_connections
+                        && let Some(g) = &self.pool.cx_open
+                    {
+                        g.set(0);
                     }
                 }
             }
@@ -292,10 +292,10 @@ impl H1Pool {
             *n += 1;
             // 15 D4 (lock-in #6): at-cap inclusive — set cx_open=1 when this
             // increment makes the per-endpoint count reach max_connections.
-            if *n >= self.max_connections {
-                if let Some(g) = &self.cx_open {
-                    g.set(1);
-                }
+            if *n >= self.max_connections
+                && let Some(g) = &self.cx_open
+            {
+                g.set(1);
             }
         }
         // Connect (lock released — connect is the slow path).
@@ -308,10 +308,10 @@ impl H1Pool {
                     *n = n.saturating_sub(1);
                     // 15 D4 (lock-in #6): clear cx_open if the rollback drops
                     // the per-endpoint count below max_connections.
-                    if *n < self.max_connections {
-                        if let Some(g) = &self.cx_open {
-                            g.set(0);
-                        }
+                    if *n < self.max_connections
+                        && let Some(g) = &self.cx_open
+                    {
+                        g.set(0);
                     }
                 }
                 return Err(PoolError::Connect(e));
@@ -394,10 +394,10 @@ impl H1Pool {
                 *n = n.saturating_sub(evicted);
                 // 15 D4 (lock-in #6): clear cx_open when eviction drops the
                 // per-endpoint count below max_connections.
-                if *n < self.max_connections {
-                    if let Some(g) = &self.cx_open {
-                        g.set(0);
-                    }
+                if *n < self.max_connections
+                    && let Some(g) = &self.cx_open
+                {
+                    g.set(0);
                 }
             }
             for _ in 0..evicted {
