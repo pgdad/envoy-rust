@@ -1,0 +1,106 @@
+# Phase 15 (`15-circuit-breakers`) — PROGRESS
+
+> Running execution log. The state-2 PLAN-write commit lands this skeleton + the Task 1
+> preamble (the 04.3 → 14.2 standalone-PLAN-write cadence). The state-3 subagent-driven
+> execution arc appends one subsection per task (Tasks 1–10); Task 11 is the state-5 review +
+> state-6 close-out (later sessions).
+
+---
+
+## Task 1 preamble — PLAN-time SPEC corrections, §6.2 lock-ins, carryforward dispositions
+
+This preamble records the facts the phase-15 state-2 PLAN-write established by reading the
+ratified `SPEC.md` against the PLAN-time HEAD `35236eec3` (the phase-15 state-1 brainstorm) +
+the HEAVY §6.2 Docker empirical verification. It is the authoritative cold-start context for the
+state-3 implementer. **The SPEC is ratified and NOT edited; the §6.2 findings materially
+re-scoped the phase — read ADR-0043 + PLAN §0.B/§0.C BEFORE implementing.**
+
+### PLAN-write disposition
+
+- **State 2 → state 3.** `PLAN.md` + this `PROGRESS.md` skeleton + this Task 1 preamble land in
+  one standalone pre-Task-1 commit (mirrors 14.2 `9a56e85` / 13.2 `8c7d8a23`). The commit ALSO
+  lands **ADR-0043** (the §6.2 re-scope — a cadence departure from the docs-only 14.x PLAN-writes,
+  justified because §6.2 falsified the SPEC's central premise) + the ROADMAP row-15
+  `planned → in-progress` flip + summary update + the STATE advance. Commit title carries
+  **`[ADR-0043]`**.
+- **§6.1 split-gate verdict: NO SPLIT.** The re-scoped PLAN is **11 tasks / ~1100–1250 LoC**
+  (production ~430, tests/backstop ~520, fixture/docs ~300) — under the §6.1 ~1500-LoC /
+  ~25-task gate. The reserved **ADR-0044 (split) does NOT fire.**
+- **ADR posture: ADR-0043 lands at THIS commit** (DECISIONS.md ledger head `ADR-0042` → `ADR-0043`,
+  count 44; next available `ADR-0044`). No further ADR expected in the 15 lifecycle.
+- **Family/execution posture:** subagent-driven at state 3 (`feedback_execution_style`);
+  implementers dispatched SERIALLY (`feedback_serial_subagent_dispatch`); recommendation picked
+  at every borderline call (`feedback_pick_recommendation`, no fork — including the ADR-0043
+  re-scope itself).
+
+### The §6.2 finding that re-scoped the phase (ADR-0043; PLAN §0.B C-0 / §0.C)
+
+The SPEC §1/§2.1/§2.3 premise — `max_connections:1` + `max_pending_requests:0` + K=2 concurrent
+→ `{200, 503}` + `cluster.<name>.upstream_cx_overflow:1` — is **empirically FALSE** at
+`envoyproxy/envoy:v1.33.0`:
+
+1. **`max_pending_requests:0` rejects EVERY request** (K=1, K=2, sequential) with a 503; the
+   pool never warms; the backend is never contacted; `upstream_cx_total:0`, `upstream_cx_overflow:0`.
+   The live counter is **`upstream_rq_pending_overflow`**.
+2. The overflow-503 body is **NON-EMPTY**: the 81-byte `upstream connect error or
+   disconnect/reset before headers. reset reason: overflow` (no trailing newline) + the
+   `x-envoy-overloaded: true` header (the wire surfacing of the access-log-only `UO` flag).
+3. The bilateral `{200,503}` overflow fixture is **not achievable** without the deferred
+   pending-request queue (Envoy queues a cap-overflow; envoy-rust 503s immediately).
+
+**Re-scope (option c):** implement `max_pending_requests:0` FAITHFULLY (reject-on-establish →
+`upstream_rq_pending_overflow` + the 81-byte 503) and build the bilateral fixture around a
+SINGLE GET against a `max_pending_requests:0` cluster (both proxies 503; timing-robust, no
+concurrency, no slow backend). RETAIN the `upstream_cx_overflow` + `circuit_breakers.default.cx_open`
+observability (validated inert-0 bilaterally on fixtures 0020/0023; non-zero in-process only).
+DROP the SPEC's `Driver::Http1Concurrent` + `--hold-ms` knob. See PLAN §0.A/§0.B/§0.C.
+
+### PLAN-time SPEC corrections (PLAN §0.B; the 06.2 → 14.2 cadence)
+
+- **C-0** — the load-bearing ADR-0043 re-scope (above).
+- **C-1** — H2 overflow currently emits **502** (`synth_h2_502`, `http2/src/hcm.rs:368-380`),
+  contradicting ADR-0042 §0's "both arms already 503". Task 5 corrects to 503. Pre-existing,
+  differential-inert (no H2 overflow fixture).
+- **C-2** — the existing `cluster_circuit_breakers_rejects_phase13_deferred_threshold_fields`
+  test (`bootstrap.rs:9058`) uses `max_pending_requests: 5` to prove `deny_unknown_fields`;
+  Task 1 re-points it to `max_requests: 5` (still deferred) + adds the new validator test.
+- **C-3** — fixture renamed `0023-upstream-circuit-breaker-max-connections` →
+  `0023-upstream-circuit-breaker-max-pending-requests`.
+- **C-4** — `Driver::Http1Concurrent` (D6) + `--hold-ms` backend knob DROPPED (the fixture uses
+  the existing `Driver::Http1KeepAlive` single-GET shape; the backstop uses `tokio::join!`).
+- **C-5** — fuzz seed `cluster_circuit_breakers.yaml` extended IN PLACE with
+  `max_pending_requests: 0` (already `.gitignore`-allow-listed; corpus stays 22; stays in the
+  SUCCESS array — it parses clean).
+
+### §6.2 empirical lock-ins (PLAN §0.C; locked — do NOT re-verify)
+
+The 7-item findings: (1) `max_pending_requests:0` rejects all establish → `rq_pending_overflow`;
+(2) `cx_overflow` is a cap-hit counter, name+semantics matched, value-bilateral only at-0;
+(3) overflow-503 = 81-byte body + `x-envoy-overloaded:true`, `UO` access-log-only; (4) `cx_open`
+at-cap inclusive (`1` when `cx_active == max_connections`); (5) `max_connections` per-cluster/
+per-priority (single-endpoint fixture coincides); (6) full `circuit_breakers.*` = 10 always-emitted
+gauges (envoy-rust emits only `default.cx_open`); (7) overflow-rejected request does not
+increment `upstream_cx_total`.
+
+### Carryforward dispositions (PLAN §0.D; none gate phase 15)
+
+- Per-endpoint-vs-per-cluster `cx_open` reconciliation → future multi-endpoint phase
+  (single-endpoint fixtures sidestep it).
+- The `max_pending_requests > 0` pending-request QUEUE + the `{200,200}` bilateral overflow
+  fixture → the deferred pending-queue phase.
+- The standing multi-phase Minor inventory + the `upstream_cx_total` TCP carve-out + **ADR-0028**
+  carry forward unchanged; phase 15 closes none.
+
+### Task ledger (Tasks 1–10 land at state 3; one commit per task)
+
+1. envoy-config schema + validator (`max_pending_requests`, accept 0 / reject >0; C-2 fix).
+2. H1 pool `max_pending_requests:0` reject gate + `upstream_rq_pending_overflow`.
+3. H1 pool `upstream_cx_overflow` counter + `circuit_breakers.default.cx_open` gauge.
+4. H1 `synth_overflow()` 81-byte body + `x-envoy-overloaded` + router arms + BEHAVIOR_CONTRACT row.
+5. H2 pool + HCM mirror (incl. the 502→503 overflow correction).
+6. Fixture 0023 (single-GET `max_pending_requests:0` bilateral 503) + Docker wrapper.
+7. Fixture 0020 inert-0 `upstream_cx_overflow` + `cx_open` assertions.
+8. In-process backstop (pending-overflow path + cx-overflow path / `cx_open` both edges).
+9. Fuzz seed + BEHAVIOR_CONTRACT stat rows + the overflow-model divergence note.
+10. State-4 verification (incl. isolated-crate builds) + STATE advance.
+11. (later) state-5 review → state-6 close-out.
