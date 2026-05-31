@@ -1175,6 +1175,12 @@ pub struct CircuitBreakers {
 }
 
 /// 13.1 D1: a single circuit-breaker threshold entry. See `CircuitBreakers`.
+/// 15 D1: `max_pending_requests` added — accepts `0` ONLY (the no-queue carve-out;
+/// matches Envoy's reject-on-establish behavior per ADR-0043 §6.2 finding 1).
+/// `max_pending_requests > 0` (the pending-request queue) is rejected by the validator
+/// and deferred. Other phase-13/15-deferred fields (`max_requests`, `max_retries`,
+/// `max_connection_pools`, `track_remaining`, `retry_budget`) stay rejected by
+/// `deny_unknown_fields`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Thresholds {
@@ -1182,6 +1188,8 @@ pub struct Thresholds {
     pub priority: Option<RoutingPriority>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pending_requests: Option<u32>,
 }
 
 /// 13.1 D1: Envoy `RoutingPriority` enum. Phase-13 supports DEFAULT only; the
@@ -2604,6 +2612,14 @@ fn validate_circuit_breakers(cluster: &Cluster) -> Result<(), crate::ConfigError
             && value == 0
         {
             return Err(crate::ConfigError::InvalidMaxConnections {
+                cluster: cluster.name.clone(),
+                value,
+            });
+        }
+        if let Some(value) = t.max_pending_requests
+            && value > 0
+        {
+            return Err(crate::ConfigError::UnsupportedNonZeroMaxPendingRequests {
                 cluster: cluster.name.clone(),
                 value,
             });
@@ -9056,7 +9072,74 @@ admin:
 
     #[test]
     fn cluster_circuit_breakers_rejects_phase13_deferred_threshold_fields() {
-        // deny_unknown_fields rejects max_pending_requests etc.
+        // deny_unknown_fields rejects max_requests etc.
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - max_connections: 1
+            max_requests: 5
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_requests") || msg.contains("unknown field"),
+            "expected unknown-field error mentioning max_requests; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cluster_max_pending_requests_zero_accepted() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - max_connections: 1
+            max_pending_requests: 0
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8080 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap =
+            crate::parse_bootstrap(yaml).expect("max_pending_requests:0 must parse+validate");
+        assert_eq!(
+            bootstrap.static_resources.clusters[0]
+                .circuit_breakers
+                .as_ref()
+                .unwrap()
+                .thresholds[0]
+                .max_pending_requests,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn cluster_max_pending_requests_positive_rejected_by_validator() {
         let yaml = r#"
 static_resources:
   listeners: []
@@ -9074,16 +9157,14 @@ static_resources:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: 127.0.0.1, port_value: 1 }
+                    socket_address: { address: 127.0.0.1, port_value: 8080 }
 admin:
   address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
 "#;
-        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        let err =
+            crate::parse_bootstrap(yaml).expect_err("max_pending_requests>0 must be rejected");
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("max_pending_requests") || msg.contains("unknown field"),
-            "expected unknown-field error mentioning max_pending_requests; got: {msg}"
-        );
+        assert!(msg.contains("max_pending_requests"), "got: {msg}");
     }
 
     // --- 13.1 D2: validate_circuit_breakers ---

@@ -461,6 +461,13 @@ pub enum ConfigError {
     )]
     InvalidMaxConnections { cluster: String, value: u32 },
 
+    /// 15 D2: `max_pending_requests > 0` (the pending-request queue) is deferred per ADR-0043;
+    /// only `max_pending_requests: 0` (no-queue) is supported at phase-15 scope.
+    #[error(
+        "cluster '{cluster}': max_pending_requests={value} is unsupported; only 0 (no-queue) is accepted at this scope"
+    )]
+    UnsupportedNonZeroMaxPendingRequests { cluster: String, value: u32 },
+
     /// 14.1 D2 (parent-14 D2): outlier_detection.consecutive_5xx or
     /// outlier_detection.consecutive_gateway_failure is zero. Both detector thresholds
     /// must be >= 1 when present (the validator rejects `0`; absent is fine and means
