@@ -209,3 +209,30 @@ section (byte-exact body+status equivalence; `UO` flag is access-log-only → wi
   redone into a single clean commit).
 - `git show --stat HEAD` → `2 files changed` (`hcm.rs` +76, `BEHAVIOR_CONTRACT.md` +1). No
   pre-existing overflow test asserted an empty body (none needed updating).
+
+---
+
+## Task 5 — H2 pool + HCM mirror of Tasks 2–4 incl. 502→503 correction (commit `c32f2bfe8`)
+
+**Landed.** `crates/envoy-http2/src/pool.rs`: H2 `PoolError::PendingOverflow { cluster }`;
+`max_pending_requests` + the 3 `Option<Arc<..>>` stat handles + `DEFAULT_MAX_PENDING_REQUESTS=1024`;
+pending-gate AFTER the Phase-1 stream-slot-claim block and BEFORE the Phase-2 `max_connections`
+cap-check (lock-in #7); `cx_overflow.inc()` at the cap-check; `cx_open.set(1)` after `*n += 1`
+reaches cap; `cx_open.set(0)` at 3 decrement edges (connect-failure rollback, `H2PoolGuard::Drop`
+invalidate, sweeper eviction) under the established lock. Registered gated on `circuit_breakers.is_some()`.
+`crates/envoy-http2/src/hcm.rs`: `synth_h2_overflow()` (503 + 81-byte body + `x-envoy-overloaded:
+true`, NO `connection` header per the H2 synth convention, mirroring `synth_h2_502`); BOTH the
+`Overflow` and new `PendingOverflow` arms route to it via the `finalize_h2_stream` early-return —
+**correcting the pre-existing 502 (`synth_h2_502`) → 503** (C-1 / lock-in #10). 3 new tests
+(pending-overflow, cx_overflow/cx_open edges via H2 stream-slot saturation, synth_h2_overflow shape).
+
+**Verification (quoted):**
+- `cargo test -p envoy-http2` → `test result: ok. 57 passed; 0 failed; 1 ignored` (the 1 ignored is
+  the pre-existing `h2_protocol_options_max_concurrent_streams_applied`).
+- `cargo build -p envoy-http2` (standalone, lock-in #14) → `Finished`.
+- `cargo fmt --all -- --check` → clean (RC 0).
+- `git show --stat HEAD` → `2 files changed` (`hcm.rs` +82, `pool.rs` +327) — only envoy-http2.
+
+**Note (harness):** the implementer reported the harness garbled a large parallel tool batch and
+silently dropped two hcm.rs edits (surfaced as compile errors); re-applied + re-verified green.
+Consistent with `feedback_serial_subagent_dispatch`'s large-parallel-batch caveat.
