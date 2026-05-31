@@ -239,36 +239,43 @@ Consistent with `feedback_serial_subagent_dispatch`'s large-parallel-batch cavea
 
 ---
 
-## Task 6 — Bilateral fixture `0023` + Docker-gated wrapper (commit `3206e9e02`)
+## Task 6 — Bilateral fixture `0023` + Docker-gated wrapper (commit `46963f8e4`)
 
 **Landed (4 files).** `tests/fixtures/0023-upstream-circuit-breaker-max-pending-requests/{envoy.yaml,
 envoy-rust.yaml,expectations.yaml}` + `tests/differential/tests/upstream_circuit_breaker.rs`.
-Mirrors fixture-0020 topology (STRICT_DNS single endpoint → cluster `backend`, H1 HCM listener
-`/`→backend, admin) with the cluster's `circuit_breakers.thresholds: [{priority: DEFAULT,
+Mirrors fixture-0020 topology (STRICT_DNS single endpoint → cluster `backend_cluster`, H1 HCM
+listener `/`→backend, admin) with the cluster's `circuit_breakers.thresholds: [{priority: DEFAULT,
 max_connections: 1, max_pending_requests: 0}]`. The `expectations.yaml` drives a SINGLE GET via the
 existing `Driver::Http1KeepAlive` (lock-in #11) asserting `expected_status: 503` +
-`expected_body_exact` (the 81-byte overflow body) + `require_headers_present: [x-envoy-overloaded]`
-+ `expected_stats` (`upstream_rq_pending_overflow:1`, `upstream_cx_overflow:0`, `upstream_cx_total:0`,
-`circuit_breakers.default.cx_open:0`). Field names audited against `tests/differential/src/lib.rs`
-`Http1KeepAliveRequest` (the 14.2-added `expected_body_exact` / `require_headers_present` fields), not
-guessed. Wrapper mirrors `upstream_connection_pooling_and_per_class_counters.rs`.
+`expected_body: { kind: byte_exact, body: <81-byte overflow body> }` + `require_header_present:
+x-envoy-overloaded` (a single string — `Http1KeepAliveRequest.require_header_present` is
+`Option<String>`) + `expected_stats` on cluster `backend_cluster`
+(`upstream_rq_pending_overflow:1`, `upstream_cx_overflow:0`, `upstream_cx_total:0`,
+`circuit_breakers.default.cx_open:0`). Field names audited against `tests/differential/src/lib.rs:312-350`
+`Http1KeepAliveRequest`, not guessed. Wrapper mirrors `upstream_connection_pooling_and_per_class_counters.rs`.
 
 **Verification — BILATERAL GREEN (Docker UP, real Envoy v1.33.0):**
 - `cargo test -p differential --test upstream_circuit_breaker -- --nocapture` →
-  `test upstream_circuit_breaker_max_pending_requests ... ok` / `1 passed; 0 failed`. BOTH proxies
-  503 the GET with the byte-exact 81-byte body + `x-envoy-overloaded` + `upstream_rq_pending_overflow:1`;
-  backend never contacted (`upstream_cx_total:0`). **Acceptance signal (a) green.**
-- `cargo fmt --all -- --check` → clean.
-- `git show --stat HEAD` → `4 files changed, 171 insertions(+)` — only the 4 intended files.
-- **No ADR-0043 option-(b) fallback needed** — the overflow-form fixture worked bilaterally on the
-  first green run.
+  `test upstream_circuit_breaker_max_pending_requests_fixture ... ok` / `1 passed; 0 failed` (3.52s).
+  BOTH proxies 503 the GET with the byte-exact 81-byte body + `x-envoy-overloaded` +
+  `upstream_rq_pending_overflow:1`; backend never contacted (`upstream_cx_total:0`).
+  **Acceptance signal (a) green.**
+- `cargo fmt --all -- --check` → clean; `cargo build --workspace` green.
+- `git show --stat HEAD` → `4 files changed, 215 insertions(+)` — only the 4 intended files.
+- **No ADR-0043 option-(b) fallback needed** — the overflow-form fixture worked bilaterally.
+- **⚠ STALE-BINARY GOTCHA (load-bearing for Task 10 CI).** The differential harness locates the
+  subject binary at `target/<profile>/envoy-bin` and does NOT rebuild it (`tests/differential/src/subject.rs:56-81`).
+  The first 0023 run RED'd with envoy-rust rejecting `max_pending_requests` as "unknown field" — a
+  STALE `envoy-bin` predating Tasks 1–5, not a code defect; `cargo build -p envoy-bin` then re-run
+  → green. **Task 10's CI/differential run MUST rebuild `envoy-bin` (e.g. `cargo build --workspace`)
+  BEFORE the differential suite, or the same stale-binary RED recurs.**
 
 ---
 
-## Task 7 — Fixture 0020 inert-0 `upstream_cx_overflow` + `cx_open` assertions (commit `f4e9b2c1a`)
+## Task 7 — Fixture 0020 inert-0 `upstream_cx_overflow` + `cx_open` assertions (commit `47b878037`)
 
 **Landed.** `tests/fixtures/0020-upstream-connection-pooling-and-per-class-counters/expectations.yaml`
-gains two `expected_stats` rows on cluster `echo` (which configures `circuit_breakers.thresholds:
+gains two `expected_stats` rows on cluster `backend_cluster` (which configures `circuit_breakers.thresholds:
 [{max_connections: 4}]` ⇒ envoy-rust registers both stats via Task 3's `is_some()` gate; Envoy
 always emits them): `cluster.echo.upstream_cx_overflow: 0` + `cluster.echo.circuit_breakers.default.cx_open:
 0`. The sequential single-keep-alive-conn workload never trips the cap ⇒ both read 0 on BOTH proxies.
@@ -284,7 +291,7 @@ always emits them): `cluster.echo.upstream_cx_overflow: 0` + `cluster.echo.circu
 
 ---
 
-## Task 8 — In-process backstop (both overflow paths + `cx_open` both edges) (commit `8d1f4e6a2`)
+## Task 8 — In-process backstop (both overflow paths + `cx_open` both edges) (commit `bd730f4e9`)
 
 **Landed.** `crates/envoy-bin/tests/upstream_circuit_breaker.rs` (286 lines, 2 `#[tokio::test]` cases),
 booting envoy-bin via its library entrypoint with a retained `Arc<StatsRegistry>` handle (gauge
@@ -294,23 +301,31 @@ directly readable — no admin-scrape race; the §6.3 backstop rationale).
   (`server/date/content-length/content-type/connection`) + `upstream_rq_pending_overflow==1` +
   `upstream_cx_total==0` (backend never contacted).
 - **(b) cx-overflow (in-process only; Envoy serves {200,200}, bilaterally deferred):**
-  `max_connections:1` (default pending) + hold-capable in-test backend (reads, `sleep(400ms)`, 200) +
-  K=2 `tokio::join!` → status multiset `{200,503}` + `upstream_cx_overflow==1` + `cx_open`
-  observed **1 while saturated** (bounded poll, rising edge) and **0 after drain** (terminal-0,
-  falling edge).
+  `max_connections:1` (default pending) + hold-capable in-test backend (reads, `sleep(~800ms)`, 200) +
+  K=2 `tokio::join!` → status multiset `{200,503}` + `upstream_cx_overflow==1` + the `cx_open` RISING
+  edge observed **live == 1 while saturated** (concurrent mid-flight admin `/stats` scrape, bounded
+  poll). **Correction:** the `cx_open` FALLING edge to 0 is NOT re-observed in this in-process
+  backstop — a clean keep-alive 200 returns the upstream conn to the pool's IDLE list (not destroyed),
+  so `established` stays at the cap until the 60s idle-sweeper, which a fast backstop can't promptly
+  observe. The falling edge (→0) is covered instead by the Task-3 pool unit test
+  `cx_overflow_increments_and_cx_open_tracks_cap_edges` (drives the `PoolGuard::Drop` destroy
+  decrement via `invalidate()`); the backstop sanity-checks `cx_open` stays a well-formed 0/1 gauge.
+  So "both edges" are covered across the phase (rising live in the backstop, falling in the unit test).
 
 **Verification (quoted):**
 - `cargo test -p envoy-bin --test upstream_circuit_breaker` → `2 passed; 0 failed` (1.83s).
 - `cargo build -p envoy-bin` standalone → `Finished`; `cargo test -p envoy-bin` whole-crate → green,
   no regressions (existing backstops still ok).
 - `cargo fmt --all -- --check` → clean.
-- `git show --stat HEAD` → `1 file changed, 286 insertions(+)` — only the new test file.
-- **Flakiness control:** generous 400ms hold + bounded poll loops for BOTH edges (the 14.2
-  convergence-poll discipline); ran 5× green, no single-shot sleep asserts remain.
+- `git show --stat HEAD` → `1 file changed, 509 insertions(+)` — only the new test file.
+- **Flakiness control:** generous ~800ms hold + bounded poll loop for the rising edge (the 14.2
+  convergence-poll discipline); ran 4× green, no single-shot sleep asserts remain. Whole-crate
+  `cargo test -p envoy-bin` exit 0 (sibling subprocess tests like `access_log_file_sink` flake under
+  parallel whole-crate runs per `project_flaky_access_log_fixture_0012` — pre-existing, unrelated).
 
 ---
 
-## Task 9 — Fuzz seed + BEHAVIOR_CONTRACT 3 stat rows + overflow-model divergence note (commit `b1e9f3a07`)
+## Task 9 — Fuzz seed + BEHAVIOR_CONTRACT 3 stat rows + overflow-model divergence note (commit `2b98b5251`)
 
 **Landed.** `crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_circuit_breakers.yaml` extended
 IN PLACE: `max_pending_requests: 0` added to the DEFAULT-priority threshold entry (corpus stays 22;
@@ -323,9 +338,10 @@ overflow-503 BODY row (distinct section).
 
 **Verification (quoted):**
 - `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → `1 passed`.
-- `cargo test -p envoy-config` → `289 passed; 0 failed` (287 + the 2 Task-1 validator tests).
+- `cargo test -p envoy-config` → `287 passed; 0 failed` (lib unittests; doc-tests 0).
 - `cargo fmt --all -- --check` → clean.
-- `git show --stat HEAD` → `2 files changed, 14 insertions(+)` — only the seed + BEHAVIOR_CONTRACT.
+- `git show --stat HEAD` → `2 files changed, 11 insertions(+)` — only the seed (`+1`, extends the
+  existing `max_connections: 4` DEFAULT threshold in place) + BEHAVIOR_CONTRACT (`+10`).
 
 ---
 
@@ -335,7 +351,7 @@ All NINE implementation/verification tasks (1–9) landed, one TDD commit + one 
 each, dispatched SERIALLY via `superpowers:subagent-driven-development` (`feedback_serial_subagent_dispatch`).
 Commit chain (task commits; each followed by its `…: PROGRESS subsection` docs commit):
 `0c46b7bc1`(T1) · `1e37cf4bc`(T2) · `db3ff1af6`(T3) · `9f284759c`(T4) · `c32f2bfe8`(T5) ·
-`3206e9e02`(T6) · `f4e9b2c1a`(T7) · `8d1f4e6a2`(T8) · `b1e9f3a07`(T9).
+`46963f8e4`(T6) · `47b878037`(T7) · `bd730f4e9`(T8) · `2b98b5251`(T9).
 
 **Headline results:** fixture 0023 BILATERALLY GREEN vs real Envoy v1.33.0 (acceptance signal (a));
 fixture 0020 inert-0 assertions bilaterally green (signal (b) for the new stats); in-process backstop
