@@ -365,16 +365,60 @@ async fn handle_one_stream(
                                     );
                                     Err(format!("{source}"))
                                 }
+                                // 15 D5 (lock-in #10 / C-1): cap-overflow — NO
+                                // connect was attempted (the pool refused the
+                                // acquire before reaching Client::connect), so
+                                // cx_total intentionally does not fire (it lives
+                                // inside the pool's connect-on-miss path). EARLY
+                                // return the byte-exact overflow-503 via
+                                // finalize_h2_stream (mirrors the synth_h2_502
+                                // early-return below). This CORRECTS the pre-15
+                                // 502 (which funnelled through synth_h2_502) to a
+                                // 503, matching the H1 synth_overflow arm.
                                 Err(crate::pool::PoolError::Overflow { cluster: cl, max }) => {
                                     tracing::warn!(
                                         cluster = %cl,
                                         max = %max,
-                                        "H2 pool overflow",
+                                        "H2 pool overflow — emitting 503",
                                     );
-                                    Err(format!(
-                                        "H2 pool overflow at cluster '{cl}' \
-                                         (max_connections={max})",
-                                    ))
+                                    let r = synth_h2_overflow();
+                                    cluster.record_response(endpoint, r.status);
+                                    return finalize_h2_stream(
+                                        &config,
+                                        &mut pipeline,
+                                        send_response,
+                                        r,
+                                        req_arrival_instant,
+                                        req_arrival_systime,
+                                        &envoy_req,
+                                        request_body_len,
+                                        upstream_host_for_log_h2,
+                                    )
+                                    .await;
+                                }
+                                // 15 D5 (lock-in #10): max_pending_requests:0
+                                // reject-on-establish. Like the cap-overflow arm,
+                                // no connect was attempted; cx_total does not
+                                // fire. EARLY return the same overflow-503.
+                                Err(crate::pool::PoolError::PendingOverflow { cluster: cl }) => {
+                                    tracing::warn!(
+                                        cluster = %cl,
+                                        "H2 pending-request overflow (max_pending_requests:0) — emitting 503",
+                                    );
+                                    let r = synth_h2_overflow();
+                                    cluster.record_response(endpoint, r.status);
+                                    return finalize_h2_stream(
+                                        &config,
+                                        &mut pipeline,
+                                        send_response,
+                                        r,
+                                        req_arrival_instant,
+                                        req_arrival_systime,
+                                        &envoy_req,
+                                        request_body_len,
+                                        upstream_host_for_log_h2,
+                                    )
+                                    .await;
                                 }
                             },
                             None => {
@@ -678,6 +722,34 @@ fn synth_h2_502() -> Response {
             ("content-type".to_string(), "text/plain".to_string()),
         ],
         body: Bytes::from_static(b""),
+    }
+}
+
+/// 15 D5 (lock-in #10 / C-1; ADR-0043 §6.2 finding 3): the `max_connections` /
+/// `max_pending_requests:0` overflow synth-503 on the H2 path — the H2 sibling
+/// of `envoy_http1::hcm::synth_overflow`. Body is the byte-exact 81-byte Envoy
+/// local-reply `upstream connect error or disconnect/reset before headers.
+/// reset reason: overflow` (no trailing newline), plus `content-length` +
+/// `x-envoy-overloaded: true` (the wire surfacing of Envoy's access-log-only
+/// `UO` response flag). Mirrors `synth_h2_502`'s header construction — the H2
+/// synth convention OMITS the `connection` header (H2 has its own connection
+/// lifecycle). Routed from BOTH the H2 pool cap-overflow arm AND the
+/// pending-overflow arm; this CORRECTS the pre-15 502 (which funnelled through
+/// `synth_h2_502`) to a 503.
+fn synth_h2_overflow() -> Response {
+    let body = Bytes::from_static(
+        b"upstream connect error or disconnect/reset before headers. reset reason: overflow",
+    );
+    Response {
+        status: 503,
+        reason: None,
+        headers: vec![
+            ("server".to_string(), "envoy-rust".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("content-length".to_string(), body.len().to_string()),
+            ("x-envoy-overloaded".to_string(), "true".to_string()),
+        ],
+        body,
     }
 }
 
