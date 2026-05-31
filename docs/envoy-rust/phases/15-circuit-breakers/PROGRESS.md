@@ -363,3 +363,89 @@ build/clippy/fmt/test/deny + the 3 standalone crate builds + the 23-fixture Dock
 + h2spec ≥95% + parse_bootstrap fuzz short-budget, with real CI-run-URL + HEAD-SHA + per-gate quoted
 evidence per §6.6) → then STATE advance to state-5-next. Task 11 (state-5 review → state-6 close) is
 a later session. **Do NOT restart from Task 1.**
+
+---
+
+## Task 10 — State-4 phase-done verification + STATE advance (commit `<this>`)
+
+**Landed.** The §7.5 (a)–(f) gate set ran FRESH at the verification HEAD. State-4 verification
+**surfaced one defect** (a clippy lint never run during the state-3 per-task arc) — fixed in-place,
+re-verified, and CI-confirmed green before the STATE advance.
+
+### Verification-surfaced defect — clippy `collapsible_if` (fixed at `655cea7e1`)
+
+The FIRST `cargo clippy --workspace --all-targets --all-features -- -D warnings` against the phase-15
+code (clippy is a state-4 / §7.5(e) gate — the per-task state-3 "Verification (quoted)" blocks ran
+`cargo build`/`cargo test`/`cargo fmt` but **never clippy**) flagged **8** `clippy::collapsible_if`
+errors: the Task-3/5 `cx_open` edge blocks were written as nested
+`if *n {<>}= max { if let Some(g) = &cx_open { g.set(..) } }` — 4 sites in
+`crates/envoy-http1/src/pool.rs` (lines 191/295/311/397) + 4 mirror sites in
+`crates/envoy-http2/src/pool.rs` (177/396/412/547). Under toolchain 1.95.0, `collapsible_if`
+(`-D warnings`) flags these as collapsible into let-chains. The lib **compiles fine** (it is a pure
+style lint) — `cargo build --workspace --all-targets` was green; only clippy is strict. This RED-failed
+the first push's CI run `26716702937` (HEAD `77bf9412d`) at the `clippy` step (exit 101).
+
+Diagnosed via `superpowers:systematic-debugging`. Root cause: toolchain UNCHANGED (1.95.0 pinned since
+bootstrap `b42f18d17`; clippy `0.1.95`) — not a regression, simply the first clippy run on the new code.
+Fix (`655cea7e1`): collapse each of the 8 sites into a let-chain
+(`if *n {<>}= max && let Some(g) = &cx_open { g.set(..) }`), which 1.95.0 supports (let_chains
+stabilized 1.88). Behavior-identical mechanical refactor (the collapsed form is semantically the same
+short-circuit). Re-verified: `cargo test -p envoy-http1` `87 passed; 0 failed`,
+`cargo test -p envoy-http2` `57 passed; 0 failed; 1 ignored`; `cargo fmt` normalized the let-chain form;
+diff `2 files changed, 32 insertions(+), 32 deletions(-)`. Recorded as memory
+`project_state3_arc_skips_clippy` for future state-3 arcs.
+
+### Local gate evidence (fresh at the fixed tree, quoted)
+
+- `cargo build --workspace --all-targets` → `Finished` (rc 0).
+- **Standalone crate builds (lock-in #14 — `project_isolated_crate_build_blindspot`):**
+  `cargo build -p envoy-config` rc 0 · `cargo build -p envoy-http1` rc 0 ·
+  `cargo build -p envoy-http2` rc 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished`, **rc 0**
+  (was 4 errors pre-fix; 0 after).
+- `cargo fmt --all -- --check` → rc 0.
+- `cargo test --workspace` → all green EXCEPT the **known 13.2 in-process backstop flake**
+  `upstream_h2_connection_pooling` (`crates/envoy-bin/tests/upstream_h2_connection_pooling.rs:296`
+  `backend ready: ConnectionRefused`, 30.45s = the `cargo run --manifest-path http2-echo-server`
+  compile-on-demand 30s budget exceeded under build-lock pressure). **Proven environmental, not a
+  regression:** pre-building the backend (`cargo build --manifest-path tests/helpers/http2-echo-server/Cargo.toml`)
+  then re-running the test in isolation → `1 passed; 0 failed; finished in 2.06s` (matches the
+  documented `1 passed, 2.05s`). It is an in-process backstop (not a differential fixture) and CI does
+  not see it. The phase-15 differential acceptance fixture `upstream_circuit_breaker` (0023) passed in
+  the local Docker run, alongside every prior differential fixture.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (rc 0).
+- `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` (crates/envoy-config) →
+  `Done 417097 runs in 31 second(s)`, 0 crashes, on the extended corpus.
+
+### CI evidence (§6.6 / 05.3→14.2 discipline — authoritative Docker-gated surface)
+
+- **Run URL:** https://github.com/pgdad/envoy-rust/actions/runs/26717619099
+- **HEAD SHA:** `655cea7e1c999669fb1c6bb12f2f02e73b02b40f` (the clippy-fix HEAD)
+- **Trigger / completion:** push to `main`; `createdAt 2026-05-31T16:08:43Z` →
+  `updatedAt 2026-05-31T16:11:43Z`; **`status=completed`, `conclusion=success`.**
+- **Per-step conclusions, job `build + test + lint` [success], 2m57s:** `fmt` success · `clippy`
+  success · `build` success · `install h2spec` success · **`test (includes differential harness →
+  Docker)` success** · `cargo deny check` success.
+- **Per-step, job `fuzz (parse_bootstrap, 30s)` [success], 1m17s:** `fuzz parse_bootstrap` success.
+- No `0012`-flake (`project_flaky_access_log_fixture_0012`) surfaced; no rerun needed.
+
+### §7.5 acceptance gates (a)–(f)
+
+- **(a)** new fixture `0023-upstream-circuit-breaker-max-pending-requests` GREEN — bilaterally vs
+  `envoyproxy/envoy:v1.33.0` (CI `test` step + local Docker run `upstream_circuit_breaker ... ok`).
+- **(b)** all 22 pre-existing fixtures (`0001`–`0022`) GREEN simultaneously (CI `test` step; the
+  differential harness runs the full fixture set under Docker).
+- **(c)** h2spec ≥95% held vacuously — phase 15 touched no H2 framing/codec, only HCM post-dispatch +
+  pool-edge logic (h2spec installed + exercised in the CI `test` step; no new H2-framing surface).
+- **(d)** `parse_bootstrap` fuzz clean short-budget (CI `fuzz` job + local `Done 417097 runs`, 0
+  crashes).
+- **(e)** `cargo build --workspace --all-targets` + `clippy -D warnings` + `fmt --check` +
+  `cargo test --workspace` + `cargo deny check` all clean (local + CI; the lone local `cargo test`
+  failure is the proven non-regression h2 backstop env flake).
+- **(f)** `REVIEW.md` — NOT this state; landed at state 5 (Task 11, next session).
+
+Gates (a)–(e) satisfied → state-4 verification COMPLETE. STATE advanced to `15` state-4-complete /
+state-5-next (next-skill `superpowers:requesting-code-review`). **No new ADR** (verification +
+mechanical lint fix; DECISIONS.md ledger head stays **ADR-0043**). Next session enters **state 5** —
+`superpowers:requesting-code-review` over the Task 1–10 commit range (`0c46b7bc1..<Task-10 commit>`,
+including the `655cea7e1` clippy fix); per §5.1 this session EXITS after the STATE advance.
