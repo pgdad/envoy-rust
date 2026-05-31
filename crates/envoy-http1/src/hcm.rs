@@ -559,6 +559,20 @@ async fn serve_connection(
                                         );
                                         Err(synth_status(503, close))
                                     }
+                                    // 15 D3 (Task 2): max_pending_requests:0
+                                    // reject-on-establish. Like the cap-overflow
+                                    // arm above, NO connect was attempted, so
+                                    // `cx_total` does not fire. Both overflow
+                                    // variants are "overflow" 503s; Task 4
+                                    // refines both to the byte-exact 81-byte
+                                    // `synth_overflow` body.
+                                    Err(crate::pool::PoolError::PendingOverflow { .. }) => {
+                                        tracing::warn!(
+                                            cluster = %cluster.name(),
+                                            "pending-request overflow (max_pending_requests:0) — returning 503",
+                                        );
+                                        Err(synth_status(503, close))
+                                    }
                                 },
                                 None => {
                                     // No pool entry for this cluster (e.g.,

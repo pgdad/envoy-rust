@@ -20,6 +20,10 @@ use tokio_util::sync::CancellationToken;
 
 /// Phase-13 hardcoded H1 pool defaults (§5.4 + §2 item-iii deferral).
 const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
+/// 15 D3: default `max_pending_requests` for clusters without circuit-breakers
+/// config. Matches Envoy's default + the as-today behavior (the reject gate
+/// never fires unless explicitly set to 0). See lock-in #4.
+const DEFAULT_MAX_PENDING_REQUESTS: u32 = 1024;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Sweeper tick interval: `idle_timeout / 4` (15s at the default 60s timeout).
 const SWEEPER_DIVISOR: u32 = 4;
@@ -30,6 +34,10 @@ pub enum PoolError {
     /// Pool is at `max_connections` AND no idle stream available.
     #[error("upstream pool overflow: cluster='{cluster}', max_connections={max}")]
     Overflow { cluster: String, max: u32 },
+    /// Pool's `max_pending_requests` is 0 and a new connection must be established
+    /// (no idle stream to reuse). Envoy reject-on-establish parity (ADR-0043 §6.2 finding 1).
+    #[error("upstream pending-request overflow: cluster='{cluster}' (max_pending_requests=0)")]
+    PendingOverflow { cluster: String },
     /// `Client::connect()` failed on the connect-on-miss branch.
     #[error(transparent)]
     Connect(#[from] Http1Error),
@@ -45,6 +53,12 @@ struct IdleEntry {
 pub struct H1Pool {
     cluster_name: String,
     max_connections: u32,
+    /// 15 D3: `max_pending_requests` cap. Only `0` (no-queue) is meaningful at
+    /// phase-15 scope (the validator rejects `> 0`); `0` rejects every
+    /// connect-on-miss with `PendingOverflow`. Defaults to
+    /// `DEFAULT_MAX_PENDING_REQUESTS` (1024) for unconfigured clusters → the
+    /// gate never fires (lock-in #4).
+    max_pending_requests: u32,
     idle_timeout: Duration,
     /// Per-endpoint idle list. 13.2 A-I3 closure: switched from
     /// `tokio::sync::Mutex` to `parking_lot::Mutex` so the per-acquire
@@ -68,6 +82,15 @@ pub struct H1Pool {
     /// Per-cluster `upstream_cx_active` gauge handle — shared Arc with `Cluster.cx_active`.
     /// Each `PoolGuard` owns a `ConnGaugeGuard` created via this handle.
     cx_active: Arc<envoy_stats::Gauge>,
+    /// 15 D3: per-cluster `upstream_rq_pending_overflow` counter, registered
+    /// ONLY for clusters whose `circuit_breakers` is configured (lock-in #4 —
+    /// inert-when-unconfigured). `None` for unconfigured clusters; the
+    /// reject gate short-circuits on `max_pending_requests != 0` (default
+    /// 1024) before this is ever touched, so an unconfigured cluster never
+    /// reaches an `unwrap`. (`envoy_stats::Counter::new()` is `pub(crate)`,
+    /// so a throwaway unregistered handle cannot be built here — the `Option`
+    /// is the documented fallback per the PLAN Step 6 caveat.)
+    rq_pending_overflow: Option<Arc<envoy_stats::Counter>>,
 }
 
 /// Per-acquire RAII handle. Owns one `ConnGaugeGuard` (gauge decrements on
@@ -149,18 +172,22 @@ impl H1Pool {
     /// Build a new pool. `cx_total`/`cx_active` come from the existing cluster
     /// stat handles (shared `Arc`); `cx_destroy`/`cx_http1_total` are
     /// registered by the caller (see `H1PoolManager::for_bootstrap`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cluster_name: String,
         max_connections: u32,
+        max_pending_requests: u32,
         idle_timeout: Duration,
         cx_total: Arc<envoy_stats::Counter>,
         cx_destroy: Arc<envoy_stats::Counter>,
         cx_http1_total: Arc<envoy_stats::Counter>,
         cx_active: Arc<envoy_stats::Gauge>,
+        rq_pending_overflow: Option<Arc<envoy_stats::Counter>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             cluster_name,
             max_connections,
+            max_pending_requests,
             idle_timeout,
             idle: parking_lot::Mutex::new(HashMap::new()),
             established: parking_lot::Mutex::new(HashMap::new()),
@@ -168,6 +195,7 @@ impl H1Pool {
             cx_destroy,
             cx_http1_total,
             cx_active,
+            rq_pending_overflow,
         })
     }
 
@@ -196,6 +224,21 @@ impl H1Pool {
                     _cx_active_guard,
                 });
             }
+        }
+        // 15 D3 (lock-in #7): max_pending_requests:0 reject-on-establish. A new
+        // connection must be established (no idle stream); under
+        // max_pending_requests:0 Envoy rejects before any connect (ADR-0043 §6.2
+        // finding 1). Fires BEFORE the cap-check so upstream_cx_overflow stays 0
+        // (no connection demand reaches the cap). For unconfigured clusters
+        // max_pending_requests defaults to 1024, so this branch is dead and the
+        // `rq_pending_overflow` Option is never touched.
+        if self.max_pending_requests == 0 {
+            if let Some(counter) = &self.rq_pending_overflow {
+                counter.inc();
+            }
+            return Err(PoolError::PendingOverflow {
+                cluster: self.cluster_name.clone(),
+            });
         }
         // Connect-on-miss: enforce cap.
         {
@@ -361,6 +404,26 @@ impl H1PoolManager {
                 .and_then(|cb| cb.thresholds.first())
                 .and_then(|t| t.max_connections)
                 .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+            let max_pending_requests = cfg
+                .circuit_breakers
+                .as_ref()
+                .and_then(|cb| cb.thresholds.first())
+                .and_then(|t| t.max_pending_requests)
+                .unwrap_or(DEFAULT_MAX_PENDING_REQUESTS);
+            // 15 D3 (lock-in #4): register upstream_rq_pending_overflow ONLY when
+            // circuit_breakers is configured (inert-when-unconfigured). Unconfigured
+            // clusters get `None` — and never reach the gate (max_pending_requests
+            // defaults to 1024). `Counter::new()` is pub(crate), so a throwaway
+            // unregistered handle can't be built here; `Option` is the documented
+            // fallback per the PLAN Step 6 caveat.
+            let rq_pending_overflow = if cfg.circuit_breakers.is_some() {
+                Some(registry.register_counter(&format!(
+                    "cluster.{}.upstream_rq_pending_overflow",
+                    cfg.name
+                ))?)
+            } else {
+                None
+            };
             let cx_destroy =
                 registry.register_counter(&format!("cluster.{}.upstream_cx_destroy", cfg.name))?;
             let cx_http1_total = registry
@@ -385,11 +448,13 @@ impl H1PoolManager {
             let pool = H1Pool::new(
                 cfg.name.clone(),
                 max_connections,
+                max_pending_requests,
                 DEFAULT_IDLE_TIMEOUT,
                 cx_total,
                 cx_destroy,
                 cx_http1_total,
                 cx_active,
+                rq_pending_overflow,
             );
             sweepers.push(pool.spawn_idle_sweeper(token.clone()));
             pools.insert(cfg.name.clone(), pool);
@@ -448,13 +513,54 @@ mod tests {
         let pool = H1Pool::new(
             cluster.to_string(),
             max_connections,
+            DEFAULT_MAX_PENDING_REQUESTS,
             idle_timeout,
             Arc::clone(&cx_total),
             Arc::clone(&cx_destroy),
             Arc::clone(&cx_http1_total),
             Arc::clone(&cx_active),
+            None,
         );
         (pool, cx_total, cx_destroy, cx_http1_total, cx_active)
+    }
+
+    /// 15 D3: build a pool with a configured `max_pending_requests` + a
+    /// registered `upstream_rq_pending_overflow` counter handle (the
+    /// circuit-breakers-configured shape). Returns the pool + the counter
+    /// handle so tests can assert the overflow count.
+    fn mk_pool_pending(
+        cluster: &str,
+        max_connections: u32,
+        max_pending_requests: u32,
+    ) -> (Arc<H1Pool>, Arc<envoy_stats::Counter>) {
+        let registry = envoy_stats::StatsRegistry::new();
+        let cx_total = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_cx_total"))
+            .unwrap();
+        let cx_destroy = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_cx_destroy"))
+            .unwrap();
+        let cx_http1_total = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_cx_http1_total"))
+            .unwrap();
+        let cx_active = registry
+            .register_gauge(&format!("cluster.{cluster}.upstream_cx_active"))
+            .unwrap();
+        let rq_pending_overflow = registry
+            .register_counter(&format!("cluster.{cluster}.upstream_rq_pending_overflow"))
+            .unwrap();
+        let pool = H1Pool::new(
+            cluster.to_string(),
+            max_connections,
+            max_pending_requests,
+            Duration::from_secs(60),
+            cx_total,
+            cx_destroy,
+            cx_http1_total,
+            cx_active,
+            Some(Arc::clone(&rq_pending_overflow)),
+        );
+        (pool, rq_pending_overflow)
     }
 
     /// In-process echo backend that responds to each request with a minimal
@@ -525,6 +631,32 @@ mod tests {
             .await
             .expect_err("second acquire must overflow");
         assert!(matches!(err, PoolError::Overflow { ref cluster, max: 1 } if cluster == "c"));
+    }
+
+    /// 15 D3 (lock-in #7): under `max_pending_requests:0` the first
+    /// connect-on-miss is rejected with `PoolError::PendingOverflow` BEFORE
+    /// any connect (the backend is never dialed) and the
+    /// `upstream_rq_pending_overflow` counter ticks to 1.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_rejects_with_pending_overflow_when_max_pending_requests_zero() {
+        let (pool, rq_pending_overflow) = mk_pool_pending("c", 1, 0);
+        // Unroutable endpoint: must never be dialed. If the gate fails to
+        // fire, the connect to 127.0.0.1:1 would error with Connect, not
+        // PendingOverflow — so the assertion below catches a missing gate.
+        let endpoint: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let err = pool
+            .acquire(endpoint, "c")
+            .await
+            .expect_err("max_pending_requests:0 must reject");
+        assert!(
+            matches!(err, PoolError::PendingOverflow { ref cluster } if cluster == "c"),
+            "expected PendingOverflow, got {err:?}"
+        );
+        assert_eq!(
+            rq_pending_overflow.value(),
+            1,
+            "upstream_rq_pending_overflow must read 1 after the reject"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
