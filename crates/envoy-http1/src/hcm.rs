@@ -4144,4 +4144,57 @@ static_resources:
             "limit_exceeded 0"
         );
     }
+
+    /// 16 (connect-failure retry): cluster endpoint is 127.0.0.1:1 (kernel-
+    /// refused — a deterministic connect failure), retry_on "connect-failure",
+    /// num_retries 1. The connect failure MUST classify as
+    /// `AttemptOutcome::ConnectFailure` and therefore be retriable under
+    /// `connect-failure` (without `reset`). Asserts: downstream synth-502,
+    /// upstream_rq_retry=1 (the retry fired → ConnectFailure classification),
+    /// limit_exceeded=1 (the retried attempt also refused), retry_success=0,
+    /// upstream_rq_total=0 (no upstream RESPONSE was ever received). Sibling of
+    /// H2's `h2_connect_failure_retried_on_connect_failure_policy`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_failure_retried_on_connect_failure_policy() {
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", 1).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry(
+            "/",
+            "backend",
+            Some(envoy_config::RetryPolicy {
+                retry_on: "connect-failure".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "downstream must be synth-502 after exhausting connect-failure retries: {s}"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry().value(),
+            1,
+            "retry fired — connect failure classified as ConnectFailure (retriable under connect-failure)"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            1,
+            "limit_exceeded — retried attempt also refused"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_success().value(),
+            0,
+            "retry_success 0 — never succeeded"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            0,
+            "rq_total 0 — no upstream response was ever received"
+        );
+    }
 }

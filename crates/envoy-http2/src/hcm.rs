@@ -129,6 +129,290 @@ enum H2RequestPath {
     SynthFromDecode(Response),
 }
 
+/// 16 Task 5: outcome of one upstream attempt inside the H2 retry loop.
+///
+/// H2-local mirror of envoy-http1's `AttemptResult` (envoy-http2 must NOT
+/// depend on envoy-http1's internal struct; signpost 10 keeps the two HCM
+/// types separate). Pure data carrier returned by [`run_h2_attempt`]; the
+/// caller (`handle_one_stream`'s proxy arm) drives all counters /
+/// `record_response` / retry classification from these fields so the
+/// per-attempt lifecycle (pick → dispatch [H1-or-H2 fork] → receive →
+/// classify) lives in one place.
+struct H2AttemptResult {
+    /// The downstream response (proxied or synth) produced by this attempt.
+    response: Response,
+    /// The endpoint this attempt picked, if any. `None` ONLY on the
+    /// `pick() -> None` path (no endpoint to attribute): the caller then skips
+    /// both `record_response` and the `%UPSTREAM_HOST%` log capture. `Some` on
+    /// every path that reached an endpoint (connect-fail, send-fail (Reset),
+    /// overflow, real response).
+    endpoint: Option<std::net::SocketAddr>,
+    /// This attempt's classifiable outcome for the retry decision. `Some` for
+    /// the picked-endpoint paths (upstream Response, connect-failure →
+    /// ConnectFailure, send/reset → Reset); `None` for `pick() -> None` and
+    /// pool-overflow synth paths (terminal, not retriable — mirrors the H1
+    /// carve-out).
+    outcome: Option<envoy_config::AttemptOutcome>,
+    /// `true` iff a real upstream RESPONSE was received (gates the per-attempt
+    /// `upstream_rq_total` tick — lock-in #5). Connect-fail / send-fail and
+    /// overflow synths leave this `false`.
+    upstream_response: bool,
+}
+
+/// 16 Task 5: run ONE upstream attempt on the H2 path — pick an endpoint,
+/// dispatch over the cluster's upstream protocol (H1-or-H2 fork lives INSIDE
+/// here so the retry loop stays protocol-agnostic), and translate the upstream
+/// response into a downstream `Response`. Pure of all counter side effects
+/// EXCEPT the `cluster.cx_total().inc()` per-call/connect-on-miss ticks (which
+/// have always lived on those connect boundaries); every other counter and the
+/// `record_response` hook are driven by the caller from [`H2AttemptResult`].
+///
+/// Mirrors envoy-http1's `run_attempt`. The H1 hop-by-hop strip + outbound
+/// request rebuild happen per attempt (the prior attempt's `out_req` was moved
+/// into `send_request`).
+async fn run_h2_attempt(
+    config: &HCMConfig,
+    cluster: &envoy_cluster::ClusterHandle,
+    cluster_name: &str,
+    envoy_req: &Request,
+    host_header: &str,
+) -> H2AttemptResult {
+    // Re-pick the endpoint each attempt — Envoy re-runs LB on every retry.
+    // On `pick() -> None`, no endpoint is attributable: emit the H2 synth-502
+    // (preserving the pre-phase-16 H2 pick-none shape) and return (not
+    // retriable; no record_response).
+    let Some(endpoint) = cluster.pick_endpoint() else {
+        tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
+        return H2AttemptResult {
+            response: synth_h2_502(),
+            endpoint: None,
+            outcome: None,
+            upstream_response: false,
+        };
+    };
+
+    // Build the outbound request: strip H1 hop-by-hop headers (Connection,
+    // Transfer-Encoding) mirroring envoy-http1's run_attempt. The H2 request
+    // body is a buffered `Bytes` — replay is free, each attempt re-clones.
+    let mut out_headers = envoy_req.headers.clone();
+    out_headers.retain(|(n, _)| {
+        !n.eq_ignore_ascii_case("connection") && !n.eq_ignore_ascii_case("transfer-encoding")
+    });
+    let out_req = envoy_http1::codec::Request {
+        method: envoy_req.method.clone(),
+        path: envoy_req.path.clone(),
+        version: envoy_http1::codec::HttpVersion::Http11,
+        headers: out_headers,
+        bytes_consumed: 0,
+        body: envoy_req.body.clone(),
+    };
+
+    // 13.2 D6 lock-in #8: the outer cx_active guard fires only on the H1 fork
+    // (per-call connect); the H2 fork's PoolGuard owns its own ConnGaugeGuard.
+    // Declared HERE so it drops AFTER the per-attempt stream closes. (See the
+    // pre-Task-5 comment block for the full rationale — unchanged.)
+    let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> = match cluster.upstream_protocol() {
+        envoy_cluster::UpstreamProtocol::Http1 => Some(cluster.cx_active_guard()),
+        envoy_cluster::UpstreamProtocol::Http2 => None,
+    };
+
+    let start = Instant::now();
+
+    // Per-attempt dispatch. The H1-or-H2 fork is INSIDE the attempt; the retry
+    // loop above is protocol-agnostic.
+    //
+    // 16: connect failures and send/recv failures classify DISTINCTLY, mirroring
+    // envoy-http1's `run_attempt` `AcquireOutcome` split. A connect failure (TCP
+    // connect / pool connect error, BEFORE any request bytes left) →
+    // `AttemptOutcome::ConnectFailure`; a post-connect send/recv failure →
+    // `AttemptOutcome::Reset`. Collapsing both into Reset (the pre-16 H2 shape)
+    // made `retry_on: connect-failure` (without `reset`) retry on H1 but NOT on
+    // H2 — an observable cross-protocol asymmetry. The synth response shape on
+    // every failure path is unchanged (synth_h2_502 / synth_h2_overflow).
+    //
+    // `Sent` carries the post-acquire send_request result (Ok = real response;
+    // Err = send/recv failure → Reset). `ConnectFailure` is the connect-boundary
+    // failure → ConnectFailure. `Overflow` is the byte-exact overflow-503 synth
+    // (terminal, not retriable — mirrors the H1 overflow carve-out).
+    enum AcquireOutcome {
+        // The upstream connected and send_request resolved (Ok = real response;
+        // Err = post-connect send/recv failure to be classified as Reset).
+        Sent(Result<envoy_http1::Response, String>),
+        // Connect-boundary failure (no request bytes left) → ConnectFailure.
+        ConnectFailure,
+        // Pool cap / pending overflow — terminal synth-503 (not retriable).
+        Overflow(Response),
+    }
+
+    let acquire: AcquireOutcome = match cluster.upstream_protocol() {
+        envoy_cluster::UpstreamProtocol::Http1 => {
+            match envoy_http1::Client::connect(endpoint, host_header).await {
+                Ok(mut s) => {
+                    // 06.1 D4.b: per-cluster upstream_cx_total increment on
+                    // successful upstream H1 connect (unchanged).
+                    cluster.cx_total().inc();
+                    AcquireOutcome::Sent(s.send_request(out_req).await.map_err(|e| format!("{e}")))
+                }
+                Err(source) => {
+                    tracing::warn!(
+                        cluster = %cluster.name(),
+                        addr = %endpoint,
+                        error = ?source,
+                        "upstream connect failed (H1 fork) — returning 502",
+                    );
+                    AcquireOutcome::ConnectFailure
+                }
+            }
+        }
+        envoy_cluster::UpstreamProtocol::Http2 => {
+            match config
+                .h2_pool_mgr
+                .as_ref()
+                .and_then(|m| m.get(cluster_name))
+            {
+                Some(pool) => match pool.acquire(endpoint, host_header).await {
+                    Ok(mut guard) => AcquireOutcome::Sent(
+                        guard
+                            .client_stream_mut()
+                            .send_request(out_req)
+                            .await
+                            .map_err(|e| format!("{e}")),
+                    ),
+                    Err(crate::pool::PoolError::Connect(source)) => {
+                        tracing::warn!(
+                            cluster = %cluster.name(),
+                            addr = %endpoint,
+                            error = ?source,
+                            "H2 pool connect failed — returning 502",
+                        );
+                        AcquireOutcome::ConnectFailure
+                    }
+                    // 15 D5 (lock-in #10 / C-1): cap-overflow — NO connect was
+                    // attempted, so cx_total intentionally does not fire (it
+                    // lives inside the pool's connect-on-miss path). Terminal
+                    // overflow-503 (not retriable).
+                    Err(crate::pool::PoolError::Overflow { cluster: cl, max }) => {
+                        tracing::warn!(cluster = %cl, max = %max, "H2 pool overflow — emitting 503");
+                        AcquireOutcome::Overflow(synth_h2_overflow())
+                    }
+                    // 15 D5 (lock-in #10): max_pending_requests:0 reject — like
+                    // cap-overflow, no connect attempted; cx_total does not fire.
+                    Err(crate::pool::PoolError::PendingOverflow { cluster: cl }) => {
+                        tracing::warn!(
+                            cluster = %cl,
+                            "H2 pending-request overflow (max_pending_requests:0) — emitting 503",
+                        );
+                        AcquireOutcome::Overflow(synth_h2_overflow())
+                    }
+                },
+                None => {
+                    // No pool wired (test paths). Per-call connect + per-call
+                    // cx_total.inc() preserves the pre-13.2 behavior.
+                    match crate::Client::connect(endpoint, host_header).await {
+                        Ok(mut s) => {
+                            cluster.cx_total().inc();
+                            AcquireOutcome::Sent(
+                                s.send_request(out_req).await.map_err(|e| format!("{e}")),
+                            )
+                        }
+                        Err(source) => {
+                            tracing::warn!(
+                                cluster = %cluster.name(),
+                                addr = %endpoint,
+                                error = ?source,
+                                "upstream connect failed (per-call) — returning 502",
+                            );
+                            AcquireOutcome::ConnectFailure
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match acquire {
+        AcquireOutcome::Sent(Ok(upstream_resp)) => {
+            // Build the downstream response: mirror the pre-Task-5 inline header
+            // policy — replace upstream `server` with `server: envoy-rust`;
+            // replace or inject `date`; append x-envoy-upstream-service-time.
+            let elapsed_ms = start.elapsed().as_millis();
+            let now_date = envoy_http1::date::format_imf_fixdate(SystemTime::now());
+            let status = upstream_resp.status;
+            let mut headers: Vec<(String, String)> =
+                Vec::with_capacity(upstream_resp.headers.len() + 3);
+            let mut saw_server = false;
+            let mut saw_date = false;
+            for (name, value) in upstream_resp.headers.into_iter() {
+                let lc = name.to_ascii_lowercase();
+                if lc == "server" {
+                    saw_server = true;
+                    headers.push(("server".to_string(), "envoy-rust".to_string()));
+                } else if lc == "date" {
+                    saw_date = true;
+                    headers.push(("date".to_string(), now_date.clone()));
+                } else {
+                    headers.push((lc, value));
+                }
+            }
+            if !saw_server {
+                headers.push(("server".to_string(), "envoy-rust".to_string()));
+            }
+            if !saw_date {
+                headers.push(("date".to_string(), now_date));
+            }
+            headers.push((
+                "x-envoy-upstream-service-time".to_string(),
+                elapsed_ms.to_string(),
+            ));
+            H2AttemptResult {
+                response: Response {
+                    status,
+                    reason: upstream_resp.reason,
+                    headers,
+                    body: upstream_resp.body,
+                },
+                endpoint: Some(endpoint),
+                outcome: Some(envoy_config::AttemptOutcome::Response),
+                upstream_response: true,
+            }
+        }
+        AcquireOutcome::Sent(Err(e)) => {
+            // Post-connect send/recv failure → classify as Reset (the upstream
+            // connected but did not deliver a complete response). The H2
+            // synth-502 preserves the pre-phase-16 dispatch-failure shape.
+            tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
+            H2AttemptResult {
+                response: synth_h2_502(),
+                endpoint: Some(endpoint),
+                outcome: Some(envoy_config::AttemptOutcome::Reset),
+                upstream_response: false,
+            }
+        }
+        AcquireOutcome::ConnectFailure => {
+            // Connect-boundary failure (no request bytes left) → classify as
+            // ConnectFailure, NOT Reset (mirrors envoy-http1's `run_attempt`).
+            // The H2 synth-502 preserves the pre-phase-16 connect-failure shape.
+            H2AttemptResult {
+                response: synth_h2_502(),
+                endpoint: Some(endpoint),
+                outcome: Some(envoy_config::AttemptOutcome::ConnectFailure),
+                upstream_response: false,
+            }
+        }
+        AcquireOutcome::Overflow(response) => {
+            // Terminal: not retriable in this phase. No upstream_rq_total tick
+            // (no connect reached); the picked endpoint still gets a
+            // record_response (driven by the caller), mirroring H1.
+            H2AttemptResult {
+                response,
+                endpoint: Some(endpoint),
+                outcome: None,
+                upstream_response: false,
+            }
+        }
+    }
+}
+
 async fn handle_one_stream(
     config: Arc<HCMConfig>,
     req: http::Request<h2::RecvStream>,
@@ -223,48 +507,23 @@ async fn handle_one_stream(
             BuildOutcome::Synth(r) => r,
             BuildOutcome::Proxy {
                 cluster: cluster_name,
-                // 16 Task 4: BuildOutcome::Proxy gained `retry_config` +
-                // `include_attempt_count_in_response` for the H1 retry loop.
-                // The H2 path consumes them in Task 5; ignored here so the
-                // workspace builds with H2 behavior unchanged for now.
-                ..
+                // 16 Task 5: consume the retry policy + attempt-count flag that
+                // Task 4 added to BuildOutcome::Proxy (the H1 path landed them
+                // first; this is the H2 mirror).
+                retry_config,
+                include_attempt_count_in_response,
             } => {
                 // SPEC §3 D4 H2-side: symmetric H1-or-H2 dispatch keyed on
-                // cluster.upstream_protocol(). The validator ensures every cluster
-                // name referenced from a RouteAction::Route exists in the
-                // bootstrap; the .expect() is defense-in-depth (mirrors
-                // envoy-http1/src/hcm.rs:215-218).
+                // cluster.upstream_protocol() (the fork now lives inside
+                // `run_h2_attempt`). The validator ensures every cluster name
+                // referenced from a RouteAction::Route exists in the bootstrap;
+                // the .expect() is defense-in-depth (mirrors
+                // envoy-http1/src/hcm.rs).
                 let cluster = config
                     .inner
                     .cluster_mgr
                     .get(&cluster_name)
                     .expect("validator ensures cluster present");
-
-                let endpoint = match cluster.pick_endpoint() {
-                    Some(e) => e,
-                    None => {
-                        tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
-                        let r = synth_h2_502();
-                        // Funnel through the unified send + access-log
-                        // dispatch site at the bottom of handle_one_stream.
-                        return finalize_h2_stream(
-                            &config,
-                            &mut pipeline,
-                            send_response,
-                            r,
-                            req_arrival_instant,
-                            req_arrival_systime,
-                            &envoy_req,
-                            request_body_len,
-                            upstream_host_for_log_h2,
-                        )
-                        .await;
-                    }
-                };
-
-                // 06.2 Task 7: capture the resolved upstream endpoint
-                // for the access-log `%UPSTREAM_HOST%` token.
-                upstream_host_for_log_h2 = Some(endpoint.to_string());
 
                 // Extract Host: from the synthesized envoy_req.
                 // http_to_envoy_request always synthesizes host from
@@ -278,253 +537,102 @@ async fn handle_one_stream(
                     .map(|(_, v)| v.clone())
                     .expect("http_to_envoy_request always synthesizes Host from :authority");
 
-                // Build the outbound request: strip H1 hop-by-hop headers
-                // (Connection, Transfer-Encoding) mirroring
-                // envoy-http1/src/hcm.rs:244-248.
-                let mut out_headers = envoy_req.headers.clone();
-                out_headers.retain(|(n, _)| {
-                    !n.eq_ignore_ascii_case("connection")
-                        && !n.eq_ignore_ascii_case("transfer-encoding")
-                });
-                let out_req = envoy_http1::codec::Request {
-                    method: envoy_req.method.clone(),
-                    path: envoy_req.path.clone(),
-                    version: envoy_http1::codec::HttpVersion::Http11,
-                    headers: out_headers,
-                    bytes_consumed: 0,
-                    body: envoy_req.body.clone(),
-                };
+                // 16 Task 5: H2 retry loop (mirror of the H1 Task 4 loop). With
+                // `retry_config: None`, `max_retries == 0` so the loop runs
+                // exactly once and the path is byte-identical to the
+                // pre-phase-16 single-attempt dispatch (no retry counters tick,
+                // no x-envoy-attempt-count).
+                let max_retries = retry_config.as_ref().map_or(0, |r| r.num_retries);
+                let mut attempts: u32 = 0;
+                // Whether the FINAL attempt (the one we broke out on) was itself
+                // retriable. Assigned on every break path; read post-loop to
+                // split retry_success vs limit_exceeded (L4).
+                #[allow(unused_assignments)]
+                let mut final_retriable = false;
 
-                // 13.2 D6 lock-in #8: Outer `_cx_guard` relocation. Pre-Task-2 the
-                // guard fired UNCONDITIONALLY for both protocol arms. Post-Task-2:
-                //
-                // * H1 arm (cross-protocol H1-cluster-in-H2-HCM, lock-in #7): the
-                //   arm stays per-call, so the outer guard is Some — cx_active
-                //   fires once per request via the outer guard (preserved
-                //   pre-Task-2 semantic).
-                //
-                // * H2 arm with pool wired (PRODUCTION path; envoy-bin always passes
-                //   Some(h2_pool_mgr)): the outer guard is None — cx_active fires
-                //   once per request via the PoolGuard's internal ConnGaugeGuard
-                //   (lock-in #6). Adding the outer guard here would double-count.
-                //   This mirrors the 13.1 Task 4 code-quality fold-in on the H1 HCM
-                //   verbatim.
-                //
-                // * H2 arm with pool None (TEST path only; production never reaches
-                //   this branch): the outer guard is None AND there is no inner
-                //   PoolGuard, so cx_active does NOT fire on this request. This is
-                //   a behavior change relative to pre-Task-2 (which would have
-                //   fired via the unconditional outer guard). No existing test
-                //   asserts cx_active during in-flight H2 dispatch on the test
-                //   path, so no test breakage. If a future test needs cx_active to
-                //   fire on the pool-None path, add an explicit `Some(cluster.
-                //   cx_active_guard())` in the pool-None arm.
-                let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> =
-                    match cluster.upstream_protocol() {
-                        envoy_cluster::UpstreamProtocol::Http1 => Some(cluster.cx_active_guard()),
-                        envoy_cluster::UpstreamProtocol::Http2 => None,
-                    };
+                let final_response: Response = loop {
+                    attempts += 1;
 
-                let start = Instant::now();
-                let upstream_resp_result = match cluster.upstream_protocol() {
-                    envoy_cluster::UpstreamProtocol::Http1 => {
-                        match envoy_http1::Client::connect(endpoint, &host_header).await {
-                            Ok(mut s) => {
-                                // 06.1 D4.b: per-cluster upstream_cx_total
-                                // increment on successful upstream H1 connect
-                                // (mirrors envoy-http1::serve_connection's
-                                // proxy arm).
-                                cluster.cx_total().inc();
-                                s.send_request(out_req).await.map_err(|e| format!("{e}"))
-                            }
-                            Err(e) => Err(format!("{e}")),
-                        }
+                    // Run one attempt: pick → dispatch (H1-or-H2 fork inside) →
+                    // receive. All counter side effects (except the per-call /
+                    // connect-on-miss cx_total ticks that live inside) are
+                    // driven HERE from the returned `H2AttemptResult`.
+                    let attempt =
+                        run_h2_attempt(&config, &cluster, &cluster_name, &envoy_req, &host_header)
+                            .await;
+
+                    if let Some(endpoint) = attempt.endpoint {
+                        // 06.2 Task 7: capture the resolved upstream endpoint for
+                        // the access-log `%UPSTREAM_HOST%` token (last attempt's
+                        // endpoint wins). Skipped on pick()->None.
+                        upstream_host_for_log_h2 = Some(endpoint.to_string());
                     }
-                    envoy_cluster::UpstreamProtocol::Http2 => {
-                        // 13.2 D6: dispatch via the H2 pool when wired; fall
-                        // through to per-call connect when `h2_pool_mgr` is
-                        // None (test paths). On the pool path,
-                        // `cluster.cx_total().inc()` fires inside
-                        // `H2Pool::acquire`'s connect-on-miss branch (Task
-                        // 1, lock-in #6) — so we do NOT increment it again
-                        // here. On the fallthrough per-call path the
-                        // pre-13.2 `cluster.cx_total().inc()` site is
-                        // preserved.
-                        match config
-                            .h2_pool_mgr
+
+                    // L5: per-attempt upstream_rq_total — only for received
+                    // upstream responses (single source of truth).
+                    if attempt.upstream_response {
+                        cluster.upstream_rq_total().inc();
+                    }
+
+                    // 14.2 D4 / lock-in #9 (L8): response-receipt hook PER
+                    // ATTEMPT — each attempt feeds outlier detection. Records
+                    // against the picked endpoint for Response, connect-fail,
+                    // send-fail (Reset), and overflow paths (every path that
+                    // reached a pick()). Skipped on pick()->None (no endpoint to
+                    // attribute, lock-in #8). Inert without outlier_detection.
+                    if let Some(endpoint) = attempt.endpoint {
+                        cluster.record_response(endpoint, attempt.response.status);
+                    }
+
+                    // Retry decision. `final_retriable` mirrors whether THIS
+                    // (final-so-far) attempt is retriable — used post-loop to
+                    // split retry_success vs limit_exceeded (L4).
+                    final_retriable = match attempt.outcome {
+                        Some(outcome) => retry_config
                             .as_ref()
-                            .and_then(|m| m.get(&cluster_name))
-                        {
-                            Some(pool) => match pool.acquire(endpoint, &host_header).await {
-                                Ok(mut guard) => guard
-                                    .client_stream_mut()
-                                    .send_request(out_req)
-                                    .await
-                                    .map_err(|e| format!("{e}")),
-                                Err(crate::pool::PoolError::Connect(source)) => {
-                                    tracing::warn!(
-                                        cluster = %cluster.name(),
-                                        addr = %endpoint,
-                                        error = ?source,
-                                        "H2 pool connect failed",
-                                    );
-                                    Err(format!("{source}"))
-                                }
-                                // 15 D5 (lock-in #10 / C-1): cap-overflow — NO
-                                // connect was attempted (the pool refused the
-                                // acquire before reaching Client::connect), so
-                                // cx_total intentionally does not fire (it lives
-                                // inside the pool's connect-on-miss path). EARLY
-                                // return the byte-exact overflow-503 via
-                                // finalize_h2_stream (mirrors the synth_h2_502
-                                // early-return below). This CORRECTS the pre-15
-                                // 502 (which funnelled through synth_h2_502) to a
-                                // 503, matching the H1 synth_overflow arm.
-                                Err(crate::pool::PoolError::Overflow { cluster: cl, max }) => {
-                                    tracing::warn!(
-                                        cluster = %cl,
-                                        max = %max,
-                                        "H2 pool overflow — emitting 503",
-                                    );
-                                    let r = synth_h2_overflow();
-                                    cluster.record_response(endpoint, r.status);
-                                    return finalize_h2_stream(
-                                        &config,
-                                        &mut pipeline,
-                                        send_response,
-                                        r,
-                                        req_arrival_instant,
-                                        req_arrival_systime,
-                                        &envoy_req,
-                                        request_body_len,
-                                        upstream_host_for_log_h2,
-                                    )
-                                    .await;
-                                }
-                                // 15 D5 (lock-in #10): max_pending_requests:0
-                                // reject-on-establish. Like the cap-overflow arm,
-                                // no connect was attempted; cx_total does not
-                                // fire. EARLY return the same overflow-503.
-                                Err(crate::pool::PoolError::PendingOverflow { cluster: cl }) => {
-                                    tracing::warn!(
-                                        cluster = %cl,
-                                        "H2 pending-request overflow (max_pending_requests:0) — emitting 503",
-                                    );
-                                    let r = synth_h2_overflow();
-                                    cluster.record_response(endpoint, r.status);
-                                    return finalize_h2_stream(
-                                        &config,
-                                        &mut pipeline,
-                                        send_response,
-                                        r,
-                                        req_arrival_instant,
-                                        req_arrival_systime,
-                                        &envoy_req,
-                                        request_body_len,
-                                        upstream_host_for_log_h2,
-                                    )
-                                    .await;
-                                }
-                            },
-                            None => {
-                                // No pool wired (test paths). Per-call
-                                // connect + per-call cx_total.inc()
-                                // preserves the pre-13.2 behavior for
-                                // pool-less HCMConfig wrappers.
-                                match crate::Client::connect(endpoint, &host_header).await {
-                                    Ok(mut s) => {
-                                        cluster.cx_total().inc();
-                                        s.send_request(out_req).await.map_err(|e| format!("{e}"))
-                                    }
-                                    Err(e) => Err(format!("{e}")),
-                                }
-                            }
+                            .is_some_and(|r| r.is_retriable(attempt.response.status, outcome)),
+                        None => false,
+                    };
+                    if final_retriable && attempts <= max_retries {
+                        // L4: a retry is firing. Count it, back off, loop.
+                        cluster.upstream_rq_retry().inc();
+                        if let Some(d) = envoy_config::RetryConfig::backoff(attempts) {
+                            tokio::time::sleep(d).await;
                         }
+                        continue;
                     }
+                    break attempt.response;
                 };
 
-                let upstream_resp = match upstream_resp_result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
-                        let r = synth_h2_502();
-                        // 14.2 D4 (lock-in #9, ADR-0041 §6.2 item-9): the picked endpoint failed
-                        // to connect/send — record the synth-502 (ticks BOTH consecutive_5xx
-                        // AND consecutive_gateway_failure). The no-healthy `pick() -> None` arm
-                        // above does NOT record (no endpoint).
-                        cluster.record_response(endpoint, 502);
-                        // Funnel through the unified send + access-log
-                        // dispatch site at the bottom of handle_one_stream.
-                        return finalize_h2_stream(
-                            &config,
-                            &mut pipeline,
-                            send_response,
-                            r,
-                            req_arrival_instant,
-                            req_arrival_systime,
-                            &envoy_req,
-                            request_body_len,
-                            upstream_host_for_log_h2,
-                        )
-                        .await;
-                    }
-                };
-
-                // 06.3 D15.3.c: per PLAN-write SPEC correction 3, the H2 router-arm
-                // does NOT call write_proxied_response (it builds the downstream
-                // Response inline below). Inline 2-line increments parallel the H1
-                // path. Both fire on the success arm only (the Err arm returned via
-                // finalize_h2_stream above).
-                cluster.upstream_rq_total().inc();
-                if upstream_resp.status / 100 == 5 {
+                // Post-loop reconciliation (mirrors H1).
+                // L5: upstream_rq_5xx on the COMPLETING response only (retried-
+                // away 5xx attempts do NOT tick it). Single source of truth.
+                if final_response.status / 100 == 5 {
                     cluster.upstream_rq_5xx().inc();
                 }
-
-                // 14.2 D4 (lock-in #9): response-receipt hook (H2 post-dispatch). Fires AFTER
-                // the upstream_rq_* increments and BEFORE the downstream response is built/sent.
-                // Inert when outlier_detection is None (cluster-level is_none() short-circuit).
-                cluster.record_response(endpoint, upstream_resp.status);
-
-                // Build the downstream response: mirror envoy-http1::router::
-                // write_proxied_response's header policy — replace upstream
-                // `server` with `server: envoy-rust`; replace or inject `date`
-                // with a fresh IMF-fixdate; append x-envoy-upstream-service-time.
-                // The H2 forbidden hop-by-hop headers (connection, transfer-encoding,
-                // etc.) are stripped later by build_http_response in response.rs.
-                let elapsed_ms = start.elapsed().as_millis();
-                let now_date = envoy_http1::date::format_imf_fixdate(SystemTime::now());
-                let mut headers: Vec<(String, String)> =
-                    Vec::with_capacity(upstream_resp.headers.len() + 3);
-                let mut saw_server = false;
-                let mut saw_date = false;
-                for (name, value) in upstream_resp.headers.into_iter() {
-                    let lc = name.to_ascii_lowercase();
-                    if lc == "server" {
-                        saw_server = true;
-                        headers.push(("server".to_string(), "envoy-rust".to_string()));
-                    } else if lc == "date" {
-                        saw_date = true;
-                        headers.push(("date".to_string(), now_date.clone()));
+                // L4: retry outcome counters. Only when at least one retry fired
+                // (attempts > 1). If the final attempt was still retriable (we
+                // ran out of budget) → limit_exceeded; else → success.
+                if attempts > 1 {
+                    if final_retriable {
+                        cluster.upstream_rq_retry_limit_exceeded().inc();
                     } else {
-                        headers.push((lc, value));
+                        cluster.upstream_rq_retry_success().inc();
                     }
                 }
-                if !saw_server {
-                    headers.push(("server".to_string(), "envoy-rust".to_string()));
+
+                let mut outgoing = final_response;
+
+                // L6: x-envoy-attempt-count on the downstream response, ONLY when
+                // the vhost flag is set. Emitted on ALL outcomes that reached the
+                // proxy arm (proxied responses and synths), value = total
+                // attempts.
+                if include_attempt_count_in_response {
+                    outgoing
+                        .headers
+                        .push(("x-envoy-attempt-count".to_string(), attempts.to_string()));
                 }
-                if !saw_date {
-                    headers.push(("date".to_string(), now_date));
-                }
-                headers.push((
-                    "x-envoy-upstream-service-time".to_string(),
-                    elapsed_ms.to_string(),
-                ));
-                Response {
-                    status: upstream_resp.status,
-                    reason: upstream_resp.reason,
-                    headers,
-                    body: upstream_resp.body,
-                }
+                outgoing
             }
         },
         H2RequestPath::SynthFromDecode(mut r) => {
@@ -2348,5 +2456,363 @@ static_resources:
             buf.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(&buf[..], b"teapot\n");
+    }
+
+    // ── 16 Task 5: H2 retry loop tests (mirror of the H1 Task 4 trio) ────────
+    //
+    // All three exercise the H1-protocol-upstream fork inside the H2 retry
+    // loop (a per-request fresh-connection H1 backend whose status the test
+    // controls — the simplest way to drive a stateful 503-then-200 / always-503
+    // backend with a deterministic per-request count). The H2-protocol-upstream
+    // fork is covered structurally: the retry loop wraps the existing
+    // `match cluster.upstream_protocol()` dispatch (the fork is INSIDE the
+    // per-attempt helper `run_h2_attempt`), and the pre-existing
+    // `h2_proxy_outcome_dispatches_to_upstream` /
+    // `h2_hcm_increments_upstream_rq_total_on_200` tests already exercise the
+    // H2-upstream fork through that same loop with `max_retries == 0`.
+
+    /// Build an H2 HCMConfig whose single route proxies "/" to the given
+    /// cluster with the caller-supplied `retry_policy`, and the vhost
+    /// `include_attempt_count_in_response` flag. H2 mirror of envoy-http1's
+    /// `hcm_config_with_retry`.
+    async fn h2_hcm_config_with_retry(
+        retry_policy: Option<envoy_config::RetryPolicy>,
+        include_attempt_count: bool,
+        cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+    ) -> Arc<Http1HCMConfig> {
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test-retry".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: RouteConfiguration {
+                name: "r".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: include_attempt_count,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy,
+                        }),
+                    }],
+                }],
+            },
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+                .await
+                .expect("build HCM config"),
+        )
+    }
+
+    /// Build a single-endpoint H1-protocol "backend" cluster, returning both
+    /// the ClusterManager and the live ClusterHandle (so the test can read the
+    /// retry counters after the request drives through). Mirrors the
+    /// cluster-build shape used by `h2_router_arm_records_response_and_ejects_after_threshold`.
+    async fn h1_backend_cluster(
+        upstream_addr: SocketAddr,
+    ) -> (
+        Arc<envoy_cluster::ClusterManager>,
+        envoy_cluster::ClusterHandle,
+    ) {
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http1)
+                .await;
+        let cluster = cluster_mgr.get("backend").expect("backend cluster present");
+        (cluster_mgr, cluster)
+    }
+
+    /// Spawn a stateful in-process H1 upstream that returns `fail_status`
+    /// (CL: 0) for its first `fail_count` requests, then 200 "ok" for all
+    /// subsequent requests. Each request arrives on its own connection (the
+    /// H2 HCM's per-call `Client::connect` H1 fallback path), so the accept
+    /// loop counts attempts. Returns `(addr, request_counter)`. H2 mirror of
+    /// envoy-http1's `spawn_fail_then_ok_upstream`.
+    async fn spawn_fail_then_ok_h1_upstream(
+        fail_status: u16,
+        fail_count: usize,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_srv = Arc::clone(&counter);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    sock.read(&mut buf),
+                )
+                .await;
+                let resp: Vec<u8> = if n < fail_count {
+                    format!("HTTP/1.1 {fail_status} X\r\nContent-Length: 0\r\n\r\n").into_bytes()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+                        .to_vec()
+                };
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, counter)
+    }
+
+    /// Drive a single GET / through an in-process H2 HCM wired with the given
+    /// config; return the downstream response (status + collected headers as a
+    /// `(name, value)` Vec). Helper for the retry tests.
+    async fn drive_h2_once(config: Arc<Http1HCMConfig>) -> (u16, Vec<(String, String)>) {
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        let status = resp.status().as_u16();
+        let headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        // Drain body to let the stream + the spawned handler complete.
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        // Settle so the spawned handle_one_stream task's post-loop counter
+        // increments are visible from this thread (mirrors the 100ms posture
+        // of the other H2 counter tests).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        (status, headers)
+    }
+
+    fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// 16 Task 5 (L4/L5/L6 success path): H1-upstream backend 503-then-200,
+    /// retry_on 5xx, num_retries 1, vhost include_attempt_count true. Downstream
+    /// 200, x-envoy-attempt-count: 2, retry=1 / retry_success=1 /
+    /// limit_exceeded=0, upstream_rq_total=2, upstream_rq_5xx=0 (retried-away
+    /// 503 doesn't tick). H2 mirror of `retry_success_path_503_then_200`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_retry_success_path_503_then_200() {
+        let (upstream_addr, reqs) = spawn_fail_then_ok_h1_upstream(503, 1).await;
+        let (cluster_mgr, cluster) = h1_backend_cluster(upstream_addr).await;
+        let cfg = h2_hcm_config_with_retry(
+            Some(envoy_config::RetryPolicy {
+                retry_on: "5xx".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        )
+        .await;
+        let (status, headers) = drive_h2_once(cfg).await;
+        assert_eq!(status, 200, "downstream must be 200 after retry");
+        assert_eq!(
+            header_value(&headers, "x-envoy-attempt-count"),
+            Some("2"),
+            "x-envoy-attempt-count: 2 expected: {headers:?}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "2 attempts"
+        );
+        assert_eq!(cluster.upstream_rq_retry().value(), 1, "retry");
+        assert_eq!(
+            cluster.upstream_rq_retry_success().value(),
+            1,
+            "retry_success"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            0,
+            "limit_exceeded"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            2,
+            "rq_total per attempt"
+        );
+        assert_eq!(
+            cluster.upstream_rq_5xx().value(),
+            0,
+            "5xx counts completing response only"
+        );
+    }
+
+    /// 16 Task 5 (L4/L5/L6/L9 limit-exceeded path): always-503 H1 backend,
+    /// retry_on 5xx, num_retries 1, vhost include_attempt_count true. Downstream
+    /// 503 (verbatim last upstream), x-envoy-attempt-count: 2, retry=1 /
+    /// retry_success=0 / limit_exceeded=1, upstream_rq_total=2, upstream_rq_5xx=1
+    /// (completing 503 only). H2 mirror of `retry_limit_exceeded_path_always_503`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_retry_limit_exceeded_path_always_503() {
+        let (upstream_addr, reqs) = spawn_fail_then_ok_h1_upstream(503, 1000).await;
+        let (cluster_mgr, cluster) = h1_backend_cluster(upstream_addr).await;
+        let cfg = h2_hcm_config_with_retry(
+            Some(envoy_config::RetryPolicy {
+                retry_on: "5xx".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        )
+        .await;
+        let (status, headers) = drive_h2_once(cfg).await;
+        assert_eq!(status, 503, "downstream must be the last upstream 503");
+        assert_eq!(
+            header_value(&headers, "x-envoy-attempt-count"),
+            Some("2"),
+            "x-envoy-attempt-count: 2 expected: {headers:?}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "2 attempts"
+        );
+        assert_eq!(cluster.upstream_rq_retry().value(), 1, "retry");
+        assert_eq!(
+            cluster.upstream_rq_retry_success().value(),
+            0,
+            "retry_success"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            1,
+            "limit_exceeded"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            2,
+            "rq_total per attempt"
+        );
+        assert_eq!(
+            cluster.upstream_rq_5xx().value(),
+            1,
+            "5xx counts completing 503 only, not both attempts"
+        );
+    }
+
+    /// 16 Task 5 (no-retry regression): NO retry_policy, H1 backend 503.
+    /// Downstream 503, exactly 1 attempt, upstream_rq_total=1, upstream_rq_5xx=1,
+    /// NO x-envoy-attempt-count header, all 3 retry counters 0. Proves the
+    /// no-retry path is byte-identical to pre-phase-16 H2 behavior. H2 mirror
+    /// of `retry_absent_no_retry_single_attempt`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_retry_absent_no_retry_single_attempt() {
+        let (upstream_addr, reqs) = spawn_fail_then_ok_h1_upstream(503, 1000).await;
+        let (cluster_mgr, cluster) = h1_backend_cluster(upstream_addr).await;
+        let cfg = h2_hcm_config_with_retry(None, false, cluster_mgr).await;
+        let (status, headers) = drive_h2_once(cfg).await;
+        assert_eq!(status, 503, "downstream 503");
+        assert!(
+            header_value(&headers, "x-envoy-attempt-count").is_none(),
+            "no attempt-count header without vhost flag: {headers:?}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "1 attempt"
+        );
+        assert_eq!(cluster.upstream_rq_total().value(), 1, "rq_total 1");
+        assert_eq!(cluster.upstream_rq_5xx().value(), 1, "rq_5xx 1");
+        assert_eq!(cluster.upstream_rq_retry().value(), 0, "retry 0");
+        assert_eq!(cluster.upstream_rq_retry_success().value(), 0, "success 0");
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            0,
+            "limit_exceeded 0"
+        );
+    }
+
+    /// 16 (connect-failure retry): H1-protocol cluster endpoint is 127.0.0.1:1
+    /// (kernel-refused — a deterministic connect failure), retry_on
+    /// "connect-failure", num_retries 1. The connect failure MUST classify as
+    /// `AttemptOutcome::ConnectFailure` (NOT Reset) and therefore be retriable
+    /// under `connect-failure` (without `reset`). Asserts: downstream synth-502,
+    /// upstream_rq_retry=1 (the retry fired → ConnectFailure classification),
+    /// limit_exceeded=1 (the retried attempt also refused), retry_success=0,
+    /// upstream_rq_total=0 (no upstream RESPONSE was ever received). Sibling of
+    /// H1's `connect_failure_retried_on_connect_failure_policy`. Pre-fix this
+    /// test FAILS: H2 collapsed connect failures into Reset → not retriable
+    /// under connect-failure → upstream_rq_retry stayed 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_connect_failure_retried_on_connect_failure_policy() {
+        // 127.0.0.1:1 is kernel-refused — a deterministic connect failure.
+        let refused_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (cluster_mgr, cluster) = h1_backend_cluster(refused_addr).await;
+        let cfg = h2_hcm_config_with_retry(
+            Some(envoy_config::RetryPolicy {
+                retry_on: "connect-failure".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        )
+        .await;
+        let (status, _headers) = drive_h2_once(cfg).await;
+        assert_eq!(
+            status, 502,
+            "downstream must be synth-502 after exhausting connect-failure retries"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry().value(),
+            1,
+            "retry fired — connect failure classified as ConnectFailure (retriable under connect-failure)"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            1,
+            "limit_exceeded — retried attempt also refused"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_success().value(),
+            0,
+            "retry_success 0 — never succeeded"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            0,
+            "rq_total 0 — no upstream response was ever received"
+        );
     }
 }
