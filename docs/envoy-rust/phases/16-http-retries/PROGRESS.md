@@ -85,3 +85,27 @@ trim + skip-empty; UNKNOWN tokens silently ignored per L2; `num_retries.unwrap_o
 **Two-stage review:** spec-compliance **✅ compliant** (first pass); code-quality **Approved** (zero
 Critical / zero Important; Minors: the `is_retriable(status, outcome)` dummy-status-on-ConnectFailure
 API shape kept as PLAN-specified; boundary-case test gaps noted as obviously-correct-by-inspection).
+
+---
+
+## Task 3 — cluster `upstream_rq_retry{,_success,_limit_exceeded}` counters, inert-at-0 (commit `dbabd526a`)
+
+**Landed.** `crates/envoy-cluster/src/cluster.rs`: 3 `pub(crate) Arc<envoy_stats::Counter>` fields next
+to `upstream_rq_total`/`upstream_rq_5xx`; **unconditional registration** in `from_bootstrap` (every
+cluster, inert at 0 — PLAN Task 3 lock-in; names byte-exact `cluster.<name>.upstream_rq_retry` /
+`_retry_success` / `_retry_limit_exceeded`); accessors on `Cluster` + `ClusterHandle` delegates
+mirroring the existing counter accessor shape; registry-level TDD test
+`from_bootstrap_registers_upstream_rq_retry_counters_at_zero` (snapshot presence + 0-values + accessors).
+No increments (Tasks 4/5).
+
+**Verification (quoted):**
+- `cargo test -p envoy-cluster` → `test result: ok. 71 passed; 0 failed; 0 ignored` (70 + 1 new).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+- `cargo fmt --all -- --check` → clean (exit 0).
+- `git show --stat HEAD` → 1 file changed (`cluster.rs` +188).
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass); code-quality **Approved** (zero
+Critical / zero Important). The reviewer concretely ruled out the unconditional-registration risk
+against the fixture-0011 Prometheus set-diff: fixture 0011 declares `clusters: []`, so the per-cluster
+loop registers nothing there; all other stat fixtures (0020/0021/0022/0023) use named-stat assertions
+immune to extra registered names.
