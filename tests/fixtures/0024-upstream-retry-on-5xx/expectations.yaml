@@ -1,0 +1,67 @@
+# Phase 16 fixture-0024 expectations: HTTP retry-on-5xx (ADR-0044/ADR-0045).
+# Two sequential GETs over ONE H1 keep-alive conn exercise the two retry
+# outcomes of `retry_policy: {retry_on: "5xx", num_retries: 1}`:
+#
+#   probe 1  GET /retry-success  : attempt 1 -> backend 503 ("fail\n"); the
+#            single retry re-dispatches and attempt 2 -> backend 200 ("ok\n").
+#            Final response 200, body "ok\n", x-envoy-attempt-count: 2 (L6).
+#            `upstream_rq_retry` + `upstream_rq_retry_success` tick (L4).
+#   probe 2  GET /retry-exhausted: both attempts -> backend 503
+#            ("service unavailable\n", 20 bytes, the stateless --per-path 503
+#            body). The single retry is consumed; the LAST upstream 503 is
+#            returned verbatim (status + body), x-envoy-attempt-count: 2 (L9).
+#            `upstream_rq_retry` + `upstream_rq_retry_limit_exceeded` tick (L4).
+#
+# Driver `http1_keep_alive` (13.1 D10; extended at 14.2 Task 6 with per-request
+# body/header assertions; extended at 16 Task 7 with `require_header_value` for
+# the value-exact `x-envoy-attempt-count: 2` check). ONE downstream keep-alive
+# conn drives the two GETs; 200ms settle past the last request; bilateral admin
+# stat scrape on the cumulative retry + per-attempt counters.
+#
+# expected_stats are CUMULATIVE over both probes (cluster `backend`):
+#   - upstream_rq_retry: 2                 (one retry per probe)
+#   - upstream_rq_retry_success: 1         (probe 1 only)
+#   - upstream_rq_retry_limit_exceeded: 1  (probe 2 only)
+#   - upstream_rq_total: 4                 (2 attempts x 2 probes; per-attempt L5)
+#   - upstream_rq_5xx: 1                   (completing-only: only probe 2's final 503; L5)
+# HCM downstream (stat_prefix ingress_http):
+#   - downstream_rq_2xx: 1                 (probe 1 final 200)
+#   - downstream_rq_5xx: 1                 (probe 2 final 503)
+#   - downstream_rq_total: 2               (two downstream requests)
+#
+# Header allow-list note: the keep-alive driver asserts per-request status +
+# byte-exact body + value-exact `x-envoy-attempt-count`. The standing per-proxy
+# divergent headers (`server`, `date`, `x-envoy-upstream-service-time`) are NOT
+# asserted, so they need no allow-list (the driver does NOT perform a full
+# header-set diff). The L10 Envoy-only retry stat names
+# (`upstream_rq_retry_overflow`, `upstream_rq_retry_backoff_*`,
+# `retry_or_shadow_abandoned`, `circuit_breakers.*.rq_retry_open`, the
+# `cluster.backend.retry.*` sub-scope) are likewise unasserted and ignored by
+# the named-stat scrape path — no `allowlist_envoy_only` key (which is a field
+# of the prometheus-set-diff BodyRule, not the keep-alive driver, and the
+# Driver enum's deny_unknown_fields rejects it here; mirrors 0022/0023).
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /retry-success
+      host: backend
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      require_header_value: { name: x-envoy-attempt-count, value: "2" }
+    - method: GET
+      path: /retry-exhausted
+      host: backend
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "service unavailable\n" }
+      require_header_value: { name: x-envoy-attempt-count, value: "2" }
+  settle_ms: 200
+  expected_stats:
+    - { name: cluster.backend.upstream_rq_retry,                value: 2 }
+    - { name: cluster.backend.upstream_rq_retry_success,        value: 1 }
+    - { name: cluster.backend.upstream_rq_retry_limit_exceeded, value: 1 }
+    - { name: cluster.backend.upstream_rq_total,                value: 4 }
+    - { name: cluster.backend.upstream_rq_5xx,                  value: 1 }
+    - { name: http.ingress_http.downstream_rq_2xx,             value: 1 }
+    - { name: http.ingress_http.downstream_rq_5xx,             value: 1 }
+    - { name: http.ingress_http.downstream_rq_total,           value: 2 }

@@ -872,26 +872,24 @@ mod tests {
     /// `health-aware-http1-backend`. Spawns the backend with:
     ///   --retry-script /retry-success=fail:1
     ///   --per-path /retry-exhausted=503
-    /// Then:
+    /// Then exercises the CYCLIC window for `fail:1` (window length 2 →
+    /// alternating 503,200,…):
     ///   • GET /retry-success #1 → 503 (fail body `fail\n`)
     ///   • GET /retry-success #2 → 200 (success body `ok\n`)
-    ///   • GET /retry-exhausted #1 → 503
+    ///   • GET /retry-success #3 → 503 (next window opens)
+    ///   • GET /retry-success #4 → 200
+    ///   • GET /retry-exhausted #1 → 503 (stateless --per-path arm)
     ///   • GET /retry-exhausted #2 → 503
     ///
-    /// Per-source semantics: the retry-script counter is keyed per (source IP,
-    /// path). All requests here originate from 127.0.0.1, so this is a single-
-    /// source test exercising the normal case. The differential fixture (Task 7)
-    /// relies on the per-source keying so that envoy-rust (127.0.0.1) and
-    /// Envoy-in-Docker (Docker bridge/NAT address) each see their own
-    /// independent fail-then-succeed sequence against the shared backend.
-    ///
-    /// A second-source test (binding a client socket to 127.0.0.2 to verify
-    /// counter independence) is not added here: binding to 127.0.0.2 requires
-    /// that address to be configured on the loopback interface, which is the
-    /// default on Linux but not on macOS. Since this project runs on macOS in
-    /// development, adding such a test would introduce platform-dependent
-    /// flakiness. The per-source logic is covered by unit tests inside the
-    /// `health-aware-http1-backend` crate instead.
+    /// Cyclic-window semantics: a single global per-path counter (NOT source-IP
+    /// keyed) partitions the request stream into repeating windows of length
+    /// `fail_count + 1`. The differential fixture (Task 7) relies on this being
+    /// NAT-immune: on macOS, Docker Desktop NATs Envoy-in-Docker's source IP to
+    /// 127.0.0.1 — identical to envoy-rust's — so per-source keying is not
+    /// viable. Because the harness drives the two proxies sequentially and each
+    /// proxy's upstream attempts for one downstream request are consecutive,
+    /// each proxy's retry sequence lands in its own fresh window and sees the
+    /// same fail-then-succeed pattern.
     #[tokio::test(flavor = "multi_thread")]
     async fn backend_retry_script_stateful_fail_then_succeed() {
         let backend = HealthAwareHttp1Backend::spawn_with_retry_script(
@@ -937,7 +935,7 @@ mod tests {
             (status, body)
         }
 
-        // /retry-success: first → 503 fail\n, second → 200 ok\n
+        // /retry-success: cyclic fail:1 window → 503,200,503,200
         let (s1, b1) = get(&addr, "/retry-success").await;
         assert_eq!(s1, 503, "/retry-success #1 must be 503 (fail attempt)");
         assert_eq!(b1, b"fail\n", "/retry-success #1 body must be `fail\\n`");
@@ -949,12 +947,20 @@ mod tests {
         );
         assert_eq!(b2, b"ok\n", "/retry-success #2 body must be `ok\\n`");
 
-        // /retry-exhausted: always 503 (stateless --per-path arm)
-        let (s3, _) = get(&addr, "/retry-exhausted").await;
-        assert_eq!(s3, 503, "/retry-exhausted #1 must be 503");
+        let (s3, b3) = get(&addr, "/retry-success").await;
+        assert_eq!(s3, 503, "/retry-success #3 must be 503 (next window opens)");
+        assert_eq!(b3, b"fail\n", "/retry-success #3 body must be `fail\\n`");
 
-        let (s4, _) = get(&addr, "/retry-exhausted").await;
-        assert_eq!(s4, 503, "/retry-exhausted #2 must be 503");
+        let (s4, b4) = get(&addr, "/retry-success").await;
+        assert_eq!(s4, 200, "/retry-success #4 must be 200 (window closes)");
+        assert_eq!(b4, b"ok\n", "/retry-success #4 body must be `ok\\n`");
+
+        // /retry-exhausted: always 503 (stateless --per-path arm)
+        let (e1, _) = get(&addr, "/retry-exhausted").await;
+        assert_eq!(e1, 503, "/retry-exhausted #1 must be 503");
+
+        let (e2, _) = get(&addr, "/retry-exhausted").await;
+        assert_eq!(e2, 503, "/retry-exhausted #2 must be 503");
 
         drop(backend);
     }

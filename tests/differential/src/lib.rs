@@ -333,6 +333,24 @@ pub struct Http1KeepAliveRequest {
     /// for responses (e.g. local-reply 503s) that must NOT carry the header.
     #[serde(default)]
     pub require_header_absent: Option<String>,
+    /// 16 Task 7 (fixture 0024): assert this (lower-cased) header NAME is
+    /// present on each side's response AND its value equals the given string.
+    /// Value-exact counterpart of `require_header_present` — used for
+    /// `x-envoy-attempt-count: 2`, where presence-only is insufficient (the
+    /// retry behaviour must yield exactly 2 attempts, not merely the header).
+    /// Serializes as `{ name: x-envoy-attempt-count, value: "2" }`.
+    #[serde(default)]
+    pub require_header_value: Option<Http1HeaderValueRule>,
+}
+
+/// 16 Task 7: value-exact header assertion for `Http1KeepAliveRequest`. The
+/// header `name` (compared case-insensitively) must be present and its value
+/// must equal `value` byte-for-byte on each side's response.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Http1HeaderValueRule {
+    pub name: String,
+    pub value: String,
 }
 
 /// 13.1 D10: bilateral stat assertion for
@@ -2143,7 +2161,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let needs_health_aware_backend = needs_backend
         && (fixture_name == "0019-upstream-active-health-check"
             || fixture_name == "0020-upstream-connection-pooling-and-per-class-counters"
-            || fixture_name == "0022-upstream-outlier-detection-consecutive-5xx");
+            || fixture_name == "0022-upstream-outlier-detection-consecutive-5xx"
+            || fixture_name == "0024-upstream-retry-on-5xx");
     let _backend = if needs_backend && !needs_health_aware_backend {
         Some(
             backend::TcpProxyBackend::spawn()
@@ -2159,6 +2178,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // GET drives a deterministic 2xx/3xx/4xx/5xx response class.
             // Fixture 0019 keeps the default-arms semantics (200 on `/`,
             // 503 on `/healthz`).
+            // 16 Task 7 (fixture 0024): the retry-on-5xx fixture needs a
+            // STATEFUL `/retry-success` path (503 "fail\n" on attempt 1, then
+            // 200 "ok\n" on the retry — a single global per-path cyclic window,
+            // fail:1 → 503,200,…, so each sequentially-driven proxy's
+            // consecutive retry pair lands in its own window; NAT-immune on
+            // macOS where Docker collapses source IPs to 127.0.0.1) alongside a
+            // STATELESS `/retry-exhausted` path (always 503 "service unavailable\n").
+            // Spawned via the dedicated `spawn_with_retry_script` arm below;
+            // its `per_path` here stays None so this `spawn_with_per_path`
+            // branch is not taken for 0024.
             let per_path =
                 if fixture_name == "0020-upstream-connection-pooling-and-per-class-counters" {
                     Some("/301=301,/404=404,/500=500".to_string())
@@ -2174,10 +2203,24 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 } else {
                     None
                 };
+            // 16 Task 7: fixture 0024 forwards a retry-script + per-path pair.
+            let retry_script = if fixture_name == "0024-upstream-retry-on-5xx" {
+                Some("/retry-success=fail:1".to_string())
+            } else {
+                None
+            };
+            let per_path = if fixture_name == "0024-upstream-retry-on-5xx" {
+                Some("/retry-exhausted=503".to_string())
+            } else {
+                per_path
+            };
             Some(
-                crate::backend::HealthAwareHttp1Backend::spawn_with_per_path(per_path)
-                    .await
-                    .context("spawning HealthAwareHttp1Backend")?,
+                crate::backend::HealthAwareHttp1Backend::spawn_with_retry_script(
+                    retry_script,
+                    per_path,
+                )
+                .await
+                .context("spawning HealthAwareHttp1Backend")?,
             )
         } else {
             None
@@ -2821,6 +2864,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                             "{side_name}: expected header {h} absent for {} {}",
                             req.method,
                             req.path,
+                        );
+                    }
+                    if let Some(rule) = &req.require_header_value {
+                        let got = resp_headers
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(&rule.name))
+                            .map(|(_, v)| v.as_str());
+                        anyhow::ensure!(
+                            got == Some(rule.value.as_str()),
+                            "{side_name}: header {} expected value {:?} for {} {}, got {:?}",
+                            rule.name,
+                            rule.value,
+                            req.method,
+                            req.path,
+                            got,
                         );
                     }
                 }

@@ -16,15 +16,26 @@
 //! over the default-path arm; bodies for per-path responses are deterministic
 //! per-class bytes (see `per_class_body`).
 //!
-//! `--retry-script` (16 Task 6): stateful knob. For each listed path, returns
-//! 503 (body `fail\n`) for the first N requests to that path from a given
-//! source IP, then 200 (body `ok\n`) for all subsequent requests from that
-//! source IP. Each distinct client source IP gets its own independent
-//! fail-then-succeed sequence — required because the differential harness
-//! shares one backend between both proxies (envoy-rust from 127.0.0.1, Envoy-
-//! in-Docker from the Docker bridge/NAT address); without per-source keying the
-//! two proxies would share a single counter and only the first proxy would ever
-//! see 503s. Backed by a per-path `Mutex<HashMap<IpAddr, u64>>` counter map.
+//! `--retry-script` (16 Task 6, amended): stateful knob with CYCLIC-WINDOW
+//! semantics. For each listed path, maintains ONE global request counter
+//! (an `AtomicU64`, NOT keyed by source IP) and partitions the request stream
+//! into repeating windows of length `N+1`: within each window the first `N`
+//! requests return 503 (body `fail\n`) and the final request returns 200
+//! (body `ok\n`). Concretely, for request index `idx` (0-based): if
+//! `idx % (N+1) < N` → 503, else → 200. For `fail:1` this alternates
+//! 503, 200, 503, 200, ….
+//!
+//! Why cyclic windows instead of a per-source-IP one-shot counter: the
+//! differential harness shares one backend between both proxies and drives
+//! them SEQUENTIALLY. On macOS, Docker Desktop NATs every container→host
+//! connection to source IP 127.0.0.1 — identical to envoy-rust's source IP —
+//! so per-source keying is not viable (both proxies collapse into one bucket,
+//! and the first-driven proxy burns the entire fail budget). Cyclic windows
+//! are NAT-immune: because each proxy's upstream attempts for a single
+//! downstream request are consecutive, and the proxies are driven one after
+//! the other, each proxy's retry sequence lands in its own fresh window and
+//! sees the same fail-then-succeed pattern.
+//!
 //! Takes precedence over `--per-path` and all default arms for paths listed in
 //! the retry-script map.
 //!
@@ -34,15 +45,8 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
-
-/// Per-source-IP request counter for a single retry-script path.
-/// Maps peer IpAddr → number of requests seen so far from that source.
-/// Each key is created on first contact; the Mutex allows concurrent
-/// connections (from different source IPs) to bump their own counters
-/// without blocking each other for longer than one map insert+increment.
-type SourceCounters = Mutex<HashMap<IpAddr, u64>>;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,11 +59,14 @@ struct Config {
     data_status: u16,
     data_body: Vec<u8>,
     per_path: HashMap<String, u16>,
-    /// 16 Task 6: per-path retry-script map. Value is (fail_count, per-source counters).
-    /// For paths in this map: return 503 for the first `fail_count` requests from a
-    /// given source IP, then 200 thereafter. The inner map keys are peer IpAddrs;
-    /// each source IP gets its own independent fail-then-succeed sequence.
-    retry_script: HashMap<String, (u64, SourceCounters)>,
+    /// 16 Task 6 (amended): per-path retry-script map. Value is
+    /// `(fail_count, global_counter)`. For paths in this map, requests are
+    /// partitioned into repeating windows of length `fail_count + 1`: the
+    /// first `fail_count` requests in each window return 503, the last
+    /// returns 200 (see `serve`). The counter is a single global `AtomicU64`
+    /// per path — NOT keyed by source IP (Docker Desktop NAT collapses all
+    /// container source IPs to 127.0.0.1, so per-source keying is not viable).
+    retry_script: HashMap<String, (u64, AtomicU64)>,
 }
 
 #[tokio::main]
@@ -73,10 +80,9 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(cfg);
     loop {
         let (stream, peer) = listener.accept().await.context("accept")?;
-        let peer_ip = peer.ip();
         let cfg = Arc::clone(&cfg);
         tokio::spawn(async move {
-            if let Err(e) = serve(stream, cfg, peer_ip).await {
+            if let Err(e) = serve(stream, cfg).await {
                 tracing::debug!(error=?e, %peer, "connection ended");
             }
         });
@@ -89,7 +95,7 @@ fn parse_args() -> Result<Config> {
     let mut data_status: u16 = 200;
     let mut data_body: Vec<u8> = b"ok\n".to_vec();
     let mut per_path: HashMap<String, u16> = HashMap::new();
-    let mut retry_script: HashMap<String, (u64, SourceCounters)> = HashMap::new();
+    let mut retry_script: HashMap<String, (u64, AtomicU64)> = HashMap::new();
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -153,14 +159,13 @@ fn parse_per_path(s: &str) -> Result<HashMap<String, u16>> {
 
 /// 16 Task 6 (amended): parse `--retry-script` flag value:
 /// `PATH=fail:N[,PATH=fail:N,...]`.
-/// Returns a map of path → (fail_count, SourceCounters).
-/// N is the per-source-IP fail count — each distinct client source IP gets its
-/// own independent fail-then-succeed sequence. Required because the differential
-/// harness shares one backend between both proxies (envoy-rust from 127.0.0.1;
-/// Envoy-in-Docker from the Docker bridge/NAT address); without per-source
-/// keying the two proxies would share a single counter and only the first proxy
-/// would ever see the configured 503 failures.
-fn parse_retry_script(s: &str) -> Result<HashMap<String, (u64, SourceCounters)>> {
+/// Returns a map of path → (fail_count, global counter).
+/// N is the per-window fail count: requests to a scripted path are partitioned
+/// into repeating windows of length `N+1`, with the first `N` returning 503
+/// and the last returning 200. The counter is a single global `AtomicU64`
+/// (NOT source-IP keyed): Docker Desktop NAT collapses all container source
+/// IPs to 127.0.0.1, so per-source keying cannot distinguish the two proxies.
+fn parse_retry_script(s: &str) -> Result<HashMap<String, (u64, AtomicU64)>> {
     let mut out = HashMap::new();
     for entry in s.split(',') {
         let entry = entry.trim();
@@ -175,7 +180,7 @@ fn parse_retry_script(s: &str) -> Result<HashMap<String, (u64, SourceCounters)>>
             .with_context(|| format!("retry-script spec must be `fail:N`, got: {spec:?}"))?
             .parse()
             .with_context(|| format!("retry-script fail count not numeric in: {spec:?}"))?;
-        out.insert(path.to_string(), (fail_count, Mutex::new(HashMap::new())));
+        out.insert(path.to_string(), (fail_count, AtomicU64::new(0)));
     }
     Ok(out)
 }
@@ -194,7 +199,7 @@ fn per_class_body(status: u16) -> &'static [u8] {
     }
 }
 
-async fn serve(mut stream: TcpStream, cfg: Arc<Config>, peer_ip: IpAddr) -> Result<()> {
+async fn serve(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     // 13.1 Task 7 (D9.1): HTTP/1.1 keep-alive support. The 12.2 D7.1
     // single-shot shape (one request, write response with
     // `connection: close`, shutdown) was fine for fixture 0019's
@@ -247,24 +252,26 @@ async fn serve(mut stream: TcpStream, cfg: Arc<Config>, peer_ip: IpAddr) -> Resu
         // beyond `head_end` carry forward into the next request's window.
         buf.drain(..head_end);
         let (status, body): (u16, Vec<u8>) =
-            if let Some((fail_count, counters)) = cfg.retry_script.get(&path) {
-                // 16 Task 6 (amended): retry-script arm. Counter is keyed per
-                // (source IP, path) so each distinct client (e.g. envoy-rust on
-                // 127.0.0.1 vs. Envoy-in-Docker on the bridge NAT address) gets
-                // its own independent fail-then-succeed sequence. The Mutex guard
-                // is held only for the duration of the counter bump — negligible
-                // contention in a test helper. The pre-increment value (prev) is
-                // the zero-based index of this request from this source:
-                // 0 = first request, 1 = second, …. Return 503 for indices 0
-                // through fail_count-1, then 200 thereafter.
-                let prev = {
-                    let mut map = counters.lock().expect("retry-script counter lock");
-                    let cnt = map.entry(peer_ip).or_insert(0);
-                    let prev = *cnt;
-                    *cnt += 1;
-                    prev
-                };
-                if prev < *fail_count {
+            if let Some((fail_count, counter)) = cfg.retry_script.get(&path) {
+                // 16 Task 6 (amended): retry-script arm with CYCLIC-WINDOW
+                // semantics. A single global per-path counter (NOT source-IP
+                // keyed — Docker Desktop NAT collapses all container source IPs
+                // to 127.0.0.1, so per-source keying cannot tell the two proxies
+                // apart). `idx` is the 0-based global request index for this path
+                // (fetch_add returns the pre-increment value). Requests are
+                // partitioned into repeating windows of length `fail_count + 1`:
+                // within a window the first `fail_count` requests return 503 and
+                // the last returns 200. For fail:1 this alternates 503,200,503,…
+                // Because the harness drives the two proxies sequentially and
+                // each proxy's upstream attempts for one downstream request are
+                // consecutive, each proxy's retry sequence lands in its own fresh
+                // window and observes the same fail-then-succeed pattern.
+                // CAUTION (latent fragility): if the differential keep-alive
+                // driver is ever refactored to drive the two proxies in
+                // PARALLEL (e.g. tokio::join), the windows would interleave and
+                // retry fixtures using this knob would silently flake.
+                let idx = counter.fetch_add(1, Ordering::Relaxed);
+                if idx % (*fail_count + 1) < *fail_count {
                     (503u16, b"fail\n".to_vec())
                 } else {
                     (200u16, b"ok\n".to_vec())
@@ -342,16 +349,42 @@ mod tests {
 
     #[test]
     fn parse_retry_script_parses_single_entry() {
-        // Per-source semantics: each source IP gets its own independent counter;
-        // the Mutex'd HashMap starts empty (no IPs have made requests yet).
+        // Cyclic-window semantics: one global counter per path, starting at 0
+        // (no requests seen yet).
         let m = parse_retry_script("/retry-success=fail:1").expect("parse");
         assert_eq!(m.len(), 1);
-        let (fail_count, counters) = m.get("/retry-success").expect("entry present");
+        let (fail_count, counter) = m.get("/retry-success").expect("entry present");
         assert_eq!(*fail_count, 1);
-        assert!(
-            counters.lock().unwrap().is_empty(),
-            "counter map must start empty before any requests"
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "counter must start at 0 before any requests"
         );
+    }
+
+    #[test]
+    fn retry_script_cyclic_window_modulo_for_fail_1() {
+        // fail:1 → window length 2 → alternating 503,200,503,200,…
+        // The serve() arm computes `idx % (N+1) < N`; replicate it here.
+        let fail_count: u64 = 1;
+        let expect_503 = |idx: u64| idx % (fail_count + 1) < fail_count;
+        assert!(expect_503(0), "idx 0 → 503");
+        assert!(!expect_503(1), "idx 1 → 200");
+        assert!(expect_503(2), "idx 2 → 503");
+        assert!(!expect_503(3), "idx 3 → 200");
+    }
+
+    #[test]
+    fn retry_script_cyclic_window_modulo_for_fail_2() {
+        // fail:2 → window length 3 → 503,503,200 repeating.
+        let fail_count: u64 = 2;
+        let expect_503 = |idx: u64| idx % (fail_count + 1) < fail_count;
+        assert!(expect_503(0));
+        assert!(expect_503(1));
+        assert!(!expect_503(2));
+        assert!(expect_503(3));
+        assert!(expect_503(4));
+        assert!(!expect_503(5));
     }
 
     #[test]
