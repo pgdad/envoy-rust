@@ -149,3 +149,41 @@ proxy-arm size ~320 lines / 7-8 nesting levels ahead of the Task-5 H2 mirror) + 
 `cluster` param; garbled comment) → ALL FIXED in the amended commit (guard declared before the handle
 binding → drops last; `run_attempt` extraction → proxy arm ~128 lines; param dropped; comment
 rewritten) → re-review **Approved** (no new issues).
+
+**CI:** run `26749898283` (HEAD `107899920`) `completed / success` — all 23 Docker-gated fixtures +
+fuzz + 5 stable-toolchain gates green with the per-attempt counting reconciliation in place.
+
+---
+
+## Task 5 — H2 retry loop + per-attempt counting + `x-envoy-attempt-count` (commit `5c65fc173`)
+
+**Landed.** `crates/envoy-http2/src/hcm.rs`: `handle_one_stream`'s `BuildOutcome::Proxy` arm is now a
+retry loop over an extracted `run_h2_attempt(...) -> H2AttemptResult` helper (a faithful local mirror
+of H1's `run_attempt`/`AttemptResult` — no envoy-http1 dependency). The H1-vs-H2 upstream-protocol fork
+lives INSIDE the helper (internal `AcquireOutcome` enum: `Sent(Result)` / `ConnectFailure` /
+`Overflow`), so the loop is protocol-agnostic — a retry on an H2-protocol cluster re-acquires from the
+H2 pool. Per-attempt accounting identical to H1 (L5 `upstream_rq_total` gated on `upstream_response`;
+L8 `record_response` gated on `endpoint.is_some()`; post-loop completing-only `upstream_rq_5xx` + L4
+XOR split + L6 gated `x-envoy-attempt-count`); back-off REUSES `envoy_config::RetryConfig::backoff`.
+Body replay = per-attempt `envoy_req.body.clone()` of the buffered `Bytes` (ADR-0044 §0). Existing
+synth shapes (pick-none 502 / overflow 503 / connect-fail 502) preserved byte-exact. 3 TDD tests
+(success / limit-exceeded / no-retry regression; all on the H1-upstream fork — the H2-upstream fork is
+covered structurally + by pre-existing `max_retries==0` tests) + 1 fix-driven test (below).
+
+**Verification (quoted):**
+- `cargo test -p envoy-http2` → `test result: ok. 61 passed; 0 failed; 1 ignored` (57 + 4 new).
+- `cargo test -p envoy-http1` → `test result: ok. 91 passed` (90 + 1 new sibling test); `-p envoy-config` → `295 passed`; `-p envoy-cluster` → `71 passed`.
+- `cargo build --workspace --all-targets` → clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0); `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → 2 files changed (H2 `hcm.rs` +756/−268; H1 `hcm.rs` +53 [sibling test only]).
+
+**Two-stage review:** spec-compliance **✅ compliant** (mirror fidelity verified line-by-line; H2-upstream
+fork retry path verified structurally; body-replay per-attempt clone verified; counting
+single-source-of-truth; pre-existing H2 synth/bypass behavior preserved vs base). Code-quality first
+pass **With fixes** → 1 Important: **H2 collapsed connect-failure into `Reset`** (H1 distinguishes
+`ConnectFailure` vs `Reset`) — an observable cross-protocol asymmetry under `retry_on:
+connect-failure`-without-`reset` → FIXED in the amended commit (H2 `AcquireOutcome` restructured to
+mirror H1: all 3 connect sites → `ConnectFailure`; only `send_request` errors → `Reset`), proven by a
+NEW TDD sibling test pair `{h2_,}connect_failure_retried_on_connect_failure_policy` (kernel-refused
+`127.0.0.1:1` endpoint; H2 test RED before the fix [retry never fired], GREEN after; H1 test green
+before AND after, proving H1 was already correct) + 2 Minor (comment alignment — fixed; H2-upstream-fork
+retry not directly tested — noted for Task 8).
