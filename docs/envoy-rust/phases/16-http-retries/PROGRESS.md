@@ -219,3 +219,54 @@ acceptable for a test helper; **RESIDUAL RISK carried to Task 7:** Docker-side s
 the design assumes Envoy's retry attempts present the SAME source IP to the host backend (true for
 Docker Desktop NAT + Linux bridge, but unproven in this repo) — Task 7's first Docker run must confirm;
 if it fails, the symptom is the retry-success path returning 503 bilaterally instead of 200).
+
+---
+
+## Task 7 — fixture `0024-upstream-retry-on-5xx` + Docker wrapper + cyclic retry-script (commit `d1f87a247`)
+
+**Landed — and the Task-6 residual risk MATERIALIZED + was reconciled.** The first live Docker run
+FAILED exactly as the Task-6 review warned: **macOS Docker Desktop NATs every container→host connection
+to source IP `127.0.0.1`** (proven by a direct host-listener probe: `PEER ('127.0.0.1', …)` from inside
+the Docker network) — identical to envoy-rust's source IP — so the per-source-IP counter keying
+collapsed both proxies into one bucket; Envoy-in-Docker (driven first) burned the `fail:1` budget and
+envoy-rust never retried (`x-envoy-attempt-count: 1`). **Reconciliation (controller decision, no fork):**
+the `--retry-script PATH=fail:N` semantics changed to **cyclic windows** — a single global per-path
+`AtomicU64`; request idx where `idx % (N+1) < N` → 503 (`fail\n`), else 200 (`ok\n`). For `fail:1`:
+503,200,503,200,… Each proxy's retry pair (2 consecutive attempts) lands in its own window because the
+keep-alive driver drives the proxies SEQUENTIALLY (verified structurally: a plain `for` loop over
+`[upstream, subject]` in `lib.rs` — no `tokio::join`); NAT-immune; no harness topology change. The
+latent fragility (a future parallel-drive refactor would interleave windows) is documented in the
+helper + README.
+
+**Fixture content:** `envoy.yaml`/`envoy-rust.yaml` structurally identical (H1 HCM `ingress_http`;
+STRICT_DNS cluster `backend` + `dns_lookup_family: V4_ONLY` per L11; vhost
+`include_attempt_count_in_response: true` per L6; routes `/retry-success` + `/retry-exhausted` each
+`retry_policy: {retry_on: "5xx", num_retries: 1}`). Backend spawn:
+`--retry-script /retry-success=fail:1 --per-path /retry-exhausted=503`. `expectations.yaml`
+(`http1_keep_alive` driver): probe 1 → 200 + body `ok\n` + `x-envoy-attempt-count: 2` (value-exact);
+probe 2 → 503 + body `service unavailable\n` (the last upstream 503 verbatim per L9) +
+`x-envoy-attempt-count: 2`; 8 `expected_stats`: `cluster.backend.upstream_rq_retry: 2` /
+`_retry_success: 1` / `_retry_limit_exceeded: 1` (L4) / `upstream_rq_total: 4` (per-attempt, L5) /
+`upstream_rq_5xx: 1` (completing-only, L5) / `http.ingress_http.downstream_rq_2xx: 1` /
+`downstream_rq_5xx: 1` / `downstream_rq_total: 2`. No `allowlist_envoy_only` needed (named-stat driver
+ignores unasserted Envoy-only names — the 0022/0023 precedent). Harness additions:
+`Http1HeaderValueRule`/`require_header_value` (value-exact header assertion, default-None — inert for
+fixtures 0001–0023) + the 0024 spawn arm.
+
+**THE DIFFERENTIAL RESULT (the phase's discriminating observable):**
+- `cargo test -p differential --test upstream_retry` → **`test result: ok. 1 passed`** — both proxies
+  agree bilaterally on BOTH probes (statuses, bodies, `x-envoy-attempt-count: 2`) AND all 8 stats, with
+  ZERO expectation edits (the L4/L5/L6 reconciliation validated end-to-end against real Envoy v1.33.0).
+- Regression fixtures re-run locally: 0020 → `ok. 1 passed`; 0022 → `ok. 1 passed`; 0023 → `ok. 1 passed`.
+
+**Verification (quoted):**
+- `cargo test -p health-aware-http1-backend` → `test result: ok. 9 passed` (cyclic-modulo unit tests added).
+- harness self-test `backend_retry_script_stateful_fail_then_succeed` → ok (asserts the 503,200,503,200 cycle).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → 8 files changed (+553/−85).
+
+**Two-stage review:** spec-compliance **✅ compliant** (reviewer independently re-ran the differential —
+PASS; found 3 stale per-source-design doc references → fixed + folded in); code-quality **Approved**
+(zero Critical / zero Important; 1 Minor — the parallel-drive latent-fragility caution → added + folded
+in). The cyclic-window decision is a test-harness-internal tactical choice (no ADR; documented here +
+in the helper/README per the 12.x–15 harness-decision precedent).
