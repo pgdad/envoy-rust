@@ -109,6 +109,21 @@ pub struct Cluster {
     /// time as `cluster.<name>.upstream_rq_5xx`. Exposed via
     /// `upstream_rq_5xx()`.
     pub(crate) upstream_rq_5xx: Arc<envoy_stats::Counter>,
+    /// 16 Task 3: per-cluster counter incremented once per retry attempt
+    /// dispatched. Registered unconditionally at construct time as
+    /// `cluster.<name>.upstream_rq_retry` (inert-at-0 until Task 4/5 increment
+    /// it). Exposed via `upstream_rq_retry()`.
+    pub(crate) upstream_rq_retry: Arc<envoy_stats::Counter>,
+    /// 16 Task 3: per-cluster counter incremented when a retried request
+    /// ultimately succeeds. Registered unconditionally at construct time as
+    /// `cluster.<name>.upstream_rq_retry_success`. Exposed via
+    /// `upstream_rq_retry_success()`.
+    pub(crate) upstream_rq_retry_success: Arc<envoy_stats::Counter>,
+    /// 16 Task 3: per-cluster counter incremented when a request exhausts its
+    /// configured retry budget (num_retries reached). Registered unconditionally
+    /// at construct time as `cluster.<name>.upstream_rq_retry_limit_exceeded`.
+    /// Exposed via `upstream_rq_retry_limit_exceeded()`.
+    pub(crate) upstream_rq_retry_limit_exceeded: Arc<envoy_stats::Counter>,
     /// 12.1 (parent-12 D3/D5): per-endpoint active-health-check state, aligned by
     /// index with `endpoints`. `None` when the cluster has no `health_checks`
     /// configured (the §5.4 inert-when-unconfigured invariant) — `pick()` is then
@@ -173,6 +188,30 @@ impl Cluster {
     /// Mirrors `upstream_rq_total()`'s borrow shape.
     pub fn upstream_rq_5xx(&self) -> &Arc<envoy_stats::Counter> {
         &self.upstream_rq_5xx
+    }
+
+    /// 16 Task 3: shared accessor for the per-cluster retry-attempt counter
+    /// (`cluster.<name>.upstream_rq_retry`). Incremented by the retry loop
+    /// (Tasks 4/5) once per attempt beyond the first. Mirrors
+    /// `upstream_rq_total()`'s borrow shape.
+    pub fn upstream_rq_retry(&self) -> &Arc<envoy_stats::Counter> {
+        &self.upstream_rq_retry
+    }
+
+    /// 16 Task 3: shared accessor for the per-cluster retry-success counter
+    /// (`cluster.<name>.upstream_rq_retry_success`). Incremented by the retry
+    /// loop when a retried request ultimately returns a non-retry-eligible
+    /// response. Mirrors `upstream_rq_total()`'s borrow shape.
+    pub fn upstream_rq_retry_success(&self) -> &Arc<envoy_stats::Counter> {
+        &self.upstream_rq_retry_success
+    }
+
+    /// 16 Task 3: shared accessor for the per-cluster retry-limit-exceeded
+    /// counter (`cluster.<name>.upstream_rq_retry_limit_exceeded`). Incremented
+    /// by the retry loop when num_retries is exhausted. Mirrors
+    /// `upstream_rq_total()`'s borrow shape.
+    pub fn upstream_rq_retry_limit_exceeded(&self) -> &Arc<envoy_stats::Counter> {
+        &self.upstream_rq_retry_limit_exceeded
     }
 
     /// 06.3 D15.3.b: increment `cluster.<name>.upstream_cx_active` and
@@ -433,6 +472,25 @@ impl ClusterHandle {
     /// ergonomic reach.
     pub fn upstream_rq_5xx(&self) -> &Arc<envoy_stats::Counter> {
         self.inner.upstream_rq_5xx()
+    }
+
+    /// 16 Task 3: delegates to `Cluster::upstream_rq_retry`. Retry-loop
+    /// callers hold a `ClusterHandle`; this mirrors the accessor for
+    /// ergonomic reach.
+    pub fn upstream_rq_retry(&self) -> &Arc<envoy_stats::Counter> {
+        self.inner.upstream_rq_retry()
+    }
+
+    /// 16 Task 3: delegates to `Cluster::upstream_rq_retry_success`.
+    /// Mirrors `upstream_rq_retry()`'s borrow shape.
+    pub fn upstream_rq_retry_success(&self) -> &Arc<envoy_stats::Counter> {
+        self.inner.upstream_rq_retry_success()
+    }
+
+    /// 16 Task 3: delegates to `Cluster::upstream_rq_retry_limit_exceeded`.
+    /// Mirrors `upstream_rq_retry()`'s borrow shape.
+    pub fn upstream_rq_retry_limit_exceeded(&self) -> &Arc<envoy_stats::Counter> {
+        self.inner.upstream_rq_retry_limit_exceeded()
     }
 
     /// 12.2 (parent-12 D4): per-endpoint health-probe targets when this
@@ -709,6 +767,31 @@ pub async fn from_bootstrap(
                 cluster: cfg.name.clone(),
                 message: e.to_string(),
             })?;
+        // 16 Task 3: register per-cluster retry counters unconditionally at 0.
+        // A route's retry config is not known here; these are inert until the
+        // retry loop (Tasks 4/5) increments them. All 23 existing fixtures remain
+        // green because they do not assert the absence of these names.
+        let upstream_rq_retry = registry
+            .register_counter(&format!("cluster.{}.upstream_rq_retry", cfg.name))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
+        let upstream_rq_retry_success = registry
+            .register_counter(&format!("cluster.{}.upstream_rq_retry_success", cfg.name))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
+        let upstream_rq_retry_limit_exceeded = registry
+            .register_counter(&format!(
+                "cluster.{}.upstream_rq_retry_limit_exceeded",
+                cfg.name
+            ))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
         // 12.1 (parent-12 D5): `common_lb_config.healthy_panic_threshold` is a
         // cluster-level load-balancing property independent of active health
         // checking — it governs `pick()`'s panic-routing for ANY eligibility
@@ -848,6 +931,9 @@ pub async fn from_bootstrap(
             cx_active,
             upstream_rq_total,
             upstream_rq_5xx,
+            upstream_rq_retry,
+            upstream_rq_retry_success,
+            upstream_rq_retry_limit_exceeded,
             endpoint_health,
             panic_threshold,
             outlier_detection,
@@ -893,6 +979,15 @@ mod tests {
         let upstream_rq_5xx = registry
             .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
             .expect("counter registers");
+        let upstream_rq_retry = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry"))
+            .expect("counter registers");
+        let upstream_rq_retry_success = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_success"))
+            .expect("counter registers");
+        let upstream_rq_retry_limit_exceeded = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
+            .expect("counter registers");
         ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
@@ -903,6 +998,9 @@ mod tests {
                 cx_active,
                 upstream_rq_total,
                 upstream_rq_5xx,
+                upstream_rq_retry,
+                upstream_rq_retry_success,
+                upstream_rq_retry_limit_exceeded,
                 endpoint_health: None,
                 panic_threshold: 50.0,
                 outlier_detection: None,
@@ -1200,6 +1298,15 @@ admin:
                 .expect("counter registers"),
             upstream_rq_5xx: registry
                 .register_counter("cluster.backend.upstream_rq_5xx")
+                .expect("counter registers"),
+            upstream_rq_retry: registry
+                .register_counter("cluster.backend.upstream_rq_retry")
+                .expect("counter registers"),
+            upstream_rq_retry_success: registry
+                .register_counter("cluster.backend.upstream_rq_retry_success")
+                .expect("counter registers"),
+            upstream_rq_retry_limit_exceeded: registry
+                .register_counter("cluster.backend.upstream_rq_retry_limit_exceeded")
                 .expect("counter registers"),
             endpoint_health: None,
             panic_threshold: 50.0,
@@ -1768,6 +1875,15 @@ admin:
         let upstream_rq_5xx = registry
             .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
             .unwrap();
+        let upstream_rq_retry = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry"))
+            .unwrap();
+        let upstream_rq_retry_success = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_success"))
+            .unwrap();
+        let upstream_rq_retry_limit_exceeded = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
+            .unwrap();
         let gauge = registry
             .register_gauge(&format!("cluster.{name}.membership_healthy"))
             .unwrap();
@@ -1791,6 +1907,9 @@ admin:
                 cx_active,
                 upstream_rq_total,
                 upstream_rq_5xx,
+                upstream_rq_retry,
+                upstream_rq_retry_success,
+                upstream_rq_retry_limit_exceeded,
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: None,
@@ -2098,6 +2217,15 @@ admin:
         let upstream_rq_5xx = registry
             .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
             .unwrap();
+        let upstream_rq_retry = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry"))
+            .unwrap();
+        let upstream_rq_retry_success = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_success"))
+            .unwrap();
+        let upstream_rq_retry_limit_exceeded = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
+            .unwrap();
         let membership = registry
             .register_gauge(&format!("cluster.{name}.membership_healthy"))
             .unwrap();
@@ -2176,6 +2304,9 @@ admin:
                 cx_active,
                 upstream_rq_total,
                 upstream_rq_5xx,
+                upstream_rq_retry,
+                upstream_rq_retry_success,
+                upstream_rq_retry_limit_exceeded,
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: Some(od_state),
@@ -2574,6 +2705,63 @@ admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
         let handle = mgr.get("od").expect("cluster present");
         let od = handle.inner.outlier_detection.as_ref().expect("OD wired");
         assert_eq!(od.max_ejection_percent, 10, "Envoy default 10");
+    }
+
+    #[tokio::test]
+    async fn from_bootstrap_registers_upstream_rq_retry_counters_at_zero() {
+        // 16 Task 3: `from_bootstrap` unconditionally registers
+        // cluster.<name>.upstream_rq_retry, upstream_rq_retry_success, and
+        // upstream_rq_retry_limit_exceeded — each readable at 0. The accessors
+        // on both `Cluster` and `ClusterHandle` must return the same Arc handles.
+        // Mirrors the `from_bootstrap_registers_7_outlier_detection_stats_when_configured`
+        // pattern (snapshot → name presence) plus the upstream_rq_total/5xx accessor shape.
+        let bootstrap = envoy_config::parse_bootstrap(SINGLE_ENDPOINT_YAML).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let handle = mgr.get("backend").expect("cluster present");
+
+        // 1. Each stat name appears in the registry snapshot.
+        let snapshot = registry.snapshot();
+        let names: Vec<&str> = snapshot.iter().map(|(n, _)| n.as_str()).collect();
+        for stat in &[
+            "cluster.backend.upstream_rq_retry",
+            "cluster.backend.upstream_rq_retry_success",
+            "cluster.backend.upstream_rq_retry_limit_exceeded",
+        ] {
+            assert!(names.contains(stat), "{stat} not registered; got {names:?}");
+        }
+
+        // 2. Each counter starts at 0 (inert-at-0 invariant: no retry config
+        //    is plumbed here; registration is unconditional per PLAN Task 3 step 3).
+        let retry = registry
+            .register_counter("cluster.backend.upstream_rq_retry")
+            .expect("counter present");
+        assert_eq!(retry.value(), 0, "upstream_rq_retry must start at 0");
+
+        let retry_success = registry
+            .register_counter("cluster.backend.upstream_rq_retry_success")
+            .expect("counter present");
+        assert_eq!(
+            retry_success.value(),
+            0,
+            "upstream_rq_retry_success must start at 0"
+        );
+
+        let retry_limit_exceeded = registry
+            .register_counter("cluster.backend.upstream_rq_retry_limit_exceeded")
+            .expect("counter present");
+        assert_eq!(
+            retry_limit_exceeded.value(),
+            0,
+            "upstream_rq_retry_limit_exceeded must start at 0"
+        );
+
+        // 3. The accessor methods return handles (accessor existence check).
+        let _ = handle.upstream_rq_retry();
+        let _ = handle.upstream_rq_retry_success();
+        let _ = handle.upstream_rq_retry_limit_exceeded();
     }
 }
 
