@@ -276,6 +276,21 @@ impl HealthAwareHttp1Backend {
     /// per-path arm wins over the `/healthz` special-case + the default
     /// arm per `health-aware-http1-backend/src/main.rs`).
     pub async fn spawn_with_per_path(per_path: Option<String>) -> Result<Self> {
+        Self::spawn_with_retry_script(None, per_path).await
+    }
+
+    /// 16 Task 6: spawn the helper backend with an optional
+    /// `--retry-script PATH=fail:N[,...]` value and an optional
+    /// `--per-path PATH=STATUS[,...]` value. Either or both may be `None`.
+    /// The retry-script knob takes precedence over per-path for paths listed in
+    /// the retry-script map (see `health-aware-http1-backend/src/main.rs`).
+    ///
+    /// Replaces the body of the previous `spawn_with_per_path`; that shim now
+    /// delegates here with `retry_script = None`.
+    pub async fn spawn_with_retry_script(
+        retry_script: Option<String>,
+        per_path: Option<String>,
+    ) -> Result<Self> {
         let port = crate::reserve_port()?;
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
@@ -290,6 +305,9 @@ impl HealthAwareHttp1Backend {
             .arg("--")
             .arg("--port")
             .arg(port.to_string());
+        if let Some(spec) = retry_script.as_deref() {
+            cmd.arg("--retry-script").arg(spec);
+        }
         if let Some(spec) = per_path.as_deref() {
             cmd.arg("--per-path").arg(spec);
         }
@@ -848,5 +866,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Phase 16 Task 6 (amended): stateful retry-script knob on the
+    /// `health-aware-http1-backend`. Spawns the backend with:
+    ///   --retry-script /retry-success=fail:1
+    ///   --per-path /retry-exhausted=503
+    /// Then:
+    ///   • GET /retry-success #1 → 503 (fail body `fail\n`)
+    ///   • GET /retry-success #2 → 200 (success body `ok\n`)
+    ///   • GET /retry-exhausted #1 → 503
+    ///   • GET /retry-exhausted #2 → 503
+    ///
+    /// Per-source semantics: the retry-script counter is keyed per (source IP,
+    /// path). All requests here originate from 127.0.0.1, so this is a single-
+    /// source test exercising the normal case. The differential fixture (Task 7)
+    /// relies on the per-source keying so that envoy-rust (127.0.0.1) and
+    /// Envoy-in-Docker (Docker bridge/NAT address) each see their own
+    /// independent fail-then-succeed sequence against the shared backend.
+    ///
+    /// A second-source test (binding a client socket to 127.0.0.2 to verify
+    /// counter independence) is not added here: binding to 127.0.0.2 requires
+    /// that address to be configured on the loopback interface, which is the
+    /// default on Linux but not on macOS. Since this project runs on macOS in
+    /// development, adding such a test would introduce platform-dependent
+    /// flakiness. The per-source logic is covered by unit tests inside the
+    /// `health-aware-http1-backend` crate instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_retry_script_stateful_fail_then_succeed() {
+        let backend = HealthAwareHttp1Backend::spawn_with_retry_script(
+            Some("/retry-success=fail:1".to_string()),
+            Some("/retry-exhausted=503".to_string()),
+        )
+        .await;
+        // If the helper binary isn't compiled yet this will fail with a spawn
+        // error — skip gracefully so `cargo test -p differential` in isolation
+        // doesn't hard-fail on a missing binary.
+        let backend = match backend {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping backend_retry_script_stateful_fail_then_succeed: {e}");
+                return;
+            }
+        };
+
+        let port = backend.port();
+        let addr = format!("127.0.0.1:{port}");
+
+        // Helper: issue one HTTP/1.1 GET with Connection: close and return
+        // (status_code, body_bytes).
+        async fn get(addr: &str, path: &str) -> (u16, Vec<u8>) {
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            let req = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).await.expect("write");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read");
+            let raw = String::from_utf8_lossy(&buf);
+            // Parse first line for status.
+            let status: u16 = raw
+                .split(' ')
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            // Body is after the double-CRLF.
+            let body = if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                buf[pos + 4..].to_vec()
+            } else {
+                Vec::new()
+            };
+            (status, body)
+        }
+
+        // /retry-success: first → 503 fail\n, second → 200 ok\n
+        let (s1, b1) = get(&addr, "/retry-success").await;
+        assert_eq!(s1, 503, "/retry-success #1 must be 503 (fail attempt)");
+        assert_eq!(b1, b"fail\n", "/retry-success #1 body must be `fail\\n`");
+
+        let (s2, b2) = get(&addr, "/retry-success").await;
+        assert_eq!(
+            s2, 200,
+            "/retry-success #2 must be 200 (success after fail)"
+        );
+        assert_eq!(b2, b"ok\n", "/retry-success #2 body must be `ok\\n`");
+
+        // /retry-exhausted: always 503 (stateless --per-path arm)
+        let (s3, _) = get(&addr, "/retry-exhausted").await;
+        assert_eq!(s3, 503, "/retry-exhausted #1 must be 503");
+
+        let (s4, _) = get(&addr, "/retry-exhausted").await;
+        assert_eq!(s4, 503, "/retry-exhausted #2 must be 503");
+
+        drop(backend);
     }
 }
