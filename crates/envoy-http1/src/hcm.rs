@@ -729,7 +729,7 @@ async fn serve_connection(
                     #[allow(unused_assignments)]
                     let mut final_retriable = false;
 
-                    let final_response: Response = loop {
+                    let (final_response, completing_upstream_response): (Response, bool) = loop {
                         attempts += 1;
 
                         // Run one attempt: pick → acquire → send → receive. All
@@ -790,14 +790,19 @@ async fn serve_connection(
                             }
                             continue;
                         }
-                        break attempt.response;
+                        break (attempt.response, attempt.upstream_response);
                     };
 
                     // Post-loop reconciliation.
-                    // L5: upstream_rq_5xx on the COMPLETING response only (the
-                    // retried-away 5xx attempts do NOT tick it). Single source of
+                    // L5: upstream_rq_5xx reflects the COMPLETING REAL upstream
+                    // response only (retried-away 5xx attempts do NOT tick it).
+                    // Gated on the completing attempt having received a real
+                    // upstream response — synth local replies (the no-healthy-
+                    // upstream synth-503, connect-failure synth-502, reset synth-
+                    // 502, and overflow synth-503 paths) do NOT tick it, preserving
+                    // the pre-phase-16 baseline (they never did). Single source of
                     // truth (moved here from router::construct_proxied_response).
-                    if final_response.status / 100 == 5 {
+                    if completing_upstream_response && final_response.status / 100 == 5 {
                         cluster.upstream_rq_5xx().inc();
                     }
                     // L4: retry outcome counters. Only when at least one retry
@@ -4190,6 +4195,38 @@ static_resources:
             cluster.upstream_rq_retry_success().value(),
             0,
             "retry_success 0 — never succeeded"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            0,
+            "rq_total 0 — no upstream response was ever received"
+        );
+    }
+
+    /// 16 state-5 review fix: a connect-failure synth-502 with NO retry_policy
+    /// (1 attempt) must NOT tick `upstream_rq_5xx`. The post-loop 5xx tick is
+    /// gated on the completing attempt having received a REAL upstream response;
+    /// the synth-502 (kernel-refused connect) never reached an upstream, so per
+    /// ADR-0045 L5 the 1-attempt path is byte-identical to the pre-phase-16
+    /// baseline where this path never ticked rq_5xx. Sibling of H2's
+    /// `h2_connect_failure_synth_does_not_tick_upstream_rq_5xx`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_failure_synth_does_not_tick_upstream_rq_5xx() {
+        // 127.0.0.1:1 is kernel-refused — a deterministic connect failure.
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", 1).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry("/", "backend", None, false, cluster_mgr);
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
+            "downstream must be connect-failure synth-502: {s}"
+        );
+        assert_eq!(
+            cluster.upstream_rq_5xx().value(),
+            0,
+            "rq_5xx 0 — synth-502 (no real upstream response) must not tick the completing-5xx counter"
         );
         assert_eq!(
             cluster.upstream_rq_total().value(),
