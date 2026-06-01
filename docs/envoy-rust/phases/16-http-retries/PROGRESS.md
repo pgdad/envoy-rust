@@ -187,3 +187,35 @@ NEW TDD sibling test pair `{h2_,}connect_failure_retried_on_connect_failure_poli
 `127.0.0.1:1` endpoint; H2 test RED before the fix [retry never fired], GREEN after; H1 test green
 before AND after, proving H1 was already correct) + 2 Minor (comment alignment — fixed; H2-upstream-fork
 retry not directly tested — noted for Task 8).
+
+---
+
+## Task 6 — stateful fail-then-succeed synthetic-backend harness knob (commit `1af2f69e0`)
+
+**Landed.** `tests/helpers/health-aware-http1-backend/src/main.rs`: new `--retry-script PATH=fail:N`
+CLI knob — for a scripted path, return **503 (body `fail\n`) for the first N requests then 200 (body
+`ok\n`)**, with the counter keyed **per (source IP, path)** (`Mutex<HashMap<IpAddr, u64>>` per scripted
+path; lock never held across an await). Per-source keying is load-bearing: **the differential harness
+shares ONE backend between both proxies** (envoy-rust dials from `127.0.0.1`; Envoy-in-Docker from the
+bridge/NAT gateway address), so a global counter would let the first proxy consume the fail budget and
+the second proxy would never retry — per-source gives each proxy its own independent fail-then-succeed
+sequence. Stateless `--per-path PATH=STATUS` unchanged (503 body remains `service unavailable\n` —
+NOTE for Task 7: the always-503 limit-exceeded path body is `service unavailable\n` (20 bytes), NOT
+`fail\n`). Retry-script arm takes precedence over `--per-path`/`/healthz`/default.
+`tests/differential/src/backend.rs`: `spawn_with_retry_script(retry_script, per_path)`;
+`spawn_with_per_path` delegates (existing callers unchanged). Real-process TDD test
+`backend_retry_script_stateful_fail_then_succeed` + 4 parser unit tests.
+
+**Verification (quoted):**
+- `cargo test -p health-aware-http1-backend` → `test result: ok. 7 passed; 0 failed`.
+- differential `backend_retry_script_stateful_fail_then_succeed` → `ok. 1 passed`.
+- `cargo build --workspace --all-targets` → clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → 2 files changed (helper `main.rs` + harness `backend.rs`).
+
+**Two-stage review:** spec-compliance **✅ compliant** → review surfaced the **shared-backend topology
+finding** (one backend, both proxies) → per-source-IP counter keying added in the amended commit;
+code-quality **Approved** (zero Critical / zero Important; Minors: positional `Option<String>` params
+acceptable for a test helper; **RESIDUAL RISK carried to Task 7:** Docker-side source-IP stability —
+the design assumes Envoy's retry attempts present the SAME source IP to the host backend (true for
+Docker Desktop NAT + Linux bridge, but unproven in this repo) — Task 7's first Docker run must confirm;
+if it fails, the symptom is the retry-success path returning 503 bilaterally instead of 200).
