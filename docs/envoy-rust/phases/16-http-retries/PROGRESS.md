@@ -315,3 +315,27 @@ is retry behavior, not pool connection management).
 the Connection-close gap is pre-existing with file:line evidence); code-quality **Approved** → 1
 Important (fixed 200 ms settle sleeps → `poll_stat_until` bounded polling, hardened + folded in) + 3
 Minors (all pre-existing helper-copy conventions; no action).
+
+---
+
+## Task 9 — `parse_bootstrap` fuzz seed `route_retry_policy.yaml`, corpus 27→28 (commit `8cbd8a9ba`)
+
+**Landed.** New seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/route_retry_policy.yaml` (based on
+`hcm_route_to_cluster.yaml`): exercises ALL 5 `retry_on` tokens + `num_retries: 2` +
+`retriable_status_codes: [409, 429]` + vhost `include_attempt_count_in_response: true`. ATOMIC edit of
+the fuzz `.gitignore` allow-list (27→28 `!corpus` lines) AND the
+`fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (22→23 entries; the on-disk corpus is 28
+files — one seed is covered by its own dedicated test, the pre-existing pattern) — the
+09/10/11/12.2/13.1/15 atomic-edit lesson honored.
+
+**Verification (quoted):**
+- `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → `ok. 1 passed`.
+- Short-budget fuzz smoke (`cargo +nightly fuzz run parse_bootstrap -- -runs=100000`) → `Done 100000
+  runs in 9 second(s)`, **cov 14205 / ft 39532, 0 crashes** (cov up from the phase-15 baseline 13745 —
+  the new RetryPolicy/RetryConfig surface).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → exactly 3 files (seed + `.gitignore` + `bootstrap.rs`); fuzz `Cargo.lock` NOT committed.
+
+**Two-stage review (combined pass for this mechanical task):** spec-compliance **✅ compliant**;
+code-quality **Approved** (zero Critical / zero Important; Minors: optional `node:` field noise;
+the accept-and-ignore design means the seed can't catch token typos — a known L2 constraint).
