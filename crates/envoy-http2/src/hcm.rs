@@ -223,6 +223,11 @@ async fn handle_one_stream(
             BuildOutcome::Synth(r) => r,
             BuildOutcome::Proxy {
                 cluster: cluster_name,
+                // 16 Task 4: BuildOutcome::Proxy gained `retry_config` +
+                // `include_attempt_count_in_response` for the H1 retry loop.
+                // The H2 path consumes them in Task 5; ignored here so the
+                // workspace builds with H2 behavior unchanged for now.
+                ..
             } => {
                 // SPEC §3 D4 H2-side: symmetric H1-or-H2 dispatch keyed on
                 // cluster.upstream_protocol(). The validator ensures every cluster

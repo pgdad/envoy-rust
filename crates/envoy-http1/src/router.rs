@@ -53,6 +53,16 @@ pub const HCM_EMITTED_HEADERS: &[&str] = &["server", "date"];
 /// latency in milliseconds.
 pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 
+/// 16 Task 4 (L6): the `x-envoy-attempt-count` response-header name. Emitted on
+/// the downstream response by the HCM retry loop (`hcm.rs`) ONLY when the
+/// matched virtual-host's `include_attempt_count_in_response` flag is true; the
+/// value is the total number of upstream attempts (2 after one retry). Lives
+/// here next to `X_ENVOY_UPSTREAM_SERVICE_TIME` for header-name co-location;
+/// the injection itself happens in the retry loop (not in
+/// `construct_proxied_response`) because it must also decorate the
+/// limit-exceeded last-503 and the connect-fail synth-502.
+pub const X_ENVOY_ATTEMPT_COUNT: &str = "x-envoy-attempt-count";
+
 /// Construct the synthesized downstream Response value WITHOUT writing it to
 /// the wire. Mirrors the pre-07.1 body of `write_proxied_response` minus the
 /// wire-write call.
@@ -64,11 +74,13 @@ pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 /// will insert `pipeline.encode_headers(&mut outgoing)` between the arm
 /// match's close and the wire write.
 ///
-/// 06.3 D15.3.c: increments `cluster.upstream_rq_total` on every call and
-/// `cluster.upstream_rq_5xx` when `upstream_response.status / 100 == 5`. The
-/// counter increment moved here from `write_proxied_response` so it fires
-/// once per response construction regardless of how the response is
-/// subsequently written.
+/// 16 Task 4: this helper NO LONGER increments any cluster counters. The
+/// `upstream_rq_total` / `upstream_rq_5xx` increments (06.3 D15.3.c) moved out
+/// to the HCM retry loop in `hcm.rs` so each counter has a single source of
+/// truth under retries: `upstream_rq_total` fires per ATTEMPT (lock-in L5) and
+/// `upstream_rq_5xx` fires once on the COMPLETING response only (a retried-away
+/// 5xx must not tick it). This helper is response-construction only; it is
+/// called once per upstream-response attempt and stays side-effect-free.
 ///
 /// Per SPEC §6 signpost 7:
 /// 1. Status line forwards verbatim from upstream.
@@ -85,17 +97,13 @@ pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 ///    — the body bytes are already decoded into a single Bytes by client.rs's
 ///    chunked reader, so the downstream side always emits CL-framed in 04.3).
 pub fn construct_proxied_response(
-    cluster: &envoy_cluster::ClusterHandle,
     upstream_response: Response,
     elapsed_ms: u128,
     close: bool,
 ) -> Response {
-    // 06.3 D15.3.c: per-upstream-response counters. Fires once per call
-    // (which is already gated on receiving a valid upstream_response).
-    cluster.upstream_rq_total().inc();
-    if upstream_response.status / 100 == 5 {
-        cluster.upstream_rq_5xx().inc();
-    }
+    // 16 Task 4: counter increments removed (moved to the HCM retry loop, see
+    // the function doc above) — this helper is response-construction only and
+    // no longer needs the cluster handle.
     let now_date = crate::date::now_imf_fixdate();
     let mut headers: Vec<(String, String)> =
         Vec::with_capacity(upstream_response.headers.len() + 2);
@@ -183,7 +191,8 @@ pub async fn write_proxied_response<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let resp = construct_proxied_response(cluster, upstream_response, elapsed_ms, close);
+    let _ = cluster;
+    let resp = construct_proxied_response(upstream_response, elapsed_ms, close);
     Http1Response::write_to(&resp, downstream).await
 }
 
@@ -352,15 +361,20 @@ static_resources:
         assert!(s.ends_with("\r\nhello"), "body: {s}");
     }
 
-    // ── 06.3 D15.3.c: upstream_rq_total / upstream_rq_5xx counter tests ──
+    // ── 16 Task 4: single-source-of-truth — counters NOT incremented here ──
+    //
+    // 06.3 D15.3.c originally incremented `upstream_rq_total` / `upstream_rq_5xx`
+    // inside `construct_proxied_response`. Phase 16 Task 4 moved those increments
+    // to the HCM retry loop (per-attempt total; completing-response-only 5xx) so
+    // each counter has a single increment site under retries. These tests now
+    // assert the helper is side-effect-FREE — the increments are exercised
+    // end-to-end by the `hcm.rs` retry tests instead.
 
-    /// 06.3 D15.3.c: `write_proxied_response` increments `upstream_rq_total`
-    /// on every call (200 status). Verifies the prologue-increment fires
-    /// unconditionally.
+    /// 16 Task 4: `write_proxied_response` (200) no longer ticks
+    /// `upstream_rq_total` / `upstream_rq_5xx` — the counters moved to the HCM.
     #[tokio::test]
-    async fn write_proxied_response_increments_upstream_rq_total_on_200() {
+    async fn write_proxied_response_does_not_increment_counters_on_200() {
         let (cluster, registry) = mk_test_cluster().await;
-        // Re-register by name to get the same Arc (idempotent same-kind contract).
         let rq_total = registry
             .register_counter("cluster.test.upstream_rq_total")
             .unwrap();
@@ -372,15 +386,13 @@ static_resources:
         write_proxied_response(&mut buf, &cluster, up, 1, false)
             .await
             .expect("write");
-        assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 200");
-        assert_eq!(rq_5xx.value(), 0, "upstream_rq_5xx must stay 0 for 200");
+        assert_eq!(rq_total.value(), 0, "upstream_rq_total moved to HCM loop");
+        assert_eq!(rq_5xx.value(), 0, "upstream_rq_5xx moved to HCM loop");
     }
 
-    /// 06.3 D15.3.c: `write_proxied_response` increments both
-    /// `upstream_rq_total` AND `upstream_rq_5xx` when the upstream status
-    /// is 503 (5xx).
+    /// 16 Task 4: `write_proxied_response` (503) no longer ticks either counter.
     #[tokio::test]
-    async fn write_proxied_response_increments_upstream_rq_5xx_on_503() {
+    async fn write_proxied_response_does_not_increment_counters_on_503() {
         let (cluster, registry) = mk_test_cluster().await;
         let rq_total = registry
             .register_counter("cluster.test.upstream_rq_total")
@@ -393,8 +405,8 @@ static_resources:
         write_proxied_response(&mut buf, &cluster, up, 1, false)
             .await
             .expect("write");
-        assert_eq!(rq_total.value(), 1, "upstream_rq_total must be 1 after 503");
-        assert_eq!(rq_5xx.value(), 1, "upstream_rq_5xx must be 1 after 503");
+        assert_eq!(rq_total.value(), 0, "upstream_rq_total moved to HCM loop");
+        assert_eq!(rq_5xx.value(), 0, "upstream_rq_5xx moved to HCM loop");
     }
 
     // ── 07.1 Task 5: construct_proxied_response factored helper tests ──
@@ -405,9 +417,9 @@ static_resources:
     /// `close = false`.
     #[tokio::test]
     async fn construct_proxied_response_returns_response_with_status_200() {
-        let (cluster, _registry) = mk_test_cluster().await;
+        let (_cluster, _registry) = mk_test_cluster().await;
         let up = upstream(200, vec![("content-type", "text/plain")], b"hello");
-        let resp = construct_proxied_response(&cluster, up, 7, false);
+        let resp = construct_proxied_response(up, 7, false);
         assert_eq!(resp.status, 200);
         // x-envoy-upstream-service-time injected with the elapsed_ms value.
         assert!(
@@ -432,29 +444,27 @@ static_resources:
         );
     }
 
-    /// 07.1 Task 5: `construct_proxied_response` increments
-    /// `upstream_rq_total` exactly once and leaves `upstream_rq_5xx` at 0
-    /// for a 200 response.
+    /// 16 Task 4: `construct_proxied_response` is now side-effect-free — it
+    /// does NOT tick `upstream_rq_total` / `upstream_rq_5xx` (moved to HCM).
     #[tokio::test]
-    async fn construct_proxied_response_increments_upstream_rq_total_only_once() {
+    async fn construct_proxied_response_does_not_increment_counters() {
         let (cluster, _registry) = mk_test_cluster().await;
         let up = upstream(200, vec![], b"");
-        let _resp = construct_proxied_response(&cluster, up, 1, false);
-        assert_eq!(cluster.upstream_rq_total().value(), 1);
+        let _resp = construct_proxied_response(up, 1, false);
+        assert_eq!(cluster.upstream_rq_total().value(), 0);
         assert_eq!(cluster.upstream_rq_5xx().value(), 0);
     }
 
-    /// 07.1 Task 5: `construct_proxied_response` increments both
-    /// `upstream_rq_total` AND `upstream_rq_5xx` on 503, and sets
-    /// `Connection: close` when `close = true`.
+    /// 16 Task 4: `construct_proxied_response` on 503 still does NOT tick the
+    /// counters, and sets `Connection: close` when `close = true`.
     #[tokio::test]
-    async fn construct_proxied_response_increments_upstream_rq_5xx_on_503() {
+    async fn construct_proxied_response_no_counters_on_503() {
         let (cluster, _registry) = mk_test_cluster().await;
         let up = upstream(503, vec![], b"");
-        let resp = construct_proxied_response(&cluster, up, 5, true);
+        let resp = construct_proxied_response(up, 5, true);
         assert_eq!(resp.status, 503);
-        assert_eq!(cluster.upstream_rq_total().value(), 1);
-        assert_eq!(cluster.upstream_rq_5xx().value(), 1);
+        assert_eq!(cluster.upstream_rq_total().value(), 0);
+        assert_eq!(cluster.upstream_rq_5xx().value(), 0);
         // Connection: close when close = true.
         assert!(
             resp.headers

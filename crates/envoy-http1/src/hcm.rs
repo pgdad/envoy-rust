@@ -9,8 +9,8 @@ use crate::response::{Http1Response, Response};
 
 use bytes::{Buf, Bytes, BytesMut};
 use envoy_config::{
-    DataSource, DirectResponse, HttpConnectionManagerConfig, Route, RouteAction, RouteAction_Route,
-    RouteConfiguration, RouteMatch, VirtualHost,
+    AttemptOutcome, DataSource, DirectResponse, HttpConnectionManagerConfig, RetryConfig, Route,
+    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, VirtualHost,
 };
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::Arc;
@@ -272,6 +272,251 @@ impl ConnectionHandler for HCM {
     }
 }
 
+/// 16 Task 4: outcome of one upstream attempt inside the H1 retry loop.
+///
+/// Pure data carrier returned by [`run_attempt`]; the caller (`serve_connection`'s
+/// proxy arm) drives all counters / `record_response` / retry classification from
+/// these fields so the per-attempt lifecycle (pick → acquire → send → receive)
+/// lives in one place and Task 5 mirrors only the clean version.
+struct AttemptResult {
+    /// The response (or synth) produced by this attempt.
+    response: Response,
+    /// The endpoint this attempt picked, if any. `None` ONLY on the
+    /// `pick() -> None` path (no endpoint to attribute): the caller then skips
+    /// both `record_response` and the `%UPSTREAM_HOST%` log capture. `Some` on
+    /// every path that reached an endpoint (connect-fail, reset, overflow,
+    /// real response).
+    endpoint: Option<std::net::SocketAddr>,
+    /// This attempt's classifiable outcome for the retry decision. `Some` for the
+    /// picked-endpoint paths (upstream Response or connect/reset failure); `None`
+    /// for `pick() -> None` and pool-overflow synth paths (terminal, not
+    /// retriable — lock-in #8/#9 carve-out).
+    outcome: Option<AttemptOutcome>,
+    /// `true` iff a real upstream RESPONSE was received (gates the per-attempt
+    /// `upstream_rq_total` tick — lock-in #5). Connect/reset failures and
+    /// overflow synths leave this `false`.
+    upstream_response: bool,
+}
+
+/// 16 Task 4: run ONE upstream attempt — pick an endpoint, acquire a stream
+/// (pool or per-call), send the request, and receive the response. Pure of all
+/// counter side effects EXCEPT `cluster.cx_total().inc()` on a per-call connect
+/// (which has always lived on that connect boundary); every other counter and
+/// the `record_response` hook are driven by the caller from [`AttemptResult`].
+///
+/// `out_headers`/body framing is rebuilt per attempt by the caller's loop, so
+/// the request bits are passed in fresh.
+async fn run_attempt(
+    config: &HCMConfig,
+    cluster: &envoy_cluster::ClusterHandle,
+    cluster_name: &str,
+    req: &Request,
+    host_header: &str,
+    close: bool,
+) -> AttemptResult {
+    // Re-pick the endpoint each attempt — Envoy re-runs LB on every retry (a
+    // healthy host may have been ejected, or a round-robin cluster rotates).
+    // When `pick() -> None`, no endpoint is attributable: emit the 19-byte
+    // no-healthy synth-503 and return (not retriable; no record_response,
+    // lock-in #8).
+    let Some(endpoint) = cluster.pick_endpoint() else {
+        tracing::warn!(
+            cluster = %cluster.name(),
+            "no healthy endpoint for cluster — returning 503",
+        );
+        return AttemptResult {
+            response: synth_no_healthy_upstream(close),
+            endpoint: None,
+            outcome: None,
+            upstream_response: false,
+        };
+    };
+
+    // Strip Connection: per SPEC §3 D1 (one-shot upstream connection) and
+    // Transfer-Encoding: per RFC 7230 §3.3.3. Rebuilt per attempt (the prior
+    // attempt's `out_req` was consumed by send_request).
+    let mut out_headers = req.headers.clone();
+    out_headers.retain(|(n, _)| {
+        !n.eq_ignore_ascii_case(headers::CONNECTION)
+            && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
+    });
+    let out_req = Request {
+        method: req.method.clone(),
+        path: req.path.clone(),
+        version: HttpVersion::Http11,
+        headers: out_headers,
+        bytes_consumed: 0,
+        // Chunked-request-body forwarding is a SPEC §4 non-goal.
+        body: Some(Bytes::new()),
+    };
+
+    let start = std::time::Instant::now();
+
+    // 13.1 Task 4 (D4): the per-attempt StreamHandle abstraction over a pooled
+    // guard vs a one-shot connection.
+    enum StreamHandle {
+        Pooled(crate::pool::PoolGuard),
+        OneShot(ClientStream),
+    }
+
+    // 13.1 Task 4 (D4): acquire from the pool when configured (production path),
+    // else per-call `Client::connect` (test path with `pool_mgr: None`).
+    // `cx_total.inc()` lives inside the pool's connect-on-miss branch; the
+    // fallback arms keep the legacy `cluster.cx_total().inc()`.
+    //
+    // 16 Task 4: connect/overflow failures classify into an `AttemptOutcome`
+    // for the retry decision rather than immediately surfacing a synth response.
+    enum AcquireOutcome {
+        // Connected; ready to send.
+        Stream(StreamHandle),
+        // Connect failed → synth-502, AttemptOutcome::ConnectFailure.
+        ConnectFailure(Response),
+        // Overflow / pending-overflow synth-503 — terminal, not retriable in
+        // this phase (no AttemptOutcome).
+        Overflow(Response),
+    }
+    let acquire: AcquireOutcome = if let Some(pool_mgr) = config.pool_mgr.as_ref() {
+        match pool_mgr.get(cluster_name) {
+            Some(pool) => match pool.acquire(endpoint, host_header).await {
+                Ok(guard) => AcquireOutcome::Stream(StreamHandle::Pooled(guard)),
+                Err(crate::pool::PoolError::Connect(source)) => {
+                    tracing::warn!(
+                        cluster = %cluster.name(),
+                        addr = %endpoint,
+                        error = ?source,
+                        "upstream connect failed (pool) — returning 502",
+                    );
+                    AcquireOutcome::ConnectFailure(synth_status(502, close))
+                }
+                Err(crate::pool::PoolError::Overflow { .. }) => {
+                    tracing::warn!(
+                        cluster = %cluster.name(),
+                        "pool overflow — returning 503",
+                    );
+                    AcquireOutcome::Overflow(synth_overflow(close))
+                }
+                Err(crate::pool::PoolError::PendingOverflow { .. }) => {
+                    tracing::warn!(
+                        cluster = %cluster.name(),
+                        "pending-request overflow (max_pending_requests:0) — returning 503",
+                    );
+                    AcquireOutcome::Overflow(synth_overflow(close))
+                }
+            },
+            None => match Client::connect(endpoint, host_header).await {
+                Ok(s) => {
+                    cluster.cx_total().inc();
+                    AcquireOutcome::Stream(StreamHandle::OneShot(s))
+                }
+                Err(source) => {
+                    tracing::warn!(
+                        cluster = %cluster.name(),
+                        addr = %endpoint,
+                        error = ?source,
+                        "upstream connect failed — returning 502",
+                    );
+                    AcquireOutcome::ConnectFailure(synth_status(502, close))
+                }
+            },
+        }
+    } else {
+        match Client::connect(endpoint, host_header).await {
+            Ok(s) => {
+                cluster.cx_total().inc();
+                AcquireOutcome::Stream(StreamHandle::OneShot(s))
+            }
+            Err(source) => {
+                tracing::warn!(
+                    cluster = %cluster.name(),
+                    addr = %endpoint,
+                    error = ?source,
+                    "upstream connect failed — returning 502",
+                );
+                AcquireOutcome::ConnectFailure(synth_status(502, close))
+            }
+        }
+    };
+
+    // 13.1 cx_active guard: only the `OneShot` arm needs it (the Pooled
+    // PoolGuard owns its own `ConnGaugeGuard` against the SAME `Arc<Gauge>`, so
+    // an outer guard would double-count; the terminal arms reached no connect).
+    //
+    // The guard MUST drop AFTER the stream handle — the documented invariant is
+    // that `upstream_cx_active` decrements only once the upstream connection
+    // has closed. Rust drops locals in reverse declaration order, so `_cx_guard`
+    // is declared HERE, BEFORE the `match acquire` below binds the `OneShot`
+    // `ClientStream` into `handle`. The stream (declared later) drops FIRST,
+    // closing the upstream connection; then `_cx_guard` drops, firing the gauge
+    // decrement — the correct ordering for an `active` gauge.
+    let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> = match &acquire {
+        AcquireOutcome::Stream(StreamHandle::OneShot(_)) => Some(cluster.cx_active_guard()),
+        _ => None,
+    };
+
+    match acquire {
+        AcquireOutcome::Stream(mut handle) => {
+            let send_result = match &mut handle {
+                StreamHandle::Pooled(g) => g.stream_mut().send_request(out_req).await,
+                StreamHandle::OneShot(s) => s.send_request(out_req).await,
+            };
+            match send_result {
+                Ok(upstream_response) => {
+                    let elapsed_ms = start.elapsed().as_millis();
+                    let response = crate::router::construct_proxied_response(
+                        upstream_response,
+                        elapsed_ms,
+                        close,
+                    );
+                    AttemptResult {
+                        response,
+                        endpoint: Some(endpoint),
+                        outcome: Some(AttemptOutcome::Response),
+                        upstream_response: true,
+                    }
+                }
+                Err(source) => {
+                    // send/recv failure → classify as Reset (the upstream did
+                    // not deliver a complete response). Invalidate a pooled
+                    // stream so Drop destroys it + fires cx_destroy.
+                    if let StreamHandle::Pooled(g) = &mut handle {
+                        g.invalidate();
+                    }
+                    tracing::warn!(
+                        cluster = %cluster.name(),
+                        addr = %endpoint,
+                        error = ?source,
+                        "upstream request failed — returning 502",
+                    );
+                    AttemptResult {
+                        response: synth_status(502, close),
+                        endpoint: Some(endpoint),
+                        outcome: Some(AttemptOutcome::Reset),
+                        upstream_response: false,
+                    }
+                }
+            }
+        }
+        AcquireOutcome::ConnectFailure(response) => AttemptResult {
+            response,
+            endpoint: Some(endpoint),
+            outcome: Some(AttemptOutcome::ConnectFailure),
+            upstream_response: false,
+        },
+        AcquireOutcome::Overflow(response) => {
+            // Terminal: not retriable in this phase. No upstream_rq_total tick
+            // (no connect reached); the picked endpoint still gets a
+            // record_response (it failed to serve), mirroring the pre-phase-16
+            // behavior at the old `cluster.record_response` site.
+            AttemptResult {
+                response,
+                endpoint: Some(endpoint),
+                outcome: None,
+                upstream_response: false,
+            }
+        }
+    }
+}
+
 async fn serve_connection(
     config: Arc<HCMConfig>,
     mut downstream: TcpStream,
@@ -455,6 +700,8 @@ async fn serve_connection(
                 }
                 BuildOutcome::Proxy {
                     cluster: cluster_name,
+                    retry_config,
+                    include_attempt_count_in_response,
                 } => {
                     // The validator (envoy-config Task 2) ensures every cluster
                     // name referenced from a RouteAction::Route exists in the
@@ -464,258 +711,119 @@ async fn serve_connection(
                         .get(&cluster_name)
                         .expect("validator ensures cluster present");
 
-                    if let Some(endpoint) = cluster.pick_endpoint() {
-                        let host_header = find_header(&req.headers, headers::HOST)
-                            .expect(
-                                "build_response rejected missing/empty Host before BuildOutcome::Proxy",
-                            )
-                            .to_owned();
+                    let host_header = find_header(&req.headers, headers::HOST)
+                        .expect(
+                            "build_response rejected missing/empty Host before BuildOutcome::Proxy",
+                        )
+                        .to_owned();
 
-                        // Strip Connection: per SPEC §3 D1 (one-shot upstream connection)
-                        // and Transfer-Encoding: per RFC 7230 §3.3.3 — the outgoing body
-                        // is forced to CL: 0, mirroring the response-side strip in
-                        // `router::write_proxied_response`.
-                        let mut out_headers = req.headers.clone();
-                        out_headers.retain(|(n, _)| {
-                            !n.eq_ignore_ascii_case(headers::CONNECTION)
-                                && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
-                        });
-                        let out_req = Request {
-                            method: req.method.clone(),
-                            path: req.path.clone(),
-                            version: HttpVersion::Http11,
-                            headers: out_headers,
-                            bytes_consumed: 0,
-                            // Chunked-request-body forwarding is a SPEC §4 non-goal.
-                            body: Some(Bytes::new()),
-                        };
+                    // 16 Task 4: H1 retry loop. With `retry_config: None`,
+                    // `max_retries == 0` so the loop runs exactly once and the
+                    // path is byte-identical to the pre-phase-16 single-attempt
+                    // dispatch (no retry counters tick, no x-envoy-attempt-count).
+                    let max_retries = retry_config.as_ref().map_or(0, |r| r.num_retries);
+                    let mut attempts: u32 = 0;
+                    // Whether the FINAL attempt (the one we broke out on) was
+                    // itself retriable. Assigned on every `break` path; read
+                    // post-loop to split retry_success vs limit_exceeded (L4).
+                    #[allow(unused_assignments)]
+                    let mut final_retriable = false;
 
-                        // 06.2 Task 6: capture the resolved upstream endpoint
-                        // for the access-log `%UPSTREAM_HOST%` token. The
-                        // SocketAddr Display impl produces the canonical
-                        // `addr:port` rendering envoy uses.
-                        upstream_host_for_log = Some(endpoint.to_string());
+                    let final_response: Response = loop {
+                        attempts += 1;
 
-                        // 06.3 D15.3.b: `cluster.<name>.upstream_cx_active`
-                        // RAII guard. 13.1 Task 4 code-quality fold-in: the
-                        // guard is now wired BELOW (after `StreamHandle` is
-                        // built) so it only fires on the `OneShot` arms — the
-                        // pool path owns its own `ConnGaugeGuard` inside
-                        // `PoolGuard` (pool.rs::PoolGuard::_cx_active_guard),
-                        // which shares the SAME `Arc<Gauge>` via the registry's
-                        // idempotent same-kind contract. An outer-scope guard
-                        // here would double-count cx_active on every pool-path
-                        // in-flight request (regression test:
-                        // `h1_hcm_pool_path_does_not_double_count_cx_active`).
+                        // Run one attempt: pick → acquire → send → receive. All
+                        // counter side effects (except the per-call `cx_total`
+                        // connect tick that lives inside) are driven HERE from
+                        // the returned `AttemptResult`, so behavior is identical
+                        // to the inlined version.
+                        let attempt = run_attempt(
+                            &config,
+                            &cluster,
+                            &cluster_name,
+                            &req,
+                            &host_header,
+                            close,
+                        )
+                        .await;
 
-                        let start = std::time::Instant::now();
-
-                        // 13.1 Task 4 (D4): dispatch through `H1Pool::acquire`
-                        // when a pool manager is configured (the production
-                        // path, lock-in #1). Tests that build HCMConfig as a
-                        // struct-literal without a pool manager fall back to
-                        // per-call `Client::connect` (preserves every pre-13.1
-                        // HCM unit test). `cx_total.inc()` lives inside
-                        // `H1Pool::acquire`'s connect-on-miss branch (Task 3,
-                        // lock-in #6); the fallback `else` arm below keeps the
-                        // legacy `cluster.cx_total().inc()` site since the
-                        // pool's increment doesn't fire on this path.
-                        enum StreamHandle {
-                            Pooled(crate::pool::PoolGuard),
-                            OneShot(ClientStream),
+                        if let Some(endpoint) = attempt.endpoint {
+                            // 06.2 Task 6: capture the resolved upstream endpoint
+                            // for the access-log `%UPSTREAM_HOST%` token (last
+                            // attempt's endpoint wins). Skipped on pick()->None.
+                            upstream_host_for_log = Some(endpoint.to_string());
                         }
-                        let stream_or_synth: Result<StreamHandle, Response> = if let Some(
-                            pool_mgr,
-                        ) =
-                            config.pool_mgr.as_ref()
-                        {
-                            match pool_mgr.get(&cluster_name) {
-                                Some(pool) => match pool.acquire(endpoint, &host_header).await {
-                                    Ok(guard) => Ok(StreamHandle::Pooled(guard)),
-                                    Err(crate::pool::PoolError::Connect(source)) => {
-                                        tracing::warn!(
-                                            cluster = %cluster.name(),
-                                            addr = %endpoint,
-                                            error = ?source,
-                                            "upstream connect failed (pool) — returning 502",
-                                        );
-                                        Err(synth_status(502, close))
-                                    }
-                                    Err(crate::pool::PoolError::Overflow { .. }) => {
-                                        // Minor #2 (code-quality fold-in):
-                                        // overflow means NO connect was
-                                        // attempted (the pool refused the
-                                        // acquire before reaching
-                                        // `Client::connect`), so `cx_total`
-                                        // intentionally does NOT increment on
-                                        // this arm — symmetric with the
-                                        // `PoolError::Connect` arm above
-                                        // where the connect failed and
-                                        // `cx_total` also doesn't fire
-                                        // (lock-in #6: `cx_total.inc()`
-                                        // lives inside the pool's
-                                        // connect-on-miss success path).
-                                        tracing::warn!(
-                                            cluster = %cluster.name(),
-                                            "pool overflow — returning 503",
-                                        );
-                                        Err(synth_overflow(close))
-                                    }
-                                    // 15 D3 (Task 2): max_pending_requests:0
-                                    // reject-on-establish. Like the cap-overflow
-                                    // arm above, NO connect was attempted, so
-                                    // `cx_total` does not fire. Both overflow
-                                    // variants are "overflow" 503s; Task 4
-                                    // refines both to the byte-exact 81-byte
-                                    // `synth_overflow` body.
-                                    Err(crate::pool::PoolError::PendingOverflow { .. }) => {
-                                        tracing::warn!(
-                                            cluster = %cluster.name(),
-                                            "pending-request overflow (max_pending_requests:0) — returning 503",
-                                        );
-                                        Err(synth_overflow(close))
-                                    }
-                                },
-                                None => {
-                                    // No pool entry for this cluster (e.g.,
-                                    // an H2-protocol cluster — H2 pools defer
-                                    // to 13.2). Fall through to per-call
-                                    // connect on this request.
-                                    match Client::connect(endpoint, &host_header).await {
-                                        Ok(s) => {
-                                            cluster.cx_total().inc();
-                                            Ok(StreamHandle::OneShot(s))
-                                        }
-                                        Err(source) => {
-                                            tracing::warn!(
-                                                cluster = %cluster.name(),
-                                                addr = %endpoint,
-                                                error = ?source,
-                                                "upstream connect failed — returning 502",
-                                            );
-                                            Err(synth_status(502, close))
-                                        }
-                                    }
-                                }
+
+                        // L5: per-attempt upstream_rq_total — only for received
+                        // upstream responses (single source of truth; the
+                        // increment moved here from
+                        // router::construct_proxied_response).
+                        if attempt.upstream_response {
+                            cluster.upstream_rq_total().inc();
+                        }
+
+                        // 14.2 D4 / lock-in #9 (L8): response-receipt hook PER
+                        // ATTEMPT — each attempt feeds outlier detection. Records
+                        // against the picked endpoint for Response, connect-fail,
+                        // send-fail (Reset), and overflow paths (every path that
+                        // reached a pick()). Skipped on pick()->None (no endpoint
+                        // to attribute, lock-in #8). Inert without
+                        // outlier_detection.
+                        if let Some(endpoint) = attempt.endpoint {
+                            cluster.record_response(endpoint, attempt.response.status);
+                        }
+
+                        // Retry decision. `final_retriable` mirrors whether THIS
+                        // (final-so-far) attempt is retriable — used post-loop to
+                        // split retry_success vs limit_exceeded (L4).
+                        final_retriable = match attempt.outcome {
+                            Some(outcome) => retry_config
+                                .as_ref()
+                                .is_some_and(|r| r.is_retriable(attempt.response.status, outcome)),
+                            None => false,
+                        };
+                        if final_retriable && attempts <= max_retries {
+                            // L4: a retry is firing. Count it, back off, loop.
+                            cluster.upstream_rq_retry().inc();
+                            if let Some(d) = RetryConfig::backoff(attempts) {
+                                tokio::time::sleep(d).await;
                             }
+                            continue;
+                        }
+                        break attempt.response;
+                    };
+
+                    // Post-loop reconciliation.
+                    // L5: upstream_rq_5xx on the COMPLETING response only (the
+                    // retried-away 5xx attempts do NOT tick it). Single source of
+                    // truth (moved here from router::construct_proxied_response).
+                    if final_response.status / 100 == 5 {
+                        cluster.upstream_rq_5xx().inc();
+                    }
+                    // L4: retry outcome counters. Only when at least one retry
+                    // fired (attempts > 1). If the final attempt was still
+                    // retriable (we ran out of budget) → limit_exceeded (L9 final
+                    // response is the last upstream verbatim); else → success.
+                    if attempts > 1 {
+                        if final_retriable {
+                            cluster.upstream_rq_retry_limit_exceeded().inc();
                         } else {
-                            // No pool manager wired (test path; struct-literal
-                            // HCMConfig with `pool_mgr: None`). Per-call connect;
-                            // `cx_total.inc()` stays on this fallback arm — the
-                            // pool's increment site (Task 3) only fires when the
-                            // pool path is taken.
-                            match Client::connect(endpoint, &host_header).await {
-                                Ok(s) => {
-                                    cluster.cx_total().inc();
-                                    Ok(StreamHandle::OneShot(s))
-                                }
-                                Err(source) => {
-                                    tracing::warn!(
-                                        cluster = %cluster.name(),
-                                        addr = %endpoint,
-                                        error = ?source,
-                                        "upstream connect failed — returning 502",
-                                    );
-                                    Err(synth_status(502, close))
-                                }
-                            }
-                        };
-
-                        // 13.1 Task 4 code-quality fold-in: cx_active guard
-                        // only fires on the `OneShot` arms (`PoolError::*`
-                        // and `Ok(Pooled)` are skipped). The Pooled arm's
-                        // `PoolGuard` already owns a `ConnGaugeGuard` against
-                        // the SAME `Arc<Gauge>` (pool.rs:183, 219) — an
-                        // outer-scope guard would double-count cx_active
-                        // for every in-flight pool-path request.
-                        //
-                        // Declared BEFORE `match stream_or_synth` so that the
-                        // `OneShot` `ClientStream` (moved into `handle` by
-                        // the match) drops FIRST (closing the upstream TCP
-                        // connection), then `_cx_guard` drops, firing the
-                        // gauge decrement after the stream is gone — the
-                        // correct ordering for an `active` gauge.
-                        let _cx_guard: Option<envoy_cluster::ConnGaugeGuard> =
-                            match &stream_or_synth {
-                                Ok(StreamHandle::OneShot(_)) => Some(cluster.cx_active_guard()),
-                                // `Pooled` carries its own guard;
-                                // `Err(_)` means no connect was reached.
-                                _ => None,
-                            };
-
-                        match stream_or_synth {
-                            Ok(mut handle) => {
-                                let send_result = match &mut handle {
-                                    StreamHandle::Pooled(g) => {
-                                        g.stream_mut().send_request(out_req).await
-                                    }
-                                    StreamHandle::OneShot(s) => s.send_request(out_req).await,
-                                };
-                                match send_result {
-                                    Ok(upstream_response) => {
-                                        let elapsed_ms = start.elapsed().as_millis();
-                                        outgoing = crate::router::construct_proxied_response(
-                                            &cluster,
-                                            upstream_response,
-                                            elapsed_ms,
-                                            close,
-                                        );
-                                        // PoolGuard's Drop returns the stream to
-                                        // the pool's idle list on the success path
-                                        // (lock-in #7); the OneShot ClientStream
-                                        // closes cleanly on drop here.
-                                    }
-                                    Err(source) => {
-                                        // On send/recv failure with a pooled
-                                        // guard, invalidate so Drop destroys
-                                        // the stream + fires `cx_destroy` rather
-                                        // than returning a half-broken stream to
-                                        // the idle list.
-                                        //
-                                        // Minor #4 (code-quality fold-in):
-                                        // on the OneShot arm there's no pool
-                                        // to protect — the `ClientStream`
-                                        // simply drops at scope exit, closing
-                                        // the upstream TCP connection cleanly
-                                        // (no `invalidate()` analogue needed).
-                                        if let StreamHandle::Pooled(g) = &mut handle {
-                                            g.invalidate();
-                                        }
-                                        tracing::warn!(
-                                            cluster = %cluster.name(),
-                                            addr = %endpoint,
-                                            error = ?source,
-                                            "upstream request failed — returning 502",
-                                        );
-                                        outgoing = synth_status(502, close);
-                                    }
-                                }
-                            }
-                            Err(resp) => {
-                                outgoing = resp;
-                            }
+                            cluster.upstream_rq_retry_success().inc();
                         }
+                    }
 
-                        // 14.2 D4 (lock-in #9): response-receipt hook (H1). Classify the FINAL
-                        // response status for the picked endpoint AFTER the upstream_rq_*
-                        // increments fire (inside construct_proxied_response on the success arm)
-                        // and BEFORE the downstream write. The connect/send-failure synth-502 +
-                        // pool-overflow synth-503 ALSO record here (the picked endpoint failed;
-                        // 502/503 tick both detectors per ADR-0041 §6.2 item-9, lock-in #3/#10).
-                        // Inert when the cluster has no outlier_detection (record_response
-                        // short-circuits at the cluster-level is_none() check, lock-in #8). The
-                        // no-healthy `else` arm below does NOT call this (no endpoint to attribute).
-                        cluster.record_response(endpoint, outgoing.status);
-                    } else {
-                        // No healthy endpoint available for this cluster.
-                        // 12.2 (parent-12 D6.2 / ADR-0037): emit the 19-byte
-                        // `no healthy upstream` body to match upstream Envoy
-                        // v1.33.0's wire shape on the same path.
-                        tracing::warn!(
-                            cluster = %cluster.name(),
-                            "no healthy endpoint for cluster — returning 503",
-                        );
-                        outgoing = synth_no_healthy_upstream(close);
+                    outgoing = final_response;
+
+                    // L6: x-envoy-attempt-count on the downstream response, ONLY
+                    // when the vhost flag is set. Emitted on ALL outcomes that
+                    // reached the proxy arm (proxied responses and synths), value
+                    // = total attempts. (Envoy emits attempt-count on local replies
+                    // generated by the router too when the flag is on.)
+                    if include_attempt_count_in_response {
+                        outgoing.headers.push((
+                            crate::router::X_ENVOY_ATTEMPT_COUNT.to_string(),
+                            attempts.to_string(),
+                        ));
                     }
                 }
             },
@@ -911,7 +1019,17 @@ fn extract_upstream_service_time(headers: &[(String, String)]) -> Option<std::ti
 /// `cluster_mgr` → `pick_endpoint` → `Client::connect` → `send_request`.
 pub enum BuildOutcome {
     Synth(Response),
-    Proxy { cluster: String },
+    Proxy {
+        cluster: String,
+        /// 16 Task 4: resolved per-route retry policy (`None` → no retries).
+        /// Built from the matched route's `RouteAction_Route.retry_policy` via
+        /// `RetryConfig::from`.
+        retry_config: Option<RetryConfig>,
+        /// 16 Task 4 (L6): the matched virtual-host's
+        /// `include_attempt_count_in_response` flag. Gates emission of the
+        /// `x-envoy-attempt-count` downstream response header.
+        include_attempt_count_in_response: bool,
+    },
 }
 
 /// Per-request dispatch path (07.1 Task 6).
@@ -986,6 +1104,11 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
         RouteAction::DirectResponse(dr) => BuildOutcome::Synth(synth_direct_response(dr, close)),
         RouteAction::Route(ar) => BuildOutcome::Proxy {
             cluster: ar.cluster.clone(),
+            // 16 Task 4: resolve the per-route retry policy. `None` → no retries.
+            retry_config: ar.retry_policy.as_ref().map(RetryConfig::from),
+            // 16 Task 4 (L6): the matched vhost's attempt-count flag travels to
+            // the dispatch seam so the retry loop can gate x-envoy-attempt-count.
+            include_attempt_count_in_response: vh.include_attempt_count_in_response,
         },
     }
 }
@@ -3787,5 +3910,238 @@ static_resources:
         );
 
         pool_token.cancel();
+    }
+
+    // ── 16 Task 4: H1 retry loop tests ───────────────────────────────────────
+
+    /// Build an HCMConfig with a single `Route` action whose `retry_policy` is
+    /// the caller-supplied value, the vhost `include_attempt_count_in_response`
+    /// flag, and a caller-supplied cluster_mgr. Mirrors `hcm_config_with_cluster`
+    /// but exposes the two phase-16 fields.
+    fn hcm_config_with_retry(
+        prefix: &str,
+        cluster: &str,
+        retry_policy: Option<envoy_config::RetryPolicy>,
+        include_attempt_count: bool,
+        cluster_mgr: Arc<envoy_cluster::ClusterManager>,
+    ) -> Arc<HCMConfig> {
+        Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: Arc::new(RouteConfiguration {
+                name: "rc".to_string(),
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: include_attempt_count,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some(prefix.to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: cluster.to_string(),
+                            retry_policy,
+                        }),
+                    }],
+                }],
+            }),
+        })
+    }
+
+    /// Spawn a stateful in-process upstream that returns `fail_status` (CL: 0)
+    /// for its first `fail_count` requests, then `ok` (200, body "ok") for all
+    /// subsequent requests. Returns `(port, request_counter)` — the counter is
+    /// the total number of upstream requests observed (each accepted+read
+    /// connection counts as one). Each request arrives on its own connection
+    /// (the HCM's per-call `Client::connect` fallback path used by tests with
+    /// `pool_mgr: None`).
+    async fn spawn_fail_then_ok_upstream(
+        fail_status: u16,
+        fail_count: usize,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_srv = Arc::clone(&counter);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut buf)).await;
+                let resp: Vec<u8> = if n < fail_count {
+                    format!("HTTP/1.1 {fail_status} X\r\nContent-Length: 0\r\n\r\n").into_bytes()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+                        .to_vec()
+                };
+                let _ = sock.write_all(&resp).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (port, counter)
+    }
+
+    /// 16 Task 4 (L4/L5/L6 success path): backend 503-then-200, retry_on 5xx,
+    /// num_retries 1, vhost include_attempt_count true. Downstream 200,
+    /// x-envoy-attempt-count: 2, retry=1 / retry_success=1 / limit_exceeded=0,
+    /// upstream_rq_total=2, upstream_rq_5xx=0 (retried-away 503 doesn't tick).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_success_path_503_then_200() {
+        let (port, reqs) = spawn_fail_then_ok_upstream(503, 1).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry(
+            "/",
+            "backend",
+            Some(envoy_config::RetryPolicy {
+                retry_on: "5xx".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "downstream must be 200 after retry: {s}"
+        );
+        assert!(
+            s.contains("x-envoy-attempt-count: 2\r\n"),
+            "x-envoy-attempt-count: 2 expected: {s}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "2 attempts"
+        );
+        assert_eq!(cluster.upstream_rq_retry().value(), 1, "retry");
+        assert_eq!(
+            cluster.upstream_rq_retry_success().value(),
+            1,
+            "retry_success"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            0,
+            "limit_exceeded"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            2,
+            "rq_total per attempt"
+        );
+        assert_eq!(
+            cluster.upstream_rq_5xx().value(),
+            0,
+            "5xx counts completing response only"
+        );
+    }
+
+    /// 16 Task 4 (L4/L5/L6/L9 limit-exceeded path): always-503 backend,
+    /// retry_on 5xx, num_retries 1, vhost include_attempt_count true.
+    /// Downstream 503 (verbatim last upstream), x-envoy-attempt-count: 2,
+    /// retry=1 / retry_success=0 / limit_exceeded=1, upstream_rq_total=2,
+    /// upstream_rq_5xx=1 (completing 503 only — not 2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_limit_exceeded_path_always_503() {
+        let (port, reqs) = spawn_fail_then_ok_upstream(503, 1000).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry(
+            "/",
+            "backend",
+            Some(envoy_config::RetryPolicy {
+                retry_on: "5xx".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 503 "),
+            "downstream must be the last upstream 503: {s}"
+        );
+        assert!(
+            s.contains("x-envoy-attempt-count: 2\r\n"),
+            "x-envoy-attempt-count: 2 expected: {s}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "2 attempts"
+        );
+        assert_eq!(cluster.upstream_rq_retry().value(), 1, "retry");
+        assert_eq!(
+            cluster.upstream_rq_retry_success().value(),
+            0,
+            "retry_success"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            1,
+            "limit_exceeded"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            2,
+            "rq_total per attempt"
+        );
+        assert_eq!(
+            cluster.upstream_rq_5xx().value(),
+            1,
+            "5xx counts completing 503 only, not both attempts"
+        );
+    }
+
+    /// 16 Task 4 (no-retry regression): NO retry_policy, backend 503.
+    /// Downstream 503, exactly 1 attempt, upstream_rq_total=1, upstream_rq_5xx=1,
+    /// NO x-envoy-attempt-count header, all 3 retry counters 0. Proves the
+    /// no-retry path is byte-identical to pre-phase-16 behavior.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_absent_no_retry_single_attempt() {
+        let (port, reqs) = spawn_fail_then_ok_upstream(503, 1000).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry("/", "backend", None, false, cluster_mgr);
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("HTTP/1.1 503 "), "downstream 503: {s}");
+        assert!(
+            !s.to_ascii_lowercase().contains("x-envoy-attempt-count"),
+            "no attempt-count header without vhost flag: {s}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "1 attempt"
+        );
+        assert_eq!(cluster.upstream_rq_total().value(), 1, "rq_total 1");
+        assert_eq!(cluster.upstream_rq_5xx().value(), 1, "rq_5xx 1");
+        assert_eq!(cluster.upstream_rq_retry().value(), 0, "retry 0");
+        assert_eq!(cluster.upstream_rq_retry_success().value(), 0, "success 0");
+        assert_eq!(
+            cluster.upstream_rq_retry_limit_exceeded().value(),
+            0,
+            "limit_exceeded 0"
+        );
     }
 }

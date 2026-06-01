@@ -1021,6 +1021,29 @@ pub struct RetryConfig {
 }
 
 impl RetryConfig {
+    /// 16 Task 4 (§6.2 L7): exponential back-off delay between retry attempts.
+    /// Base 25ms, doubling per attempt, capped at 250ms. `attempt` is the
+    /// 1-based number of the attempt that just FAILED (i.e. the delay before
+    /// attempt N+1): attempt 1 → 25ms, attempt 2 → 50ms, attempt 3 → 100ms,
+    /// attempt 4 → 200ms, attempt 5+ → 250ms (cap). Returns `None` for
+    /// `attempt == 0` (overflow/safety guard — there is no delay "before"
+    /// the first attempt). No jitter (deterministic; timing is never asserted
+    /// differentially per L7). Shared by the H1 (Task 4) and H2 (Task 5)
+    /// retry loops so the back-off schedule has a single source of truth.
+    pub fn backoff(attempt: u32) -> Option<std::time::Duration> {
+        if attempt == 0 {
+            return None;
+        }
+        // 25ms * 2^(attempt-1), saturating, capped at 250ms.
+        let shift = attempt - 1;
+        let ms = if shift >= 4 {
+            250
+        } else {
+            (25u64 << shift).min(250)
+        };
+        Some(std::time::Duration::from_millis(ms))
+    }
+
     /// Classify whether `status`/`outcome` satisfies any enabled retry condition.
     pub fn is_retriable(&self, status: u16, outcome: AttemptOutcome) -> bool {
         match outcome {
@@ -9625,6 +9648,19 @@ routes: []
         assert!(rc.is_retriable(0, AttemptOutcome::Reset));
         assert!(rc.is_retriable(409, AttemptOutcome::Response)); // retriable_status_codes
         assert!(!rc.is_retriable(503, AttemptOutcome::Response)); // 5xx token NOT present
+    }
+
+    #[test]
+    fn backoff_exponential_base_25ms_cap_250ms() {
+        use std::time::Duration;
+        assert_eq!(RetryConfig::backoff(0), None);
+        assert_eq!(RetryConfig::backoff(1), Some(Duration::from_millis(25)));
+        assert_eq!(RetryConfig::backoff(2), Some(Duration::from_millis(50)));
+        assert_eq!(RetryConfig::backoff(3), Some(Duration::from_millis(100)));
+        assert_eq!(RetryConfig::backoff(4), Some(Duration::from_millis(200)));
+        // attempt 5 would be 400ms → capped to 250ms.
+        assert_eq!(RetryConfig::backoff(5), Some(Duration::from_millis(250)));
+        assert_eq!(RetryConfig::backoff(100), Some(Duration::from_millis(250)));
     }
 }
 
