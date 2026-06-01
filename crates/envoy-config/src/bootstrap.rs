@@ -917,6 +917,10 @@ pub struct VirtualHost {
     pub name: String,
     pub domains: Vec<String>,
     pub routes: Vec<Route>,
+    /// 16.1 D1 (phase-16 §6.2 L6): gate for `x-envoy-attempt-count` response
+    /// header. Absent → false (header suppressed).
+    #[serde(default)]
+    pub include_attempt_count_in_response: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -945,13 +949,34 @@ pub enum RouteAction {
 }
 
 /// 04.3 NEW (under SPEC §3 D2). Names the cluster to forward the matched
-/// request to. Future route-action knobs (timeout, retries, weighted clusters,
+/// request to. Future route-action knobs (timeout, weighted clusters,
 /// host-rewrite, header manipulations) are deferred (SPEC §4 non-goals).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Phase 16 adds `retry_policy` (§6.2 L3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[allow(non_camel_case_types)]
 pub struct RouteAction_Route {
     pub cluster: String,
+    /// 16.1 D1: optional per-route retry policy. Absent → no retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<RetryPolicy>,
+}
+
+/// 16.1 D1 (phase-16 §6.2 L3): per-route retry policy shape as parsed from
+/// the Envoy YAML config. Deferred fields (`per_try_timeout`, `retry_back_off`,
+/// etc.) are rejected automatically by `deny_unknown_fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RetryPolicy {
+    /// Comma-separated condition tokens (e.g. `"5xx"`, `"connect-failure,5xx"`).
+    #[serde(default)]
+    pub retry_on: String,
+    /// Maximum number of retries. Envoy default 1; resolved at RetryConfig::from (Task 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_retries: Option<u32>,
+    /// Additional HTTP status codes to retry on (beyond those named in retry_on).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retriable_status_codes: Vec<u32>,
 }
 
 /// 04.3 NEW: hand-rolled because Envoy's `Route` schema uses a field-name
@@ -9387,6 +9412,75 @@ admin:
 "#;
         let err = crate::parse_bootstrap(yaml).expect_err("must reject");
         assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
+    }
+
+    // --- 16.1 D1: RetryPolicy schema + retry_policy field + include_attempt_count_in_response ---
+
+    /// (a) A route YAML with retry_policy round-trips into the expected struct.
+    #[test]
+    fn route_retry_policy_parses_minimal_shape() {
+        let yaml = r#"
+cluster: my-cluster
+retry_policy:
+  retry_on: "5xx"
+  num_retries: 1
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(ar.cluster, "my-cluster");
+        let rp = ar.retry_policy.as_ref().expect("retry_policy present");
+        assert_eq!(rp.retry_on, "5xx");
+        assert_eq!(rp.num_retries, Some(1));
+        assert_eq!(rp.retriable_status_codes, Vec::<u32>::new());
+    }
+
+    /// (b) A route with NO retry_policy → retry_policy: None.
+    #[test]
+    fn route_retry_policy_absent_yields_none() {
+        let yaml = r#"
+cluster: my-cluster
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses");
+        assert!(ar.retry_policy.is_none());
+    }
+
+    /// (c) retry_policy with a deferred field per_try_timeout → parse ERROR (deny_unknown_fields).
+    #[test]
+    fn route_retry_policy_rejects_deferred_field_per_try_timeout() {
+        let yaml = r#"
+cluster: my-cluster
+retry_policy:
+  retry_on: "5xx"
+  per_try_timeout: 1s
+"#;
+        let err = serde_yaml::from_str::<RouteAction_Route>(yaml)
+            .expect_err("must reject deferred field");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("per_try_timeout") || msg.contains("unknown field"),
+            "expected unknown-field error mentioning per_try_timeout; got: {msg}"
+        );
+    }
+
+    /// (d) A VirtualHost YAML with include_attempt_count_in_response: true → field true;
+    ///     absent → false (default).
+    #[test]
+    fn virtual_host_include_attempt_count_in_response_parses() {
+        let yaml_with_flag = r#"
+name: vh
+domains: ["*"]
+routes: []
+include_attempt_count_in_response: true
+"#;
+        let vh: VirtualHost = serde_yaml::from_str(yaml_with_flag).expect("parses");
+        assert!(vh.include_attempt_count_in_response);
+
+        let yaml_absent = r#"
+name: vh
+domains: ["*"]
+routes: []
+"#;
+        let vh2: VirtualHost = serde_yaml::from_str(yaml_absent).expect("parses");
+        assert!(!vh2.include_attempt_count_in_response);
     }
 }
 

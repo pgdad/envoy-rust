@@ -794,6 +794,7 @@ mod tests {
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -943,6 +944,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -951,6 +953,7 @@ static_resources:
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
+                            retry_policy: None,
                         }),
                     }],
                 }],
@@ -1064,6 +1067,7 @@ static_resources:
                     VirtualHost {
                         name: "specific".to_string(),
                         domains: vec!["test.example".to_string()],
+                        include_attempt_count_in_response: false,
                         routes: vec![Route {
                             r#match: RouteMatch {
                                 prefix: Some("/".to_string()),
@@ -1082,6 +1086,7 @@ static_resources:
                     VirtualHost {
                         name: "catch_all".to_string(),
                         domains: vec!["*".to_string()],
+                        include_attempt_count_in_response: false,
                         routes: vec![Route {
                             r#match: RouteMatch {
                                 prefix: Some("/".to_string()),
@@ -1513,6 +1518,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -1594,6 +1600,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -2024,6 +2031,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -2086,6 +2094,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -2164,6 +2173,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),

@@ -220,6 +220,7 @@ fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
             .map(|vh| VirtualHost {
                 name: vh.name.clone(),
                 domains: vh.domains.clone(),
+                include_attempt_count_in_response: vh.include_attempt_count_in_response,
                 routes: vh
                     .routes
                     .iter()
@@ -248,6 +249,7 @@ fn clone_route_action(a: &RouteAction) -> RouteAction {
         }),
         RouteAction::Route(ar) => RouteAction::Route(RouteAction_Route {
             cluster: ar.cluster.clone(),
+            retry_policy: ar.retry_policy.clone(),
         }),
     }
 }
@@ -1322,6 +1324,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
@@ -1402,6 +1405,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "specific".to_string(),
                     domains: vec!["foo.example.com".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -1444,6 +1448,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![
                         Route {
                             r#match: RouteMatch {
@@ -1514,6 +1519,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "specific".to_string(),
                     domains: vec!["only.example.com".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -1601,6 +1607,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "test_vh".into(),
                     domains: vec!["*".into()],
+                    include_attempt_count_in_response: false,
                     routes,
                 }],
             }),
@@ -1900,6 +1907,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
@@ -1998,6 +2006,7 @@ static_resources:
             "/",
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
+                retry_policy: None,
             }),
             cluster_mgr,
         );
@@ -2055,6 +2064,7 @@ static_resources:
             "/",
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
+                retry_policy: None,
             }),
             cluster_mgr,
         );
@@ -2088,6 +2098,7 @@ static_resources:
             "/",
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
+                retry_policy: None,
             }),
             cluster_mgr,
         );
@@ -2111,6 +2122,7 @@ static_resources:
             "/",
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
+                retry_policy: None,
             }),
             cluster_mgr,
         );
@@ -2168,6 +2180,7 @@ static_resources:
             "/",
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
+                retry_policy: None,
             }),
             cluster_mgr,
         );
@@ -2191,6 +2204,7 @@ static_resources:
             "/",
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
+                retry_policy: None,
             }),
             cluster_mgr,
         );
@@ -2233,6 +2247,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -2300,6 +2315,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -2571,6 +2587,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -2766,6 +2783,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -2932,6 +2950,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -3040,6 +3059,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
@@ -3145,6 +3165,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![matcher_route],
                 }],
             }),
@@ -3178,6 +3199,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -3488,6 +3510,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -3496,6 +3519,7 @@ static_resources:
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
+                            retry_policy: None,
                         }),
                     }],
                 }],
@@ -3670,6 +3694,7 @@ static_resources:
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
                     routes: vec![Route {
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
@@ -3678,6 +3703,7 @@ static_resources:
                         },
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
+                            retry_policy: None,
                         }),
                     }],
                 }],

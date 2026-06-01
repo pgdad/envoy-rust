@@ -18,11 +18,11 @@ pub use bootstrap::{
     HttpFilterTypedConfig, HttpHealthCheck, HttpProtocolOptions, HttpStatus, Int64Range,
     LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints,
     Mutations, NetworkFilter, Node, OutlierDetection, Percent, Permission, PermissionSet, Policy,
-    Principal, PrincipalSet, RbacConfig, Route, RouteAction, RouteAction_Route, RouteConfiguration,
-    RouteMatch, RouterConfig, RoutingPriority, Rules, SafeRegex, SocketAddress, StaticResources,
-    StringMatcher, StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket,
-    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
-    UpstreamTlsContext, VirtualHost, parse_duration,
+    Principal, PrincipalSet, RbacConfig, RetryPolicy, Route, RouteAction, RouteAction_Route,
+    RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, SafeRegex, SocketAddress,
+    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate,
+    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
+    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
