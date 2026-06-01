@@ -364,3 +364,85 @@ NOT a synth; `URX` access-log-only).
 
 **Two-stage review (combined pass for this docs task):** spec-compliance **✅ compliant**; code-quality
 **Approved** (zero Critical / zero Important; 3 wording Minors, none acted on).
+
+---
+
+## Task 11 — state-4 phase-done verification + STATE advance to state-5-next
+
+**§7.5 (a)–(e) ALL GREEN.** Run locally on 2026-06-01 against HEAD `b13168134` (Tasks 1–10 complete)
+with Docker Desktop 28.0.4 + the pinned `envoyproxy/envoy:v1.33.0` (digest `sha256:56da5afd…`); CI
+anchor: run `26761833864` (HEAD `b13168134`, `completed / success` — every step green incl. the Docker
+differential `test` step, h2spec install, and fuzz).
+
+**(a) + (b) — fixture 0024 green AND all 23 pre-existing fixtures green simultaneously** (one
+`cargo test --workspace` run, Docker-gated):
+
+```
+tests/upstream_retry.rs (fixture 0024):                         ok. 1 passed   (3.16s)
+tests/access_log_file_sink.rs (0012):                           ok. 1 passed
+tests/admin_*.rs (0002/0011/0014/0015), echo (0001):            ok. 1 passed each
+tests/http1_*.rs (0007/0008), http2_*.rs (0009/0010):           ok. 1 passed each
+tests/http_filter_*.rs (0013/0016/0017/0018):                   ok. 1 passed each
+tests/tcp_proxy.rs (0003), tls_*.rs (0004/0005/0006):           ok. 1 passed each
+tests/upstream_active_health_check.rs (0019):                   ok. 1 passed
+tests/upstream_connection_pooling_and_per_class_counters (0020): ok. 1 passed
+tests/upstream_h2_connection_pooling.rs (0021):                 ok. 1 passed
+tests/upstream_outlier_detection.rs (0022):                     ok. 1 passed
+tests/upstream_circuit_breaker.rs (0023):                       ok. 1 passed
+```
+
+All **24** Docker-gated fixtures bilaterally green vs `envoyproxy/envoy:v1.33.0` — the L5 per-attempt
+counting reconciliation provably keeps 0020/0022 byte-exact (regression-equivalence §7.5(b)).
+
+**(c) — h2spec ≥95%:** locally skipped via the 05.2 SPEC §3 D7 graceful-skip (no `h2spec` binary on
+the dev box); **CI anchors the gate** (run `26761833864` includes the `install h2spec` + `test` steps,
+green; phase 16 does not touch H2 framing — the parent-05 99.31% baseline holds).
+
+**(d) — fuzz clean:** `cargo +nightly fuzz run parse_bootstrap -- -runs=200000 -max_total_time=60` →
+`Done 200000 runs in 14 second(s)`, **cov 14261 / ft 39923, 0 crashes** (Δ vs phase-15 baseline
+13745/37892 = **+516 cov / +2031 ft**, matching the new RetryPolicy/RetryConfig/retry-loop surface; the
+28-seed corpus incl. `route_retry_policy.yaml`).
+
+**(e) — the 5 stable-toolchain gates (all clean):**
+
+```
+cargo build --workspace --all-targets   → Finished `dev` profile … in 4m 07s   (exit 0)
+cargo clippy --workspace --all-targets --all-features -- -D warnings → Finished (exit 0, zero warnings)
+cargo fmt --all -- --check              → (exit 0)
+cargo test --workspace                  → 82 result lines: 971 passed; 0 failed; 2 ignored
+cargo deny check                        → advisories ok, bans ok, licenses ok, sources ok (exit 0)
+```
+
+(`cargo test --workspace` first attempt hit the PRE-EXISTING `upstream_h2_connection_pooling`
+(envoy-bin 13.2 backstop) cold-compile readiness flake — its backend helper compiles on demand and blew
+the 30 s budget; documented at Task 8. After pre-building `tests/helpers/*` the full warm re-run is
+**971/0/2 across 82 result lines** with zero failures. Test-count delta vs the phase-15 baseline
+922/0/2 across ~79 lines = **+49 tests / +3 binaries** — the phase-16 additions.)
+
+**Standalone-crate builds (lock-in #14 / `project_isolated_crate_build_blindspot` / SPEC §6.7):**
+
+```
+cargo build -p envoy-config   → Finished (9.71s)
+cargo build -p envoy-cluster  → Finished (19.88s)
+cargo build -p envoy-http1    → Finished (20.66s)
+cargo build -p envoy-http2    → Finished (27.36s)
+```
+
+**CI flake note (for the state-5 reviewer):** the Task-9 push's CI run `26761458559` failed on fixture
+**0011** (`admin_stats_prometheus`) — "envoy-rust admin listener never became accept-ready within 10s"
+— a startup-readiness flake on a loaded runner, unrelated to Task 9's corpus-only diff; the identical
+code passed at the very next run (`26761833864`, Task 10's docs-only push). Same flake family as
+`project_flaky_access_log_fixture_0012` (now also seen on 0011's readiness probe).
+
+**ADR posture:** no new ADR at state-3/state-4 (ADR-0045 landed at the PLAN-write; ledger head stays
+**ADR-0045**, count 46; next available **ADR-0046**). **ADR-0028 remains OPEN** (not engaged).
+
+**Carryforwards discovered during the arc (for the state-5 review inventory):**
+1. **H1-pool `Connection: close` re-pooling gap** (pre-existing, phase 13.1 — Task 8 subsection above).
+2. **Cyclic retry-script latent fragility** (parallel-drive refactor would interleave windows — Task 7).
+3. **H2-upstream-fork retry not directly tested** (covered structurally + bilaterally — Tasks 5/8).
+4. **CI readiness flakes now seen on 0011 + 0012** (startup-probe budget on loaded runners).
+
+**STATE advance:** `16` state-2-complete/state-3-next → **state-4-complete / state-5-next** (Next
+expected skill → `superpowers:requesting-code-review` over the Task 1–11 commit range
+`3b0e23ecc..HEAD`). Per §5.1 the state-5 review is a LATER session.
