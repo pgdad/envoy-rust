@@ -109,3 +109,43 @@ Critical / zero Important). The reviewer concretely ruled out the unconditional-
 against the fixture-0011 Prometheus set-diff: fixture 0011 declares `clusters: []`, so the per-cluster
 loop registers nothing there; all other stat fixtures (0020/0021/0022/0023) use named-stat assertions
 immune to extra registered names.
+
+---
+
+## Task 4 — H1 retry loop + per-attempt `upstream_rq_total` + `x-envoy-attempt-count` + back-off (commit `546b06973`)
+
+**Landed.** `crates/envoy-http1/src/hcm.rs`: the `BuildOutcome::Proxy` arm of `serve_connection` is now
+a retry loop over an extracted per-attempt helper `run_attempt(...) -> AttemptResult { response,
+endpoint: Option<SocketAddr>, outcome: Option<AttemptOutcome>, upstream_response: bool }` (pick →
+pool/per-call acquire → send → receive → classify). Counter reconciliation (L5): `upstream_rq_total`
+ticks PER upstream-response attempt inside the loop (gated on `upstream_response` — connect-failures/
+synths do NOT tick, preserving the BEHAVIOR_CONTRACT bypass); `upstream_rq_5xx` ticks ONCE post-loop on
+the COMPLETING response; both moved OUT of `router::construct_proxied_response` (now side-effect-free).
+Retry counters (L4): `upstream_rq_retry` per retry fired; post-loop XOR `retry_success`/
+`retry_limit_exceeded` on `attempts > 1`. `record_response` per attempt for every picked endpoint
+(connect-failure + overflow record; pick()→None does not — L8 / 14.x bypass preserved). Connect-failure
+arm participates in retry under `retry_on: connect-failure`; post-connect send/recv failure classified
+`AttemptOutcome::Reset` (Envoy-faithful; inert unless `retry_on: reset`). `x-envoy-attempt-count`
+emitted gated on the matched vhost `include_attempt_count_in_response` (L6); `X_ENVOY_ATTEMPT_COUNT`
+const in router.rs. Back-off = `RetryConfig::backoff(attempt)` in `envoy-config` (exp base 25 ms cap
+250 ms, no jitter — L7; shared with Task 5). `BuildOutcome::Proxy` carries `retry_config:
+Option<RetryConfig>` + `include_attempt_count_in_response: bool`; H2's destructure ignores them via
+`..` (Task 5 wires the H2 loop). 3 TDD tests (success-retry 503→200; limit-exceeded always-503;
+no-retry regression) against a stateful in-test `AtomicUsize`-counted backend.
+
+**Verification (quoted):**
+- `cargo test -p envoy-http1` → `test result: ok. 90 passed; 0 failed; 0 ignored` (87 + 3 new).
+- `cargo test -p envoy-config` → `test result: ok. 295 passed` (+1 backoff test); `-p envoy-cluster` → `71 passed`; `-p envoy-http2` → `57 passed; 1 ignored`.
+- `cargo build --workspace --all-targets` + `cargo build -p envoy-http1` (standalone) → clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+- `cargo fmt --all -- --check` → clean (exit 0).
+- `git show --stat HEAD` → 4 files changed (+698/−291).
+
+**Two-stage review:** spec-compliance **✅ compliant** (verified per-attempt counting semantics, loop
+boundary `attempts <= max_retries` → exactly 2 attempts at `num_retries: 1`, no-retry path
+byte-identical, router.rs test repurposing sound). Code-quality first pass **With fixes** → 2 Important
+(inverted `_cx_active` ConnGaugeGuard drop ordering vs the documented stream-drops-first invariant;
+proxy-arm size ~320 lines / 7-8 nesting levels ahead of the Task-5 H2 mirror) + 2 Minor (vestigial
+`cluster` param; garbled comment) → ALL FIXED in the amended commit (guard declared before the handle
+binding → drops last; `run_attempt` extraction → proxy arm ~128 lines; param dropped; comment
+rewritten) → re-review **Approved** (no new issues).
