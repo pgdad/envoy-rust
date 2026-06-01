@@ -270,3 +270,48 @@ PASS; found 3 stale per-source-design doc references → fixed + folded in); cod
 (zero Critical / zero Important; 1 Minor — the parallel-drive latent-fragility caution → added + folded
 in). The cyclic-window decision is a test-harness-internal tactical choice (no ADR; documented here +
 in the helper/README per the 12.x–15 harness-decision precedent).
+
+---
+
+## Task 8 — in-process retry backstop, success + limit-exceeded paths (commit `273d59be2`)
+
+**Landed.** `crates/envoy-bin/tests/upstream_retry.rs` (single new file): boots `envoy-bin` (tempfile
+bootstrap; `kill_on_drop(true)` + piped stderr per the phase-09 M3 discipline) with an H1 listener +
+HCM (vhost `include_attempt_count_in_response: true`; routes `/retry-success` + `/retry-exhausted`
+each `retry_policy: {retry_on: "5xx", num_retries: 1}`; STATIC cluster `backend`) + admin listener +
+an in-process keep-alive stateful backend (cyclic fail:1 / always-503; clean accept loop, no panicking
+unwraps). One test, one envoy-bin instance, cumulative counters (the 14.2/15 both-paths discipline):
+**(a)** GET `/retry-success` → 200 + `x-envoy-attempt-count: 2` + retry=1/success=1/limit=0/total=2/
+5xx=0; **(b)** GET `/retry-exhausted` → 503 + `x-envoy-attempt-count: 2` + cumulative retry=2/limit=1/
+success=1/total=4/5xx=1. Stat settling via `poll_stat_until` (25 ms tick, 5 s budget — the phase-15
+circuit-breaker backstop's stricter pattern, hardened in review). **H2-upstream-fork retry test
+SKIPPED** (justified: no stateful H2 backend machinery exists — the only H2 helper is the always-200
+`http2-echo-server`; the H2 retry path is covered structurally by Task 5 + bilaterally by fixture 0024).
+
+**DISCOVERED CARRYFORWARD (pre-existing, NOT a phase-16 defect — for the state-5 review inventory):**
+**H1-pool `Connection: close` re-pooling gap (phase 13.1).** The dispatch success arm
+(`crates/envoy-http1/src/hcm.rs:462-476`) re-pools the upstream stream WITHOUT inspecting its
+`Connection` header (`construct_proxied_response` strips-and-discards it at `router.rs:116`), and
+`H1Pool::acquire` (`pool.rs:247-261`) does no liveness check on idle reuse — so a connection the
+upstream marked `Connection: close` is handed out dead on the next request → send failure → `Reset` →
+synth-502. **Differential gap vs real Envoy** (which never reuses such a connection), currently
+invisible because every fixture/helper backend serves keep-alive. Confirmed PRE-EXISTING: the same
+gap exists at `821d1f036` (pre-phase-16); `git diff 821d1f036..HEAD -- crates/envoy-http1/src/pool.rs`
+is empty (phase 16 never touched the pool). Surfaced by Task 8's first backstop attempt (its backend
+sent `Connection: close` → the retry got the dead pooled conn). Candidate fixes for a future phase:
+(a) invalidate the PoolGuard in the success arm when the response carries `Connection: close`; (b)
+acquire-time EOF/liveness detection. The backstop legitimately uses a keep-alive backend (its purpose
+is retry behavior, not pool connection management).
+
+**Verification (quoted):**
+- `cargo test -p envoy-bin --test upstream_retry` → `test result: ok. 1 passed` (3 consecutive runs: 0.83 s / 1.33 s / 0.83 s).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → 1 file changed (`upstream_retry.rs` +490).
+- Note: the full `cargo test -p envoy-bin` suite has an environmental cold-compile flake in the
+  PRE-EXISTING `upstream_h2_connection_pooling` test (its backend helper compiles on demand; cold
+  compile can blow the 30 s readiness budget under load) — unrelated to this task; passes warm.
+
+**Two-stage review:** spec-compliance **✅ compliant** (incl. the special investigation that confirmed
+the Connection-close gap is pre-existing with file:line evidence); code-quality **Approved** → 1
+Important (fixed 200 ms settle sleeps → `poll_stat_until` bounded polling, hardened + folded in) + 3
+Minors (all pre-existing helper-copy conventions; no action).
