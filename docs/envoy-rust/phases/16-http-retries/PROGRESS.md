@@ -339,3 +339,28 @@ files — one seed is covered by its own dedicated test, the pre-existing patter
 **Two-stage review (combined pass for this mechanical task):** spec-compliance **✅ compliant**;
 code-quality **Approved** (zero Critical / zero Important; Minors: optional `node:` field noise;
 the accept-and-ignore design means the seed can't catch token typos — a known L2 constraint).
+
+---
+
+## Task 10 — BEHAVIOR_CONTRACT retry stat + `x-envoy-attempt-count` rows (commit `7dc83e292`)
+
+**Landed.** `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (pure additions — zero deletions; append-only
+discipline verified): **(1)** "16 entries (HTTP retries)" Stat-name-mapping block — 3 value-exact rows
+(`cluster.<name>.upstream_rq_retry` / `_retry_success` / `_retry_limit_exceeded`, with fixture-0024
+values 2/1/1 + the unconditional-registration inert-at-0 rationale) + the **per-attempt counting
+reconciliation paragraph** (ADR-0045 L5: `upstream_rq_total` per upstream ATTEMPT — explicitly
+SUPERSEDES-with-citation the 06.3 row's "per upstream response received" wording for retried requests
+while preserving its accuracy for non-retried requests; `upstream_rq_5xx` completing-only; the
+Envoy-only `retry.*` sub-scope + overflow/backoff names allow-listed); **(2)** the
+`x-envoy-attempt-count` Header-allow-list row (value-exact; gated on `include_attempt_count_in_response`
+per L6; injection sites cited to the ACTUAL landed code — H1 `hcm.rs:824` w/ const in `router.rs:64`,
+H2 `hcm.rs:633`); **(3)** the retry-limit-exceeded wire-shape note (L9: last upstream response verbatim,
+NOT a synth; `URX` access-log-only).
+
+**Verification (quoted):**
+- Reviewer verified all five cited fixture values byte-match `expectations.yaml`; all code-path claims
+  grep-verified; the 06.3 `upstream_rq_total` row byte-identical before/after; diff is pure additions.
+- `git show --stat HEAD` → 1 file changed (BEHAVIOR_CONTRACT.md, additions only).
+
+**Two-stage review (combined pass for this docs task):** spec-compliance **✅ compliant**; code-quality
+**Approved** (zero Critical / zero Important; 3 wording Minors, none acted on).
