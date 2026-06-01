@@ -979,6 +979,93 @@ pub struct RetryPolicy {
     pub retriable_status_codes: Vec<u32>,
 }
 
+/// 16.1 D2: outcome of a single upstream attempt, used by `RetryConfig::is_retriable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// A response was received (status code is meaningful).
+    Response,
+    /// The upstream TCP/TLS connection could not be established.
+    ConnectFailure,
+    /// The upstream reset the connection (e.g. RST_STREAM / TCP RST).
+    Reset,
+}
+
+/// 16.1 D2: bitmask of enabled `retry_on` conditions parsed from
+/// `RetryPolicy::retry_on`. Unknown tokens are silently ignored (L2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetryOn {
+    /// `5xx` — any response in 500..=599.
+    pub on_5xx: bool,
+    /// `gateway-error` — 502, 503, or 504 ONLY (L1).
+    pub on_gateway_error: bool,
+    /// `connect-failure` — TCP/TLS connect failed.
+    pub on_connect_failure: bool,
+    /// `reset` — upstream reset the connection.
+    pub on_reset: bool,
+    /// `retriable-status-codes` — status codes listed in `retriable_status_codes`.
+    pub on_retriable_status_codes: bool,
+}
+
+/// 16.1 D2: resolved retry configuration derived from a parsed `RetryPolicy`.
+/// Downstream crates (envoy-http1, envoy-http2) use this in Tasks 4/5 to drive
+/// the retry loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryConfig {
+    /// Parsed set of retry conditions.
+    pub on: RetryOn,
+    /// Maximum retry count (Envoy default 1, §6.2 L3).
+    pub num_retries: u32,
+    /// Additional HTTP status codes beyond those named in `on` (from
+    /// `RetryPolicy::retriable_status_codes`).
+    pub retriable_status_codes: Vec<u32>,
+}
+
+impl RetryConfig {
+    /// Classify whether `status`/`outcome` satisfies any enabled retry condition.
+    pub fn is_retriable(&self, status: u16, outcome: AttemptOutcome) -> bool {
+        match outcome {
+            AttemptOutcome::ConnectFailure => self.on.on_connect_failure,
+            AttemptOutcome::Reset => self.on.on_reset,
+            AttemptOutcome::Response => {
+                (self.on.on_5xx && (500..=599).contains(&status))
+                    || (self.on.on_gateway_error && matches!(status, 502..=504))
+                    || (self.on.on_retriable_status_codes
+                        && self.retriable_status_codes.contains(&(status as u32)))
+            }
+        }
+    }
+}
+
+impl From<&RetryPolicy> for RetryConfig {
+    /// Build a `RetryConfig` from a parsed `RetryPolicy`.
+    ///
+    /// Unknown `retry_on` tokens are silently ignored (§6.2 L2).
+    /// `num_retries` defaults to 1 when absent (§6.2 L3).
+    fn from(p: &RetryPolicy) -> Self {
+        let mut on = RetryOn::default();
+        for tok in p
+            .retry_on
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            match tok {
+                "5xx" => on.on_5xx = true,
+                "gateway-error" => on.on_gateway_error = true,
+                "connect-failure" => on.on_connect_failure = true,
+                "reset" => on.on_reset = true,
+                "retriable-status-codes" => on.on_retriable_status_codes = true,
+                _ => {} // L2: unrecognized tokens silently ignored
+            }
+        }
+        RetryConfig {
+            on,
+            num_retries: p.num_retries.unwrap_or(1),
+            retriable_status_codes: p.retriable_status_codes.clone(),
+        }
+    }
+}
+
 /// 04.3 NEW: hand-rolled because Envoy's `Route` schema uses a field-name
 /// oneof for the action variant — `direct_response: { ... }` and `route: { ... }`
 /// are peers of `match: { ... }` at the same map level, not nested under a
@@ -2112,6 +2199,9 @@ fn validate_hcm(
             for hm in &mut r.r#match.headers {
                 validate_header_matcher(hm)?;
             }
+
+            // 16.1 D2: validate per-route retry_policy.
+            validate_retry_policy(r)?;
         }
     }
     Ok(())
@@ -2704,6 +2794,16 @@ fn validate_outlier_detection(cluster: &Cluster) -> Result<(), crate::ConfigErro
             value: v,
         });
     }
+    Ok(())
+}
+
+/// 16.1 D2: validate a route's `retry_policy` block.
+///
+/// `retry_on` tokens are accept-and-ignore (§6.2 L2), so this validator is
+/// currently infallible. It exists so future semantic rejections have a home
+/// and so the validator surface is symmetric with `validate_circuit_breakers`
+/// and `validate_outlier_detection`.
+fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
     Ok(())
 }
 
@@ -9481,6 +9581,50 @@ routes: []
 "#;
         let vh2: VirtualHost = serde_yaml::from_str(yaml_absent).expect("parses");
         assert!(!vh2.include_attempt_count_in_response);
+    }
+
+    // --- 16.1 D2: RetryConfig + retry_on tokenization (accept-and-ignore) + is_retriable ---
+
+    #[test]
+    fn retry_on_parses_known_tokens_and_ignores_unknown() {
+        // L2: accept-and-ignore unknown tokens (Envoy-faithful, empirically verified)
+        let p = RetryPolicy {
+            retry_on: "5xx,bogus-token-xyz".into(),
+            num_retries: None,
+            retriable_status_codes: vec![],
+        };
+        let rc = RetryConfig::from(&p);
+        assert_eq!(rc.num_retries, 1); // L3: default 1
+        assert!(rc.is_retriable(503, AttemptOutcome::Response)); // 5xx matches
+        assert!(rc.is_retriable(500, AttemptOutcome::Response)); // 5xx = 500-599 (L1)
+        assert!(!rc.is_retriable(404, AttemptOutcome::Response)); // not retriable
+    }
+
+    #[test]
+    fn gateway_error_is_502_503_504_only() {
+        let p = RetryPolicy {
+            retry_on: "gateway-error".into(),
+            num_retries: Some(2),
+            retriable_status_codes: vec![],
+        };
+        let rc = RetryConfig::from(&p);
+        assert_eq!(rc.num_retries, 2);
+        assert!(rc.is_retriable(503, AttemptOutcome::Response));
+        assert!(!rc.is_retriable(500, AttemptOutcome::Response)); // L1: 500 NOT in gateway-error
+    }
+
+    #[test]
+    fn connect_failure_and_reset_and_retriable_status_codes() {
+        let p = RetryPolicy {
+            retry_on: "connect-failure,reset,retriable-status-codes".into(),
+            num_retries: Some(1),
+            retriable_status_codes: vec![409],
+        };
+        let rc = RetryConfig::from(&p);
+        assert!(rc.is_retriable(0, AttemptOutcome::ConnectFailure));
+        assert!(rc.is_retriable(0, AttemptOutcome::Reset));
+        assert!(rc.is_retriable(409, AttemptOutcome::Response)); // retriable_status_codes
+        assert!(!rc.is_retriable(503, AttemptOutcome::Response)); // 5xx token NOT present
     }
 }
 
