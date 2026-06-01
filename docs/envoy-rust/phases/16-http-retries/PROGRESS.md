@@ -60,3 +60,28 @@ SPEC-correction CRITICAL deep-clone sites, discharged at Task 1 instead of Task 
 **Two-stage review:** spec-compliance review surfaced the workspace break (Critical) → fixed +
 re-verified; code-quality review **Approved** (zero Critical / zero Important; 2 Minor notes:
 `Eq`-drop confirmed correct, deserialize-only tests match house style).
+
+---
+
+## Task 2 — `RetryConfig` + `retry_on` tokenization (accept-and-ignore) + `validate_retry_policy` (commit `2511d7be7`)
+
+**Landed.** `crates/envoy-config/src/bootstrap.rs`: `AttemptOutcome` enum (Response/ConnectFailure/Reset),
+`RetryOn` 5-flag struct, `RetryConfig` resolved type with `impl From<&RetryPolicy>` (comma tokenize +
+trim + skip-empty; UNKNOWN tokens silently ignored per L2; `num_retries.unwrap_or(1)` per L3) and
+`is_retriable(status, outcome)` classifier (`5xx` = 500..=599; `gateway-error` = 502..=504 ONLY per L1;
+`retriable-status-codes` list membership; ConnectFailure/Reset purely outcome-driven). Infallible
+`validate_retry_policy(route)` hook wired per-route into the `validate_hcm` route walk (sibling of
+`validate_header_matcher`). `lib.rs` re-exports `AttemptOutcome`/`RetryConfig`/`RetryOn`. 3 TDD tests.
+**PLAN deviations (both improvements):** `From` trait impl instead of inherent `fn from` (avoids clippy
+`should_implement_trait`); `matches!(status, 502..=504)` instead of `502 | 503 | 504` (avoids clippy
+`manual_range_patterns`).
+
+**Verification (quoted):**
+- `cargo test -p envoy-config` → `test result: ok. 294 passed; 0 failed; 0 ignored` (291 + 3 new).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+- `cargo fmt --all -- --check` → clean (exit 0).
+- `git show --stat HEAD` → 2 files changed (`bootstrap.rs` +144, `lib.rs` +8/-8).
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass); code-quality **Approved** (zero
+Critical / zero Important; Minors: the `is_retriable(status, outcome)` dummy-status-on-ConnectFailure
+API shape kept as PLAN-specified; boundary-case test gaps noted as obviously-correct-by-inspection).
