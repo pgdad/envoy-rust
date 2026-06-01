@@ -1295,13 +1295,13 @@ pub struct Percent {
     pub value: f64,
 }
 
-/// 13.1 D1 (parent-13 D1): per-cluster circuit-breaker thresholds. At
-/// phase-13 scope ONLY `thresholds[0].{priority?, max_connections?}` are
-/// supported; the phase-13-deferred fields per parent SPEC §4 (`max_pending_requests`,
-/// `max_requests`, `max_retries`, `max_connection_pools`, `track_remaining`,
-/// `retry_budget`) are rejected by `deny_unknown_fields`. The validator at
-/// `validate_circuit_breakers` (Task 2) enforces at-most-one entry + DEFAULT-only
-/// priority + non-zero max_connections.
+/// 13.1 D1 (parent-13 D1): per-cluster circuit-breaker thresholds. Phase-13
+/// added `thresholds[0].{priority?, max_connections?}`; phase-15 added
+/// `max_pending_requests` (accepts `0` only); phase-17 added `max_requests`,
+/// `max_retries`, and `track_remaining`. The still-deferred fields
+/// (`max_connection_pools`, `retry_budget`) are rejected by `deny_unknown_fields`.
+/// The validator at `validate_circuit_breakers` (Task 2) enforces at-most-one
+/// entry + DEFAULT-only priority + non-zero max_connections.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CircuitBreakers {
@@ -1313,8 +1313,12 @@ pub struct CircuitBreakers {
 /// 15 D1: `max_pending_requests` added — accepts `0` ONLY (the no-queue carve-out;
 /// matches Envoy's reject-on-establish behavior per ADR-0043 §6.2 finding 1).
 /// `max_pending_requests > 0` (the pending-request queue) is rejected by the validator
-/// and deferred. Other phase-13/15-deferred fields (`max_requests`, `max_retries`,
-/// `max_connection_pools`, `track_remaining`, `retry_budget`) stay rejected by
+/// and deferred.
+/// 17 D1: `max_requests`, `max_retries`, `track_remaining` added (circuit-breaker budget
+/// caps). `0` is a VALID config for both caps (always-open-breaker semantic per ADR-0047
+/// §L1/L2). Envoy defaults (max_retries 3 / max_requests 1024) are resolved at
+/// `Cluster::from_bootstrap` (Task 3), NOT here — schema keeps `Option<u32>`.
+/// Still-deferred fields (`max_connection_pools`, `retry_budget`) remain rejected by
 /// `deny_unknown_fields`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -1325,6 +1329,12 @@ pub struct Thresholds {
     pub max_connections: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pending_requests: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_requests: Option<u32>, // 17 D1: request-budget cap (0 = always-open; L2)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>, // 17 D1: retry-budget cap (0 = always-open; L1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_remaining: Option<bool>, // 17 D1: emit remaining_* gauges (L8)
 }
 
 /// 13.1 D1: Envoy `RoutingPriority` enum. Phase-13 supports DEFAULT only; the
@@ -2726,6 +2736,14 @@ fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
 /// At phase-13 scope: at-most-one thresholds entry; DEFAULT priority only (or absent);
 /// non-zero `max_connections`. Phase-13-deferred threshold fields per parent SPEC §4
 /// are rejected by `deny_unknown_fields` automatically at parse time.
+///
+/// 17 D1 note: `max_requests: 0` and `max_retries: 0` are intentionally NOT rejected
+/// here, in contrast to `max_connections: 0`. The distinction is semantic:
+///   - `max_connections: 0` has no defined "always-open" meaning in the connection-pool
+///     model (phase-13 rationale: a zero connection cap is a misconfiguration).
+///   - `max_requests: 0` / `max_retries: 0` are the always-open-breaker configs
+///     (ADR-0047 §L1/L2): they disable the budget cap entirely, which is a deliberate
+///     and valid operator choice (fixture 0025 relies on this).
 fn validate_circuit_breakers(cluster: &Cluster) -> Result<(), crate::ConfigError> {
     let Some(cb) = cluster.circuit_breakers.as_ref() else {
         return Ok(());
@@ -2762,6 +2780,8 @@ fn validate_circuit_breakers(cluster: &Cluster) -> Result<(), crate::ConfigError
                 value,
             });
         }
+        // max_requests and max_retries: no semantic rejection — 0 is "always-open"
+        // (ADR-0047 §L1/L2). Envoy defaults are resolved later at Cluster::from_bootstrap.
     }
     Ok(())
 }
@@ -9220,8 +9240,10 @@ admin:
     }
 
     #[test]
-    fn cluster_circuit_breakers_rejects_phase13_deferred_threshold_fields() {
-        // deny_unknown_fields rejects max_requests etc.
+    fn cluster_circuit_breakers_rejects_still_deferred_threshold_fields() {
+        // deny_unknown_fields rejects still-deferred fields (max_connection_pools, retry_budget).
+        // NOTE: max_requests/max_retries/track_remaining were promoted in phase-17 D1 and
+        // are now accepted — this test uses max_connection_pools which remains deferred.
         let yaml = r#"
 static_resources:
   listeners: []
@@ -9232,7 +9254,7 @@ static_resources:
       circuit_breakers:
         thresholds:
           - max_connections: 1
-            max_requests: 5
+            max_connection_pools: 5
       load_assignment:
         cluster_name: c
         endpoints:
@@ -9246,8 +9268,8 @@ admin:
         let err = crate::parse_bootstrap(yaml).expect_err("must reject");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("max_requests") || msg.contains("unknown field"),
-            "expected unknown-field error mentioning max_requests; got: {msg}"
+            msg.contains("max_connection_pools") || msg.contains("unknown field"),
+            "expected unknown-field error mentioning max_connection_pools; got: {msg}"
         );
     }
 
@@ -9443,6 +9465,316 @@ admin:
             ),
             "got {err:?}"
         );
+    }
+
+    // --- 17 D1: Thresholds budget fields (max_requests / max_retries / track_remaining) ---
+
+    #[test]
+    fn thresholds_parse_budget_fields() {
+        // (a) all three new fields present and populated
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1
+            max_requests: 0
+            max_retries: 0
+            track_remaining: true
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("must parse+validate");
+        let t = &bootstrap.static_resources.clusters[0]
+            .circuit_breakers
+            .as_ref()
+            .unwrap()
+            .thresholds[0];
+        assert_eq!(t.max_requests, Some(0));
+        assert_eq!(t.max_retries, Some(0));
+        assert_eq!(t.track_remaining, Some(true));
+    }
+
+    #[test]
+    fn thresholds_parse_budget_fields_nonzero_and_false() {
+        // (a2) non-zero caps + track_remaining: false
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1
+            max_requests: 5
+            max_retries: 3
+            track_remaining: false
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("must parse+validate");
+        let t = &bootstrap.static_resources.clusters[0]
+            .circuit_breakers
+            .as_ref()
+            .unwrap()
+            .thresholds[0];
+        assert_eq!(t.max_requests, Some(5));
+        assert_eq!(t.max_retries, Some(3));
+        assert_eq!(t.track_remaining, Some(false));
+    }
+
+    #[test]
+    fn thresholds_budget_fields_absent_yield_none() {
+        // (b) new fields absent → all three None
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("must parse+validate");
+        let t = &bootstrap.static_resources.clusters[0]
+            .circuit_breakers
+            .as_ref()
+            .unwrap()
+            .thresholds[0];
+        assert_eq!(t.max_requests, None);
+        assert_eq!(t.max_retries, None);
+        assert_eq!(t.track_remaining, None);
+    }
+
+    #[test]
+    fn thresholds_reject_deferred_retry_budget() {
+        // (c) retry_budget stays rejected by deny_unknown_fields
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            retry_budget: { budget_percent: 20 }
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("retry_budget must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("retry_budget") || msg.contains("unknown field"),
+            "expected unknown-field error mentioning retry_budget; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn thresholds_reject_deferred_max_connection_pools() {
+        // (d) max_connection_pools stays rejected by deny_unknown_fields
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connection_pools: 1
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("max_connection_pools must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_connection_pools") || msg.contains("unknown field"),
+            "expected unknown-field error mentioning max_connection_pools; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_circuit_breakers_accepts_zero_budget_caps() {
+        // (e) max_requests: 0 and max_retries: 0 are ACCEPTED (always-open-breaker configs;
+        // contrast with max_connections: 0 which is REJECTED by InvalidMaxConnections).
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1
+            max_requests: 0
+            max_retries: 0
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        crate::parse_bootstrap(yaml)
+            .expect("max_requests:0 and max_retries:0 must be accepted by the validator");
+    }
+
+    #[test]
+    fn validate_circuit_breakers_existing_rejections_still_fire_with_budget_fields() {
+        // (f) existing rejections remain: multiple thresholds, HIGH priority,
+        // max_pending_requests > 0 — verified here with budget fields present to
+        // ensure the new fields don't mask pre-existing validator checks.
+
+        // multiple thresholds
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - max_connections: 1
+            max_requests: 5
+          - max_connections: 2
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("multiple thresholds must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedMultipleCircuitBreakerThresholds { ref cluster }
+                    if cluster == "c"
+            ),
+            "got {err:?}"
+        );
+
+        // HIGH priority
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: HIGH
+            max_connections: 1
+            max_requests: 5
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("HIGH priority must reject");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedCircuitBreakerPriority {
+                    ref cluster,
+                    priority: crate::RoutingPriority::High
+                } if cluster == "c"
+            ),
+            "got {err:?}"
+        );
+
+        // max_pending_requests > 0
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - max_connections: 1
+            max_pending_requests: 5
+            max_requests: 10
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("max_pending_requests > 0 must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("max_pending_requests"), "got: {msg}");
     }
 
     #[test]
