@@ -28,3 +28,35 @@
 - **Verification:** `cargo test -p envoy-config retry_policy` (PASS) + `cargo clippy -p envoy-config --all-targets --all-features -- -D warnings` + `cargo fmt --all -- --check`.
 
 _(Tasks 2–11 entries appended by the executor as each completes.)_
+
+---
+
+## Task 1 — `RetryPolicy` schema + `retry_policy` field + `include_attempt_count_in_response` (commit `3b0e23ecc`)
+
+**Landed.** `crates/envoy-config/src/bootstrap.rs`: new `RetryPolicy` struct (`retry_on: String` +
+`num_retries: Option<u32>` [L3 — default-1 resolution deferred to Task 2's `RetryConfig::from`] +
+`retriable_status_codes: Vec<u32>`; `#[serde(deny_unknown_fields)]` rejects all deferred fields);
+`RouteAction_Route` gains `retry_policy: Option<RetryPolicy>` (`Eq` derive dropped — `RetryPolicy`
+is `PartialEq`-only, matching the `CircuitBreakers`/`Thresholds` house convention; verified no
+consumer needs `RouteAction_Route: Eq`); `VirtualHost` gains
+`include_attempt_count_in_response: bool` (`#[serde(default)]` → false; L6). 4 TDD serde tests
+(parse-minimal / absent-yields-none / rejects-`per_try_timeout` / vhost-flag-true-and-absent).
+`crates/envoy-config/src/lib.rs`: `RetryPolicy` re-export. **Workspace-compile fold-in (spec-review
+finding):** the new required fields broke exhaustive struct literals downstream — fixed in the SAME
+commit by FAITHFUL clones at `crates/envoy-http1/src/hcm.rs` `clone_route_config` (`:222`,
+`include_attempt_count_in_response`) + `clone_route_action` (`:251`, `retry_policy`) (the PLAN-time
+SPEC-correction CRITICAL deep-clone sites, discharged at Task 1 instead of Task 4) + inert defaults
+(`false`/`None`) at the 16+8 H1 and 9+1 H2 `#[cfg(test)]` struct literals.
+
+**Verification (quoted):**
+- `cargo test -p envoy-config` → `test result: ok. 291 passed; 0 failed; 0 ignored` (287 + 4 new).
+- `cargo test -p envoy-http1` → `test result: ok. 87 passed; 0 failed; 0 ignored`.
+- `cargo test -p envoy-http2` → `test result: ok. 57 passed; 0 failed; 1 ignored`.
+- `cargo build --workspace --all-targets` → `Finished` (clean).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+- `cargo fmt --all -- --check` → clean (exit 0).
+- `git show --stat HEAD` → 4 files changed (`bootstrap.rs` +98, `lib.rs` +10/-7, H1 `hcm.rs` +26, H2 `hcm.rs` +10).
+
+**Two-stage review:** spec-compliance review surfaced the workspace break (Critical) → fixed +
+re-verified; code-quality review **Approved** (zero Critical / zero Important; 2 Minor notes:
+`Eq`-drop confirmed correct, deserialize-only tests match house style).
