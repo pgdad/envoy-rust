@@ -165,4 +165,40 @@ precision; helper `Option<u32>` parameterization; missing `limit_exceeded == 0` 
 
 ---
 
-_(Tasks 5–11 entries appended by the executor as each completes.)_
+## Task 5 — H1 request-budget gate (`max_requests`) + overflow local reply (commit `ce9136c0b`)
+
+**Landed.** `crates/envoy-http1/src/hcm.rs` (+472/−157, single file; the deletion count is dominated by the
+retry-loop reindent — `git diff -w` shows the real change is small): the request-budget gate at the
+`BuildOutcome::Proxy` dispatch entry — `cluster.try_acquire_request()` called **exactly once**, bound into
+`request_acquire`, then an `if let Rejected … else { <the retry loop> }` split. **PLAN deviation (approved at
+spec review):** the PLAN sketched an early return, but this HCM is a unified-writer architecture — the Rejected
+arm instead sets `outgoing = synth_overflow(close)` and FALLS THROUGH to the same writer site the pool-overflow
+arm uses (encode-filters → wire write → `downstream_rq_5xx` per-class tick → access log), which is exactly the
+PendingOverflow-arm-equivalent accounting the PLAN intended. **Rejected path:** ticks `upstream_rq_5xx` once
+(the L3/ADR-0047 reconciliation — THE ONLY synth path that ticks it; the phase-16 completing-response gate
+`995445b52` is byte-untouched per `git diff -w`) + the 81-byte `synth_overflow` body + `x-envoy-overloaded` +
+gated `x-envoy-attempt-count: 1` (L11); no pool contact, no retry loop, `upstream_rq_total` stays 0.
+**Acquired path:** `_request_guard` is arm-scoped — spans the ENTIRE retry loop and releases on arm exit
+(L9b: a retrying request counts ONCE against `max_requests`). **L9a gate ordering** is structural: the gate is
+lexically before the loop; Rejected never reaches `try_acquire_retry`. M16-3 comment correction: **N/A**
+(grep confirms no hedging comment exists in H1 — nothing to correct). 4 TDD tests + 2 helpers (a: overflow —
+503/81-byte/x-envoy-overloaded/attempt-count-1/backend-never-contacted/pending_overflow=1/upstream_rq_5xx=1/
+rq_total=0/retry_overflow=0; b: gate ordering with retry_policy — retry budget never consulted; c: `max_requests: 1`
++ retry → 200/attempt-count-2/pending_overflow=0 [the guard-spans-the-loop proof]; d: no-CB regression).
+
+**Verification (quoted):**
+- TDD RED: tests (a)/(b) failed pre-gate (backend returned 200 — no gate); (c)/(d) passed pre-gate (no-op without the gate).
+- `cargo test -p envoy-http1` → `test result: ok. 99 passed; 0 failed` (95 + 4 new).
+- `cargo build --workspace --all-targets` + `cargo build -p envoy-http1` (standalone) → clean; clippy `-D warnings` → clean; fmt → clean.
+- `git show --stat HEAD` → 1 file changed.
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer verified the CRITICAL single-acquire
+property [no overflow double-tick — one call site, re-matched not re-invoked], the L9a structural ordering, the
+guard span, the L3 tick isolation [no other synth path gained it], and the unified-writer fall-through equivalence
+to the pool-overflow arm). Code-quality **Approved** (zero Critical / zero Important / 4 Minors [2 comment-precision
+items that would have misled the Task-7 H2 mirror; a missing `upstream_rq_5xx` assertion in test (b); a helper
+signature-asymmetry docstring note] — **all 4 fixed in-task** [amended pre-push]).
+
+---
+
+_(Tasks 6–11 entries appended by the executor as each completes.)_
