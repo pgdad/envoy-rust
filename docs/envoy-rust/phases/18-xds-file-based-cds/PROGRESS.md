@@ -28,3 +28,16 @@
 - **Verification:** `cargo test -p envoy-config` (PASS; the existing UnknownCluster tests at `:3691`/`:6009`/`:6023` must stay green) + `cargo build --workspace --all-targets` + `cargo build -p envoy-config` (standalone, per `project_isolated_crate_build_blindspot`) + `cargo clippy --workspace --all-targets --all-features -- -D warnings` + `cargo fmt --all -- --check`.
 
 _(Task entries are appended below by the state-3 executor — one per task, with quoted verification output + the two-stage review verdicts, per the 06.2 → 17 cadence.)_
+
+### Task 1 — COMPLETE (code commit `ce7abce5b`)
+
+**Landed:** `Bootstrap.dynamic_resources: Option<DynamicResources>` (+ `#[serde(skip)] dynamic_clusters: Option<Vec<Cluster>>` side-field + `all_clusters()` + `pub(crate) cds_configured_but_unloaded()`); `DynamicResources`/`ConfigSource`/`PathConfigSource` structs (all `deny_unknown_fields` — lds_config/ads_config/api_config_source/watched_directory rejected, proven by test); `RouteConfiguration.validate_clusters: Option<bool>` (parse-and-accept, L12b doc comment); 3 new `ConfigError` variants (`UnsupportedResourceApiVersion`/`CdsFileError`/`CdsParseError`) + lib.rs re-exports; the `resource_api_version` V3-or-absent validator check; the deferred cluster-reference validation (`defer_cluster_refs` snapshot before the `&mut` listener loop, threaded into BOTH UnknownCluster sites [tcp_proxy + `validate_hcm` new bool param] + the `Http2ClusterFromHttp1Listener` gate's `.expect` restructured to `if let` — structurally panic-free on deferred references); the Node xDS-reservation comment updated (phase 18 consumed the reservation). Workspace-compile fold-in: 2 `Bootstrap` literals (envoy-cluster) + 26 `RouteConfiguration` literal sites (envoy-http1/envoy-http2 hcm.rs incl. `clone_route_config` propagation) extended in the same commit.
+
+**Verification (quoted):**
+- `cargo test -p envoy-config` → `test result: ok. 309 passed; 0 failed; 0 ignored` (was 302; +7 new tests — the 6 PLAN-prescribed + a tcp_proxy deferral sibling)
+- `cargo build --workspace --all-targets` → clean; `cargo build -p envoy-config` (standalone) → clean
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean
+
+**Two-stage review:**
+- **Spec compliance:** 1 issue found (the Node xDS-reservation comment at `bootstrap.rs:89-94` not updated as the PLAN requires) → **fixed in-task** (commit amended `84e796ba1` → `ce7abce5b`); re-verified compliant.
+- **Code quality:** zero Critical; **1 Important (forward-looking, dispositioned per-PLAN):** the two reference-check sites consult `static_resources.clusters` (not `all_clusters()`), which Task 3's post-merge re-validation needs — **this is exactly PLAN Task 3 Step 3b** (the check sites migrate to the merged list at Task 3); carried as a binding Task-3 input, NOT a Task-1 defect. Minor notes: `all_clusters()` is defined-but-unused until Task 3 (per-plan); the bool threading through `validate_hcm` judged appropriate (no enum needed).
