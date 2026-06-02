@@ -124,6 +124,19 @@ pub struct Cluster {
     /// at construct time as `cluster.<name>.upstream_rq_retry_limit_exceeded`.
     /// Exposed via `upstream_rq_retry_limit_exceeded()`.
     pub(crate) upstream_rq_retry_limit_exceeded: Arc<envoy_stats::Counter>,
+    /// 17 Task 3: per-cluster counter registered unconditionally at construct time
+    /// as `cluster.<name>.upstream_rq_retry_overflow`. Shared with `BudgetState`
+    /// via the idempotent-registration contract: when a `BudgetState` is also
+    /// constructed, its registration of the same name returns the SAME Arc.
+    /// Inert at 0 on clusters without `circuit_breakers`; incremented by
+    /// `BudgetState::try_acquire_retry` when the breaker is open.
+    pub(crate) upstream_rq_retry_overflow: Arc<envoy_stats::Counter>,
+    /// 17 Task 3: per-cluster circuit-breaker budget state. `None` when the
+    /// cluster has no `circuit_breakers` configured (the §5.3
+    /// inert-when-unconfigured invariant). When present, `try_acquire_retry` /
+    /// `try_acquire_request` gate in-flight retries and requests against the
+    /// configured caps (L1/L2).
+    pub(crate) budget: Option<Arc<crate::BudgetState>>,
     /// 12.1 (parent-12 D3/D5): per-endpoint active-health-check state, aligned by
     /// index with `endpoints`. `None` when the cluster has no `health_checks`
     /// configured (the §5.4 inert-when-unconfigured invariant) — `pick()` is then
@@ -212,6 +225,16 @@ impl Cluster {
     /// `upstream_rq_total()`'s borrow shape.
     pub fn upstream_rq_retry_limit_exceeded(&self) -> &Arc<envoy_stats::Counter> {
         &self.upstream_rq_retry_limit_exceeded
+    }
+
+    /// 17 Task 3: shared accessor for the per-cluster retry-overflow counter
+    /// (`cluster.<name>.upstream_rq_retry_overflow`). Registered unconditionally
+    /// at construct time (inert at 0 on clusters without `circuit_breakers`).
+    /// When a `BudgetState` is also present, they share this Arc via the
+    /// idempotent-registration contract. Mirrors `upstream_rq_retry()`'s
+    /// borrow shape.
+    pub fn upstream_rq_retry_overflow(&self) -> &Arc<envoy_stats::Counter> {
+        &self.upstream_rq_retry_overflow
     }
 
     /// 06.3 D15.3.b: increment `cluster.<name>.upstream_cx_active` and
@@ -359,6 +382,42 @@ impl Cluster {
         *ejected_at = Some(std::time::Instant::now());
     }
 
+    /// 17 Task 3: attempt to acquire one retry budget slot.
+    ///
+    /// Returns `BudgetAcquisition::Unlimited` when the cluster has no
+    /// `circuit_breakers` configured (never gates; zero stat side-effects).
+    /// Returns `BudgetAcquisition::Acquired(guard)` on success; dropping the
+    /// guard releases the slot. Returns `BudgetAcquisition::Rejected` when the
+    /// active retry count is at or above `max_retries` (the overflow counter is
+    /// incremented inside `BudgetState::try_acquire_retry`).
+    pub fn try_acquire_retry(&self) -> crate::BudgetAcquisition<crate::RetryBudgetGuard> {
+        match &self.budget {
+            None => crate::BudgetAcquisition::Unlimited,
+            Some(b) => match b.try_acquire_retry() {
+                Some(guard) => crate::BudgetAcquisition::Acquired(guard),
+                None => crate::BudgetAcquisition::Rejected,
+            },
+        }
+    }
+
+    /// 17 Task 3: attempt to acquire one request budget slot.
+    ///
+    /// Returns `BudgetAcquisition::Unlimited` when the cluster has no
+    /// `circuit_breakers` configured (never gates; zero stat side-effects).
+    /// Returns `BudgetAcquisition::Acquired(guard)` on success; dropping the
+    /// guard releases the slot. Returns `BudgetAcquisition::Rejected` when the
+    /// active request count is at or above `max_requests` (the overflow counter
+    /// is incremented inside `BudgetState::try_acquire_request`).
+    pub fn try_acquire_request(&self) -> crate::BudgetAcquisition<crate::RequestBudgetGuard> {
+        match &self.budget {
+            None => crate::BudgetAcquisition::Unlimited,
+            Some(b) => match b.try_acquire_request() {
+                Some(guard) => crate::BudgetAcquisition::Acquired(guard),
+                None => crate::BudgetAcquisition::Rejected,
+            },
+        }
+    }
+
     /// 14.2 D7 (lock-in #6/#7): borrow the cluster's runtime outlier-detection state, if
     /// configured. `None` when the cluster has no `outlier_detection` block (§5.3 inert
     /// invariant). Consumed by `OutlierManager::for_bootstrap` (via `ClusterHandle::
@@ -491,6 +550,26 @@ impl ClusterHandle {
     /// Mirrors `upstream_rq_retry()`'s borrow shape.
     pub fn upstream_rq_retry_limit_exceeded(&self) -> &Arc<envoy_stats::Counter> {
         self.inner.upstream_rq_retry_limit_exceeded()
+    }
+
+    /// 17 Task 3: delegates to `Cluster::upstream_rq_retry_overflow`. Mirrors
+    /// `upstream_rq_retry()`'s borrow shape.
+    pub fn upstream_rq_retry_overflow(&self) -> &Arc<envoy_stats::Counter> {
+        self.inner.upstream_rq_retry_overflow()
+    }
+
+    /// 17 Task 3: delegates to `Cluster::try_acquire_retry`. H1/H2 HCM callers
+    /// hold a `ClusterHandle`; this mirrors the accessor for ergonomic reach.
+    /// See `Cluster::try_acquire_retry` for the full behavior contract.
+    pub fn try_acquire_retry(&self) -> crate::BudgetAcquisition<crate::RetryBudgetGuard> {
+        self.inner.try_acquire_retry()
+    }
+
+    /// 17 Task 3: delegates to `Cluster::try_acquire_request`. H1/H2 HCM callers
+    /// hold a `ClusterHandle`; this mirrors the accessor for ergonomic reach.
+    /// See `Cluster::try_acquire_request` for the full behavior contract.
+    pub fn try_acquire_request(&self) -> crate::BudgetAcquisition<crate::RequestBudgetGuard> {
+        self.inner.try_acquire_request()
     }
 
     /// 12.2 (parent-12 D4): per-endpoint health-probe targets when this
@@ -792,6 +871,37 @@ pub async fn from_bootstrap(
                 cluster: cfg.name.clone(),
                 message: e.to_string(),
             })?;
+        // 17 Task 3: register `cluster.<name>.upstream_rq_retry_overflow`
+        // unconditionally (every cluster gets it, inert at 0). When a
+        // `BudgetState` is also constructed below, its idempotent
+        // registration of the same name returns the SAME Arc (they share
+        // the counter — single source of truth per §5.3).
+        let upstream_rq_retry_overflow = registry
+            .register_counter(&format!("cluster.{}.upstream_rq_retry_overflow", cfg.name))
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: cfg.name.clone(),
+                message: e.to_string(),
+            })?;
+        // 17 Task 3: conditionally build the circuit-breaker budget when
+        // `circuit_breakers` is configured. Clusters WITHOUT the block get
+        // `budget: None` and register ZERO new `circuit_breakers.default.*`
+        // stats (inert-when-unconfigured discipline per phase-15 precedent).
+        let budget: Option<Arc<crate::BudgetState>> =
+            if let Some(cb) = cfg.circuit_breakers.as_ref() {
+                let t = cb.thresholds.first();
+                let max_retries = t.and_then(|t| t.max_retries).unwrap_or(3); // L5 default
+                let max_requests = t.and_then(|t| t.max_requests).unwrap_or(1024); // L5 default
+                let track = t.and_then(|t| t.track_remaining).unwrap_or(false);
+                Some(
+                    crate::BudgetState::new(max_retries, max_requests, track, &registry, &cfg.name)
+                        .map_err(|e| ClusterError::StatsRegistration {
+                            cluster: cfg.name.clone(),
+                            message: e.to_string(),
+                        })?,
+                )
+            } else {
+                None
+            };
         // 12.1 (parent-12 D5): `common_lb_config.healthy_panic_threshold` is a
         // cluster-level load-balancing property independent of active health
         // checking — it governs `pick()`'s panic-routing for ANY eligibility
@@ -934,6 +1044,8 @@ pub async fn from_bootstrap(
             upstream_rq_retry,
             upstream_rq_retry_success,
             upstream_rq_retry_limit_exceeded,
+            upstream_rq_retry_overflow,
+            budget,
             endpoint_health,
             panic_threshold,
             outlier_detection,
@@ -988,6 +1100,9 @@ mod tests {
         let upstream_rq_retry_limit_exceeded = registry
             .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
             .expect("counter registers");
+        let upstream_rq_retry_overflow = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_overflow"))
+            .expect("counter registers");
         ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
@@ -1001,6 +1116,8 @@ mod tests {
                 upstream_rq_retry,
                 upstream_rq_retry_success,
                 upstream_rq_retry_limit_exceeded,
+                upstream_rq_retry_overflow,
+                budget: None,
                 endpoint_health: None,
                 panic_threshold: 50.0,
                 outlier_detection: None,
@@ -1308,6 +1425,10 @@ admin:
             upstream_rq_retry_limit_exceeded: registry
                 .register_counter("cluster.backend.upstream_rq_retry_limit_exceeded")
                 .expect("counter registers"),
+            upstream_rq_retry_overflow: registry
+                .register_counter("cluster.backend.upstream_rq_retry_overflow")
+                .expect("counter registers"),
+            budget: None,
             endpoint_health: None,
             panic_threshold: 50.0,
             outlier_detection: None,
@@ -1884,6 +2005,9 @@ admin:
         let upstream_rq_retry_limit_exceeded = registry
             .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
             .unwrap();
+        let upstream_rq_retry_overflow = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_overflow"))
+            .unwrap();
         let gauge = registry
             .register_gauge(&format!("cluster.{name}.membership_healthy"))
             .unwrap();
@@ -1910,6 +2034,8 @@ admin:
                 upstream_rq_retry,
                 upstream_rq_retry_success,
                 upstream_rq_retry_limit_exceeded,
+                upstream_rq_retry_overflow,
+                budget: None,
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: None,
@@ -2226,6 +2352,9 @@ admin:
         let upstream_rq_retry_limit_exceeded = registry
             .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
             .unwrap();
+        let upstream_rq_retry_overflow = registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_retry_overflow"))
+            .unwrap();
         let membership = registry
             .register_gauge(&format!("cluster.{name}.membership_healthy"))
             .unwrap();
@@ -2307,6 +2436,8 @@ admin:
                 upstream_rq_retry,
                 upstream_rq_retry_success,
                 upstream_rq_retry_limit_exceeded,
+                upstream_rq_retry_overflow,
+                budget: None,
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: Some(od_state),
@@ -2762,6 +2893,272 @@ admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
         let _ = handle.upstream_rq_retry();
         let _ = handle.upstream_rq_retry_success();
         let _ = handle.upstream_rq_retry_limit_exceeded();
+    }
+
+    // ── 17 Task 3: budget integration tests ─────────────────────────────────
+
+    /// Helper: build a bootstrap YAML with a single-endpoint static cluster.
+    /// `cb_block` is the optional YAML text for the `circuit_breakers:` key +
+    /// value (already indented for the cluster level). Pass `""` for no block.
+    fn mk_cb_yaml(cb_block: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      {cb_block}
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10042
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#
+        )
+    }
+
+    /// (a) A cluster WITHOUT `circuit_breakers`:
+    ///  - `try_acquire_retry()` / `try_acquire_request()` return `Unlimited`
+    ///  - NO `circuit_breakers.default.*` stats registered
+    ///  - `upstream_rq_retry_overflow` IS registered (unconditional, inert at 0)
+    #[tokio::test]
+    async fn budget_integration_no_circuit_breakers_returns_unlimited() {
+        let yaml = mk_cb_yaml("");
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let handle = mgr.get("backend").expect("cluster present");
+
+        // try_acquire_retry returns Unlimited (budget: None)
+        assert!(
+            matches!(
+                handle.try_acquire_retry(),
+                crate::BudgetAcquisition::Unlimited
+            ),
+            "no circuit_breakers → try_acquire_retry must be Unlimited"
+        );
+        // try_acquire_request returns Unlimited
+        assert!(
+            matches!(
+                handle.try_acquire_request(),
+                crate::BudgetAcquisition::Unlimited
+            ),
+            "no circuit_breakers → try_acquire_request must be Unlimited"
+        );
+
+        // No circuit_breakers.default.* stats registered
+        let snapshot = registry.snapshot();
+        for (name, _) in &snapshot {
+            assert!(
+                !name.contains("circuit_breakers.default"),
+                "unconfigured cluster MUST NOT register circuit_breakers.default stats; got {name}"
+            );
+        }
+
+        // upstream_rq_retry_overflow IS registered (unconditional, inert at 0)
+        let names: Vec<&str> = snapshot.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"cluster.backend.upstream_rq_retry_overflow"),
+            "upstream_rq_retry_overflow must be registered unconditionally; snapshot: {names:?}"
+        );
+        let overflow_counter = registry
+            .register_counter("cluster.backend.upstream_rq_retry_overflow")
+            .expect("present");
+        assert_eq!(
+            overflow_counter.value(),
+            0,
+            "upstream_rq_retry_overflow must be inert at 0 with no circuit_breakers"
+        );
+    }
+
+    /// (b) A cluster WITH `circuit_breakers: {thresholds: [{max_retries: 0}]}`:
+    ///  - budget present
+    ///  - retry acquisition returns Rejected (cap 0 = always-open breaker)
+    ///  - max_requests resolves to default 1024 (L5)
+    #[tokio::test]
+    async fn budget_integration_zero_max_retries_returns_rejected() {
+        let yaml = mk_cb_yaml("circuit_breakers:\n        thresholds:\n          - max_retries: 0");
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("valid");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("construct");
+        let handle = mgr.get("backend").expect("cluster present");
+
+        // Retry acquisition: Rejected (cap 0)
+        assert!(
+            matches!(
+                handle.try_acquire_retry(),
+                crate::BudgetAcquisition::Rejected
+            ),
+            "max_retries=0 → try_acquire_retry must be Rejected"
+        );
+
+        // Request acquisition: Acquired (default cap 1024 >> 0 active)
+        let acq = handle.try_acquire_request();
+        assert!(
+            matches!(acq, crate::BudgetAcquisition::Acquired(_)),
+            "max_requests defaults to 1024, should be Acquired"
+        );
+        // acq dropped here — test only checks the variant, not guard lifetime
+    }
+
+    /// (c) `track_remaining: true` → `remaining_retries`/`remaining_rq` registered
+    ///     at the cap values; `track_remaining` absent/false → ABSENT
+    #[tokio::test]
+    async fn budget_integration_track_remaining_conditional_registration() {
+        // With track_remaining: true
+        let yaml_with = mk_cb_yaml(
+            "circuit_breakers:\n        thresholds:\n          - max_retries: 5\n            max_requests: 10\n            track_remaining: true",
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml_with).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+
+        let snapshot = registry.snapshot();
+        let names: Vec<&str> = snapshot.iter().map(|(n, _)| n.as_str()).collect();
+
+        // remaining_retries registered at cap 5
+        assert!(
+            names.contains(&"cluster.backend.circuit_breakers.default.remaining_retries"),
+            "remaining_retries must be present when track_remaining=true; got {names:?}"
+        );
+        assert!(
+            names.contains(&"cluster.backend.circuit_breakers.default.remaining_rq"),
+            "remaining_rq must be present when track_remaining=true; got {names:?}"
+        );
+        let remaining_retries = registry
+            .register_gauge("cluster.backend.circuit_breakers.default.remaining_retries")
+            .expect("present");
+        assert_eq!(
+            remaining_retries.value(),
+            5,
+            "remaining_retries should equal max_retries cap at construct"
+        );
+        let remaining_rq = registry
+            .register_gauge("cluster.backend.circuit_breakers.default.remaining_rq")
+            .expect("present");
+        assert_eq!(
+            remaining_rq.value(),
+            10,
+            "remaining_rq should equal max_requests cap at construct"
+        );
+
+        // Without track_remaining (absent → false)
+        let yaml_without = mk_cb_yaml(
+            "circuit_breakers:\n        thresholds:\n          - max_retries: 5\n            max_requests: 10",
+        );
+        let bootstrap2 = envoy_config::parse_bootstrap(&yaml_without).expect("valid");
+        let registry2 = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr2 = crate::from_bootstrap(&bootstrap2, Arc::clone(&registry2))
+            .await
+            .expect("construct");
+
+        for (name, _) in registry2.snapshot() {
+            assert!(
+                !name.contains("remaining_retries") && !name.contains("remaining_rq"),
+                "remaining_* must be absent when track_remaining is not set; got {name}"
+            );
+        }
+    }
+
+    /// (d) `circuit_breakers: {thresholds: [{}]}` (empty threshold) → L5 defaults:
+    ///     max_retries = 3, max_requests = 1024
+    #[tokio::test]
+    async fn budget_integration_empty_threshold_uses_l5_defaults() {
+        let yaml = mk_cb_yaml("circuit_breakers:\n        thresholds:\n          - {}");
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("valid");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("construct");
+        let handle = mgr.get("backend").expect("cluster present");
+
+        // Acquire 3 retry slots — should succeed (default cap = 3)
+        let g1 = match handle.try_acquire_retry() {
+            crate::BudgetAcquisition::Acquired(g) => g,
+            _other => panic!("expected Acquired for slot 1, got non-Acquired variant"),
+        };
+        let g2 = match handle.try_acquire_retry() {
+            crate::BudgetAcquisition::Acquired(g) => g,
+            _other => panic!("expected Acquired for slot 2, got non-Acquired variant"),
+        };
+        let g3 = match handle.try_acquire_retry() {
+            crate::BudgetAcquisition::Acquired(g) => g,
+            _other => panic!("expected Acquired for slot 3, got non-Acquired variant"),
+        };
+        // 4th retry should be Rejected (cap = 3)
+        assert!(
+            matches!(
+                handle.try_acquire_retry(),
+                crate::BudgetAcquisition::Rejected
+            ),
+            "4th retry beyond default cap 3 must be Rejected"
+        );
+        drop((g1, g2, g3));
+
+        // Acquire 1024 request slots — should all succeed (default cap = 1024)
+        let mut guards = Vec::with_capacity(1024);
+        for i in 0..1024 {
+            match handle.try_acquire_request() {
+                crate::BudgetAcquisition::Acquired(g) => guards.push(g),
+                _ => panic!("request slot {i} should be Acquired (default cap 1024)"),
+            }
+        }
+        // 1025th request should be Rejected
+        assert!(
+            matches!(
+                handle.try_acquire_request(),
+                crate::BudgetAcquisition::Rejected
+            ),
+            "1025th request beyond default cap 1024 must be Rejected"
+        );
+        drop(guards);
+    }
+
+    /// 17 Task 3: idempotent-registration contract — the `upstream_rq_retry_overflow`
+    /// counter registered unconditionally by `from_bootstrap` and the same counter
+    /// registered inside `BudgetState::new` must be the SAME Arc (shared identity).
+    #[tokio::test]
+    async fn budget_integration_retry_overflow_counter_shared_with_budget_state() {
+        let yaml = mk_cb_yaml("circuit_breakers:\n        thresholds:\n          - max_retries: 0");
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("valid");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let handle = mgr.get("backend").expect("cluster present");
+
+        // Trigger a retry overflow (cap 0 = always rejects)
+        let _ = handle.try_acquire_retry(); // increments upstream_rq_retry_overflow
+
+        // Both the handle accessor and the registry re-lookup must see value 1
+        assert_eq!(
+            handle.upstream_rq_retry_overflow().value(),
+            1,
+            "overflow counter must increment via BudgetState's try_acquire_retry"
+        );
+        let from_reg = registry
+            .register_counter("cluster.backend.upstream_rq_retry_overflow")
+            .expect("present");
+        assert_eq!(
+            from_reg.value(),
+            1,
+            "registry-obtained handle must share the same Arc (idempotent registration)"
+        );
     }
 }
 

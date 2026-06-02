@@ -17,7 +17,7 @@ mod ejection;
 mod health;
 mod outlier;
 
-pub use budget::{BudgetState, RequestBudgetGuard, RetryBudgetGuard};
+pub use budget::{BudgetAcquisition, BudgetState, RequestBudgetGuard, RetryBudgetGuard};
 pub use cluster::{
     Cluster, ClusterError, ClusterHandle, ClusterManager, ConnGaugeGuard, UpstreamProtocol,
     from_bootstrap,

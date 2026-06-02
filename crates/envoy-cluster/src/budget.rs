@@ -22,6 +22,7 @@ use envoy_stats::StatsRegistry;
 ///
 /// `BudgetState::new` takes already-resolved cap values; the L5 default resolution
 /// (3 / 1024) is the caller's responsibility (Task 3 `from_bootstrap` wiring).
+#[derive(Debug)]
 pub struct BudgetState {
     max_retries: u32,
     max_requests: u32,
@@ -222,6 +223,12 @@ pub struct RetryBudgetGuard {
     budget: Arc<BudgetState>,
 }
 
+impl std::fmt::Debug for RetryBudgetGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetryBudgetGuard").finish_non_exhaustive()
+    }
+}
+
 impl Drop for RetryBudgetGuard {
     fn drop(&mut self) {
         let prev = self.budget.active_retries.fetch_sub(1, Ordering::AcqRel);
@@ -238,11 +245,45 @@ pub struct RequestBudgetGuard {
     budget: Arc<BudgetState>,
 }
 
+impl std::fmt::Debug for RequestBudgetGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestBudgetGuard").finish_non_exhaustive()
+    }
+}
+
 impl Drop for RequestBudgetGuard {
     fn drop(&mut self) {
         let prev = self.budget.active_requests.fetch_sub(1, Ordering::AcqRel);
         self.budget.update_request_gauges(prev - 1);
     }
+}
+
+// ── BudgetAcquisition ────────────────────────────────────────────────────────
+
+/// Three-state result of a `try_acquire_retry` / `try_acquire_request` call on
+/// a `Cluster` (Task 3 public API).
+///
+/// Keeping three distinct variants (rather than `Option<Option<G>>`) gives the
+/// H1/H2 HCM call sites a single `match` with no nesting, which clippy prefers
+/// and ADR-0047 §5.2 mandates.
+///
+/// - `Unlimited`: the cluster has **no** `circuit_breakers` configured; callers
+///   must proceed without gating (zero stat side-effects).
+/// - `Acquired(guard)`: a budget slot was acquired; hold the guard for the
+///   operation's duration — dropping it releases the slot and re-syncs all
+///   gauges.
+/// - `Rejected`: the budget is exhausted (active ≥ cap, or cap == 0); the
+///   overflow counter has already been incremented inside `BudgetState`.
+#[must_use = "dropping BudgetAcquisition::Acquired immediately releases the budget slot"]
+#[derive(Debug)]
+pub enum BudgetAcquisition<G> {
+    /// No `circuit_breakers` configured — never gate; zero stat side-effects.
+    Unlimited,
+    /// A budget slot was acquired; hold the guard for the operation's duration.
+    Acquired(G),
+    /// The budget is exhausted (or the cap is 0); the overflow counter has
+    /// already ticked.
+    Rejected,
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
