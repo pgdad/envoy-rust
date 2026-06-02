@@ -201,4 +201,34 @@ signature-asymmetry docstring note] — **all 4 fixed in-task** [amended pre-pus
 
 ---
 
-_(Tasks 6–11 entries appended by the executor as each completes.)_
+## Task 6 — H2 retry-budget gate (`max_retries` mirror) (commit `a468eac7f`)
+
+**Landed.** `crates/envoy-http2/src/hcm.rs` (+323/−14, single file): the Task-4 retry-budget gate mirrored
+verbatim onto the H2 retry loop in `handle_one_stream`'s `BuildOutcome::Proxy` arm — same `retry_guard_slot` /
+`retry_budget_blocked` declarations, same three-arm `match cluster.try_acquire_retry()` (Unlimited / Acquired /
+Rejected) inside the `final_retriable && attempts <= max_retries` conjunct, same Acquired-arm ordering (tick →
+back-off → park guard → continue), same post-loop `if attempts > 1 && !retry_budget_blocked` guard, same
+`drop(retry_guard_slot)` site, same comments (adapted only for H2 specifics). **Sibling parity verified
+mechanically at spec review: the H2 gate is byte-identical to the H1 gate after normalizing indentation + the
+`envoy_config::RetryConfig` path prefix.** Phase-16 H2 machinery (per-attempt `upstream_rq_total` /
+`record_response`, the completing-response `upstream_rq_5xx` gate, gated `x-envoy-attempt-count`) untouched per
+`git diff -w`. 3 TDD tests (`h2_`-prefixed mirrors of the Task-4 names + same assertion sets) + 2 test helpers
+(`h1_backend_cluster_with_max_retries(addr, Option<u32>)` [the `h1_` prefix = upstream protocol, per the file's
+existing convention] + `drive_h2_once_with_body` [the general form — `drive_h2_once` now delegates to it]).
+
+**Verification (quoted):**
+- TDD RED: `h2_budget_blocked_retry_max_retries_zero` failed pre-gate with attempt-count 2 (the H2 loop ignored the budget).
+- `cargo test -p envoy-http2` → `test result: ok. 65 passed; 0 failed` (62 + 3 new). `cargo test -p envoy-http1` → 99 passed (untouched).
+- `cargo build --workspace --all-targets` + `cargo build -p envoy-http2` (standalone) → clean; clippy `-D warnings` → clean; fmt → clean.
+- `git show --stat HEAD` → 1 file changed.
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer extracted both gates and diffed them
+mechanically — IDENTICAL modulo indentation/path-prefix; arm ordering, post-loop guard, and preserved phase-16
+lines all confirmed; the `h1_`-prefixed helper name confirmed as the file's established upstream-protocol
+convention, not an asymmetry). Code-quality **Approved** (zero Critical / zero Important / 3 Minors — a 24-line
+`drive_h2_once` copy [→ refactored to delegation], a vacuous `windows(80)` body assertion [→ direct
+`starts_with`], and a naming note [no action] — **2 of 3 fixed in-task** [amended pre-push]).
+
+---
+
+_(Tasks 7–11 entries appended by the executor as each completes.)_
