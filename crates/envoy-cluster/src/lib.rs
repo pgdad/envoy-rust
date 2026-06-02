@@ -11,11 +11,13 @@
 //! (`tokio::spawn` + `CancellationToken`), mirroring the H1/H2 pool idle sweepers + the
 //! `envoy-health` scheduler — the FOURTH periodic-background primitive.
 
+pub mod budget;
 mod cluster;
 mod ejection;
 mod health;
 mod outlier;
 
+pub use budget::{BudgetState, RequestBudgetGuard, RetryBudgetGuard};
 pub use cluster::{
     Cluster, ClusterError, ClusterHandle, ClusterManager, ConnGaugeGuard, UpstreamProtocol,
     from_bootstrap,
