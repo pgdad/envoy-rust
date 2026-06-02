@@ -267,4 +267,38 @@ in-process-tested; the bilateral differential proof is Task 8 (fixture 0025).**
 
 ---
 
-_(Tasks 8–11 entries appended by the executor as each completes.)_
+## Task 8 — fixture `0025-upstream-circuit-breaker-retry-budget` + Docker wrapper (commit `b565dee9d`)
+
+**Landed — THE DIFFERENTIAL RESULT (the phase's discriminating observable): fixture 0025 PASSED BILATERALLY ON
+THE FIRST RUN with ZERO divergences from the PLAN expectations.** Every PLAN-specified assertion (3 probes'
+status/body/header sets + 22 cumulative stat assertions incl. the ADR-0047 re-anchored gauge-at-0 and
+`upstream_rq_5xx`-on-overflow values) held identically on real Envoy v1.33.0 and envoy-rust — no expectation
+loosening, no envoy-rust code fix needed. The ADR-0047 L1–L12 lock-ins are now bilaterally proven.
+
+**Files (6, +575/−1):** fixture dir ×4 (`envoy.yaml`/`envoy-rust.yaml` — identical modulo the standard 0024-pattern
+deltas [bind address, node id, `generate_request_id`]; three routes → `budget_zero` [max_retries:0 + track_remaining
++ retry_policy] / `budget_default` [defaults + track_remaining + retry_policy] / `rq_zero` [max_requests:0, no
+retry_policy]; vhost `include_attempt_count_in_response: true`; STRICT_DNS V4_ONLY; `expectations.yaml` — 3
+`Http1KeepAlive` probes + 22 stats + commented non-assertions; `README.md` — purpose + probe table + the ADR-0047
+L3/L4 re-anchoring rationale + the 0024 cyclic-retry-script caution verbatim) + the Docker wrapper
+`tests/differential/tests/upstream_circuit_breaker_budgets.rs` + **`tests/differential/src/lib.rs` (+13/−1, a
+justified PLAN deviation):** the harness's stateful-backend launch is fixture-name-keyed, so 0025 needed wiring
+(`--per-path /budget-blocked=503 --retry-script /budget-allowed=fail:1`, mirroring the 0024 arm; exact-name-gated →
+provably inert for all other fixtures).
+
+**Verification (quoted):**
+- Fixture 0025 bilateral: `test upstream_circuit_breaker_budgets_fixture ... ok` / `test result: ok. 1 passed; 0 failed` (5.37s first run; 3.91s on the spec reviewer's independent re-run).
+- **Full Docker-gated regression: ALL 25 fixtures (0001–0025) GREEN simultaneously**, zero flakes (the 0011/0012 flake family passed first try; no retries needed).
+- Neighbors re-verified independently at spec review: 0023 `ok. 1 passed` (3.09s), 0024 `ok. 1 passed` (3.09s).
+- `cargo build --workspace --all-targets` → clean; clippy `-D warnings` → clean; fmt → clean.
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer verified all 22 stat assertions + probe
+sets against the PLAN, the fixture-pair symmetry vs the 0024 convention, the lib.rs deviation's
+necessity/minimality/inertness, and independently re-ran 0025 + 0023 + 0024 under Docker). Code-quality **Approved**
+(zero Critical / zero Important / 3 non-blocking doc nits carried to the state-5 review inventory: a README
+"Reuse" bullet that could note `rq_zero` omits `track_remaining`; the lib.rs fixture-name else-if chain as a future
+consolidation candidate; the `rq_zero` block's omitted-by-design `rq_retry_open` assertion asymmetry).
+
+---
+
+_(Tasks 9–11 entries appended by the executor as each completes.)_
