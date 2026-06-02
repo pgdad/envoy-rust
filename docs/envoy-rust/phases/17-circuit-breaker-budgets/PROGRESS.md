@@ -62,4 +62,38 @@ fixed in-task** before the commit was finalized [amended pre-push]).
 
 ---
 
-_(Tasks 2–11 entries appended by the executor as each completes.)_
+## Task 2 — `BudgetState` + RAII budget guards (`crates/envoy-cluster/src/budget.rs`) (commit `12817303e`)
+
+**Landed.** New module `crates/envoy-cluster/src/budget.rs` (522 lines incl. tests) + `lib.rs` module decl/re-exports
+(2 lines): `BudgetState` (resolved caps + plain `AtomicI64` active-counts + stat handles), `try_acquire_retry(self:
+&Arc<Self>) -> Option<RetryBudgetGuard>` / `try_acquire_request(...) -> Option<RequestBudgetGuard>` (CAS
+compare-and-increment under the cap; a `0` cap always fails = the always-open breaker [L1/L2]), RAII guards whose
+`Drop` decrements the active count + re-syncs gauges. **Overflow counters tick INSIDE the failed acquire** (§5.3
+single source of truth; retry → `upstream_rq_retry_overflow`, request → `upstream_rq_pending_overflow` [L3], once
+per failed call, never on CAS contention). **Momentary gauge semantic (L4 / ADR-0047):** `*_open` = 1 iff
+`active > 0 AND active >= max`, updated on acquire success/failure + guard Drop; zero-cap gauges provably stay 0.
+**`remaining_*` gauges (L8):** registered ONLY when `track_remaining: true`, initialized to cap values, floored at 0;
+absent (not present-at-0) otherwise. `upstream_rq_pending_overflow` registration is idempotent-shared with the
+phase-15 pool handle (verified against `envoy-stats::registry` same-kind semantics). Guards are Send+Sync (hold only
+`Arc<BudgetState>`) — safe to hold across `.await` in the Tasks 4–7 retry loops. 10 TDD tests.
+
+**Public API for Tasks 3–7:** `BudgetState::new(max_retries, max_requests, track_remaining, &StatsRegistry,
+cluster_name) -> Result<Arc<Self>, StatsError>`; `try_acquire_retry` / `try_acquire_request`; `RetryBudgetGuard` /
+`RequestBudgetGuard`.
+
+**Verification (quoted):**
+- TDD RED: `cargo test -p envoy-cluster budget` → 0 tests / compile failure before the module landed.
+- `cargo test -p envoy-cluster` → `test result: ok. 80 passed; 0 failed` (70 + 10 new).
+- `cargo build --workspace --all-targets` → clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0); `cargo fmt --all -- --check` → clean (exit 0).
+- `git show --stat HEAD` → 2 files changed (`budget.rs` +522 new; `lib.rs` +2).
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer verified the CAS loop has no TOCTOU, the
+overflow tick fires once per failed call [not on contention], the L4 formula, the L8 absence-via-snapshot assertion,
+and the idempotent shared registration). Code-quality **Approved** (zero Critical / zero Important / 3 Minors — the
+PLAN-skeleton-inherited `Arc<AtomicI64>` double-wrap [hot-path allocation], a missing gauge-interleaving doc note,
+and a `remaining_rq` cycle test gap — **all 3 fixed in-task** [amended pre-push]). Reviewer confirmed guards are
+Send+Sync (the highest-risk Tasks-4–7 integration concern).
+
+---
+
+_(Tasks 3–11 entries appended by the executor as each completes.)_
