@@ -1,6 +1,15 @@
 use std::path::Path;
 use std::time::Duration;
 
+/// 18 Task 6 (ADR-0049 lock-in L1): the container-internal path the rendered
+/// per-fixture CDS file is copied to for the upstream Envoy. The path MUST end
+/// in `.yaml` — Envoy selects its config-file parser by extension, and a
+/// non-`.yaml` path would make it parse the YAML-content CDS file as JSON-only
+/// and fail. The `{{CDS_PATH}}` marker in the upstream `envoy.yaml`
+/// (`dynamic_resources.cds_config.path_config_source.path`) is substituted to
+/// this constant; the subject side substitutes a host temp path instead.
+pub const CDS_CONTAINER_PATH: &str = "/etc/envoy-cds/cds.yaml";
+
 use anyhow::{Context, Result};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -66,6 +75,12 @@ pub async fn start(
     host_gateway: bool,
     tls_pki: Option<&crate::tls::TlsTestPki>,
     expose_admin_port: bool,
+    // 18 Task 6 (ADR-0049 L1): host path of the rendered upstream CDS file.
+    // When `Some`, it is copied into the container at `CDS_CONTAINER_PATH`
+    // (`.yaml`-suffixed per L1) via `with_copy_to`, mirroring the TLS-PKI
+    // mounting pattern. `None` for fixtures with no `{{CDS_PATH}}` marker
+    // (all pre-18 fixtures).
+    cds_file: Option<&Path>,
     // 06.2 D4.2.c (revised CI fix #2): bind-mount each (host_dir, container_dir)
     // pair so the container's access-log writes surface on the host where
     // the harness reads them. The PARENT DIRECTORY of the access-log file
@@ -111,6 +126,17 @@ pub async fn start(
         for (host_path, container_path) in pki.container_mounts() {
             request = request.with_copy_to(container_path, host_path);
         }
+    }
+    // 18 Task 6 (ADR-0049 L1): copy the rendered CDS file into the container at
+    // `CDS_CONTAINER_PATH` (a constant ending in `.yaml`). Same `with_copy_to`
+    // shape as the TLS-PKI mounts above. The host source path is canonicalized
+    // so a relative temp path resolves regardless of the container's working
+    // directory.
+    if let Some(cds) = cds_file {
+        let cds_abs = cds
+            .canonicalize()
+            .with_context(|| format!("canonicalizing CDS file {}", cds.display()))?;
+        request = request.with_copy_to(CDS_CONTAINER_PATH, cds_abs);
     }
     // 06.2 D4.2.c: bind-mount access-log file paths so the container's
     // append-mode writes surface on the host where the harness's
@@ -185,7 +211,9 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path(), false, None, false, &[]).await.unwrap();
+        let proxy = start(yaml.path(), false, None, false, None, &[])
+            .await
+            .unwrap();
         assert!(proxy.host_port() > 0);
         // Validate accept-readiness via the library's own helper.
         let addr: std::net::SocketAddr =

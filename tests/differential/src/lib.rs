@@ -170,6 +170,17 @@ pub enum Driver {
         settle_ms: u64,
         #[serde(default)]
         expected_stats: Vec<KeepAliveExpectedStat>,
+        /// 18 Task 6 (ADR-0049): after the post-settle `expected_stats`
+        /// scrape, run zero or more admin-listener scrape sub-cases through
+        /// the SAME per-case assertion logic the `Driver::AdminScrape` arm
+        /// uses (status + content-type + body-rule, each side independently;
+        /// the shared `assert_admin_scrape_case` fn). Fixture 0026 uses this
+        /// to assert `/config_dump`'s `ClustersConfigDump` reflects the
+        /// file-based CDS load without adding a new `Driver` variant.
+        /// `#[serde(default)]` so the existing fixtures (0020-0025) that
+        /// omit the field deserialize unchanged to an empty vec.
+        #[serde(default)]
+        admin_scrapes: Vec<AdminScrapeCase>,
     },
     /// 13.2 Task 5 (ADR-0039 topology pivot): drive N sequential single-stream
     /// HTTP/2 requests over a SINGLE downstream H2 connection. The
@@ -900,6 +911,31 @@ pub fn render_yaml(template: &str, kvs: &[(&str, &str)]) -> String {
         out = out.replace(&format!("{{{{{k}}}}}"), v);
     }
     out
+}
+
+/// 18 Task 6 (ADR-0049): does ANY of `sources` reference the literal
+/// `{{marker}}` token? Used by `run_fixture`'s backend-launch detection so a
+/// marker that lives ONLY in the CDS template (`cds.yaml` — the main configs
+/// having zero static clusters and routing to a CDS-defined cluster, as in
+/// fixture 0026) still triggers the corresponding host backend to spawn. The
+/// `marker` argument is the bare key (e.g. `HTTP1_BACKEND_PORT`); the `{{…}}`
+/// wrapping is added here so callers read as a plain key check.
+pub fn scan_needs_marker(sources: &[&str], marker: &str) -> bool {
+    let token = format!("{{{{{marker}}}}}");
+    sources.iter().any(|s| s.contains(&token))
+}
+
+/// 18 Task 6 (ADR-0049): scan a CDS rendition for any residual `{{MARKER}}`
+/// token left behind by `render_yaml` (which intentionally leaves unmatched
+/// tokens in place). Returns the first offending marker name (the text between
+/// the first `{{` and its `}}`), or `None` if the content is fully resolved.
+/// Used to fail fast with a named marker instead of letting an unsubstituted
+/// token surface as a confusing downstream Envoy parse error.
+fn residual_marker(content: &str) -> Option<&str> {
+    let start = content.find("{{")?;
+    let after = &content[start + 2..];
+    let end = after.find("}}")?;
+    Some(&after[..end])
 }
 
 /// Write `content` to a new temp file in `dir` and return the path. The caller
@@ -2129,6 +2165,36 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         None
     };
 
+    // 18 Task 6 (ADR-0049): detect file-based CDS. When either main template
+    // references `{{CDS_PATH}}`, the fixture carries a `cds.yaml` template that
+    // is rendered TWICE (once per side, through the same per-side kv map so
+    // `{{BACKEND_HOST}}`/`{{HTTP1_BACKEND_PORT}}` etc. get per-side values),
+    // written to the temp dir, and threaded into each side's config:
+    //   - upstream side: `{{CDS_PATH}}` → `CDS_CONTAINER_PATH` (a `.yaml`-
+    //     suffixed container constant per L1); the rendered upstream file is
+    //     copied into the container via `upstream::start(.., cds_file, ..)`.
+    //   - subject side: `{{CDS_PATH}}` → the host temp path of the rendered
+    //     subject CDS file (the subject runs as a host subprocess and reads
+    //     the file directly).
+    // The CDS render/write happens AFTER the per-side kv maps are built (so
+    // the kv maps drive the CDS render) but the CDS_PATH marker value is a
+    // per-side CONSTANT known up-front, so it is added to each kv map before
+    // the maps are used — same dependency shape as the TLS-PKI paths.
+    let needs_cds =
+        upstream_template.contains("{{CDS_PATH}}") || subject_template.contains("{{CDS_PATH}}");
+    let cds_template = if needs_cds {
+        Some(
+            std::fs::read_to_string(fixture_dir.join("cds.yaml"))
+                .context("reading cds.yaml (fixture references {{CDS_PATH}})")?,
+        )
+    } else {
+        None
+    };
+    // Subject-side host path is known before rendering (the temp dir exists);
+    // the upstream-side value is the container constant.
+    let subject_cds_path = tmp.path().join("cds-subject.yaml");
+    let subject_cds_path_str = subject_cds_path.to_string_lossy().into_owned();
+
     // Spawn a host-local backend if either template needs one. Holding the
     // backend in a binding outside the proxies' lifetime ensures the child
     // process outlives the fixture run; Drop fires after `run_fixture`'s
@@ -2150,8 +2216,17 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let needs_backend = upstream_template.contains("{{BACKEND_PORT}}")
-        || subject_template.contains("{{BACKEND_PORT}}");
+    // 18 Task 6 (ADR-0049): backend-launch detection scans the main templates
+    // AND the CDS template. Phase-18 fixture 0026 places `{{BACKEND_HOST}}` and
+    // the backend-port markers ONLY in `cds.yaml` (the main configs route to a
+    // CDS-defined cluster and carry no static clusters), so a scan over only
+    // `upstream_template`/`subject_template` would never spawn the backend and
+    // the markers would render unsubstituted. The combined source threads the
+    // CDS template (empty string when no `cds.yaml`) into every `needs_*`
+    // check below via `scan_needs_marker`.
+    let cds_scan = cds_template.as_deref().unwrap_or("");
+    let backend_scan_sources: [&str; 3] = [&upstream_template, &subject_template, cds_scan];
+    let needs_backend = scan_needs_marker(&backend_scan_sources, "BACKEND_PORT");
     // 13.1 D9.1 / Task 7: fixture 0020 reuses `HealthAwareHttp1Backend` but
     // needs the helper's per-path status mapping
     // (`/301=301,/404=404,/500=500`) to span 2xx/3xx/4xx/5xx classes so the
@@ -2247,8 +2322,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // `Option<TlsEchoBackend>` outlives both proxies, and Drop fires after
     // `run_fixture` returns. Requires `tls_pki` to also be present (the
     // backend reads cert + key from the same PKI the upstream consults).
-    let needs_tls_backend = upstream_template.contains("{{TLS_BACKEND_PORT}}")
-        || subject_template.contains("{{TLS_BACKEND_PORT}}");
+    let needs_tls_backend = scan_needs_marker(&backend_scan_sources, "TLS_BACKEND_PORT");
     let _tls_backend: Option<crate::backend::TlsEchoBackend> = if needs_tls_backend {
         let pki = tls_pki
             .as_ref()
@@ -2266,8 +2340,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // 04.3 Task 13: spawn an Http1EchoBackend if either template needs one.
     // Same alive-keeper binding-order discipline as `_backend` and
     // `_tls_backend` above — Drop fires after `run_fixture` returns.
-    let needs_http1_backend = upstream_template.contains("{{HTTP1_BACKEND_PORT}}")
-        || subject_template.contains("{{HTTP1_BACKEND_PORT}}");
+    let needs_http1_backend = scan_needs_marker(&backend_scan_sources, "HTTP1_BACKEND_PORT");
     let _http1_backend: Option<crate::backend::Http1EchoBackend> = if needs_http1_backend {
         Some(
             crate::backend::Http1EchoBackend::spawn()
@@ -2282,8 +2355,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // 05.3 NEW per SPEC §3 D6.b: spawn Http2EchoBackend if either template
     // needs one. Same alive-keeper binding-order discipline as _backend /
     // _tls_backend / _http1_backend above.
-    let needs_http2_backend = upstream_template.contains("{{HTTP2_BACKEND_PORT}}")
-        || subject_template.contains("{{HTTP2_BACKEND_PORT}}");
+    let needs_http2_backend = scan_needs_marker(&backend_scan_sources, "HTTP2_BACKEND_PORT");
     let _http2_backend: Option<crate::backend::Http2EchoBackend> = if needs_http2_backend {
         Some(
             crate::backend::Http2EchoBackend::spawn()
@@ -2339,6 +2411,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 v.push((*k, val.clone()));
             }
         }
+        if needs_cds {
+            // 18 Task 6 (ADR-0049 L1): the container-internal `.yaml` path the
+            // rendered upstream CDS file is copied to.
+            v.push(("CDS_PATH", upstream::CDS_CONTAINER_PATH.to_string()));
+        }
         v
     };
     let subject_kvs: Vec<(&str, String)> = {
@@ -2371,6 +2448,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 v.push((*k, val.clone()));
             }
         }
+        if needs_cds {
+            // 18 Task 6 (ADR-0049): host temp path of the rendered subject CDS
+            // file; the subject subprocess reads it directly from the host FS.
+            v.push(("CDS_PATH", subject_cds_path_str.clone()));
+        }
         v
     };
 
@@ -2380,6 +2462,35 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         upstream_kvs.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let subject_kvs_refs: Vec<(&str, &str)> =
         subject_kvs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    // 18 Task 6 (ADR-0049): render + write the per-side CDS files BEFORE the
+    // main configs. Each rendition uses the side's own kv map (so backend
+    // host/port markers inside cds.yaml resolve per-side). The upstream file is
+    // later copied into the container at `CDS_CONTAINER_PATH`; the subject file
+    // stays at its host temp path (`subject_cds_path`, already injected into
+    // the subject kv map as `{{CDS_PATH}}`).
+    let upstream_cds_path: Option<PathBuf> = if let Some(tpl) = cds_template.as_ref() {
+        let upstream_cds_yaml = render_yaml(tpl, &upstream_kvs_refs);
+        let subject_cds_yaml = render_yaml(tpl, &subject_kvs_refs);
+        // 18 Task 6 (ADR-0049): `render_yaml` intentionally leaves any unmatched
+        // `{{MARKER}}` token in place, so a marker present in `cds.yaml` but
+        // absent from the kv map would otherwise slip through and surface as a
+        // confusing Envoy parse error. Fail fast here, CDS-scoped, naming the
+        // offending marker. (Deliberately NOT applied to main-config rendering.)
+        if let Some(marker) = residual_marker(&upstream_cds_yaml) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream cds.yaml");
+        }
+        if let Some(marker) = residual_marker(&subject_cds_yaml) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject cds.yaml");
+        }
+        let up_path = write_temp(tmp.path(), "cds-upstream.yaml", &upstream_cds_yaml)?;
+        // Write the subject rendition at the exact path injected into the
+        // subject kv map so `{{CDS_PATH}}` resolves to a file that exists.
+        write_temp(tmp.path(), "cds-subject.yaml", &subject_cds_yaml)?;
+        Some(up_path)
+    } else {
+        None
+    };
 
     let upstream_yaml = render_yaml(&upstream_template, &upstream_kvs_refs);
     let subject_yaml = render_yaml(&subject_template, &subject_kvs_refs);
@@ -2462,6 +2573,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         host_uses_host_gateway,
         tls_pki.as_ref(),
         needs_admin_port,
+        upstream_cds_path.as_deref(),
         &upstream_access_log_mounts,
     )
     .await?;
@@ -2787,6 +2899,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             requests,
             settle_ms,
             expected_stats,
+            admin_scrapes,
         } => {
             use tokio::io::AsyncWriteExt;
             let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
@@ -2923,6 +3036,32 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     stat.value,
                     subject_value,
                 );
+            }
+
+            // 18 Task 6 (ADR-0049): after the bilateral stat scrape, run any
+            // `admin_scrapes` sub-cases through the SAME per-case assertion
+            // logic the `Driver::AdminScrape` arm uses (the shared
+            // `assert_admin_scrape_case` fn). Fixture 0026 uses this to assert
+            // `/config_dump`'s `ClustersConfigDump` reflects the file-based CDS
+            // load. Empty for fixtures 0020-0025 (`#[serde(default)]`), so the
+            // loop is skipped and the dispatch shape is unchanged for them.
+            // No HCM pre-requests here — keep-alive already drove the
+            // data-plane requests above, so pass an empty `hcm_addrs` map and
+            // `&[]` pre-requests (drive_admin_scrape then hits the admin
+            // listener directly).
+            let empty_hcm: std::collections::BTreeMap<String, SocketAddr> =
+                std::collections::BTreeMap::new();
+            let no_pre: &[PreRequest] = &[];
+            for case in admin_scrapes {
+                let upstream_resp =
+                    drive_admin_scrape(no_pre, upstream_admin_addr, &empty_hcm, &case.path)
+                        .await
+                        .with_context(|| format!("upstream envoy admin scrape: {}", case.path))?;
+                let subject_resp =
+                    drive_admin_scrape(no_pre, subject_admin_addr, &empty_hcm, &case.path)
+                        .await
+                        .with_context(|| format!("envoy-rust admin scrape: {}", case.path))?;
+                assert_admin_scrape_case(case, &upstream_resp, &subject_resp)?;
             }
 
             subject.shutdown(Duration::from_secs(5)).await.ok();
@@ -3611,38 +3750,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 }
             }
             for (case, upstream_resp, subject_resp) in &results {
-                // expected_status: each side independently equals it.
-                if upstream_resp.status != case.expected_status {
-                    bail!(
-                        "upstream admin status {} != expected {} (path={})",
-                        upstream_resp.status,
-                        case.expected_status,
-                        case.path,
-                    );
-                }
-                if subject_resp.status != case.expected_status {
-                    bail!(
-                        "subject admin status {} != expected {} (path={})",
-                        subject_resp.status,
-                        case.expected_status,
-                        case.path,
-                    );
-                }
-
-                // expected_content_type: each side independently has a
-                // `content-type:` header whose (case-insensitive) value matches.
-                check_content_type(&upstream_resp.headers, &case.expected_content_type)
-                    .with_context(|| format!("upstream admin content-type: {}", case.path))?;
-                check_content_type(&subject_resp.headers, &case.expected_content_type)
-                    .with_context(|| format!("envoy-rust admin content-type: {}", case.path))?;
-
-                // Body rule: dispatch on BodyRule variant.
-                assert_body_rule(
-                    &case.expected_body_rule,
-                    &upstream_resp.body,
-                    &subject_resp.body,
-                )
-                .with_context(|| format!("admin body rule: {}", case.path))?;
+                assert_admin_scrape_case(case, upstream_resp, subject_resp)?;
             }
 
             // STEP 4: post_admin_assertions — wire-level invariants
@@ -3729,6 +3837,58 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     }
 
     // _backend Drop fires here.
+    Ok(())
+}
+
+/// 18 Task 6 (ADR-0049): per-`AdminScrapeCase` assertion logic, shared by the
+/// `Driver::AdminScrape` scrape loop and the `Driver::Http1KeepAlive`
+/// `admin_scrapes` loop. Asserts, for one sub-case against both proxies'
+/// already-fetched responses, that (1) `expected_status` is matched by each
+/// side independently, (2) each side independently carries a matching
+/// (case-insensitive) `content-type` header equal to `expected_content_type`,
+/// and (3) the `expected_body_rule` `BodyRule`-dispatched envoy ↔ envoy-rust
+/// body comparison passes (e.g. `JsonShape`, `PrometheusExposition`,
+/// `TextLines`, `ByteExact`).
+///
+/// Extracted verbatim from the former inline `Driver::AdminScrape` body so the
+/// json_shape / prometheus diff code is not duplicated across the two drivers.
+fn assert_admin_scrape_case(
+    case: &AdminScrapeCase,
+    upstream_resp: &DriveHttp1Result,
+    subject_resp: &DriveHttp1Result,
+) -> Result<()> {
+    // expected_status: each side independently equals it.
+    if upstream_resp.status != case.expected_status {
+        bail!(
+            "upstream admin status {} != expected {} (path={})",
+            upstream_resp.status,
+            case.expected_status,
+            case.path,
+        );
+    }
+    if subject_resp.status != case.expected_status {
+        bail!(
+            "subject admin status {} != expected {} (path={})",
+            subject_resp.status,
+            case.expected_status,
+            case.path,
+        );
+    }
+
+    // expected_content_type: each side independently has a
+    // `content-type:` header whose (case-insensitive) value matches.
+    check_content_type(&upstream_resp.headers, &case.expected_content_type)
+        .with_context(|| format!("upstream admin content-type: {}", case.path))?;
+    check_content_type(&subject_resp.headers, &case.expected_content_type)
+        .with_context(|| format!("envoy-rust admin content-type: {}", case.path))?;
+
+    // Body rule: dispatch on BodyRule variant.
+    assert_body_rule(
+        &case.expected_body_rule,
+        &upstream_resp.body,
+        &subject_resp.body,
+    )
+    .with_context(|| format!("admin body rule: {}", case.path))?;
     Ok(())
 }
 
@@ -4170,6 +4330,7 @@ driver:
             requests,
             settle_ms,
             expected_stats,
+            admin_scrapes,
         } = exp.driver
         else {
             panic!("expected Driver::Http1KeepAlive");
@@ -4186,6 +4347,8 @@ driver:
             "cluster.backend_cluster.upstream_cx_total"
         );
         assert_eq!(expected_stats[0].value, 1);
+        // 18 Task 6: admin_scrapes defaults to empty when the key is absent.
+        assert!(admin_scrapes.is_empty());
     }
 
     /// 14.2 D8.1a (SPEC correction B-3): the three optional per-request
@@ -4236,6 +4399,258 @@ expected_status: 200
         assert!(req.expected_body.is_none());
         assert!(req.require_header_present.is_none());
         assert!(req.require_header_absent.is_none());
+    }
+
+    /// 18 Task 6 (ADR-0049): the per-side `{{CDS_PATH}}` + backend-marker
+    /// rendering of a fixture `cds.yaml` template produces per-side
+    /// substitutions — the upstream (container-perspective) side resolves
+    /// `{{BACKEND_HOST}}` to `host.docker.internal`, while the subject
+    /// (host-perspective) side resolves it to `127.0.0.1`. Mirrors the
+    /// existing `render_yaml_substitutes_backend_keys_for_{envoy,envoy_rust}_side`
+    /// tests, exercising the same `render_yaml` mechanic that `run_fixture`'s
+    /// CDS pre-flight uses (the Docker-gated end-to-end proof is fixture
+    /// 0026's job, Task 7).
+    #[test]
+    fn render_cds_template_substitutes_backend_host_per_side() {
+        let cds_template = r#"
+resources:
+  - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+    name: dynamic_backend
+    load_assignment:
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: {{BACKEND_HOST}}
+                    port_value: {{HTTP1_BACKEND_PORT}}
+"#;
+        let upstream_cds = render_yaml(
+            cds_template,
+            &[
+                ("BACKEND_HOST", "host.docker.internal"),
+                ("HTTP1_BACKEND_PORT", "31415"),
+            ],
+        );
+        let subject_cds = render_yaml(
+            cds_template,
+            &[
+                ("BACKEND_HOST", "127.0.0.1"),
+                ("HTTP1_BACKEND_PORT", "31415"),
+            ],
+        );
+        assert!(
+            upstream_cds.contains("address: host.docker.internal"),
+            "upstream cds should use container-perspective backend host: {upstream_cds}",
+        );
+        assert!(
+            subject_cds.contains("address: 127.0.0.1"),
+            "subject cds should use host-perspective backend host: {subject_cds}",
+        );
+        // Both renditions resolve the shared backend port marker.
+        assert!(upstream_cds.contains("port_value: 31415"));
+        assert!(subject_cds.contains("port_value: 31415"));
+    }
+
+    /// 18 Task 6 (ADR-0049): backend-launch detection must scan the CDS
+    /// template too. Fixture 0026 places `{{HTTP1_BACKEND_PORT}}` and
+    /// `{{BACKEND_HOST}}` ONLY in `cds.yaml`; the main templates carry just
+    /// `{{CDS_PATH}}` + `{{PORT}}` + `{{ADMIN_PORT}}` (no backend markers, the
+    /// configs routing to a CDS-defined cluster). A scan over only the main
+    /// templates would report `needs_http1_backend == false` and the backend
+    /// would never spawn. `scan_needs_marker` over the combined source (main +
+    /// CDS) is what `run_fixture` uses; this locks that it sees the CDS-only
+    /// marker.
+    #[test]
+    fn backend_scan_detects_marker_in_cds_template_only() {
+        let upstream_main = "  path: {{CDS_PATH}}\n  port_value: {{PORT}}\n  admin: {{ADMIN_PORT}}";
+        let subject_main = "  path: {{CDS_PATH}}\n  port_value: {{PORT}}\n  admin: {{ADMIN_PORT}}";
+        let cds = r#"
+resources:
+  - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+    load_assignment:
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: {{BACKEND_HOST}}
+                    port_value: {{HTTP1_BACKEND_PORT}}
+"#;
+        // Mirrors run_fixture's combined `backend_scan_sources`.
+        let sources: [&str; 3] = [upstream_main, subject_main, cds];
+
+        // No backend marker in the main configs alone.
+        assert!(
+            !scan_needs_marker(&[upstream_main, subject_main], "HTTP1_BACKEND_PORT"),
+            "main templates alone must not report an http1 backend need",
+        );
+        // The combined scan (incl. CDS) must report the need.
+        assert!(
+            scan_needs_marker(&sources, "HTTP1_BACKEND_PORT"),
+            "combined scan (main + cds.yaml) must detect the CDS-only HTTP1_BACKEND_PORT marker",
+        );
+        // The CDS-only BACKEND_HOST presence is likewise visible (so the
+        // host.docker.internal-vs-127.0.0.1 gate is reachable once the backend
+        // port lands in the kv map).
+        assert!(
+            scan_needs_marker(&sources, "BACKEND_HOST"),
+            "combined scan must detect the CDS-only BACKEND_HOST marker",
+        );
+        // Empty CDS source (the no-cds.yaml case) collapses to main-only.
+        assert!(
+            !scan_needs_marker(&[upstream_main, subject_main, ""], "HTTP1_BACKEND_PORT"),
+            "empty cds source must not fabricate a backend need",
+        );
+    }
+
+    /// 18 Task 6 (ADR-0049): `render_yaml` leaves an unmatched `{{MARKER}}`
+    /// token in place, so a CDS rendition with a marker absent from the kv map
+    /// would otherwise slip into Envoy and fail with an opaque parse error. The
+    /// `residual_marker` guard (applied to each CDS rendition in `run_fixture`)
+    /// detects the leftover token and names it. A fully-resolved rendition
+    /// returns `None`.
+    #[test]
+    fn residual_marker_names_unsubstituted_cds_token() {
+        // A backend port marker with no kv entry → render_yaml leaves it; the
+        // guard reports the offending marker name.
+        let cds_template = "    address: {{BACKEND_HOST}}\n    port_value: {{HTTP1_BACKEND_PORT}}";
+        // Only BACKEND_HOST resolved; HTTP1_BACKEND_PORT has no kv entry.
+        let rendered = render_yaml(cds_template, &[("BACKEND_HOST", "127.0.0.1")]);
+        assert_eq!(
+            residual_marker(&rendered),
+            Some("HTTP1_BACKEND_PORT"),
+            "guard must name the unsubstituted marker, got: {rendered}",
+        );
+
+        // A fully-resolved rendition has no residual marker.
+        let resolved = render_yaml(
+            cds_template,
+            &[
+                ("BACKEND_HOST", "127.0.0.1"),
+                ("HTTP1_BACKEND_PORT", "31415"),
+            ],
+        );
+        assert_eq!(
+            residual_marker(&resolved),
+            None,
+            "fully-resolved rendition must have no residual marker, got: {resolved}",
+        );
+    }
+
+    /// 18 Task 6 (ADR-0049 L1): the upstream-side `{{CDS_PATH}}` substitution
+    /// value is the container constant `upstream::CDS_CONTAINER_PATH`, which
+    /// MUST end in `.yaml` (Envoy selects its config parser by file extension;
+    /// a non-`.yaml` path would make it parse the YAML content as JSON-only and
+    /// fail). The subject-side value is a host temp path to the subject's
+    /// rendered cds file. This locks the L1 extension constraint structurally:
+    /// the container path is a compile-time constant.
+    #[test]
+    fn cds_path_substitution_is_per_side_and_container_path_is_yaml() {
+        // L1: the container-perspective path is a constant ending in `.yaml`.
+        assert!(
+            upstream::CDS_CONTAINER_PATH.ends_with(".yaml"),
+            "L1: upstream container CDS path must end in .yaml, got {}",
+            upstream::CDS_CONTAINER_PATH,
+        );
+
+        let main_template = "  path: {{CDS_PATH}}";
+        // Upstream side: {{CDS_PATH}} → the container constant.
+        let upstream_main =
+            render_yaml(main_template, &[("CDS_PATH", upstream::CDS_CONTAINER_PATH)]);
+        assert_eq!(
+            upstream_main,
+            format!("  path: {}", upstream::CDS_CONTAINER_PATH),
+        );
+        assert!(
+            upstream_main.trim_end().ends_with(".yaml"),
+            "upstream rendered CDS path must end in .yaml: {upstream_main}",
+        );
+
+        // Subject side: {{CDS_PATH}} → a host temp path to cds-subject.yaml.
+        let tmp = tempfile::tempdir().unwrap();
+        let subject_cds_path = tmp.path().join("cds-subject.yaml");
+        let subject_cds_path_str = subject_cds_path.to_string_lossy().into_owned();
+        let subject_main = render_yaml(main_template, &[("CDS_PATH", &subject_cds_path_str)]);
+        assert_eq!(subject_main, format!("  path: {subject_cds_path_str}"));
+        assert_ne!(
+            subject_cds_path_str,
+            upstream::CDS_CONTAINER_PATH,
+            "subject CDS path must be a host temp path, not the container constant",
+        );
+    }
+
+    /// 18 Task 6 (ADR-0049): `Driver::Http1KeepAlive` with an `admin_scrapes:`
+    /// list deserializes from YAML (the fixture-0026 shape — a `/config_dump`
+    /// json_shape sub-case after the keep-alive request + stat scrape).
+    #[test]
+    fn http1_keep_alive_with_admin_scrapes_round_trips() {
+        let yaml = r#"
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /
+      host: dynamic_backend
+      expected_status: 200
+  settle_ms: 100
+  admin_scrapes:
+    - path: /config_dump
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+"#;
+        let exp: crate::Expectations = serde_yaml::from_str(yaml).expect("yaml parses");
+        let Driver::Http1KeepAlive {
+            requests,
+            settle_ms,
+            expected_stats,
+            admin_scrapes,
+        } = exp.driver
+        else {
+            panic!("expected Driver::Http1KeepAlive");
+        };
+        assert_eq!(requests.len(), 1);
+        assert_eq!(settle_ms, 100);
+        assert!(expected_stats.is_empty());
+        assert_eq!(admin_scrapes.len(), 1);
+        assert_eq!(admin_scrapes[0].path, "/config_dump");
+        assert_eq!(admin_scrapes[0].expected_status, 200);
+        assert_eq!(admin_scrapes[0].expected_content_type, "application/json");
+        assert!(matches!(
+            admin_scrapes[0].expected_body_rule,
+            BodyRule::JsonShape { .. }
+        ));
+    }
+
+    /// 18 Task 6 (ADR-0049): an existing-style keep-alive `Driver` block that
+    /// omits the `admin_scrapes` key (the shape fixtures 0020-0025 use) still
+    /// deserializes, with `admin_scrapes` defaulting to an empty vec. Guards
+    /// the `#[serde(default)]` backward-compat contract.
+    #[test]
+    fn http1_keep_alive_without_admin_scrapes_defaults_empty() {
+        let yaml = r#"
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /
+      host: backend_cluster
+      expected_status: 200
+  settle_ms: 100
+  expected_stats:
+    - name: cluster.backend_cluster.upstream_cx_total
+      value: 1
+"#;
+        let exp: crate::Expectations = serde_yaml::from_str(yaml).expect("yaml parses");
+        let Driver::Http1KeepAlive { admin_scrapes, .. } = exp.driver else {
+            panic!("expected Driver::Http1KeepAlive");
+        };
+        assert!(
+            admin_scrapes.is_empty(),
+            "admin_scrapes must default to empty when the key is absent",
+        );
     }
 
     /// 13.2 Task 5 (ADR-0039): `Driver::Http2KeepAlive` round-trips through
