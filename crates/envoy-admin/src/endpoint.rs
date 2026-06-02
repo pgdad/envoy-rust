@@ -306,7 +306,54 @@ pub(crate) enum ConfigDumpEntry<'a> {
         bootstrap: &'a envoy_config::Bootstrap,
         last_updated: String,
     },
+    /// Phase 18 D5 (ADR-0049 L5): the `ClustersConfigDump` entry, emitted ONLY
+    /// when `dynamic_resources.cds_config` is configured (fixture 0014 stays
+    /// single-entry — its config_dump shape is untouched). Keys mirror Envoy's
+    /// proto3-JSON shape: empty lists are OMITTED entirely (`skip_serializing_if`),
+    /// and there is NO `version_info` key (the CDS file carried none → proto3
+    /// JSON omits empty fields). When present this entry lands at `configs[1]`,
+    /// AFTER the Bootstrap entry, matching Envoy v1.33's ordering.
+    #[serde(rename = "type.googleapis.com/envoy.admin.v3.ClustersConfigDump")]
+    Clusters {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        static_clusters: Vec<StaticClusterEntry<'a>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dynamic_active_clusters: Vec<DynamicClusterEntry<'a>>,
+    },
 }
+
+/// Phase 18 D5: one static cluster inside `ClustersConfigDump`. Envoy shape:
+/// `{"cluster": {...}}` (no `last_updated` on static-config entries).
+#[derive(Serialize)]
+pub(crate) struct StaticClusterEntry<'a> {
+    pub(crate) cluster: TaggedCluster<'a>,
+}
+
+/// Phase 18 D5: one dynamically-loaded cluster. Envoy shape:
+/// `{"cluster": {...}, "last_updated": "..."}`.
+#[derive(Serialize)]
+pub(crate) struct DynamicClusterEntry<'a> {
+    pub(crate) cluster: TaggedCluster<'a>,
+    pub(crate) last_updated: String,
+}
+
+/// Phase 18 D5: a `Cluster` serialized with the inner `@type` tag Envoy's
+/// `google.protobuf.Any`-projection carries on the nested `cluster` object.
+/// `#[serde(flatten)]` merges the full cluster config alongside the `@type`
+/// key. This is a flatten on a NESTED struct (not on the internally-tagged
+/// outer enum's variant content), so it does not trip serde's
+/// flatten+internally-tagged-enum limitation — verified compiling + the
+/// emitted JSON carries both `@type` and the full cluster fields.
+#[derive(Serialize)]
+pub(crate) struct TaggedCluster<'a> {
+    #[serde(rename = "@type")]
+    pub(crate) type_url: &'static str,
+    #[serde(flatten)]
+    pub(crate) cluster: &'a envoy_config::Cluster,
+}
+
+/// The `@type` URL for the nested `cluster` object inside `ClustersConfigDump`.
+const CLUSTER_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
 
 /// Phase 08.2 Task 5 (D-ready): drain-aware `/ready` response. Widens the
 /// 06.1 hardcoded 200 `"LIVE\n"` shape to a three-arm match on
@@ -357,12 +404,53 @@ pub(crate) fn render_ready_with(handler: &crate::handler::AdminHandler) -> envoy
 /// `Bootstrap` from the handler; the `last_updated` timestamp is the wall
 /// clock at render time formatted via [`envoy_accesslog::format_iso8601`].
 pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
-    let body = ConfigDumpBody {
-        configs: vec![ConfigDumpEntry::Bootstrap {
-            bootstrap: handler.bootstrap(),
-            last_updated: envoy_accesslog::format_iso8601(std::time::SystemTime::now()),
-        }],
-    };
+    let bootstrap = handler.bootstrap();
+    // Single render-time wall clock, shared by the Bootstrap entry and (when
+    // emitted) the dynamic-cluster `last_updated` fields — same source/format.
+    let last_updated = envoy_accesslog::format_iso8601(std::time::SystemTime::now());
+    let mut configs = vec![ConfigDumpEntry::Bootstrap {
+        bootstrap,
+        last_updated: last_updated.clone(),
+    }];
+    // Phase 18 D5 (ADR-0049 L5): emit the ClustersConfigDump entry ONLY when
+    // `dynamic_resources.cds_config` is configured. Pushed AFTER the Bootstrap
+    // entry ⇒ `configs[1]` (matching Envoy v1.33's ordering). Empty cluster
+    // lists serialize to omitted keys via the variant's `skip_serializing_if`.
+    if bootstrap
+        .dynamic_resources
+        .as_ref()
+        .and_then(|dr| dr.cds_config.as_ref())
+        .is_some()
+    {
+        let static_clusters = bootstrap
+            .static_resources
+            .clusters
+            .iter()
+            .map(|cluster| StaticClusterEntry {
+                cluster: TaggedCluster {
+                    type_url: CLUSTER_TYPE_URL,
+                    cluster,
+                },
+            })
+            .collect();
+        let dynamic_active_clusters = bootstrap
+            .dynamic_clusters
+            .iter()
+            .flatten()
+            .map(|cluster| DynamicClusterEntry {
+                cluster: TaggedCluster {
+                    type_url: CLUSTER_TYPE_URL,
+                    cluster,
+                },
+                last_updated: last_updated.clone(),
+            })
+            .collect();
+        configs.push(ConfigDumpEntry::Clusters {
+            static_clusters,
+            dynamic_active_clusters,
+        });
+    }
+    let body = ConfigDumpBody { configs };
     let body_bytes = serde_json::to_vec_pretty(&body)
         .expect("ConfigDumpBody serializes (all subtypes derive Serialize per Task 4)");
     envoy_http1::Response {
@@ -862,6 +950,253 @@ mod config_dump_tests {
             .pointer("/configs/0/bootstrap/node/id")
             .and_then(|v| v.as_str());
         assert_eq!(node_id, Some("my-node-id"));
+    }
+}
+
+#[cfg(test)]
+mod clusters_config_dump_tests {
+    //! Phase 18 Task 5 — D5 (ADR-0049 L5): the `ClustersConfigDump`
+    //! `/config_dump` entry, emitted CONDITIONALLY (only when
+    //! `dynamic_resources.cds_config` is configured). Four test groups:
+    //! (a) conditional emission — no `dynamic_resources` ⇒ exactly one entry
+    //! (the fixture-0014 single-entry regression shape); (b) the entry with a
+    //! dynamic cluster present (`configs[1]` shape: outer `@type`, inner
+    //! `cluster.@type`, `cluster.name`, ISO-8601 `last_updated`); (c) empty-key
+    //! omission (zero static clusters ⇒ no `static_clusters` key; a static
+    //! cluster present ⇒ the key is present); (d) the BootstrapConfigDump shows
+    //! `dynamic_resources` but NOT the loaded clusters (the `#[serde(skip)]`
+    //! `dynamic_clusters` separation, §5.5).
+
+    use super::AdminEndpoint;
+    use crate::config::AdminConfig;
+    use crate::handler::AdminHandler;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// A single STRICT_DNS cluster named `dynamic_backend`, the L5 fixture
+    /// shape. Parsed standalone (not via the bootstrap path) so the test can
+    /// inject it into `dynamic_clusters` directly.
+    const DYNAMIC_BACKEND_CLUSTER: &str = "\
+name: dynamic_backend
+type: STRICT_DNS
+lb_policy: ROUND_ROBIN
+load_assignment:
+  cluster_name: dynamic_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: backend.example.com
+            port_value: 8080
+";
+
+    /// A static cluster (type STATIC) named `static_backend`, used by the
+    /// static_clusters-key-presence test (group c inverse).
+    const STATIC_BACKEND_CLUSTER: &str = "\
+name: static_backend
+type: STATIC
+lb_policy: ROUND_ROBIN
+load_assignment:
+  cluster_name: static_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: 127.0.0.1
+            port_value: 9000
+";
+
+    /// Bootstrap WITH `dynamic_resources.cds_config` configured (triggers the
+    /// conditional ClustersConfigDump emission). The `path` is never read at
+    /// render time — the loaded clusters live in `dynamic_clusters`.
+    const DR_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    fn parse_cluster(yaml: &str) -> envoy_config::Cluster {
+        serde_yaml::from_str(yaml).expect("cluster yaml parses")
+    }
+
+    /// Build a handler from an already-constructed `Bootstrap` (mirrors
+    /// `config_dump_tests::handler_with_bootstrap`, but takes the owned
+    /// `Bootstrap` so a test can populate `dynamic_clusters` first).
+    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+        )
+    }
+
+    fn parse_bootstrap(yaml: &str) -> Bootstrap {
+        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
+    }
+
+    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
+        let resp = AdminEndpoint::ConfigDump.render_with(handler);
+        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
+        serde_json::from_str(body_str).expect("valid JSON")
+    }
+
+    // (a) conditional emission: no dynamic_resources ⇒ exactly ONE entry.
+    #[test]
+    fn no_dynamic_resources_emits_single_bootstrap_entry() {
+        let bootstrap = parse_bootstrap(
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n",
+        );
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(configs.len(), 1, "no dynamic_resources ⇒ single entry");
+        assert_eq!(
+            configs[0].get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.BootstrapConfigDump")
+        );
+    }
+
+    // (b) with a dynamic cluster present ⇒ TWO entries; configs[1] is the
+    // ClustersConfigDump with the expected nested shape.
+    #[test]
+    fn dynamic_cluster_emits_clusters_config_dump_at_configs_1() {
+        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(configs.len(), 2, "dynamic_resources ⇒ two entries");
+        let entry = &configs[1];
+        assert_eq!(
+            entry.get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.ClustersConfigDump")
+        );
+        assert_eq!(
+            entry
+                .pointer("/dynamic_active_clusters/0/cluster/name")
+                .and_then(|v| v.as_str()),
+            Some("dynamic_backend")
+        );
+        assert_eq!(
+            entry
+                .pointer("/dynamic_active_clusters/0/cluster/@type")
+                .and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.config.cluster.v3.Cluster")
+        );
+        // last_updated parses as a non-empty ISO-8601 string (same format the
+        // BootstrapConfigDump entry uses: format_iso8601).
+        let last_updated = entry
+            .pointer("/dynamic_active_clusters/0/last_updated")
+            .and_then(|v| v.as_str())
+            .expect("last_updated is a string");
+        assert!(!last_updated.is_empty(), "last_updated non-empty");
+        // RFC-3339 / ISO-8601 parseable (the BootstrapConfigDump format).
+        assert!(
+            last_updated.contains('T') && last_updated.ends_with('Z'),
+            "last_updated ISO-8601-shaped; got {last_updated:?}"
+        );
+    }
+
+    // (c) empty-key omission (L5): zero static clusters ⇒ NO static_clusters key.
+    #[test]
+    fn zero_static_clusters_omits_static_clusters_key() {
+        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let entry = &value.get("configs").and_then(|c| c.as_array()).unwrap()[1];
+        assert!(
+            entry.get("static_clusters").is_none(),
+            "zero static clusters ⇒ static_clusters key omitted; entry was {entry}"
+        );
+        // Inverse cheap check: dynamic_active_clusters key IS present.
+        assert!(entry.get("dynamic_active_clusters").is_some());
+    }
+
+    // (c, inverse) a static cluster present + dynamic_resources configured ⇒
+    // static_clusters key present, carrying it.
+    #[test]
+    fn static_cluster_present_emits_static_clusters_key() {
+        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        bootstrap.static_resources.clusters = vec![parse_cluster(STATIC_BACKEND_CLUSTER)];
+        bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let entry = &value.get("configs").and_then(|c| c.as_array()).unwrap()[1];
+        assert_eq!(
+            entry
+                .pointer("/static_clusters/0/cluster/name")
+                .and_then(|v| v.as_str()),
+            Some("static_backend")
+        );
+        assert_eq!(
+            entry
+                .pointer("/static_clusters/0/cluster/@type")
+                .and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.config.cluster.v3.Cluster")
+        );
+    }
+
+    // (d) §5.5 separation: the BootstrapConfigDump entry shows dynamic_resources
+    // but NOT the loaded clusters (dynamic_clusters is #[serde(skip)]).
+    #[test]
+    fn bootstrap_entry_shows_dynamic_resources_not_loaded_clusters() {
+        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let boot = &value.get("configs").and_then(|c| c.as_array()).unwrap()[0];
+        // BootstrapConfigDump carries the dynamic_resources subtree.
+        assert!(
+            boot.pointer("/bootstrap/dynamic_resources/cds_config/path_config_source/path")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "BootstrapConfigDump shows dynamic_resources; entry was {boot}"
+        );
+        // ...but static_resources.clusters stays empty (the loaded
+        // dynamic_clusters are #[serde(skip)] — structurally excluded).
+        let static_clusters = boot
+            .pointer("/bootstrap/static_resources/clusters")
+            .and_then(|v| v.as_array())
+            .expect("static_resources.clusters is an array");
+        assert!(
+            static_clusters.is_empty(),
+            "loaded dynamic clusters must NOT appear in the BootstrapConfigDump"
+        );
+        // And there is no `dynamic_clusters` key anywhere in the bootstrap subtree.
+        assert!(
+            boot.pointer("/bootstrap/dynamic_clusters").is_none(),
+            "dynamic_clusters is #[serde(skip)] — must be absent"
+        );
     }
 }
 
