@@ -28,4 +28,38 @@
 - **Carry-forward warning:** the phase-15 pool test modules (`crates/envoy-http1/src/pool.rs` + `crates/envoy-http2/src/pool.rs` `#[cfg(test)]`) construct `Thresholds` struct literals — if exhaustive, they break on the new fields and MUST be extended with `max_requests: None, max_retries: None, track_remaining: None` in the SAME commit (the phase-16 Task-1 workspace-compile lesson).
 - **Verification:** `cargo test -p envoy-config` (PASS) + `cargo build --workspace --all-targets` + `cargo clippy --workspace --all-targets --all-features -- -D warnings` + `cargo fmt --all -- --check`.
 
+## Task 1 — `Thresholds` budget fields (`max_requests`/`max_retries`/`track_remaining`) (commit `902a5aa48`)
+
+**Landed.** `crates/envoy-config/src/bootstrap.rs` (single file): the 3 new `Option` fields on `Thresholds`
+(`max_requests: Option<u32>` / `max_retries: Option<u32>` / `track_remaining: Option<bool>`, each
+`#[serde(default, skip_serializing_if = "Option::is_none")]`; `deny_unknown_fields` retained); the
+`validate_circuit_breakers` doc-comment explaining the zero-cap acceptance asymmetry (`max_requests: 0`/
+`max_retries: 0` = always-open breakers [L1/L2], ACCEPTED, vs `max_connections: 0` = `InvalidMaxConnections`
+[phase-13 rationale]); the `CircuitBreakers` struct doc updated to reflect the new accepted-field set.
+**Zero new `ConfigError` variants; zero semantic validation changes** (PLAN lock-in). The pre-existing test
+`cluster_circuit_breakers_rejects_phase13_deferred_threshold_fields` renamed to
+`..._rejects_still_deferred_threshold_fields` (its unknown-field probe switched `max_requests: 5` →
+`max_connection_pools: 5` since the former is now a valid field — no coverage lost). 7 new TDD tests
+(parse 0/0/true; parse 5/3/false; absent → None; `retry_budget` rejected; `max_connection_pools` rejected;
+validator accepts zero caps; existing rejections still fire with budget fields present).
+
+**Pool-literal carry-forward warning: did NOT materialize.** `grep Thresholds crates/envoy-http{1,2}/src/pool.rs`
+→ no struct literals (the pools read thresholds via `.and_then()` accessors) — no fold-in needed; the commit
+touches exactly 1 file.
+
+**Verification (quoted):**
+- TDD RED: 6 compile errors (`no field 'max_requests' on type '&Thresholds'`) before the fields landed.
+- `cargo test -p envoy-config` → `test result: ok. 302 passed; 0 failed` (295 + 7 new).
+- `cargo build --workspace --all-targets` → clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+- `cargo fmt --all -- --check` → clean (exit 0).
+- `git show --stat HEAD` → 1 file changed (`bootstrap.rs` +346/−14).
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer independently re-ran all gates +
+verified the renamed test lost no coverage + verified the pool.rs no-literal claim); code-quality **Approved**
+(zero Critical / zero Important / 3 Minors — stale `CircuitBreakers` doc + 2 test-coverage nits — **all 3
+fixed in-task** before the commit was finalized [amended pre-push]).
+
+---
+
 _(Tasks 2–11 entries appended by the executor as each completes.)_
