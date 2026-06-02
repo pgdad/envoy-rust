@@ -1960,84 +1960,12 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
     // without conflicting with the listener borrow.
     let defer_cluster_refs = bootstrap.cds_configured_but_unloaded();
 
-    // Per-cluster invariants.
+    // Per-cluster invariants. Each static cluster runs the same gauntlet as
+    // dynamically-loaded (CDS) clusters — `validate_cluster` is the single
+    // source of truth shared by `validate()` and `cds::parse_cds_file`
+    // (18 D2 / SPEC D2; Task-2 Step 3b extraction).
     for cluster in &bootstrap.static_resources.clusters {
-        if cluster.load_assignment.cluster_name != cluster.name {
-            return Err(crate::ConfigError::LoadAssignmentNameMismatch {
-                cluster: cluster.name.clone(),
-                assignment: cluster.load_assignment.cluster_name.clone(),
-            });
-        }
-        let total_endpoints: usize = cluster
-            .load_assignment
-            .endpoints
-            .iter()
-            .map(|le| le.lb_endpoints.len())
-            .sum();
-        if total_endpoints == 0 {
-            return Err(crate::ConfigError::EmptyClusterEndpoints(
-                cluster.name.clone(),
-            ));
-        }
-        if let Some(ts) = cluster.transport_socket.as_ref() {
-            if ts.name != crate::TLS_TRANSPORT_SOCKET {
-                return Err(crate::ConfigError::UnknownTransportSocketName(
-                    ts.name.clone(),
-                ));
-            }
-            match &ts.typed_config {
-                TransportSocketTypedConfig::Upstream(ctx) => {
-                    if !ctx.common_tls_context.tls_certificates.is_empty() {
-                        return Err(crate::ConfigError::EmptyTlsCertificates { side: "cluster" });
-                    }
-                    let vc = ctx
-                        .common_tls_context
-                        .validation_context
-                        .as_ref()
-                        .ok_or(crate::ConfigError::MissingValidationContext)?;
-                    validate_data_source(
-                        &vc.trusted_ca,
-                        "validation_context.trusted_ca",
-                        Required::Filename,
-                    )?;
-                    if ctx.sni.is_empty() {
-                        return Err(crate::ConfigError::EmptyUpstreamSni);
-                    }
-                }
-                TransportSocketTypedConfig::Downstream(_) => {
-                    return Err(crate::ConfigError::MismatchedTransportSocketDirection {
-                        side: "cluster",
-                        got: "DownstreamTlsContext",
-                    });
-                }
-            }
-        }
-        // 05.3 NEW per SPEC §3 D2.a: validate cluster-side
-        // typed_extension_protocol_options.
-        if let Some(teo) = &cluster.typed_extension_protocol_options {
-            const EXPECTED_TYPE_URL: &str =
-                "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
-            if teo.http_protocol_options.type_url != EXPECTED_TYPE_URL {
-                return Err(crate::ConfigError::UnsupportedTypedConfigUrl {
-                    got: teo.http_protocol_options.type_url.clone(),
-                    expected: EXPECTED_TYPE_URL,
-                });
-            }
-            let ehc = &teo.http_protocol_options.explicit_http_config;
-            if ehc.http_protocol_options.is_some() && ehc.http2_protocol_options.is_some() {
-                return Err(crate::ConfigError::MutuallyExclusiveExplicitHttpConfig {
-                    cluster: cluster.name.clone(),
-                });
-            }
-            if let Some(h2_opts) = &ehc.http2_protocol_options {
-                validate_http2_protocol_options_ranges(h2_opts)?;
-            }
-        }
-        // 12.1: validate the cluster's active-HC config (HTTP-only, 0-or-1) +
-        // common_lb_config panic threshold.
-        validate_health_checks(cluster)?;
-        validate_circuit_breakers(cluster)?; // 13.1 D2
-        validate_outlier_detection(cluster)?; // 14.1 D2
+        validate_cluster(cluster)?;
     }
 
     // Per-listener invariants.
@@ -2207,6 +2135,95 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
             }
         }
     }
+    Ok(())
+}
+
+/// Run the per-cluster invariant gauntlet on a single cluster. Extracted from
+/// `validate()`'s static-cluster loop (Task-2 Step 3b) so that `validate()` and
+/// `cds::parse_cds_file` share ONE source of truth: dynamically-loaded (CDS)
+/// clusters pass exactly the same checks static clusters do (18 D2 / SPEC D2).
+///
+/// This covers only the genuinely per-cluster invariants. Cross-cluster checks
+/// (duplicate names, cluster-reference resolution from listeners) live outside
+/// this function — they require the full cluster list and listener context, so
+/// they stay in `validate()` / `validate_hcm` / `load_dynamic_resources`.
+pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigError> {
+    if cluster.load_assignment.cluster_name != cluster.name {
+        return Err(crate::ConfigError::LoadAssignmentNameMismatch {
+            cluster: cluster.name.clone(),
+            assignment: cluster.load_assignment.cluster_name.clone(),
+        });
+    }
+    let total_endpoints: usize = cluster
+        .load_assignment
+        .endpoints
+        .iter()
+        .map(|le| le.lb_endpoints.len())
+        .sum();
+    if total_endpoints == 0 {
+        return Err(crate::ConfigError::EmptyClusterEndpoints(
+            cluster.name.clone(),
+        ));
+    }
+    if let Some(ts) = cluster.transport_socket.as_ref() {
+        if ts.name != crate::TLS_TRANSPORT_SOCKET {
+            return Err(crate::ConfigError::UnknownTransportSocketName(
+                ts.name.clone(),
+            ));
+        }
+        match &ts.typed_config {
+            TransportSocketTypedConfig::Upstream(ctx) => {
+                if !ctx.common_tls_context.tls_certificates.is_empty() {
+                    return Err(crate::ConfigError::EmptyTlsCertificates { side: "cluster" });
+                }
+                let vc = ctx
+                    .common_tls_context
+                    .validation_context
+                    .as_ref()
+                    .ok_or(crate::ConfigError::MissingValidationContext)?;
+                validate_data_source(
+                    &vc.trusted_ca,
+                    "validation_context.trusted_ca",
+                    Required::Filename,
+                )?;
+                if ctx.sni.is_empty() {
+                    return Err(crate::ConfigError::EmptyUpstreamSni);
+                }
+            }
+            TransportSocketTypedConfig::Downstream(_) => {
+                return Err(crate::ConfigError::MismatchedTransportSocketDirection {
+                    side: "cluster",
+                    got: "DownstreamTlsContext",
+                });
+            }
+        }
+    }
+    // 05.3 NEW per SPEC §3 D2.a: validate cluster-side
+    // typed_extension_protocol_options.
+    if let Some(teo) = &cluster.typed_extension_protocol_options {
+        const EXPECTED_TYPE_URL: &str =
+            "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions";
+        if teo.http_protocol_options.type_url != EXPECTED_TYPE_URL {
+            return Err(crate::ConfigError::UnsupportedTypedConfigUrl {
+                got: teo.http_protocol_options.type_url.clone(),
+                expected: EXPECTED_TYPE_URL,
+            });
+        }
+        let ehc = &teo.http_protocol_options.explicit_http_config;
+        if ehc.http_protocol_options.is_some() && ehc.http2_protocol_options.is_some() {
+            return Err(crate::ConfigError::MutuallyExclusiveExplicitHttpConfig {
+                cluster: cluster.name.clone(),
+            });
+        }
+        if let Some(h2_opts) = &ehc.http2_protocol_options {
+            validate_http2_protocol_options_ranges(h2_opts)?;
+        }
+    }
+    // 12.1: validate the cluster's active-HC config (HTTP-only, 0-or-1) +
+    // common_lb_config panic threshold.
+    validate_health_checks(cluster)?;
+    validate_circuit_breakers(cluster)?; // 13.1 D2
+    validate_outlier_detection(cluster)?; // 14.1 D2
     Ok(())
 }
 

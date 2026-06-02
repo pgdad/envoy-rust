@@ -5,6 +5,7 @@
 //! ADR-0008 for the extraction rationale.
 
 pub mod bootstrap;
+pub mod cds;
 pub mod matcher;
 
 pub use bootstrap::{
@@ -25,6 +26,7 @@ pub use bootstrap::{
     TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
     TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
 };
+pub use cds::parse_cds_file;
 
 /// The only network filter name envoy-rust recognizes in phase 01.
 pub const ECHO_FILTER: &str = "envoy.filters.network.echo";
