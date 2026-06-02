@@ -717,173 +717,223 @@ async fn serve_connection(
                         )
                         .to_owned();
 
-                    // 16 Task 4: H1 retry loop. With `retry_config: None`,
-                    // `max_retries == 0` so the loop runs exactly once and the
-                    // path is byte-identical to the pre-phase-16 single-attempt
-                    // dispatch (no retry counters tick, no x-envoy-attempt-count).
-                    let max_retries = retry_config.as_ref().map_or(0, |r| r.num_retries);
-                    let mut attempts: u32 = 0;
-                    // Whether the FINAL attempt (the one we broke out on) was
-                    // itself retriable. Assigned on every `break` path; read
-                    // post-loop to split retry_success vs limit_exceeded (L4).
-                    #[allow(unused_assignments)]
-                    let mut final_retriable = false;
-                    // 17 D4 (ADR-0047): retry-budget gate state. `retry_guard_slot`
-                    // holds the budget slot acquired for the IN-FLIGHT retry; it is
-                    // declared here so its lifetime spans the back-off + the next
-                    // attempt (constraint iii). Each retry's guard is parked here and
-                    // dropped at the NEXT retry's assignment (after its back-off) or at
-                    // loop exit — so the slot is held across the back-off sleep and the
-                    // in-flight retried attempt (constraint iii). `Unlimited` (no
-                    // circuit_breakers) leaves it `None` forever (constraint iv —
-                    // byte-identical to phase-16).
-                    let mut retry_guard_slot: Option<envoy_cluster::RetryBudgetGuard> = None;
-                    // Set true only on a budget `Rejected` exit: suppresses the
-                    // post-loop success/limit-exceeded split (L7 exclusivity — the
-                    // overflow counter already ticked inside `try_acquire_retry`).
-                    let mut retry_budget_blocked = false;
-
-                    let (final_response, completing_upstream_response): (Response, bool) = loop {
-                        attempts += 1;
-
-                        // Run one attempt: pick → acquire → send → receive. All
-                        // counter side effects (except the per-call `cx_total`
-                        // connect tick that lives inside) are driven HERE from
-                        // the returned `AttemptResult`, so behavior is identical
-                        // to the inlined version.
-                        let attempt = run_attempt(
-                            &config,
-                            &cluster,
-                            &cluster_name,
-                            &req,
-                            &host_header,
-                            close,
-                        )
-                        .await;
-
-                        if let Some(endpoint) = attempt.endpoint {
-                            // 06.2 Task 6: capture the resolved upstream endpoint
-                            // for the access-log `%UPSTREAM_HOST%` token (last
-                            // attempt's endpoint wins). Skipped on pick()->None.
-                            upstream_host_for_log = Some(endpoint.to_string());
+                    // 17 D5 (ADR-0046/ADR-0047): the request-budget gate
+                    // (max_requests). Acquired ONCE per downstream request; the
+                    // guard spans the ENTIRE retry loop (L9b) — bound here so it
+                    // lives until the final response is built, then released on
+                    // drop. Fires BEFORE the retry loop and BEFORE any pool/backend
+                    // contact (L9a gate ordering: the request breaker fires before
+                    // the retry breaker). On `Rejected` the request never reaches
+                    // the retry loop: we build the overflow synth-503 and fall
+                    // through to the unified writer site (where downstream_rq_5xx +
+                    // access log fire, identical to the pool overflow arm).
+                    let request_acquire = cluster.try_acquire_request();
+                    // `_request_guard` holds the slot (when Acquired) for the whole
+                    // Proxy arm — through the entire retry loop and until `outgoing`
+                    // is built, then released on arm exit before the wire write
+                    // (constraint v: one request = one slot for its whole lifetime).
+                    let _request_guard: Option<envoy_cluster::RequestBudgetGuard>;
+                    if let envoy_cluster::BudgetAcquisition::Rejected = request_acquire {
+                        _request_guard = None;
+                        // The failed acquire already ticked
+                        // upstream_rq_pending_overflow (§5.3 — single source of
+                        // truth). L3 (ADR-0047): Envoy's overflow local reply ALSO
+                        // ticks upstream_rq_5xx — mirror it here (the ONLY synth
+                        // path that ticks it; the phase-16 completing-response gate
+                        // for every OTHER path is untouched). upstream_rq_total is
+                        // NOT ticked (constraint iv — no attempt ever dispatches).
+                        cluster.upstream_rq_5xx().inc();
+                        // The overflow synth-503 (81-byte body + x-envoy-overloaded)
+                        // — the SAME helper the pool PendingOverflow arm uses.
+                        outgoing = synth_overflow(close);
+                        // L11: the overflow local reply carries
+                        // x-envoy-attempt-count: 1 when the vhost flag is set (only
+                        // the would-be first attempt; none ever dispatched).
+                        if include_attempt_count_in_response {
+                            outgoing.headers.push((
+                                crate::router::X_ENVOY_ATTEMPT_COUNT.to_string(),
+                                "1".to_string(),
+                            ));
                         }
-
-                        // L5: per-attempt upstream_rq_total — only for received
-                        // upstream responses (single source of truth; the
-                        // increment moved here from
-                        // router::construct_proxied_response).
-                        if attempt.upstream_response {
-                            cluster.upstream_rq_total().inc();
-                        }
-
-                        // 14.2 D4 / lock-in #9 (L8): response-receipt hook PER
-                        // ATTEMPT — each attempt feeds outlier detection. Records
-                        // against the picked endpoint for Response, connect-fail,
-                        // send-fail (Reset), and overflow paths (every path that
-                        // reached a pick()). Skipped on pick()->None (no endpoint
-                        // to attribute, lock-in #8). Inert without
-                        // outlier_detection.
-                        if let Some(endpoint) = attempt.endpoint {
-                            cluster.record_response(endpoint, attempt.response.status);
-                        }
-
-                        // Retry decision. `final_retriable` mirrors whether THIS
-                        // (final-so-far) attempt is retriable — used post-loop to
-                        // split retry_success vs limit_exceeded (L4).
-                        final_retriable = match attempt.outcome {
-                            Some(outcome) => retry_config
-                                .as_ref()
-                                .is_some_and(|r| r.is_retriable(attempt.response.status, outcome)),
-                            None => false,
+                        // Fall through to the unified writer site (no pool contact,
+                        // no retry loop).
+                    } else {
+                        // `Unlimited` (no circuit_breakers — constraint vi,
+                        // byte-identical to phase-16) → None; `Acquired` → hold the
+                        // slot across the whole retry loop (L9b).
+                        _request_guard = match request_acquire {
+                            envoy_cluster::BudgetAcquisition::Acquired(g) => Some(g),
+                            _ => None, // only Unlimited reaches here; Rejected is gated above
                         };
-                        if final_retriable && attempts <= max_retries {
-                            // 17 D4 (ADR-0047): the retry-budget gate. A retriable
-                            // outcome with attempts remaining ADDITIONALLY requires a
-                            // retry-budget slot (§5.5 — composes with, never replaces,
-                            // the phase-16 condition above).
-                            match cluster.try_acquire_retry() {
-                                // No circuit_breakers configured: never gate, zero
-                                // side-effects — byte-identical to phase-16.
-                                envoy_cluster::BudgetAcquisition::Unlimited => {
-                                    // L4: a retry is firing. Count it, back off, loop.
-                                    cluster.upstream_rq_retry().inc();
-                                    if let Some(d) = RetryConfig::backoff(attempts) {
-                                        tokio::time::sleep(d).await;
+
+                        // 16 Task 4: H1 retry loop. With `retry_config: None`,
+                        // `max_retries == 0` so the loop runs exactly once and the
+                        // path is byte-identical to the pre-phase-16 single-attempt
+                        // dispatch (no retry counters tick, no x-envoy-attempt-count).
+                        let max_retries = retry_config.as_ref().map_or(0, |r| r.num_retries);
+                        let mut attempts: u32 = 0;
+                        // Whether the FINAL attempt (the one we broke out on) was
+                        // itself retriable. Assigned on every `break` path; read
+                        // post-loop to split retry_success vs limit_exceeded (L4).
+                        #[allow(unused_assignments)]
+                        let mut final_retriable = false;
+                        // 17 D4 (ADR-0047): retry-budget gate state. `retry_guard_slot`
+                        // holds the budget slot acquired for the IN-FLIGHT retry; it is
+                        // declared here so its lifetime spans the back-off + the next
+                        // attempt (constraint iii). Each retry's guard is parked here and
+                        // dropped at the NEXT retry's assignment (after its back-off) or at
+                        // loop exit — so the slot is held across the back-off sleep and the
+                        // in-flight retried attempt (constraint iii). `Unlimited` (no
+                        // circuit_breakers) leaves it `None` forever (constraint iv —
+                        // byte-identical to phase-16).
+                        let mut retry_guard_slot: Option<envoy_cluster::RetryBudgetGuard> = None;
+                        // Set true only on a budget `Rejected` exit: suppresses the
+                        // post-loop success/limit-exceeded split (L7 exclusivity — the
+                        // overflow counter already ticked inside `try_acquire_retry`).
+                        let mut retry_budget_blocked = false;
+
+                        let (final_response, completing_upstream_response): (Response, bool) = loop {
+                            attempts += 1;
+
+                            // Run one attempt: pick → acquire → send → receive. All
+                            // counter side effects (except the per-call `cx_total`
+                            // connect tick that lives inside) are driven HERE from
+                            // the returned `AttemptResult`, so behavior is identical
+                            // to the inlined version.
+                            let attempt = run_attempt(
+                                &config,
+                                &cluster,
+                                &cluster_name,
+                                &req,
+                                &host_header,
+                                close,
+                            )
+                            .await;
+
+                            if let Some(endpoint) = attempt.endpoint {
+                                // 06.2 Task 6: capture the resolved upstream endpoint
+                                // for the access-log `%UPSTREAM_HOST%` token (last
+                                // attempt's endpoint wins). Skipped on pick()->None.
+                                upstream_host_for_log = Some(endpoint.to_string());
+                            }
+
+                            // L5: per-attempt upstream_rq_total — only for received
+                            // upstream responses (single source of truth; the
+                            // increment moved here from
+                            // router::construct_proxied_response).
+                            if attempt.upstream_response {
+                                cluster.upstream_rq_total().inc();
+                            }
+
+                            // 14.2 D4 / lock-in #9 (L8): response-receipt hook PER
+                            // ATTEMPT — each attempt feeds outlier detection. Records
+                            // against the picked endpoint for Response, connect-fail,
+                            // send-fail (Reset), and overflow paths (every path that
+                            // reached a pick()). Skipped on pick()->None (no endpoint
+                            // to attribute, lock-in #8). Inert without
+                            // outlier_detection.
+                            if let Some(endpoint) = attempt.endpoint {
+                                cluster.record_response(endpoint, attempt.response.status);
+                            }
+
+                            // Retry decision. `final_retriable` mirrors whether THIS
+                            // (final-so-far) attempt is retriable — used post-loop to
+                            // split retry_success vs limit_exceeded (L4).
+                            final_retriable = match attempt.outcome {
+                                Some(outcome) => retry_config.as_ref().is_some_and(|r| {
+                                    r.is_retriable(attempt.response.status, outcome)
+                                }),
+                                None => false,
+                            };
+                            if final_retriable && attempts <= max_retries {
+                                // 17 D4 (ADR-0047): the retry-budget gate. A retriable
+                                // outcome with attempts remaining ADDITIONALLY requires a
+                                // retry-budget slot (§5.5 — composes with, never replaces,
+                                // the phase-16 condition above).
+                                match cluster.try_acquire_retry() {
+                                    // No circuit_breakers configured: never gate, zero
+                                    // side-effects — byte-identical to phase-16.
+                                    envoy_cluster::BudgetAcquisition::Unlimited => {
+                                        // L4: a retry is firing. Count it, back off, loop.
+                                        cluster.upstream_rq_retry().inc();
+                                        if let Some(d) = RetryConfig::backoff(attempts) {
+                                            tokio::time::sleep(d).await;
+                                        }
+                                        continue;
                                     }
-                                    continue;
-                                }
-                                // Slot held: drive the retry exactly as phase-16, but
-                                // park the guard in the loop-scoped slot so it lives
-                                // across the back-off + the next attempt (constraint
-                                // iii). Reassigning drops the prior iteration's guard.
-                                envoy_cluster::BudgetAcquisition::Acquired(retry_guard) => {
-                                    cluster.upstream_rq_retry().inc();
-                                    if let Some(d) = RetryConfig::backoff(attempts) {
-                                        tokio::time::sleep(d).await;
+                                    // Slot held: drive the retry exactly as phase-16, but
+                                    // park the guard in the loop-scoped slot so it lives
+                                    // across the back-off + the next attempt (constraint
+                                    // iii). Reassigning drops the prior iteration's guard.
+                                    envoy_cluster::BudgetAcquisition::Acquired(retry_guard) => {
+                                        cluster.upstream_rq_retry().inc();
+                                        if let Some(d) = RetryConfig::backoff(attempts) {
+                                            tokio::time::sleep(d).await;
+                                        }
+                                        retry_guard_slot = Some(retry_guard);
+                                        continue;
                                     }
-                                    retry_guard_slot = Some(retry_guard);
-                                    continue;
-                                }
-                                // Budget exhausted: the would-be-retried response
-                                // surfaces downstream VERBATIM (L6). The overflow
-                                // counter already ticked inside `try_acquire_retry`
-                                // (§5.3); do NOT tick upstream_rq_retry (the retry
-                                // never happens) and mark the exit so the post-loop
-                                // success/limit-exceeded split is bypassed (L7).
-                                envoy_cluster::BudgetAcquisition::Rejected => {
-                                    retry_budget_blocked = true;
+                                    // Budget exhausted: the would-be-retried response
+                                    // surfaces downstream VERBATIM (L6). The overflow
+                                    // counter already ticked inside `try_acquire_retry`
+                                    // (§5.3); do NOT tick upstream_rq_retry (the retry
+                                    // never happens) and mark the exit so the post-loop
+                                    // success/limit-exceeded split is bypassed (L7).
+                                    envoy_cluster::BudgetAcquisition::Rejected => {
+                                        retry_budget_blocked = true;
+                                    }
                                 }
                             }
+                            break (attempt.response, attempt.upstream_response);
+                        };
+
+                        // Post-loop reconciliation.
+                        // L5: upstream_rq_5xx reflects the COMPLETING REAL upstream
+                        // response only (retried-away 5xx attempts do NOT tick it).
+                        // Gated on the completing attempt having received a real
+                        // upstream response — synth local replies (the no-healthy-
+                        // upstream synth-503, connect-failure synth-502, reset synth-
+                        // 502, and overflow synth-503 paths) do NOT tick it, preserving
+                        // the pre-phase-16 baseline (they never did). Single source of
+                        // truth (moved here from router::construct_proxied_response).
+                        if completing_upstream_response && final_response.status / 100 == 5 {
+                            cluster.upstream_rq_5xx().inc();
                         }
-                        break (attempt.response, attempt.upstream_response);
-                    };
-
-                    // Post-loop reconciliation.
-                    // L5: upstream_rq_5xx reflects the COMPLETING REAL upstream
-                    // response only (retried-away 5xx attempts do NOT tick it).
-                    // Gated on the completing attempt having received a real
-                    // upstream response — synth local replies (the no-healthy-
-                    // upstream synth-503, connect-failure synth-502, reset synth-
-                    // 502, and overflow synth-503 paths) do NOT tick it, preserving
-                    // the pre-phase-16 baseline (they never did). Single source of
-                    // truth (moved here from router::construct_proxied_response).
-                    if completing_upstream_response && final_response.status / 100 == 5 {
-                        cluster.upstream_rq_5xx().inc();
-                    }
-                    // L4: retry outcome counters. Only when at least one retry
-                    // fired (attempts > 1). If the final attempt was still
-                    // retriable (we ran out of budget) → limit_exceeded (L9 final
-                    // response is the last upstream verbatim); else → success.
-                    // 17 D4 (L7 exclusivity): a budget-blocked exit bypasses this
-                    // split entirely — the overflow counter already accounted for
-                    // it, and the blocked retry never fired (so attempts==1 here in
-                    // the L1 case; the guard is belt-and-braces for a >0-cap
-                    // exhaustion after one or more retries already fired).
-                    if attempts > 1 && !retry_budget_blocked {
-                        if final_retriable {
-                            cluster.upstream_rq_retry_limit_exceeded().inc();
-                        } else {
-                            cluster.upstream_rq_retry_success().inc();
+                        // L4: retry outcome counters. Only when at least one retry
+                        // fired (attempts > 1). If the final attempt was still
+                        // retriable (we ran out of budget) → limit_exceeded (L9 final
+                        // response is the last upstream verbatim); else → success.
+                        // 17 D4 (L7 exclusivity): a budget-blocked exit bypasses this
+                        // split entirely — the overflow counter already accounted for
+                        // it, and the blocked retry never fired (so attempts==1 here in
+                        // the L1 case; the guard is belt-and-braces for a >0-cap
+                        // exhaustion after one or more retries already fired).
+                        if attempts > 1 && !retry_budget_blocked {
+                            if final_retriable {
+                                cluster.upstream_rq_retry_limit_exceeded().inc();
+                            } else {
+                                cluster.upstream_rq_retry_success().inc();
+                            }
                         }
-                    }
-                    // Release the retry-budget slot now, before building the outgoing response,
-                    // so the slot (and its gauges) reflect completion rather than lingering
-                    // until this stack frame unwinds.
-                    drop(retry_guard_slot);
+                        // Release the retry-budget slot now, before building the outgoing response,
+                        // so the slot (and its gauges) reflect completion rather than lingering
+                        // until this stack frame unwinds.
+                        drop(retry_guard_slot);
 
-                    outgoing = final_response;
+                        outgoing = final_response;
 
-                    // L6: x-envoy-attempt-count on the downstream response, ONLY
-                    // when the vhost flag is set. Emitted on ALL outcomes that
-                    // reached the proxy arm (proxied responses and synths), value
-                    // = total attempts. (Envoy emits attempt-count on local replies
-                    // generated by the router too when the flag is on.)
-                    if include_attempt_count_in_response {
-                        outgoing.headers.push((
-                            crate::router::X_ENVOY_ATTEMPT_COUNT.to_string(),
-                            attempts.to_string(),
-                        ));
-                    }
+                        // L6: x-envoy-attempt-count on the downstream response, ONLY
+                        // when the vhost flag is set. Emitted on ALL outcomes that
+                        // reached the proxy arm (proxied responses and synths), value
+                        // = total attempts. (Envoy emits attempt-count on local replies
+                        // generated by the router too when the flag is on.)
+                        if include_attempt_count_in_response {
+                            outgoing.headers.push((
+                                crate::router::X_ENVOY_ATTEMPT_COUNT.to_string(),
+                                attempts.to_string(),
+                            ));
+                        }
+                    } // close the `else` (request-budget Acquired/Unlimited path)
                 }
             },
             RequestPath::SynthFromDecode(resp) => {
@@ -4526,5 +4576,270 @@ static_resources:
             "limit_exceeded 0 — L7 exclusivity: only overflow ticks on budget-blocked exits"
         );
         assert_eq!(cluster.upstream_rq_total().value(), 2, "rq_total 2");
+    }
+
+    // ── 17 Task 5: H1 request-budget gate tests (max_requests; ADR-0047) ─────
+
+    /// 17 Task 5: like `cluster_mgr_with_endpoint_max_retries` but emits a
+    /// `max_requests:` cap instead of `max_retries:`. Returns the shared
+    /// `StatsRegistry` alongside the manager so tests can read the
+    /// `cluster.<name>.upstream_rq_pending_overflow` counter (which has no
+    /// public ClusterHandle accessor — it lives inside the BudgetState). The
+    /// registry's `register_counter` is idempotent (returns the already-
+    /// registered Arc), so re-registering by name reflects live ticks.
+    ///
+    /// The `(ClusterManager, StatsRegistry)` return shape differs from the
+    /// `ClusterManager`-only shape of `cluster_mgr_with_endpoint_max_retries`
+    /// because `pending_overflow` has no public `ClusterHandle` accessor and
+    /// must be read through the registry. The H2 mirror (Task 7) should follow
+    /// the same `(manager, registry)` shape for the same reason.
+    async fn cluster_mgr_with_endpoint_max_requests(
+        name: &str,
+        port: u16,
+        max_requests: u32,
+    ) -> (
+        Arc<envoy_cluster::ClusterManager>,
+        Arc<envoy_stats::StatsRegistry>,
+    ) {
+        let yaml = format!(
+            r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: {name}
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_requests: {max_requests}
+            track_remaining: true
+      load_assignment:
+        cluster_name: {name}
+        endpoints:
+          - lb_endpoints:
+              - endpoint: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: {port} }} }} }}
+"#
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("cluster mgr"),
+        );
+        (mgr, registry)
+    }
+
+    /// Read `cluster.<name>.upstream_rq_pending_overflow` from a shared
+    /// registry (idempotent re-register returns the live Arc).
+    fn pending_overflow(registry: &envoy_stats::StatsRegistry, name: &str) -> u64 {
+        registry
+            .register_counter(&format!("cluster.{name}.upstream_rq_pending_overflow"))
+            .expect("counter")
+            .value()
+    }
+
+    /// 17 Task 5 (a) request-breaker overflow (L2/L3/L11): `max_requests: 0`
+    /// (always-open request breaker), NO retry_policy, vhost
+    /// include_attempt_count true. The FIRST downstream request is rejected at
+    /// the dispatch entry BEFORE any backend contact → downstream 503 with the
+    /// 81-byte overflow body + `x-envoy-overloaded: true` + `x-envoy-attempt-
+    /// count: 1`. Backend NEVER contacted (request counter == 0).
+    /// upstream_rq_pending_overflow=1, upstream_rq_5xx=1 (L3/ADR-0047 — the ONLY
+    /// synth path that ticks it), upstream_rq_total=0, upstream_rq_retry_
+    /// overflow=0 (L9a exclusivity).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_budget_overflow_max_requests_zero() {
+        // Backend that records every accepted connection; never expected to fire.
+        let (port, reqs) = spawn_fail_then_ok_upstream(200, 0).await;
+        let (cluster_mgr, registry) =
+            cluster_mgr_with_endpoint_max_requests("backend", port, 0).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry("/", "backend", None, true, cluster_mgr);
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 503 "),
+            "downstream must be the overflow synth-503: {s}"
+        );
+        assert!(
+            s.to_ascii_lowercase()
+                .contains("x-envoy-overloaded: true\r\n"),
+            "overflow synth carries x-envoy-overloaded: true: {s}"
+        );
+        assert!(
+            s.contains(
+                "upstream connect error or disconnect/reset before headers. reset reason: overflow"
+            ),
+            "81-byte overflow body: {s}"
+        );
+        assert!(
+            s.contains("x-envoy-attempt-count: 1\r\n"),
+            "x-envoy-attempt-count: 1 (L11): {s}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "backend NEVER contacted — the gate fires before pool contact"
+        );
+        assert_eq!(
+            pending_overflow(&registry, "backend"),
+            1,
+            "upstream_rq_pending_overflow 1"
+        );
+        assert_eq!(
+            cluster.upstream_rq_5xx().value(),
+            1,
+            "upstream_rq_5xx 1 — L3/ADR-0047 reconciliation (the only synth path that ticks it)"
+        );
+        assert_eq!(
+            cluster.upstream_rq_total().value(),
+            0,
+            "upstream_rq_total 0 — no attempt ever dispatched"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_overflow().value(),
+            0,
+            "upstream_rq_retry_overflow 0 — L9a exclusivity (retry budget never consulted)"
+        );
+    }
+
+    /// 17 Task 5 (b) gate ordering (L9a): `max_requests: 0` AND a retry_policy.
+    /// Same outcome as (a); the retry budget is never consulted (request breaker
+    /// fires FIRST). upstream_rq_retry_overflow=0, upstream_rq_retry=0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_budget_gate_ordering_before_retry() {
+        let (port, reqs) = spawn_fail_then_ok_upstream(200, 0).await;
+        let (cluster_mgr, registry) =
+            cluster_mgr_with_endpoint_max_requests("backend", port, 0).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry(
+            "/",
+            "backend",
+            Some(envoy_config::RetryPolicy {
+                retry_on: "5xx".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 503 ") && s.to_ascii_lowercase().contains("x-envoy-overloaded"),
+            "same overflow synth-503 as (a) — request breaker fires before the retry breaker: {s}"
+        );
+        assert!(
+            s.contains("x-envoy-attempt-count: 1\r\n"),
+            "x-envoy-attempt-count: 1: {s}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "backend NEVER contacted"
+        );
+        assert_eq!(
+            pending_overflow(&registry, "backend"),
+            1,
+            "pending_overflow 1"
+        );
+        assert_eq!(
+            cluster.upstream_rq_5xx().value(),
+            1,
+            "upstream_rq_5xx 1 — same overflow path as (a), request breaker fires first"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry_overflow().value(),
+            0,
+            "retry_overflow 0 — L9a: the retry budget is never consulted"
+        );
+        assert_eq!(
+            cluster.upstream_rq_retry().value(),
+            0,
+            "retry 0 — no retry ever fired"
+        );
+    }
+
+    /// 17 Task 5 (c) request-budget lifetime (L9b): `max_requests: 1` + retry_
+    /// policy + fail-once-then-succeed backend. The request counts ONCE against
+    /// the budget for its WHOLE lifetime (the guard spans the retry loop), so
+    /// the sequential retry does NOT overflow `max_requests: 1`. Final 200,
+    /// x-envoy-attempt-count: 2, upstream_rq_pending_overflow=0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_budget_lifetime_spans_retry() {
+        let (port, reqs) = spawn_fail_then_ok_upstream(503, 1).await;
+        let (cluster_mgr, registry) =
+            cluster_mgr_with_endpoint_max_requests("backend", port, 1).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry(
+            "/",
+            "backend",
+            Some(envoy_config::RetryPolicy {
+                retry_on: "5xx".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            true,
+            cluster_mgr,
+        );
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "final 200 — the sequential retry counts ONCE against max_requests:1 (L9b): {s}"
+        );
+        assert!(
+            s.contains("x-envoy-attempt-count: 2\r\n"),
+            "x-envoy-attempt-count: 2: {s}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "2 attempts — both fit under the single request-budget slot"
+        );
+        assert_eq!(
+            pending_overflow(&registry, "backend"),
+            0,
+            "pending_overflow 0 — one request = one slot for its whole lifetime"
+        );
+        assert_eq!(cluster.upstream_rq_total().value(), 2, "rq_total 2");
+    }
+
+    /// 17 Task 5 (d) regression (vi): NO circuit_breakers → no behavior change.
+    /// A plain proxied request works; the request-budget gate returns Unlimited
+    /// (zero side-effects). pending_overflow inert at 0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_budget_absent_unlimited_regression() {
+        let (port, reqs) = spawn_fail_then_ok_upstream(200, 0).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let cluster = cluster_mgr.get("backend").expect("backend present");
+        let cfg = hcm_config_with_retry("/", "backend", None, false, cluster_mgr);
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "plain proxied request unaffected by the absent request breaker: {s}"
+        );
+        assert!(
+            !s.to_ascii_lowercase().contains("x-envoy-overloaded"),
+            "no overflow synth on the unlimited path: {s}"
+        );
+        assert_eq!(
+            reqs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "backend contacted exactly once"
+        );
+        assert_eq!(cluster.upstream_rq_total().value(), 1, "rq_total 1");
     }
 }
