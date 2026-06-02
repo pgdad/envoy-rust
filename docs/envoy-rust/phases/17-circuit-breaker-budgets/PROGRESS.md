@@ -369,4 +369,60 @@ unconditional registration, the fixture-0025 expectation values 1/0/0 / 0/3 / 10
 
 ---
 
-_(Task 11 entry appended at the state-4 verification.)_
+## Task 11 — state-4 phase-done verification + STATE advance to state-5-next
+
+**§7.5 (a)–(e) ALL GREEN.** Run locally on 2026-06-02 against HEAD `8bef1c109` (Tasks 1–10 complete; working tree
+clean apart from the standing untracked operator files). Per `superpowers:verification-before-completion` every
+gate below was run fresh in this session and its output quoted.
+
+**(a) + (b) — fixture 0025 green AND all 24 pre-existing fixtures green simultaneously.** One exclusive
+`cargo test -p differential --no-fail-fast` run (helpers pre-built first per `project_flaky_access_log_fixture_0012`):
+all **25 Docker-gated fixture wrappers** `ok. 1 passed; 0 failed` each (0001-tcp-echo … 0025-upstream-circuit-breaker-retry-budget;
+fixture 0025 in 3.06s) + the differential lib `ok. 112 passed; 0 failed; 1 ignored`. The 25 fixtures then passed
+AGAIN inside the gate-(e) `cargo test --workspace` run (lines 2–26 of its output — a second full bilateral pass in
+the same session). **Local-run process note:** the first differential attempt of the session failed on fixture 0019's
+30s helper-readiness window — self-inflicted cargo-target-lock contention (the suite ran in background while
+foreground builds held the lock), NOT a regression; the exclusive re-run was fully green.
+
+**(c) — h2spec ≥95%:** locally skipped via the 05.2 SPEC §3 D7 graceful-skip (`h2spec not found` on PATH → the
+runner eprintln!-skips). CI is the gate: the run on HEAD `8bef1c109` (run `26798019441`, `completed / success`)
+includes the h2spec job — covered.
+
+**(d) — fuzz clean:** `cargo +nightly fuzz run parse_bootstrap -- -runs=200000 -max_total_time=60` →
+`#200000 DONE cov: 14437 ft: 40510 corp: 3830/2403Kb` / `Done 200000 runs in 15 second(s)` — **0 crashes**
+(coverage 14437, +176 vs the phase-16 baseline 14261; the corpus includes the Task-10-extended
+`cluster_circuit_breakers.yaml` budget-field seed).
+
+**(e) — the 5 stable-toolchain gates (all clean):**
+- `cargo build --workspace --all-targets` → `Finished dev profile` (exit 0).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished` (exit 0, zero warnings —
+  zero clippy lints reached state-4, validating the per-task discipline per `project_state3_arc_skips_clippy`).
+- `cargo fmt --all -- --check` → exit 0.
+- `cargo test --workspace` → **84 result lines, ~1010 passed; 0 failed; 2 ignored** (+39 tests vs the phase-16
+  971/0/2 baseline; incl. envoy-config 302, envoy-cluster 85, envoy-http1 99, envoy-http2 69/1-ignored, the
+  in-process budget backstop, and all 25 Docker fixtures). **Flake note:** attempt 1 failed on the PRE-EXISTING
+  phase-13-era harness unit test `differential::backend::tests::http1_echo_backend_drop_terminates_child`
+  (a 200ms drop-to-port-release timing window, flaky under full-workspace load; passed in the exclusive
+  differential run, in CI, and on attempt 2) — recorded as a carryforward candidate for the state-5 inventory.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (exit 0).
+
+**Standalone-crate builds (`project_isolated_crate_build_blindspot` / SPEC §6.7):**
+- `cargo build -p envoy-config` → Finished (exit 0).
+- `cargo build -p envoy-cluster` → Finished (exit 0).
+- `cargo build -p envoy-http1` → Finished (exit 0).
+- `cargo build -p envoy-http2` → Finished (exit 0).
+
+**CI evidence (per-push, the 05.3→16 discipline):** every phase-17 push's CI run quoted from
+`gh run list`: state-2 PLAN-write `9774231e5` → `26787629076` success; Task 1 `5a1bc444f` → `26789669628` success;
+Task 2 `579bc377d` → `26790690335` success; Task 3 `afb8324af` → `26791679865` success; Task 4 `64af2a9ca` →
+`26792443004` success; Task 5 `b75cbef92` → `26793157607` success; Task 6 `edeac16fe` → `26793833580` success;
+Task 7 `688ba4609` → `26794375070` success; Task 8 `02c6575d1` → `26795815792` success; **Task 9 `9153c48cf` →
+`26797777933` FAILURE — fixture 0022 (`upstream_outlier_detection`) readiness flake** (`envoy-rust never became
+accept-ready ... not accept-ready within 10s` — the documented 0011/0012 loaded-CI-runner readiness-flake family,
+which now also spans 0022; NOT a phase-17 surface [0022 configures no budgets]; the fuzz job in the same run
+passed); **Task 10 `8bef1c109` → `26798019441` success** (the same code, fixture 0022 green again — flake
+confirmed, not a regression). **The CI anchor for this state-4 verification is run `26798019441`
+(HEAD `8bef1c109`, `completed / success`).**
+
+**STATE advance:** `docs/envoy-rust/STATE.md` advanced to phase-17 state-4-complete / state-5-next (next skill
+`superpowers:requesting-code-review` over the phase-17 commit range `9774231e5..HEAD`).
