@@ -2162,7 +2162,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         && (fixture_name == "0019-upstream-active-health-check"
             || fixture_name == "0020-upstream-connection-pooling-and-per-class-counters"
             || fixture_name == "0022-upstream-outlier-detection-consecutive-5xx"
-            || fixture_name == "0024-upstream-retry-on-5xx");
+            || fixture_name == "0024-upstream-retry-on-5xx"
+            || fixture_name == "0025-upstream-circuit-breaker-retry-budget");
     let _backend = if needs_backend && !needs_health_aware_backend {
         Some(
             backend::TcpProxyBackend::spawn()
@@ -2204,13 +2205,23 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     None
                 };
             // 16 Task 7: fixture 0024 forwards a retry-script + per-path pair.
+            // 17 Task 8: fixture 0025 reuses the same backend with a budget-keyed
+            // pair — `/budget-blocked` always-503 (stateless, the max_retries:0
+            // budget-blocked retry path) + `/budget-allowed=fail:1` (stateful
+            // cyclic window, the within-cap retry-success control). `/rq-blocked`
+            // needs no backend mapping — its request-budget gate rejects before
+            // any upstream connect, so the backend is never contacted there.
             let retry_script = if fixture_name == "0024-upstream-retry-on-5xx" {
                 Some("/retry-success=fail:1".to_string())
+            } else if fixture_name == "0025-upstream-circuit-breaker-retry-budget" {
+                Some("/budget-allowed=fail:1".to_string())
             } else {
                 None
             };
             let per_path = if fixture_name == "0024-upstream-retry-on-5xx" {
                 Some("/retry-exhausted=503".to_string())
+            } else if fixture_name == "0025-upstream-circuit-breaker-retry-budget" {
+                Some("/budget-blocked=503".to_string())
             } else {
                 per_path
             };

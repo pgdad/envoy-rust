@@ -1,0 +1,99 @@
+# Phase 17 fixture-0025 expectations: circuit-breaker retry/request budgets
+# (ADR-0046 SPEC / ADR-0047 PLAN). Three sequential GETs over ONE H1 keep-alive
+# conn exercise the three budget outcomes:
+#
+#   probe 1  GET /budget-blocked (cluster budget_zero, max_retries:0) : attempt 1
+#            -> backend 503 ("service unavailable\n", 20 bytes). The retry the
+#            `retry_on 5xx num_retries:1` policy would dispatch is BLOCKED by the
+#            max_retries:0 budget; the attempt-1 503 is returned VERBATIM (L6),
+#            x-envoy-attempt-count: 1 (no second attempt was made, L11),
+#            `upstream_rq_retry_overflow` ticks (L1). It is a real upstream 503,
+#            so NO `x-envoy-overloaded` (L11 — distinguishes the budget-blocked
+#            retry from the request-budget synth-503 of probe 3).
+#   probe 2  GET /budget-allowed (cluster budget_default, default budgets 3/1024)
+#            : attempt 1 -> backend 503 ("fail\n"); the retry budget admits the
+#            retry and attempt 2 -> backend 200 ("ok\n"). Final 200, body "ok\n"
+#            (L10 — retry proceeded), x-envoy-attempt-count: 2,
+#            `upstream_rq_retry_success` ticks.
+#   probe 3  GET /rq-blocked (cluster rq_zero, max_requests:0) : the
+#            request-budget gate rejects the request BEFORE any upstream connect
+#            -> byte-exact "...reset reason: overflow" local-reply 503 (L2) +
+#            `x-envoy-overloaded` (L11/M16-3), x-envoy-attempt-count: 1,
+#            `upstream_rq_pending_overflow` ticks; `upstream_rq_5xx` ALSO ticks
+#            (L3 / ADR-0047 — the synth-overflow 503 is class-counted). Backend
+#            never contacted.
+#
+# Driver `http1_keep_alive` (per fixtures 0023/0024). ONE downstream keep-alive
+# conn drives the three GETs; 200ms settle past the last request; bilateral admin
+# stat scrape on the cumulative per-cluster + HCM-downstream counters/gauges.
+#
+# Gauge semantics (L4 / ADR-0047 re-anchoring): the `circuit_breakers.default.
+# rq_retry_open` / `rq_open` gauges are MOMENTARY — they reflect breaker state
+# only while a request is in-flight at the gate, so every post-settle sequential
+# scrape observes 0. The `remaining_retries` / `remaining_rq` gauges (emitted
+# only when `track_remaining: true`) are cap - active = cap at rest (no in-flight
+# request): budget_zero -> remaining_retries 0 (cap 0); budget_default ->
+# remaining_retries 3, remaining_rq 1024 (L5 defaults).
+#
+# NOT asserted (intentional — see README):
+#   - cluster.rq_zero.upstream_cx_total : Envoy prefetches a pool connection
+#     (1) even though the request-budget gate rejects before dispatch;
+#     envoy-rust never connects (0). The L3/ADR-0047 known divergence — left
+#     unasserted rather than loosened.
+#   - cluster.budget_zero.upstream_rq_5xx : left unasserted to keep probe-1's
+#     set focused on the L7 retry-counter exclusivity (retry_overflow vs the
+#     other retry counters), not on per-class accounting of the verbatim 503.
+#   - remaining_cx / remaining_pending / remaining_cx_pools, circuit_breakers.
+#     high.*, circuit_breakers.default.{cx_open,cx_pool_open,rq_pending_open}:
+#     Envoy-only at this scope, ignored by the named-stat scrape (no set-diff).
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /budget-blocked
+      host: budget_zero
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "service unavailable\n" }
+      require_header_absent: x-envoy-overloaded
+      require_header_value: { name: x-envoy-attempt-count, value: "1" }
+    - method: GET
+      path: /budget-allowed
+      host: budget_default
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      require_header_value: { name: x-envoy-attempt-count, value: "2" }
+    - method: GET
+      path: /rq-blocked
+      host: rq_zero
+      expected_status: 503
+      expected_body: { kind: byte_exact, body: "upstream connect error or disconnect/reset before headers. reset reason: overflow" }
+      require_header_present: x-envoy-overloaded
+      require_header_value: { name: x-envoy-attempt-count, value: "1" }
+  settle_ms: 200
+  expected_stats:
+    # probe-1 cluster (budget_zero) — L1/L7 counter exclusivity + L4/L8 gauges:
+    - { name: cluster.budget_zero.upstream_rq_retry_overflow,                 value: 1 }
+    - { name: cluster.budget_zero.upstream_rq_retry,                          value: 0 }
+    - { name: cluster.budget_zero.upstream_rq_retry_success,                  value: 0 }
+    - { name: cluster.budget_zero.upstream_rq_retry_limit_exceeded,           value: 0 }
+    - { name: cluster.budget_zero.upstream_rq_total,                          value: 1 }
+    - { name: cluster.budget_zero.circuit_breakers.default.rq_retry_open,     value: 0 }
+    - { name: cluster.budget_zero.circuit_breakers.default.remaining_retries, value: 0 }
+    # probe-2 cluster (budget_default) — L10 control + L5 defaults:
+    - { name: cluster.budget_default.upstream_rq_retry,                          value: 1 }
+    - { name: cluster.budget_default.upstream_rq_retry_success,                  value: 1 }
+    - { name: cluster.budget_default.upstream_rq_retry_overflow,                 value: 0 }
+    - { name: cluster.budget_default.upstream_rq_total,                          value: 2 }
+    - { name: cluster.budget_default.circuit_breakers.default.remaining_retries, value: 3 }
+    - { name: cluster.budget_default.circuit_breakers.default.remaining_rq,      value: 1024 }
+    - { name: cluster.budget_default.circuit_breakers.default.rq_retry_open,     value: 0 }
+    # probe-3 cluster (rq_zero) — L2/L3/L9a:
+    - { name: cluster.rq_zero.upstream_rq_pending_overflow,            value: 1 }
+    - { name: cluster.rq_zero.upstream_rq_5xx,                         value: 1 }
+    - { name: cluster.rq_zero.upstream_rq_total,                       value: 0 }
+    - { name: cluster.rq_zero.upstream_rq_retry_overflow,              value: 0 }
+    - { name: cluster.rq_zero.circuit_breakers.default.rq_open,        value: 0 }
+    # HCM downstream (cumulative over 3 probes):
+    - { name: http.ingress_http.downstream_rq_2xx,   value: 1 }
+    - { name: http.ingress_http.downstream_rq_5xx,   value: 2 }
+    - { name: http.ingress_http.downstream_rq_total, value: 3 }
