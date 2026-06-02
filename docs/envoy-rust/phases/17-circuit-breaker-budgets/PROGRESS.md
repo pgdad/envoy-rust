@@ -96,4 +96,37 @@ Send+Sync (the highest-risk Tasks-4–7 integration concern).
 
 ---
 
-_(Tasks 3–11 entries appended by the executor as each completes.)_
+## Task 3 — `Cluster` budget integration + conditional stat registration (commit `b714b43e8`)
+
+**Landed.** `crates/envoy-cluster/src/cluster.rs` (+397): `Cluster` gains `budget: Option<Arc<BudgetState>>` + the
+**unconditional** `upstream_rq_retry_overflow` counter handle (registered for EVERY cluster in `from_bootstrap`
+next to the phase-16 retry counters, inert at 0 — the L12/fixture-0011-safe posture; idempotent-Arc-shared with
+`BudgetState`'s own registration when a budget exists). Budget resolution is **conditional on
+`circuit_breakers.is_some()`** (the phase-15 conditional-registration discipline — clusters without
+`circuit_breakers` register ZERO `circuit_breakers.default.*` gauges, keeping the 24 existing fixtures' stat
+surfaces untouched): `thresholds.first()` → `max_retries.unwrap_or(3)` / `max_requests.unwrap_or(1024)` /
+`track_remaining.unwrap_or(false)` (L5 defaults). `crates/envoy-cluster/src/budget.rs` (+41): new
+`#[must_use] #[derive(Debug)] pub enum BudgetAcquisition<G> { Unlimited, Acquired(G), Rejected }` (the
+clippy-friendly three-state shape — no `Option<Option<_>>` at the H1/H2 call sites) + hand-rolled `Debug` impls on
+both guards (the `PoolGuard` precedent). `Cluster::try_acquire_retry()/try_acquire_request()` +
+**`ClusterHandle` delegates** (mirroring the `upstream_rq_retry()` delegate pattern — the H1/H2 HCMs hold
+`ClusterHandle` from `cluster_mgr.get()`, so Tasks 4–7 call the gates directly on what they already hold). 5 TDD
+integration tests (a: no-CB → Unlimited + zero conditional gauges via full snapshot scan + unconditional overflow
+counter at 0; b: `max_retries: 0` → Rejected + default-1024 request budget; c: `track_remaining` conditionality;
+d: empty threshold → L5 defaults 3/1024 proven by exhaustion; e: the shared-Arc idempotent-registration contract).
+
+**Verification (quoted):**
+- `cargo test -p envoy-cluster` → `test result: ok. 85 passed; 0 failed` (80 + 5 new).
+- `cargo build --workspace --all-targets` → clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → 3 files changed (+439/−1).
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer verified the conditional-registration
+regression-safety property via the snapshot-scan test, the L5 defaults, the Unlimited zero-side-effect path, the
+non-duplicated overflow tick, and that `ClusterManager::get` → `ClusterHandle` makes the API reachable for Tasks
+4–7). Code-quality **Approved** (zero Critical / ONE Important — missing `#[must_use]` on `BudgetAcquisition`,
+the guard-lifetime hazard class for Tasks 4–7 — / 2 Minors [guard `Debug` impls; a test guard-drop-in-`matches!`
+example] — **all 3 fixed in-task** [amended pre-push]).
+
+---
+
+_(Tasks 4–11 entries appended by the executor as each completes.)_
