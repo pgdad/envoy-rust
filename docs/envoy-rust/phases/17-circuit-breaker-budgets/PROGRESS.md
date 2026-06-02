@@ -341,4 +341,32 @@ strings).
 
 ---
 
-_(Tasks 10–11 entries appended by the executor as each completes.)_
+## Task 10 — fuzz seed budget fields + BEHAVIOR_CONTRACT budget rows (commit `fd3d9b147`)
+
+**Landed.** Two files (+20/−1): **(1)** `crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_circuit_breakers.yaml`
+extended IN PLACE (+3: `max_requests: 0` / `max_retries: 0` / `track_remaining: true` on the existing threshold;
+corpus stays 28 files — no `.gitignore`/SUCCESS-array churn, the PLAN-locked no-new-seed-file call). **(2)**
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md`: the new **"17 entries (circuit-breaker budgets)"** Stat-name-mapping
+subsection — 5 rows (`upstream_rq_retry_overflow` [counter, value-exact, unconditional, fixture 1/0/0];
+`circuit_breakers.default.{rq_retry_open, rq_open}` [gauges, value-exact-at-0 bilaterally, ADR-0047 L4 momentary
+semantic, non-zero edge in-process-only]; `.{remaining_retries, remaining_rq}` [gauges, `track_remaining`-conditional
+per L8, fixture 0/3 + 1024]) + 3 paragraphs (the **L3 overflow co-firing** note [the ONLY synth path that ticks
+`upstream_rq_5xx`; narrowly supersedes the phase-16 sentence per ADR-0047; `upstream_cx_total` known prefetch
+divergence], the **§5.4 registration-seam** note [pools own `cx_open`; cluster owns the budget gauges; the
+idempotently-shared `upstream_rq_pending_overflow` handle], the **L12 Envoy-only enumeration**) + the
+`x-envoy-attempt-count` Header-allow-list row extended in place with the L11/M16-3-closure finding. Pure additions —
+the only `-/+` pair in the contract diff is the allowed in-place row extension.
+
+**Verification (quoted):**
+- Corpus gate `fuzz_corpus_seeds_parse_or_reject_cleanly` → `ok. 1 passed`.
+- Fuzz smoke `cargo +nightly fuzz run parse_bootstrap -- -runs=100000` → `Done 100000 runs in 8 second(s)` — 0 crashes.
+- `cargo test -p envoy-config` → 302 passed; `cargo build --workspace` → clean; clippy/fmt → clean.
+- `git show --stat HEAD` → 2 files; `crates/envoy-config/fuzz/Cargo.lock` confirmed still untracked.
+
+**Two-stage review (combined pass for this mechanical/docs task):** **✅ compliant** + **Approved** (zero findings).
+The reviewer cross-checked every contract claim against the implementation (`budget.rs` tick sites, `cluster.rs`
+unconditional registration, the fixture-0025 expectation values 1/0/0 / 0/3 / 1024) — all technically exact.
+
+---
+
+_(Task 11 entry appended at the state-4 verification.)_
