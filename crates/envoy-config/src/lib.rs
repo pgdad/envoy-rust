@@ -526,3 +526,55 @@ pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
     bootstrap::validate(&mut bootstrap)?;
     Ok(bootstrap)
 }
+
+/// 18 D3: read + parse + merge the CDS file (ADR-0048/ADR-0049). Called by
+/// envoy-bin AFTER `parse_bootstrap` and BEFORE any consumer iterates clusters.
+/// No-op when `dynamic_resources.cds_config` is unconfigured. ALL failures are
+/// fatal (the L4 reconciliation — envoy-rust never warn-and-serves a broken
+/// CDS file; recorded divergence vs Envoy, BEHAVIOR_CONTRACT).
+///
+/// Deliberately NOT called by `parse_bootstrap`: `parse_bootstrap` is the fuzz
+/// target and must stay pure (no file I/O).
+pub fn load_dynamic_resources(bootstrap: &mut Bootstrap) -> Result<(), ConfigError> {
+    // Clone the path early and drop the `&bootstrap` borrow before the later
+    // `&mut bootstrap` mutation.
+    let Some(path) = bootstrap
+        .dynamic_resources
+        .as_ref()
+        .and_then(|dr| dr.cds_config.as_ref())
+        .map(|cs| cs.path_config_source.path.clone())
+    else {
+        return Ok(());
+    };
+    let contents = std::fs::read_to_string(&path).map_err(|source| ConfigError::CdsFileError {
+        path: path.clone(),
+        source,
+    })?;
+    let parsed = cds::parse_cds_file(&path, &contents)?;
+    // L9 (ADR-0049): static wins on name collision — the dynamic duplicate is
+    // skipped with a warning, mirroring Envoy's "skipped N unmodified cluster(s)".
+    let mut dynamic = Vec::with_capacity(parsed.len());
+    for cluster in parsed {
+        if bootstrap
+            .static_resources
+            .clusters
+            .iter()
+            .any(|c| c.name == cluster.name)
+        {
+            tracing::warn!(cluster = %cluster.name, "CDS cluster collides with a static cluster; static wins (skipped)");
+            continue;
+        }
+        // Intra-file duplicates: first wins, warn, skip.
+        if dynamic.iter().any(|c: &Cluster| c.name == cluster.name) {
+            tracing::warn!(cluster = %cluster.name, "duplicate cluster in CDS file; first wins (skipped)");
+            continue;
+        }
+        dynamic.push(cluster);
+    }
+    bootstrap.dynamic_clusters = Some(dynamic);
+    // Post-merge re-validation: cds_configured_but_unloaded() is now false, so
+    // the deferred cluster-reference checks (UnknownCluster + the H2-from-H1
+    // gate) re-run with full enforcement against the effective cluster list.
+    bootstrap::validate(bootstrap)?;
+    Ok(())
+}

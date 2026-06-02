@@ -48,7 +48,11 @@ fn install_tracing() {
 async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let yaml = std::fs::read_to_string(&config_path)
         .with_context(|| format!("reading config at {}", config_path.display()))?;
-    let bootstrap = std::sync::Arc::new(envoy_config::parse_bootstrap(&yaml)?);
+    let mut bootstrap = envoy_config::parse_bootstrap(&yaml)?;
+    // 18 D3: read + parse + merge the CDS file (if configured) BEFORE any
+    // consumer iterates clusters. All failures are fatal (ADR-0049 L4).
+    envoy_config::load_dynamic_resources(&mut bootstrap)?;
+    let bootstrap = std::sync::Arc::new(bootstrap);
 
     // Phase 08.1 D13a: capture the process-start `Instant` once at startup
     // so the admin `/server_info` renderer (Task 6) can compute uptime as
@@ -188,7 +192,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         String,
         std::sync::Arc<envoy_tls::UpstreamTls>,
     > = std::collections::HashMap::new();
-    for cluster in &bootstrap.static_resources.clusters {
+    for cluster in bootstrap.all_clusters() {
         let Some(socket) = cluster.transport_socket.as_ref() else {
             continue;
         };

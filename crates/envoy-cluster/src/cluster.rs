@@ -723,7 +723,7 @@ pub async fn from_bootstrap(
     registry: Arc<envoy_stats::StatsRegistry>,
 ) -> Result<ClusterManager, ClusterError> {
     let mut clusters: HashMap<String, Arc<Cluster>> = HashMap::new();
-    for cfg in &bootstrap.static_resources.clusters {
+    for cfg in bootstrap.all_clusters() {
         // envoy-config enforces cluster_type ∈ {Static, StrictDns} (post-05.1),
         // lb_policy == RoundRobin, load_assignment.cluster_name == cfg.name,
         // and total endpoints ≥ 1 at parse time. We don't re-check those here;

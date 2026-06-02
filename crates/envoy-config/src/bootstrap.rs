@@ -1960,6 +1960,28 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
     // without conflicting with the listener borrow.
     let defer_cluster_refs = bootstrap.cds_configured_but_unloaded();
 
+    // 18 D3: snapshot the EFFECTIVE cluster list (static + dynamic) BEFORE the
+    // `&mut bootstrap.static_resources.listeners` loop below — the reference
+    // checks (UnknownCluster + the H2-from-H1 gate) must resolve against the
+    // merged list so that, post-CDS-load re-validation, a route to a legitimately
+    // CDS-loaded cluster does not wrongly fail. Collected as `&Cluster` refs
+    // (NOT cloned) — see the borrow note below.
+    // When `dynamic_clusters` is None this is exactly `static_resources.clusters`
+    // (existing behavior unchanged).
+    //
+    // We borrow the two cluster fields DIRECTLY (not via `all_clusters(&self)`):
+    // `static_resources.clusters` and `dynamic_clusters` are fields disjoint from
+    // `static_resources.listeners`, so the borrow checker permits this immutable
+    // snapshot to coexist with the `&mut listeners` loop below (a whole-`&self`
+    // borrow via `all_clusters()` would NOT — it would conflict). Holds `&Cluster`
+    // refs, so no `Cluster: Clone` requirement.
+    let effective_clusters: Vec<&Cluster> = bootstrap
+        .static_resources
+        .clusters
+        .iter()
+        .chain(bootstrap.dynamic_clusters.iter().flatten())
+        .collect();
+
     // Per-cluster invariants. Each static cluster runs the same gauntlet as
     // dynamically-loaded (CDS) clusters — `validate_cluster` is the single
     // source of truth shared by `validate()` and `cds::parse_cds_file`
@@ -2044,11 +2066,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                         // configured-but-unloaded; load_dynamic_resources
                         // re-enforces post-merge.
                         if !defer_cluster_refs
-                            && !bootstrap
-                                .static_resources
-                                .clusters
-                                .iter()
-                                .any(|c| c.name == cluster_name)
+                            && !effective_clusters.iter().any(|c| c.name == cluster_name)
                         {
                             return Err(crate::ConfigError::UnknownCluster(cluster_name));
                         }
@@ -2063,7 +2081,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                         };
                         validate_hcm(
                             hcm,
-                            &bootstrap.static_resources.clusters,
+                            &effective_clusters,
                             chain_has_tls,
                             &listener.name,
                             defer_cluster_refs,
@@ -2238,7 +2256,7 @@ pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigErr
 /// uses it to name the offending listener in `ConfigError::Http2ClusterFromHttp1Listener`.
 fn validate_hcm(
     hcm: &mut HttpConnectionManagerConfig,
-    clusters: &[Cluster],
+    clusters: &[&Cluster],
     chain_has_tls: bool,
     listener_name: &str,
     defer_cluster_refs: bool,
@@ -6340,6 +6358,212 @@ static_resources:
 "#;
         let err = crate::parse_bootstrap(yaml_no_dr).unwrap_err();
         assert!(matches!(err, crate::ConfigError::UnknownCluster(ref c) if c == "dynamic_backend"));
+    }
+
+    // --- 18 D3 (ADR-0049): load_dynamic_resources — read + parse + merge + re-validate ---
+
+    /// The Task-2 minimal CDS file shape: one `dynamic_backend` cluster with a
+    /// 127.0.0.1:8124 endpoint.
+    const MINIMAL_CDS: &str = r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+  name: dynamic_backend
+  type: STRICT_DNS
+  lb_policy: ROUND_ROBIN
+  dns_lookup_family: V4_ONLY
+  load_assignment:
+    cluster_name: dynamic_backend
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address: { address: 127.0.0.1, port_value: 8124 }
+"#;
+
+    /// Build a complete bootstrap YAML: the fixture-0026 HCM listener with a
+    /// route to the named cluster, NO static clusters, and a dynamic_resources
+    /// block pointing at `cds_path`.
+    fn bootstrap_yaml_with_cds_route_to(cds_path: &str, cluster: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: rc
+                  validate_clusters: false
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: {cluster} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+dynamic_resources:
+  cds_config:
+    path_config_source: {{ path: {cds_path} }}
+"#
+        )
+    }
+
+    /// Route to `dynamic_backend` (the CDS-supplied cluster) — the happy-path
+    /// helper. The route genuinely references the CDS-loaded cluster so the
+    /// post-merge re-validation exercises deferred-reference resolution.
+    fn bootstrap_yaml_with_cds_route(cds_path: &str) -> String {
+        bootstrap_yaml_with_cds_route_to(cds_path, "dynamic_backend")
+    }
+
+    /// Build a bootstrap that statically defines `cluster_name` (with the given
+    /// port), a route to it, AND a dynamic_resources block at `cds_path`.
+    fn bootstrap_yaml_with_static_and_cds(cluster_name: &str, port: u16, cds_path: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+static_resources:
+  clusters:
+    - name: {cluster_name}
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: {cluster_name}
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: {{ address: 127.0.0.1, port_value: {port} }}
+  listeners:
+    - name: hcm_listener
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: rc
+                  validate_clusters: false
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: {cluster_name} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+dynamic_resources:
+  cds_config:
+    path_config_source: {{ path: {cds_path} }}
+"#
+        )
+    }
+
+    /// Extract the single endpoint port_value of a cluster (test convenience).
+    fn single_endpoint_port(cluster: &Cluster) -> u16 {
+        cluster.load_assignment.endpoints[0].lb_endpoints[0]
+            .endpoint
+            .address
+            .socket_address
+            .port_value
+    }
+
+    #[test]
+    fn load_dynamic_resources_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        std::fs::write(&cds_path, MINIMAL_CDS).unwrap();
+        let yaml = bootstrap_yaml_with_cds_route(cds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        assert!(b.dynamic_clusters.is_none());
+        crate::load_dynamic_resources(&mut b).unwrap();
+        assert_eq!(b.dynamic_clusters.as_ref().unwrap().len(), 1);
+        assert_eq!(b.all_clusters().count(), 1);
+    }
+
+    #[test]
+    fn dynamic_cluster_resolves_deferred_route_reference() {
+        // Closes the Task-1 review finding: the route to `dynamic_backend` is
+        // deferred at parse_bootstrap (no static cluster), and RESOLVES against
+        // the CDS-loaded cluster at load_dynamic_resources (no UnknownCluster).
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        std::fs::write(&cds_path, MINIMAL_CDS).unwrap();
+        let yaml = bootstrap_yaml_with_cds_route(cds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        // The route references dynamic_backend, supplied only by the CDS file.
+        crate::load_dynamic_resources(&mut b).expect("deferred ref must resolve post-load");
+        assert!(b.all_clusters().any(|c| c.name == "dynamic_backend"));
+    }
+
+    #[test]
+    fn load_is_noop_without_dynamic_resources() {
+        let yaml = r#"
+node: { id: t, cluster: c }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+"#;
+        let mut b = crate::parse_bootstrap(yaml).unwrap();
+        crate::load_dynamic_resources(&mut b).unwrap();
+        assert!(b.dynamic_clusters.is_none());
+    }
+
+    #[test]
+    fn missing_cds_file_is_fatal() {
+        let yaml = bootstrap_yaml_with_cds_route("/nonexistent/cds.yaml");
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(matches!(err, crate::ConfigError::CdsFileError { .. }));
+    }
+
+    #[test]
+    fn malformed_cds_file_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        std::fs::write(&cds_path, "resources: [unclosed").unwrap();
+        let yaml = bootstrap_yaml_with_cds_route(cds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        assert!(crate::load_dynamic_resources(&mut b).is_err());
+    }
+
+    #[test]
+    fn static_dynamic_collision_static_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        std::fs::write(&cds_path, MINIMAL_CDS).unwrap(); // dynamic_backend → 8124
+        let yaml =
+            bootstrap_yaml_with_static_and_cds("dynamic_backend", 8123, cds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        crate::load_dynamic_resources(&mut b).unwrap();
+        // The dynamic duplicate is SKIPPED (no error); static wins.
+        assert_eq!(b.dynamic_clusters.as_ref().unwrap().len(), 0);
+        assert_eq!(b.all_clusters().count(), 1);
+        assert_eq!(single_endpoint_port(b.all_clusters().next().unwrap()), 8123);
+    }
+
+    #[test]
+    fn unresolved_route_reference_fatal_after_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        std::fs::write(&cds_path, MINIMAL_CDS).unwrap(); // defines dynamic_backend only
+        let yaml = bootstrap_yaml_with_cds_route_to(cds_path.to_str().unwrap(), "no_such_cluster");
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(matches!(err, crate::ConfigError::UnknownCluster(ref c) if c == "no_such_cluster"));
     }
 
     #[test]

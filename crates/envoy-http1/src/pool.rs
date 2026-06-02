@@ -448,7 +448,7 @@ impl H1PoolManager {
     ) -> Result<Arc<Self>, envoy_stats::StatsError> {
         let mut pools: HashMap<String, Arc<H1Pool>> = HashMap::new();
         let mut sweepers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for cfg in &bootstrap.static_resources.clusters {
+        for cfg in bootstrap.all_clusters() {
             // 13.2 A-M4 closure: improved `.expect` message naming the
             // single-bootstrap-per-process invariant explicitly.
             let handle = cluster_mgr.get(&cfg.name).expect(

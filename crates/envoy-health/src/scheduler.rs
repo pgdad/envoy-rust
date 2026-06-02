@@ -44,7 +44,7 @@ impl Scheduler {
         cancel: CancellationToken,
     ) -> Result<Self, HealthError> {
         let mut handles = Vec::new();
-        for cfg in &bootstrap.static_resources.clusters {
+        for cfg in bootstrap.all_clusters() {
             // 12.1 D2 validator guarantees 0 or 1 HC entry, HTTP-only.
             let hc = match cfg.health_checks.first() {
                 Some(h) => h,

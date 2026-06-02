@@ -597,7 +597,7 @@ impl H2PoolManager {
     ) -> Result<Arc<Self>, envoy_stats::StatsError> {
         let mut pools: HashMap<String, Arc<H2Pool>> = HashMap::new();
         let mut sweepers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        for cfg in &bootstrap.static_resources.clusters {
+        for cfg in bootstrap.all_clusters() {
             let handle = cluster_mgr.get(&cfg.name).expect(
                 "H2PoolManager::for_bootstrap requires cluster_mgr built from the same \
                  bootstrap (single-bootstrap-per-process invariant)",
