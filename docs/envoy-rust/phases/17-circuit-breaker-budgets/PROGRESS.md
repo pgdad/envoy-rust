@@ -129,4 +129,40 @@ example] — **all 3 fixed in-task** [amended pre-push]).
 
 ---
 
-_(Tasks 4–11 entries appended by the executor as each completes.)_
+## Task 4 — H1 retry-budget gate (`max_retries`) (commit `03d3b0ba7`)
+
+**Landed.** `crates/envoy-http1/src/hcm.rs` (+299/−6, single file): the retry-budget gate composed as one more
+CONJUNCT inside the phase-16 retry decision (`final_retriable && attempts <= max_retries` preserved unchanged;
+the `match cluster.try_acquire_retry()` sits inside it — §5.5 composes-with-never-replaces). **Guard threading:**
+`retry_guard_slot: Option<RetryBudgetGuard>` + `retry_budget_blocked: bool` declared before the loop;
+`Unlimited` arm = phase-16 behavior byte-identical (regression-critical, proven by test (c));
+`Acquired(guard)` arm = tick `upstream_rq_retry` + back-off + park the guard in the slot + `continue` (each
+reassignment drops the PRIOR guard → the slot is held across the back-off sleep AND the in-flight retried
+attempt — constraint iii); `Rejected` arm = set the flag + fall through to `break` (the would-be-retried
+response surfaces downstream VERBATIM — L6; no retry-counter ticks — the overflow already ticked inside the
+failed acquire, §5.3). **Post-loop split** guarded `if attempts > 1 && !retry_budget_blocked` → a budget-blocked
+exit ticks NEITHER `_success` NOR `_limit_exceeded` (L7 exclusivity; the flag — not the attempts check — is
+load-bearing for >0-cap mid-sequence exhaustion). Preserved untouched: per-attempt `upstream_rq_total` /
+`record_response`, the completing-response `upstream_rq_5xx` gate (`995445b52`), gated `x-envoy-attempt-count`.
+3 TDD tests + an `Option<u32>`-parameterized cluster-helper (a: blocked — 503 verbatim + attempt-count 1 +
+overflow=1/retry=0/success=0/limit=0/rq_total=1 + backend saw exactly 1; b: default-cap-3 control — 200 +
+attempt-count 2 + retry=1/success=1/overflow=0/limit=0; c: no-circuit_breakers Unlimited regression — same
+as (b) + no budget stats registered).
+
+**Verification (quoted):**
+- TDD RED: test (a) failed pre-gate with `x-envoy-attempt-count: 2` (the retry fired); tests (b)/(c) passed
+  pre-gate (proving the control paths are phase-16-identical).
+- `cargo test -p envoy-http1` → `test result: ok. 95 passed; 0 failed` (92 + 3 new). `cargo test -p envoy-cluster` → 85 passed.
+- `cargo build --workspace --all-targets` → clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (the match-inside-if shape trips no lint); `cargo fmt --all -- --check` → clean.
+- `git show --stat HEAD` → 1 file changed.
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer traced the guard lifetime across
+back-off + in-flight retry, the Rejected fall-through, the L7 exclusivity flag, and diffed the preserved
+phase-16 lines character-identical). Code-quality **Approved** (zero Critical / ONE Important [an inaccurate
+`drop()` comment — matters because Task 6 mirrors these comments verbatim] / 3 Minors [declaration-comment
+precision; helper `Option<u32>` parameterization; missing `limit_exceeded == 0` assertions on tests (b)/(c)] —
+**all 4 fixed in-task** [amended pre-push]).
+
+---
+
+_(Tasks 5–11 entries appended by the executor as each completes.)_
