@@ -1056,6 +1056,45 @@ pub async fn from_bootstrap(
             });
         }
     }
+    // 18 D4 (ADR-0049 L3/L10): the cluster_manager.* stat family — the project's
+    // first top-level-scope (non-resource-name-prefixed) stat family. Registered
+    // ONLY when dynamic_resources.cds_config is configured (the §5.2 conditional-
+    // registration discipline; Envoy emits the base cluster_manager.* names
+    // unconditionally — those stay Envoy-only-unasserted on non-CDS fixtures).
+    // All failure paths are fatal pre-construction (L4 reconciliation), so
+    // update_failure / update_rejected register at 0 and never tick. The counts
+    // include STATIC clusters too (Envoy counts ALL clusters added to the
+    // manager) — `clusters` is the merged static+dynamic map.
+    if bootstrap
+        .dynamic_resources
+        .as_ref()
+        .and_then(|dr| dr.cds_config.as_ref())
+        .is_some()
+    {
+        let total = clusters.len() as u64;
+        let mk = |name: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
+            registry
+                .register_counter(name)
+                .map_err(|e| ClusterError::StatsRegistration {
+                    cluster: name.to_string(),
+                    message: e.to_string(),
+                })
+        };
+        mk("cluster_manager.cds.update_attempt")?.add(1);
+        mk("cluster_manager.cds.update_success")?.add(1);
+        mk("cluster_manager.cds.update_failure")?; // registers at 0 (L4)
+        mk("cluster_manager.cds.update_rejected")?; // registers at 0 (L4)
+        mk("cluster_manager.cluster_added")?.add(total);
+        // active_clusters is the lone GAUGE in the family (the 5 above are
+        // counters), so it can't route through the counter-typed `mk` closure.
+        registry
+            .register_gauge("cluster_manager.active_clusters")
+            .map_err(|e| ClusterError::StatsRegistration {
+                cluster: "cluster_manager.active_clusters".to_string(),
+                message: e.to_string(),
+            })?
+            .set(total as i64);
+    }
     Ok(ClusterManager { clusters })
 }
 
@@ -3162,6 +3201,183 @@ admin:
             from_reg.value(),
             1,
             "registry-obtained handle must share the same Arc (idempotent registration)"
+        );
+    }
+
+    // ---- 18 Task 4 (ADR-0049 L3/L10): cluster_manager.* stat family ----
+
+    /// Build a minimal valid single-endpoint STATIC `Cluster` with the given
+    /// name and port. Mirrors the by-hand constructor shape used by
+    /// `from_bootstrap_rejects_duplicate_cluster_name` so these tests can set
+    /// `dynamic_resources` / `dynamic_clusters` directly (no file I/O at this
+    /// layer).
+    fn mk_static_cluster(name: &str, port: u16) -> envoy_config::Cluster {
+        use envoy_config::{
+            Address, Cluster, ClusterType, Endpoint, LbEndpoint, LbPolicy, LoadAssignment,
+            LocalityLbEndpoints, SocketAddress,
+        };
+        Cluster {
+            name: name.into(),
+            cluster_type: ClusterType::Static,
+            lb_policy: LbPolicy::RoundRobin,
+            load_assignment: LoadAssignment {
+                cluster_name: name.into(),
+                endpoints: vec![LocalityLbEndpoints {
+                    lb_endpoints: vec![LbEndpoint {
+                        endpoint: Endpoint {
+                            address: Address {
+                                socket_address: SocketAddress {
+                                    address: "127.0.0.1".into(),
+                                    port_value: port,
+                                },
+                            },
+                        },
+                    }],
+                }],
+            },
+            transport_socket: None,
+            dns_lookup_family: None,
+            typed_extension_protocol_options: None,
+            health_checks: vec![],
+            common_lb_config: None,
+            circuit_breakers: None,
+            outlier_detection: None,
+        }
+    }
+
+    /// `dynamic_resources.cds_config` configured (the conditionality predicate
+    /// for the cluster_manager.* family).
+    fn cds_dynamic_resources() -> envoy_config::DynamicResources {
+        use envoy_config::{ConfigSource, DynamicResources, PathConfigSource};
+        DynamicResources {
+            cds_config: Some(ConfigSource {
+                path_config_source: PathConfigSource {
+                    path: "/tmp/cds.yaml".into(),
+                },
+                resource_api_version: None,
+            }),
+        }
+    }
+
+    fn mk_bootstrap(
+        static_clusters: Vec<envoy_config::Cluster>,
+        dynamic_resources: Option<envoy_config::DynamicResources>,
+        dynamic_clusters: Option<Vec<envoy_config::Cluster>>,
+    ) -> envoy_config::Bootstrap {
+        use envoy_config::{Address, Admin, Bootstrap, SocketAddress, StaticResources};
+        Bootstrap {
+            node: None,
+            admin: Some(Admin {
+                address: Address {
+                    socket_address: SocketAddress {
+                        address: "127.0.0.1".into(),
+                        port_value: 9901,
+                    },
+                },
+                access_log_path: None,
+            }),
+            static_resources: StaticResources {
+                listeners: vec![],
+                clusters: static_clusters,
+            },
+            dynamic_resources,
+            dynamic_clusters,
+        }
+    }
+
+    /// Scrape the registry for the current u64/i64 value of a stat by name.
+    fn stat_value(registry: &envoy_stats::StatsRegistry, name: &str) -> Option<i64> {
+        registry.snapshot().into_iter().find_map(|(n, h)| {
+            if n != name {
+                return None;
+            }
+            Some(match h {
+                envoy_stats::StatHandle::Counter(c) => c.value() as i64,
+                envoy_stats::StatHandle::Gauge(g) => g.value(),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn cluster_manager_stats_not_registered_without_dynamic_resources() {
+        // §5.2 inertness: with NO dynamic_resources, none of the
+        // cluster_manager.* names register.
+        let bootstrap = mk_bootstrap(vec![mk_static_cluster("backend", 10001)], None, None);
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let cm_names: Vec<String> = registry
+            .snapshot()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.starts_with("cluster_manager."))
+            .collect();
+        assert!(
+            cm_names.is_empty(),
+            "no cluster_manager.* stat may register without dynamic_resources.cds_config; got {cm_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_manager_stats_registered_with_cds_bootstrap() {
+        // CDS configured + one dynamic cluster (zero static, like fixture 0026).
+        let bootstrap = mk_bootstrap(
+            vec![],
+            Some(cds_dynamic_resources()),
+            Some(vec![mk_static_cluster("dyn-backend", 10010)]),
+        );
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.cds.update_attempt"),
+            Some(1)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.cds.update_success"),
+            Some(1)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.cds.update_failure"),
+            Some(0)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.cds.update_rejected"),
+            Some(0)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.cluster_added"),
+            Some(1)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.active_clusters"),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_manager_counts_include_static_clusters() {
+        // 1 static + 1 dynamic, CDS configured → counts include the static one.
+        let bootstrap = mk_bootstrap(
+            vec![mk_static_cluster("static-backend", 10020)],
+            Some(cds_dynamic_resources()),
+            Some(vec![mk_static_cluster("dyn-backend", 10021)]),
+        );
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.cluster_added"),
+            Some(2),
+            "cluster_added must count static + dynamic clusters"
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster_manager.active_clusters"),
+            Some(2),
+            "active_clusters must count static + dynamic clusters"
         );
     }
 }
