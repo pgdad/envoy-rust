@@ -301,4 +301,44 @@ consolidation candidate; the `rq_zero` block's omitted-by-design `rq_retry_open`
 
 ---
 
-_(Tasks 9–11 entries appended by the executor as each completes.)_
+## Task 9 — in-process budget backstop, 4 paths incl. the >0-cap concurrency regime (commit `e1ea23be7`)
+
+**Landed.** New `crates/envoy-bin/tests/upstream_circuit_breaker_budgets.rs` (776 lines, single file, NO production
+code changes): one `multi_thread` mega-test (the established upstream_retry.rs template shape — envoy-bin booted
+ONCE via tempfile config + kill_on_drop, 5 STATIC clusters, one keep-alive path-dispatching in-process backend,
+admin `/stats` scrapes via the bounded `poll_stat_until` pattern). Paths: **(i)** budget-blocked retry (verbatim
+503 + attempt-count 1 + overflow/retry/total counter set); **(ii)** budget-allowed retry (200 + attempt-count 2 +
+the L5 defaults `remaining_retries: 3`/`remaining_rq: 1024` read back through the full stack); **(iii)**
+request-breaker overflow (81-byte body + `x-envoy-overloaded` + pending_overflow/upstream_rq_5xx + a
+backend-counter-delta proof of zero contact); **(iv-a)** `max_requests: 1` + 1.5s-hold slow backend + 2 concurrent
+requests → `{200, 503}` multiset + **`rq_open` observed at `1` MID-FLIGHT** (the L4 momentary non-zero edge — the
+ONLY place in the project it is asserted) then `0` after; **(iv-b)** `max_retries: 1` + 2 concurrent requests →
+attempt-count multiset `{1, 2}` + exactly one `upstream_rq_retry` + one `upstream_rq_retry_overflow`.
+
+**Concurrency determinism (the load-bearing design, documented in the module doc):** iv-a — the request guard spans
+the whole dispatch, so the slow backend pins the slot during the 700ms-budget mid-flight scrape (>2× margin under
+the 1500ms hold); iv-b — the retry winner's guard is held across its retry attempt (another 1500ms hold + back-off),
+so the loser's retry decision (landing within scheduling-jitter of the winner's) falls inside that window →
+exactly one Rejected, deterministically. **No production bugs surfaced** — the budget machinery passed the
+concurrency regime as-built (the only iteration was a test-harness fix: the backend needed keep-alive support to
+avoid racing the H1 pool's connection reuse).
+
+**Verification (quoted):**
+- `cargo test -p envoy-bin --test upstream_circuit_breaker_budgets` → `ok. 1 passed; 0 failed` — **stable across
+  5/5 implementer reruns + 3/3 independent spec-reviewer reruns** (~5.35s each).
+- Full `cargo test -p envoy-bin` → green (one UNRELATED known flake: `upstream_h2_connection_pooling` hit its
+  30s helper-compile readiness timeout once, passed in 1.65s on isolated re-run — the documented subprocess-readiness
+  flake family, not interference).
+- `cargo build --workspace --all-targets` → clean; clippy `-D warnings` → clean; fmt → clean.
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; reviewer traced both concurrency designs
+end-to-end against the production guard-hold windows [iv-b's "winner finishes before loser asks" race is closed by
+the guard-spans-retry-attempt property], verified no vacuous-pass failure modes [`poll_stat_until` + `u64::MAX`
+sentinel], and re-ran 3/3). Code-quality **Approved** (zero Critical / zero Important / 3 cosmetic Minors carried
+to the state-5 inventory: an uncommented `u64::MAX` sentinel [a deliberate improvement over the phase-15 template's
+`0`]; the 1500/700ms interdependent timing literals could be named constants; the escaped single-line cluster-YAML
+strings).
+
+---
+
+_(Tasks 10–11 entries appended by the executor as each completes.)_
