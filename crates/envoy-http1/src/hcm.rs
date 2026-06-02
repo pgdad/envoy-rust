@@ -214,6 +214,7 @@ fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
     // (If envoy-config later derives Clone on these types, this helper retires.)
     RouteConfiguration {
         name: rc.name.clone(),
+        validate_clusters: rc.validate_clusters,
         virtual_hosts: rc
             .virtual_hosts
             .iter()
@@ -1601,6 +1602,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -1682,6 +1684,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "specific".to_string(),
                     domains: vec!["foo.example.com".to_string()],
@@ -1725,6 +1728,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -1796,6 +1800,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "specific".to_string(),
                     domains: vec!["only.example.com".to_string()],
@@ -1884,6 +1889,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "test_vh".into(),
                     domains: vec!["*".into()],
@@ -2184,6 +2190,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -2524,6 +2531,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -2592,6 +2600,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -2864,6 +2873,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -3060,6 +3070,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -3227,6 +3238,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -3336,6 +3348,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -3442,6 +3455,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -3476,6 +3490,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -3787,6 +3802,7 @@ static_resources:
             pool_mgr: Some(Arc::clone(&pool_mgr)),
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -3971,6 +3987,7 @@ static_resources:
             pool_mgr: Some(Arc::clone(&pool_mgr)),
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
@@ -4092,6 +4109,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],

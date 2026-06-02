@@ -14,14 +14,86 @@ pub struct Bootstrap {
     pub admin: Option<Admin>,
     #[serde(default)]
     pub static_resources: StaticResources,
+    /// 18 D1: file-based CDS (the xDS-family opener; ADR-0048/ADR-0049).
+    /// Only `cds_config.path_config_source` is supported; everything else
+    /// in the upstream DynamicResources proto is rejected loudly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_resources: Option<DynamicResources>,
+    /// 18 D3: clusters loaded from the CDS file by `load_dynamic_resources`.
+    /// `None` = not loaded yet (parse_bootstrap leaves it None — the fuzz
+    /// target does no I/O); `Some(vec)` = loaded (possibly empty).
+    /// NOT serialized: the BootstrapConfigDump must show the bootstrap as
+    /// parsed from disk (SPEC §5.5 config_dump separation); dynamic clusters
+    /// surface in the ClustersConfigDump entry instead.
+    #[serde(skip)]
+    pub dynamic_clusters: Option<Vec<Cluster>>,
+}
+
+impl Bootstrap {
+    /// 18 D3: the effective cluster list — static clusters followed by
+    /// dynamically-loaded (CDS) clusters. Every downstream consumer
+    /// (validators, ClusterManager, pools, health, TLS) iterates THIS,
+    /// never `static_resources.clusters` directly (SPEC §5.3: dynamic
+    /// clusters are full Clusters, indistinguishable downstream).
+    pub fn all_clusters(&self) -> impl Iterator<Item = &Cluster> {
+        self.static_resources
+            .clusters
+            .iter()
+            .chain(self.dynamic_clusters.iter().flatten())
+    }
+
+    /// 18 D1/D3: true iff a CDS config source is configured but
+    /// `load_dynamic_resources` has not run yet. While true, cluster-reference
+    /// validation DEFERS (the references may resolve against the CDS file);
+    /// `load_dynamic_resources` re-validates with full enforcement.
+    pub(crate) fn cds_configured_but_unloaded(&self) -> bool {
+        self.dynamic_resources
+            .as_ref()
+            .and_then(|dr| dr.cds_config.as_ref())
+            .is_some()
+            && self.dynamic_clusters.is_none()
+    }
+}
+
+/// 18 D1: `dynamic_resources` — only the CDS filesystem transport at this
+/// phase (ADR-0048). `lds_config` / `ads_config` are deliberately NOT fields:
+/// deny_unknown_fields rejects them loudly (SPEC §4 deferral ledger).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicResources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cds_config: Option<ConfigSource>,
+}
+
+/// 18 D1: a ConfigSource restricted to the filesystem transport.
+/// `api_config_source` (gRPC/REST) / `ads` are NOT fields (rejected; deferred
+/// to the gRPC-xDS phase, which also supersedes ADR-0014 per ADR-0048).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSource {
+    pub path_config_source: PathConfigSource,
+    /// L8: optional; Envoy defaults it. Accept "V3" or absent; reject others
+    /// (validate(), UnsupportedResourceApiVersion).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_api_version: Option<String>,
+}
+
+/// 18 D1: `path_config_source` — the file path. `watched_directory` is NOT a
+/// field (rejected; deferred with file watching per SPEC §4).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PathConfigSource {
+    pub path: String,
 }
 
 // NOTE: Node deliberately omits `deny_unknown_fields`. Upstream Envoy's Node
 // also carries metadata, locality, user_agent_*, extensions, client_features,
 // listening_addresses, dynamic_parameters. Phase 01 accepts id + cluster and
-// silently ignores the rest. When xDS (§9 family) lands, Node is either moved
-// or tightened under a new ADR that names the fields then semantically
-// load-bearing. (See SPEC §6 signpost 8.)
+// silently ignores the rest. Phase 18 (file-based CDS, ADR-0048/ADR-0049)
+// consumed the xDS reservation by adding `Bootstrap.dynamic_resources`; Node
+// itself remains open — Envoy requires `node.id` + `node.cluster` when CDS is
+// configured, but phase 18 parses without enforcing this. The gRPC-xDS phase
+// tightens or moves Node under a future ADR. (See SPEC §6 signpost 8.)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
@@ -909,6 +981,16 @@ pub struct Http2ProtocolOptions {
 pub struct RouteConfiguration {
     pub name: String,
     pub virtual_hosts: Vec<VirtualHost>,
+    /// 18 L12b (ADR-0049): parse-and-accept. Envoy requires `validate_clusters:
+    /// false` on a static route_config that references CDS-supplied clusters
+    /// (else it exits: "route: unknown cluster"). envoy-rust parses the field so
+    /// the identical fixture configs load, but does NOT honor its literal
+    /// runtime-503 semantics — envoy-rust's own reference validation defers
+    /// while CDS is configured-but-unloaded and re-enforces post-merge
+    /// (Bootstrap::cds_configured_but_unloaded). A route to a cluster in
+    /// NEITHER list still fails startup (recorded divergence, BEHAVIOR_CONTRACT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate_clusters: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -1858,6 +1940,26 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
         return Err(crate::ConfigError::NoRuntime);
     }
 
+    // 18 D1 (L8, ADR-0049): resource_api_version must be "V3" or absent.
+    if let Some(cs) = bootstrap
+        .dynamic_resources
+        .as_ref()
+        .and_then(|dr| dr.cds_config.as_ref())
+        && let Some(v) = cs.resource_api_version.as_deref()
+        && v != "V3"
+    {
+        return Err(crate::ConfigError::UnsupportedResourceApiVersion(
+            v.to_string(),
+        ));
+    }
+
+    // 18 D1/D3: while CDS is configured-but-unloaded, cluster-reference checks
+    // DEFER (the references may resolve against the CDS file once
+    // load_dynamic_resources runs). Captured here as a `bool` before the
+    // `&mut` listener loop below so the reference-check sites can read it
+    // without conflicting with the listener borrow.
+    let defer_cluster_refs = bootstrap.cds_configured_but_unloaded();
+
     // Per-cluster invariants.
     for cluster in &bootstrap.static_resources.clusters {
         if cluster.load_assignment.cluster_name != cluster.name {
@@ -2010,11 +2112,15 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                             ));
                         };
                         let cluster_name = tp.cluster.clone();
-                        if !bootstrap
-                            .static_resources
-                            .clusters
-                            .iter()
-                            .any(|c| c.name == cluster_name)
+                        // 18 D1/D3: defer the reference check while CDS is
+                        // configured-but-unloaded; load_dynamic_resources
+                        // re-enforces post-merge.
+                        if !defer_cluster_refs
+                            && !bootstrap
+                                .static_resources
+                                .clusters
+                                .iter()
+                                .any(|c| c.name == cluster_name)
                         {
                             return Err(crate::ConfigError::UnknownCluster(cluster_name));
                         }
@@ -2032,6 +2138,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                             &bootstrap.static_resources.clusters,
                             chain_has_tls,
                             &listener.name,
+                            defer_cluster_refs,
                         )?;
                     }
                     _ => {
@@ -2117,6 +2224,7 @@ fn validate_hcm(
     clusters: &[Cluster],
     chain_has_tls: bool,
     listener_name: &str,
+    defer_cluster_refs: bool,
 ) -> Result<(), crate::ConfigError> {
     // codec_type: AUTO, HTTP1, and HTTP2 are runtime-supported. HTTP3 is
     // rejected pending future work. HTTP2 over TLS is rejected separately
@@ -2202,28 +2310,31 @@ fn validate_hcm(
                     // 04.3 NEW: check the cluster reference against declared clusters.
                     // ConfigError::UnknownCluster is the 02.1-landed variant reused here
                     // per SPEC §3 D2.
-                    if !clusters.iter().any(|c| c.name == ar.cluster) {
+                    // 18 D1/D3: defer the reference check while CDS is
+                    // configured-but-unloaded; load_dynamic_resources re-enforces.
+                    if !defer_cluster_refs && !clusters.iter().any(|c| c.name == ar.cluster) {
                         return Err(crate::ConfigError::UnknownCluster(ar.cluster.clone()));
                     }
                     // 06.3 D14.3 NEW: H1-listener × H2-cluster reachability gate.
                     // Closes 05.3 REVIEW I1 per parent-06 SPEC §3 D14.3.
-                    if matches!(hcm.codec_type, CodecType::HTTP1 | CodecType::AUTO) {
-                        let cluster_ref = clusters
-                            .iter()
-                            .find(|c| c.name == ar.cluster)
-                            .expect("UnknownCluster check above guarantees presence");
-                        if let Some(teo) = &cluster_ref.typed_extension_protocol_options
-                            && teo
-                                .http_protocol_options
-                                .explicit_http_config
-                                .http2_protocol_options
-                                .is_some()
-                        {
-                            return Err(crate::ConfigError::Http2ClusterFromHttp1Listener {
-                                listener: listener_name.to_string(),
-                                cluster: ar.cluster.clone(),
-                            });
-                        }
+                    // 18 D1/D3: the cluster lookup may not resolve when the
+                    // reference was deferred (CDS unloaded) — the gate is
+                    // skipped for deferred references and re-enforced at the
+                    // Task-3 re-validation, so use `if let Some(..)` rather
+                    // than `.expect(..)`.
+                    if matches!(hcm.codec_type, CodecType::HTTP1 | CodecType::AUTO)
+                        && let Some(cluster_ref) = clusters.iter().find(|c| c.name == ar.cluster)
+                        && let Some(teo) = &cluster_ref.typed_extension_protocol_options
+                        && teo
+                            .http_protocol_options
+                            .explicit_http_config
+                            .http2_protocol_options
+                            .is_some()
+                    {
+                        return Err(crate::ConfigError::Http2ClusterFromHttp1Listener {
+                            listener: listener_name.to_string(),
+                            cluster: ar.cluster.clone(),
+                        });
                     }
                 }
             }
@@ -6023,6 +6134,195 @@ static_resources:
             matches!(&err, crate::ConfigError::UnknownCluster(name) if name.is_empty()),
             "expected UnknownCluster(\"\"); got: {err:?}"
         );
+    }
+
+    // --- 18 D1 (ADR-0049): dynamic_resources schema + deferred cluster-ref validation ---
+
+    /// Fixture-0026 topology: `node` + one HCM listener whose route_config carries
+    /// `validate_clusters: false` and a single route to cluster `dynamic_backend`,
+    /// with NO `clusters:` key (the cluster will be supplied by the CDS file). The
+    /// listener satisfies the NoRuntime check, so no `admin` block is needed.
+    const HCM_LISTENER_TO_DYNAMIC_BACKEND: &str = r#"
+node: { id: t, cluster: c }
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address: { socket_address: { address: 127.0.0.1, port_value: 10000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: rc
+                  validate_clusters: false
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: dynamic_backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"#;
+
+    #[test]
+    fn bootstrap_parses_dynamic_resources_cds_path_config_source() {
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  cds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: /tmp/cds.yaml
+"#;
+        let b = crate::parse_bootstrap(yaml).unwrap();
+        let dr = b.dynamic_resources.as_ref().unwrap();
+        let cs = dr.cds_config.as_ref().unwrap();
+        assert_eq!(cs.path_config_source.path, "/tmp/cds.yaml");
+        assert_eq!(cs.resource_api_version.as_deref(), Some("V3"));
+    }
+
+    #[test]
+    fn dynamic_resources_rejects_deferred_fields() {
+        // lds_config / ads_config / api_config_source / watched_directory all
+        // rejected loudly by deny_unknown_fields (SPEC §4 deferral ledger).
+        for field in [
+            "lds_config: { path_config_source: { path: /x } }",
+            "ads_config: { api_type: GRPC }",
+        ] {
+            let yaml = format!(
+                "node: {{ id: t, cluster: t }}\nadmin: {{ address: {{ socket_address: {{ address: 0.0.0.0, port_value: 0 }} }} }}\ndynamic_resources:\n  {field}"
+            );
+            assert!(
+                crate::parse_bootstrap(&yaml).is_err(),
+                "{field} should reject"
+            );
+        }
+        // api_config_source on the ConfigSource:
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  cds_config:
+    api_config_source: { api_type: GRPC }
+"#;
+        assert!(crate::parse_bootstrap(yaml).is_err());
+        // watched_directory on PathConfigSource:
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /tmp/cds.yaml
+      watched_directory: { path: /tmp }
+"#;
+        assert!(crate::parse_bootstrap(yaml).is_err());
+    }
+
+    #[test]
+    fn resource_api_version_v3_or_absent_accepted_others_rejected() {
+        // L8: absent + V3 accepted; V2 / garbage rejected (UnsupportedResourceApiVersion).
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  cds_config:
+    resource_api_version: V2
+    path_config_source: { path: /tmp/cds.yaml }
+"#;
+        let err = crate::parse_bootstrap(yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedResourceApiVersion(ref v) if v == "V2")
+        );
+        // Absent resource_api_version is accepted.
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  cds_config:
+    path_config_source: { path: /tmp/cds.yaml }
+"#;
+        assert!(crate::parse_bootstrap(yaml).is_ok());
+    }
+
+    #[test]
+    fn route_config_parses_validate_clusters_field() {
+        // L12b: parse-and-accept (Envoy requires `validate_clusters: false` on a
+        // route_config referencing CDS clusters; configs are identical on both sides).
+        let yaml = r#"
+name: local_route
+validate_clusters: false
+virtual_hosts: []
+"#;
+        let rc: RouteConfiguration = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rc.validate_clusters, Some(false));
+    }
+
+    #[test]
+    fn route_to_unknown_cluster_deferred_when_dynamic_resources_configured_unloaded() {
+        // The fixture-0026 topology: zero static clusters + a route to a cluster the
+        // CDS file will supply. parse_bootstrap (which cannot do I/O) must ACCEPT this
+        // — the reference check defers until load_dynamic_resources re-validates.
+        let yaml = format!(
+            "{HCM_LISTENER_TO_DYNAMIC_BACKEND}\ndynamic_resources:\n  cds_config:\n    path_config_source: {{ path: /tmp/cds.yaml }}\n"
+        );
+        assert!(crate::parse_bootstrap(&yaml).is_ok());
+    }
+
+    #[test]
+    fn route_to_unknown_cluster_still_rejected_without_dynamic_resources() {
+        // Regression: the deferral ONLY applies when dynamic_resources.cds_config is
+        // configured. The existing UnknownCluster behavior is unchanged otherwise.
+        let yaml = HCM_LISTENER_TO_DYNAMIC_BACKEND; // no dynamic_resources block
+        let err = crate::parse_bootstrap(yaml).unwrap_err();
+        assert!(matches!(err, crate::ConfigError::UnknownCluster(ref c) if c == "dynamic_backend"));
+    }
+
+    #[test]
+    fn tcp_proxy_to_unknown_cluster_deferred_when_dynamic_resources_configured_unloaded() {
+        // The deferral covers BOTH reference-check sites: the tcp_proxy cluster ref
+        // also defers while CDS is configured-but-unloaded.
+        let yaml = r#"
+node: { id: t, cluster: c }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress
+                cluster: dynamic_backend
+dynamic_resources:
+  cds_config:
+    path_config_source: { path: /tmp/cds.yaml }
+"#;
+        assert!(crate::parse_bootstrap(yaml).is_ok());
+        // Regression: without dynamic_resources, the tcp_proxy ref still rejects.
+        let yaml_no_dr = r#"
+node: { id: t, cluster: c }
+static_resources:
+  listeners:
+    - name: l
+      address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress
+                cluster: dynamic_backend
+"#;
+        let err = crate::parse_bootstrap(yaml_no_dr).unwrap_err();
+        assert!(matches!(err, crate::ConfigError::UnknownCluster(ref c) if c == "dynamic_backend"));
     }
 
     #[test]

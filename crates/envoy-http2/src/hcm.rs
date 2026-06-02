@@ -1018,6 +1018,7 @@ mod tests {
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
@@ -1168,6 +1169,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
@@ -1290,6 +1292,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![
                     VirtualHost {
                         name: "specific".to_string(),
@@ -1742,6 +1745,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
@@ -1824,6 +1828,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
@@ -2255,6 +2260,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
@@ -2318,6 +2324,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
@@ -2397,6 +2404,7 @@ static_resources:
             pool_mgr: None,
             route_config: Arc::new(RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],
@@ -2601,6 +2609,7 @@ static_resources:
             access_log: vec![],
             route_config: RouteConfiguration {
                 name: "r".to_string(),
+                validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
                     name: "vh".to_string(),
                     domains: vec!["*".to_string()],

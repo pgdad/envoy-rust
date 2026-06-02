@@ -1325,6 +1325,8 @@ admin:
                     outlier_detection: None, // 14.1 D1
                 }],
             },
+            dynamic_resources: None,
+            dynamic_clusters: None,
         };
         let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
@@ -1386,6 +1388,8 @@ admin:
                 listeners: vec![],
                 clusters: vec![mk_cluster(), mk_cluster()],
             },
+            dynamic_resources: None,
+            dynamic_clusters: None,
         };
         let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await

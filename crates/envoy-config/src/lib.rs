@@ -10,19 +10,20 @@ pub mod matcher;
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, AttemptOutcome,
     Bootstrap, CertificateValidationContext, CircuitBreakers, Cluster, ClusterType, CodecType,
-    CommonLbConfig, CommonTlsContext, DataSource, DenominatorType, DirectResponse, DnsLookupFamily,
-    DownstreamTlsContext, Endpoint, ExplicitHttpConfig, FaultAbort, FaultConfig, FileAccessLog,
-    FilterChain, FilterChainMatch, FractionalPercent, HeaderMatcher, HeaderMatcherMode,
-    HeaderMutationConfig, HeaderMutationEntry, HeaderValue, HeaderValueOption, HealthCheck,
-    Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
-    HttpFilterTypedConfig, HttpHealthCheck, HttpProtocolOptions, HttpStatus, Int64Range,
-    LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints,
-    Mutations, NetworkFilter, Node, OutlierDetection, Percent, Permission, PermissionSet, Policy,
-    Principal, PrincipalSet, RbacConfig, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction,
-    RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules,
-    SafeRegex, SocketAddress, StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig,
-    Thresholds, TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig,
-    TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
+    CommonLbConfig, CommonTlsContext, ConfigSource, DataSource, DenominatorType, DirectResponse,
+    DnsLookupFamily, DownstreamTlsContext, DynamicResources, Endpoint, ExplicitHttpConfig,
+    FaultAbort, FaultConfig, FileAccessLog, FilterChain, FilterChainMatch, FractionalPercent,
+    HeaderMatcher, HeaderMatcherMode, HeaderMutationConfig, HeaderMutationEntry, HeaderValue,
+    HeaderValueOption, HealthCheck, Http1ProtocolOptions, Http2ProtocolOptions,
+    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpHealthCheck,
+    HttpProtocolOptions, HttpStatus, Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment,
+    LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter, Node, OutlierDetection,
+    PathConfigSource, Percent, Permission, PermissionSet, Policy, Principal, PrincipalSet,
+    RbacConfig, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
+    RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, SafeRegex, SocketAddress,
+    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate,
+    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
+    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
 };
 
 /// The only network filter name envoy-rust recognizes in phase 01.
@@ -58,6 +59,25 @@ pub enum ConfigError {
     UnexpectedTypedConfig(&'static str),
     #[error("unknown cluster '{0}'")]
     UnknownCluster(String),
+    /// 18 D1 (L8, ADR-0049): `dynamic_resources.cds_config.resource_api_version`
+    /// carried an unsupported value. envoy-rust accepts only `"V3"` or an
+    /// absent field; any other value (e.g. `"V2"`) is rejected loudly.
+    #[error(
+        "dynamic_resources.cds_config.resource_api_version '{0}' is unsupported; envoy-rust accepts only 'V3' or absent"
+    )]
+    UnsupportedResourceApiVersion(String),
+    /// 18 D2: reading the CDS file at the configured path failed (I/O error).
+    /// Part of the D1 schema surface; first raised by the Task-2 CDS parser.
+    #[error("reading CDS file '{path}': {source}")]
+    CdsFileError {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// 18 D2/D3: parsing the CDS file's contents failed. Part of the D1 schema
+    /// surface; first raised by the Task-2/Task-3 CDS loader.
+    #[error("parsing CDS file '{path}': {message}")]
+    CdsParseError { path: String, message: String },
     #[error(
         "cluster '{cluster}' declares load_assignment.cluster_name '{assignment}'; these must match"
     )]
