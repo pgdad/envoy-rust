@@ -41,3 +41,16 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance:** 1 issue found (the Node xDS-reservation comment at `bootstrap.rs:89-94` not updated as the PLAN requires) → **fixed in-task** (commit amended `84e796ba1` → `ce7abce5b`); re-verified compliant.
 - **Code quality:** zero Critical; **1 Important (forward-looking, dispositioned per-PLAN):** the two reference-check sites consult `static_resources.clusters` (not `all_clusters()`), which Task 3's post-merge re-validation needs — **this is exactly PLAN Task 3 Step 3b** (the check sites migrate to the merged list at Task 3); carried as a binding Task-3 input, NOT a Task-1 defect. Minor notes: `all_clusters()` is defined-but-unused until Task 3 (per-plan); the bool threading through `validate_hcm` judged appropriate (no enum needed).
+
+### Task 2 — COMPLETE (code commit `33ecf55cd`)
+
+**Landed:** new `crates/envoy-config/src/cds.rs` — `parse_cds_file(path: &str, contents: &str) -> Result<Vec<Cluster>, ConfigError>` via the internally-tagged `#[serde(tag = "@type")]` `CdsResource` enum (the ADR-0014 TypedConfig pattern; single `Cluster` variant renamed to the full type URL). Envelope (`CdsFile`) is accept-and-ignore (NO deny_unknown_fields — `version_info`/`type_url`/`nonce` tolerated, L1); per-resource `Cluster` keeps deny_unknown_fields strictness (L4 recorded divergence); malformed YAML / missing `@type` / wrong `@type` → `CdsParseError { path, message }` with serde line/column detail; every parsed cluster runs `validate_cluster`. **Step 3b refactor:** `validate()`'s per-cluster loop body extracted verbatim (order-preserving) into `pub(crate) fn validate_cluster(cluster: &Cluster)` — shared single source of truth between `validate()` and `parse_cds_file`; cross-cluster/listener checks stay in `validate()`. lib.rs: `pub mod cds;` + `pub use cds::parse_cds_file;`.
+
+**Verification (quoted):**
+- `cargo test -p envoy-config` → `test result: ok. 317 passed; 0 failed; 0 ignored` (was 309; +8 new cds tests)
+- `cargo build -p envoy-config` (standalone) → clean; `cargo build --workspace --all-targets` → clean
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean
+
+**Two-stage review:**
+- **Spec compliance:** ✅ compliant (reviewer additionally probe-verified that deny_unknown_fields genuinely fires through the internally-tagged enum on an otherwise-valid cluster — serde_yaml 0.9.34 honors the inner strictness). Implementer deviation accepted: test fixtures carry `lb_policy: ROUND_ROBIN` (mandatory field in the real Cluster schema; the PLAN's draft YAML omitted it).
+- **Code quality:** zero Critical / zero Important / 3 Minors — **2 fixed in-task pre-push** (the `rejects_unknown_fields_in_resource` test tightened to a fully-valid-cluster fixture + `CdsParseError`-message assertion so it isolates the deny_unknown_fields gate; the DiscoveryResponse-envelope test now also asserts the cluster name); 1 optional polish (message-assertions on the remaining negative tests) carried to the state-5 inventory.
