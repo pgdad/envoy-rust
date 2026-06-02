@@ -231,4 +231,40 @@ convention, not an asymmetry). Code-quality **Approved** (zero Critical / zero I
 
 ---
 
-_(Tasks 7–11 entries appended by the executor as each completes.)_
+## Task 7 — H2 request-budget gate (`max_requests` mirror) (commit `a977879e9`)
+
+**Landed.** `crates/envoy-http2/src/hcm.rs` (+460/−144, single file; deletions dominated by the retry-loop
+reindent under the new `else` wrapper): the Task-5 request-budget gate mirrored onto the H2 dispatch entry in
+`handle_one_stream`'s `BuildOutcome::Proxy` arm — `cluster.try_acquire_request()` called **exactly once**
+(bound into `request_acquire`; spec review confirmed exactly 1 production call site → no overflow double-tick),
+same `if let Rejected … else { <guard match> + <the Task-6 retry loop, untouched> }` split. **H1/H2 structural
+difference accommodated:** H1 assigns into a mutable `outgoing` flowing to its unified writer; H2's Rejected arm
+produces `overflow_resp` as the arm's VALUE flowing into `finalize_h2_stream` (the same accounting path the H2
+pool `PendingOverflow` arm uses — `downstream_rq_5xx` + access log fire identically). **Rejected path:** ticks
+`upstream_rq_5xx` once (L3/ADR-0047; the H2 file now has exactly TWO tick sites — this arm + the phase-16
+completing-response gate, both verified) + `synth_h2_overflow()` (81-byte body + `x-envoy-overloaded`) + gated
+`x-envoy-attempt-count: 1` (L11; the literal-string form per the established H2 convention); no pool contact;
+`upstream_rq_total` stays 0. **Acquired guard** spans the entire retry loop (L9b). Task-6 retry gate + phase-16
+completing-response gate byte-untouched per `git diff -w`. 4 TDD tests (`h2_`-prefixed Task-5 mirrors, same
+assertion sets) + `h1_backend_cluster_with_max_requests` helper (the `(manager, registry)` return shape per the
+Task-5 docstring note); full reuse of the Task-6 helpers (`drive_h2_once_with_body` etc. — zero duplication).
+
+**Verification (quoted):**
+- TDD RED: tests (a)/(b) failed pre-gate (`left: 200 right: 503` — backend contacted, no gate); (c)/(d) passed pre-gate.
+- `cargo test -p envoy-http2` → `test result: ok. 69 passed; 0 failed` (65 + 4 new). `cargo test -p envoy-http1` → 99 passed (untouched).
+- `cargo build --workspace --all-targets` + `cargo build -p envoy-http2` (standalone) → clean; clippy `-D warnings` → clean; fmt → clean.
+- `git show --stat HEAD` → 1 file changed.
+
+**Two-stage review:** spec-compliance **✅ compliant** (first pass; single-acquire property, block-for-block H1
+parity [only documented differences: `synth_h2_overflow()`, the value-flow vs mutable-assignment, protocol
+identifiers], Rejected-path accounting flow, guard span, and both untouched-gate properties all verified).
+Code-quality **Approved** (zero Critical / zero Important / zero actionable Minors; the literal-vs-const
+`x-envoy-attempt-count` reference difference between H1/H2 confirmed as PRE-EXISTING phase-16 convention which
+Task 7 correctly follows — noted as a possible future cleanup, not a defect).
+
+**With Tasks 4–7 landed, both budget gates exist on both protocols. All four gate insertions are
+in-process-tested; the bilateral differential proof is Task 8 (fixture 0025).**
+
+---
+
+_(Tasks 8–11 entries appended by the executor as each completes.)_
