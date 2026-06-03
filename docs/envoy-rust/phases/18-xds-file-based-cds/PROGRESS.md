@@ -148,3 +148,13 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review (combined pass for this mechanical 3-file task):**
 - **Spec compliance:** ✅ compliant (exactly 3 files; fuzz Cargo.lock untracked; the full schema surface exercised; both registries updated; the count reconciliation verified; the opportunistic fix verified genuinely pre-existing at the parent commit).
 - **Code quality:** zero Critical / zero Important / zero Minor — **Ready to merge: Yes.** The reviewer additionally proved the corpus gate test is not stale (renaming the seed away makes the gate FAIL — the test reads real files).
+
+### Task 10 — COMPLETE (code commit `62bcecce6`)
+
+**Landed:** the BEHAVIOR_CONTRACT extensions (`docs/envoy-rust/BEHAVIOR_CONTRACT.md`, the only file; +143/−2): **(1)** the "18 entries (file-based CDS)" stat block — the 6-name `cluster_manager.*` table (value-exact on fixture 0026; `update_failure`/`update_rejected` carry the L4 structurally-0 note; `cluster_added`/`active_clusters` carry the static-inclusion caveat) + the §5.2 conditional-registration-narrowing paragraph (recorded divergence per D-3.3) + the L3 Envoy-only 12-name enumeration; **(2)** the "xDS wire state machine" section's FIRST population — "Filesystem transport (`path_config_source`) — phase 18" recording the L1 byte-exact envelope + @type requirement + always-YAML leniency divergence, the L2 readiness-implies-loaded ordering, the L4 negative-path table (Envoy's 3-way split vs envoy-rust's all-fatal — the recorded divergence), the L9 static-wins rule, the L12 prerequisites + defer-then-revalidate enforcement, and the explicit gRPC/ADS-still-unpopulated note; **(3)** the `/config_dump` ClustersConfigDump row in "Admin endpoint body shapes" (the L5 shape, conditional emission, empty-key omission, the fixture-0026 anchor) + a tightening of the existing BootstrapConfigDump row (`configs[0]` + the §5.5 separation note).
+
+**Verification:** docs-only (no cargo gates per the PLAN); markdown table syntax verified.
+
+**Two-stage review (combined accuracy-focused pass):**
+- **Spec compliance:** ✅ all three additions present and complete; scope clean; all 4 divergences explicit.
+- **Factual accuracy:** **zero inaccuracies at any severity** — every load-bearing claim cross-checked against the implementation (`cluster.rs` registration block / `endpoint.rs` Clusters variant / `lib.rs` loader), the PLAN §6.2 lock-ins (the L4 parse-vs-semantic split, the byte-exact L1 file, the 12 Envoy-only names), fixture 0026's expectations, and ADR-0049's four reconciliations. The BootstrapConfigDump tightening verified consistent with fixture 0014. **Ready to merge: Yes.**
