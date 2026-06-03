@@ -64,3 +64,20 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — signature/module-wiring/envelope/enum/no-validation-difference all verified by independent code inspection; all 7 tests genuine (minimal fixture carries a real HCM filter chain); exact commit message confirmed; no scope creep in the parser itself.
 - **Code quality: Approve** — faithful idiomatic mirror of `cds.rs`; the single-variant `.map(|LdsResource::Listener(l)| l)` collect and the `format!`-based DiscoveryResponse test are deliberate sibling-parity choices. Three Minor items, none requiring a fix: (1) the pre-existing untracked `crates/envoy-config/fuzz/Cargo.lock` was swept into this commit by `git add crates/envoy-config/` — a legitimate, conventionally-committed lockfile, left in place to avoid amend-churn; (2)/(3) doc-rationale duplication + `format!` test pattern, both mirror-faithful to cds.rs and kept as-is.
+
+---
+
+### Task 3 — COMPLETE (code commit `cb7e12ba2`, +488/−42)
+
+**Implemented (TDD, RED→GREEN):** restructured `load_dynamic_resources` (`lib.rs`) — removed the early-return-when-CDS-unconfigured; the function now runs the CDS branch, then a parallel LDS branch (read → `LdsFileError`; parse via `lds::parse_lds_file` → `LdsParseError`; L7 merge: static-wins + intra-file-first-wins, each with a `tracing::warn!` paralleling the CDS wording), then exactly ONE post-merge `bootstrap::validate()` gated on `dynamic_clusters.is_some() || dynamic_listeners.is_some()` — the §5.7 ordering invariant (clusters merged BEFORE listener route-references re-validated). Doc comment extended (LDS branch + §5.7 + L6 divergence + the M18-1 on-error-mutation caveat). Per-listener validation loop (`bootstrap.rs`) extended to chain dynamic listeners via a `&mut` split borrow of the two disjoint fields, with the `effective_clusters` snapshot collected BEFORE the split (identity-equivalent when `dynamic_listeners` is None). Consumer migrations: `main.rs` spawn (`first()` → `all_listeners().next()`) + `endpoint.rs` `render_listeners` (`all_listeners()`). 8 envoy-config tests (a–h) + 1 envoy-admin test.
+
+**Sound test-(g) divergence:** omitting `http_filters` fails at PARSE time (required field, no serde default) — would not prove validation-loop coverage. The implementer used `http_filters: []` (parses, then `validate_http_filters` rejects with `EmptyHttpFilters`), genuinely exercising the post-merge per-listener validation path. Verified sound by spec review.
+
+**Verification (quoted):**
+- `cargo test -p envoy-config`: **347 passed; 0 failed**. `cargo test -p envoy-admin`: **80 passed; 0 failed**.
+- `cargo build --workspace --all-targets`: clean. Standalone `-p envoy-config`/`-p envoy-cluster`/`-p envoy-http1`/`-p envoy-http2`: clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean. `cargo fmt --all -- --check`: clean.
+
+**Two-stage review:**
+- **Spec compliance: ✅** — restructure verified (CDS behavior preserved, single gated post-merge validate, §5.7 ordering, L7 collision rules); snapshot-before-split-borrow confirmed; both consumer migrations confirmed; all 8 a–h + admin tests genuine; test-(g) reasoning verified sound; exact commit message confirmed; no CDS regression.
+- **Code quality: Approve** — zero Critical/Important; faithful CDS-mirror, honest M18-1 caveat, correct split-borrow. Two non-blocking Minor notes (admin-test handler boilerplate could extract `handler_from_bootstrap`; the split-borrow comment slightly overstates borrow-checker necessity since the inline form also compiles) — both left as-is.
