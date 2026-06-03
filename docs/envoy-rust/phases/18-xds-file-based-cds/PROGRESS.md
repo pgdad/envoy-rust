@@ -158,3 +158,32 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review (combined accuracy-focused pass):**
 - **Spec compliance:** ✅ all three additions present and complete; scope clean; all 4 divergences explicit.
 - **Factual accuracy:** **zero inaccuracies at any severity** — every load-bearing claim cross-checked against the implementation (`cluster.rs` registration block / `endpoint.rs` Clusters variant / `lib.rs` loader), the PLAN §6.2 lock-ins (the L4 parse-vs-semantic split, the byte-exact L1 file, the 12 Envoy-only names), fixture 0026's expectations, and ADR-0049's four reconciliations. The BootstrapConfigDump tightening verified consistent with fixture 0014. **Ready to merge: Yes.**
+
+### In-arc fix — the CI-only host-gateway bug (code commit `f5873902a`)
+
+**Found at the state-4 verification:** CI runs at the Task-9 and Task-10 pushes failed deterministically on `xds_file_based_cds_fixture` with `upstream: expected status 200 for GET /, got 503` — CI-only (local macOS always green). (The Task-7 and Task-8 push failures were the DOCUMENTED flake family — fixture 0012's access-log race and fixture 0025's readiness timeout respectively — which fail-fast-masked the real 0026 failure in those runs.) **Root cause (systematic diagnosis):** the ADR-0015 `host_uses_host_gateway` flag (`tests/differential/src/lib.rs:2505`) scanned ONLY the rendered upstream MAIN config for `host.docker.internal`; fixture 0026's only reference lives in the rendered upstream **CDS file** (the main config has zero clusters) → no `--add-host=host.docker.internal:host-gateway` on the Envoy container → on Linux CI the container cannot resolve the backend host → STRICT_DNS resolution fails → 503. macOS Docker Desktop resolves `host.docker.internal` natively regardless, which is why every local run passed. **This was the THIRD site of the Task-6-Critical bug class** (main-template-only scanning); the Task-6 fix covered the `needs_*backend` scans + the kv-map gate but missed this one. **Fix (TDD):** extracted the decision into the testable `uses_host_gateway(upstream_main, upstream_cds)` helper (true if either contains the marker; test verified red against the old single-scan logic); the rendered upstream CDS content hoisted out of its block. **Proof:** local fixture still green (`1 passed`); **the CI run at this fix's push (`26863221247`) is SUCCESS** — fixture 0026 green on Linux.
+
+### Task 11 — STATE-4 PHASE-DONE VERIFICATION (this commit)
+
+**§7.5 (a)–(e) ALL GREEN. Per-gate evidence (all at HEAD `f5873902a` unless noted):**
+
+**(a) + (b) — all 26 Docker-gated differential fixtures green simultaneously:**
+- **CI anchor run `26863221247`** (HEAD `f5873902a`, ubuntu-latest + Docker, 2026-06-03T04:12–04:15Z): `conclusion: success`; both jobs green (`build + test + lint`: success; `fuzz (parse_bootstrap, 30s)`: success). All 26 fixture tests `... ok` in the job log — `echo`/`tcp_proxy`/`admin_ready`/`tls_{downstream,upstream,sni}`/`http1_{direct_response,router_upstream}`/`http2_{direct_response,router_upstream}`/`admin_stats_prometheus`/`access_log_file_sink`/`http_filter_{header_mutation,local_rate_limit,rbac,fault}`/`admin_{config_dump_server_info,drain_listeners}`/`upstream_{active_health_check,connection_pooling_and_per_class_counters,h2_connection_pooling,outlier_detection_consecutive_5xx}`/`upstream_circuit_breaker_{max_pending_requests,budgets}`/`upstream_retry_on_5xx`/**`xds_file_based_cds`**.
+- Local (macOS + Docker): fixture 0026 green 3× (Task-7 isolated run, the 26-fixture regression, the post-fix re-run); the 25 pre-existing fixtures green in the Task-7 regression run.
+
+**(c) — h2spec ≥95% conformance:** `test h2spec_pass_rate_gate ... ok` in the CI anchor run (the parent-05 baseline holds; envoy-rust's H2 framing untouched by phase 18).
+
+**(d) — fuzz clean:** local `cargo +nightly fuzz run parse_bootstrap -- -runs=200000 -max_total_time=120` → `Done 200000 runs in 20 second(s)`, zero crashes, on the 29-seed corpus; + the CI fuzz job success.
+
+**(e) — the 5 stable-toolchain gates (local, fresh at `f5873902a`):**
+- `cargo build --workspace --all-targets` → `Finished ... in 3m 31s`, exit 0
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished ... in 4m 20s`, exit 0 (zero warnings — clippy was run PER TASK across the arc per `project_state3_arc_skips_clippy`)
+- `cargo fmt --all -- --check` → clean, exit 0
+- `cargo test --workspace --no-fail-fast` → 86 result lines / **1052 passed** / 1 failed → the 1 failure (`upstream_h2_connection_pooling`, 30.46s readiness timeout) is the DOCUMENTED helper-rebuild flake (the clippy `--all-features` run immediately before dirtied the shared target-dir fingerprints, making the test's nested `cargo run --manifest-path` helper build take 83s > the 30s budget); **re-run in isolation: `ok` in 2.05s**; the sibling helper-spawning backstops also re-verified green. NOT a regression (the same test is green in the CI anchor run).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`
+
+**Plus the 4 standalone-crate builds** (`project_isolated_crate_build_blindspot`): `-p envoy-config` / `-p envoy-cluster` / `-p envoy-http1` / `-p envoy-http2` → all `Finished`, exit 0.
+
+**Workspace test-count delta:** 1052 passed (the phase-17 baseline was ~1010) — the +42 are phase 18's new tests (7 Task-1 + 8 Task-2 + 7 Task-3 + 3 Task-4 + 5 Task-5 + 7 Task-6 incl. the 2 in-review fix tests + 1 Task-6 host-gateway fix test + 5 Task-8 + corpus-gate coverage).
+
+**STATE advanced to state-4-complete / state-5-next.** Per §5.1 the state-5 code review (`superpowers:requesting-code-review` → REVIEW.md) is the NEXT session.
