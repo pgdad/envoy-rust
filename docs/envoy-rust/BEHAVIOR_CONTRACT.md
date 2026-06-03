@@ -240,6 +240,33 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 
 **The L3 Envoy-only enumeration paragraph.** After a successful load Envoy emits **18** `cluster_manager.*` names; envoy-rust emits the **6** above. The 12 Envoy-only unasserted names (ignored by fixture 0026's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `cds.update_time`, `cds.version`, `cds.version_text`, `cds.update_duration`, `cds.init_fetch_timeout`, `cluster_modified`, `cluster_removed`, `cluster_updated`, `cluster_updated_via_merge`, `update_merge_cancelled`, `update_out_of_merge_window`, `warming_clusters`. (Envoy additionally carries a `cds.control_plane.*` family, irrelevant to the filesystem transport.) None of the 6 emitted `cluster_manager.*` values change pre- vs post-GET — request counters live under `cluster.<name>.*`.
 
+**19 entries (file-based LDS):**
+
+> The xDS-family continuation (ADR-0050 SPEC / PLAN). file-based LDS loads
+> listeners from `dynamic_resources.lds_config.path_config_source.path` at
+> startup; these are the first top-level-scope `listener_manager.*` stats. All
+> derived from the §6.2 empirical lock-in **L3** (verified against
+> `envoyproxy/envoy:v1.33.0`, digest `sha256:56da5afd…`, 2026-06-02). Envoy
+> emits **21** names under `listener_manager.*` after a successful LDS load;
+> envoy-rust's minimum-viable subset is **6 names**. The 4 `lds.*` names +
+> `listener_added` register **conditionally** — ONLY when
+> `dynamic_resources.lds_config` is configured (`register_lds_stats`, Task 4);
+> `total_listeners_active` keeps its pre-existing 08.2 **unconditional**
+> registration, here tightened to a bilateral assertion on fixture 0027.
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `listener_manager.lds.update_attempt` | value-exact (fixture 0027: 1) | Counter; one increment per LDS load attempt. envoy-rust's synchronous `load_dynamic_resources` ticks it once at the file-read+parse step. Both proxies emit 1 on the single initial load (no hot-reload at phase-19 scope). |
+| `listener_manager.lds.update_success` | value-exact (fixture 0027: 1) | Counter; one increment per LDS load that produced an installed listener set. The load-bearing differential proof of the phase: `update_success: 1` can only pass if real Envoy genuinely loaded the LDS file (fixture 0027 asserts it bilaterally). |
+| `listener_manager.lds.update_failure` | value-exact (fixture 0027: 0) | Counter; in Envoy, `+1` per LDS load that hit a **parse error** (malformed envelope / missing `@type`) — Envoy then warns-and-serves. **In envoy-rust this is structurally 0:** all LDS load errors are FATAL pre-construction (the L4 all-fatal posture, ADR-0049 extended to LDS by ADR-0050 — see the xDS-wire-state-machine LDS §(c)), so the process exits rather than reach a non-zero `update_failure` state. Registered at 0 and **structurally unreachable non-zero**. Bilaterally satisfiable at 0 on fixture 0027 (a successful load). |
+| `listener_manager.lds.update_rejected` | value-exact (fixture 0027: 0) | Counter; in Envoy, `+1` per LDS load whose resource was **semantically invalid** (PGV violation / listener-build failure) — distinct from the parse-error `update_failure` bucket; Envoy warns-and-serves. **In envoy-rust this is structurally 0** for the same reason as `update_failure` (the all-fatal posture; the process exits instead). Registered at 0 and **structurally unreachable non-zero**. Bilaterally satisfiable at 0 on fixture 0027. |
+| `listener_manager.listener_added` | value-exact (fixture 0027: 1) | Counter; `+1` per listener ADDED to the manager. The count includes **static listeners** — Envoy counts ALL listeners added, not just LDS-supplied ones; envoy-rust mirrors. Bilateral on fixture 0027 because it has **zero static listeners** (the single dynamic listener yields 1 on both sides); the L7 collision backstop (a static listener defined under the same name as the LDS entry) asserts 1 (the static listener only — the collision-skipped LDS entry does not re-tick). **Conditional registration narrowing** — see the §5.2 paragraph below. |
+| `listener_manager.total_listeners_active` | value-exact (fixture 0027: 1) | Gauge; the count of currently-active listeners in the manager. **Distinct from `listener_added` in registration:** this gauge keeps its pre-existing 08.2 **unconditional** registration (it predates LDS); phase 19 only tightens it to a bilateral assertion on fixture 0027. The lone gauge of the 6 names (the other 5 are counters). |
+
+**The §5.2 conditional-registration narrowing (recorded divergence, L10/ADR-0050).** The 4 `lds.*` names **and** `listener_added` register ONLY when `dynamic_resources.lds_config` is configured. This is a **deliberate divergence** from Envoy's tree: Envoy emits the `listener_manager.lds.*` subtree conditionally (the lds subtree exists only with LDS configured — both proxies agree here), but Envoy emits the **base** `listener_manager.*` names (`listener_added`, `listener_create_success`, `total_listeners_active`, `workers_started`, …) **unconditionally** on every bootstrap. envoy-rust narrows the base name `listener_added` to the same LDS-configured condition (registers nothing on non-LDS fixtures — verified by the backstop's inertness path (vi), which asserts `listener_added` is ABSENT and no `lds.*` names appear when no `lds_config` is present), so on the fixture-0026 topology (CDS configured, NO lds_config) the `listener_manager.lds.*` subtree + the base `listener_added` name stay **Envoy-only-unasserted**. `total_listeners_active` is the **exception** — it keeps its unconditional 08.2 registration on both LDS and non-LDS fixtures. Recorded explicitly per doctrine D-3.3.
+
+**The L3 Envoy-only enumeration paragraph (LDS).** After a successful load Envoy emits **21** `listener_manager.*` names; envoy-rust emits the **6** above. The 15 Envoy-only unasserted names (ignored by fixture 0027's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `listener_create_success`, `listener_create_failure`, `listener_modified`, `listener_removed`, `listener_stopped`, `listener_in_place_updated`, `total_listeners_warming`, `total_listeners_draining`, `total_filter_chains_draining`, `workers_started`, `lds.update_time`, `lds.update_duration`, `lds.version`, `lds.version_text`, `lds.init_fetch_timeout`. **✧ `listener_create_success` is PER-WORKER** — observed at **12 on a 12-core host** (one tick per worker thread per listener); it is host-core-count-dependent, **NEVER asserted bilaterally**, and is NOT in the 6-name subset. (Envoy additionally carries an `lds.control_plane.*` family, irrelevant to the filesystem transport.) Fixture 0027 also carries the phase-18 `cluster_manager.*` 6-name subset, here with **`cluster_added: 2` / `active_clusters: 2`** (TWO clusters: the static `static_backend` + the CDS-supplied `dynamic_backend`) and `cds.update_attempt/success/failure/rejected` = 1/1/0/0.
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments
@@ -281,9 +308,10 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 |---|---|---|---|
 | `/config_dump` | GET | JSON object | Top-level shape `{ "configs": [...] }`. envoy-rust emits the `BootstrapConfigDump` entry at `configs[0]`: `{ "@type": "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump", "bootstrap": <static-bootstrap-as-JSON>, "last_updated": <ISO-8601 timestamp> }`. Envoy may emit additional entries for xDS-derived configs; those land on `allowlist_envoy_only`. `bootstrap.static_resources` content value-exact-after-roundtrip (modulo serde renamings; the harness's `JsonShape::required_subtree` covers this). `last_updated` name-required-value-may-differ (wall-clock non-determinism). The `BootstrapConfigDump` shows the bootstrap **as parsed from disk** — dynamic (CDS) clusters do NOT appear here (SPEC §5.5 config_dump separation); they surface in the `ClustersConfigDump` entry below. |
 | `/config_dump` `ClustersConfigDump` (phase 18, L5/ADR-0049) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when `dynamic_resources.cds_config` is configured; on non-CDS fixtures it is absent (fixture 0014's single-`BootstrapConfigDump`-entry shape preserved). When present, it lands at `configs[1]` on **both** proxies (Envoy's order: `BootstrapConfigDump`[0], `ClustersConfigDump`[1], …). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.ClustersConfigDump", "dynamic_active_clusters": [ { "cluster": { "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster", <full cluster config> }, "last_updated": <ISO-8601> } ], "static_clusters": [ … when non-empty ] }`. The inner `cluster` object carries its own `@type` plus the full flattened cluster config. **Empty-key omission (proto3-JSON style):** `static_clusters` and `dynamic_active_clusters` are each `skip_serializing_if = Vec::is_empty` on both sides — a static-only Envoy emits the entry with ONLY a `static_clusters` key (no `dynamic_active_clusters`); there is NO `version_info` key (the CDS file had none — proto3 JSON omits empty fields). `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Bilateral anchor (fixture 0026):** `configs.1.dynamic_active_clusters.0.cluster.name == dynamic_backend` (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array content otherwise differs substantially per side (envoy emits its full protobuf-canonical projection; envoy-rust the narrower parsed-bootstrap projection) — `value_may_differ_keys: ["configs"]`, mirroring fixture 0014. Note: envoy-rust's cluster JSON uses snake_case field names while Envoy's proto3-JSON defaults to camelCase for multi-word fields — irrelevant for the `name` anchor (single-word, identical) but binding if a future fixture asserts deeper nested cluster fields. |
+| `/config_dump` `ListenersConfigDump` (phase 19, L5/ADR-0050) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when `dynamic_resources.lds_config` is configured; on non-LDS fixtures it is absent (the backstop inertness path (vi) verifies `/config_dump` does NOT contain `"ListenersConfigDump"` on a CDS-only bootstrap). When present with **both** LDS+CDS configured, it lands at `configs[2]` on **both** proxies — **AFTER** the `ClustersConfigDump` at `configs[1]` (Envoy's verified order: `BootstrapConfigDump`[0], `ClustersConfigDump`[1], `ListenersConfigDump`[2], …; fixture 0026's `configs[1]` Clusters assertion needs NO amendment). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.ListenersConfigDump", "dynamic_listeners": [ { "name": "dynamic_listener", "active_state": { "listener": { "@type": "type.googleapis.com/envoy.config.listener.v3.Listener", <full listener config> }, "last_updated": <ISO-8601> } } ], "static_listeners": [ … when non-empty ] }`. **Note the DIFFERENT nesting from the CDS dump:** the listener is nested under `dynamic_listeners[].active_state.listener` (vs the CDS dump's flatter `dynamic_active_clusters[].cluster`), and each entry carries a top-level `name` key. **No `version_info` key** — `active_state` has NO `version_info` (file-based LDS; the LDS file had none — proto3 JSON omits empty fields). **Empty-key omission:** `static_listeners` and `dynamic_listeners` are each `skip_serializing_if = Vec::is_empty` — a static-only Envoy emits the entry with ONLY `static_listeners`. `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Bilateral anchor (fixture 0027):** `configs.2.dynamic_listeners.0.name == dynamic_listener` (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array otherwise differs per side — `value_may_differ_keys: ["configs"]`. **Known narrowing (LDS-only bootstrap):** on an LDS-only (no-CDS) bootstrap, envoy-rust's Listeners entry would land at `configs[1]` vs Envoy's `configs[2]` (Envoy emits a `ClustersConfigDump` for static clusters unconditionally, occupying `[1]`; envoy-rust's `ClustersConfigDump` is CDS-conditional per phase-18 L10, so it is absent and Listeners shifts up). Fixture 0027 configures BOTH LDS+CDS so the indices align at `[2]`; the divergence is recorded for any future LDS-only fixture (none exercises it today). |
 | `/server_info` | GET | JSON object | Required keys `state`, `version`, `node`, `uptime_current_epoch_seconds`, `uptime_all_epochs_seconds`, `hot_restart_version`, `command_line_options`. `state` value-exact, sourced from `DrainState::current()` via the mapping `Live | HealthcheckFailing → "LIVE"`, `Draining → "DRAINING"` (08.1 emitted the literal constant `"LIVE"` as a placeholder; 08.2's D5e patches the value-binding source at Task 5 — the struct shape is unchanged at the 08.1 → 08.2 boundary); `node.*` value-exact from the parsed bootstrap; `version` + `hot_restart_version` + `command_line_options` allowlist-each-side (envoy-rust emits its own version string; Envoy emits its own); `uptime_*` name-required-value-may-differ (wall clock). |
 | `/clusters` | GET | text/plain | Set-equal `<cluster_name>::observability_name::<name>` + `<cluster_name>::default_priority::endpoints` lines per Envoy v1.33's plain-text format. Per-endpoint numeric fields (success/error/timeout counts) name-required-value-may-differ; envoy-rust at 08.1 emits only the minimum two lines per cluster (architecture-decision lock-in #10) — Envoy's richer output is allow-listed envoy-only on fixture 0014. Cluster output order is deterministic by name (sorted in `ClusterManager::clusters()`). |
-| `/listeners` | GET | text/plain | Set-equal `<listener_name>::<address>:<port>` lines. Order: sorted-by-name (deterministic on both sides). |
+| `/listeners` | GET | text/plain | Set-equal `<listener_name>::<address>:<port>` lines. Order: sorted-by-name (deterministic on both sides). **LDS extension (phase 19, L5/ADR-0050):** LDS-supplied listeners appear in the output alongside static ones — envoy-rust migrated the endpoint to enumerate the merged `all_listeners()` set (static + LDS-delivered), so fixture 0027's `dynamic_listener` line is emitted on both sides. The per-side address shapes are **prefix-matched** (Envoy binds `dynamic_listener::0.0.0.0:<port>`; envoy-rust binds `dynamic_listener::127.0.0.1:<kernel-ephemeral>`) — the differential harness matches on the `dynamic_listener::` line prefix bilaterally with per-side `allowlist_*_line_prefixes` for the address+port tail. |
 | `/drain_listeners` | POST | empty | Status 200; empty body (`content-length: 0`); effect-only endpoint. Invokes `DrainState::drain()`. Sticky — repeat POSTs are idempotent. Both proxies emit 200 OK on first AND subsequent POSTs. |
 | `/healthcheck/fail` | POST | empty | Status 200; empty body; effect-only endpoint. Invokes `DrainState::fail_healthcheck()`. Flips `/ready` to 503 (per parent-08 SPEC §5.5 wire-state mapping); `/server_info.state` stays `"LIVE"` (server-state is independent of healthcheck-failure). |
 | `/healthcheck/ok` | POST | empty | Status 200; empty body; effect-only endpoint. Invokes `DrainState::ok_healthcheck()`. Restores from `HealthcheckFailing` → `Live`. Sticky-drain: `/healthcheck/ok` AFTER `/drain_listeners` does NOT un-drain (the `HealthcheckFailing → Live` compare_exchange fails silently against the `Draining` state). |
@@ -514,6 +542,105 @@ remains **deferred to the gRPC-xDS phase**, which also **supersedes ADR-0014**
 (the YAML-native typed-config shim) per ADR-0048. The intro blockquote above
 describes that machine; phase 18 populates only the filesystem transport, which
 has no on-the-wire message sequence (it is a synchronous file read).
+
+### Filesystem transport (`path_config_source`) — phase 19 LDS extension
+
+> The xDS-family continuation (ADR-0050 SPEC / PLAN). file-based LDS loads
+> listeners from `dynamic_resources.lds_config.path_config_source.path` at
+> startup. The lock-ins below (L1–L10) are the §6.2 empirical findings, verified
+> against `envoyproxy/envoy:v1.33.0` (digest `sha256:56da5afd…`, 2026-06-02) and
+> reconciled by ADR-0050; what is bilaterally asserted lives in fixture 0027, the
+> negative/fatal paths + the static/dynamic collision live in the in-process
+> backstop (`crates/envoy-bin/tests/xds_file_based_lds.rs`). The LDS transport
+> mirrors the phase-18 CDS transport structurally — the per-finding letters below
+> intentionally parallel the CDS §(a)–(f).
+
+**(a) The LDS file envelope (L1).** Same dual-envelope posture as CDS: both the
+bare `resources:` list AND the full `DiscoveryResponse` shape (`version_info` +
+`resources`) are accepted; Envoy treats `version_info` as load-bearing, envoy-rust
+accepts-and-ignores it. Each resource MUST carry an `@type` (omitting it → Envoy
+`lds.update_failure: 1`); LDS files carry **Listener** resources only, with the
+type URL `type.googleapis.com/envoy.config.listener.v3.Listener`. envoy-rust's
+`parse_lds_file` is **always-YAML** (`serde_yaml`, regardless of extension — the
+same strictly-more-lenient stance as `parse_cds_file`; the Envoy-side container
+path is structurally `.yaml`) and **requires** the `@type` per resource (the
+ADR-0014 internally-tagged-on-`@type` pattern; a non-Listener `@type` rejects
+loudly).
+
+**(b) Initial-load / readiness ordering (L2).** Readiness implies loaded on both
+proxies; the dynamic listener accepts connections the instant `/ready` first
+returns 200. Envoy's startup log order with zero static listeners +
+both LDS+CDS configured: `loading 0 listener(s)` → cds init → `cds: add N
+cluster(s)` → `cm init: all clusters initialized` → `lds: add/update listener
+'dynamic_listener'` → `all dependencies initialized. starting workers`.
+**Clusters initialize BEFORE listeners are added** — this mirrors the §5.7
+merge-ordering invariant (the dynamic listener's route_config can reference the
+CDS-supplied cluster only because clusters land first). envoy-rust mirrors
+naturally: `load_dynamic_resources` runs **synchronously** (CDS merge then LDS
+merge, before listeners bind), so the sync-load order reproduces Envoy's
+cds→clusters→lds→workers sequence. No settle/timing machinery is needed; fixture
+0027's two GETs fire after readiness.
+
+**(c) Negative-path disposition (L4) — recorded divergence (ADR-0050).** Envoy's
+LDS disposition is the **same 3-way split** as its CDS split:
+
+| LDS load fault | Envoy | envoy-rust |
+|---|---|---|
+| Nonexistent `path` | hard startup failure (container exits non-zero; `paths must refer to an existing path in the system` — a bootstrap-level PGV check) | **FATAL** (process exits) — agrees with Envoy on this one class (backstop path (ii)) |
+| File exists, malformed YAML / missing `@type` | **starts and serves** (`/ready` 200), `listener_manager.lds.update_failure: 1` | **FATAL** (process exits) — **diverges** (backstop path (iii)) |
+| Valid YAML, semantically-invalid listener (PGV violation) | starts and serves, `lds.update_rejected: 1` ticks (NOT `update_failure`) | **FATAL** (process exits) — **diverges** (backstop path (iv)) |
+| Unknown field inside a resource | **warn-accepted** (lenient protobuf parsing) | **FATAL** (`deny_unknown_fields`; process exits) — **diverges** |
+
+envoy-rust treats **ALL LDS load errors as FATAL at startup** — the ADR-0049
+decision-2 all-fatal posture extended to LDS (pre-ratified by ADR-0050): missing/
+unreadable file, malformed YAML, missing `@type`, unknown fields, per-listener
+validation failure all exit the process before construction completes.
+**Consequence for the stats contract:** `listener_manager.lds.update_failure` and
+`listener_manager.lds.update_rejected` register at 0 and are **structurally
+unreachable non-zero** in envoy-rust. fixture 0027 asserts both at 0 bilaterally
+(satisfiable on both sides — a successful load); the negative paths are
+**backstop-only** (Envoy exits the process on a fatal LDS error, which the
+differential harness cannot observe as a data-plane response).
+
+**(d) Static/dynamic listener name collision: STATIC WINS (L7) — ADR-0050.** A
+listener defined both statically and in the LDS file: **both proxies keep the
+STATIC one and skip the LDS entry**; only the static listener's port binds, no
+error, no startup failure. Envoy: `lds.update_success` still ticks 1,
+`listener_added: 1`, `/config_dump` shows `static_listeners` only, no
+error/warning log. envoy-rust mirrors — on collision the dynamic listener is
+SKIPPED (with a `tracing::warn!`), the static listener wins. The backstop (path
+(v)) asserts the static listener's port serves while the LDS listener's port
+refuses connections, and `listener_added == 1` / `total_listeners_active == 1`.
+
+**(e) LDS+CDS composition + the LDS-route validation divergence (L6) — recorded
+divergence (ADR-0050).** The composition works on both proxies (both `/static`
+and `/dynamic` routes return 200). The `route_config` inside an LDS-supplied
+listener does **NOT** require `validate_clusters: false` on Envoy — **Envoy skips
+inline route-table cluster validation entirely for dynamically-delivered
+listeners** (no `validate_clusters` knob needed; the check that CDS-delivered
+static routes need suppressed simply does not run for LDS listeners). envoy-rust's
+posture is **UNCHANGED** from phase 18: dynamic-listener routes go through the
+same **defer-then-revalidate** enforcement (cluster-reference checks defer while
+`dynamic_resources` is configured-but-unloaded, then RE-ENFORCE post-merge inside
+`load_dynamic_resources` against the effective static+dynamic list). **Recorded
+narrow divergence:** an LDS-listener route to a cluster in **NEITHER** list
+**fails envoy-rust startup** (`UnknownCluster`), vs Envoy's start-and-runtime-503
+— extending ADR-0049 decision-4's class to LDS routes (per ADR-0050 / SPEC §5.7).
+`node.id` + `node.cluster` apply identically (both fixture sides carry a `node:`
+block).
+
+**(f) L10 conditionality narrowing (recorded divergence — ADR-0050).** On the
+fixture-0026 topology (CDS configured, NO `lds_config`): Envoy emits ZERO
+`listener_manager.lds.*` names but DOES emit the base `listener_manager.*` names
+(`listener_added`, `listener_create_success`, `total_listeners_active`,
+`workers_started`) **unconditionally**, AND a `ListenersConfigDump` entry for the
+static-only listeners (at `configs[2]`). envoy-rust **gates both** on `lds_config`:
+the 4 `lds.*` names + the base `listener_added` register only with `lds_config`
+configured, and the `ListenersConfigDump` entry is emitted only with `lds_config`
+configured (`total_listeners_active` is the sole exception — unconditional, per
+its 08.2 registration). The backstop's inertness path (vi) verifies this on a
+CDS-only bootstrap: no `lds.*` names, no `listener_added`, and `/config_dump` does
+NOT contain `"ListenersConfigDump"`.
 
 ---
 
