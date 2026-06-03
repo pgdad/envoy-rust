@@ -1,0 +1,127 @@
+# Phase 19 fixture-0027 expectations: file-based LDS (ADR-0050 SPEC / PLAN) —
+# the xDS-family continuation. Envoy's documented canonical LDS+CDS
+# filesystem-dynamic-config topology, bilaterally asserted. The bootstrap
+# carries ZERO static listeners (L2); the H1 HCM listener exists ONLY because
+# each proxy loaded `dynamic_resources.lds_config.path_config_source.path` at
+# boot. TWO GETs over ONE H1 keep-alive conn (Driver::Http1KeepAlive):
+#
+#   GET /static  -> routed to cluster `static_backend`  (a STATIC cluster) ->
+#       200. Probe 1 discriminates LDS-loaded from not-loaded INDEPENDENTLY of
+#       CDS: a proxy that ignored `dynamic_resources.lds_config` would have NO
+#       listener at all and the connect would be refused (or the route would
+#       404 if the listener existed but the LDS route_config did not). The
+#       static cluster keeps this probe orthogonal to CDS.
+#   GET /dynamic -> routed to cluster `dynamic_backend` (the CDS-supplied
+#       cluster) -> 200. Probe 2 proves the §5.7 composition: a request whose
+#       listener AND cluster BOTH exist only in dynamic-resource files.
+#
+# Both probes' `expected_body` assert the echoed body byte-exact on EACH side
+# independently. With identical request inputs (the Envoy-side LDS file's
+# `request_headers_to_remove` strips the proxy-injected headers so both sides
+# forward the same request to the echo helper) this pins the data-plane wire
+# shape. `require_header_present: x-envoy-upstream-service-time` asserts both
+# proxies emit the router timing header (presence-only; the value differs).
+#
+# expected_stats (L3): the conditional `listener_manager.lds.*` family
+# (attempt/success 1/1, failure/rejected 0/0) + `listener_added` 1 +
+# `total_listeners_active` 1, alongside the fixture-0026 CDS family
+# (cluster_manager.cds.* 1/1/0/0) with cluster_added/active 2/2 (TWO clusters
+# now: the static `static_backend` + the CDS `dynamic_backend`), plus the
+# per-cluster upstream + HCM downstream counters.
+#
+# NOT asserted (intentional — see README "L3 Envoy-only stat enumeration"):
+# Envoy v1.33 also emits a large `listener_manager.*` family that envoy-rust
+# does not emit at this scope — notably the PER-WORKER
+# `listener_manager.<...>.listener_create_success` / `.listener_in_place_*` /
+# `.listener_modified` / `.listener_removed` / `.listener_stopped` /
+# `.lds.version` / `.lds.control_plane.*` / `.total_listeners_{warming,draining}`
+# names. The named-stat scrape asserts only the six lock-in #L3 names (no
+# set-diff), so the Envoy-only family is ignored rather than allow-listed.
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /static
+      host: static_backend
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "method: GET\npath: /static\nheaders:\n  host: static_backend\nbody: \n" }
+      require_header_present: x-envoy-upstream-service-time
+    - method: GET
+      path: /dynamic
+      host: dynamic_backend
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "method: GET\npath: /dynamic\nheaders:\n  host: dynamic_backend\nbody: \n" }
+      require_header_present: x-envoy-upstream-service-time
+  settle_ms: 200
+  expected_stats:
+    # LDS load (L3 — conditional listener_manager.lds.* + listener_added/active):
+    - { name: listener_manager.lds.update_attempt,  value: 1 }
+    - { name: listener_manager.lds.update_success,  value: 1 }
+    - { name: listener_manager.lds.update_failure,  value: 0 }
+    - { name: listener_manager.lds.update_rejected, value: 0 }
+    - { name: listener_manager.listener_added,      value: 1 }
+    - { name: listener_manager.total_listeners_active, value: 1 }
+    # CDS load (the fixture-0026 family; cluster_added/active are 2 here — the
+    # static `static_backend` + the CDS `dynamic_backend`):
+    - { name: cluster_manager.cds.update_attempt,  value: 1 }
+    - { name: cluster_manager.cds.update_success,  value: 1 }
+    - { name: cluster_manager.cds.update_failure,  value: 0 }
+    - { name: cluster_manager.cds.update_rejected, value: 0 }
+    - { name: cluster_manager.cluster_added,       value: 2 }
+    - { name: cluster_manager.active_clusters,     value: 2 }
+    # Data-plane through each cluster (probe 1 -> static_backend, probe 2 ->
+    # dynamic_backend):
+    - { name: cluster.static_backend.upstream_rq_total,  value: 1 }
+    - { name: cluster.static_backend.upstream_cx_total,  value: 1 }
+    - { name: cluster.dynamic_backend.upstream_rq_total, value: 1 }
+    - { name: cluster.dynamic_backend.upstream_cx_total, value: 1 }
+    # HCM downstream (stat_prefix ingress_http1; both probes over one conn):
+    - { name: http.ingress_http1.downstream_rq_total, value: 2 }
+    - { name: http.ingress_http1.downstream_rq_2xx,   value: 2 }
+  admin_scrapes:
+    # /config_dump (L5): with BOTH lds_config AND cds_config present, the
+    # config order is Bootstrap[0], Clusters[1], Listeners[2]. The conditional
+    # ListenersConfigDump lands at configs[2] on BOTH sides; its first
+    # dynamic_listeners entry's name is the LDS-supplied `dynamic_listener`.
+    - path: /config_dump
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["configs"]
+        required_subtree:
+          path: configs.2.dynamic_listeners.0.name
+          expected: dynamic_listener
+        value_may_differ_keys: ["configs"]
+    # /config_dump (fixture-0026 compatibility check): the ClustersConfigDump
+    # still lands at configs[1]; its first dynamic_active_clusters entry's
+    # cluster.name is the CDS-supplied `dynamic_backend`.
+    - path: /config_dump
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["configs"]
+        required_subtree:
+          path: configs.1.dynamic_active_clusters.0.cluster.name
+          expected: dynamic_backend
+        value_may_differ_keys: ["configs"]
+    # /listeners (L5): both proxies emit exactly one line per listener,
+    # `<name>::<address>:<port>`. envoy binds `0.0.0.0:<port>`; envoy-rust
+    # binds `127.0.0.1:<kernel-ephemeral>`. Match on prefix on both sides;
+    # the per-side address+port shape lands in the per-side
+    # `allowlist_*_line_prefixes`.
+    - path: /listeners
+      expected_status: 200
+      expected_content_type: "text/plain"
+      expected_body_rule:
+        kind: text_lines
+        required_lines: []
+        required_line_prefixes:
+          - "dynamic_listener::"
+        allowlist_envoy_only_lines: []
+        allowlist_envoy_rust_only_lines: []
+        allowlist_envoy_only_line_prefixes:
+          - "dynamic_listener::0.0.0.0:"
+        allowlist_envoy_rust_only_line_prefixes:
+          - "dynamic_listener::127.0.0.1:"

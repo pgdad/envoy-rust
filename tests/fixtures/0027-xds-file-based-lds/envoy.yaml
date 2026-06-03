@@ -1,0 +1,25 @@
+node: { id: envoy-rust-phase-19-fixture-0027, cluster: envoy-rust-phase-19 }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: {{ADMIN_PORT}} } } }
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: {{LDS_PATH}}
+  cds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: {{CDS_PATH}}
+static_resources:
+  # ZERO static listeners (L2: the listener arrives from the LDS file).
+  clusters:
+    - name: static_backend
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: static_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{BACKEND_HOST}}, port_value: {{HTTP1_BACKEND_PORT}} }
