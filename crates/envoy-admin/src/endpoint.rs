@@ -582,9 +582,7 @@ pub(crate) fn render_listeners(handler: &crate::handler::AdminHandler) -> envoy_
     // + `port_value: u16`.
     let mut lines: Vec<(String, String)> = handler
         .bootstrap()
-        .static_resources
-        .listeners
-        .iter()
+        .all_listeners()
         .map(|l| {
             (
                 l.name.clone(),
@@ -1465,6 +1463,71 @@ static_resources:
         assert!(
             alpha_pos < zebra_pos,
             "alpha should sort before zebra; body was: {body:?}"
+        );
+    }
+
+    // 19 D3: `/listeners` iterates `all_listeners()` (static + dynamic), so a
+    // bootstrap carrying `dynamic_listeners: Some(vec![dyn_l])` surfaces the
+    // dynamic listener in the body.
+    #[test]
+    fn listeners_body_includes_dynamic_listeners() {
+        use crate::config::AdminConfig;
+        use crate::handler::AdminHandler;
+        use envoy_cluster::ClusterManager;
+        use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        // A bootstrap with ZERO static listeners; the LDS-supplied listener
+        // `dyn_l` lives only in `dynamic_listeners`.
+        let mut bootstrap: Bootstrap = serde_yaml::from_str(TINY_BOOTSTRAP).expect("yaml parses");
+        let dyn_l: envoy_config::Listener = serde_yaml::from_str(
+            "name: dyn_l
+address:
+  socket_address:
+    address: 127.0.0.1
+    port_value: 7777
+filter_chains:
+- filters:
+  - name: envoy.filters.network.tcp_proxy
+    typed_config:
+      \"@type\": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+      stat_prefix: d
+      cluster: c
+",
+        )
+        .expect("dynamic listener parses");
+        bootstrap.dynamic_listeners = Some(vec![dyn_l]);
+
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        let handler = AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+        );
+
+        let resp = AdminEndpoint::Listeners.render_with(&handler);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(
+            body.contains("dyn_l::127.0.0.1:7777\n"),
+            "dynamic listener must appear in /listeners body; body was: {body:?}"
         );
     }
 }

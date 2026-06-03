@@ -541,54 +541,116 @@ pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
     Ok(bootstrap)
 }
 
-/// 18 D3: read + parse + merge the CDS file (ADR-0048/ADR-0049). Called by
-/// envoy-bin AFTER `parse_bootstrap` and BEFORE any consumer iterates clusters.
-/// No-op when `dynamic_resources.cds_config` is unconfigured. ALL failures are
-/// fatal (the L4 reconciliation — envoy-rust never warn-and-serves a broken
-/// CDS file; recorded divergence vs Envoy, BEHAVIOR_CONTRACT).
+/// 18 D3 / 19 D3: read + parse + merge the CDS and LDS files (ADR-0048/0049/0050).
+/// Called by envoy-bin AFTER `parse_bootstrap` and BEFORE any consumer iterates
+/// clusters or listeners. No-op when neither `dynamic_resources.cds_config` nor
+/// `dynamic_resources.lds_config` is configured. ALL failures are fatal (the L4
+/// reconciliation — envoy-rust never warn-and-serves a broken CDS/LDS file;
+/// recorded divergence vs Envoy, BEHAVIOR_CONTRACT).
+///
+/// §5.7 merge ordering: the CDS branch merges dynamic CLUSTERS into
+/// `dynamic_clusters` BEFORE the single post-merge re-validation, so that when
+/// that re-validation checks a dynamic LISTENER's route→cluster references, the
+/// dynamic cluster is already visible via `all_clusters()`. The LDS branch then
+/// merges dynamic LISTENERS, and exactly ONE `bootstrap::validate()` runs after
+/// BOTH branches — never one validate per branch.
+///
+/// L6 recorded divergence: a dynamic-listener route to a cluster in NEITHER the
+/// static nor the dynamic list is FATAL here (`UnknownCluster`), diverging from
+/// Envoy (which would start and 503 at runtime). This is intentional and
+/// pre-ratified (defer-then-revalidate).
+///
+/// M18-1 on-error mutation caveat: this function mutates `dynamic_clusters` /
+/// `dynamic_listeners` IN PLACE before the post-merge `validate()`. If that
+/// validate (or a later branch) errors, those fields stay populated — the
+/// caller MUST treat any error as fatal-startup and discard the bootstrap, NOT
+/// retry against the partially-mutated value.
 ///
 /// Deliberately NOT called by `parse_bootstrap`: `parse_bootstrap` is the fuzz
 /// target and must stay pure (no file I/O).
 pub fn load_dynamic_resources(bootstrap: &mut Bootstrap) -> Result<(), ConfigError> {
+    // ---- CDS branch (phase 18, ADR-0048/0049) ----
     // Clone the path early and drop the `&bootstrap` borrow before the later
     // `&mut bootstrap` mutation.
-    let Some(path) = bootstrap
+    let cds_path = bootstrap
         .dynamic_resources
         .as_ref()
         .and_then(|dr| dr.cds_config.as_ref())
-        .map(|cs| cs.path_config_source.path.clone())
-    else {
-        return Ok(());
-    };
-    let contents = std::fs::read_to_string(&path).map_err(|source| ConfigError::CdsFileError {
-        path: path.clone(),
-        source,
-    })?;
-    let parsed = cds::parse_cds_file(&path, &contents)?;
-    // L9 (ADR-0049): static wins on name collision — the dynamic duplicate is
-    // skipped with a warning, mirroring Envoy's "skipped N unmodified cluster(s)".
-    let mut dynamic = Vec::with_capacity(parsed.len());
-    for cluster in parsed {
-        if bootstrap
-            .static_resources
-            .clusters
-            .iter()
-            .any(|c| c.name == cluster.name)
-        {
-            tracing::warn!(cluster = %cluster.name, "CDS cluster collides with a static cluster; static wins (skipped)");
-            continue;
+        .map(|cs| cs.path_config_source.path.clone());
+    if let Some(path) = cds_path {
+        let contents =
+            std::fs::read_to_string(&path).map_err(|source| ConfigError::CdsFileError {
+                path: path.clone(),
+                source,
+            })?;
+        let parsed = cds::parse_cds_file(&path, &contents)?;
+        // L9 (ADR-0049): static wins on name collision — the dynamic duplicate is
+        // skipped with a warning, mirroring Envoy's "skipped N unmodified cluster(s)".
+        let mut dynamic = Vec::with_capacity(parsed.len());
+        for cluster in parsed {
+            if bootstrap
+                .static_resources
+                .clusters
+                .iter()
+                .any(|c| c.name == cluster.name)
+            {
+                tracing::warn!(cluster = %cluster.name, "CDS cluster collides with a static cluster; static wins (skipped)");
+                continue;
+            }
+            // Intra-file duplicates: first wins, warn, skip.
+            if dynamic.iter().any(|c: &Cluster| c.name == cluster.name) {
+                tracing::warn!(cluster = %cluster.name, "duplicate cluster in CDS file; first wins (skipped)");
+                continue;
+            }
+            dynamic.push(cluster);
         }
-        // Intra-file duplicates: first wins, warn, skip.
-        if dynamic.iter().any(|c: &Cluster| c.name == cluster.name) {
-            tracing::warn!(cluster = %cluster.name, "duplicate cluster in CDS file; first wins (skipped)");
-            continue;
-        }
-        dynamic.push(cluster);
+        bootstrap.dynamic_clusters = Some(dynamic);
     }
-    bootstrap.dynamic_clusters = Some(dynamic);
-    // Post-merge re-validation: cds_configured_but_unloaded() is now false, so
-    // the deferred cluster-reference checks (UnknownCluster + the H2-from-H1
-    // gate) re-run with full enforcement against the effective cluster list.
-    bootstrap::validate(bootstrap)?;
+
+    // ---- LDS branch (phase 19, ADR-0050; §6.2 L1/L4/L7) ----
+    let lds_path = bootstrap
+        .dynamic_resources
+        .as_ref()
+        .and_then(|dr| dr.lds_config.as_ref())
+        .map(|cs| cs.path_config_source.path.clone());
+    if let Some(path) = lds_path {
+        let contents =
+            std::fs::read_to_string(&path).map_err(|source| ConfigError::LdsFileError {
+                path: path.clone(),
+                source,
+            })?;
+        let parsed = lds::parse_lds_file(&path, &contents)?;
+        // L7: static wins on listener name collision; intra-file first wins.
+        let mut dynamic = Vec::with_capacity(parsed.len());
+        for listener in parsed {
+            if bootstrap
+                .static_resources
+                .listeners
+                .iter()
+                .any(|l| l.name == listener.name)
+            {
+                tracing::warn!(listener = %listener.name, "LDS listener collides with a static listener; static wins (skipped)");
+                continue;
+            }
+            if dynamic.iter().any(|l: &Listener| l.name == listener.name) {
+                tracing::warn!(listener = %listener.name, "duplicate listener in LDS file; first wins (skipped)");
+                continue;
+            }
+            dynamic.push(listener);
+        }
+        bootstrap.dynamic_listeners = Some(dynamic);
+    }
+
+    // ---- §5.7: ONE post-merge re-validation after BOTH merges ----
+    // cds_configured_but_unloaded() / lds_configured_but_unloaded() are now
+    // false (both side-fields are Some when their config source is set), so the
+    // deferred cluster-reference checks (UnknownCluster + the H2-from-H1 gate)
+    // and the deferred NoRuntime gate re-enforce against the full effective
+    // state. A dynamic-listener route may reference a dynamic cluster (resolved
+    // because CDS merged above); a reference to a cluster in NEITHER list is
+    // fatal (the L6 recorded divergence vs Envoy's runtime-503).
+    if bootstrap.dynamic_clusters.is_some() || bootstrap.dynamic_listeners.is_some() {
+        bootstrap::validate(bootstrap)?;
+    }
     Ok(())
 }

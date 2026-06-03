@@ -2045,7 +2045,25 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
     }
 
     // Per-listener invariants.
-    for listener in &mut bootstrap.static_resources.listeners {
+    //
+    // 19 D3 (§5.3/§5.7): dynamic listeners go through the SAME validation
+    // gauntlet as static listeners (HCM shape, route→cluster references against
+    // the merged `effective_clusters` snapshot, TLS checks, the H2-from-H1
+    // gate). At parse time `dynamic_listeners` is None (the chain is empty); at
+    // the post-merge re-validation inside `load_dynamic_resources` it covers the
+    // LDS-supplied listeners. `static_resources.listeners` and
+    // `dynamic_listeners` are disjoint `Bootstrap` fields (and disjoint from the
+    // cluster fields already borrowed by `effective_clusters`), so this chained
+    // `&mut` iterator borrows cleanly. When `dynamic_listeners` is None the
+    // chain is exactly the static loop (existing behavior unchanged).
+    let (static_listeners, dynamic_listeners) = (
+        &mut bootstrap.static_resources.listeners,
+        &mut bootstrap.dynamic_listeners,
+    );
+    for listener in static_listeners
+        .iter_mut()
+        .chain(dynamic_listeners.iter_mut().flatten())
+    {
         for chain in &mut listener.filter_chains {
             // Snapshot per-chain TLS state for `validate_hcm`'s D2.a check
             // (phase 05.2 SPEC §3 — reject `codec_type: HTTP2` on TLS chains).
@@ -6618,6 +6636,309 @@ admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
         let mut b = crate::parse_bootstrap(&yaml).unwrap();
         let err = crate::load_dynamic_resources(&mut b).unwrap_err();
         assert!(matches!(err, crate::ConfigError::UnknownCluster(ref c) if c == "no_such_cluster"));
+    }
+
+    // ── 19 D3: LDS load branch + §5.7 merge ordering ──────────────────────────
+
+    /// An LDS file body (the `resources:` envelope with one @type-tagged
+    /// Listener named `lds_listener`, an HCM routing `/` to `route_cluster`).
+    /// `valid_http_filters = true` emits a valid router-terminated chain;
+    /// `false` emits an EMPTY `http_filters: []` (parses, but `validate_hcm`
+    /// rejects it — proving the per-listener validation loop covers dynamic
+    /// listeners). `http_filters` is a required field on the HCM struct, so it
+    /// must be PRESENT (an empty list) rather than omitted, which would fail at
+    /// parse time, not validation.
+    fn lds_file(route_cluster: &str, valid_http_filters: bool) -> String {
+        let http_filters = if valid_http_filters {
+            r#"        http_filters:
+        - name: envoy.filters.http.router
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#
+        } else {
+            "        http_filters: []\n"
+        };
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+  name: lds_listener
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 10000 }}
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.http_connection_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+        stat_prefix: ingress_http
+        codec_type: HTTP1
+        route_config:
+          name: rc
+          validate_clusters: false
+          virtual_hosts:
+          - name: vh
+            domains: ["*"]
+            routes:
+            - match: {{ prefix: "/" }}
+              route: {{ cluster: {route_cluster} }}
+{http_filters}"#
+        )
+    }
+
+    /// An LDS file defining a listener with the GIVEN name (collision tests).
+    fn lds_file_named(listener_name: &str) -> String {
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+  name: {listener_name}
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 10001 }}
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.tcp_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+        stat_prefix: t
+        cluster: static_c
+"#
+        )
+    }
+
+    /// A bootstrap with a static `static_c` cluster, ZERO static listeners, an
+    /// admin block (satisfies NoRuntime), and an `lds_config` at `lds_path`.
+    /// (CDS is left unconfigured.)
+    fn bootstrap_yaml_with_lds(lds_path: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }} }}
+static_resources:
+  clusters:
+    - name: static_c
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: static_c
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: {{ address: 127.0.0.1, port_value: 8200 }}
+  listeners: []
+dynamic_resources:
+  lds_config:
+    path_config_source: {{ path: {lds_path} }}
+"#
+        )
+    }
+
+    /// A bootstrap with NO admin and ZERO static listeners (so NoRuntime is in
+    /// play), a static `static_c` cluster, and an `lds_config` at `lds_path`.
+    fn bootstrap_yaml_with_lds_no_admin(lds_path: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+static_resources:
+  clusters:
+    - name: static_c
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: static_c
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: {{ address: 127.0.0.1, port_value: 8200 }}
+  listeners: []
+dynamic_resources:
+  lds_config:
+    path_config_source: {{ path: {lds_path} }}
+"#
+        )
+    }
+
+    /// A bootstrap with BOTH cds_config and lds_config: a static `static_c`
+    /// cluster, zero static listeners, admin, CDS at `cds_path`, LDS at
+    /// `lds_path`. (§5.7 composition — a dynamic listener may route to a
+    /// dynamic cluster.)
+    fn bootstrap_yaml_with_cds_and_lds(cds_path: &str, lds_path: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }} }}
+static_resources:
+  clusters: []
+  listeners: []
+dynamic_resources:
+  cds_config:
+    path_config_source: {{ path: {cds_path} }}
+  lds_config:
+    path_config_source: {{ path: {lds_path} }}
+"#
+        )
+    }
+
+    /// A bootstrap with ONE static listener named `x` (a trivial tcp_proxy
+    /// chain), a static `static_c` cluster, admin, and an `lds_config` at
+    /// `lds_path` (collision test — static `x` vs LDS `x`).
+    fn bootstrap_yaml_static_listener_and_lds(static_listener: &str, lds_path: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }} }}
+static_resources:
+  clusters:
+    - name: static_c
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: static_c
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: {{ address: 127.0.0.1, port_value: 8200 }}
+  listeners:
+    - name: {static_listener}
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: t
+                cluster: static_c
+dynamic_resources:
+  lds_config:
+    path_config_source: {{ path: {lds_path} }}
+"#
+        )
+    }
+
+    // (a) the LDS branch loads.
+    #[test]
+    fn lds_branch_loads_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        std::fs::write(&lds_path, lds_file("static_c", true)).unwrap();
+        let yaml = bootstrap_yaml_with_lds(lds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        assert!(b.dynamic_listeners.is_none());
+        crate::load_dynamic_resources(&mut b).unwrap();
+        assert_eq!(b.dynamic_listeners.as_ref().unwrap().len(), 1);
+        assert_eq!(b.all_listeners().count(), 1);
+        assert_eq!(b.all_listeners().next().unwrap().name, "lds_listener");
+    }
+
+    // (b) missing LDS file is fatal.
+    #[test]
+    fn missing_lds_file_is_fatal() {
+        let yaml = bootstrap_yaml_with_lds("/nonexistent/lds.yaml");
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(matches!(err, crate::ConfigError::LdsFileError { .. }));
+    }
+
+    // (c) malformed LDS file is fatal.
+    #[test]
+    fn malformed_lds_file_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        std::fs::write(&lds_path, "resources: [unclosed").unwrap();
+        let yaml = bootstrap_yaml_with_lds(lds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(matches!(err, crate::ConfigError::LdsParseError { .. }));
+    }
+
+    // (d) the §5.7 composition resolves: a dynamic listener routes to a dynamic
+    // cluster (CDS merged BEFORE the single post-merge re-validation).
+    #[test]
+    fn dynamic_listener_route_to_dynamic_cluster_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        // MINIMAL_CDS defines cluster `dynamic_backend`.
+        std::fs::write(&cds_path, MINIMAL_CDS).unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        // The LDS listener routes to `dynamic_backend` — supplied ONLY by CDS.
+        std::fs::write(&lds_path, lds_file("dynamic_backend", true)).unwrap();
+        let yaml =
+            bootstrap_yaml_with_cds_and_lds(cds_path.to_str().unwrap(), lds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        crate::load_dynamic_resources(&mut b)
+            .expect("dynamic-listener route to a dynamic cluster must resolve (§5.7)");
+        assert_eq!(b.all_listeners().count(), 1);
+        assert!(b.all_clusters().any(|c| c.name == "dynamic_backend"));
+    }
+
+    // (e) unresolved dynamic-listener route is fatal (L6): a route to a cluster
+    // in NEITHER list → UnknownCluster, NOT a panic.
+    #[test]
+    fn dynamic_listener_unresolved_route_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        std::fs::write(&lds_path, lds_file("nope", true)).unwrap();
+        let yaml = bootstrap_yaml_with_lds(lds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnknownCluster(ref c) if c == "nope"),
+            "got {err:?}"
+        );
+    }
+
+    // (f) listener name collision — static wins (L7).
+    #[test]
+    fn lds_listener_name_collision_static_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        std::fs::write(&lds_path, lds_file_named("x")).unwrap();
+        let yaml = bootstrap_yaml_static_listener_and_lds("x", lds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        crate::load_dynamic_resources(&mut b).unwrap();
+        // The dynamic duplicate is SKIPPED (no error); static wins.
+        assert_eq!(b.dynamic_listeners.as_ref().unwrap().len(), 0);
+        assert_eq!(b.all_listeners().count(), 1);
+    }
+
+    // (g) dynamic listeners go through per-listener validation: an LDS listener
+    // with an invalid HCM (empty http_filters) → the existing validate_hcm
+    // error (EmptyHttpFilters), proving the per-listener loop covers dynamic
+    // listeners. (The HCM otherwise parses cleanly — the ONLY rejection trigger
+    // is the empty filter list, surfaced at the post-merge re-validation.)
+    #[test]
+    fn dynamic_listener_invalid_hcm_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        // Empty http_filters → validate_hcm rejects (EmptyHttpFilters).
+        std::fs::write(&lds_path, lds_file("static_c", false)).unwrap();
+        let yaml = bootstrap_yaml_with_lds(lds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::EmptyHttpFilters { ref listener } if listener == "lds_listener"),
+            "expected EmptyHttpFilters from the per-listener loop, got {err:?}"
+        );
+    }
+
+    // (h) post-merge NoRuntime enforcement: no admin + 0 static listeners + an
+    // EMPTY LDS resources list → NoRuntime (deferred at parse, enforced post-merge).
+    #[test]
+    fn empty_lds_no_admin_is_no_runtime_post_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        std::fs::write(&lds_path, "resources: []").unwrap();
+        let yaml = bootstrap_yaml_with_lds_no_admin(lds_path.to_str().unwrap());
+        // parse_bootstrap succeeds: the NoRuntime gate DEFERS while
+        // lds_configured_but_unloaded.
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(matches!(err, crate::ConfigError::NoRuntime), "got {err:?}");
     }
 
     #[test]

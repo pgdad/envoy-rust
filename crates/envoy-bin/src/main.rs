@@ -213,7 +213,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
-    if let Some(listener_cfg) = bootstrap.static_resources.listeners.first() {
+    if let Some(listener_cfg) = bootstrap.all_listeners().next() {
         // The validator guarantees `filter_chains.len() ≥ 1` and at least one
         // filter; we read the single first filter (phase 02.2 supports one
         // filter per chain). Phase 07's filter chain framework will iterate.
