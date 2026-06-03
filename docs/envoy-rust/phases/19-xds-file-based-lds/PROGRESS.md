@@ -95,3 +95,17 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — exact stat-name literals (no typos), `lds_config`-specific guard, all 5 values, total_listeners_active carve-out, call-site ordering (after registry + load), and all 3 tests verified by independent inspection; exact commit message.
 - **Code quality: Approve** — faithful literal CDS-template mirror; error idiom matches `Listener::bind`; `as u64` cast sound. Three stylistic Minors (guard polarity `.is_none()`+early-return vs CDS `.is_some()`-wrap; hand-built test `Bootstrap` — required because YAML round-trip won't populate the `#[serde(skip)]` side-field; `counter_value` lookup helper) — all justified, no change.
+
+---
+
+### Task 5 — COMPLETE (code commit `10c44ca25`, +436 single file, purely additive)
+
+**Implemented (TDD, RED→GREEN):** `ConfigDumpEntry::Listeners` variant (`@type` = `type.googleapis.com/envoy.admin.v3.ListenersConfigDump`) + 4 serializer structs (`StaticListenerEntry`/`DynamicListenerEntry`/`ListenerActiveState`/`TaggedListener`) mirroring the phase-18 CDS sibling, with the ONE intended divergence: the dynamic entry nests `dynamic_listeners[].active_state.{listener,last_updated}` (an extra level vs the CDS flat `dynamic_active_clusters[].cluster`); inner listener `@type` = `type.googleapis.com/envoy.config.listener.v3.Listener` via `#[serde(flatten)]`; NO `version_info` key (L5 ✧); both vecs `skip_serializing_if = Vec::is_empty`. `StaticListenerEntry` carries `last_updated` (matches Envoy's real static-listener shape; CDS's `StaticClusterEntry` has none). `render_config_dump`: conditional `Listeners` push gated on `lds_config.is_some()`, placed AFTER Clusters (configs[] order Bootstrap[0]/Clusters[1]/Listeners[2]); `last_updated` reuses the single shared render-time ISO-8601 value. 6 tests (a conditional-emission incl. cds-only inertness witness / b 3-entry order-lock + active_state nesting + no-version_info + ISO-8601 / c static_listeners-key-omission + inverse / d §5.5 Bootstrap separation).
+
+**Verification (quoted):**
+- `cargo test -p envoy-admin`: **86 passed; 0 failed** (6 new; the fixture-0014/0026 config_dump regression tests intact — zero deletions in the diff).
+- `cargo build --workspace --all-targets`: clean. `cargo build -p envoy-admin` (standalone): clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean. `cargo fmt --all -- --check`: clean.
+
+**Two-stage review:**
+- **Spec compliance: ✅** — exact type-URL strings, active_state nesting, no-version_info, `skip_serializing_if`, lds-specific gating, Clusters-before-Listeners ordering, shared ISO-8601 source; all 4 test groups genuine; no regression to existing config_dump tests (diff purely additive).
+- **Code quality: Approve** — faithful CDS-sibling mirror with exactly the intended divergences; healthy ~90 production / ~343 test line split. Minor test-helper/fixture duplication (`handler_from_bootstrap`/`parse_cluster`/`DYNAMIC_BACKEND_CLUSTER` re-copied — direct `Bootstrap` construction genuinely required since `handler_with_bootstrap` can't inject the `#[serde(skip)]` side-fields; consistent with the file's per-module self-containment convention) — a recurring M18-9-class extract-shared-helper item, left as-is.
