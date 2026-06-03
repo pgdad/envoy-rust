@@ -925,19 +925,23 @@ pub fn scan_needs_marker(sources: &[&str], marker: &str) -> bool {
     sources.iter().any(|s| s.contains(&token))
 }
 
-/// 18 Task 11 (ADR-0015, ADR-0049): decide whether the upstream Envoy container
-/// needs the `with_host("host.docker.internal", Host::HostGateway)` mapping. The
-/// flag is true exactly when the rendered upstream config references the
+/// 18 Task 11 (ADR-0015, ADR-0049); generalized to a slice in 19 Task 6
+/// (ADR-0050): decide whether the upstream Envoy container needs the
+/// `with_host("host.docker.internal", Host::HostGateway)` mapping. The flag is
+/// true exactly when ANY rendered upstream source references the
 /// `host.docker.internal` hostname — silent otherwise so fixtures 0001/0002 stay
-/// unchanged. The reference can live in the main config OR (fixture 0026, where
-/// the main config has zero static clusters and the backend endpoint is defined
-/// in the CDS file) in the rendered upstream CDS file. The CDS extension is
-/// required on Linux CI, where the host-gateway is wired via `--add-host`; macOS
-/// Docker Desktop resolves `host.docker.internal` natively, which is why missing
-/// the CDS site only surfaced as a CI-only 503.
-pub fn uses_host_gateway(upstream_main: &str, upstream_cds: Option<&str>) -> bool {
-    upstream_main.contains("host.docker.internal")
-        || upstream_cds.is_some_and(|cds| cds.contains("host.docker.internal"))
+/// unchanged. The reference can live in the main config (most fixtures), the
+/// rendered upstream CDS file (fixture 0026, where the main config has zero
+/// static clusters and the backend endpoint is defined in the CDS file), OR the
+/// rendered upstream LDS file (fixture 0027, where the HCM/route carrying the
+/// endpoint lives in the dynamically-loaded listener). The mapping is required
+/// on Linux CI, where the host-gateway is wired via `--add-host`; macOS Docker
+/// Desktop resolves `host.docker.internal` natively, which is why missing a
+/// rendered-source scan site only ever surfaced as a CI-only 503 (the phase-18
+/// escaped-to-CI Critical). Pass all rendered upstream sources (main + CDS +
+/// LDS, empty strings for absent ones) so no site is missed.
+pub fn uses_host_gateway(sources: &[&str]) -> bool {
+    sources.iter().any(|s| s.contains("host.docker.internal"))
 }
 
 /// 18 Task 6 (ADR-0049): scan a CDS rendition for any residual `{{MARKER}}`
@@ -2210,6 +2214,42 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let subject_cds_path = tmp.path().join("cds-subject.yaml");
     let subject_cds_path_str = subject_cds_path.to_string_lossy().into_owned();
 
+    // 19 Task 6 (ADR-0050): detect file-based LDS. When either main template
+    // references `{{LDS_PATH}}`, the fixture carries PER-SIDE LDS templates —
+    // `lds-envoy.yaml` (upstream) and `lds-envoy-rust.yaml` (subject). Unlike
+    // CDS (a single SHARED `cds.yaml` rendered twice), the LDS payload carries
+    // the HCM, whose Envoy-only fields (`generate_request_id`,
+    // `request_headers_to_remove`) the envoy-rust parser rejects — so the two
+    // sides need DIFFERENT LDS files, mirroring the `envoy.yaml`/
+    // `envoy-rust.yaml` main-config split. Each per-side file is rendered
+    // through that side's kv map (so `{{BACKEND_HOST}}`/`{{HTTP1_BACKEND_PORT}}`
+    // etc. get per-side values). A missing per-side file is a hard error
+    // naming the expected filename.
+    //   - upstream side: `{{LDS_PATH}}` → `LDS_CONTAINER_PATH` (a `.yaml`-
+    //     suffixed container constant per L1); the rendered upstream file is
+    //     copied into the container via `upstream::start(.., lds_file, ..)`.
+    //   - subject side: `{{LDS_PATH}}` → the host temp path of the rendered
+    //     subject LDS file (the subject runs as a host subprocess and reads
+    //     the file directly).
+    let needs_lds =
+        upstream_template.contains("{{LDS_PATH}}") || subject_template.contains("{{LDS_PATH}}");
+    let (upstream_lds_template, subject_lds_template): (Option<String>, Option<String>) =
+        if needs_lds {
+            let up = std::fs::read_to_string(fixture_dir.join("lds-envoy.yaml")).context(
+                "reading lds-envoy.yaml (fixture references {{LDS_PATH}}; \
+                 the upstream per-side LDS template)",
+            )?;
+            let subj = std::fs::read_to_string(fixture_dir.join("lds-envoy-rust.yaml")).context(
+                "reading lds-envoy-rust.yaml (fixture references {{LDS_PATH}}; \
+                 the subject per-side LDS template)",
+            )?;
+            (Some(up), Some(subj))
+        } else {
+            (None, None)
+        };
+    let subject_lds_path = tmp.path().join("lds-subject.yaml");
+    let subject_lds_path_str = subject_lds_path.to_string_lossy().into_owned();
+
     // Spawn a host-local backend if either template needs one. Holding the
     // backend in a binding outside the proxies' lifetime ensures the child
     // process outlives the fixture run; Drop fires after `run_fixture`'s
@@ -2240,7 +2280,17 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // CDS template (empty string when no `cds.yaml`) into every `needs_*`
     // check below via `scan_needs_marker`.
     let cds_scan = cds_template.as_deref().unwrap_or("");
-    let backend_scan_sources: [&str; 3] = [&upstream_template, &subject_template, cds_scan];
+    // 19 Task 6 (ADR-0050): the combined backend-launch scan must ALSO cover the
+    // rendered LDS source (fixture 0027 places its backend markers ONLY in the
+    // dynamically-loaded listener's HCM/route). The upstream LDS TEMPLATE (pre-
+    // render) is scanned for the `{{MARKER}}` tokens — `scan_needs_marker` looks
+    // for the literal `{{...}}` form, which is present in the unrendered
+    // template. This is the same carryforward-disposition-2 bug-class lesson as
+    // the phase-18 CDS scan extension: scan ALL sources or a CI-only 503 hides
+    // until Linux. Empty string when the fixture carries no LDS template.
+    let lds_scan = upstream_lds_template.as_deref().unwrap_or("");
+    let backend_scan_sources: [&str; 4] =
+        [&upstream_template, &subject_template, cds_scan, lds_scan];
     let needs_backend = scan_needs_marker(&backend_scan_sources, "BACKEND_PORT");
     // 13.1 D9.1 / Task 7: fixture 0020 reuses `HealthAwareHttp1Backend` but
     // needs the helper's per-path status mapping
@@ -2431,6 +2481,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // rendered upstream CDS file is copied to.
             v.push(("CDS_PATH", upstream::CDS_CONTAINER_PATH.to_string()));
         }
+        if needs_lds {
+            // 19 Task 6 (ADR-0050 L1): the container-internal `.yaml` path the
+            // rendered upstream LDS file is copied to.
+            v.push(("LDS_PATH", upstream::LDS_CONTAINER_PATH.to_string()));
+        }
         v
     };
     let subject_kvs: Vec<(&str, String)> = {
@@ -2467,6 +2522,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // 18 Task 6 (ADR-0049): host temp path of the rendered subject CDS
             // file; the subject subprocess reads it directly from the host FS.
             v.push(("CDS_PATH", subject_cds_path_str.clone()));
+        }
+        if needs_lds {
+            // 19 Task 6 (ADR-0050): host temp path of the rendered subject LDS
+            // file; the subject subprocess reads it directly from the host FS.
+            v.push(("LDS_PATH", subject_lds_path_str.clone()));
         }
         v
     };
@@ -2512,6 +2572,41 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         None
     };
 
+    // 19 Task 6 (ADR-0050): render + write the PER-SIDE LDS files. Unlike CDS
+    // (one shared template rendered twice), the two sides have DIFFERENT source
+    // templates (`lds-envoy.yaml` / `lds-envoy-rust.yaml`) — each rendered
+    // through its own side's kv map. The upstream rendition is copied into the
+    // container at `LDS_CONTAINER_PATH`; the subject rendition stays at its host
+    // temp path (`subject_lds_path`, already injected into the subject kv map as
+    // `{{LDS_PATH}}`). The rendered upstream LDS string is retained so the
+    // `host_uses_host_gateway` scan below can cover it too (fixture 0027: the
+    // `host.docker.internal` reference may live ONLY in the LDS-carried route).
+    let mut upstream_lds_yaml: Option<String> = None;
+    let upstream_lds_path: Option<PathBuf> = if let (Some(up_tpl), Some(subj_tpl)) = (
+        upstream_lds_template.as_ref(),
+        subject_lds_template.as_ref(),
+    ) {
+        let up_lds = render_yaml(up_tpl, &upstream_kvs_refs);
+        let subject_lds = render_yaml(subj_tpl, &subject_kvs_refs);
+        // Fail fast, LDS-scoped, naming any unsubstituted marker (a token
+        // present in an LDS template but absent from the kv map). Mirrors the
+        // CDS residual-marker guard above.
+        if let Some(marker) = residual_marker(&up_lds) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream lds-envoy.yaml");
+        }
+        if let Some(marker) = residual_marker(&subject_lds) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject lds-envoy-rust.yaml");
+        }
+        let up_path = write_temp(tmp.path(), "lds-upstream.yaml", &up_lds)?;
+        // Write the subject rendition at the exact path injected into the
+        // subject kv map so `{{LDS_PATH}}` resolves to a file that exists.
+        write_temp(tmp.path(), "lds-subject.yaml", &subject_lds)?;
+        upstream_lds_yaml = Some(up_lds);
+        Some(up_path)
+    } else {
+        None
+    };
+
     let upstream_yaml = render_yaml(&upstream_template, &upstream_kvs_refs);
     let subject_yaml = render_yaml(&subject_template, &subject_kvs_refs);
     let upstream_path = write_temp(tmp.path(), "envoy.yaml", &upstream_yaml)?;
@@ -2530,7 +2625,14 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // so without this the container's STRICT_DNS resolution fails and the route
     // 503s; macOS Docker Desktop resolves the hostname natively, which is why
     // the gap surfaced only in CI.
-    let host_uses_host_gateway = uses_host_gateway(&upstream_yaml, upstream_cds_yaml.as_deref());
+    // 19 Task 6 (ADR-0050): the scan now covers ALL rendered upstream sources —
+    // the main config, the rendered upstream CDS file, AND the rendered upstream
+    // LDS file (fixture 0027). Empty strings stand in for absent sources.
+    let host_uses_host_gateway = uses_host_gateway(&[
+        &upstream_yaml,
+        upstream_cds_yaml.as_deref().unwrap_or(""),
+        upstream_lds_yaml.as_deref().unwrap_or(""),
+    ]);
     // (e) Thread tls_pki through to upstream::start. 06.1: also thread
     // `needs_admin_port` so the container exposes ADMIN_CONTAINER_PORT for
     // Driver::AdminScrape fixtures.
@@ -2602,6 +2704,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         tls_pki.as_ref(),
         needs_admin_port,
         upstream_cds_path.as_deref(),
+        upstream_lds_path.as_deref(),
         &upstream_access_log_mounts,
     )
     .await?;
@@ -4546,22 +4649,22 @@ resources:
         // The CDS-only case: marker lives ONLY in the rendered CDS string, not
         // the main config. This is the fixture-0026 regression the fix targets.
         assert!(
-            uses_host_gateway("no marker here", Some("address: host.docker.internal")),
+            uses_host_gateway(&["no marker here", "address: host.docker.internal"]),
             "host.docker.internal in the CDS file alone must drive the host-gateway mapping",
         );
         // No CDS file and no marker in main → no mapping (fixtures 0001/0002).
         assert!(
-            !uses_host_gateway("no marker", None),
+            !uses_host_gateway(&["no marker"]),
             "absent hostname must leave the mapping off",
         );
         // The original main-config path stays true (no regression).
         assert!(
-            uses_host_gateway("host.docker.internal", None),
+            uses_host_gateway(&["host.docker.internal"]),
             "host.docker.internal in the main config must still drive the mapping",
         );
         // A CDS file present but without the marker must not fabricate a need.
         assert!(
-            !uses_host_gateway("no marker", Some("address: 127.0.0.1")),
+            !uses_host_gateway(&["no marker", "address: 127.0.0.1"]),
             "a CDS file without the hostname must not turn the mapping on",
         );
     }
@@ -4639,6 +4742,216 @@ resources:
             subject_cds_path_str,
             upstream::CDS_CONTAINER_PATH,
             "subject CDS path must be a host temp path, not the container constant",
+        );
+    }
+
+    // ---- 19 Task 6 (ADR-0050): per-side LDS-template render-path tests ----
+    // These mirror the phase-18 CDS render-path tests above. The LDS file is
+    // PER-SIDE (`lds-envoy.yaml` upstream + `lds-envoy-rust.yaml` subject)
+    // because the LDS payload carries the HCM whose Envoy-only fields
+    // (`generate_request_id`, `request_headers_to_remove`) the envoy-rust
+    // parser rejects — the two sides need different LDS files (mirroring the
+    // `envoy.yaml`/`envoy-rust.yaml` main-config split). Each side's LDS file
+    // is rendered through that side's kv map (container-perspective vs
+    // host-perspective backend host/port). The Docker-gated end-to-end proof
+    // is fixture 0027's job (Task 7).
+
+    /// 19 Task 6 (a): the per-side LDS templates render through their side's kv
+    /// map. The upstream (container-perspective) side resolves
+    /// `{{BACKEND_HOST}}` to `host.docker.internal`; the subject
+    /// (host-perspective) side resolves it to `127.0.0.1`. Because the LDS
+    /// files are per-side, the two templates may also differ in body — here
+    /// the upstream one carries the Envoy-only `generate_request_id` field that
+    /// the envoy-rust template omits, proving the split is honoured.
+    #[test]
+    fn render_lds_template_substitutes_backend_host_per_side() {
+        let upstream_lds = r#"
+resources:
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    name: dynamic_listener
+    filter_chains:
+      - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              generate_request_id: true
+              route_config:
+                virtual_hosts:
+                  - routes:
+                      - route: { host_rewrite_literal: {{BACKEND_HOST}}, port: {{HTTP1_BACKEND_PORT}} }
+"#;
+        let subject_lds = r#"
+resources:
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    name: dynamic_listener
+    filter_chains:
+      - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              route_config:
+                virtual_hosts:
+                  - routes:
+                      - route: { host_rewrite_literal: {{BACKEND_HOST}}, port: {{HTTP1_BACKEND_PORT}} }
+"#;
+        let rendered_up = render_yaml(
+            upstream_lds,
+            &[
+                ("BACKEND_HOST", "host.docker.internal"),
+                ("HTTP1_BACKEND_PORT", "31415"),
+            ],
+        );
+        let rendered_subject = render_yaml(
+            subject_lds,
+            &[
+                ("BACKEND_HOST", "127.0.0.1"),
+                ("HTTP1_BACKEND_PORT", "31415"),
+            ],
+        );
+        assert!(
+            rendered_up.contains("host_rewrite_literal: host.docker.internal"),
+            "upstream lds should use container-perspective backend host: {rendered_up}",
+        );
+        assert!(
+            rendered_subject.contains("host_rewrite_literal: 127.0.0.1"),
+            "subject lds should use host-perspective backend host: {rendered_subject}",
+        );
+        // Both resolve the shared backend port marker.
+        assert!(rendered_up.contains("port: 31415"));
+        assert!(rendered_subject.contains("port: 31415"));
+        // Per-side split: the Envoy-only field lives only in the upstream
+        // rendition.
+        assert!(
+            rendered_up.contains("generate_request_id"),
+            "upstream lds carries the Envoy-only HCM field",
+        );
+        assert!(
+            !rendered_subject.contains("generate_request_id"),
+            "subject lds omits the Envoy-only HCM field",
+        );
+    }
+
+    /// 19 Task 6 (b): the upstream-side `{{LDS_PATH}}` substitution value is the
+    /// container constant `upstream::LDS_CONTAINER_PATH`, which MUST end in
+    /// `.yaml` (the L1 extension constraint — Envoy selects its config parser by
+    /// file extension). The subject-side value is a host temp path to the
+    /// subject's rendered LDS file. Locks the L1 constraint structurally: the
+    /// container path is a compile-time constant.
+    #[test]
+    fn lds_path_substitution_is_per_side_and_container_path_is_yaml() {
+        assert!(
+            upstream::LDS_CONTAINER_PATH.ends_with(".yaml"),
+            "L1: upstream container LDS path must end in .yaml, got {}",
+            upstream::LDS_CONTAINER_PATH,
+        );
+
+        let main_template = "  path: {{LDS_PATH}}";
+        // Upstream side: {{LDS_PATH}} → the container constant.
+        let upstream_main =
+            render_yaml(main_template, &[("LDS_PATH", upstream::LDS_CONTAINER_PATH)]);
+        assert_eq!(
+            upstream_main,
+            format!("  path: {}", upstream::LDS_CONTAINER_PATH),
+        );
+        assert!(
+            upstream_main.trim_end().ends_with(".yaml"),
+            "upstream rendered LDS path must end in .yaml: {upstream_main}",
+        );
+
+        // Subject side: {{LDS_PATH}} → a host temp path to lds-subject.yaml.
+        let tmp = tempfile::tempdir().unwrap();
+        let subject_lds_path = tmp.path().join("lds-subject.yaml");
+        let subject_lds_path_str = subject_lds_path.to_string_lossy().into_owned();
+        let subject_main = render_yaml(main_template, &[("LDS_PATH", &subject_lds_path_str)]);
+        assert_eq!(subject_main, format!("  path: {subject_lds_path_str}"));
+        assert_ne!(
+            subject_lds_path_str,
+            upstream::LDS_CONTAINER_PATH,
+            "subject LDS path must be a host temp path, not the container constant",
+        );
+    }
+
+    /// 19 Task 6 (c): the `residual_marker` guard names an unsubstituted
+    /// `{{MARKER}}` left inside a rendered LDS file. `render_yaml` leaves an
+    /// unmatched token in place, so an LDS rendition with a marker absent from
+    /// the kv map would otherwise slip into Envoy and fail with an opaque parse
+    /// error. A fully-resolved rendition returns `None`.
+    #[test]
+    fn residual_marker_names_unsubstituted_lds_token() {
+        let lds_template =
+            "    host_rewrite_literal: {{BACKEND_HOST}}\n    port: {{HTTP1_BACKEND_PORT}}";
+        // Only BACKEND_HOST resolved; HTTP1_BACKEND_PORT has no kv entry.
+        let rendered = render_yaml(lds_template, &[("BACKEND_HOST", "127.0.0.1")]);
+        assert_eq!(
+            residual_marker(&rendered),
+            Some("HTTP1_BACKEND_PORT"),
+            "guard must name the unsubstituted LDS marker, got: {rendered}",
+        );
+
+        let resolved = render_yaml(
+            lds_template,
+            &[
+                ("BACKEND_HOST", "127.0.0.1"),
+                ("HTTP1_BACKEND_PORT", "31415"),
+            ],
+        );
+        assert_eq!(
+            residual_marker(&resolved),
+            None,
+            "fully-resolved LDS rendition must have no residual marker, got: {resolved}",
+        );
+    }
+
+    /// 19 Task 6 (d) — THE regression guard for the phase-18 escaped-to-CI
+    /// Critical (carryforward-disposition-2): the combined-source scans must
+    /// cover the rendered LDS file too. Fixture 0027 places its
+    /// `{{HTTP1_BACKEND_PORT}}` and `host.docker.internal` references ONLY in
+    /// the LDS file (the main configs route to a CDS cluster and carry no
+    /// backend markers). A scan over only main + CDS would report
+    /// `needs_http1_backend == false` and `uses_host_gateway == false` — the
+    /// backend never spawns and on Linux CI the container never gets the
+    /// `--add-host` mapping, 503-ing the route. The fix adds the LDS rendition
+    /// as a fourth scan source AND generalizes `uses_host_gateway` to a slice.
+    #[test]
+    fn backend_and_host_gateway_scans_detect_lds_only_markers() {
+        let upstream_main = "  cds_path: {{CDS_PATH}}\n  lds_path: {{LDS_PATH}}\n  port: {{PORT}}";
+        let subject_main = "  cds_path: {{CDS_PATH}}\n  lds_path: {{LDS_PATH}}\n  port: {{PORT}}";
+        // CDS file: no backend marker, no host.docker.internal (the endpoint
+        // lives in the LDS-carried route in this fixture shape).
+        let cds = "resources:\n  - name: dynamic_backend\n";
+        // LDS file: the ONLY site of the backend marker and the gateway host.
+        let lds_up = r#"
+resources:
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    route:
+      host: host.docker.internal
+      port: {{HTTP1_BACKEND_PORT}}
+"#;
+
+        // The combined backend-scan source as `run_fixture` builds it: main x2
+        // + CDS + LDS (4 sources).
+        let backend_scan_sources: [&str; 4] = [upstream_main, subject_main, cds, lds_up];
+
+        // Main + CDS alone (the pre-LDS-extension scan) must NOT see the
+        // backend need — proving the test genuinely fails without the LDS
+        // source.
+        assert!(
+            !scan_needs_marker(&[upstream_main, subject_main, cds], "HTTP1_BACKEND_PORT"),
+            "main + CDS alone must not report the backend need (the bug-class baseline)",
+        );
+        // The 4-source scan (incl. LDS) must report the need.
+        assert!(
+            scan_needs_marker(&backend_scan_sources, "HTTP1_BACKEND_PORT"),
+            "combined scan (main + CDS + LDS) must detect the LDS-only HTTP1_BACKEND_PORT marker",
+        );
+
+        // host-gateway: the slice-based signature must see the LDS-only
+        // hostname. Main + CDS alone return false (the regression baseline).
+        assert!(
+            !uses_host_gateway(&[upstream_main, cds]),
+            "main + CDS alone must not drive the host-gateway mapping (the bug-class baseline)",
+        );
+        assert!(
+            uses_host_gateway(&[upstream_main, cds, lds_up]),
+            "host.docker.internal in the LDS file alone must drive the host-gateway mapping",
         );
     }
 

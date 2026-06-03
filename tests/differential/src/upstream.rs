@@ -10,6 +10,15 @@ use std::time::Duration;
 /// this constant; the subject side substitutes a host temp path instead.
 pub const CDS_CONTAINER_PATH: &str = "/etc/envoy-cds/cds.yaml";
 
+/// 19 Task 6 (ADR-0050, mirrors the CDS L1 constraint): the container-internal
+/// path the rendered upstream LDS file is copied to for the upstream Envoy. The
+/// path MUST end in `.yaml` — Envoy selects its config-file parser by extension,
+/// and a non-`.yaml` path would make it parse the YAML-content LDS file as
+/// JSON-only and fail. The `{{LDS_PATH}}` marker in the upstream `envoy.yaml`
+/// (`dynamic_resources.lds_config.path_config_source.path`) is substituted to
+/// this constant; the subject side substitutes a host temp path instead.
+pub const LDS_CONTAINER_PATH: &str = "/etc/envoy-lds/lds.yaml";
+
 use anyhow::{Context, Result};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -81,6 +90,12 @@ pub async fn start(
     // mounting pattern. `None` for fixtures with no `{{CDS_PATH}}` marker
     // (all pre-18 fixtures).
     cds_file: Option<&Path>,
+    // 19 Task 6 (ADR-0050 L1): host path of the rendered upstream LDS file.
+    // When `Some`, it is copied into the container at `LDS_CONTAINER_PATH`
+    // (`.yaml`-suffixed per L1) via `with_copy_to`, mirroring `cds_file`
+    // exactly. `None` for fixtures with no `{{LDS_PATH}}` marker (all pre-19
+    // fixtures).
+    lds_file: Option<&Path>,
     // 06.2 D4.2.c (revised CI fix #2): bind-mount each (host_dir, container_dir)
     // pair so the container's access-log writes surface on the host where
     // the harness reads them. The PARENT DIRECTORY of the access-log file
@@ -137,6 +152,17 @@ pub async fn start(
             .canonicalize()
             .with_context(|| format!("canonicalizing CDS file {}", cds.display()))?;
         request = request.with_copy_to(CDS_CONTAINER_PATH, cds_abs);
+    }
+    // 19 Task 6 (ADR-0050 L1): copy the rendered upstream LDS file into the
+    // container at `LDS_CONTAINER_PATH` (a constant ending in `.yaml`). Same
+    // `with_copy_to` shape as the CDS mount above; the host source path is
+    // canonicalized so a relative temp path resolves regardless of the
+    // container's working directory.
+    if let Some(lds) = lds_file {
+        let lds_abs = lds
+            .canonicalize()
+            .with_context(|| format!("canonicalizing LDS file {}", lds.display()))?;
+        request = request.with_copy_to(LDS_CONTAINER_PATH, lds_abs);
     }
     // 06.2 D4.2.c: bind-mount access-log file paths so the container's
     // append-mode writes surface on the host where the harness's
@@ -211,7 +237,7 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path(), false, None, false, None, &[])
+        let proxy = start(yaml.path(), false, None, false, None, None, &[])
             .await
             .unwrap();
         assert!(proxy.host_port() > 0);
