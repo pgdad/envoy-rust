@@ -183,3 +183,26 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — all 3 additions complete; EVERY stat value cross-checked against fixture 0027's expectations.yaml; the ListenersConfigDump shape cross-checked against the real `crates/envoy-admin/src/endpoint.rs` emitter (not just the PLAN); the negative-path dispositions cross-checked against the backstop; the per-worker caveat + 15-name enumeration accurate; no invented values; exact commit message; docs-only.
 - **Code quality: Approve with two fixes (applied)** — excellent structural parallelism with phase 18, clean edit (the `-1` is the expanded `/listeners` row), well-formed markdown, no stale CDS copy-paste. Two Minor prose nits FIXED (a self-contradictory "base `lds.*`" qualifier reworded to "`lds.*` subtree + the base `listener_added` name"; an orphan `✧` glyph removed, keeping the intentional per-worker callout). Commit amended `8ea5c6049` → `e7d436d30`.
+
+---
+
+### Task 11 — state-4 phase-done verification — COMPLETE
+
+The state-3 execution arc (Tasks 1–10) and this state-4 verification completed in one session (the phase-18 cadence); each task landed one code commit + one PROGRESS commit with passing two-stage review (spec-compliance THEN code-quality), TDD, and per-task clippy. **All §7.5 (a)–(e) gates GREEN.**
+
+**§7.5 (e) — stable-toolchain gates (local; quoted):**
+- `cargo build --workspace --all-targets`: `Finished` (exit 0).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: `Finished` (exit 0, zero warnings).
+- `cargo fmt --all -- --check`: clean (exit 0).
+- `cargo test --workspace`: **1097 passed; 0 failed** (across all binaries). [First run surfaced one failure — fixture 0021's in-process backstop (`upstream_h2_connection_pooling`) at `backend ready: ConnectionRefused` — root-caused to the documented cold-helper-compile flake (`project_flaky_access_log_fixture_0012`): the backstop spawns `http2-echo-server` via `cargo run`, whose cold compile (>30s) exceeds the readiness window. Phase 19 touched no H2-pooling/helper code. Cleared by pre-building all 5 `tests/helpers/*` binaries (http1-echo-server alone is 1m14s cold); the full re-run is 1097/0.]
+- `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok` (exit 0).
+
+**§7.5 (e) — 4 standalone-crate builds (`project_isolated_crate_build_blindspot`; quoted):** `cargo build -p envoy-config` / `-p envoy-cluster` / `-p envoy-http1` / `-p envoy-http2` — all `Finished` (exit 0).
+
+**§7.5 (d) — fuzz short-budget gate (local; quoted):** `cargo +nightly fuzz run parse_bootstrap -- -runs=200000 -timeout=10` → `Done 200000 runs in 17 second(s)`, zero crashes/leaks on the 30-seed corpus.
+
+**§7.5 (a)+(b)+(c) — the Docker-gated CI anchor run:** pushed HEAD `759686acd` (Tasks 1–10: 20 commits); **CI run `26903181658` — `conclusion=success`, both jobs green:** `build + test + lint => success` (the full Docker differential suite on ubuntu-latest) and `fuzz (parse_bootstrap, 30s) => success`. Confirmed in the CI log: `test xds_file_based_lds_fixture ... ok` (fixture 0027 — the load-bearing differential proof, green on Linux), `test xds_file_based_cds_fixture ... ok` (the fixture-0026 regression witness), the full differential suite green (all 27 Docker-gated fixtures 0001–0027 simultaneously), and `h2spec_pass_rate_gate ... ok` (the ≥95% conformance gate maintained). (a) fixture 0027 green ✅ / (b) all 26 pre-existing fixtures still green ✅ / (c) h2spec ≥95% ✅.
+
+**ADR posture:** ledger head stays **ADR-0050** (count 51); the state-3 arc landed NO new ADR (no §6.1 mid-execution split fired — ADR-0052 unconsumed; ADR-0051 remains free). **ADR-0014 in force; ADR-0028 open.**
+
+Per §5.1, the state-5 code review (`superpowers:requesting-code-review` → REVIEW.md) is a SEPARATE next session. STATE advanced to state-4-complete / state-5-next at this commit.
