@@ -1,0 +1,28 @@
+# 19 Task 9: fuzz seed for the dynamic_resources.lds_config schema surface
+# (parse_bootstrap never reads the referenced files — parse-and-validate only;
+# the NoRuntime gate defers on lds_configured_but_unloaded).
+node: { id: fuzz-lds, cluster: fuzz }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: /etc/envoy/lds.yaml
+  cds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: /etc/envoy/cds.yaml
+static_resources:
+  clusters:
+    - name: static_backend
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: static_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8124 }

@@ -4135,6 +4135,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/route_retry_policy.yaml",        // 16 Task 9
             "fuzz/corpus/parse_bootstrap/cluster_http2_protocol_options.yaml",
             "fuzz/corpus/parse_bootstrap/dynamic_resources_cds.yaml", // 18 Task 9
+            "fuzz/corpus/parse_bootstrap/dynamic_resources_lds.yaml", // 19 Task 9
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
