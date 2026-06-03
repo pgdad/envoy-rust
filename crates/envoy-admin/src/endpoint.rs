@@ -320,6 +320,21 @@ pub(crate) enum ConfigDumpEntry<'a> {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         dynamic_active_clusters: Vec<DynamicClusterEntry<'a>>,
     },
+    /// Phase 19 D5 (ADR-0050 §6.2 L5): the `ListenersConfigDump` entry, emitted
+    /// ONLY when `dynamic_resources.lds_config` is configured (fixtures 0014 +
+    /// 0026 untouched). Pushed AFTER the Clusters entry — Envoy v1.33's verified
+    /// `configs[]` order is Bootstrap[0], Clusters[1], Listeners[2]. Envoy's LDS
+    /// dump nests the listener under `dynamic_listeners[].active_state.listener`
+    /// (a DIFFERENT shape from the CDS dump's flat
+    /// `dynamic_active_clusters[].cluster`); there is NO `version_info` key for
+    /// file-based LDS.
+    #[serde(rename = "type.googleapis.com/envoy.admin.v3.ListenersConfigDump")]
+    Listeners {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        static_listeners: Vec<StaticListenerEntry<'a>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dynamic_listeners: Vec<DynamicListenerEntry<'a>>,
+    },
 }
 
 /// Phase 18 D5: one static cluster inside `ClustersConfigDump`. Envoy shape:
@@ -354,6 +369,47 @@ pub(crate) struct TaggedCluster<'a> {
 
 /// The `@type` URL for the nested `cluster` object inside `ClustersConfigDump`.
 const CLUSTER_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
+
+/// Phase 19 D5: one static listener inside `ListenersConfigDump`. Envoy shape:
+/// `{"listener": {...}, "last_updated": "..."}`.
+#[derive(Serialize)]
+pub(crate) struct StaticListenerEntry<'a> {
+    pub(crate) listener: TaggedListener<'a>,
+    pub(crate) last_updated: String,
+}
+
+/// Phase 19 D5: one dynamically-loaded listener. Envoy shape:
+/// `{"name": ..., "active_state": {...}}` — the LDS dump nests the listener one
+/// level deeper than the CDS dump (under `active_state`).
+#[derive(Serialize)]
+pub(crate) struct DynamicListenerEntry<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) active_state: ListenerActiveState<'a>,
+}
+
+/// Phase 19 D5: the `active_state` nesting inside a `DynamicListenerEntry`
+/// (L5 ✧: `listener` + `last_updated`; NO `version_info` for file-based LDS).
+#[derive(Serialize)]
+pub(crate) struct ListenerActiveState<'a> {
+    pub(crate) listener: TaggedListener<'a>,
+    pub(crate) last_updated: String,
+}
+
+/// Phase 19 D5: a `Listener` serialized with the inner `@type` tag Envoy's
+/// `google.protobuf.Any`-projection carries on the nested `listener` object.
+/// Mirrors `TaggedCluster`: a flatten on a NESTED struct (not on the
+/// internally-tagged outer enum's variant content), so it sidesteps serde's
+/// flatten+internally-tagged-enum limitation.
+#[derive(Serialize)]
+pub(crate) struct TaggedListener<'a> {
+    #[serde(rename = "@type")]
+    pub(crate) type_url: &'static str,
+    #[serde(flatten)]
+    pub(crate) listener: &'a envoy_config::Listener,
+}
+
+/// The `@type` URL for the nested `listener` object inside `ListenersConfigDump`.
+const LISTENER_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
 
 /// Phase 08.2 Task 5 (D-ready): drain-aware `/ready` response. Widens the
 /// 06.1 hardcoded 200 `"LIVE\n"` shape to a three-arm match on
@@ -448,6 +504,49 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
         configs.push(ConfigDumpEntry::Clusters {
             static_clusters,
             dynamic_active_clusters,
+        });
+    }
+    // Phase 19 D5 (ADR-0050 §6.2 L5): emit the ListenersConfigDump entry ONLY
+    // when `dynamic_resources.lds_config` is configured. Pushed AFTER the
+    // Clusters entry ⇒ `configs[2]` when both are present (Envoy v1.33's
+    // verified order: Bootstrap[0], Clusters[1], Listeners[2]). Empty listener
+    // lists serialize to omitted keys via the variant's `skip_serializing_if`.
+    if bootstrap
+        .dynamic_resources
+        .as_ref()
+        .and_then(|dr| dr.lds_config.as_ref())
+        .is_some()
+    {
+        let static_listeners = bootstrap
+            .static_resources
+            .listeners
+            .iter()
+            .map(|listener| StaticListenerEntry {
+                listener: TaggedListener {
+                    type_url: LISTENER_TYPE_URL,
+                    listener,
+                },
+                last_updated: last_updated.clone(),
+            })
+            .collect();
+        let dynamic_listeners = bootstrap
+            .dynamic_listeners
+            .iter()
+            .flatten()
+            .map(|listener| DynamicListenerEntry {
+                name: &listener.name,
+                active_state: ListenerActiveState {
+                    listener: TaggedListener {
+                        type_url: LISTENER_TYPE_URL,
+                        listener,
+                    },
+                    last_updated: last_updated.clone(),
+                },
+            })
+            .collect();
+        configs.push(ConfigDumpEntry::Listeners {
+            static_listeners,
+            dynamic_listeners,
         });
     }
     let body = ConfigDumpBody { configs };
@@ -1194,6 +1293,343 @@ static_resources:
         assert!(
             boot.pointer("/bootstrap/dynamic_clusters").is_none(),
             "dynamic_clusters is #[serde(skip)] — must be absent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod listeners_config_dump_tests {
+    //! Phase 19 Task 5 — D5 (ADR-0050 §6.2 L5): the `ListenersConfigDump`
+    //! `/config_dump` entry, emitted CONDITIONALLY (only when
+    //! `dynamic_resources.lds_config` is configured) and pushed AFTER the
+    //! `ClustersConfigDump` entry — Envoy v1.33's verified `configs[]` order is
+    //! Bootstrap[0], Clusters[1], Listeners[2]. Test groups: (a) conditional
+    //! emission — a plain bootstrap and a `cds_config`-only bootstrap render NO
+    //! ListenersConfigDump entry (fixture-0014 + fixture-0026 regression
+    //! shapes); (b) the entry with a dynamic listener present (`configs[2]`
+    //! shape: outer `@type`, nested `dynamic_listeners[].active_state.listener`
+    //! — a DIFFERENT nesting from the CDS dump's flat
+    //! `dynamic_active_clusters[].cluster`; NO `version_info` key); (c)
+    //! empty-key omission (zero static listeners ⇒ no `static_listeners` key);
+    //! (d) the BootstrapConfigDump never shows `dynamic_listeners` (the
+    //! `#[serde(skip)]` separation, §5.5).
+
+    use super::AdminEndpoint;
+    use crate::config::AdminConfig;
+    use crate::handler::AdminHandler;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// A single listener named `dynamic_listener`, the L5 fixture shape. Parsed
+    /// standalone (not via the bootstrap path) so the test can inject it into
+    /// `dynamic_listeners` directly.
+    const DYNAMIC_LISTENER: &str = "\
+name: dynamic_listener
+address:
+  socket_address:
+    address: 0.0.0.0
+    port_value: 10000
+filter_chains: []
+";
+
+    /// A static listener named `static_listener`, used by the
+    /// static_listeners-key-presence test (group c inverse).
+    const STATIC_LISTENER: &str = "\
+name: static_listener
+address:
+  socket_address:
+    address: 0.0.0.0
+    port_value: 10001
+filter_chains: []
+";
+
+    /// Bootstrap WITH BOTH `cds_config` and `lds_config` configured (triggers
+    /// the conditional Clusters AND Listeners emission — the Listeners entry
+    /// must land at `configs[2]`, AFTER Clusters). The `path`s are never read at
+    /// render time — the loaded resources live in `dynamic_clusters` /
+    /// `dynamic_listeners`.
+    const CDS_LDS_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+  lds_config:
+    path_config_source:
+      path: /etc/lds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    /// Bootstrap with ONLY `cds_config` (the fixture-0026 regression shape — it
+    /// renders exactly Bootstrap[0] + Clusters[1], NO Listeners).
+    const CDS_ONLY_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    fn parse_listener(yaml: &str) -> envoy_config::Listener {
+        serde_yaml::from_str(yaml).expect("listener yaml parses")
+    }
+
+    fn parse_cluster(yaml: &str) -> envoy_config::Cluster {
+        serde_yaml::from_str(yaml).expect("cluster yaml parses")
+    }
+
+    /// A STRICT_DNS cluster named `dynamic_backend` — used to populate
+    /// `dynamic_clusters` so the Clusters entry is present and the Listeners
+    /// entry must order AFTER it.
+    const DYNAMIC_BACKEND_CLUSTER: &str = "\
+name: dynamic_backend
+type: STRICT_DNS
+lb_policy: ROUND_ROBIN
+load_assignment:
+  cluster_name: dynamic_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: backend.example.com
+            port_value: 8080
+";
+
+    /// Build a handler from an already-constructed `Bootstrap` (mirrors
+    /// `clusters_config_dump_tests::handler_from_bootstrap`).
+    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+        )
+    }
+
+    fn parse_bootstrap(yaml: &str) -> Bootstrap {
+        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
+    }
+
+    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
+        let resp = AdminEndpoint::ConfigDump.render_with(handler);
+        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
+        serde_json::from_str(body_str).expect("valid JSON")
+    }
+
+    const LISTENERS_TYPE: &str = "type.googleapis.com/envoy.admin.v3.ListenersConfigDump";
+
+    fn has_listeners_entry(value: &serde_json::Value) -> bool {
+        value
+            .get("configs")
+            .and_then(|c| c.as_array())
+            .unwrap()
+            .iter()
+            .any(|e| e.get("@type").and_then(|v| v.as_str()) == Some(LISTENERS_TYPE))
+    }
+
+    // (a) conditional emission — a PLAIN bootstrap (no dynamic_resources)
+    // renders NO ListenersConfigDump entry (fixture-0014 regression shape).
+    #[test]
+    fn plain_bootstrap_emits_no_listeners_config_dump() {
+        let bootstrap = parse_bootstrap(
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n",
+        );
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        assert!(
+            !has_listeners_entry(&value),
+            "plain bootstrap ⇒ no ListenersConfigDump entry; got {value}"
+        );
+    }
+
+    // (a) conditional emission — a CDS-ONLY bootstrap renders exactly
+    // Bootstrap[0] + Clusters[1] and NO ListenersConfigDump (fixture-0026
+    // regression shape: the CDS-only topology is untouched).
+    #[test]
+    fn cds_only_bootstrap_emits_no_listeners_config_dump() {
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
+        bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(
+            configs.len(),
+            2,
+            "cds-only ⇒ exactly Bootstrap[0] + Clusters[1]; got {value}"
+        );
+        assert_eq!(
+            configs[1].get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.ClustersConfigDump")
+        );
+        assert!(
+            !has_listeners_entry(&value),
+            "cds-only ⇒ no ListenersConfigDump entry"
+        );
+    }
+
+    // (b) with a dynamic listener (+ dynamic cluster) present ⇒ THREE entries;
+    // the order lock: Clusters BEFORE Listeners. configs[2] is the
+    // ListenersConfigDump with the nested active_state shape and NO version_info.
+    #[test]
+    fn dynamic_listener_emits_listeners_config_dump_at_configs_2() {
+        let mut bootstrap = parse_bootstrap(CDS_LDS_BOOTSTRAP);
+        bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
+        bootstrap.dynamic_listeners = Some(vec![parse_listener(DYNAMIC_LISTENER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(configs.len(), 3, "cds+lds ⇒ three entries; got {value}");
+        // Order lock (L5): Clusters BEFORE Listeners.
+        assert_eq!(
+            configs[1].get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.ClustersConfigDump"),
+            "configs[1] must be ClustersConfigDump (order lock)"
+        );
+        let entry = &configs[2];
+        assert_eq!(
+            entry.get("@type").and_then(|v| v.as_str()),
+            Some(LISTENERS_TYPE)
+        );
+        assert_eq!(
+            entry
+                .pointer("/dynamic_listeners/0/name")
+                .and_then(|v| v.as_str()),
+            Some("dynamic_listener")
+        );
+        // The active_state nesting (DIFFERENT from the CDS flat shape).
+        assert_eq!(
+            entry
+                .pointer("/dynamic_listeners/0/active_state/listener/@type")
+                .and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.config.listener.v3.Listener")
+        );
+        assert_eq!(
+            entry
+                .pointer("/dynamic_listeners/0/active_state/listener/name")
+                .and_then(|v| v.as_str()),
+            Some("dynamic_listener")
+        );
+        // last_updated lives inside active_state and is ISO-8601-shaped.
+        let last_updated = entry
+            .pointer("/dynamic_listeners/0/active_state/last_updated")
+            .and_then(|v| v.as_str())
+            .expect("active_state.last_updated is a string");
+        assert!(!last_updated.is_empty(), "last_updated non-empty");
+        assert!(
+            last_updated.contains('T') && last_updated.ends_with('Z'),
+            "last_updated ISO-8601-shaped; got {last_updated:?}"
+        );
+        // L5 ✧: NO version_info key anywhere in active_state.
+        assert!(
+            entry
+                .pointer("/dynamic_listeners/0/active_state/version_info")
+                .is_none(),
+            "file-based LDS active_state must carry NO version_info key; entry was {entry}"
+        );
+    }
+
+    // (c) empty-key omission (L5): zero static listeners ⇒ NO static_listeners
+    // key (fixture 0027 has zero static listeners → ABSENT, not []).
+    #[test]
+    fn zero_static_listeners_omits_static_listeners_key() {
+        let mut bootstrap = parse_bootstrap(CDS_LDS_BOOTSTRAP);
+        bootstrap.dynamic_listeners = Some(vec![parse_listener(DYNAMIC_LISTENER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        let entry = configs
+            .iter()
+            .find(|e| e.get("@type").and_then(|v| v.as_str()) == Some(LISTENERS_TYPE))
+            .expect("ListenersConfigDump entry present");
+        assert!(
+            entry.get("static_listeners").is_none(),
+            "zero static listeners ⇒ static_listeners key omitted; entry was {entry}"
+        );
+        // Inverse cheap check: dynamic_listeners key IS present.
+        assert!(entry.get("dynamic_listeners").is_some());
+    }
+
+    // (c, inverse) a static listener present + lds_config configured ⇒
+    // static_listeners key present, carrying it (with the active_state-free
+    // static shape: {"listener": {...}, "last_updated": ...}).
+    #[test]
+    fn static_listener_present_emits_static_listeners_key() {
+        let mut bootstrap = parse_bootstrap(CDS_LDS_BOOTSTRAP);
+        bootstrap.static_resources.listeners = vec![parse_listener(STATIC_LISTENER)];
+        bootstrap.dynamic_listeners = Some(vec![parse_listener(DYNAMIC_LISTENER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        let entry = configs
+            .iter()
+            .find(|e| e.get("@type").and_then(|v| v.as_str()) == Some(LISTENERS_TYPE))
+            .expect("ListenersConfigDump entry present");
+        assert_eq!(
+            entry
+                .pointer("/static_listeners/0/listener/name")
+                .and_then(|v| v.as_str()),
+            Some("static_listener")
+        );
+        assert_eq!(
+            entry
+                .pointer("/static_listeners/0/listener/@type")
+                .and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.config.listener.v3.Listener")
+        );
+    }
+
+    // (d) §5.5 separation: the BootstrapConfigDump entry never shows the loaded
+    // dynamic listeners (dynamic_listeners is #[serde(skip)] on Bootstrap).
+    #[test]
+    fn bootstrap_entry_never_shows_dynamic_listeners() {
+        let mut bootstrap = parse_bootstrap(CDS_LDS_BOOTSTRAP);
+        bootstrap.dynamic_listeners = Some(vec![parse_listener(DYNAMIC_LISTENER)]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let boot = &value.get("configs").and_then(|c| c.as_array()).unwrap()[0];
+        // static_resources.listeners stays empty (the loaded dynamic_listeners
+        // are #[serde(skip)] — structurally excluded from the BootstrapConfigDump).
+        let static_listeners = boot
+            .pointer("/bootstrap/static_resources/listeners")
+            .and_then(|v| v.as_array())
+            .expect("static_resources.listeners is an array");
+        assert!(
+            static_listeners.is_empty(),
+            "loaded dynamic listeners must NOT appear in the BootstrapConfigDump"
+        );
+        // And there is no `dynamic_listeners` key anywhere in the bootstrap subtree.
+        assert!(
+            boot.pointer("/bootstrap/dynamic_listeners").is_none(),
+            "dynamic_listeners is #[serde(skip)] — must be absent"
         );
     }
 }
