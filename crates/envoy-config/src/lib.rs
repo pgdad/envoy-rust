@@ -80,6 +80,18 @@ pub enum ConfigError {
     /// surface; first raised by the Task-2/Task-3 CDS loader.
     #[error("parsing CDS file '{path}': {message}")]
     CdsParseError { path: String, message: String },
+    /// 19 D2: reading the LDS file at the configured path failed (I/O error).
+    /// Part of the D1 schema surface; first raised by the Task-2 LDS parser.
+    #[error("reading LDS file '{path}': {source}")]
+    LdsFileError {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// 19 D2/D3: parsing the LDS file's contents failed. Part of the D1 schema
+    /// surface; first raised by the Task-2/Task-3 LDS loader.
+    #[error("parsing LDS file '{path}': {message}")]
+    LdsParseError { path: String, message: String },
     #[error(
         "cluster '{cluster}' declares load_assignment.cluster_name '{assignment}'; these must match"
     )]

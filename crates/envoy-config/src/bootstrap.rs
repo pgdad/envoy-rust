@@ -27,6 +27,14 @@ pub struct Bootstrap {
     /// surface in the ClustersConfigDump entry instead.
     #[serde(skip)]
     pub dynamic_clusters: Option<Vec<Cluster>>,
+    /// 19 D3: listeners loaded from the LDS file by `load_dynamic_resources`.
+    /// `None` = not loaded yet (parse_bootstrap leaves it None — the fuzz
+    /// target does no I/O); `Some(vec)` = loaded (possibly empty).
+    /// NOT serialized: the BootstrapConfigDump must show the bootstrap as
+    /// parsed from disk (SPEC §5.5 config_dump separation); dynamic listeners
+    /// surface in the ListenersConfigDump entry instead.
+    #[serde(skip)]
+    pub dynamic_listeners: Option<Vec<Listener>>,
 }
 
 impl Bootstrap {
@@ -53,16 +61,44 @@ impl Bootstrap {
             .is_some()
             && self.dynamic_clusters.is_none()
     }
+
+    /// 19 D3: the effective listener list — static listeners followed by
+    /// dynamically-loaded (LDS) listeners. Every consumer that previously
+    /// iterated `static_resources.listeners` goes through THIS instead
+    /// (dynamic listeners are full Listeners, indistinguishable downstream).
+    pub fn all_listeners(&self) -> impl Iterator<Item = &Listener> {
+        self.static_resources
+            .listeners
+            .iter()
+            .chain(self.dynamic_listeners.iter().flatten())
+    }
+
+    /// 19 D1: true iff `lds_config` is configured but `load_dynamic_resources`
+    /// has not yet populated `dynamic_listeners` (the NoRuntime-gate deferral
+    /// predicate; mirrors `cds_configured_but_unloaded`).
+    pub(crate) fn lds_configured_but_unloaded(&self) -> bool {
+        self.dynamic_resources
+            .as_ref()
+            .and_then(|dr| dr.lds_config.as_ref())
+            .is_some()
+            && self.dynamic_listeners.is_none()
+    }
 }
 
-/// 18 D1: `dynamic_resources` — only the CDS filesystem transport at this
-/// phase (ADR-0048). `lds_config` / `ads_config` are deliberately NOT fields:
-/// deny_unknown_fields rejects them loudly (SPEC §4 deferral ledger).
+/// 18 D1: `dynamic_resources` — the CDS and LDS filesystem transports at this
+/// phase (ADR-0048, ADR-0050). `ads_config` / `api_config_source` /
+/// `watched_directory` are deliberately NOT fields: deny_unknown_fields rejects
+/// them loudly (SPEC §4 deferral ledger).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicResources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cds_config: Option<ConfigSource>,
+    /// 19 D1 (ADR-0050): file-based LDS. Reuses ConfigSource/PathConfigSource
+    /// verbatim (resource-type-agnostic). ads_config / api_config_source /
+    /// watched_directory remain rejected by deny_unknown_fields (deferred, SPEC §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lds_config: Option<ConfigSource>,
 }
 
 /// 18 D1: a ConfigSource restricted to the filesystem transport.
@@ -1931,26 +1967,44 @@ impl serde::Serialize for HeaderMatcher {
 }
 
 pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigError> {
-    if bootstrap.static_resources.listeners.len() > 1 {
-        return Err(crate::ConfigError::TooManyListeners(
-            bootstrap.static_resources.listeners.len(),
-        ));
+    // 19 D3 (Correction 1): the single-listener limitation applies to the
+    // MERGED list (static + dynamic together ≤ 1; the pre-existing limitation
+    // is preserved, not lifted — SPEC §4).
+    let total_listeners = bootstrap.all_listeners().count();
+    if total_listeners > 1 {
+        return Err(crate::ConfigError::TooManyListeners(total_listeners));
     }
-    if bootstrap.admin.is_none() && bootstrap.static_resources.listeners.is_empty() {
+    // 19 D3 (Correction 2): the no-runtime gate DEFERS while lds_config is
+    // configured-but-unloaded (listeners may arrive from the LDS file); the
+    // post-merge re-validation (load_dynamic_resources → validate()) re-enforces.
+    if bootstrap.admin.is_none() && total_listeners == 0 && !bootstrap.lds_configured_but_unloaded()
+    {
         return Err(crate::ConfigError::NoRuntime);
     }
 
-    // 18 D1 (L8, ADR-0049): resource_api_version must be "V3" or absent.
-    if let Some(cs) = bootstrap
-        .dynamic_resources
-        .as_ref()
-        .and_then(|dr| dr.cds_config.as_ref())
-        && let Some(v) = cs.resource_api_version.as_deref()
-        && v != "V3"
+    // 18 D1 (L8, ADR-0049): resource_api_version must be "V3" or absent. 19 D1:
+    // the same check now covers the new lds_config field — iterate both
+    // Option<ConfigSource> sources.
+    for cs in [
+        bootstrap
+            .dynamic_resources
+            .as_ref()
+            .and_then(|dr| dr.cds_config.as_ref()),
+        bootstrap
+            .dynamic_resources
+            .as_ref()
+            .and_then(|dr| dr.lds_config.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
     {
-        return Err(crate::ConfigError::UnsupportedResourceApiVersion(
-            v.to_string(),
-        ));
+        if let Some(v) = cs.resource_api_version.as_deref()
+            && v != "V3"
+        {
+            return Err(crate::ConfigError::UnsupportedResourceApiVersion(
+                v.to_string(),
+            ));
+        }
     }
 
     // 18 D1/D3: while CDS is configured-but-unloaded, cluster-reference checks
@@ -6226,20 +6280,18 @@ dynamic_resources:
 
     #[test]
     fn dynamic_resources_rejects_deferred_fields() {
-        // lds_config / ads_config / api_config_source / watched_directory all
-        // rejected loudly by deny_unknown_fields (SPEC §4 deferral ledger).
-        for field in [
-            "lds_config: { path_config_source: { path: /x } }",
-            "ads_config: { api_type: GRPC }",
-        ] {
-            let yaml = format!(
-                "node: {{ id: t, cluster: t }}\nadmin: {{ address: {{ socket_address: {{ address: 0.0.0.0, port_value: 0 }} }} }}\ndynamic_resources:\n  {field}"
-            );
-            assert!(
-                crate::parse_bootstrap(&yaml).is_err(),
-                "{field} should reject"
-            );
-        }
+        // ads_config / api_config_source / watched_directory all rejected loudly
+        // by deny_unknown_fields (SPEC §4 deferral ledger). NOTE: 19 D1 (ADR-0050)
+        // promoted lds_config to a real field — it is no longer in this list (its
+        // parse + the surviving deferred-field rejections live in the 19-D1 tests).
+        let field = "ads_config: { api_type: GRPC }";
+        let yaml = format!(
+            "node: {{ id: t, cluster: t }}\nadmin: {{ address: {{ socket_address: {{ address: 0.0.0.0, port_value: 0 }} }} }}\ndynamic_resources:\n  {field}"
+        );
+        assert!(
+            crate::parse_bootstrap(&yaml).is_err(),
+            "{field} should reject"
+        );
         // api_config_source on the ConfigSource:
         let yaml = r#"
 node: { id: t, cluster: t }
@@ -10537,6 +10589,203 @@ routes: []
         // attempt 5 would be 400ms → capped to 250ms.
         assert_eq!(RetryConfig::backoff(5), Some(Duration::from_millis(250)));
         assert_eq!(RetryConfig::backoff(100), Some(Duration::from_millis(250)));
+    }
+
+    // --- 19 D1 (ADR-0050): file-based LDS schema + validator-gate migration ---
+
+    /// One minimal static echo listener (satisfies NoRuntime; one allowed by the
+    /// single-listener limitation).
+    const ONE_STATIC_LISTENER: &str = r#"
+static_resources:
+  listeners:
+    - name: a
+      address: { socket_address: { address: 0.0.0.0, port_value: 1 } }
+      filter_chains: [{ filters: [{ name: envoy.filters.network.echo }] }]
+"#;
+
+    /// Parse a standalone Listener YAML (test convenience — no listener helper exists).
+    fn parse_listener(yaml: &str) -> Listener {
+        serde_yaml::from_str(yaml).expect("listener parses")
+    }
+
+    #[test]
+    fn bootstrap_parses_dynamic_resources_lds_path_config_source() {
+        // (a) lds_config parses: resource_api_version + path_config_source.
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: /tmp/lds.yaml
+"#;
+        let b = crate::parse_bootstrap(yaml).unwrap();
+        let dr = b.dynamic_resources.as_ref().unwrap();
+        assert!(dr.lds_config.is_some());
+        let cs = dr.lds_config.as_ref().unwrap();
+        assert_eq!(cs.path_config_source.path, "/tmp/lds.yaml");
+        assert_eq!(cs.resource_api_version.as_deref(), Some("V3"));
+    }
+
+    #[test]
+    fn bootstrap_parses_cds_and_lds_side_by_side() {
+        // (b) the fixture-0027 shape: cds_config + lds_config together.
+        let yaml = r#"
+node: { id: test, cluster: test }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  cds_config:
+    path_config_source: { path: /tmp/cds.yaml }
+  lds_config:
+    path_config_source: { path: /tmp/lds.yaml }
+"#;
+        let b = crate::parse_bootstrap(yaml).unwrap();
+        let dr = b.dynamic_resources.as_ref().unwrap();
+        assert!(dr.cds_config.is_some());
+        assert!(dr.lds_config.is_some());
+    }
+
+    #[test]
+    fn dynamic_resources_still_rejects_deferred_fields_with_lds_present() {
+        // (c) deny_unknown_fields regression gate: ads_config / api_config_source /
+        // watched_directory remain rejected even now that lds_config is a field.
+        for field in [
+            "ads_config: { api_type: GRPC }",
+            "api_config_source: { api_type: GRPC }",
+        ] {
+            let yaml = format!(
+                "node: {{ id: t, cluster: t }}\nadmin: {{ address: {{ socket_address: {{ address: 0.0.0.0, port_value: 0 }} }} }}\ndynamic_resources:\n  {field}"
+            );
+            assert!(
+                crate::parse_bootstrap(&yaml).is_err(),
+                "{field} should reject"
+            );
+        }
+        // watched_directory inside lds_config.path_config_source still rejects.
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  lds_config:
+    path_config_source:
+      path: /tmp/lds.yaml
+      watched_directory: { path: /tmp }
+"#;
+        assert!(crate::parse_bootstrap(yaml).is_err());
+    }
+
+    #[test]
+    fn lds_configured_but_unloaded_transitions() {
+        // (d) true when configured + dynamic_listeners is None; false unconfigured;
+        // false once dynamic_listeners is Some (even empty).
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  lds_config:
+    path_config_source: { path: /tmp/lds.yaml }
+"#;
+        let mut b = crate::parse_bootstrap(yaml).unwrap();
+        assert!(b.lds_configured_but_unloaded());
+        b.dynamic_listeners = Some(vec![]);
+        assert!(!b.lds_configured_but_unloaded());
+
+        // Unconfigured: no lds_config at all → false.
+        let mut b2 = crate::parse_bootstrap(MINIMAL).unwrap();
+        assert!(!b2.lds_configured_but_unloaded());
+        b2.dynamic_listeners = Some(vec![]);
+        assert!(!b2.lds_configured_but_unloaded());
+    }
+
+    #[test]
+    fn all_listeners_chains_static_and_dynamic() {
+        // (e) 1 static + 1 dynamic → all_listeners().count() == 2.
+        let mut b = crate::parse_bootstrap(ONE_STATIC_LISTENER).unwrap();
+        assert_eq!(b.all_listeners().count(), 1);
+        let listener2 = parse_listener(
+            r#"
+name: b
+address: { socket_address: { address: 0.0.0.0, port_value: 2 } }
+filter_chains: [{ filters: [{ name: envoy.filters.network.echo }] }]
+"#,
+        );
+        b.dynamic_listeners = Some(vec![listener2]);
+        assert_eq!(b.all_listeners().count(), 2);
+    }
+
+    #[test]
+    fn too_many_listeners_gate_fires_on_merged_count() {
+        // (f) 1 static + 1 dynamic (distinct names) → validate() errs TooManyListeners(2).
+        let mut b = crate::parse_bootstrap(ONE_STATIC_LISTENER).unwrap();
+        let listener2 = parse_listener(
+            r#"
+name: b
+address: { socket_address: { address: 0.0.0.0, port_value: 2 } }
+filter_chains: [{ filters: [{ name: envoy.filters.network.echo }] }]
+"#,
+        );
+        b.dynamic_listeners = Some(vec![listener2]);
+        let err = validate(&mut b).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::TooManyListeners(2)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn no_runtime_gate_defers_while_lds_configured_but_unloaded() {
+        // (g) no admin + zero static listeners + lds_config configured (unloaded)
+        // → parse_bootstrap SUCCEEDS (deferred).
+        let yaml = r#"
+node: { id: t, cluster: t }
+dynamic_resources:
+  lds_config:
+    path_config_source: { path: /tmp/lds.yaml }
+"#;
+        assert!(
+            crate::parse_bootstrap(yaml).is_ok(),
+            "lds-configured-but-unloaded must defer NoRuntime"
+        );
+
+        // Same bootstrap WITHOUT lds_config → NoRuntime (pre-existing behavior).
+        let yaml_no_lds = "node: { id: t, cluster: t }\n";
+        let err = crate::parse_bootstrap(yaml_no_lds).expect_err("must reject");
+        assert!(matches!(err, crate::ConfigError::NoRuntime), "got {err:?}");
+
+        // Same bootstrap with dynamic_listeners = Some(vec![]) (loaded-but-empty)
+        // → NoRuntime (post-merge enforcement; the deferral no longer applies).
+        let mut b = crate::parse_bootstrap(yaml).unwrap();
+        b.dynamic_listeners = Some(vec![]);
+        let err = validate(&mut b).expect_err("must reject post-merge");
+        assert!(matches!(err, crate::ConfigError::NoRuntime), "got {err:?}");
+    }
+
+    #[test]
+    fn lds_resource_api_version_v3_or_absent_accepted_others_rejected() {
+        // (h) V3/absent accepted; V2 rejected with UnsupportedResourceApiVersion.
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  lds_config:
+    resource_api_version: V2
+    path_config_source: { path: /tmp/lds.yaml }
+"#;
+        let err = crate::parse_bootstrap(yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedResourceApiVersion(ref v) if v == "V2"),
+            "got {err:?}"
+        );
+        // Absent resource_api_version on lds_config is accepted.
+        let yaml = r#"
+node: { id: t, cluster: t }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
+dynamic_resources:
+  lds_config:
+    path_config_source: { path: /tmp/lds.yaml }
+"#;
+        assert!(crate::parse_bootstrap(yaml).is_ok());
     }
 }
 

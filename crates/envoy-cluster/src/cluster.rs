@@ -1366,6 +1366,7 @@ admin:
             },
             dynamic_resources: None,
             dynamic_clusters: None,
+            dynamic_listeners: None,
         };
         let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
@@ -1429,6 +1430,7 @@ admin:
             },
             dynamic_resources: None,
             dynamic_clusters: None,
+            dynamic_listeners: None,
         };
         let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
@@ -3256,6 +3258,7 @@ admin:
                 },
                 resource_api_version: None,
             }),
+            lds_config: None,
         }
     }
 
@@ -3282,6 +3285,7 @@ admin:
             },
             dynamic_resources,
             dynamic_clusters,
+            dynamic_listeners: None,
         }
     }
 
