@@ -109,3 +109,19 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — exact type-URL strings, active_state nesting, no-version_info, `skip_serializing_if`, lds-specific gating, Clusters-before-Listeners ordering, shared ISO-8601 source; all 4 test groups genuine; no regression to existing config_dump tests (diff purely additive).
 - **Code quality: Approve** — faithful CDS-sibling mirror with exactly the intended divergences; healthy ~90 production / ~343 test line split. Minor test-helper/fixture duplication (`handler_from_bootstrap`/`parse_cluster`/`DYNAMIC_BACKEND_CLUSTER` re-copied — direct `Bootstrap` construction genuinely required since `handler_with_bootstrap` can't inject the `#[serde(skip)]` side-fields; consistent with the file's per-module self-containment convention) — a recurring M18-9-class extract-shared-helper item, left as-is.
+
+---
+
+### Task 6 — COMPLETE (code commit `7af301f67`)
+
+**Implemented (TDD, RED→GREEN):** generalized the phase-18 `{{CDS_PATH}}` differential-harness machinery to a second dynamic file `{{LDS_PATH}}`. `upstream.rs`: `LDS_CONTAINER_PATH = "/etc/envoy-lds/lds.yaml"` (`.yaml` per L1) + `upstream::start` gains `lds_file: Option<&Path>` (mounted via `with_copy_to`). `lib.rs`: `needs_lds` detection; PER-SIDE template read (`lds-envoy.yaml` upstream + `lds-envoy-rust.yaml` subject — NOT shared, because the LDS payload carries the HCM with Envoy-only fields the envoy-rust parser rejects; hard error on a missing per-side file); kv-map injection (upstream → container path, subject → host temp path); per-side render + dual residual-marker fail-fast; threaded into `upstream::start`. `uses_host_gateway` generalized to a slice signature `(&[&str])` (all call sites + 4 CDS-render-test assertions migrated). 4 non-Docker render-path tests (a–d).
+
+**The load-bearing two-scan correctness (the phase-18 escaped-Critical bug class) — CONFIRMED correct:** `scan_needs_marker` (backend detection) scans the UNRENDERED upstream LDS template (`{{...BACKEND_PORT}}` markers exist only pre-render); `uses_host_gateway` (line 2631) scans the RENDERED `upstream_lds_yaml` (`host.docker.internal` appears only after `{{BACKEND_HOST}}` substitution). Dataflow ordering verified (rendered LDS at :2604 precedes the scan at :2631). Test (d) is the regression guard: it asserts the negative baselines (main+CDS alone → false for both scans) AND the positive with-LDS cases, proving the LDS source is load-bearing.
+
+**Verification (quoted):**
+- `cargo test -p differential --lib`: **123 passed; 0 failed; 1 ignored** (the Docker-gated test).
+- `cargo build --workspace --all-targets`: clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean. `cargo fmt --all -- --check`: clean.
+
+**Two-stage review:**
+- **Spec compliance: ✅** — all 5 requirements + the two-scan correctness verified by code inspection (the highest-priority check: `scan_needs_marker`=unrendered, `uses_host_gateway`=rendered, dataflow ordering confirmed); all 4 tests genuine; all `uses_host_gateway` callers migrated; exact commit message.
+- **Code quality: Approve** — faithful CDS-machinery mirror with the per-side read as the one justified divergence; the correctness-critical unrendered-vs-rendered distinction is explicitly commented; test (d) docstring names the phase-18 Critical and explains the negative baseline. Two Minor nits (the LDS render block's tuple `if let` could key on `needs_lds`; `upstream::start` now has two adjacent same-typed `Option<&Path>` params) — both left as-is.
