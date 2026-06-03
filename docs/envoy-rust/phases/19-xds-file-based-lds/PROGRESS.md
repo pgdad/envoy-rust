@@ -170,3 +170,16 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — atomicity (all 3 edits in one commit), seed well-formed + in SUCCESS array, `.gitignore`/array styles match siblings, corpus arithmetic verified by `git ls-files`=30 and array counts 26+3+1=30; exact commit message; no stray artifacts.
 - **Code quality: Approve** — clean YAML, accurate comment (no `cds` copy-paste leftover), entries follow sibling conventions; two immaterial cosmetic Minors (compact-vs-expanded `admin:` form; `fuzz-lds` node id), no change.
+
+---
+
+### Task 10 — COMPLETE (code commit `e7d436d30`, docs-only +128/-1)
+
+**Implemented:** three `docs/envoy-rust/BEHAVIOR_CONTRACT.md` additions mirroring the phase-18 CDS rows. (1) The "19 entries (file-based LDS)" 6-row stat table (`listener_manager.lds.{update_attempt=1,update_success=1,update_failure=0,update_rejected=0}`, `listener_added=1`, `total_listeners_active=1`) + the §5.2 conditional-registration narrowing paragraph + the L3 Envoy-only enumeration paragraph (21 Envoy names; the 15 unasserted incl. the per-worker `listener_create_success` ✧ caveat; the co-asserted `cluster_added`/`active_clusters`=2). (2) The xDS "Filesystem transport — phase 19 LDS extension" subsection (a)–(f) (envelope/type-URL, readiness+§5.7, the negative-path 3-way-split-vs-all-fatal divergence table, static-wins collision, the L6 validate_clusters/route divergence, the L10 conditionality narrowing). (3) The ListenersConfigDump admin-body-shapes row (conditional, `configs[2]`, `active_state.listener` nesting, NO `version_info`, empty-key omission, bilateral anchor, the LDS-only-bootstrap index caveat) + the `/listeners` annotation. Cross-read against fixture 0027, the backstop, and the emitter source — no discrepancies.
+
+**Verification (quoted):**
+- `cargo build --workspace`: clean (vacuous — docs-only; confirms no stray damage).
+
+**Two-stage review:**
+- **Spec compliance: ✅** — all 3 additions complete; EVERY stat value cross-checked against fixture 0027's expectations.yaml; the ListenersConfigDump shape cross-checked against the real `crates/envoy-admin/src/endpoint.rs` emitter (not just the PLAN); the negative-path dispositions cross-checked against the backstop; the per-worker caveat + 15-name enumeration accurate; no invented values; exact commit message; docs-only.
+- **Code quality: Approve with two fixes (applied)** — excellent structural parallelism with phase 18, clean edit (the `-1` is the expanded `/listeners` row), well-formed markdown, no stale CDS copy-paste. Two Minor prose nits FIXED (a self-contradictory "base `lds.*`" qualifier reworded to "`lds.*` subtree + the base `listener_added` name"; an orphan `✧` glyph removed, keeping the intentional per-worker callout). Commit amended `8ea5c6049` → `e7d436d30`.
