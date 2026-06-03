@@ -81,3 +81,17 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — restructure verified (CDS behavior preserved, single gated post-merge validate, §5.7 ordering, L7 collision rules); snapshot-before-split-borrow confirmed; both consumer migrations confirmed; all 8 a–h + admin tests genuine; test-(g) reasoning verified sound; exact commit message confirmed; no CDS regression.
 - **Code quality: Approve** — zero Critical/Important; faithful CDS-mirror, honest M18-1 caveat, correct split-borrow. Two non-blocking Minor notes (admin-test handler boilerplate could extract `handler_from_bootstrap`; the split-borrow comment slightly overstates borrow-checker necessity since the inline form also compiles) — both left as-is.
+
+---
+
+### Task 4 — COMPLETE (code commit `d24cb52a0`)
+
+**Implemented (TDD, RED→GREEN):** `envoy_listener::register_lds_stats(&Bootstrap, &StatsRegistry) -> Result<(), ListenerError>` — a NO-OP early-return when `dynamic_resources.lds_config` is unconfigured (the §5.2 inertness invariant); otherwise registers the conditional family: `listener_manager.lds.update_attempt`(+1), `lds.update_success`(+1), `lds.update_failure`(0), `lds.update_rejected`(0), `listener_manager.listener_added`(= `all_listeners().count()`, includes static). `total_listeners_active` is NOT registered here (keeps its unconditional 08.2-D14 registration in `Listener::bind`). main.rs call site placed after registry construction AND after `load_dynamic_resources` (so `listener_added` counts merged dynamic listeners). Faithful mirror of the phase-18 `cluster_manager.cds.*` template. 3 tests (a conditional-registration incl. the cds-but-no-lds inertness witness / b 5-name subset / c static-inclusion). API confirmed: `StatsRegistry::register_counter` is idempotent for same-name/same-kind.
+
+**Verification (quoted):**
+- `cargo test -p envoy-listener`: **33 passed; 0 failed** (3 new lds tests).
+- `cargo build --workspace --all-targets`: clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean. `cargo fmt --all -- --check`: clean.
+
+**Two-stage review:**
+- **Spec compliance: ✅** — exact stat-name literals (no typos), `lds_config`-specific guard, all 5 values, total_listeners_active carve-out, call-site ordering (after registry + load), and all 3 tests verified by independent inspection; exact commit message.
+- **Code quality: Approve** — faithful literal CDS-template mirror; error idiom matches `Listener::bind`; `as u64` cast sound. Three stylistic Minors (guard polarity `.is_none()`+early-return vs CDS `.is_some()`-wrap; hand-built test `Bootstrap` — required because YAML round-trip won't populate the `#[serde(skip)]` side-field; `counter_value` lookup helper) — all justified, no change.
