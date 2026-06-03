@@ -29,3 +29,20 @@
 - **Verification:** `cargo test -p envoy-config` (PASS; every pre-existing test stays green) + `cargo build --workspace --all-targets` + `cargo build -p envoy-config` (standalone, per `project_isolated_crate_build_blindspot`) + `cargo clippy --workspace --all-targets --all-features -- -D warnings` + `cargo fmt --all -- --check`.
 
 _(Task entries are appended below by the state-3 executor — one per task, with quoted verification output + the two-stage review verdicts, per the 06.2 → 18 cadence.)_
+
+---
+
+### Task 1 — COMPLETE (code commit `fda4f8668`)
+
+**Implemented (TDD, RED→GREEN):** `DynamicResources.lds_config: Option<ConfigSource>` (reuses `ConfigSource`/`PathConfigSource` verbatim; `ads_config`/`api_config_source`/`watched_directory` still rejected by `deny_unknown_fields`); `Bootstrap.dynamic_listeners: Option<Vec<Listener>>` (`#[serde(skip)]`); `all_listeners()` + `lds_configured_but_unloaded()` (mirroring `all_clusters()` / `cds_configured_but_unloaded()`); `ConfigError::{LdsFileError, LdsParseError}` (mirroring the Cds pair); the `TooManyListeners` gate migrated to `all_listeners().count()` (merged); the `NoRuntime` gate defers iff `lds_configured_but_unloaded()` and re-enforces post-merge (Corrections 1+2); the `resource_api_version` V3-or-absent check extended to cover BOTH `cds_config` + `lds_config`. 8 new tests (groups a–h). **Carry-forward fixes (the phase-16/17/18 Task-1 lesson):** 4 literal sites in `crates/envoy-cluster/src/cluster.rs` (3 `Bootstrap` + 1 `DynamicResources`) extended. One pre-existing test (`dynamic_resources_rejects_deferred_fields`) dropped its now-obsolete `lds_config`-rejected entry; the `ads_config`/`api_config_source`/`watched_directory` deny-unknown-field gate is retained (test group c reinforces it).
+
+**Verification (quoted):**
+- `cargo test -p envoy-config`: **332 passed; 0 failed**.
+- `cargo build --workspace --all-targets`: clean.
+- `cargo build -p envoy-config` (standalone, per `project_isolated_crate_build_blindspot`): clean.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+
+**Two-stage review:**
+- **Spec compliance: ✅** — all 7 requirements + 8 test groups verified by independent code inspection; the removed pre-existing test confirmed legitimately obsolete with deferred-field coverage retained; exact commit message confirmed; only the 3 intended files touched.
+- **Code quality: Approve with one Important fix** — a stale `DynamicResources` doc comment (`bootstrap.rs:88-90`) that still claimed `lds_config` was "deliberately NOT a field." **FIXED** and the commit amended (`9fc6ce1` → `fda4f8668`). Two Minor items (resource_api_version double-unwrap; `parse_listener` test helper having no CDS sibling) deliberately skipped as not-worth-churn.
