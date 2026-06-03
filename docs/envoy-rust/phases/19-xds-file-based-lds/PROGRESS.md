@@ -46,3 +46,21 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — all 7 requirements + 8 test groups verified by independent code inspection; the removed pre-existing test confirmed legitimately obsolete with deferred-field coverage retained; exact commit message confirmed; only the 3 intended files touched.
 - **Code quality: Approve with one Important fix** — a stale `DynamicResources` doc comment (`bootstrap.rs:88-90`) that still claimed `lds_config` was "deliberately NOT a field." **FIXED** and the commit amended (`9fc6ce1` → `fda4f8668`). Two Minor items (resource_api_version double-unwrap; `parse_listener` test helper having no CDS sibling) deliberately skipped as not-worth-churn.
+
+---
+
+### Task 2 — COMPLETE (code commit `3cf3bc4ca`)
+
+**Implemented (TDD, RED→GREEN):** `crates/envoy-config/src/lds.rs` — `parse_lds_file(path, contents) -> Result<Vec<Listener>, ConfigError>` parsing the `@type`-tagged Listener envelope (`type.googleapis.com/envoy.config.listener.v3.Listener`); accepts BOTH the bare `resources:` list and the full DiscoveryResponse (`version_info` accept-and-ignore — envelope is NOT `deny_unknown_fields`); always-YAML; errors map to `LdsParseError`. UNLIKE `parse_cds_file`, it does NOT validate listeners (deferred to Task 3's post-merge re-validation per the §5.7 ordering invariant — documented in module + fn docs). `lib.rs`: `pub mod lds;` + `pub use lds::parse_lds_file;`. 7 tests (groups a–g), faithfully mirroring `cds.rs` and actually stronger (concrete-variant + message-content assertions vs cds.rs's bare `.is_err()`).
+
+**Note — interrupted implementer:** the implementer subagent completed the implementation (file + tests + lib wiring) but hit a server-side 500 error before its self-review/commit. The controller verified all gates and committed; the two-stage review (below) was run with extra rigor to compensate for the missing self-review.
+
+**Verification (quoted):**
+- `cargo test -p envoy-config --lib`: **339 passed; 0 failed** (7 new `lds::tests`).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean.
+- `cargo build -p envoy-config` (standalone): clean.
+- `cargo fmt --all -- --check`: clean.
+
+**Two-stage review:**
+- **Spec compliance: ✅** — signature/module-wiring/envelope/enum/no-validation-difference all verified by independent code inspection; all 7 tests genuine (minimal fixture carries a real HCM filter chain); exact commit message confirmed; no scope creep in the parser itself.
+- **Code quality: Approve** — faithful idiomatic mirror of `cds.rs`; the single-variant `.map(|LdsResource::Listener(l)| l)` collect and the `format!`-based DiscoveryResponse test are deliberate sibling-parity choices. Three Minor items, none requiring a fix: (1) the pre-existing untracked `crates/envoy-config/fuzz/Cargo.lock` was swept into this commit by `git add crates/envoy-config/` — a legitimate, conventionally-committed lockfile, left in place to avoid amend-churn; (2)/(3) doc-rationale duplication + `format!` test pattern, both mirror-faithful to cds.rs and kept as-is.
