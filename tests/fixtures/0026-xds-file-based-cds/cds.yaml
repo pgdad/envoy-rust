@@ -1,0 +1,22 @@
+# The CDS file (L1 / ADR-0049): the bare `resources:` envelope with
+# `@type`-tagged Cluster payloads. The harness renders this template per side
+# (the `{{BACKEND_HOST}}` / `{{HTTP1_BACKEND_PORT}}` markers resolve to each
+# side's backend address) and points each proxy's `dynamic_resources.cds_config.
+# path_config_source.path` (the main config's `{{CDS_PATH}}`) at the rendition.
+# The lone Cluster is 0008's static `backend` cluster moved verbatim into the
+# CDS file and renamed `dynamic_backend` (STRICT_DNS + lb_policy ROUND_ROBIN +
+# dns_lookup_family V4_ONLY) — structurally identical to fixture 0008's cluster
+# shape, the same cluster moved into the CDS file (L6).
+resources:
+  - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+    name: dynamic_backend
+    type: STRICT_DNS
+    dns_lookup_family: V4_ONLY
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: dynamic_backend
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: { address: {{BACKEND_HOST}}, port_value: {{HTTP1_BACKEND_PORT}} }

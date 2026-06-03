@@ -1,0 +1,46 @@
+node: { id: envoy-rust-phase-18-fixture-0026, cluster: envoy-rust-phase-18 }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: {{ADMIN_PORT}} } } }
+dynamic_resources:
+  cds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: {{CDS_PATH}}
+static_resources:
+  listeners:
+    - name: http1_listener
+      address: { socket_address: { address: 127.0.0.1, port_value: {{PORT}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http1
+                codec_type: HTTP1
+                # `generate_request_id` is omitted on the envoy-rust side
+                # (its HCM parser does not recognize the field — the same
+                # intentional field-set divergence as `request_headers_to_remove`,
+                # mirroring fixtures 0008/0025). envoy-rust does not inject a
+                # `x-request-id`, so suppression is a no-op for it; the Envoy
+                # side carries `generate_request_id: false` to keep the echoed
+                # body byte-equal across proxies.
+                route_config:
+                  name: local_route
+                  # L12b (ADR-0049): parse-and-accept on envoy-rust's side (the
+                  # `validate_clusters` field is recognized by the bootstrap
+                  # parser; the route to the CDS-supplied `dynamic_backend` is
+                  # deferred-then-revalidated after the CDS load). Kept here so
+                  # both proxies' route_config field-sets match modulo the
+                  # `request_headers_to_remove` divergence documented in
+                  # envoy.yaml (which envoy-rust's deny_unknown_fields parser
+                  # does not recognize, mirroring fixture 0008).
+                  validate_clusters: false
+                  virtual_hosts:
+                    - name: backend_vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: dynamic_backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

@@ -1,0 +1,80 @@
+# Phase 18 fixture-0026 expectations: file-based CDS (ADR-0048 SPEC /
+# ADR-0049 PLAN) — the xDS-family opener. ONE GET / over an H1 keep-alive conn
+# proves the data-plane routes through a cluster that exists ONLY because the
+# proxy loaded `dynamic_resources.cds_config.path_config_source.path` at boot:
+#
+#   GET / -> routed to cluster `dynamic_backend` (CDS-supplied, NOT in
+#   static_resources) -> backend 200. A proxy that ignored `dynamic_resources`
+#   would have no `dynamic_backend` cluster and 503 on the route (the L6
+#   data-plane discriminator). The per-request `expected_body` (below) asserts
+#   the echoed body byte-exact on EACH side independently; with identical
+#   request inputs (the `request_headers_to_remove` machinery strips the
+#   proxy-injected headers so both sides forward the same request to the echo
+#   helper) this pins the data-plane wire shape. The 200-vs-would-be-503 status
+#   is the CDS-load discriminator.
+#
+# Driver `http1_keep_alive` (mirrors fixtures 0023/0024/0025). ONE downstream
+# keep-alive conn drives the single GET; 200ms settle past the request; then a
+# bilateral admin stat scrape on the conditional `cluster_manager.cds.*` /
+# `cluster_added` / `active_clusters` counters (L3) + the per-cluster + HCM
+# downstream counters, followed by a `/config_dump` json_shape sub-case proving
+# the `ClustersConfigDump` at `configs[1]` reflects the loaded dynamic cluster
+# (L5).
+#
+# expected_stats values (L3, single dynamic cluster + zero static): cds
+# attempt/success 1/1, failure/rejected 0/0, cluster_added 1, active_clusters 1.
+#
+# NOT asserted (intentional — see README "L3 Envoy-only stat enumeration"):
+# Envoy v1.33 also emits ~12 other `cluster_manager.*` names (e.g.
+# `cluster_manager.cds.version`, `cluster_manager.cds.control_plane.*`,
+# `cluster_manager.warming_clusters`, `cluster_manager.cluster_modified`,
+# `cluster_manager.cluster_removed`, `cluster_manager.cluster_updated*`,
+# `cluster_manager.update_*`) that envoy-rust does not emit at this scope; the
+# named-stat scrape asserts only the six lock-in #L3 names (no set-diff).
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /
+      host: dynamic_backend
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "method: GET\npath: /\nheaders:\n  host: dynamic_backend\nbody: \n" }
+  settle_ms: 200
+  expected_stats:
+    # CDS load (L3 — conditional cluster_manager.cds.* + cluster_added/active):
+    - { name: cluster_manager.cds.update_attempt,  value: 1 }
+    - { name: cluster_manager.cds.update_success,  value: 1 }
+    - { name: cluster_manager.cds.update_failure,  value: 0 }
+    - { name: cluster_manager.cds.update_rejected, value: 0 }
+    - { name: cluster_manager.cluster_added,       value: 1 }
+    - { name: cluster_manager.active_clusters,     value: 1 }
+    # Data-plane through the dynamic cluster (L6 — structurally identical to
+    # 0008's cluster shape: the same STRICT_DNS/ROUND_ROBIN/V4_ONLY cluster
+    # moved into the CDS file):
+    - { name: cluster.dynamic_backend.upstream_rq_total, value: 1 }
+    - { name: cluster.dynamic_backend.upstream_cx_total, value: 1 }
+    # HCM downstream (stat_prefix ingress_http1, per 0008):
+    - { name: http.ingress_http1.downstream_rq_total, value: 1 }
+    - { name: http.ingress_http1.downstream_rq_2xx,   value: 1 }
+  admin_scrapes:
+    # /config_dump (L5): the conditional ClustersConfigDump lands at configs[1]
+    # on BOTH sides; its first dynamic_active_clusters entry's cluster.name is
+    # the CDS-supplied `dynamic_backend`. required_subtree asserts BOTH sides
+    # equal `expected` AND envoy == envoy-rust.
+    - path: /config_dump
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["configs"]
+        required_subtree:
+          path: configs.1.dynamic_active_clusters.0.cluster.name
+          expected: dynamic_backend
+        # The `configs` array content differs substantially per side (envoy
+        # emits its full protobuf-canonical bootstrap+config projection;
+        # envoy-rust emits the narrower parsed-bootstrap projection) — mirrors
+        # fixture 0014's `/config_dump` disposition. The required_subtree check
+        # above still pins `configs[1]` (the ClustersConfigDump, L5) and asserts
+        # both sides agree the first dynamic_active_clusters entry's cluster.name
+        # is `dynamic_backend`.
+        value_may_differ_keys: ["configs"]
