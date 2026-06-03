@@ -925,6 +925,21 @@ pub fn scan_needs_marker(sources: &[&str], marker: &str) -> bool {
     sources.iter().any(|s| s.contains(&token))
 }
 
+/// 18 Task 11 (ADR-0015, ADR-0049): decide whether the upstream Envoy container
+/// needs the `with_host("host.docker.internal", Host::HostGateway)` mapping. The
+/// flag is true exactly when the rendered upstream config references the
+/// `host.docker.internal` hostname — silent otherwise so fixtures 0001/0002 stay
+/// unchanged. The reference can live in the main config OR (fixture 0026, where
+/// the main config has zero static clusters and the backend endpoint is defined
+/// in the CDS file) in the rendered upstream CDS file. The CDS extension is
+/// required on Linux CI, where the host-gateway is wired via `--add-host`; macOS
+/// Docker Desktop resolves `host.docker.internal` natively, which is why missing
+/// the CDS site only surfaced as a CI-only 503.
+pub fn uses_host_gateway(upstream_main: &str, upstream_cds: Option<&str>) -> bool {
+    upstream_main.contains("host.docker.internal")
+        || upstream_cds.is_some_and(|cds| cds.contains("host.docker.internal"))
+}
+
 /// 18 Task 6 (ADR-0049): scan a CDS rendition for any residual `{{MARKER}}`
 /// token left behind by `render_yaml` (which intentionally leaves unmatched
 /// tokens in place). Returns the first offending marker name (the text between
@@ -2469,24 +2484,29 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // later copied into the container at `CDS_CONTAINER_PATH`; the subject file
     // stays at its host temp path (`subject_cds_path`, already injected into
     // the subject kv map as `{{CDS_PATH}}`).
+    // 18 Task 11 (ADR-0049): retain the rendered upstream CDS string so the
+    // `host_uses_host_gateway` decision below can scan it too (fixture 0026: the
+    // `host.docker.internal` reference lives ONLY in the CDS file).
+    let mut upstream_cds_yaml: Option<String> = None;
     let upstream_cds_path: Option<PathBuf> = if let Some(tpl) = cds_template.as_ref() {
-        let upstream_cds_yaml = render_yaml(tpl, &upstream_kvs_refs);
+        let up_cds = render_yaml(tpl, &upstream_kvs_refs);
         let subject_cds_yaml = render_yaml(tpl, &subject_kvs_refs);
         // 18 Task 6 (ADR-0049): `render_yaml` intentionally leaves any unmatched
         // `{{MARKER}}` token in place, so a marker present in `cds.yaml` but
         // absent from the kv map would otherwise slip through and surface as a
         // confusing Envoy parse error. Fail fast here, CDS-scoped, naming the
         // offending marker. (Deliberately NOT applied to main-config rendering.)
-        if let Some(marker) = residual_marker(&upstream_cds_yaml) {
+        if let Some(marker) = residual_marker(&up_cds) {
             bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream cds.yaml");
         }
         if let Some(marker) = residual_marker(&subject_cds_yaml) {
             bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject cds.yaml");
         }
-        let up_path = write_temp(tmp.path(), "cds-upstream.yaml", &upstream_cds_yaml)?;
+        let up_path = write_temp(tmp.path(), "cds-upstream.yaml", &up_cds)?;
         // Write the subject rendition at the exact path injected into the
         // subject kv map so `{{CDS_PATH}}` resolves to a file that exists.
         write_temp(tmp.path(), "cds-subject.yaml", &subject_cds_yaml)?;
+        upstream_cds_yaml = Some(up_cds);
         Some(up_path)
     } else {
         None
@@ -2502,7 +2522,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // testcontainers image (per ADR-0015). The flag is true exactly when the
     // upstream YAML actually references the hostname — silent when it
     // doesn't, so fixtures 0001 and 0002 stay unchanged.
-    let host_uses_host_gateway = upstream_yaml.contains("host.docker.internal");
+    //
+    // 18 Task 11 (ADR-0015, ADR-0049): the scan also covers the rendered
+    // upstream CDS file. Fixture 0026's main config has zero static clusters —
+    // the backend endpoint (and thus the only `host.docker.internal` reference)
+    // lives in cds.yaml. On Linux CI the host-gateway is wired via `--add-host`,
+    // so without this the container's STRICT_DNS resolution fails and the route
+    // 503s; macOS Docker Desktop resolves the hostname natively, which is why
+    // the gap surfaced only in CI.
+    let host_uses_host_gateway = uses_host_gateway(&upstream_yaml, upstream_cds_yaml.as_deref());
     // (e) Thread tls_pki through to upstream::start. 06.1: also thread
     // `needs_admin_port` so the container exposes ADMIN_CONTAINER_PORT for
     // Driver::AdminScrape fixtures.
@@ -4501,6 +4529,40 @@ resources:
         assert!(
             !scan_needs_marker(&[upstream_main, subject_main, ""], "HTTP1_BACKEND_PORT"),
             "empty cds source must not fabricate a backend need",
+        );
+    }
+
+    /// 18 Task 11 (ADR-0015, ADR-0049): the host-gateway decision must scan the
+    /// rendered upstream CDS file too, not just the main config. Fixture 0026's
+    /// main config has zero static clusters — the backend endpoint (and the only
+    /// `host.docker.internal` reference) lives in cds.yaml. Scanning only the
+    /// main config (the pre-fix behaviour) returned `false`, so on Linux CI the
+    /// container never got the `--add-host` host-gateway mapping and the route
+    /// 503'd; macOS Docker Desktop resolves the hostname natively, hiding the
+    /// gap locally. `uses_host_gateway` is the testable extraction of the
+    /// `host_uses_host_gateway` decision in `run_fixture`.
+    #[test]
+    fn host_gateway_detected_in_cds_only() {
+        // The CDS-only case: marker lives ONLY in the rendered CDS string, not
+        // the main config. This is the fixture-0026 regression the fix targets.
+        assert!(
+            uses_host_gateway("no marker here", Some("address: host.docker.internal")),
+            "host.docker.internal in the CDS file alone must drive the host-gateway mapping",
+        );
+        // No CDS file and no marker in main → no mapping (fixtures 0001/0002).
+        assert!(
+            !uses_host_gateway("no marker", None),
+            "absent hostname must leave the mapping off",
+        );
+        // The original main-config path stays true (no regression).
+        assert!(
+            uses_host_gateway("host.docker.internal", None),
+            "host.docker.internal in the main config must still drive the mapping",
+        );
+        // A CDS file present but without the marker must not fabricate a need.
+        assert!(
+            !uses_host_gateway("no marker", Some("address: 127.0.0.1")),
+            "a CDS file without the hostname must not turn the mapping on",
         );
     }
 
