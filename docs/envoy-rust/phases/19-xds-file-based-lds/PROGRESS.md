@@ -155,3 +155,18 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance: ✅** — all 6 tests present, correctly named, ZERO `#[ignore]`; negative tests assert non-zero exit AND the specific `thiserror` Display substrings (no false-pass — fresh ports + valid CDS make the LDS fault the only failure cause); collision proves all three conditions; inertness asserts the absence triad; happy-path config_dump checks `configs[2]` by `@type`; exact commit message.
 - **Code quality: Approve** — faithful verbatim CDS-backstop mirror; `assert_fatal_startup` a clean 3-path abstraction with correct pipe-drain discipline; flake-resistant (reserved ports, bounded waits, kill_on_drop); the collision "port B refused" check proven race-free against source (the dynamic listener is never bound after the merge drops it). Only cosmetic Minors (a `write!`-vs-`push_str(&format!)` builder nit; an unused admin_port in the fatal tests faithfully mirroring CDS; a slightly-misleading "Host header" comment) — none warranting change.
+
+---
+
+### Task 9 — COMPLETE (code commit `d9a7e2a10`, atomic 3-file edit)
+
+**Implemented:** new fuzz seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/dynamic_resources_lds.yaml` (a bootstrap with BOTH `lds_config` + `cds_config`, zero static listeners, admin, one static cluster — exercises the new schema surface) added ATOMICALLY in one commit to all three sites: the seed file, the `.gitignore` `!corpus/parse_bootstrap/...` allow-list (after the cds sibling), and the `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (`// 19 Task 9`, after the cds entry). Corpus arithmetic: **30 tracked = 30 allow-list = 26 SUCCESS + 3 REJECT + 1 minimal** (the seed PARSES — `parse_bootstrap` is pure / never reads the referenced files, and the `NoRuntime` gate defers on `lds_configured_but_unloaded` with admin present).
+
+**Verification (quoted):**
+- `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly`: **1 passed; 0 failed**. `cargo test -p envoy-config` (full): **347 passed; 0 failed**.
+- Nightly fuzz sanity: `cargo +nightly fuzz run parse_bootstrap -- -runs=10000 -timeout=10` → **clean** (21042 runs in 8s, no crashes/artifacts). [The full 200k-run gate is Task 11.]
+- `cargo build --workspace --all-targets`: clean. `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean. `cargo fmt --all -- --check`: clean.
+
+**Two-stage review:**
+- **Spec compliance: ✅** — atomicity (all 3 edits in one commit), seed well-formed + in SUCCESS array, `.gitignore`/array styles match siblings, corpus arithmetic verified by `git ls-files`=30 and array counts 26+3+1=30; exact commit message; no stray artifacts.
+- **Code quality: Approve** — clean YAML, accurate comment (no `cds` copy-paste leftover), entries follow sibling conventions; two immaterial cosmetic Minors (compact-vs-expanded `admin:` form; `fuzz-lds` node id), no change.
