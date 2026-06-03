@@ -216,6 +216,30 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 
 **The L12 Envoy-only enumeration paragraph.** Per cluster with `circuit_breakers`, Envoy always emits the 10-gauge family `circuit_breakers.{default,high}.{cx_open, cx_pool_open, rq_open, rq_pending_open, rq_retry_open}`; with `track_remaining: true` it adds 5 `circuit_breakers.default.remaining_*` gauges (`remaining_cx`, `remaining_pending`, `remaining_rq`, `remaining_retries`, `remaining_cx_pools`). envoy-rust at phase-17 scope emits: `default.cx_open` (pools, phase 15) + `default.rq_open` + `default.rq_retry_open` (cluster, conditional on `circuit_breakers`) + `default.remaining_retries`/`default.remaining_rq` (conditional on `track_remaining`). The rest are Envoy-only unasserted names (ignored by the named-stat scrape).
 
+**18 entries (file-based CDS):**
+
+> The xDS-family opener. These are the project's first **top-level-scope**
+> (non-resource-prefixed) `cluster_manager.*` stats, all derived from the
+> §6.2 empirical lock-in **L3** (verified against `envoyproxy/envoy:v1.33.0`,
+> digest `sha256:56da5afd…`, 2026-06-02). Envoy emits 18 names under
+> `cluster_manager.*` after a successful CDS load; envoy-rust's minimum-viable
+> subset is **6 names**. Registered at `ClusterManager::from_bootstrap` time
+> (`crates/envoy-cluster/src/cluster.rs`), **conditionally** — ONLY when
+> `dynamic_resources.cds_config` is configured.
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `cluster_manager.cds.update_attempt` | value-exact (fixture 0026: 1) | Counter; one increment per CDS load attempt. envoy-rust's synchronous `load_dynamic_resources` ticks it once at the file-read+parse step. Both proxies emit 1 on the single initial load (no hot-reload at phase-18 scope — L11 inconclusive/deferred). |
+| `cluster_manager.cds.update_success` | value-exact (fixture 0026: 1) | Counter; one increment per CDS load that produced an installed cluster set. The load-bearing differential proof of the phase: `update_success: 1` can only pass if real Envoy genuinely loaded the CDS file (fixture 0026 asserts it bilaterally). |
+| `cluster_manager.cds.update_failure` | value-exact (fixture 0026: 0) | Counter; in Envoy, `+1` per CDS load that hit a **parse error** (malformed envelope) — Envoy then warns-and-serves with `active_clusters: 0`. **In envoy-rust this is structurally 0:** all CDS load errors are FATAL pre-construction (the L4 all-fatal posture, ADR-0049 — see the xDS-wire-state-machine §(c)), so the process exits rather than reach a non-zero `update_failure` state. Registered at 0 and unreachable non-zero. Bilaterally satisfiable at 0 on fixture 0026 (a successful load). |
+| `cluster_manager.cds.update_rejected` | value-exact (fixture 0026: 0) | Counter; in Envoy, `+1` per CDS load whose resource was **semantically invalid** (PGV violation / cluster-build failure) — distinct from the parse-error `update_failure` bucket; Envoy warns-and-serves. **In envoy-rust this is structurally 0** for the same reason as `update_failure` (the all-fatal posture; the process exits instead). Registered at 0 and unreachable non-zero. Bilaterally satisfiable at 0 on fixture 0026. |
+| `cluster_manager.cluster_added` | value-exact (fixture 0026: 1) | Counter; `+1` per cluster ADDED to the manager. The count includes **static clusters** — Envoy counts ALL clusters added to the manager, not just CDS-supplied ones; envoy-rust mirrors (`= all_clusters().count()`, the merged static+dynamic size). Bilateral on fixture 0026 because it has **zero static clusters** (the single dynamic cluster yields 1 on both sides); a fixture mixing static + dynamic clusters would assert the combined count. |
+| `cluster_manager.active_clusters` | value-exact (fixture 0026: 1) | Gauge; the count of currently-active clusters in the manager — the same merged static+dynamic size as `cluster_added`, and the same static-inclusion caveat applies (bilateral on fixture 0026 only because it has zero static clusters). The lone gauge of the 6 names (the other 5 are counters). |
+
+**The §5.2 conditional-registration narrowing (recorded divergence, L10/ADR-0049).** All 6 names register ONLY when `dynamic_resources.cds_config` is configured. This is a **deliberate divergence** from Envoy's tree: Envoy emits the `cluster_manager.cds.*` subtree conditionally (the cds subtree exists only with CDS configured — both proxies agree here), but Envoy emits the **base** `cluster_manager.*` names (`active_clusters`, `cluster_added`, …) **unconditionally** on every bootstrap. envoy-rust narrows the base names to the same CDS-configured condition (registers nothing on non-CDS fixtures), so on all non-CDS fixtures the base `cluster_manager.*` names stay **Envoy-only-unasserted** (fixture 0011's Prometheus set-diff posture is unchanged; zero existing-fixture edits). Recorded explicitly per doctrine D-3.3.
+
+**The L3 Envoy-only enumeration paragraph.** After a successful load Envoy emits **18** `cluster_manager.*` names; envoy-rust emits the **6** above. The 12 Envoy-only unasserted names (ignored by fixture 0026's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `cds.update_time`, `cds.version`, `cds.version_text`, `cds.update_duration`, `cds.init_fetch_timeout`, `cluster_modified`, `cluster_removed`, `cluster_updated`, `cluster_updated_via_merge`, `update_merge_cancelled`, `update_out_of_merge_window`, `warming_clusters`. (Envoy additionally carries a `cds.control_plane.*` family, irrelevant to the filesystem transport.) None of the 6 emitted `cluster_manager.*` values change pre- vs post-GET — request counters live under `cluster.<name>.*`.
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments
@@ -255,7 +279,8 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 
 | Endpoint | Method | Body kind | Equivalence disposition |
 |---|---|---|---|
-| `/config_dump` | GET | JSON object | Top-level shape `{ "configs": [...] }`. envoy-rust emits exactly one entry: `{ "@type": "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump", "bootstrap": <static-bootstrap-as-JSON>, "last_updated": <ISO-8601 timestamp> }`. Envoy may emit additional entries for xDS-derived configs; those land on `allowlist_envoy_only`. `bootstrap.static_resources` content value-exact-after-roundtrip (modulo serde renamings; the harness's `JsonShape::required_subtree` covers this). `last_updated` name-required-value-may-differ (wall-clock non-determinism). |
+| `/config_dump` | GET | JSON object | Top-level shape `{ "configs": [...] }`. envoy-rust emits the `BootstrapConfigDump` entry at `configs[0]`: `{ "@type": "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump", "bootstrap": <static-bootstrap-as-JSON>, "last_updated": <ISO-8601 timestamp> }`. Envoy may emit additional entries for xDS-derived configs; those land on `allowlist_envoy_only`. `bootstrap.static_resources` content value-exact-after-roundtrip (modulo serde renamings; the harness's `JsonShape::required_subtree` covers this). `last_updated` name-required-value-may-differ (wall-clock non-determinism). The `BootstrapConfigDump` shows the bootstrap **as parsed from disk** — dynamic (CDS) clusters do NOT appear here (SPEC §5.5 config_dump separation); they surface in the `ClustersConfigDump` entry below. |
+| `/config_dump` `ClustersConfigDump` (phase 18, L5/ADR-0049) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when `dynamic_resources.cds_config` is configured; on non-CDS fixtures it is absent (fixture 0014's single-`BootstrapConfigDump`-entry shape preserved). When present, it lands at `configs[1]` on **both** proxies (Envoy's order: `BootstrapConfigDump`[0], `ClustersConfigDump`[1], …). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.ClustersConfigDump", "dynamic_active_clusters": [ { "cluster": { "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster", <full cluster config> }, "last_updated": <ISO-8601> } ], "static_clusters": [ … when non-empty ] }`. The inner `cluster` object carries its own `@type` plus the full flattened cluster config. **Empty-key omission (proto3-JSON style):** `static_clusters` and `dynamic_active_clusters` are each `skip_serializing_if = Vec::is_empty` on both sides — a static-only Envoy emits the entry with ONLY a `static_clusters` key (no `dynamic_active_clusters`); there is NO `version_info` key (the CDS file had none — proto3 JSON omits empty fields). `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Bilateral anchor (fixture 0026):** `configs.1.dynamic_active_clusters.0.cluster.name == dynamic_backend` (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array content otherwise differs substantially per side (envoy emits its full protobuf-canonical projection; envoy-rust the narrower parsed-bootstrap projection) — `value_may_differ_keys: ["configs"]`, mirroring fixture 0014. Note: envoy-rust's cluster JSON uses snake_case field names while Envoy's proto3-JSON defaults to camelCase for multi-word fields — irrelevant for the `name` anchor (single-word, identical) but binding if a future fixture asserts deeper nested cluster fields. |
 | `/server_info` | GET | JSON object | Required keys `state`, `version`, `node`, `uptime_current_epoch_seconds`, `uptime_all_epochs_seconds`, `hot_restart_version`, `command_line_options`. `state` value-exact, sourced from `DrainState::current()` via the mapping `Live | HealthcheckFailing → "LIVE"`, `Draining → "DRAINING"` (08.1 emitted the literal constant `"LIVE"` as a placeholder; 08.2's D5e patches the value-binding source at Task 5 — the struct shape is unchanged at the 08.1 → 08.2 boundary); `node.*` value-exact from the parsed bootstrap; `version` + `hot_restart_version` + `command_line_options` allowlist-each-side (envoy-rust emits its own version string; Envoy emits its own); `uptime_*` name-required-value-may-differ (wall clock). |
 | `/clusters` | GET | text/plain | Set-equal `<cluster_name>::observability_name::<name>` + `<cluster_name>::default_priority::endpoints` lines per Envoy v1.33's plain-text format. Per-endpoint numeric fields (success/error/timeout counts) name-required-value-may-differ; envoy-rust at 08.1 emits only the minimum two lines per cluster (architecture-decision lock-in #10) — Envoy's richer output is allow-listed envoy-only on fixture 0014. Cluster output order is deterministic by name (sorted in `ClusterManager::clusters()`). |
 | `/listeners` | GET | text/plain | Set-equal `<listener_name>::<address>:<port>` lines. Order: sorted-by-name (deterministic on both sides). |
@@ -372,7 +397,123 @@ extend this section with new tokens (`%FILTER_STATE%`, `%DYNAMIC_METADATA%`,
 > Populated when the xDS family (§9 of `BOOTSTRAP_PROMPT.md`) enters
 > `in-progress`.
 
-_(empty; populated when xDS family begins)_
+### Filesystem transport (`path_config_source`) — phase 18
+
+> The xDS-family opener (ADR-0048 SPEC / ADR-0049 PLAN). file-based CDS loads
+> clusters from `dynamic_resources.cds_config.path_config_source.path` at
+> startup. All findings below are the §6.2 empirical lock-ins (L1–L12),
+> verified against `envoyproxy/envoy:v1.33.0` (digest `sha256:56da5afd…`,
+> 2026-06-02) and reconciled by ADR-0049; what is bilaterally asserted lives in
+> fixture 0026, the negative paths live in the in-process backstop
+> (`crates/envoy-bin/tests/xds_file_based_cds.rs`).
+
+**(a) The CDS file envelope (L1).** Both the bare `resources:` list AND the full
+`DiscoveryResponse` shape (`version_info` + `resources`) are accepted; Envoy
+treats `version_info` as load-bearing, envoy-rust accepts-and-ignores it. Each
+resource MUST carry an `@type` (omitting it → Envoy `update_failure: 1` + log
+`missing @type in Any is only allowed for an empty object` + the route 503s);
+CDS files carry Cluster resources only. The byte-exact minimal working CDS file:
+
+```yaml
+resources:
+- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+  name: dynamic_backend
+  type: STRICT_DNS
+  dns_lookup_family: V4_ONLY
+  load_assignment:
+    cluster_name: dynamic_backend
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address: { address: host.docker.internal, port_value: 8124 }
+```
+
+**Recorded divergence (ADR-0049): parser selection.** Envoy selects its parser by
+**file extension** — `.yaml`/`.yml` → YAML parser (which also accepts JSON
+syntax); any other or absent extension → JSON-only parser (YAML content in a
+`.json`/extensionless file fails with `update_failure`). envoy-rust's
+`parse_cds_file` is **always-YAML** (`serde_yaml`, regardless of extension) —
+strictly more lenient on non-`.yaml` extensions. No differential observable: the
+fixture's CDS file ends in `.yaml` and the Envoy-side container path
+(`/etc/envoy-cds/cds.yaml`) is structurally `.yaml`. envoy-rust requires the
+`@type` per resource (the ADR-0014 internally-tagged-on-`@type` pattern; a
+non-Cluster `@type` rejects loudly).
+
+**(b) Initial-load / readiness ordering (L2).** Readiness implies loaded on both
+proxies. Envoy's startup log order: `cds: add 1 cluster(s)` → `cm init: all
+clusters initialized` → `all dependencies initialized. starting workers`; the
+dynamic cluster is routable the instant `/ready` first returns 200. envoy-rust
+mirrors this naturally — `load_dynamic_resources` runs **synchronously** (a
+`std::fs::read_to_string` between `parse_bootstrap` and `ClusterManager`
+construction, before listeners bind). No settle/timing machinery is needed on
+either side; fixture 0026's single GET fires after readiness and routes through
+the CDS-supplied cluster.
+
+**(c) Negative-path disposition (L4) — recorded divergence (ADR-0049).** This is
+the load-bearing reconciliation. Envoy's disposition is a **3-way split**:
+
+| CDS load fault | Envoy | envoy-rust |
+|---|---|---|
+| Nonexistent `path` | hard startup failure (container exits non-zero; `paths must refer to an existing path in the system` — a bootstrap-level PGV check) | **FATAL** (`CdsFileError`; process exits) — agrees with Envoy on this one class |
+| File exists, malformed YAML/JSON | **starts and serves** (`/ready` 200), `cluster_manager.cds.update_failure: 1`, `active_clusters: 0`, the route 503s | **FATAL** (`CdsParseError`; process exits) — **diverges** |
+| Valid YAML, semantically-invalid resource (PGV violation, e.g. empty `name`; cluster-build failure) | starts and serves, `update_rejected: 1` ticks (NOT `update_failure`), the route 503s | **FATAL** (per-cluster `validate_cluster` failure; process exits) — **diverges** |
+| Unknown field inside a resource | **warn-accepted** (lenient protobuf parsing) | **FATAL** (`deny_unknown_fields` on the `Cluster` schema; process exits) — **diverges** |
+| STRICT_DNS cluster with no `load_assignment` (zero-endpoint) | accepted as a zero-endpoint cluster (route → `no healthy upstream` 503) | **FATAL** (the existing `EmptyClusterEndpoints` invariant) — **diverges** |
+
+envoy-rust treats **ALL CDS load errors as FATAL at startup** — the project's
+fail-loud posture (every deferred field rejects loudly today). The warn-and-serve
+alternative would require honoring `validate_clusters: false` at runtime + a
+503-on-unknown-cluster data-plane path — machinery with zero differential
+coverage (a deliberately-broken Envoy-side fixture is not a thing this project
+does). **Consequence for the stats contract:** `cluster_manager.cds.update_failure`
+and `cluster_manager.cds.update_rejected` register at 0 and are **structurally
+unreachable non-zero** in envoy-rust (the process exits before any non-zero
+state). fixture 0026 asserts both at 0 bilaterally (satisfiable on both sides — a
+successful load); the negative paths are **backstop-only** (Envoy exits the
+process on a fatal CDS error, which the differential harness cannot observe as a
+data-plane response).
+
+**(d) Static/dynamic name collision: STATIC WINS (L9) — ADR-0049.** A cluster
+defined both statically and in the CDS file: **both proxies keep the STATIC one
+and skip the CDS entry** as unmodified; no error, no startup failure. Envoy logs
+`added/updated 0 cluster(s), skipped 1 unmodified cluster(s)`, `update_success`
+still ticks 1, `/config_dump` shows the cluster under `static_clusters` only, and
+the data plane serves the static endpoint. envoy-rust mirrors — on collision the
+dynamic cluster is SKIPPED (with a `tracing::warn!`), the static cluster wins, no
+error. (This reverses the SPEC D1 projection; the projected `DuplicateClusterName`
+ConfigError variant was DROPPED. The backstop asserts the static endpoint's
+distinct body serves on the data plane and that `dynamic_active_clusters` is
+absent.)
+
+**(e) Bootstrap prerequisites (L12) — recorded divergence (ADR-0049).**
+- **`node.id` + `node.cluster` are REQUIRED by Envoy when CDS is configured** —
+  without them Envoy exits at startup (`node 'id' and 'cluster' are required`).
+  Both fixture sides carry a `node:` block (every existing fixture already does);
+  envoy-rust parses `Node { id, cluster }` (phase 01) but adds **no mirror
+  requirement validator** (both sides are always configured; no differential
+  observable).
+- **The static `route_config` referencing a CDS-supplied cluster requires
+  `validate_clusters: false`** — without it Envoy exits at startup (`route:
+  unknown cluster 'dynamic_backend'`), because Envoy's inline route-table
+  validation runs against the static cluster set only. Both fixture sides set it.
+  envoy-rust gains `RouteConfiguration.validate_clusters: Option<bool>` as
+  **parse-and-accept** (the ADR-0024/0026 parse-only precedent) and does **NOT**
+  honor its literal runtime-503 semantics. Instead envoy-rust enforces references
+  via **defer-then-revalidate**: cluster-reference checks DEFER while
+  `dynamic_resources` is configured-but-unloaded (`Bootstrap::cds_configured_but_unloaded()`)
+  and RE-ENFORCE post-merge (inside `load_dynamic_resources`, against the
+  effective static+dynamic list). **Recorded narrow divergence:** a route to a
+  cluster in NEITHER list still **fails envoy-rust startup** (`UnknownCluster`),
+  vs Envoy's runtime-503 under `validate_clusters: false`.
+
+**(f) gRPC/ADS message-sequence state machine: UNPOPULATED.** The SotW/delta
+`DiscoveryRequest`/`DiscoveryResponse` wire sequence (version/nonce population,
+ACK/NACK representation, init-fetch timeouts, reconnection + resource caching)
+remains **deferred to the gRPC-xDS phase**, which also **supersedes ADR-0014**
+(the YAML-native typed-config shim) per ADR-0048. The intro blockquote above
+describes that machine; phase 18 populates only the filesystem transport, which
+has no on-the-wire message sequence (it is a synchronous file read).
 
 ---
 
