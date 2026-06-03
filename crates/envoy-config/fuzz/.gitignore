@@ -27,5 +27,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/cluster_circuit_breakers.yaml
 !corpus/parse_bootstrap/cluster_outlier_detection.yaml
 !corpus/parse_bootstrap/route_retry_policy.yaml
+!corpus/parse_bootstrap/dynamic_resources_cds.yaml
 artifacts/
 target/
