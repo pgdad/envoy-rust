@@ -134,3 +134,17 @@ _(Task entries are appended below by the state-3 executor — one per task, with
 **Two-stage review:**
 - **Spec compliance:** ✅ compliant (all 5 paths' assertions verified real and load-bearing; the stdout-vs-stderr deviation verified legitimate — envoy-bin's tracing fmt subscriber defaults to stdout; the Task-3 binding input honored — process-level assertions only, no Bootstrap inspection after failed loads).
 - **Code quality:** **Ready to merge** (after 1 cosmetic fix applied in-task: the module-doc "stderr carries" → "the process diagnostic carries", matching the implementation); zero Critical / zero Important / 2 Minors — 1 fixed in-task, **1 carried as a state-5 inventory item: the backstop-helper duplication has crossed the phase-05.2 REVIEW M5 disposition threshold** (the `reserve_port`/`wait_ready`/`http1_oneshot`/`scrape_admin_stats` helper cluster is now copied across ≥4 backstop files; M5 said extract a shared test-support crate "when the third consumer appears" — the trigger is now met; extraction is a future hardening-phase item, correctly NOT done in this tests-only task).
+
+### Task 9 — COMPLETE (code commit `78d393b4b`)
+
+**Landed:** fuzz seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/dynamic_resources_cds.yaml` (the fixture-0026 shape with literal ports — node + admin + `dynamic_resources.cds_config` [resource_api_version V3 + path_config_source] + HCM listener with `validate_clusters: false` + a route to the CDS-deferred `dynamic_backend` + zero static clusters — exercising the Task-1 deferral path; `parse_bootstrap` accepts it with no I/O). **The atomic three-edit:** seed + `.gitignore` allow-list entry + SUCCESS-array entry in one commit (the 09→16 lesson). **The opportunistic pre-existing-inconsistency fix SUCCEEDED:** `cluster_http2_protocol_options.yaml` (allow-listed since ~13.2 but missing from the SUCCESS array) parses cleanly and was restored to the array — **the corpus is now fully consistent: allow-list 29 = SUCCESS 25 + REJECT 3 + minimal 1.**
+
+**Verification (quoted):**
+- `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → `test result: ok. 1 passed; 0 failed`
+- `cargo test -p envoy-config` → `test result: ok. 324 passed; 0 failed`
+- Short-budget fuzz smoke (`cargo +nightly fuzz run parse_bootstrap -- -runs=100000 -max_total_time=60`) → `Done 100000 runs in 9 second(s)`, no crashes
+- `cargo clippy -p envoy-config --all-targets --all-features -- -D warnings` → clean; `cargo fmt --all -- --check` → clean
+
+**Two-stage review (combined pass for this mechanical 3-file task):**
+- **Spec compliance:** ✅ compliant (exactly 3 files; fuzz Cargo.lock untracked; the full schema surface exercised; both registries updated; the count reconciliation verified; the opportunistic fix verified genuinely pre-existing at the parent commit).
+- **Code quality:** zero Critical / zero Important / zero Minor — **Ready to merge: Yes.** The reviewer additionally proved the corpus gate test is not stale (renaming the seed away makes the gate FAIL — the test reads real files).
