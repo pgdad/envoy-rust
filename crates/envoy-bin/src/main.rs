@@ -105,6 +105,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let registry: std::sync::Arc<envoy_stats::StatsRegistry> =
         std::sync::Arc::new(envoy_stats::StatsRegistry::new());
 
+    // 19 D4: conditional listener_manager.lds.* registration (no-op when
+    // lds_config is unconfigured — the §5.2 inertness invariant). Runs after
+    // load_dynamic_resources (line 54) has populated dynamic_listeners, so
+    // listener_added counts static + dynamic correctly (the L3 lesson).
+    envoy_listener::register_lds_stats(&bootstrap, &registry)
+        .context("registering listener_manager.lds stats")?;
+
     // 08.2 D13b: construct the shared DrainState ONCE at startup. Cloned
     // into the admin handler (writer; for the 3 POST endpoints + /server_info
     // state read + /ready drain-aware response) and into every data-plane

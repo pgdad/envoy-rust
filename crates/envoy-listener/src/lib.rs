@@ -349,6 +349,49 @@ impl Listener {
     }
 }
 
+/// 19 D4 (ADR-0050; §6.2 L3/L10): the `listener_manager.lds.*` stat family +
+/// `listener_added` — registered ONLY when `dynamic_resources.lds_config` is
+/// configured (the §5.2 conditional-registration discipline; Envoy emits the
+/// base `listener_manager.*` names unconditionally — those stay Envoy-only-
+/// unasserted on non-LDS fixtures). All LDS load failures are fatal
+/// pre-registration (the L4 posture), so `update_failure` / `update_rejected`
+/// register at 0 and never tick. `listener_manager.total_listeners_active` is
+/// NOT registered here — it keeps its pre-existing unconditional registration
+/// inside `Listener::bind` (08.2 D14). `listener_added` counts ALL listeners
+/// (static + dynamic, via `all_listeners()`) per the L3 lesson.
+///
+/// Called once from envoy-bin `main()`, after the `StatsRegistry` is
+/// constructed and after `load_dynamic_resources` has populated
+/// `dynamic_listeners`. No-op (returns `Ok(())`) when `lds_config` is
+/// unconfigured — the §5.2 inertness invariant. `register_counter` is
+/// idempotent for same-name/same-kind re-registration (mirrors the phase-18
+/// `cluster_manager.cds.*` template).
+pub fn register_lds_stats(
+    bootstrap: &envoy_config::Bootstrap,
+    registry: &envoy_stats::StatsRegistry,
+) -> Result<(), ListenerError> {
+    if bootstrap
+        .dynamic_resources
+        .as_ref()
+        .and_then(|dr| dr.lds_config.as_ref())
+        .is_none()
+    {
+        return Ok(());
+    }
+    let mk = |name: &str| {
+        registry
+            .register_counter(name)
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))
+    };
+    mk("listener_manager.lds.update_attempt")?.add(1);
+    mk("listener_manager.lds.update_success")?.add(1);
+    mk("listener_manager.lds.update_failure")?; // registers at 0 (L4)
+    mk("listener_manager.lds.update_rejected")?; // registers at 0 (L4)
+    let added = mk("listener_manager.listener_added")?;
+    added.add(bootstrap.all_listeners().count() as u64);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,6 +1113,140 @@ filter_chains:
             start.elapsed() < std::time::Duration::from_secs(2),
             "serve took too long: {:?}",
             start.elapsed(),
+        );
+    }
+
+    // 19 D4 (ADR-0050): register_lds_stats — conditional listener_manager.lds.*
+    // family + listener_added.
+
+    /// Build a `Bootstrap` directly (no file I/O at this layer) with the given
+    /// static + dynamic listeners and an optional `lds_config` / `cds_config`.
+    fn mk_lds_bootstrap(
+        static_listeners: Vec<envoy_config::Listener>,
+        dynamic_listeners: Option<Vec<envoy_config::Listener>>,
+        lds_configured: bool,
+        cds_configured: bool,
+    ) -> envoy_config::Bootstrap {
+        use envoy_config::{
+            Bootstrap, ConfigSource, DynamicResources, PathConfigSource, StaticResources,
+        };
+        let mk_source = |path: &str| ConfigSource {
+            path_config_source: PathConfigSource { path: path.into() },
+            resource_api_version: None,
+        };
+        let dynamic_resources = if lds_configured || cds_configured {
+            Some(DynamicResources {
+                cds_config: cds_configured.then(|| mk_source("/tmp/cds.yaml")),
+                lds_config: lds_configured.then(|| mk_source("/tmp/lds.yaml")),
+            })
+        } else {
+            None
+        };
+        Bootstrap {
+            node: None,
+            admin: None,
+            static_resources: StaticResources {
+                listeners: static_listeners,
+                clusters: vec![],
+            },
+            dynamic_resources,
+            dynamic_clusters: None,
+            dynamic_listeners,
+        }
+    }
+
+    /// Scrape the registry for the current u64 value of a counter by name.
+    fn counter_value(registry: &envoy_stats::StatsRegistry, name: &str) -> Option<u64> {
+        registry.snapshot().into_iter().find_map(|(n, h)| {
+            if n != name {
+                return None;
+            }
+            match h {
+                envoy_stats::StatHandle::Counter(c) => Some(c.value()),
+                envoy_stats::StatHandle::Gauge(_) => None,
+            }
+        })
+    }
+
+    /// (a) §5.2 inertness invariant: with NO lds_config — including the
+    /// cds_config-but-no-lds_config case (fixture 0026's topology) — none of the
+    /// listener_manager.lds.* names register, and listener_added does not register.
+    #[test]
+    fn lds_stats_not_registered_without_lds_config() {
+        for cds_configured in [false, true] {
+            let bootstrap = mk_lds_bootstrap(
+                vec![mk_listener_cfg("127.0.0.1", 0)],
+                Some(vec![mk_listener_cfg("127.0.0.1", 0)]),
+                false,
+                cds_configured,
+            );
+            let registry = envoy_stats::StatsRegistry::new();
+            register_lds_stats(&bootstrap, &registry).expect("no-op registration");
+            let lds_names: Vec<String> = registry
+                .snapshot()
+                .into_iter()
+                .map(|(n, _)| n)
+                .filter(|n| {
+                    n.starts_with("listener_manager.lds.") || n == "listener_manager.listener_added"
+                })
+                .collect();
+            assert!(
+                lds_names.is_empty(),
+                "no listener_manager.lds.* / listener_added may register without lds_config \
+                 (cds_configured={cds_configured}); got {lds_names:?}"
+            );
+        }
+    }
+
+    /// (b) the 5-name subset on an LDS bootstrap: lds_config + 1 dynamic listener
+    /// (zero static, like fixture 0027) → the documented values.
+    #[test]
+    fn lds_stats_registered_with_lds_bootstrap() {
+        let bootstrap = mk_lds_bootstrap(
+            vec![],
+            Some(vec![mk_listener_cfg("127.0.0.1", 0)]),
+            true,
+            false,
+        );
+        let registry = envoy_stats::StatsRegistry::new();
+        register_lds_stats(&bootstrap, &registry).expect("registration");
+        assert_eq!(
+            counter_value(&registry, "listener_manager.lds.update_attempt"),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(&registry, "listener_manager.lds.update_success"),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(&registry, "listener_manager.lds.update_failure"),
+            Some(0)
+        );
+        assert_eq!(
+            counter_value(&registry, "listener_manager.lds.update_rejected"),
+            Some(0)
+        );
+        assert_eq!(
+            counter_value(&registry, "listener_manager.listener_added"),
+            Some(1)
+        );
+    }
+
+    /// (c) the L3 conditionality lesson: listener_added counts STATIC listeners
+    /// too. 1 static + 1 dynamic (constructed directly, bypassing validate) → 2.
+    #[test]
+    fn lds_stats_listener_added_includes_static_listeners() {
+        let bootstrap = mk_lds_bootstrap(
+            vec![mk_listener_cfg("127.0.0.1", 0)],
+            Some(vec![mk_listener_cfg("127.0.0.1", 0)]),
+            true,
+            false,
+        );
+        let registry = envoy_stats::StatsRegistry::new();
+        register_lds_stats(&bootstrap, &registry).expect("registration");
+        assert_eq!(
+            counter_value(&registry, "listener_manager.listener_added"),
+            Some(2)
         );
     }
 }
