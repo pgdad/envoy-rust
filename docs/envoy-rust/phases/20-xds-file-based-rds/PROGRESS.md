@@ -143,3 +143,35 @@
 
 - **Implemented:** three additions to `docs/envoy-rust/BEHAVIOR_CONTRACT.md`, mirroring the phase-18 CDS + phase-19 LDS precedents exactly: (1) **Stat-name mapping** — the 5-name `http.<stat_prefix>.rds.<route_config_name>.` subset (attempt/success/config_reload value-exact 1, failure/rejected value-exact 0) + the per-HCM scoping note (fixture 0028 = `http.ingress_http1.rds.local_route.`) + the conditional-registration narrowing (inline-route HCMs emit none; all 27 pre-existing fixtures unaffected) + the Envoy-only-NOT-asserted enumeration; (2) **xDS wire state machine** — a new "Filesystem transport — phase 20 RDS extension" subsection AFTER the phase-19 LDS one, mirroring its §(a)–(f) shape, recording L1–L11 (envelope/rds-on-HCM; readiness; negative 3-way split + all-fatal + name-mismatch; exactly-one-of both/neither fatal; RDS+CDS composition + no-validate_clusters + defer-then-revalidate `UnknownCluster`; conditional-emission + the `configs[4]`/`configs[2]` index reconciliation; + L8/L10/L11 notes); (3) **Admin endpoint body shapes** — a RoutesConfigDump row (`dynamic_route_configs[].{route_config{@type,name,virtual_hosts}, last_updated}`, NO version_info, conditional emission, the index divergence + per-side reconciliation).
 - **Review (combined): ✅ APPROVED** — EVERY factual claim cross-checked against the actual code: the 5 stat names+values vs `register_rds_stats` (`lib.rs:417-427`); the error variants vs the actual `ConfigError` + Task-3/8 behavior; the `configs[4]`/`configs[2]` indices vs fixture 0028 `expectations.yaml` + Task-5 `endpoint.rs`; the RoutesConfigDump shape (no version_info) vs the Task-5 structs; L7 vs PROGRESS Task 3; the "27 pre-existing fixtures" count. Zero inaccuracies, zero internal contradictions; faithful phase-19 §(a)–(f) mirror. 0 Critical / 0 Important / 1 pre-existing Minor (a stat-name abbreviation style in the (c) table that intentionally mirrors the phase-19 LDS precedent — not introduced by this task).
+
+## Task 11 — state-4 phase-done verification + STATE advance to state-5-next
+
+**This entry: the §7.5 phase-done gate run by the controller (`superpowers:verification-before-completion`), evidence quoted, then the STATE advance.**
+
+### Local gate suite (Step 1 — all quoted)
+- **`cargo build --workspace --all-targets`** → `Finished dev profile ... in 3m 04s` (clean; pre-built `http1-echo-server`/`http2-echo-server`).
+- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** → `Finished ... in 3m 20s` (zero warnings).
+- **`cargo fmt --all -- --check`** → clean (no diffs).
+- **`cargo test --workspace`** (run as `--exclude differential` locally to avoid kicking the full 28-fixture Docker suite under parallel load + flake risk — the Docker suite is the CI anchor below): all binaries `0 failed` EXCEPT one **confirmed flake** — `upstream_h2_connection_pooling` (a phase-13.2 H2-pooling backstop UNTOUCHED by phase 20) timed out at the backend-readiness `.expect("backend ready")` (30.44s) under parallel load; **re-run in isolation → `ok. 1 passed; 0 failed` in 2.05s** (the `project_flaky_access_log_fixture_0012` cold-helper/readiness-timeout family — the H2 helper took 51.95s to build; clears on isolated re-run, NOT a regression).
+- **`cargo deny check`** → `advisories ok, bans ok, licenses ok, sources ok` (the `deny.toml:45 "Zlib" unmatched license allowance` is a benign pre-existing unused-allow warning, not an error).
+- **The 4 standalone-crate builds** (`project_isolated_crate_build_blindspot`): `-p envoy-config` (58.78s) / `-p envoy-cluster` (59.66s) / `-p envoy-http1` (1m50s) / `-p envoy-http2` (1m07s) — all `Finished`.
+- **`cargo test -p differential --lib`** → `ok. 126 passed; 0 failed; 1 ignored` (the harness unit tests).
+- **Fixture 0028 local Docker** (captured at Task 7) → `1 passed` bilateral against `envoyproxy/envoy:v1.33.0`.
+
+### Fuzz gate (Step 2)
+- **`cargo +nightly fuzz run parse_bootstrap -- -runs=200000 -max_total_time=60`** → `Done 200000 runs in 16 second(s)`, no crashes/panics, `cov: 15011` — clean on the extended 31-seed corpus (incl. the new `hcm_rds_route_config.yaml`).
+
+### Docker-gated CI anchor (Step 3 — the load-bearing evidence per the phase-18 lesson)
+- Pushed the 20 phase-20 commits (Tasks 1–10 code+PROGRESS) `20b4d2daf..385656f21` to `origin/main`.
+- **CI run `26967529584`** (HEAD `385656f21`) → **`conclusion: success`, status: completed**, BOTH jobs green:
+  - **`build + test + lint`: success** — step 9 `test (includes differential harness → Docker)` ran `cargo test --workspace` on `ubuntu-latest` with Docker → ALL 28 Docker-gated differential fixtures `0001`–`0028` green simultaneously + h2spec ≥95% (installed v2.6.0) + all unit/in-process tests + fmt + clippy + build + `cargo deny check`, all green on Linux.
+  - **`fuzz (parse_bootstrap, 30s)`: success** — the 31-seed corpus.
+- This CI anchor (`26967529584`) is the phase's differential evidence. Subsequent docs-only pushes (this Task-11 commit) are vacuous-green; the anchor stays at code-HEAD `385656f21`.
+
+### §7.5 phase-done gate status
+(a) fixture 0028 green at Docker-gated CI ✅; (b) all 27 pre-existing fixtures `0001`–`0027` still green simultaneously ✅; (c) h2spec ≥95% ✅; (d) `parse_bootstrap` fuzz clean on the 31-seed corpus ✅; (e) build/clippy/fmt/test/deny + the 4 standalone builds all clean ✅; (f) `REVIEW.md` — the state-5 code review is the NEXT session.
+
+### STATE advance (Step 4)
+Advanced `STATE.md` Active phase `20` state-2-complete/state-3-next → **`20` state-4-complete / state-5-next** + rewrote `## Next expected skill` to the state-5 code-review arc (`superpowers:requesting-code-review`, SERIAL review subagents per concern-cluster, controller spot-verification) + updated `## Last commit` + `## Last updated` + appended the `### Phase-20 state-3 arc + state-4 verification` Notes subsection. ROADMAP row `20` stays `in-progress` (flips to `done` at the state-6 close-out). DECISIONS ledger head stays **ADR-0052** (no new ADR — no decision-level divergence surfaced in execution; ADR-0053 reserved-but-unfired). Committed PROGRESS + STATE (docs-only → vacuous-green).
+
+**Phase-20 carried Minors inventory (for the state-5 review):** M20-T1-b (tests (f)/(g) `.is_err()` tightening); M20-T3-a/b/c (per-HCM RDS re-read; borrow-strategy doc; no merged-set Ambiguous test); M20-T4-b (per-iteration `mk` closure); M20-T6-a (**notable** — CDS+LDS+RDS dynamic-file render-block triplication → "extract a dynamic-file helper", with M19-1 the parser analogue), M20-T6-b (`rds_scan` dead weight), M20-T6-c (harness file growth); M20-T7 Minor (kept the "envoy-rust emits x-envoy-upstream-service-time natively" note); M20-T8 Minor (same-backend per-cluster distinction deferred to fixture 0028); M20-T10 Minor (abbreviation style mirrors phase-19). **CLOSED in-arc:** M20-T1-a + M20-T1-c (Task 3), M20-T4-a (Task 8), M20-T4-c (Task 5). **The Task-7 Important doc inconsistency was fixed in-task.** Zero Critical/Important remain open entering state-5.
