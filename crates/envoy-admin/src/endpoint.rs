@@ -335,6 +335,18 @@ pub(crate) enum ConfigDumpEntry<'a> {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         dynamic_listeners: Vec<DynamicListenerEntry<'a>>,
     },
+    /// 20 D5 (ADR-0051/0052; §6.2 L5): the `RoutesConfigDump` entry, emitted ONLY
+    /// when some HCM uses `rds` (fixtures 0014/0026/0027 untouched — their HCMs
+    /// carry inline route_config). Envoy ALSO emits this section (static_route_configs
+    /// for inline routes) and positions it at configs[4] after a ScopedRoutesConfigDump;
+    /// envoy-rust narrows to rds-only and pushes it after the (conditional) Listeners
+    /// entry. NO `version_info` key (the RDS file carried none). The per-side configs[]
+    /// index mismatch (envoy [4] vs envoy-rust [2/3]) is reconciled in the harness (Task 6).
+    #[serde(rename = "type.googleapis.com/envoy.admin.v3.RoutesConfigDump")]
+    Routes {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dynamic_route_configs: Vec<DynamicRouteConfigEntry<'a>>,
+    },
 }
 
 /// Phase 18 D5: one static cluster inside `ClustersConfigDump`. Envoy shape:
@@ -410,6 +422,27 @@ pub(crate) struct TaggedListener<'a> {
 
 /// The `@type` URL for the nested `listener` object inside `ListenersConfigDump`.
 const LISTENER_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
+
+/// Phase 20 D5: one dynamically-loaded (RDS) route configuration. Envoy shape:
+/// `{"route_config": {...}, "last_updated": "..."}`.
+#[derive(Serialize)]
+pub(crate) struct DynamicRouteConfigEntry<'a> {
+    pub(crate) route_config: TaggedRouteConfig<'a>,
+    pub(crate) last_updated: String,
+}
+
+/// Phase 20 D5: a `RouteConfiguration` serialized with the inner `@type` tag.
+/// Mirrors `TaggedCluster`/`TaggedListener` (flatten on a NESTED struct).
+#[derive(Serialize)]
+pub(crate) struct TaggedRouteConfig<'a> {
+    #[serde(rename = "@type")]
+    pub(crate) type_url: &'static str,
+    #[serde(flatten)]
+    pub(crate) route_config: &'a envoy_config::RouteConfiguration,
+}
+
+/// The `@type` URL for the nested `route_config` object inside `RoutesConfigDump`.
+const ROUTE_CONFIG_TYPE_URL: &str = "type.googleapis.com/envoy.config.route.v3.RouteConfiguration";
 
 /// Phase 08.2 Task 5 (D-ready): drain-aware `/ready` response. Widens the
 /// 06.1 hardcoded 200 `"LIVE\n"` shape to a three-arm match on
@@ -547,6 +580,32 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
         configs.push(ConfigDumpEntry::Listeners {
             static_listeners,
             dynamic_listeners,
+        });
+    }
+    // 20 D5 (ADR-0051/0052; §6.2 L5): emit RoutesConfigDump ONLY when some HCM
+    // uses rds. Pushed after the (conditional) Listeners entry — on fixture 0028
+    // (cds yes, lds no) it lands at configs[2]; the per-side index mismatch vs
+    // Envoy's configs[4] is reconciled in the harness.
+    let dynamic_route_configs: Vec<DynamicRouteConfigEntry> = bootstrap
+        .all_listeners()
+        .flat_map(|l| l.filter_chains.iter())
+        .flat_map(|c| c.filters.iter())
+        .filter_map(|f| match f.typed_config.as_ref() {
+            Some(envoy_config::TypedConfig::HttpConnectionManager(hcm)) if hcm.rds.is_some() => {
+                hcm.route_config.as_ref().map(|rc| DynamicRouteConfigEntry {
+                    route_config: TaggedRouteConfig {
+                        type_url: ROUTE_CONFIG_TYPE_URL,
+                        route_config: rc,
+                    },
+                    last_updated: last_updated.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    if !dynamic_route_configs.is_empty() {
+        configs.push(ConfigDumpEntry::Routes {
+            dynamic_route_configs,
         });
     }
     let body = ConfigDumpBody { configs };
@@ -1630,6 +1689,337 @@ load_assignment:
         assert!(
             boot.pointer("/bootstrap/dynamic_listeners").is_none(),
             "dynamic_listeners is #[serde(skip)] — must be absent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod routes_config_dump_tests {
+    //! Phase 20 Task 5 — D5 (ADR-0051/ADR-0052 §6.2 L5): the `RoutesConfigDump`
+    //! `/config_dump` entry, emitted CONDITIONALLY (only when some HCM carries
+    //! `rds: Some(...)`). Test groups: (a) conditional emission — an rds HCM with
+    //! `route_config` populated renders a RoutesConfigDump entry; (b) inertness —
+    //! an inline-route HCM (no rds) renders NO RoutesConfigDump entry; (c)
+    //! ordering — on a cds+rds (no lds) bootstrap the Routes entry lands at
+    //! `configs[2]`; on a cds+lds+rds bootstrap it lands at `configs[3]`.
+
+    use super::AdminEndpoint;
+    use crate::config::AdminConfig;
+    use crate::handler::AdminHandler;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{
+        Address, Admin, Bootstrap, CodecType, FilterChain, HttpConnectionManagerConfig, Listener,
+        NetworkFilter, Rds, RouteConfiguration, SocketAddress, TypedConfig, VirtualHost,
+    };
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// Build a handler from an already-constructed `Bootstrap`.
+    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+        )
+    }
+
+    fn parse_bootstrap(yaml: &str) -> Bootstrap {
+        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
+    }
+
+    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
+        let resp = AdminEndpoint::ConfigDump.render_with(handler);
+        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
+        serde_json::from_str(body_str).expect("valid JSON")
+    }
+
+    const ROUTES_TYPE: &str = "type.googleapis.com/envoy.admin.v3.RoutesConfigDump";
+
+    fn has_routes_entry(value: &serde_json::Value) -> bool {
+        value
+            .get("configs")
+            .and_then(|c| c.as_array())
+            .unwrap()
+            .iter()
+            .any(|e| e.get("@type").and_then(|v| v.as_str()) == Some(ROUTES_TYPE))
+    }
+
+    /// Bootstrap WITH `dynamic_resources.cds_config` but NO `lds_config`.
+    /// Used for the ordering test: Bootstrap[0] + Clusters[1] + Routes[2].
+    const CDS_ONLY_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    /// Bootstrap WITH BOTH `cds_config` AND `lds_config`.
+    /// Used for the cds+lds+rds ordering test: Bootstrap[0] + Clusters[1] +
+    /// Listeners[2] + Routes[3].
+    const CDS_LDS_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+  lds_config:
+    path_config_source:
+      path: /etc/lds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    /// Build a `Listener` whose single filter chain has an HCM with
+    /// `rds: Some(...)` AND `route_config: Some(...)` (the post-load state).
+    fn rds_listener(route_name: &str) -> Listener {
+        let route_config = RouteConfiguration {
+            name: route_name.to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "local".to_string(),
+                domains: vec!["*".to_string()],
+                routes: vec![],
+                include_attempt_count_in_response: false,
+            }],
+            validate_clusters: None,
+        };
+        let hcm = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: CodecType::AUTO,
+            http2_protocol_options: None,
+            route_config: Some(route_config),
+            rds: Some(Rds {
+                route_config_name: route_name.to_string(),
+                config_source: envoy_config::ConfigSource {
+                    path_config_source: envoy_config::PathConfigSource {
+                        path: "/etc/rds.yaml".to_string(),
+                    },
+                    resource_api_version: None,
+                },
+            }),
+            http_filters: vec![],
+            access_log: vec![],
+        };
+        Listener {
+            name: "rds_listener".to_string(),
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "0.0.0.0".to_string(),
+                    port_value: 10000,
+                },
+            },
+            filter_chains: vec![FilterChain {
+                filters: vec![NetworkFilter {
+                    name: "envoy.filters.network.http_connection_manager".to_string(),
+                    typed_config: Some(TypedConfig::HttpConnectionManager(hcm)),
+                }],
+                filter_chain_match: None,
+                transport_socket: None,
+            }],
+            listener_filters: vec![],
+        }
+    }
+
+    /// Build a `Listener` whose HCM has NO `rds` (inline route_config — the
+    /// fixture-0014/0026/0027 shape).
+    fn inline_route_listener() -> Listener {
+        let route_config = RouteConfiguration {
+            name: "inline_route".to_string(),
+            virtual_hosts: vec![],
+            validate_clusters: None,
+        };
+        let hcm = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: CodecType::AUTO,
+            http2_protocol_options: None,
+            route_config: Some(route_config),
+            rds: None,
+            http_filters: vec![],
+            access_log: vec![],
+        };
+        Listener {
+            name: "inline_listener".to_string(),
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "0.0.0.0".to_string(),
+                    port_value: 10000,
+                },
+            },
+            filter_chains: vec![FilterChain {
+                filters: vec![NetworkFilter {
+                    name: "envoy.filters.network.http_connection_manager".to_string(),
+                    typed_config: Some(TypedConfig::HttpConnectionManager(hcm)),
+                }],
+                filter_chain_match: None,
+                transport_socket: None,
+            }],
+            listener_filters: vec![],
+        }
+    }
+
+    // (a) conditional emission: an rds HCM with populated route_config ⇒ a
+    // RoutesConfigDump entry appears, with the correct route name and no
+    // version_info key.
+    #[test]
+    fn rds_hcm_emits_routes_config_dump() {
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
+        bootstrap.static_resources.listeners = vec![rds_listener("local_route")];
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        assert!(
+            has_routes_entry(&value),
+            "rds HCM ⇒ RoutesConfigDump entry present; got {value}"
+        );
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        let entry = configs
+            .iter()
+            .find(|e| e.get("@type").and_then(|v| v.as_str()) == Some(ROUTES_TYPE))
+            .expect("RoutesConfigDump entry present");
+        // The route_config name must match.
+        assert_eq!(
+            entry
+                .pointer("/dynamic_route_configs/0/route_config/name")
+                .and_then(|v| v.as_str()),
+            Some("local_route"),
+            "route_config.name == local_route; entry was {entry}"
+        );
+        // The inner @type tag must be present (L5 shape).
+        assert_eq!(
+            entry
+                .pointer("/dynamic_route_configs/0/route_config/@type")
+                .and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.config.route.v3.RouteConfiguration"),
+            "route_config.@type correct; entry was {entry}"
+        );
+        // last_updated is an ISO-8601 string.
+        let last_updated = entry
+            .pointer("/dynamic_route_configs/0/last_updated")
+            .and_then(|v| v.as_str())
+            .expect("last_updated is a string");
+        assert!(
+            last_updated.contains('T') && last_updated.ends_with('Z'),
+            "last_updated ISO-8601-shaped; got {last_updated:?}"
+        );
+        // L5 ✧: NO version_info key in the dynamic_route_configs entry.
+        assert!(
+            entry
+                .pointer("/dynamic_route_configs/0/version_info")
+                .is_none(),
+            "file-based RDS must carry NO version_info key; entry was {entry}"
+        );
+    }
+
+    // (b) inertness: inline-route HCMs (no rds) ⇒ NO RoutesConfigDump entry.
+    // Fixtures 0014/0026/0027 use inline routes — this test guards their shape.
+    #[test]
+    fn inline_route_hcm_emits_no_routes_config_dump() {
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
+        bootstrap.static_resources.listeners = vec![inline_route_listener()];
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        assert!(
+            !has_routes_entry(&value),
+            "inline-route HCM (no rds) ⇒ NO RoutesConfigDump entry; got {value}"
+        );
+    }
+
+    // (b) inertness: a plain bootstrap with NO dynamic_resources and NO rds ⇒
+    // exactly ONE entry (the Bootstrap entry only).
+    #[test]
+    fn plain_bootstrap_emits_no_routes_config_dump() {
+        let bootstrap = parse_bootstrap(
+            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n",
+        );
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        assert!(
+            !has_routes_entry(&value),
+            "plain bootstrap ⇒ no RoutesConfigDump entry; got {value}"
+        );
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(configs.len(), 1, "plain bootstrap ⇒ single entry");
+    }
+
+    // (c) ordering: cds + rds (no lds) ⇒ Bootstrap[0] + Clusters[1] + Routes[2].
+    #[test]
+    fn cds_rds_bootstrap_routes_at_configs_2() {
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
+        bootstrap.static_resources.listeners = vec![rds_listener("local_route")];
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(
+            configs.len(),
+            3,
+            "cds+rds (no lds) ⇒ three entries; got {value}"
+        );
+        assert_eq!(
+            configs[0].get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.BootstrapConfigDump"),
+            "configs[0] must be Bootstrap"
+        );
+        assert_eq!(
+            configs[1].get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.ClustersConfigDump"),
+            "configs[1] must be Clusters"
+        );
+        assert_eq!(
+            configs[2].get("@type").and_then(|v| v.as_str()),
+            Some(ROUTES_TYPE),
+            "configs[2] must be Routes (no lds ⇒ no Listeners in between)"
+        );
+    }
+
+    // (c) ordering: cds + lds + rds ⇒ Bootstrap[0] + Clusters[1] + Listeners[2]
+    // + Routes[3].
+    #[test]
+    fn cds_lds_rds_bootstrap_routes_at_configs_3() {
+        let mut bootstrap = parse_bootstrap(CDS_LDS_BOOTSTRAP);
+        bootstrap.dynamic_listeners = Some(vec![rds_listener("local_route")]);
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(configs.len(), 4, "cds+lds+rds ⇒ four entries; got {value}");
+        assert_eq!(
+            configs[1].get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.ClustersConfigDump"),
+            "configs[1] must be Clusters"
+        );
+        assert_eq!(
+            configs[2].get("@type").and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.admin.v3.ListenersConfigDump"),
+            "configs[2] must be Listeners"
+        );
+        assert_eq!(
+            configs[3].get("@type").and_then(|v| v.as_str()),
+            Some(ROUTES_TYPE),
+            "configs[3] must be Routes (after Listeners)"
         );
     }
 }
