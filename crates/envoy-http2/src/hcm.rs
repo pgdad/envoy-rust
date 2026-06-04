@@ -1016,7 +1016,7 @@ mod tests {
             // 06.2 Task 5: field added to the schema; access-log wiring
             // lands in Task 7 (H2). Empty here.
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1038,7 +1038,8 @@ mod tests {
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
@@ -1167,7 +1168,7 @@ static_resources:
             // 06.2 Task 5: field added to the schema; access-log wiring
             // lands in Task 7 (H2). Empty here.
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1186,7 +1187,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
@@ -1290,7 +1292,7 @@ static_resources:
             // 06.2 Task 5: field added to the schema; access-log wiring
             // lands in Task 7 (H2). Empty here.
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![
@@ -1333,7 +1335,8 @@ static_resources:
                         }],
                     },
                 ],
-            },
+            }),
+            rds: None,
             http_filters: vec![HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
@@ -1743,7 +1746,7 @@ static_resources:
             // 06.2 Task 5: field added to the schema; access-log wiring
             // lands in Task 7 (H2). Empty here.
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1765,7 +1768,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
@@ -1826,7 +1830,7 @@ static_resources:
             // Bypass envoy-config's AccessLog parsing — directly seed
             // the materialized sinks below.
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1848,7 +1852,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
@@ -2258,7 +2263,7 @@ static_resources:
             codec_type: CodecType::HTTP2,
             http2_protocol_options: None,
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2280,7 +2285,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![
                 HttpFilter {
                     name: "envoy.filters.http.header_mutation".to_string(),
@@ -2322,7 +2328,7 @@ static_resources:
             codec_type: CodecType::HTTP2,
             http2_protocol_options: None,
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2348,7 +2354,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![
                 HttpFilter {
                     name: "envoy.filters.http.header_mutation".to_string(),
@@ -2607,7 +2614,7 @@ static_resources:
             codec_type: CodecType::HTTP2,
             http2_protocol_options: None,
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2626,7 +2633,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),

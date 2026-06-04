@@ -21,7 +21,7 @@ pub use bootstrap::{
     HttpProtocolOptions, HttpStatus, Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment,
     LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter, Node, OutlierDetection,
     PathConfigSource, Percent, Permission, PermissionSet, Policy, Principal, PrincipalSet,
-    RbacConfig, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
+    RbacConfig, Rds, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
     RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, SafeRegex, SocketAddress,
     StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate,
     TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
@@ -94,6 +94,37 @@ pub enum ConfigError {
     /// surface; first raised by the Task-2/Task-3 LDS loader.
     #[error("parsing LDS file '{path}': {message}")]
     LdsParseError { path: String, message: String },
+    /// 20 D1 (L9, ADR-0051/0052): an HCM declares neither `route_config` (inline)
+    /// nor `rds` (file). Exactly one is required; raised at parse time by
+    /// `check_route_sources`. `stat_prefix` names the offending HCM.
+    #[error(
+        "missing route source on HCM (stat_prefix {stat_prefix:?}): exactly one of `route_config` or `rds` is required"
+    )]
+    MissingRouteSource { stat_prefix: String },
+    /// 20 D1 (L9, ADR-0051/0052): an HCM declares BOTH `route_config` (inline) and
+    /// `rds` (file). They are mutually exclusive; raised at parse time by
+    /// `check_route_sources`. `stat_prefix` names the offending HCM.
+    #[error(
+        "ambiguous route source on HCM (stat_prefix {stat_prefix:?}): `route_config` and `rds` are mutually exclusive"
+    )]
+    AmbiguousRouteSource { stat_prefix: String },
+    /// 20 D2: reading the RDS file at the configured path failed (I/O error).
+    /// Part of the D1 schema surface; first raised by the Task-2 RDS loader.
+    #[error("reading RDS file '{path}': {source}")]
+    RdsFileError {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// 20 D2/D3: parsing the RDS file's contents failed. Part of the D1 schema
+    /// surface; first raised by the Task-2/Task-3 RDS loader.
+    #[error("parsing RDS file '{path}': {message}")]
+    RdsParseError { path: String, message: String },
+    /// 20 D3: the `rds.route_config_name` was not found among the route
+    /// configurations in the RDS file. Part of the D1 schema surface; first
+    /// raised by the Task-3 RDS loader.
+    #[error("RDS route_config_name {name:?} not found in {path:?}")]
+    RdsRouteConfigNotFound { name: String, path: String },
     #[error(
         "cluster '{cluster}' declares load_assignment.cluster_name '{assignment}'; these must match"
     )]
@@ -537,6 +568,10 @@ pub enum ConfigError {
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
     let mut bootstrap: Bootstrap = serde_yaml::from_str(yaml)?;
+    // 20 D1 (C16): the exactly-one-of route-source check runs here, before any
+    // file is read and before validate(), so an `rds` HCM (route_config: None)
+    // survives validate()'s inline-route walk (which early-returns on None).
+    bootstrap::check_route_sources(&bootstrap)?;
     bootstrap::validate(&mut bootstrap)?;
     Ok(bootstrap)
 }

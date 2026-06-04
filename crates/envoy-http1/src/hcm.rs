@@ -197,7 +197,11 @@ impl HCMConfig {
         )?);
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
-            route_config: Arc::new(clone_route_config(&cfg.route_config)),
+            route_config: Arc::new(clone_route_config(
+                cfg.route_config
+                    .as_ref()
+                    .expect("route_config populated post-load — §5.3 invariant"),
+            )),
             cluster_mgr,
             http2_protocol_options: cfg.http2_protocol_options.clone(),
             stats,
@@ -2529,7 +2533,7 @@ static_resources:
             // 06.2 Task 5: field added to the schema; access-log wiring
             // lands in Task 6 (H1) / Task 7 (H2). Empty here.
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2551,7 +2555,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![envoy_config::HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: envoy_config::HttpFilterTypedConfig::Router(
@@ -2598,7 +2603,7 @@ static_resources:
             codec_type: envoy_config::CodecType::HTTP1,
             http2_protocol_options: None,
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2620,7 +2625,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![envoy_config::HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: envoy_config::HttpFilterTypedConfig::Router(
@@ -3236,7 +3242,7 @@ static_resources:
             codec_type: envoy_config::CodecType::HTTP1,
             http2_protocol_options: None,
             access_log: vec![],
-            route_config: RouteConfiguration {
+            route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -3258,7 +3264,8 @@ static_resources:
                         }),
                     }],
                 }],
-            },
+            }),
+            rds: None,
             http_filters: vec![envoy_config::HttpFilter {
                 name: "envoy.filters.http.router".to_string(),
                 typed_config: envoy_config::HttpFilterTypedConfig::Router(

@@ -122,6 +122,18 @@ pub struct PathConfigSource {
     pub path: String,
 }
 
+/// 20 D1 (ADR-0051/0052): RDS — a route table loaded from a file. `config_source`
+/// reuses the phase-18 `ConfigSource`/`PathConfigSource` verbatim (filesystem
+/// transport only; `api_config_source`/`ads`/`watched_directory` stay rejected by
+/// `ConfigSource`'s own `deny_unknown_fields`). `resource_api_version` is optional
+/// INSIDE `config_source` (L1) — it is NOT a field of `Rds`.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Rds {
+    pub route_config_name: String,
+    pub config_source: ConfigSource,
+}
+
 // NOTE: Node deliberately omits `deny_unknown_fields`. Upstream Envoy's Node
 // also carries metadata, locality, user_agent_*, extensions, client_features,
 // listening_addresses, dynamic_parameters. Phase 01 accepts id + cluster and
@@ -544,7 +556,16 @@ pub struct HttpConnectionManagerConfig {
     #[serde(default)]
     pub access_log: Vec<AccessLog>,
 
-    pub route_config: RouteConfiguration,
+    /// 20 D1 (ADR-0051/0052): the inline route table. EXACTLY ONE of
+    /// `route_config` (inline) or `rds` (file) per HCM (enforced at parse time —
+    /// §5.8). After load_dynamic_resources populates an rds HCM's route_config
+    /// from its file, both are Some (the loaded state — §5.3); downstream
+    /// dispatch reads route_config uniformly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_config: Option<RouteConfiguration>,
+    /// 20 D1: RDS — route configuration loaded from a file (reuses ConfigSource).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rds: Option<Rds>,
     pub http_filters: Vec<HttpFilter>,
 }
 
@@ -2366,13 +2387,22 @@ fn validate_hcm(
     // http_filters: cardinality + name + Router-terminal — 07.1 D4.1.
     validate_http_filters(&hcm.http_filters, listener_name)?;
 
+    // 20 D1 (C16): inline route_config validation runs only when present.
+    // An rds HCM has route_config: None at parse time (the route table is
+    // populated post-merge by load_dynamic_resources, then re-validated). The
+    // exactly-one-of check ran at parse time (check_route_sources); this fn
+    // never re-checks cardinality, so the post-merge both-Some state is valid.
+    let Some(route_config) = hcm.route_config.as_mut() else {
+        return Ok(()); // rds HCM, pre-load — nothing inline to validate yet
+    };
+
     // route_config: walk virtual_hosts → routes.
-    if hcm.route_config.virtual_hosts.is_empty() {
+    if route_config.virtual_hosts.is_empty() {
         return Err(crate::ConfigError::EmptyVirtualHosts {
-            route_config: hcm.route_config.name.clone(),
+            route_config: route_config.name.clone(),
         });
     }
-    for vh in &mut hcm.route_config.virtual_hosts {
+    for vh in &mut route_config.virtual_hosts {
         if vh.domains.is_empty() {
             return Err(crate::ConfigError::EmptyDomains {
                 virtual_host: vh.name.clone(),
@@ -2453,6 +2483,43 @@ fn validate_hcm(
 
             // 16.1 D2: validate per-route retry_policy.
             validate_retry_policy(r)?;
+        }
+    }
+    Ok(())
+}
+
+/// 20 D1 (C16, ADR-0051/0052): the parse-time exactly-one-of route-source pass.
+/// Walks every HCM across the given listeners' filter chains and rejects any HCM
+/// that declares NEITHER `route_config` (inline) NOR `rds` (file)
+/// (`MissingRouteSource`) or BOTH (`AmbiguousRouteSource`) — §5.8 / L9.
+///
+/// Runs at PARSE time (from `parse_bootstrap`, before any file is read) rather
+/// than inside `validate()`: after `load_dynamic_resources` populates an `rds`
+/// HCM's `route_config`, BOTH `route_config` AND `rds` are `Some` (the loaded
+/// state — §5.3), and the post-merge `validate()` does NOT re-check cardinality.
+/// Factored out as a standalone crate-visible helper so the Task-3 merge pass can
+/// re-run it over the merged (static + dynamic LDS) listener set.
+pub(crate) fn check_route_sources(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
+    for listener in &bootstrap.static_resources.listeners {
+        for chain in &listener.filter_chains {
+            for filter in &chain.filters {
+                let Some(TypedConfig::HttpConnectionManager(hcm)) = &filter.typed_config else {
+                    continue;
+                };
+                match (hcm.route_config.is_some(), hcm.rds.is_some()) {
+                    (false, false) => {
+                        return Err(crate::ConfigError::MissingRouteSource {
+                            stat_prefix: hcm.stat_prefix.clone(),
+                        });
+                    }
+                    (true, true) => {
+                        return Err(crate::ConfigError::AmbiguousRouteSource {
+                            stat_prefix: hcm.stat_prefix.clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     Ok(())
@@ -5104,8 +5171,8 @@ admin:
         };
         assert_eq!(hcm.stat_prefix, "ingress_http");
         assert!(matches!(hcm.codec_type, CodecType::HTTP1));
-        assert_eq!(hcm.route_config.virtual_hosts.len(), 1);
-        let vh = &hcm.route_config.virtual_hosts[0];
+        assert_eq!(hcm.route_config.as_ref().unwrap().virtual_hosts.len(), 1);
+        let vh = &hcm.route_config.as_ref().unwrap().virtual_hosts[0];
         assert_eq!(vh.domains, vec!["*".to_string()]);
         let route = &vh.routes[0];
         assert_eq!(route.r#match.prefix.as_deref(), Some("/"));
@@ -5869,7 +5936,9 @@ prefix_match: "b"
         else {
             panic!("not HCM");
         };
-        let header_matcher = &hcm.route_config.virtual_hosts[0].routes[0].r#match.headers[0];
+        let header_matcher = &hcm.route_config.as_ref().unwrap().virtual_hosts[0].routes[0]
+            .r#match
+            .headers[0];
         let HeaderMatcherMode::SafeRegexMatch(sr) = &header_matcher.mode else {
             panic!("not SafeRegexMatch");
         };
@@ -5917,7 +5986,7 @@ prefix_match: "b"
             panic!("not HCM");
         };
         assert_eq!(
-            hcm.route_config.virtual_hosts[0].routes[0]
+            hcm.route_config.as_ref().unwrap().virtual_hosts[0].routes[0]
                 .r#match
                 .headers
                 .len(),
@@ -6017,7 +6086,9 @@ prefix_match: "b"
         else {
             panic!("not HCM");
         };
-        let header_matcher = &hcm.route_config.virtual_hosts[0].routes[0].r#match.headers[0];
+        let header_matcher = &hcm.route_config.as_ref().unwrap().virtual_hosts[0].routes[0]
+            .r#match
+            .headers[0];
         let HeaderMatcherMode::StringMatch(sm) = &header_matcher.mode else {
             panic!("not StringMatch");
         };
@@ -6112,7 +6183,7 @@ static_resources:
             TypedConfig::HttpConnectionManager(hcm) => hcm,
             other => panic!("expected HCM typed_config, got {other:?}"),
         };
-        &hcm.route_config.virtual_hosts[0].routes[0].action
+        &hcm.route_config.as_ref().unwrap().virtual_hosts[0].routes[0].action
     }
 
     #[test]
@@ -6295,6 +6366,149 @@ dynamic_resources:
         let cs = dr.cds_config.as_ref().unwrap();
         assert_eq!(cs.path_config_source.path, "/tmp/cds.yaml");
         assert_eq!(cs.resource_api_version.as_deref(), Some("V3"));
+    }
+
+    // --- 20 D1 (ADR-0051/0052): rds schema + exactly-one-of route source ---
+
+    /// Build a one-HCM-listener bootstrap whose HCM body carries the given
+    /// `route_body` lines (i.e. some combination of `route_config:`/`rds:`),
+    /// spliced verbatim into the typed_config. The listener satisfies NoRuntime,
+    /// so no admin block is needed.
+    fn rds_schema_yaml(route_body: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+static_resources:
+  listeners:
+    - name: hcm_listener
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+{route_body}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#
+        )
+    }
+
+    /// Drill into the parsed bootstrap and return the first HCM.
+    fn first_hcm(b: &Bootstrap) -> &HttpConnectionManagerConfig {
+        let filter = &b.static_resources.listeners[0].filter_chains[0].filters[0];
+        match filter.typed_config.as_ref().expect("typed_config present") {
+            TypedConfig::HttpConnectionManager(hcm) => hcm,
+            other => panic!("expected HCM typed_config, got {other:?}"),
+        }
+    }
+
+    // (a) the `Rds` struct parses; route_config is None.
+    #[test]
+    fn rds_schema_parses_rds_block() {
+        let yaml = rds_schema_yaml(
+            "                rds:\n                  route_config_name: local_route\n                  config_source:\n                    path_config_source:\n                      path: /x",
+        );
+        let b = crate::parse_bootstrap(&yaml).unwrap();
+        let hcm = first_hcm(&b);
+        assert!(hcm.route_config.is_none());
+        assert_eq!(
+            hcm.rds,
+            Some(crate::Rds {
+                route_config_name: "local_route".to_string(),
+                config_source: crate::ConfigSource {
+                    path_config_source: crate::PathConfigSource {
+                        path: "/x".to_string()
+                    },
+                    resource_api_version: None,
+                },
+            })
+        );
+    }
+
+    // (b) resource_api_version optional inside rds.config_source.
+    #[test]
+    fn rds_schema_resource_api_version_optional() {
+        let yaml = rds_schema_yaml(
+            "                rds:\n                  route_config_name: local_route\n                  config_source:\n                    path_config_source:\n                      path: /x\n                    resource_api_version: V3",
+        );
+        let b = crate::parse_bootstrap(&yaml).unwrap();
+        let hcm = first_hcm(&b);
+        let rds = hcm.rds.as_ref().unwrap();
+        assert_eq!(
+            rds.config_source.resource_api_version.as_deref(),
+            Some("V3")
+        );
+    }
+
+    // (c) inline route_config still parses to Some; rds is None (regression).
+    #[test]
+    fn rds_schema_inline_route_config_still_parses() {
+        let yaml = rds_schema_yaml(
+            "                route_config:\n                  name: rc\n                  virtual_hosts:\n                    - name: vh\n                      domains: [\"*\"]\n                      routes:\n                        - match: { prefix: \"/\" }\n                          direct_response: { status: 200, body: { inline_string: ok } }",
+        );
+        let b = crate::parse_bootstrap(&yaml).unwrap();
+        let hcm = first_hcm(&b);
+        assert!(hcm.route_config.is_some());
+        assert!(hcm.rds.is_none());
+    }
+
+    // (d) neither → MissingRouteSource.
+    #[test]
+    fn rds_schema_missing_route_source_rejected() {
+        let yaml = rds_schema_yaml("");
+        let err = crate::parse_bootstrap(&yaml).expect_err("neither source must reject");
+        assert!(
+            matches!(&err, crate::ConfigError::MissingRouteSource { stat_prefix } if stat_prefix == "ingress_http"),
+            "expected MissingRouteSource; got: {err:?}"
+        );
+    }
+
+    // (e) both → AmbiguousRouteSource.
+    #[test]
+    fn rds_schema_ambiguous_route_source_rejected() {
+        let yaml = rds_schema_yaml(
+            "                route_config:\n                  name: rc\n                  virtual_hosts:\n                    - name: vh\n                      domains: [\"*\"]\n                      routes:\n                        - match: { prefix: \"/\" }\n                          direct_response: { status: 200, body: { inline_string: ok } }\n                rds:\n                  route_config_name: local_route\n                  config_source:\n                    path_config_source:\n                      path: /x",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("both sources must reject");
+        assert!(
+            matches!(&err, crate::ConfigError::AmbiguousRouteSource { stat_prefix } if stat_prefix == "ingress_http"),
+            "expected AmbiguousRouteSource; got: {err:?}"
+        );
+    }
+
+    // (f) unknown field inside rds rejected (deny_unknown_fields on Rds).
+    #[test]
+    fn rds_schema_unknown_field_in_rds_rejected() {
+        let yaml = rds_schema_yaml(
+            "                rds:\n                  route_config_name: x\n                  config_source:\n                    path_config_source:\n                      path: /x\n                  ads: {}",
+        );
+        assert!(
+            crate::parse_bootstrap(&yaml).is_err(),
+            "unknown field `ads` inside rds must reject"
+        );
+    }
+
+    // (g) deferred ConfigSource surfaces still rejected inside rds.config_source.
+    #[test]
+    fn rds_schema_deferred_config_source_fields_rejected() {
+        for deferred in [
+            "api_config_source: { api_type: GRPC }",
+            "ads: {}",
+            "watched_directory: { path: /w }",
+        ] {
+            let yaml = rds_schema_yaml(&format!(
+                "                rds:\n                  route_config_name: x\n                  config_source:\n                    path_config_source:\n                      path: /x\n                    {deferred}"
+            ));
+            assert!(
+                crate::parse_bootstrap(&yaml).is_err(),
+                "deferred config_source field `{deferred}` must reject"
+            );
+        }
     }
 
     #[test]
