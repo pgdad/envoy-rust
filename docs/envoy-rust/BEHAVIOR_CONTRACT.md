@@ -267,6 +267,33 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 
 **The L3 Envoy-only enumeration paragraph (LDS).** After a successful load Envoy emits **21** `listener_manager.*` names; envoy-rust emits the **6** above. The 15 Envoy-only unasserted names (ignored by fixture 0027's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `listener_create_success`, `listener_create_failure`, `listener_modified`, `listener_removed`, `listener_stopped`, `listener_in_place_updated`, `total_listeners_warming`, `total_listeners_draining`, `total_filter_chains_draining`, `workers_started`, `lds.update_time`, `lds.update_duration`, `lds.version`, `lds.version_text`, `lds.init_fetch_timeout`. **✧ `listener_create_success` is PER-WORKER** — observed at **12 on a 12-core host** (one tick per worker thread per listener); it is host-core-count-dependent, **NEVER asserted bilaterally**, and is NOT in the 6-name subset. (Envoy additionally carries an `lds.control_plane.*` family, irrelevant to the filesystem transport.) Fixture 0027 also carries the phase-18 `cluster_manager.*` 6-name subset, here with **`cluster_added: 2` / `active_clusters: 2`** (TWO clusters: the static `static_backend` + the CDS-supplied `dynamic_backend`) and `cds.update_attempt/success/failure/rejected` = 1/1/0/0.
 
+**20 entries (file-based RDS):**
+
+> The xDS-family continuation (ADR-0051 SPEC / ADR-0052 PLAN). file-based RDS
+> loads route tables from `rds.config_source.path_config_source.path` on each
+> HCM at startup; these are the project's first **per-HCM-scoped** xDS stats
+> (every name is prefixed `http.<stat_prefix>.rds.<route_config_name>.`, NOT a
+> top-level-scope `*_manager.*` name). All derived from the §6.2 empirical
+> lock-ins (verified against `envoyproxy/envoy:v1.33.0`, digest
+> `sha256:56da5afd…`, 2026-06-02). Envoy emits a fuller `http.<prefix>.rds.<name>.*`
+> family after a successful RDS update; envoy-rust's minimum-viable subset is
+> **5 names**. Registered **conditionally** — ONLY when the owning HCM's `rds`
+> is configured (an inline-route HCM emits no `rds.*` names — L10).
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `http.<stat_prefix>.rds.<route_config_name>.update_attempt` | value-exact (fixture 0028: 1) | Counter; one increment per RDS update attempt. envoy-rust's synchronous initial load ticks it once at the file-read+parse step. Initial-load-only at phase-20 scope (no hot-reload) → exactly `1` after startup on both proxies. |
+| `http.<stat_prefix>.rds.<route_config_name>.update_success` | value-exact (fixture 0028: 1) | Counter; one increment per successful RDS update (an installed route table). The load-bearing differential proof of the phase: `update_success: 1` can only pass if real Envoy genuinely loaded the RDS file (fixture 0028 asserts it bilaterally). |
+| `http.<stat_prefix>.rds.<route_config_name>.update_failure` | value-exact (fixture 0028: 0) | Counter; in Envoy, `+1` per RDS update that hit a **parse error** (malformed envelope / missing `@type`) — Envoy then warns-and-serves. **In envoy-rust this is structurally 0:** all RDS load errors are FATAL pre-construction (the all-fatal posture, ADR-0049 decision 2 extended to RDS by ADR-0052 L4 — see the xDS-wire-state-machine RDS §(c)), so the process exits rather than reach a non-zero `update_failure` state. Registered at 0 and **structurally unreachable non-zero**. Bilaterally satisfiable at 0 on fixture 0028 (a successful load). |
+| `http.<stat_prefix>.rds.<route_config_name>.update_rejected` | value-exact (fixture 0028: 0) | Counter; in Envoy, `+1` per RDS update whose resource was **semantically invalid** (PGV violation / route-build failure) — distinct from the parse-error `update_failure` bucket; Envoy warns-and-serves. **In envoy-rust this is structurally 0** for the same reason as `update_failure` (the all-fatal posture; the process exits instead). Registered at 0 and **structurally unreachable non-zero**. Bilaterally satisfiable at 0 on fixture 0028. |
+| `http.<stat_prefix>.rds.<route_config_name>.config_reload` | value-exact (fixture 0028: 1) | Counter; `+1` per route-config version applied. **Ticks at initial load** (§6.2 L3 verified — the initial route table counts as the first reload), so the single synchronous load drives it to `1` on both proxies. Subsequent hot-reloads (deferred at phase-20 scope) would tick it again. |
+
+**The per-HCM scoping paragraph (L1).** Every name in the 5-name subset is prefixed `http.<stat_prefix>.rds.<route_config_name>.` — both the `<stat_prefix>` (from the owning HCM's `stat_prefix`) AND the `<route_config_name>` (from the `rds.route_config_name`) are dynamic segments. Fixture 0028's concrete prefix is `http.ingress_http1.rds.local_route.`. This is the project's first xDS stat family scoped to a per-HCM, per-route-config name (vs the phase-18 `cluster_manager.*` / phase-19 `listener_manager.*` top-level-scope names).
+
+**The conditional-registration narrowing (recorded divergence, L5/ADR-0052).** The `rds.*` names register ONLY when the owning HCM's `rds` is configured — a deliberate, recorded narrowing vs Envoy. An **inline-route HCM emits no `rds.*` names** (the route table comes from the static `route_config` on the HCM, with no RDS update lifecycle to count). All **27 pre-existing fixtures** (inline-route HCMs, or CDS/LDS-only topologies) therefore see **zero new envoy-rust names** under `http.<prefix>.rds.*`; only fixture 0028 (the first `rds`-on-HCM fixture) exercises the family. Recorded explicitly per doctrine D-3.3.
+
+**The Envoy-only enumeration paragraph.** After a successful RDS update Envoy emits a fuller `http.<prefix>.rds.<name>.*` family; envoy-rust emits the **5** above. The Envoy-only unasserted names (ignored by fixture 0028's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `version`, `version_text`, `update_time`, `config_reload_time_ms`, `update_empty`, `init_fetch_timeout`, `update_duration`. (Envoy additionally carries an `rds.<name>.control_plane.*` family, irrelevant to the filesystem transport.)
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments
@@ -309,6 +336,7 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 | `/config_dump` | GET | JSON object | Top-level shape `{ "configs": [...] }`. envoy-rust emits the `BootstrapConfigDump` entry at `configs[0]`: `{ "@type": "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump", "bootstrap": <static-bootstrap-as-JSON>, "last_updated": <ISO-8601 timestamp> }`. Envoy may emit additional entries for xDS-derived configs; those land on `allowlist_envoy_only`. `bootstrap.static_resources` content value-exact-after-roundtrip (modulo serde renamings; the harness's `JsonShape::required_subtree` covers this). `last_updated` name-required-value-may-differ (wall-clock non-determinism). The `BootstrapConfigDump` shows the bootstrap **as parsed from disk** — dynamic (CDS) clusters do NOT appear here (SPEC §5.5 config_dump separation); they surface in the `ClustersConfigDump` entry below. |
 | `/config_dump` `ClustersConfigDump` (phase 18, L5/ADR-0049) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when `dynamic_resources.cds_config` is configured; on non-CDS fixtures it is absent (fixture 0014's single-`BootstrapConfigDump`-entry shape preserved). When present, it lands at `configs[1]` on **both** proxies (Envoy's order: `BootstrapConfigDump`[0], `ClustersConfigDump`[1], …). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.ClustersConfigDump", "dynamic_active_clusters": [ { "cluster": { "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster", <full cluster config> }, "last_updated": <ISO-8601> } ], "static_clusters": [ … when non-empty ] }`. The inner `cluster` object carries its own `@type` plus the full flattened cluster config. **Empty-key omission (proto3-JSON style):** `static_clusters` and `dynamic_active_clusters` are each `skip_serializing_if = Vec::is_empty` on both sides — a static-only Envoy emits the entry with ONLY a `static_clusters` key (no `dynamic_active_clusters`); there is NO `version_info` key (the CDS file had none — proto3 JSON omits empty fields). `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Bilateral anchor (fixture 0026):** `configs.1.dynamic_active_clusters.0.cluster.name == dynamic_backend` (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array content otherwise differs substantially per side (envoy emits its full protobuf-canonical projection; envoy-rust the narrower parsed-bootstrap projection) — `value_may_differ_keys: ["configs"]`, mirroring fixture 0014. Note: envoy-rust's cluster JSON uses snake_case field names while Envoy's proto3-JSON defaults to camelCase for multi-word fields — irrelevant for the `name` anchor (single-word, identical) but binding if a future fixture asserts deeper nested cluster fields. |
 | `/config_dump` `ListenersConfigDump` (phase 19, L5/ADR-0050) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when `dynamic_resources.lds_config` is configured; on non-LDS fixtures it is absent (the backstop inertness path (vi) verifies `/config_dump` does NOT contain `"ListenersConfigDump"` on a CDS-only bootstrap). When present with **both** LDS+CDS configured, it lands at `configs[2]` on **both** proxies — **AFTER** the `ClustersConfigDump` at `configs[1]` (Envoy's verified order: `BootstrapConfigDump`[0], `ClustersConfigDump`[1], `ListenersConfigDump`[2], …; fixture 0026's `configs[1]` Clusters assertion needs NO amendment). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.ListenersConfigDump", "dynamic_listeners": [ { "name": "dynamic_listener", "active_state": { "listener": { "@type": "type.googleapis.com/envoy.config.listener.v3.Listener", <full listener config> }, "last_updated": <ISO-8601> } } ], "static_listeners": [ … when non-empty ] }`. **Note the DIFFERENT nesting from the CDS dump:** the listener is nested under `dynamic_listeners[].active_state.listener` (vs the CDS dump's flatter `dynamic_active_clusters[].cluster`), and each entry carries a top-level `name` key. **No `version_info` key** — `active_state` has NO `version_info` (file-based LDS; the LDS file had none — proto3 JSON omits empty fields). **Empty-key omission:** `static_listeners` and `dynamic_listeners` are each `skip_serializing_if = Vec::is_empty` — a static-only Envoy emits the entry with ONLY `static_listeners`. `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Bilateral anchor (fixture 0027):** `configs.2.dynamic_listeners.0.name == dynamic_listener` (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array otherwise differs per side — `value_may_differ_keys: ["configs"]`. **Known narrowing (LDS-only bootstrap):** on an LDS-only (no-CDS) bootstrap, envoy-rust's Listeners entry would land at `configs[1]` vs Envoy's `configs[2]` (Envoy emits a `ClustersConfigDump` for static clusters unconditionally, occupying `[1]`; envoy-rust's `ClustersConfigDump` is CDS-conditional per phase-18 L10, so it is absent and Listeners shifts up). Fixture 0027 configures BOTH LDS+CDS so the indices align at `[2]`; the divergence is recorded for any future LDS-only fixture (none exercises it today). |
+| `/config_dump` `RoutesConfigDump` (phase 20, L5/ADR-0052) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when **some HCM uses `rds`**; on non-RDS fixtures it is absent (vs Envoy's **always-emitted** `RoutesConfigDump`, which carries `static_route_configs` even without any RDS). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.RoutesConfigDump", "dynamic_route_configs": [ { "route_config": { "@type": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration", "name": "local_route", "virtual_hosts": [ … ] }, "last_updated": <ISO-8601> } ] }`. **No `version_info` key** — the RDS file had none (proto3 JSON omits empty fields; same posture as the CDS/LDS dumps). `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Index divergence + per-side reconciliation:** the entry lands at **`configs[4]`** on Envoy (Bootstrap[0]/Clusters[1]/Listeners[2]/ScopedRoutes[3]/Routes[4]/Secrets[5]) but **`configs[2]`** on envoy-rust on fixture 0028 (Bootstrap[0]/Clusters[1]/Routes[2] — Listeners gated off, no `lds_config` on 0028) — bridged by a **per-side `JsonSubtreeRule` path override** in the harness (Envoy `configs.4.…` vs envoy-rust `configs.2.…`). **Bilateral anchor (fixture 0028):** the `route_config.name == local_route` subtree (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array otherwise differs per side — `value_may_differ_keys: ["configs"]`. Fixtures 0026/0027 hold (the RoutesConfigDump entry is RDS-conditional and absent there; their Clusters[1]/Listeners[2] assertions are NOT displaced). |
 | `/server_info` | GET | JSON object | Required keys `state`, `version`, `node`, `uptime_current_epoch_seconds`, `uptime_all_epochs_seconds`, `hot_restart_version`, `command_line_options`. `state` value-exact, sourced from `DrainState::current()` via the mapping `Live | HealthcheckFailing → "LIVE"`, `Draining → "DRAINING"` (08.1 emitted the literal constant `"LIVE"` as a placeholder; 08.2's D5e patches the value-binding source at Task 5 — the struct shape is unchanged at the 08.1 → 08.2 boundary); `node.*` value-exact from the parsed bootstrap; `version` + `hot_restart_version` + `command_line_options` allowlist-each-side (envoy-rust emits its own version string; Envoy emits its own); `uptime_*` name-required-value-may-differ (wall clock). |
 | `/clusters` | GET | text/plain | Set-equal `<cluster_name>::observability_name::<name>` + `<cluster_name>::default_priority::endpoints` lines per Envoy v1.33's plain-text format. Per-endpoint numeric fields (success/error/timeout counts) name-required-value-may-differ; envoy-rust at 08.1 emits only the minimum two lines per cluster (architecture-decision lock-in #10) — Envoy's richer output is allow-listed envoy-only on fixture 0014. Cluster output order is deterministic by name (sorted in `ClusterManager::clusters()`). |
 | `/listeners` | GET | text/plain | Set-equal `<listener_name>::<address>:<port>` lines. Order: sorted-by-name (deterministic on both sides). **LDS extension (phase 19, L5/ADR-0050):** LDS-supplied listeners appear in the output alongside static ones — envoy-rust migrated the endpoint to enumerate the merged `all_listeners()` set (static + LDS-delivered), so fixture 0027's `dynamic_listener` line is emitted on both sides. The per-side address shapes are **prefix-matched** (Envoy binds `dynamic_listener::0.0.0.0:<port>`; envoy-rust binds `dynamic_listener::127.0.0.1:<kernel-ephemeral>`) — the differential harness matches on the `dynamic_listener::` line prefix bilaterally with per-side `allowlist_*_line_prefixes` for the address+port tail. |
@@ -641,6 +669,124 @@ configured (`total_listeners_active` is the sole exception — unconditional, pe
 its 08.2 registration). The backstop's inertness path (vi) verifies this on a
 CDS-only bootstrap: no `lds.*` names, no `listener_added`, and `/config_dump` does
 NOT contain `"ListenersConfigDump"`.
+
+### Filesystem transport (`path_config_source`) — phase 20 RDS extension
+
+> The xDS-family continuation (ADR-0051 SPEC / ADR-0052 PLAN). file-based RDS
+> loads route tables from `rds.config_source.path_config_source.path` on the HCM
+> at startup — completing the CDS+LDS+RDS filesystem triad. The lock-ins below
+> (L1–L11) are the §6.2 empirical findings, verified against
+> `envoyproxy/envoy:v1.33.0` (digest `sha256:56da5afd…`, 2026-06-02) and
+> reconciled by ADR-0052; what is bilaterally asserted lives in fixture 0028, the
+> negative/fatal paths + the exactly-one-of dispositions live in the in-process
+> backstop (`crates/envoy-bin/tests/xds_file_based_rds.rs`). The RDS transport
+> mirrors the phase-18 CDS / phase-19 LDS transports structurally — the
+> per-finding letters below intentionally parallel the CDS/LDS §(a)–(f).
+
+**(a) The RDS file envelope (L1).** Same dual-envelope posture as CDS/LDS: both the
+bare `resources:` list AND the full `DiscoveryResponse` shape (`version_info` +
+`resources`) are accepted; Envoy treats `version_info` as load-bearing, envoy-rust
+accepts-and-ignores it. Each resource MUST carry an `@type` with the type URL
+`type.googleapis.com/envoy.config.route.v3.RouteConfiguration`; RDS files carry
+**RouteConfiguration** resources only. The `rds`-on-HCM config shape is
+`rds: { route_config_name, config_source: { path_config_source: { path }, resource_api_version? } }`.
+envoy-rust's RDS parse is **always-YAML** (`serde_yaml`, regardless of extension —
+the same strictly-more-lenient stance as `parse_cds_file`/`parse_lds_file`; the
+Envoy-side container path is structurally `.yaml`) and **requires** the `@type`
+per resource (the ADR-0014 internally-tagged-on-`@type` pattern; a
+non-RouteConfiguration `@type` rejects loudly).
+
+**(b) Initial-load / readiness ordering (L2).** Readiness implies loaded on both
+proxies; the RDS route table is **active before `/ready` first returns 200** —
+**no warm-up**. Envoy loads the route table at HCM construction (the RDS
+`config_source` resolves synchronously for filesystem transport) so the route is
+routable the instant the listener serves. envoy-rust mirrors this naturally via a
+**synchronous load** (the RDS file is read between bootstrap parse and HCM
+construction, before listeners bind); fixture 0028's GET fires after readiness and
+routes through the RDS-supplied route table.
+
+**(c) Negative-path disposition (L4) — recorded divergence (ADR-0052).** Envoy's
+RDS disposition is the **same 3-way split** as its CDS/LDS splits:
+
+| RDS load fault | Envoy | envoy-rust |
+|---|---|---|
+| Nonexistent `path` | hard startup failure (container exits non-zero; `paths must refer to an existing path in the system` — a bootstrap-level PGV check) | **FATAL** (`RdsFileError`; process exits) — agrees with Envoy on this one class |
+| File exists, malformed YAML / missing `@type` | **starts and serves** (`/ready` 200), `http.<prefix>.rds.<name>.update_failure: 1` | **FATAL** (`RdsParseError`; process exits) — **diverges** |
+| Valid YAML, semantically-invalid route config (PGV violation) | starts and serves, `rds.<name>.update_rejected: 1` ticks (NOT `update_failure`) | **FATAL** (process exits) — **diverges** |
+| `route_config_name` mismatch (the file's `RouteConfiguration.name` ≠ the HCM's `rds.route_config_name`) (L6) | starts and serves, `rds.<name>.update_rejected: 1` + runtime 404 (the named route table never installs) | **FATAL** (`RdsRouteConfigNotFound`; process exits) — **diverges** |
+| Unknown field inside a resource | **warn-accepted** (lenient protobuf parsing) | **FATAL** (`deny_unknown_fields`; process exits) — **diverges** |
+
+envoy-rust treats **ALL RDS load errors as FATAL at startup** — the ADR-0049
+decision-2 all-fatal posture extended to RDS (`RdsFileError`/`RdsParseError` fatal
+at startup): missing/unreadable file, malformed YAML, missing `@type`, unknown
+fields, `route_config_name` mismatch, per-route validation failure all exit the
+process before construction completes. **Consequence for the stats contract:**
+`http.<prefix>.rds.<name>.update_failure` and `…update_rejected` register at 0 and
+are **structurally unreachable non-zero** in envoy-rust. fixture 0028 asserts both
+at 0 bilaterally (satisfiable on both sides — a successful load); the negative
+paths are **backstop-only** (Envoy exits the process on a fatal RDS error, which
+the differential harness cannot observe as a data-plane response).
+
+**(d) The exactly-one-of route-source disposition (L9) — ADR-0052.** An HCM's
+route source is an **exactly-one-of** between the inline `route_config` and the
+`rds` reference. **Both** sources present, OR **neither** present, are **FATAL on
+both proxies** — no differential divergence:
+
+| Route-source fault | Envoy | envoy-rust |
+|---|---|---|
+| Both `route_config` AND `rds` set | hard startup failure (protobuf `oneof` reject) | **FATAL** (`AmbiguousRouteSource`; parse-time exactly-one-of check) — **agrees** |
+| Neither set | hard startup failure (PGV `route_specifier required`) | **FATAL** (`MissingRouteSource`; parse-time exactly-one-of check) — **agrees** |
+
+envoy-rust enforces the disposition at **parse time** (the exactly-one-of check on
+the HCM config), matching Envoy's startup-fatal disposition on both arms.
+
+**(e) RDS+CDS composition + the route-revalidation divergence (L7) — recorded
+divergence (ADR-0052).** An RDS-supplied route to a CDS-supplied cluster resolves
+at **initial load**: **CDS merges BEFORE the RDS-route re-validation** (the §5.7
+merge-ordering invariant — clusters land first, then the RDS route table
+re-validates its cluster references against the effective static+dynamic list). An
+RDS→CDS route needs **NO `validate_clusters: false`** — RDS behaves like LDS (the
+dynamically-delivered route table is not subject to the static inline-validation
+that CDS-static routes need suppressed), **not like a CDS-static route**; the
+ADR-0050 L6 finding (LDS routes skip inline cluster validation) is **confirmed for
+RDS**. envoy-rust's posture is the same **defer-then-revalidate** as phases 18/19:
+cluster-reference checks defer while `dynamic_resources` is configured-but-unloaded,
+then RE-ENFORCE post-merge. **Recorded narrow divergence:** an RDS-route to a
+cluster in **NEITHER** list **fails envoy-rust startup** (`UnknownCluster`), vs
+Envoy's start-and-runtime-503 — the same defer-then-revalidate narrow divergence
+recorded for CDS (ADR-0049 §(e)) and LDS (ADR-0050 §(e)).
+
+**(f) L5 conditional-emission narrowing (recorded divergence — ADR-0052).**
+envoy-rust emits a `RoutesConfigDump` `/config_dump` entry **ONLY when some HCM
+uses `rds`**; vs Envoy's **always-emitted** `RoutesConfigDump` (Envoy emits it with
+`static_route_configs` even without any RDS — the inline route tables surface
+there). On fixture 0028 the entry lands at **different `configs[]` indices** per
+side, reconciled by a per-side `JsonSubtreeRule` path override in the harness:
+
+| Side | `configs[]` layout (fixture 0028) | RoutesConfigDump index |
+|---|---|---|
+| Envoy | Bootstrap[0] / Clusters[1] / Listeners[2] / ScopedRoutes[3] / Routes[4] / Secrets[5] | `configs[4]` |
+| envoy-rust | Bootstrap[0] / Clusters[1] / Routes[2] (Listeners gated off — no `lds_config` on 0028) | `configs[2]` |
+
+The per-side path override bridges the index gap; **fixtures 0026/0027 hold** —
+their Clusters[1] / Listeners[2] assertions are NOT displaced (the RoutesConfigDump
+entry is RDS-conditional and absent on those topologies).
+
+**Note (L8): the RDS file is SHAREABLE.** Unlike the per-side LDS templates (the
+LDS file's static-listener address differs per proxy), one `rds.yaml` is consumed
+**verbatim by both proxies** — the RDS route table carries no per-side address. A
+single fixture file serves both Envoy and envoy-rust.
+
+**Note (L10): an inline-route HCM emits zero `http.<prefix>.rds.*` names.** The
+conditional registration (§Stat-name mapping) means an HCM whose route table is the
+static inline `route_config` (no `rds`) participates in NO RDS update lifecycle and
+registers none of the 5 `rds.*` names — verified by the backstop's inertness path
+and by the 27 pre-existing fixtures seeing zero new names.
+
+**Note (L11): version is Envoy-only.** Envoy's RDS update carries a `version_info`
+(load-bearing on the wire); envoy-rust accepts-and-ignores it (per §(a)), and the
+`rds.<name>.version` / `version_text` stats are **Envoy-only, not asserted** (per
+the §Stat-name mapping Envoy-only enumeration).
 
 ---
 
