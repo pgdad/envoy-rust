@@ -578,19 +578,34 @@ pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
     Ok(bootstrap)
 }
 
-/// 18 D3 / 19 D3: read + parse + merge the CDS and LDS files (ADR-0048/0049/0050).
-/// Called by envoy-bin AFTER `parse_bootstrap` and BEFORE any consumer iterates
-/// clusters or listeners. No-op when neither `dynamic_resources.cds_config` nor
-/// `dynamic_resources.lds_config` is configured. ALL failures are fatal (the L4
-/// reconciliation — envoy-rust never warn-and-serves a broken CDS/LDS file;
-/// recorded divergence vs Envoy, BEHAVIOR_CONTRACT).
+/// 18 D3 / 19 D3 / 20 D3: read + parse + merge the CDS, LDS, and RDS files
+/// (ADR-0048/0049/0050/0051/0052). Called by envoy-bin AFTER `parse_bootstrap`
+/// and BEFORE any consumer iterates clusters or listeners. No-op when neither
+/// `dynamic_resources.cds_config` / `lds_config` is configured AND no HCM uses
+/// `rds`. ALL failures are fatal (the L4 reconciliation — envoy-rust never
+/// warn-and-serves a broken CDS/LDS/RDS file; recorded divergence vs Envoy,
+/// BEHAVIOR_CONTRACT).
 ///
 /// §5.7 merge ordering: the CDS branch merges dynamic CLUSTERS into
 /// `dynamic_clusters` BEFORE the single post-merge re-validation, so that when
 /// that re-validation checks a dynamic LISTENER's route→cluster references, the
 /// dynamic cluster is already visible via `all_clusters()`. The LDS branch then
-/// merges dynamic LISTENERS, and exactly ONE `bootstrap::validate()` runs after
-/// BOTH branches — never one validate per branch.
+/// merges dynamic LISTENERS. AFTER the LDS merge, `check_route_sources` is
+/// re-run over the MERGED (static + dynamic-LDS) listener set — while rds-HCMs
+/// still have `route_config: None` — so an LDS-supplied HCM with neither/both
+/// route source fails (MissingRouteSource / AmbiguousRouteSource) BEFORE any RDS
+/// file is read (M20-T1-c). The RDS pass then walks every HCM across the
+/// effective listener set, reads + parses + name-selects each `rds` file's
+/// RouteConfiguration, and populates the HCM's `route_config` (§5.3 uniform
+/// downstream shape). Because CDS merged FIRST, an RDS route to a CDS-supplied
+/// cluster resolves; a route to a cluster in NEITHER list is fatal (L7
+/// UnknownCluster) at the post-merge re-validation. Exactly ONE
+/// `bootstrap::validate()` runs after ALL branches + the RDS pass — never one
+/// validate per branch — and it now walks the rds-populated `route_config`s.
+/// That single re-validation is gated on
+/// `dynamic_clusters.is_some() || dynamic_listeners.is_some() || had_rds_hcm`,
+/// so an rds-only bootstrap (no CDS/LDS) still re-validates its now-populated
+/// inline route table.
 ///
 /// L6 recorded divergence: a dynamic-listener route to a cluster in NEITHER the
 /// static nor the dynamic list is FATAL here (`UnknownCluster`), diverging from
@@ -678,7 +693,62 @@ pub fn load_dynamic_resources(bootstrap: &mut Bootstrap) -> Result<(), ConfigErr
         bootstrap.dynamic_listeners = Some(dynamic);
     }
 
-    // ---- §5.7: ONE post-merge re-validation after BOTH merges ----
+    // ---- M20-T1-c: re-check route-source cardinality over the MERGED set ----
+    // Runs AFTER the LDS merge but BEFORE the RDS pass, while rds-HCMs still
+    // have `route_config: None` — so an LDS-supplied HCM with neither route
+    // source (MissingRouteSource) or both (AmbiguousRouteSource) fails here,
+    // and the RDS population below cannot falsely trip the "both" arm.
+    bootstrap::check_route_sources(bootstrap)?;
+
+    // ---- 20 D3: RDS pass — load + name-select + populate route_config ----
+    // Walk every HCM across the EFFECTIVE listener set (static + dynamic-LDS).
+    // The HCMs must be MUTATED (route_config populated), so a disjoint two-field
+    // mutable borrow is taken (rather than the immutable `all_listeners()`).
+    // The borrow ends when the loop completes; `had_rds_hcm` is a Copy `bool`,
+    // so nothing into `bootstrap` is held past the loop. CDS merged FIRST, so an
+    // RDS route to a CDS cluster resolves at the post-merge re-validation; a
+    // route to a cluster in NEITHER list is fatal there (L7 UnknownCluster).
+    let (static_listeners, dynamic_listeners) = (
+        &mut bootstrap.static_resources.listeners,
+        &mut bootstrap.dynamic_listeners,
+    );
+    let mut had_rds_hcm = false;
+    for listener in static_listeners
+        .iter_mut()
+        .chain(dynamic_listeners.iter_mut().flatten())
+    {
+        for chain in &mut listener.filter_chains {
+            for filter in &mut chain.filters {
+                let Some(bootstrap::TypedConfig::HttpConnectionManager(hcm)) =
+                    filter.typed_config.as_mut()
+                else {
+                    continue;
+                };
+                let Some(rds) = hcm.rds.as_ref() else {
+                    continue;
+                };
+                had_rds_hcm = true;
+                let path = rds.config_source.path_config_source.path.clone();
+                let name = rds.route_config_name.clone();
+                let contents =
+                    std::fs::read_to_string(&path).map_err(|source| ConfigError::RdsFileError {
+                        path: path.clone(),
+                        source,
+                    })?;
+                let mut parsed = rds::parse_rds_file(&path, &contents)?;
+                // L6: route_config_name must name a resource in the file.
+                let selected = parsed
+                    .iter()
+                    .position(|rc| rc.name == name)
+                    .map(|i| parsed.remove(i))
+                    .ok_or(ConfigError::RdsRouteConfigNotFound { name, path })?;
+                // §5.3: populate route_config for the uniform downstream shape.
+                hcm.route_config = Some(selected);
+            }
+        }
+    }
+
+    // ---- §5.7: ONE post-merge re-validation after ALL merges + the RDS pass ----
     // cds_configured_but_unloaded() / lds_configured_but_unloaded() are now
     // false (both side-fields are Some when their config source is set), so the
     // deferred cluster-reference checks (UnknownCluster + the H2-from-H1 gate)
@@ -686,7 +756,8 @@ pub fn load_dynamic_resources(bootstrap: &mut Bootstrap) -> Result<(), ConfigErr
     // state. A dynamic-listener route may reference a dynamic cluster (resolved
     // because CDS merged above); a reference to a cluster in NEITHER list is
     // fatal (the L6 recorded divergence vs Envoy's runtime-503).
-    if bootstrap.dynamic_clusters.is_some() || bootstrap.dynamic_listeners.is_some() {
+    if bootstrap.dynamic_clusters.is_some() || bootstrap.dynamic_listeners.is_some() || had_rds_hcm
+    {
         bootstrap::validate(bootstrap)?;
     }
     Ok(())

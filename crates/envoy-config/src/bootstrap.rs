@@ -2500,7 +2500,7 @@ fn validate_hcm(
 /// Factored out as a standalone crate-visible helper so the Task-3 merge pass can
 /// re-run it over the merged (static + dynamic LDS) listener set.
 pub(crate) fn check_route_sources(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
-    for listener in &bootstrap.static_resources.listeners {
+    for listener in bootstrap.all_listeners() {
         for chain in &listener.filter_chains {
             for filter in &chain.filters {
                 let Some(TypedConfig::HttpConnectionManager(hcm)) = &filter.typed_config else {
@@ -7154,6 +7154,298 @@ dynamic_resources:
         let mut b = crate::parse_bootstrap(&yaml).unwrap();
         let err = crate::load_dynamic_resources(&mut b).unwrap_err();
         assert!(matches!(err, crate::ConfigError::NoRuntime), "got {err:?}");
+    }
+
+    // ── 20 D3: RDS load pass (load_dynamic_resources populates route_config) ──
+
+    /// An RDS file body: one @type-tagged RouteConfiguration named `rc_name`
+    /// routing `prefix` → `cluster`. With `empty_vhosts = true` the
+    /// RouteConfiguration carries an EMPTY `virtual_hosts` list (parses; the
+    /// post-merge re-validation rejects it via EmptyVirtualHosts).
+    fn rds_file(rc_name: &str, prefix: &str, cluster: &str, empty_vhosts: bool) -> String {
+        if empty_vhosts {
+            return format!(
+                r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: {rc_name}
+  virtual_hosts: []
+"#
+            );
+        }
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: {rc_name}
+  virtual_hosts:
+  - name: vh
+    domains: ["*"]
+    routes:
+    - match: {{ prefix: "{prefix}" }}
+      route: {{ cluster: {cluster} }}
+"#
+        )
+    }
+
+    /// A bootstrap with ONE static listener whose HCM uses `rds`
+    /// (route_config_name + config_source.path = `rds_path`), a static
+    /// `static_backend` cluster, and admin. CDS/LDS unconfigured.
+    fn bootstrap_yaml_with_rds(route_config_name: &str, rds_path: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }} }}
+static_resources:
+  clusters:
+    - name: static_backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      dns_lookup_family: V4_ONLY
+      load_assignment:
+        cluster_name: static_backend
+        endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: {{ address: 127.0.0.1, port_value: 8300 }}
+  listeners:
+    - name: rds_listener
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                rds:
+                  route_config_name: {route_config_name}
+                  config_source:
+                    path_config_source: {{ path: {rds_path} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#
+        )
+    }
+
+    /// A bootstrap with NO static clusters, NO static listeners, admin, an
+    /// `rds`-using static listener, AND a `cds_config` at `cds_path` (§5.7
+    /// composition — an RDS route to a CDS-supplied cluster).
+    fn bootstrap_yaml_with_rds_and_cds(
+        route_config_name: &str,
+        rds_path: &str,
+        cds_path: &str,
+    ) -> String {
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 0 }} }} }}
+static_resources:
+  clusters: []
+  listeners:
+    - name: rds_listener
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                rds:
+                  route_config_name: {route_config_name}
+                  config_source:
+                    path_config_source: {{ path: {rds_path} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+dynamic_resources:
+  cds_config:
+    path_config_source: {{ path: {cds_path} }}
+"#
+        )
+    }
+
+    /// Pull the single HCM from the first static listener (test convenience).
+    fn first_static_hcm(b: &Bootstrap) -> &HttpConnectionManagerConfig {
+        for filter in &b.static_resources.listeners[0].filter_chains[0].filters {
+            if let Some(TypedConfig::HttpConnectionManager(hcm)) = &filter.typed_config {
+                return hcm;
+            }
+        }
+        panic!("no HCM on first static listener");
+    }
+
+    // (a) the RDS pass loads + populates route_config (name-selected).
+    #[test]
+    fn rds_pass_loads_and_populates_route_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let rds_path = dir.path().join("rds.yaml");
+        std::fs::write(
+            &rds_path,
+            rds_file("local_route", "/static", "static_backend", false),
+        )
+        .unwrap();
+        let yaml = bootstrap_yaml_with_rds("local_route", rds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        // Before the load: rds is Some, route_config is None.
+        assert!(first_static_hcm(&b).rds.is_some());
+        assert!(first_static_hcm(&b).route_config.is_none());
+        crate::load_dynamic_resources(&mut b).unwrap();
+        let hcm = first_static_hcm(&b);
+        // route_config is now populated (§5.3 uniform shape); rds remains Some.
+        let rc = hcm.route_config.as_ref().expect("route_config populated");
+        assert_eq!(rc.name, "local_route");
+        assert!(hcm.rds.is_some());
+    }
+
+    // (b) a missing RDS file is fatal (L4) → RdsFileError.
+    #[test]
+    fn missing_rds_file_is_fatal() {
+        let yaml = bootstrap_yaml_with_rds("local_route", "/nonexistent/rds.yaml");
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::RdsFileError { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // (c) a malformed RDS file is fatal (L4) → RdsParseError.
+    #[test]
+    fn malformed_rds_file_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let rds_path = dir.path().join("rds.yaml");
+        std::fs::write(&rds_path, "resources: [unclosed").unwrap();
+        let yaml = bootstrap_yaml_with_rds("local_route", rds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::RdsParseError { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // (d) route_config_name matching no resource in the file is fatal (L6)
+    //     → RdsRouteConfigNotFound. The file defines `other_route`.
+    #[test]
+    fn rds_route_config_name_mismatch_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let rds_path = dir.path().join("rds.yaml");
+        std::fs::write(
+            &rds_path,
+            rds_file("other_route", "/static", "static_backend", false),
+        )
+        .unwrap();
+        let yaml = bootstrap_yaml_with_rds("local_route", rds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::RdsRouteConfigNotFound { ref name, .. } if name == "local_route"),
+            "got {err:?}"
+        );
+    }
+
+    // (e) §5.7 RDS+CDS composition: an RDS route to a CDS-supplied cluster
+    //     resolves because CDS merges before the post-merge re-validation.
+    #[test]
+    fn rds_route_to_cds_cluster_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        // MINIMAL_CDS defines cluster `dynamic_backend`.
+        std::fs::write(&cds_path, MINIMAL_CDS).unwrap();
+        let rds_path = dir.path().join("rds.yaml");
+        std::fs::write(
+            &rds_path,
+            rds_file("local_route", "/dynamic", "dynamic_backend", false),
+        )
+        .unwrap();
+        let yaml = bootstrap_yaml_with_rds_and_cds(
+            "local_route",
+            rds_path.to_str().unwrap(),
+            cds_path.to_str().unwrap(),
+        );
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        crate::load_dynamic_resources(&mut b)
+            .expect("RDS route to a CDS cluster must resolve (§5.7)");
+        let rc = first_static_hcm(&b).route_config.as_ref().unwrap();
+        assert_eq!(rc.name, "local_route");
+        assert!(b.all_clusters().any(|c| c.name == "dynamic_backend"));
+    }
+
+    // (f) an RDS route to a cluster in NEITHER list → UnknownCluster (NOT a
+    //     panic) via the post-merge re-validation.
+    #[test]
+    fn rds_unresolved_route_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let rds_path = dir.path().join("rds.yaml");
+        std::fs::write(&rds_path, rds_file("local_route", "/x", "nope", false)).unwrap();
+        let yaml = bootstrap_yaml_with_rds("local_route", rds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnknownCluster(ref c) if c == "nope"),
+            "got {err:?}"
+        );
+    }
+
+    // (g) the post-merge re-validation walks the rds-populated route_config: an
+    //     RDS RouteConfiguration with empty virtual_hosts → EmptyVirtualHosts.
+    #[test]
+    fn rds_empty_virtual_hosts_is_fatal_post_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let rds_path = dir.path().join("rds.yaml");
+        std::fs::write(
+            &rds_path,
+            rds_file("local_route", "/", "static_backend", true),
+        )
+        .unwrap();
+        let yaml = bootstrap_yaml_with_rds("local_route", rds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::EmptyVirtualHosts { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // (h) closes M20-T1-c: check_route_sources is re-run over the MERGED set, so
+    //     an LDS-supplied HCM with NEITHER route source → MissingRouteSource.
+    #[test]
+    fn lds_hcm_with_no_route_source_is_missing_route_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let lds_path = dir.path().join("lds.yaml");
+        // An LDS listener whose HCM has neither route_config nor rds.
+        let lds = r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+  name: lds_listener
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 10000 }
+  filter_chains:
+  - filters:
+    - name: envoy.filters.network.http_connection_manager
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+        stat_prefix: ingress_http
+        codec_type: HTTP1
+        http_filters:
+        - name: envoy.filters.http.router
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#;
+        std::fs::write(&lds_path, lds).unwrap();
+        let yaml = bootstrap_yaml_with_lds(lds_path.to_str().unwrap());
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::MissingRouteSource { ref stat_prefix } if stat_prefix == "ingress_http"),
+            "got {err:?}"
+        );
     }
 
     #[test]
