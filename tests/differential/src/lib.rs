@@ -611,9 +611,34 @@ pub enum BodyRule {
 /// cleanly through `Option<JsonSubtreeRule>`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct JsonSubtreeRule {
-    /// Dotted-path key, e.g. `configs.0.bootstrap.node.id`.
+    /// Dotted-path key, e.g. `configs.0.bootstrap.node.id`. Shared default;
+    /// overridden per-side when `path_envoy` / `path_envoy_rust` is present.
+    #[serde(default)]
     pub path: String,
+    /// 20 Task 6 (ADR-0052): per-side path override. When present, overrides
+    /// `path` for that proxy only — the `RoutesConfigDump` entry lands at
+    /// `configs[4]` on Envoy (which interposes ScopedRoutes/Secrets sections +
+    /// an always-on `RoutesConfigDump` that envoy-rust does not emit) vs
+    /// `configs[2/3]` on envoy-rust, so a fixed shared index cannot match both.
+    /// Mirrors the per-side allow-list mechanism used elsewhere.
+    #[serde(default)]
+    pub path_envoy: Option<String>,
+    #[serde(default)]
+    pub path_envoy_rust: Option<String>,
     pub expected: serde_yaml::Value,
+}
+
+impl JsonSubtreeRule {
+    /// 20 Task 6 (ADR-0052): the dotted path to walk on the Envoy (upstream)
+    /// side — the per-side override if present, else the shared `path`.
+    pub fn envoy_path(&self) -> &str {
+        self.path_envoy.as_deref().unwrap_or(&self.path)
+    }
+    /// 20 Task 6 (ADR-0052): the dotted path to walk on the envoy-rust
+    /// (subject) side — the per-side override if present, else the shared `path`.
+    pub fn rust_path(&self) -> &str {
+        self.path_envoy_rust.as_deref().unwrap_or(&self.path)
+    }
 }
 
 /// 08.1 Task 10 (D15) helper: walk a dotted-path selector through a
@@ -2250,6 +2275,33 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let subject_lds_path = tmp.path().join("lds-subject.yaml");
     let subject_lds_path_str = subject_lds_path.to_string_lossy().into_owned();
 
+    // 20 Task 6 (ADR-0052): detect file-based RDS. When either main template
+    // references `{{RDS_PATH}}`, the fixture carries a SINGLE SHARED `rds.yaml`
+    // template — UNLIKE LDS (per-side `lds-envoy.yaml`/`lds-envoy-rust.yaml`
+    // because the HCM payload carries Envoy-only fields) and LIKE CDS: an RDS
+    // file carries only a bare `RouteConfiguration` (name + virtual_hosts),
+    // which envoy-rust accepts as-is, so ONE shared template is rendered twice
+    // (once per side, through the same per-side kv map so backend host/port
+    // markers resolve per-side).
+    //   - upstream side: `{{RDS_PATH}}` → `RDS_CONTAINER_PATH` (a `.yaml`-
+    //     suffixed container constant per L1); the rendered upstream file is
+    //     copied into the container via `upstream::start(.., rds_file, ..)`.
+    //   - subject side: `{{RDS_PATH}}` → the host temp path of the rendered
+    //     subject RDS file (the subject runs as a host subprocess and reads
+    //     the file directly).
+    let needs_rds =
+        upstream_template.contains("{{RDS_PATH}}") || subject_template.contains("{{RDS_PATH}}");
+    let rds_template = if needs_rds {
+        Some(
+            std::fs::read_to_string(fixture_dir.join("rds.yaml"))
+                .context("reading rds.yaml (fixture references {{RDS_PATH}})")?,
+        )
+    } else {
+        None
+    };
+    let subject_rds_path = tmp.path().join("rds-subject.yaml");
+    let subject_rds_path_str = subject_rds_path.to_string_lossy().into_owned();
+
     // Spawn a host-local backend if either template needs one. Holding the
     // backend in a binding outside the proxies' lifetime ensures the child
     // process outlives the fixture run; Drop fires after `run_fixture`'s
@@ -2289,8 +2341,22 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // the phase-18 CDS scan extension: scan ALL sources or a CI-only 503 hides
     // until Linux. Empty string when the fixture carries no LDS template.
     let lds_scan = upstream_lds_template.as_deref().unwrap_or("");
-    let backend_scan_sources: [&str; 4] =
-        [&upstream_template, &subject_template, cds_scan, lds_scan];
+    // 20 Task 6 (ADR-0052): the combined backend-launch scan must ALSO cover the
+    // shared RDS template. For fixture 0028 the backend markers live in
+    // `cds.yaml` (the `/dynamic` cluster) and the static cluster in the main
+    // config; the RDS file references CLUSTER NAMES, not host/port markers — but
+    // scan it anyway for symmetry/safety, per the phase-18/19 carryforward-
+    // disposition-2 bug-class lesson (a marker living only in `rds.yaml` must
+    // still spawn the backend, else a CI-only 503 hides until Linux). Empty
+    // string when the fixture carries no RDS template.
+    let rds_scan = rds_template.as_deref().unwrap_or("");
+    let backend_scan_sources: [&str; 5] = [
+        &upstream_template,
+        &subject_template,
+        cds_scan,
+        lds_scan,
+        rds_scan,
+    ];
     let needs_backend = scan_needs_marker(&backend_scan_sources, "BACKEND_PORT");
     // 13.1 D9.1 / Task 7: fixture 0020 reuses `HealthAwareHttp1Backend` but
     // needs the helper's per-path status mapping
@@ -2486,6 +2552,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // rendered upstream LDS file is copied to.
             v.push(("LDS_PATH", upstream::LDS_CONTAINER_PATH.to_string()));
         }
+        if needs_rds {
+            // 20 Task 6 (ADR-0052 L1): the container-internal `.yaml` path the
+            // rendered SHARED upstream RDS file is copied to.
+            v.push(("RDS_PATH", upstream::RDS_CONTAINER_PATH.to_string()));
+        }
         v
     };
     let subject_kvs: Vec<(&str, String)> = {
@@ -2527,6 +2598,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // 19 Task 6 (ADR-0050): host temp path of the rendered subject LDS
             // file; the subject subprocess reads it directly from the host FS.
             v.push(("LDS_PATH", subject_lds_path_str.clone()));
+        }
+        if needs_rds {
+            // 20 Task 6 (ADR-0052): host temp path of the rendered SHARED subject
+            // RDS file; the subject subprocess reads it directly from the host FS.
+            v.push(("RDS_PATH", subject_rds_path_str.clone()));
         }
         v
     };
@@ -2607,6 +2683,36 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         None
     };
 
+    // 20 Task 6 (ADR-0052): render + write the SHARED RDS file per-side. LIKE
+    // CDS (one shared `rds.yaml` template rendered twice through each side's own
+    // kv map) and UNLIKE LDS (per-side templates). The upstream rendition is
+    // copied into the container at `RDS_CONTAINER_PATH`; the subject rendition
+    // stays at its host temp path (`subject_rds_path`, already injected into the
+    // subject kv map as `{{RDS_PATH}}`). The rendered upstream RDS string is
+    // retained so the `host_uses_host_gateway` scan below can cover it too.
+    let mut upstream_rds_yaml: Option<String> = None;
+    let upstream_rds_path: Option<PathBuf> = if let Some(tpl) = rds_template.as_ref() {
+        let up_rds = render_yaml(tpl, &upstream_kvs_refs);
+        let subject_rds = render_yaml(tpl, &subject_kvs_refs);
+        // Fail fast, RDS-scoped, naming any unsubstituted marker (a token
+        // present in `rds.yaml` but absent from the kv map). Mirrors the CDS
+        // residual-marker guard above.
+        if let Some(marker) = residual_marker(&up_rds) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream rds.yaml");
+        }
+        if let Some(marker) = residual_marker(&subject_rds) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject rds.yaml");
+        }
+        let up_path = write_temp(tmp.path(), "rds-upstream.yaml", &up_rds)?;
+        // Write the subject rendition at the exact path injected into the
+        // subject kv map so `{{RDS_PATH}}` resolves to a file that exists.
+        write_temp(tmp.path(), "rds-subject.yaml", &subject_rds)?;
+        upstream_rds_yaml = Some(up_rds);
+        Some(up_path)
+    } else {
+        None
+    };
+
     let upstream_yaml = render_yaml(&upstream_template, &upstream_kvs_refs);
     let subject_yaml = render_yaml(&subject_template, &subject_kvs_refs);
     let upstream_path = write_temp(tmp.path(), "envoy.yaml", &upstream_yaml)?;
@@ -2628,10 +2734,14 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // 19 Task 6 (ADR-0050): the scan now covers ALL rendered upstream sources —
     // the main config, the rendered upstream CDS file, AND the rendered upstream
     // LDS file (fixture 0027). Empty strings stand in for absent sources.
+    // 20 Task 6 (ADR-0052): the scan also covers the rendered upstream RDS file
+    // (a `host.docker.internal` reference could in principle live only in an
+    // RDS-carried route). Empty string when the fixture carries no RDS file.
     let host_uses_host_gateway = uses_host_gateway(&[
         &upstream_yaml,
         upstream_cds_yaml.as_deref().unwrap_or(""),
         upstream_lds_yaml.as_deref().unwrap_or(""),
+        upstream_rds_yaml.as_deref().unwrap_or(""),
     ]);
     // (e) Thread tls_pki through to upstream::start. 06.1: also thread
     // `needs_admin_port` so the container exposes ADMIN_CONTAINER_PORT for
@@ -2705,6 +2815,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         needs_admin_port,
         upstream_cds_path.as_deref(),
         upstream_lds_path.as_deref(),
+        upstream_rds_path.as_deref(),
         &upstream_access_log_mounts,
     )
     .await?;
@@ -4188,11 +4299,17 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
                 }
             }
             if let Some(subtree) = required_subtree {
-                let envoy_sub = walk_pointer(&envoy_json, &subtree.path)
-                    .with_context(|| format!("envoy required_subtree path {:?}", subtree.path))?;
-                let rust_sub = walk_pointer(&rust_json, &subtree.path).with_context(|| {
-                    format!("envoy-rust required_subtree path {:?}", subtree.path)
-                })?;
+                // 20 Task 6 (ADR-0052): resolve the dotted path per-side. The
+                // shared `path` is used unless a per-side override
+                // (`path_envoy` / `path_envoy_rust`) is present — needed because
+                // the RoutesConfigDump entry lands at a different `configs[*]`
+                // index on Envoy vs envoy-rust.
+                let envoy_path = subtree.envoy_path();
+                let rust_path = subtree.rust_path();
+                let envoy_sub = walk_pointer(&envoy_json, envoy_path)
+                    .with_context(|| format!("envoy required_subtree path {envoy_path:?}"))?;
+                let rust_sub = walk_pointer(&rust_json, rust_path)
+                    .with_context(|| format!("envoy-rust required_subtree path {rust_path:?}"))?;
                 // 08.1 Task 11: also assert against `expected` (Task 10
                 // accepted the field but never consulted it). Compare
                 // via the canonical serde_json string form so both YAML-
@@ -4210,14 +4327,12 @@ fn assert_body_rule(rule: &BodyRule, envoy_body: &[u8], rust_body: &[u8]) -> Res
                     .context("rendering envoy-rust required_subtree sub-value as JSON")?;
                 if envoy_str != expected_str {
                     bail!(
-                        "required_subtree {:?} envoy != expected:\n  envoy:    {envoy_str}\n  expected: {expected_str}",
-                        subtree.path,
+                        "required_subtree {envoy_path:?} envoy != expected:\n  envoy:    {envoy_str}\n  expected: {expected_str}",
                     );
                 }
                 if rust_str != expected_str {
                     bail!(
-                        "required_subtree {:?} envoy-rust != expected:\n  envoy-rust: {rust_str}\n  expected:   {expected_str}",
-                        subtree.path,
+                        "required_subtree {rust_path:?} envoy-rust != expected:\n  envoy-rust: {rust_str}\n  expected:   {expected_str}",
                     );
                 }
             }
@@ -4742,6 +4857,47 @@ resources:
             subject_cds_path_str,
             upstream::CDS_CONTAINER_PATH,
             "subject CDS path must be a host temp path, not the container constant",
+        );
+    }
+
+    /// 20 Task 6 (ADR-0052 L1): the upstream-side `{{RDS_PATH}}` substitution
+    /// value is the container constant `upstream::RDS_CONTAINER_PATH`, which
+    /// MUST end in `.yaml` (Envoy selects its config parser by file extension).
+    /// The subject-side value is a host temp path to the subject's rendered RDS
+    /// file. Mirrors the CDS render-path test above — RDS, like CDS, uses ONE
+    /// SHARED `rds.yaml` rendered per-side.
+    #[test]
+    fn rds_path_substitution_is_per_side_and_container_path_is_yaml() {
+        // L1: the container-perspective path is a constant ending in `.yaml`.
+        assert!(
+            upstream::RDS_CONTAINER_PATH.ends_with(".yaml"),
+            "L1: upstream container RDS path must end in .yaml, got {}",
+            upstream::RDS_CONTAINER_PATH,
+        );
+
+        let main_template = "  path: {{RDS_PATH}}";
+        // Upstream side: {{RDS_PATH}} → the container constant.
+        let upstream_main =
+            render_yaml(main_template, &[("RDS_PATH", upstream::RDS_CONTAINER_PATH)]);
+        assert_eq!(
+            upstream_main,
+            format!("  path: {}", upstream::RDS_CONTAINER_PATH),
+        );
+        assert!(
+            upstream_main.trim_end().ends_with(".yaml"),
+            "upstream rendered RDS path must end in .yaml: {upstream_main}",
+        );
+
+        // Subject side: {{RDS_PATH}} → a host temp path to rds-subject.yaml.
+        let tmp = tempfile::tempdir().unwrap();
+        let subject_rds_path = tmp.path().join("rds-subject.yaml");
+        let subject_rds_path_str = subject_rds_path.to_string_lossy().into_owned();
+        let subject_main = render_yaml(main_template, &[("RDS_PATH", &subject_rds_path_str)]);
+        assert_eq!(subject_main, format!("  path: {subject_rds_path_str}"));
+        assert_ne!(
+            subject_rds_path_str,
+            upstream::RDS_CONTAINER_PATH,
+            "subject RDS path must be a host temp path, not the container constant",
         );
     }
 
@@ -6347,6 +6503,8 @@ mod body_rule_extension_tests {
             required_keys: vec![],
             required_subtree: Some(JsonSubtreeRule {
                 path: "node.id".into(),
+                path_envoy: None,
+                path_envoy_rust: None,
                 expected: serde_yaml::Value::String("x".into()),
             }),
             allowlist_envoy_only_keys: vec![],
@@ -6356,6 +6514,84 @@ mod body_rule_extension_tests {
         let envoy = br#"{"node":{"id":"x"}}"#;
         let rust = br#"{"node":{"id":"x"}}"#;
         assert_body_rule(&rule, envoy, rust).expect("required_subtree matches on both sides");
+    }
+
+    /// 20 Task 6 (ADR-0052) regression: a shared `path` with NO per-side
+    /// overrides resolves to the same dotted path on BOTH sides — the
+    /// pre-existing fixtures (0014/0026/0027) rely on this. `envoy_path()`
+    /// and `rust_path()` both return the shared `path`.
+    #[test]
+    fn json_subtree_rule_shared_path_resolves_both_sides() {
+        let rule = JsonSubtreeRule {
+            path: "configs.1.x".into(),
+            path_envoy: None,
+            path_envoy_rust: None,
+            expected: serde_yaml::Value::Null,
+        };
+        assert_eq!(rule.envoy_path(), "configs.1.x");
+        assert_eq!(rule.rust_path(), "configs.1.x");
+
+        // End-to-end: the same dotted path walks to the same node on both
+        // bodies (the RoutesConfigDump-at-fixed-index legacy shape).
+        let e2e = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: Some(JsonSubtreeRule {
+                path: "configs.1.x".into(),
+                path_envoy: None,
+                path_envoy_rust: None,
+                expected: serde_yaml::Value::String("shared".into()),
+            }),
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            value_may_differ_keys: vec![],
+        };
+        let envoy = br#"{"configs":[{},{"x":"shared"}]}"#;
+        let rust = br#"{"configs":[{},{"x":"shared"}]}"#;
+        assert_body_rule(&e2e, envoy, rust).expect("shared-path subtree matches on both sides");
+    }
+
+    /// 20 Task 6 (ADR-0052): per-side path override. When `path_envoy` /
+    /// `path_envoy_rust` are present they override the shared `path` for that
+    /// side only — the Envoy body addresses `configs.4.y` while the envoy-rust
+    /// body addresses `configs.2.y`, both compared to the same `expected`.
+    #[test]
+    fn json_subtree_rule_per_side_path_override() {
+        let rule = JsonSubtreeRule {
+            path: String::new(),
+            path_envoy: Some("configs.4.y".into()),
+            path_envoy_rust: Some("configs.2.y".into()),
+            expected: serde_yaml::Value::Null,
+        };
+        // The accessors pick the per-side override, not the (empty) shared path.
+        assert_eq!(rule.envoy_path(), "configs.4.y");
+        assert_eq!(rule.rust_path(), "configs.2.y");
+
+        // End-to-end: the RoutesConfigDump entry lands at configs[4] on Envoy
+        // but configs[2] on envoy-rust. Distinct array shapes per side; the
+        // per-side path resolution must pick the right node on each.
+        let e2e = BodyRule::JsonShape {
+            required_keys: vec![],
+            required_subtree: Some(JsonSubtreeRule {
+                path: String::new(),
+                path_envoy: Some("configs.4.y".into()),
+                path_envoy_rust: Some("configs.2.y".into()),
+                expected: serde_yaml::Value::String("routes".into()),
+            }),
+            allowlist_envoy_only_keys: vec![],
+            allowlist_envoy_rust_only_keys: vec![],
+            // The whole point of the per-side override is that the two bodies'
+            // top-level `configs` array differs (different length/ordering); the
+            // subtree rule pins the SEMANTIC node per-side. Tolerate the
+            // top-level value drift so only the per-side subtree check runs.
+            value_may_differ_keys: vec!["configs".into()],
+        };
+        // Envoy: the addressed node sits at configs[4]; configs[2] holds a
+        // DIFFERENT value, proving the envoy side does NOT walk the rust path.
+        let envoy = br#"{"configs":[{},{},{"y":"WRONG"},{},{"y":"routes"}]}"#;
+        // envoy-rust: the addressed node sits at configs[2].
+        let rust = br#"{"configs":[{},{},{"y":"routes"}]}"#;
+        assert_body_rule(&e2e, envoy, rust)
+            .expect("per-side-override subtree matches the right node on each side");
     }
 
     #[test]
@@ -6435,6 +6671,8 @@ mod body_rule_extension_tests {
             required_keys: vec![],
             required_subtree: Some(JsonSubtreeRule {
                 path: "node.id".into(),
+                path_envoy: None,
+                path_envoy_rust: None,
                 // Both bodies report id="x"; expected says "y" — must fail.
                 expected: serde_yaml::Value::String("y".into()),
             }),

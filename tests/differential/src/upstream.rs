@@ -19,6 +19,17 @@ pub const CDS_CONTAINER_PATH: &str = "/etc/envoy-cds/cds.yaml";
 /// this constant; the subject side substitutes a host temp path instead.
 pub const LDS_CONTAINER_PATH: &str = "/etc/envoy-lds/lds.yaml";
 
+/// 20 Task 6 (ADR-0052, mirrors the CDS L1 constraint): the container-internal
+/// path the rendered SHARED RDS file is copied to for the upstream Envoy. The
+/// path MUST end in `.yaml` — Envoy selects its config-file parser by extension,
+/// and a non-`.yaml` path would make it parse the YAML-content RDS file as
+/// JSON-only and fail. The `{{RDS_PATH}}` marker in the upstream `envoy.yaml`
+/// (HCM `rds.config_source.path_config_source.path`) is substituted to this
+/// constant; the subject side substitutes a host temp path instead. Unlike LDS
+/// (per-side files), the RDS payload is a bare `RouteConfiguration` that both
+/// proxies accept, so a single SHARED `rds.yaml` is rendered per-side.
+pub const RDS_CONTAINER_PATH: &str = "/etc/envoy-rds/rds.yaml";
+
 use anyhow::{Context, Result};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -79,6 +90,14 @@ impl UpstreamProxy {
 /// Note: testcontainers 0.23.x API uses `with_copy_to(target, source)` rather
 /// than the plan-anticipated `with_copy_to_container(host, container)` form —
 /// the CopyDataSource wraps a PathBuf directly.
+//
+// 20 Task 6 (ADR-0052): adding the `rds_file` param (alongside the existing
+// `cds_file`/`lds_file`/`tls_pki`/access-log threads) crosses clippy's
+// `too_many_arguments` (7) bound. These are all independent
+// fixture-feature toggles threaded straight from `run_fixture`; bundling them
+// into a struct would add indirection without clarifying the per-feature
+// dispatch, so the lint is allowed locally.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     envoy_yaml_path: &Path,
     host_gateway: bool,
@@ -96,6 +115,12 @@ pub async fn start(
     // exactly. `None` for fixtures with no `{{LDS_PATH}}` marker (all pre-19
     // fixtures).
     lds_file: Option<&Path>,
+    // 20 Task 6 (ADR-0052 L1): host path of the rendered SHARED upstream RDS
+    // file. When `Some`, it is copied into the container at `RDS_CONTAINER_PATH`
+    // (`.yaml`-suffixed per L1) via `with_copy_to`, mirroring `cds_file`
+    // exactly. `None` for fixtures with no `{{RDS_PATH}}` marker (all pre-20
+    // fixtures).
+    rds_file: Option<&Path>,
     // 06.2 D4.2.c (revised CI fix #2): bind-mount each (host_dir, container_dir)
     // pair so the container's access-log writes surface on the host where
     // the harness reads them. The PARENT DIRECTORY of the access-log file
@@ -163,6 +188,17 @@ pub async fn start(
             .canonicalize()
             .with_context(|| format!("canonicalizing LDS file {}", lds.display()))?;
         request = request.with_copy_to(LDS_CONTAINER_PATH, lds_abs);
+    }
+    // 20 Task 6 (ADR-0052 L1): copy the rendered SHARED upstream RDS file into
+    // the container at `RDS_CONTAINER_PATH` (a constant ending in `.yaml`). Same
+    // `with_copy_to` shape as the CDS/LDS mounts above; the host source path is
+    // canonicalized so a relative temp path resolves regardless of the
+    // container's working directory.
+    if let Some(rds) = rds_file {
+        let rds_abs = rds
+            .canonicalize()
+            .with_context(|| format!("canonicalizing RDS file {}", rds.display()))?;
+        request = request.with_copy_to(RDS_CONTAINER_PATH, rds_abs);
     }
     // 06.2 D4.2.c: bind-mount access-log file paths so the container's
     // append-mode writes surface on the host where the harness's
@@ -237,7 +273,7 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path(), false, None, false, None, None, &[])
+        let proxy = start(yaml.path(), false, None, false, None, None, None, &[])
             .await
             .unwrap();
         assert!(proxy.host_port() > 0);
