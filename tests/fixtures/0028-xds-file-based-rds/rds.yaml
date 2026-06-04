@@ -1,0 +1,26 @@
+# The SHARED RDS file (L1 / ADR-0051): a bare `resources:` envelope with one
+# `@type`-tagged RouteConfiguration payload named `local_route`. UNLIKE the
+# per-side LDS/main templates of fixtures 0026/0027, the RDS file is a SINGLE
+# SHARED template rendered per-side through each side's kv map (Task 6 only
+# supports one shared `rds.yaml`). It therefore carries NO Envoy-only fields:
+# envoy-rust's RouteConfiguration / VirtualHost use `deny_unknown_fields` and do
+# NOT accept `request_headers_to_remove`, so the byte-exact-body header
+# stripping that fixtures 0026/0027 placed at the route-config level CANNOT live
+# here — it moves to the Envoy-side MAIN config (envoy.yaml: generate_request_id
+# / router suppress_envoy_headers / a header_mutation filter). See README.
+#
+# L6: NO `validate_clusters`. The route's `dynamic_backend` cluster is
+# CDS-supplied (not present at config-load), and RDS-delivered route_configs are
+# not subject to Envoy's inline cluster validation; both routes resolve their
+# clusters at request time (the §5.7 cluster-before-route-revalidation).
+resources:
+  - "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+    name: local_route
+    virtual_hosts:
+      - name: backend_vh
+        domains: ["*"]
+        routes:
+          - match: { prefix: "/static" }
+            route: { cluster: static_backend }
+          - match: { prefix: "/dynamic" }
+            route: { cluster: dynamic_backend }

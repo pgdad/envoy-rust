@@ -1,0 +1,87 @@
+node: { id: envoy-rust-phase-20-fixture-0028, cluster: envoy-rust-phase-20 }
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: {{ADMIN_PORT}} } } }
+dynamic_resources:
+  cds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: {{CDS_PATH}}
+static_resources:
+  listeners:
+    - name: http1_listener
+      address: { socket_address: { address: 0.0.0.0, port_value: {{PORT}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http1
+                codec_type: HTTP1
+                # The HCM is RDS-configured: NO inline `route_config`. The route
+                # table arrives entirely from the SHARED rds.yaml.
+                rds:
+                  route_config_name: local_route
+                  config_source:
+                    resource_api_version: V3
+                    path_config_source:
+                      path: {{RDS_PATH}}
+                # === Envoy-only byte-exact-body stripping knobs ===
+                # The shared rds.yaml carries NO `request_headers_to_remove` (it
+                # is rendered per-side and envoy-rust's RouteConfiguration uses
+                # deny_unknown_fields). So the proxy-injected upstream headers
+                # Envoy v1.33 adds must be stripped here in the MAIN config, via
+                # HCM/router knobs that are NOT in the route table:
+                #   - generate_request_id: false  -> suppresses `x-request-id`.
+                #   - the header_mutation filter (below) -> decode-side removal
+                #     of the `x-forwarded-for`/`x-forwarded-proto` the HCM adds
+                #     before the filter chain.
+                #   - the router's `suppress_envoy_headers: true` -> suppresses
+                #     the `x-envoy-*` headers the ROUTER injects on the
+                #     upstream-bound request (notably
+                #     `x-envoy-expected-rq-timeout-ms`, which is added at
+                #     upstream-forward time DOWNSTREAM of the decode filters, so
+                #     a header_mutation `remove` cannot catch it).
+                # `suppress_envoy_headers` ALSO drops the RESPONSE header
+                # `x-envoy-upstream-service-time` (which envoy-rust always
+                # emits, and which `require_header_present` asserts on BOTH
+                # sides), so the header_mutation `response_mutations` below
+                # re-adds it (presence-only assertion; value differs per side
+                # anyway). envoy-rust injects none of these, so its side carries
+                # none of these knobs (intentional per-side field-set divergence,
+                # the fixture-0008/0026 pattern); both sides forward an identical
+                # request to the echo helper, so the byte-exact body holds.
+                generate_request_id: false
+                http_filters:
+                  - name: envoy.filters.http.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                      mutations:
+                        request_mutations:
+                          - remove: x-forwarded-for
+                          - remove: x-forwarded-proto
+                        response_mutations:
+                          # Re-add the router timing header `suppress_envoy_headers`
+                          # strips, so `require_header_present` holds on the Envoy
+                          # side (presence-only; the value differs from envoy-rust).
+                          - append:
+                              header:
+                                key: x-envoy-upstream-service-time
+                                value: "0"
+                              append_action: APPEND_IF_EXISTS_OR_ADD
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                      suppress_envoy_headers: true
+  clusters:
+    # The STATIC `static_backend` cluster (probe 1's target). The CDS file
+    # supplies the second cluster, `dynamic_backend`.
+    - name: static_backend
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: static_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{BACKEND_HOST}}, port_value: {{HTTP1_BACKEND_PORT}} }

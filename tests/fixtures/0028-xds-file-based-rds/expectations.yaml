@@ -1,0 +1,117 @@
+# Phase 20 fixture-0028 expectations: file-based RDS (ADR-0051 SPEC / ADR-0052
+# PLAN) — the xDS-family continuation that completes the CDS+LDS+RDS filesystem
+# triad. A STATIC listener whose HCM is RDS-configured (NO inline route_config);
+# the route table arrives entirely from the SHARED rds.yaml. TWO GETs over ONE
+# H1 keep-alive conn (Driver::Http1KeepAlive):
+#
+#   GET /static  -> routed to cluster `static_backend`  (a STATIC cluster) ->
+#       200. Probe 1 discriminates RDS-loaded from not-loaded INDEPENDENTLY of
+#       CDS: a proxy that ignored `rds.config_source.path_config_source` would
+#       have NO route table and 404 on the route. The static cluster keeps this
+#       probe orthogonal to CDS.
+#   GET /dynamic -> routed to cluster `dynamic_backend` (the CDS-supplied
+#       cluster) -> 200. Probe 2 proves the §5.7 composition: a request whose
+#       route table (RDS) AND cluster (CDS) BOTH arrive from dynamic-resource
+#       files (the cluster-before-route-revalidation ordering).
+#
+# Both probes' `expected_body` assert the echoed body byte-exact on EACH side
+# independently. The route table is the SHARED rds.yaml, which carries NO
+# Envoy-only header-stripping (envoy-rust's RouteConfiguration uses
+# deny_unknown_fields), so the Envoy side strips the proxy-injected upstream
+# headers in its MAIN config instead (see envoy.yaml's inline comment):
+# `generate_request_id: false` (x-request-id) + a header_mutation filter
+# decode-side-removing `x-forwarded-for`/`x-forwarded-proto` + the router's
+# `suppress_envoy_headers: true` (which strips the router-injected `x-envoy-*`
+# request headers, notably `x-envoy-expected-rq-timeout-ms` that is added
+# downstream of the decode filters where a header_mutation `remove` cannot reach
+# it). `suppress_envoy_headers` also drops the RESPONSE header
+# `x-envoy-upstream-service-time`, so the same header_mutation filter's
+# `response_mutations` re-adds it on the Envoy side (presence-only; the value
+# differs per side; envoy-rust emits it natively). With those, both sides forward
+# the SAME request to the echo helper, so the byte-exact body holds.
+# `require_header_present: x-envoy-upstream-service-time` asserts both proxies
+# emit the router timing header (presence-only; the value differs).
+#
+# expected_stats (L3): the conditional per-HCM `http.ingress_http1.rds.
+# local_route.*` family that only registers when the HCM's `rds` is configured
+# (attempt/success 1/1, failure/rejected 0/0, config_reload 1), alongside the
+# fixture-0026 CDS family (cluster_manager.cds.* 1/1/0/0) with
+# cluster_added/active 2/2 (TWO clusters: the static `static_backend` + the CDS
+# `dynamic_backend`), plus the per-cluster upstream + HCM downstream counters.
+#
+# NOT asserted (intentional — see README "L3 Envoy-only stat enumeration"):
+# Envoy v1.33 also emits Envoy-only RDS scope names (e.g. `...rds.local_route.
+# version`, `.version_text`, `.update_time`, `.config_reload_time_ms`,
+# `.update_empty`, `.init_fetch_timeout`, `.update_duration`, `.control_plane.*`)
+# that envoy-rust does not emit at this scope. The named-stat scrape asserts only
+# the five lock-in #L3 rds names and does NO set-diff.
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /static
+      host: static_backend
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "method: GET\npath: /static\nheaders:\n  host: static_backend\nbody: \n" }
+      require_header_present: x-envoy-upstream-service-time
+    - method: GET
+      path: /dynamic
+      host: dynamic_backend
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "method: GET\npath: /dynamic\nheaders:\n  host: dynamic_backend\nbody: \n" }
+      require_header_present: x-envoy-upstream-service-time
+  settle_ms: 200
+  expected_stats:
+    # RDS load (L3 — conditional per-HCM http.<stat_prefix>.rds.<name>.*):
+    - { name: http.ingress_http1.rds.local_route.update_attempt,  value: 1 }
+    - { name: http.ingress_http1.rds.local_route.update_success,  value: 1 }
+    - { name: http.ingress_http1.rds.local_route.update_failure,  value: 0 }
+    - { name: http.ingress_http1.rds.local_route.update_rejected, value: 0 }
+    - { name: http.ingress_http1.rds.local_route.config_reload,   value: 1 }
+    # CDS load (the fixture-0026 family; cluster_added/active are 2 here — the
+    # static `static_backend` + the CDS `dynamic_backend`):
+    - { name: cluster_manager.cds.update_attempt,  value: 1 }
+    - { name: cluster_manager.cds.update_success,  value: 1 }
+    - { name: cluster_manager.cds.update_failure,  value: 0 }
+    - { name: cluster_manager.cds.update_rejected, value: 0 }
+    - { name: cluster_manager.cluster_added,       value: 2 }
+    - { name: cluster_manager.active_clusters,     value: 2 }
+    # Data-plane through each cluster (probe 1 -> static_backend, probe 2 ->
+    # dynamic_backend):
+    - { name: cluster.static_backend.upstream_rq_total,  value: 1 }
+    - { name: cluster.dynamic_backend.upstream_rq_total, value: 1 }
+    # HCM downstream (stat_prefix ingress_http1; both probes over one conn):
+    - { name: http.ingress_http1.downstream_rq_total, value: 2 }
+    - { name: http.ingress_http1.downstream_rq_2xx,   value: 2 }
+  admin_scrapes:
+    # /config_dump (L5): the conditional RoutesConfigDump. Envoy lands it at
+    # configs[4] (it interposes a ScopedRoutesConfigDump at [3] after
+    # Listeners[2]); envoy-rust gates Listeners off (no lds_config) so its order
+    # is Bootstrap[0], Clusters[1], Routes[2]. The per-side path override
+    # (Task 6 JsonSubtreeRule path_envoy / path_envoy_rust) pins each side's
+    # index; both sides agree the first dynamic_route_configs entry's
+    # route_config.name is the RDS-supplied `local_route`.
+    - path: /config_dump
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["configs"]
+        required_subtree:
+          path_envoy: configs.4.dynamic_route_configs.0.route_config.name
+          path_envoy_rust: configs.2.dynamic_route_configs.0.route_config.name
+          expected: local_route
+        value_may_differ_keys: ["configs"]
+    # /config_dump (fixture-0026 compatibility check): the ClustersConfigDump
+    # still lands at configs[1] on BOTH sides; its first dynamic_active_clusters
+    # entry's cluster.name is the CDS-supplied `dynamic_backend`.
+    - path: /config_dump
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["configs"]
+        required_subtree:
+          path: configs.1.dynamic_active_clusters.0.cluster.name
+          expected: dynamic_backend
+        value_may_differ_keys: ["configs"]

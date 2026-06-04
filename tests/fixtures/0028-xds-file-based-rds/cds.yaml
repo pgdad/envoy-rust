@@ -1,0 +1,18 @@
+# Shared CDS template (the fixture-0026/0027 shape verbatim): the dynamic_backend
+# cluster both proxies load from their CDS file. Rendered per side through the
+# side's kv map ({{BACKEND_HOST}}/{{HTTP1_BACKEND_PORT}} resolve per side). The
+# lone Cluster is the STRICT_DNS + ROUND_ROBIN + V4_ONLY shape moved into the
+# CDS file and named `dynamic_backend`.
+resources:
+  - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+    name: dynamic_backend
+    type: STRICT_DNS
+    dns_lookup_family: V4_ONLY
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: dynamic_backend
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: { address: {{BACKEND_HOST}}, port_value: {{HTTP1_BACKEND_PORT}} }
