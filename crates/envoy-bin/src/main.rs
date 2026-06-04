@@ -111,6 +111,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // listener_added counts static + dynamic correctly (the L3 lesson).
     envoy_listener::register_lds_stats(&bootstrap, &registry)
         .context("registering listener_manager.lds stats")?;
+    // 20 D4: conditional per-HCM http.<prefix>.rds.<name>.* registration (no-op
+    // when no HCM uses rds — the §5.2 inertness invariant).
+    envoy_listener::register_rds_stats(&bootstrap, &registry)
+        .context("registering http.*.rds.* stats")?;
 
     // 08.2 D13b: construct the shared DrainState ONCE at startup. Cloned
     // into the admin handler (writer; for the 3 POST endpoints + /server_info

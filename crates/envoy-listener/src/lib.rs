@@ -392,6 +392,45 @@ pub fn register_lds_stats(
     Ok(())
 }
 
+/// 20 D4 (ADR-0051/0052; §6.2 L3/L10): the per-HCM http.<stat_prefix>.rds.<route_config_name>.*
+/// stat family — registered ONLY for HCMs whose `rds` is configured (the §5.2
+/// per-HCM conditional-registration discipline; inline-route HCMs emit no rds.*
+/// names). All RDS load failures are fatal pre-registration (the L4 all-fatal
+/// posture), so update_failure/update_rejected register at 0 and never tick;
+/// config_reload ticks 1 at initial load (L3). Called once from envoy-bin
+/// main(), after load_dynamic_resources + register_lds_stats.
+pub fn register_rds_stats(
+    bootstrap: &envoy_config::Bootstrap,
+    registry: &envoy_stats::StatsRegistry,
+) -> Result<(), ListenerError> {
+    for listener in bootstrap.all_listeners() {
+        for chain in &listener.filter_chains {
+            for filter in &chain.filters {
+                let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm)) =
+                    filter.typed_config.as_ref()
+                else {
+                    continue;
+                };
+                let Some(rds) = hcm.rds.as_ref() else {
+                    continue;
+                };
+                let base = format!("http.{}.rds.{}", hcm.stat_prefix, rds.route_config_name);
+                let mk = |suffix: &str| {
+                    registry
+                        .register_counter(&format!("{base}.{suffix}"))
+                        .map_err(|e| ListenerError::StatsRegistration(e.to_string()))
+                };
+                mk("update_attempt")?.add(1);
+                mk("update_success")?.add(1);
+                mk("config_reload")?.add(1);
+                mk("update_failure")?; // registers at 0 (L4)
+                mk("update_rejected")?; // registers at 0 (L4)
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,6 +1286,183 @@ filter_chains:
         assert_eq!(
             counter_value(&registry, "listener_manager.listener_added"),
             Some(2)
+        );
+    }
+
+    // 20 D4 (ADR-0051/0052): register_rds_stats — conditional per-HCM
+    // http.<stat_prefix>.rds.<route_config_name>.* family.
+
+    /// Build a `Listener` whose single filter chain contains one HCM filter
+    /// with `rds` configured (no inline `route_config`). Used only in tests.
+    fn mk_hcm_rds_listener(stat_prefix: &str, route_config_name: &str) -> envoy_config::Listener {
+        envoy_config::Listener {
+            name: format!("listener_{stat_prefix}"),
+            address: envoy_config::Address {
+                socket_address: envoy_config::SocketAddress {
+                    address: "127.0.0.1".into(),
+                    port_value: 0,
+                },
+            },
+            listener_filters: vec![],
+            filter_chains: vec![envoy_config::FilterChain {
+                filter_chain_match: None,
+                transport_socket: None,
+                filters: vec![envoy_config::NetworkFilter {
+                    name: "envoy.filters.network.http_connection_manager".into(),
+                    typed_config: Some(envoy_config::TypedConfig::HttpConnectionManager(
+                        envoy_config::HttpConnectionManagerConfig {
+                            stat_prefix: stat_prefix.into(),
+                            codec_type: envoy_config::CodecType::AUTO,
+                            http2_protocol_options: None,
+                            access_log: vec![],
+                            route_config: None,
+                            rds: Some(envoy_config::Rds {
+                                route_config_name: route_config_name.into(),
+                                config_source: envoy_config::ConfigSource {
+                                    path_config_source: envoy_config::PathConfigSource {
+                                        path: "/tmp/rds.yaml".into(),
+                                    },
+                                    resource_api_version: None,
+                                },
+                            }),
+                            http_filters: vec![],
+                        },
+                    )),
+                }],
+            }],
+        }
+    }
+
+    /// Build a bootstrap whose HCMs all have inline `route_config` (rds=None).
+    /// Used to verify inertness: register_rds_stats must emit no `.rds.` names.
+    fn mk_inline_route_bootstrap(
+        lds_configured: bool,
+        cds_configured: bool,
+    ) -> envoy_config::Bootstrap {
+        // Re-use mk_lds_bootstrap with plain listeners (no HCM filter) — their
+        // HCMs are absent entirely, which satisfies rds=None for inertness.
+        mk_lds_bootstrap(
+            vec![mk_listener_cfg("127.0.0.1", 0)],
+            Some(vec![mk_listener_cfg("127.0.0.1", 0)]),
+            lds_configured,
+            cds_configured,
+        )
+    }
+
+    /// (a) §5.2 inertness invariant: when no HCM uses rds (all listeners have
+    /// no HCM filter or use inline route_config), register_rds_stats must emit
+    /// zero stat names containing `.rds.` — including when lds_config/cds_config
+    /// are set (the fixture-0026/0027 inertness witness).
+    #[test]
+    fn rds_stats_not_registered_without_rds_hcm() {
+        for (lds, cds) in [(false, false), (false, true), (true, false), (true, true)] {
+            let bootstrap = mk_inline_route_bootstrap(lds, cds);
+            let registry = envoy_stats::StatsRegistry::new();
+            register_rds_stats(&bootstrap, &registry).expect("no-op registration");
+            let rds_names: Vec<String> = registry
+                .snapshot()
+                .into_iter()
+                .map(|(n, _)| n)
+                .filter(|n| n.contains(".rds."))
+                .collect();
+            assert!(
+                rds_names.is_empty(),
+                "no .rds. stats may register without rds HCM \
+                 (lds={lds}, cds={cds}); got {rds_names:?}"
+            );
+        }
+    }
+
+    /// (b) The 5-name subset on an rds HCM: stat_prefix=ingress_http,
+    /// route_config_name=local_route → the documented initial-load values.
+    #[test]
+    fn rds_stats_registered_for_rds_hcm() {
+        let bootstrap = envoy_config::Bootstrap {
+            node: None,
+            admin: None,
+            static_resources: envoy_config::StaticResources {
+                listeners: vec![mk_hcm_rds_listener("ingress_http", "local_route")],
+                clusters: vec![],
+            },
+            dynamic_resources: None,
+            dynamic_clusters: None,
+            dynamic_listeners: None,
+        };
+        let registry = envoy_stats::StatsRegistry::new();
+        register_rds_stats(&bootstrap, &registry).expect("registration");
+        assert_eq!(
+            counter_value(
+                &registry,
+                "http.ingress_http.rds.local_route.update_attempt"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &registry,
+                "http.ingress_http.rds.local_route.update_success"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &registry,
+                "http.ingress_http.rds.local_route.update_failure"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            counter_value(
+                &registry,
+                "http.ingress_http.rds.local_route.update_rejected"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            counter_value(&registry, "http.ingress_http.rds.local_route.config_reload"),
+            Some(1)
+        );
+    }
+
+    /// (c) Per-HCM keying: two listeners with distinct stat_prefix and
+    /// route_config_name → both http.a.rds.r1.* and http.b.rds.r2.* register.
+    #[test]
+    fn rds_stats_keyed_per_hcm() {
+        let bootstrap = envoy_config::Bootstrap {
+            node: None,
+            admin: None,
+            static_resources: envoy_config::StaticResources {
+                listeners: vec![
+                    mk_hcm_rds_listener("a", "r1"),
+                    mk_hcm_rds_listener("b", "r2"),
+                ],
+                clusters: vec![],
+            },
+            dynamic_resources: None,
+            dynamic_clusters: None,
+            dynamic_listeners: None,
+        };
+        let registry = envoy_stats::StatsRegistry::new();
+        register_rds_stats(&bootstrap, &registry).expect("registration");
+        // Both families must be present.
+        assert_eq!(
+            counter_value(&registry, "http.a.rds.r1.update_attempt"),
+            Some(1),
+            "http.a.rds.r1.update_attempt missing"
+        );
+        assert_eq!(
+            counter_value(&registry, "http.b.rds.r2.update_attempt"),
+            Some(1),
+            "http.b.rds.r2.update_attempt missing"
+        );
+        // Confirm cross-contamination is absent.
+        assert_eq!(
+            counter_value(&registry, "http.a.rds.r2.update_attempt"),
+            None
+        );
+        assert_eq!(
+            counter_value(&registry, "http.b.rds.r1.update_attempt"),
+            None
         );
     }
 }
