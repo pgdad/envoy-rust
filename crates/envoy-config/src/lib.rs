@@ -8,6 +8,7 @@ pub mod bootstrap;
 pub mod cds;
 pub mod lds;
 pub mod matcher;
+pub mod rds;
 
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, AttemptOutcome,
@@ -29,6 +30,7 @@ pub use bootstrap::{
 };
 pub use cds::parse_cds_file;
 pub use lds::parse_lds_file;
+pub use rds::parse_rds_file;
 
 /// The only network filter name envoy-rust recognizes in phase 01.
 pub const ECHO_FILTER: &str = "envoy.filters.network.echo";
