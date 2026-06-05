@@ -101,3 +101,36 @@ Pending — see `PLAN.md` for the full per-task steps. The executor appends a Co
   - `cargo fmt --all` → applied (the `select_name` `.unwrap_or_else(...)` chain wrapped to multi-line; no other reformatting).
   - `cargo build --workspace --all-targets` → Finished (exit 0).
   - Standalone builds — `cargo build -p envoy-config` / `-p envoy-cluster` / `-p envoy-http1` / `-p envoy-http2` → all Finished (exit 0) (the `project_isolated_crate_build_blindspot` guard).
+
+### Task 4 — Completion (this commit — code `b6ac083fa`)
+
+- **What landed** (all in `crates/envoy-cluster/src/cluster.rs`, `from_bootstrap`, at the per-cluster stat registration site — placed right after the `membership_healthy`/`endpoint_health` block and before the `outlier_detection` block, where `cfg`/`registry`/`cfg.name` are in scope):
+
+  ```rust
+          if cfg.cluster_type == envoy_config::ClusterType::Eds {
+              let mk = |suffix: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
+                  registry
+                      .register_counter(&format!("cluster.{}.{suffix}", cfg.name))
+                      .map_err(|e| ClusterError::StatsRegistration {
+                          cluster: cfg.name.clone(),
+                          message: e.to_string(),
+                      })
+              };
+              mk("update_attempt")?.add(1);
+              mk("update_success")?.add(1);
+              mk("update_failure")?; // registers at 0 (L4)
+              mk("update_empty")?; // registers at 0 (L4)
+          }
+  ```
+
+  - The conditional EDS `update_*` family — registered ONLY when `cfg.cluster_type == ClusterType::Eds` (the §5.2 conditional-registration discipline; STATIC/STRICT_DNS clusters add ZERO `update_*` names, so all 28 existing fixtures stay regression-equivalent). Register-and-set DIRECTLY per L3 (no handle threading): `update_attempt`/`update_success` `.add(1)`; `update_failure`/`update_empty` register at 0 (the all-fatal L4 posture makes non-zero structurally unreachable). The local `mk` closure mirrors the `cluster_manager.cds.*` template at `:1085-1092` EXACTLY (same `register_counter` → `ClusterError::StatsRegistration { cluster, message }` error map, same `Arc<envoy_stats::Counter>` return).
+  - **L3 narrowing honored — NO membership touched:** registers ONLY the 4 `update_*` counters. `membership_healthy` stays health-check-gated at its existing `:937` site (untouched); `membership_total` is NOT added (it does not exist in envoy-rust). The data-plane witness `cluster.<name>.upstream_rq_total` already registers unconditionally (`:847`) — NOT re-registered.
+  - **NO `main.rs` call-site change:** the per-cluster registration lives inside `from_bootstrap` (already called at startup) — unlike `register_rds_stats`, no new call site. Confirmed by `git status` showing ONLY `crates/envoy-cluster/src/cluster.rs` modified + a clean `cargo build --workspace --all-targets`.
+- **TDD:** the 3 `eds_stats_*` tests (in the `cluster_manager.*` test module, reusing the existing `mk_bootstrap`/`cds_dynamic_resources`/`stat_value` helpers + a new `mk_eds_cluster` factory) written FIRST and confirmed RED (`eds_stats_registered_for_eds_cluster` failed `left: None, right: Some(1)`; the two inertness tests passed pre-implementation since nothing wrong was registered yet) BEFORE implementing, then GREEN: (a) `eds_stats_not_registered_for_non_eds_clusters` — an all-STATIC bootstrap WITH `cds_config` (the fixture-0026 inertness witness) registers NO `cluster.<name>.update_*` name; (b) `eds_stats_registered_for_eds_cluster` — a `type: EDS` cluster `eds_backend` (load_assignment pre-populated with a numeric IP, `eds_cluster_config` present) reads `update_attempt == 1`, `update_success == 1`, `update_failure == 0`, `update_empty == 0`; (c) `eds_stats_register_no_membership_gauges` — the same EDS cluster (no health checks) registers NEITHER `cluster.eds_backend.membership_total` (absent) NOR `cluster.eds_backend.membership_healthy` (HC-gated).
+- **Verification outputs:**
+  - `cargo test -p envoy-cluster eds_stats` → `test result: ok. 3 passed; 0 failed; 0 ignored` (RED→GREEN confirmed: the registration test went `None → Some(1)`).
+  - `cargo test -p envoy-cluster` (full crate) → `test result: ok. 91 passed; 0 failed; 0 ignored` (88 prior + 3 new); doc-tests `0 passed; 0 failed`.
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+  - `cargo fmt --all` → applied (no reformatting of the new block beyond standard).
+  - `cargo build --workspace --all-targets` → Finished (exit 0).
+- **Note:** `EdsClusterConfig` is NOT re-exported at the `envoy_config` crate root (a Task-1 omission — only the struct + `ClusterType::Eds` are in the `pub use bootstrap::{…}` list), so the test factory references it via the fully-qualified `envoy_config::bootstrap::EdsClusterConfig` (the `bootstrap` module is `pub`). Out of scope for Task 4 to touch the re-export; flagged for Task-5+ if a root-level path becomes convenient.
