@@ -6,6 +6,7 @@
 
 pub mod bootstrap;
 pub mod cds;
+pub mod eds;
 pub mod lds;
 pub mod matcher;
 pub mod rds;
@@ -29,6 +30,7 @@ pub use bootstrap::{
     TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;
+pub use eds::parse_eds_file;
 pub use lds::parse_lds_file;
 pub use rds::parse_rds_file;
 
