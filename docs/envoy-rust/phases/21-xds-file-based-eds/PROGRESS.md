@@ -193,3 +193,35 @@ Pending — see `PLAN.md` for the full per-task steps. The executor appends a Co
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0, 0 warnings).
   - `cargo fmt --all` → no changes to the new files (the wrapper `.rs` + the YAML/MD fixtures were already canonical).
   - Existing fixtures 0001–0028 untouched (no harness code change; the new wrapper + fixture dir are purely additive).
+
+### Task 8 — Completion (this commit — code `8e70e7a38`)
+
+- **What landed:** the in-process backstop `crates/envoy-bin/tests/xds_file_based_eds.rs` — boots the real `envoy-bin` binary as a subprocess and exercises the paths the differential fixture 0029 CANNOT: the negative/fatal EDS paths (envoy-rust is all-fatal where Envoy warm-503s — L4) plus a happy-path replica and an inertness witness. NO Docker (in-process backend). The helper block (`reserve_port`/`wait_ready`/`http1_oneshot`/`admin_get_body`/`scrape_admin_stats`/`assert_stat`/`spawn_backend`/`serve_backend_conn`/`write_file`/`write_bootstrap`/`spawn_envoy_bin`/`assert_fatal_startup`) is COPIED VERBATIM from the phase-20 RDS backstop (`xds_file_based_rds.rs`) — the M18-9 "extract a shared test-support crate" item stays a future hardening task (now N≥5: CDS/LDS/RDS/EDS backstops); the duplication is recorded in the file header.
+- **The 8 cases (each boots its own envoy-bin instance):**
+  - **(i) `happy_path_eds_cluster_serves_and_reports`** — a `type: EDS` cluster `eds_backend` (`eds_cluster_config.eds_config.path_config_source` → a temp `eds.yaml` defining an `eds_backend` ClusterLoadAssignment with one `127.0.0.1` endpoint → an in-process backend) + a STATIC listener INLINE-routing `/` → `eds_backend`. Asserts: `GET /` → **200** + body `from-backend`; `cluster.eds_backend.update_attempt`=1 / `update_success`=1 / `update_failure`=0 / `update_empty`=0 (the L3 4-name subset) + `cluster.eds_backend.upstream_rq_total`=1; `/config_dump` carries an `EndpointsConfigDump` whose `static_endpoint_configs[0].endpoint_config.cluster_name == "eds_backend"`. Membership gauges NOT asserted (L3 narrowing).
+  - **(ii) `missing_eds_file_is_fatal`** — `eds_cluster_config` path → a nonexistent file → process EXITS non-zero + stderr/stdout contains `"EDS file error"` (`EdsFileError`); the listener port NEVER accepts. The L4 agrees-with-Envoy class.
+  - **(iii) `malformed_eds_file_is_fatal`** — a syntactically-broken EDS file (`resources: [unclosed`) → EXITS + `"EDS file parse error"` (`EdsParseError`). The L4 envoy-rust-diverges class (Envoy warm-503s).
+  - **(iv) `eds_cla_mismatch_is_fatal`** — the EDS file defines `other_cla`; the cluster's selection key is `eds_backend` → EXITS + `"ClusterLoadAssignment"` (`EdsClusterLoadAssignmentNotFound`).
+  - **(v) `eds_cluster_with_inline_load_assignment_is_fatal`** — an EDS cluster ALSO carrying an inline `load_assignment` → EXITS + `"must not carry an inline \`load_assignment\`"` (`LoadAssignmentOnEdsCluster` — L6 6a, Envoy accepts-and-ignores; envoy-rust stricter).
+  - **(vi) `static_cluster_with_eds_config_is_fatal`** — a STATIC cluster carrying `eds_cluster_config` → EXITS + ``"`eds_cluster_config` set on a non-EDS cluster"`` (`EdsConfigOnNonEdsCluster` — L6 6b).
+  - **(vii) `eds_cluster_with_neither_is_fatal`** — an EDS cluster with NEITHER `load_assignment` NOR `eds_cluster_config` → EXITS + ``"requires `eds_cluster_config`"`` (`MissingEdsClusterConfig` — L6 6c).
+  - **(viii) `no_eds_is_inert`** — a STATIC-only bootstrap (one plain STATIC cluster, no EDS cluster) boots; `/stats` carries NO `cluster.<name>.update_*` name (the EDS family is conditionally registered only for `type: EDS` — L10) and `/config_dump` does NOT contain `EndpointsConfigDump`.
+- **All 6 negative cases behaved ALL-FATAL exactly as the L4/L6 posture requires** — no production bug surfaced; no production code touched (Tasks 1–6 already correct).
+- **`cargo test -p envoy-bin --test xds_file_based_eds`** (helper pre-built):
+  ```
+  running 8 tests
+  test eds_cluster_with_neither_is_fatal ... ok
+  test missing_eds_file_is_fatal ... ok
+  test static_cluster_with_eds_config_is_fatal ... ok
+  test eds_cluster_with_inline_load_assignment_is_fatal ... ok
+  test malformed_eds_file_is_fatal ... ok
+  test eds_cla_mismatch_is_fatal ... ok
+  test no_eds_is_inert ... ok
+  test happy_path_eds_cluster_serves_and_reports ... ok
+
+  test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+  ```
+- **Verification outputs:**
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0, 0 warnings).
+  - `cargo fmt --all` → applied (one pre-fmt unused-variable removed in the (ii) test; no other reformatting).
+  - No production code changed — purely an additive new test file.
