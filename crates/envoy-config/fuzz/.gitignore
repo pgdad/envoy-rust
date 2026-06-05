@@ -30,5 +30,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/dynamic_resources_cds.yaml
 !corpus/parse_bootstrap/dynamic_resources_lds.yaml
 !corpus/parse_bootstrap/hcm_rds_route_config.yaml
+!corpus/parse_bootstrap/cluster_eds.yaml
 artifacts/
 target/
