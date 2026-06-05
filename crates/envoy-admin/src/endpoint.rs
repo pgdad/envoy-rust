@@ -94,6 +94,11 @@ impl AdminEndpoint {
     /// Exact-match URL path lookup. Returns `None` for unknown paths
     /// (caller produces 404). Case-sensitive per Envoy v1.33.
     pub fn from_path(path: &str) -> Option<Self> {
+        // 21 D5: strip the query string so /config_dump?include_eds routes to
+        // ConfigDump (Envoy's admin does the same; surfaces the
+        // EndpointsConfigDump bilaterally — L5). No existing fixture uses a
+        // query string, so this is inert for the established endpoints.
+        let path = path.split('?').next().unwrap_or(path);
         match path {
             "/ready" => Some(AdminEndpoint::Ready),
             "/stats" => Some(AdminEndpoint::Stats),
@@ -320,6 +325,22 @@ pub(crate) enum ConfigDumpEntry<'a> {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         dynamic_active_clusters: Vec<DynamicClusterEntry<'a>>,
     },
+    /// 21 D5 (ADR-0053/0054; §6.2 L5): the `EndpointsConfigDump` entry, emitted
+    /// ONLY when some cluster is `type: EDS` (with a populated `load_assignment`)
+    /// — fixtures 0014/0026/0027/0028 (no EDS cluster) stay untouched. File-based
+    /// EDS endpoints land under `static_endpoint_configs[].endpoint_config` (file
+    /// config is "static" config-dump-wise — L5), NOT
+    /// `dynamic_endpoint_configs[]`. There is NO `version_info`/`last_updated`
+    /// key. Pushed AFTER the Clusters entry / BEFORE the Listeners entry, matching
+    /// Envoy's `?include_eds` order (Clusters[1]/Endpoints[2]/Listeners[3]).
+    /// Envoy gates this section behind `?include_eds`; envoy-rust strips the query
+    /// string and emits unconditionally-when-EDS (a recorded narrowing) — the
+    /// per-side `configs[]` index mismatch is reconciled in the harness.
+    #[serde(rename = "type.googleapis.com/envoy.admin.v3.EndpointsConfigDump")]
+    Endpoints {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        static_endpoint_configs: Vec<StaticEndpointConfigEntry<'a>>,
+    },
     /// Phase 19 D5 (ADR-0050 §6.2 L5): the `ListenersConfigDump` entry, emitted
     /// ONLY when `dynamic_resources.lds_config` is configured (fixtures 0014 +
     /// 0026 untouched). Pushed AFTER the Clusters entry — Envoy v1.33's verified
@@ -381,6 +402,35 @@ pub(crate) struct TaggedCluster<'a> {
 
 /// The `@type` URL for the nested `cluster` object inside `ClustersConfigDump`.
 const CLUSTER_TYPE_URL: &str = "type.googleapis.com/envoy.config.cluster.v3.Cluster";
+
+/// Phase 21 D5 (L5): one entry in `EndpointsConfigDump.static_endpoint_configs`.
+/// Envoy shape: `{"endpoint_config": {...}}` (no `last_updated` — file-based EDS
+/// is "static" config-dump-wise). The nested `endpoint_config` carries its own
+/// `@type` + the resolved `ClusterLoadAssignment` body.
+#[derive(Serialize)]
+pub(crate) struct StaticEndpointConfigEntry<'a> {
+    pub(crate) endpoint_config: ClusterLoadAssignmentBody<'a>,
+}
+
+/// Phase 21 D5: the `ClusterLoadAssignment` body nested inside a
+/// `StaticEndpointConfigEntry`. Carries the inner `@type` tag Envoy's
+/// `google.protobuf.Any`-projection puts on the `endpoint_config` object, plus
+/// the resolved `cluster_name` + `endpoints` borrowed from the cluster's
+/// (EDS-populated) `LoadAssignment`. Borrowed fields (no `Clone` cascade — same
+/// idiom as `TaggedCluster`); the `LoadAssignment` reuse keeps the `endpoints`
+/// serialization byte-identical to the inline-CLA shape.
+#[derive(Serialize)]
+pub(crate) struct ClusterLoadAssignmentBody<'a> {
+    #[serde(rename = "@type")]
+    pub(crate) type_url: &'static str,
+    pub(crate) cluster_name: &'a str,
+    pub(crate) endpoints: &'a Vec<envoy_config::LocalityLbEndpoints>,
+}
+
+/// The `@type` URL for the nested `endpoint_config` object inside
+/// `EndpointsConfigDump`.
+const CLUSTER_LOAD_ASSIGNMENT_TYPE_URL: &str =
+    "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment";
 
 /// Phase 19 D5: one static listener inside `ListenersConfigDump`. Envoy shape:
 /// `{"listener": {...}, "last_updated": "..."}`.
@@ -537,6 +587,35 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
         configs.push(ConfigDumpEntry::Clusters {
             static_clusters,
             dynamic_active_clusters,
+        });
+    }
+    // 21 D5 (ADR-0053/0054; §6.2 L5): emit EndpointsConfigDump ONLY when some
+    // cluster is `type: EDS` (with a populated load_assignment) — conditional
+    // emission; fixtures 0014/0026/0027/0028 (no EDS cluster) untouched. Uses
+    // static_endpoint_configs (file-based EDS is "static" config-dump-wise — L5);
+    // pushed after the (conditional) Clusters entry / before Listeners (Envoy's
+    // ?include_eds order Clusters[1]/Endpoints[2]/Listeners[3]). On a bootstrap
+    // with cds_config it lands at configs[2]; with no cds, configs[1]. envoy-rust
+    // emits it unconditional of ?include_eds (a recorded narrowing); the per-side
+    // index mismatch is reconciled in the harness.
+    let static_endpoint_configs: Vec<StaticEndpointConfigEntry> = bootstrap
+        .all_clusters()
+        .filter(|c| c.cluster_type == envoy_config::ClusterType::Eds)
+        .filter_map(|c| {
+            c.load_assignment
+                .as_ref()
+                .map(|la| StaticEndpointConfigEntry {
+                    endpoint_config: ClusterLoadAssignmentBody {
+                        type_url: CLUSTER_LOAD_ASSIGNMENT_TYPE_URL,
+                        cluster_name: &la.cluster_name,
+                        endpoints: &la.endpoints,
+                    },
+                })
+        })
+        .collect();
+    if !static_endpoint_configs.is_empty() {
+        configs.push(ConfigDumpEntry::Endpoints {
+            static_endpoint_configs,
         });
     }
     // Phase 19 D5 (ADR-0050 §6.2 L5): emit the ListenersConfigDump entry ONLY
@@ -2688,5 +2767,281 @@ mod ready_drain_tests {
         assert_eq!(resp.status, 503);
         assert_eq!(resp.reason, Some("Service Unavailable"));
         assert_eq!(&resp.body[..], b"Service Unavailable\n");
+    }
+}
+
+#[cfg(test)]
+mod endpoints_config_dump_tests {
+    //! Phase 21 Task 5 — D5 (ADR-0053/0054; §6.2 L5): the `EndpointsConfigDump`
+    //! `/config_dump` entry (`static_endpoint_configs`, file-based EDS is
+    //! "static" config-dump-wise), emitted CONDITIONALLY (only when some cluster
+    //! is `type: EDS` with a populated `load_assignment`) and pushed AFTER the
+    //! `ClustersConfigDump` entry / BEFORE the `ListenersConfigDump` entry —
+    //! Envoy's `?include_eds` order is Clusters[1]/Endpoints[2]/Listeners[3].
+    //! Plus the admin query-string strip so `/config_dump?include_eds` routes to
+    //! `ConfigDump` (Envoy's admin does the same). Test groups: (a) query-strip;
+    //! (b) conditional emission with an EDS cluster present; (c) inertness — only
+    //! STATIC/STRICT_DNS clusters ⇒ NO EndpointsConfigDump entry; (d) ordering.
+
+    use super::{AdminEndpoint, Dispatch};
+    use crate::config::AdminConfig;
+    use crate::handler::AdminHandler;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// An EDS cluster named `eds_backend`. The `load_assignment` is the
+    /// resolved CLA that `load_dynamic_resources` would populate from the EDS
+    /// file (here the test parses it inline — render-time only reads it). The
+    /// CLA `cluster_name` is `eds_backend` (service_name unset ⇒ equals the
+    /// cluster name — L8). The endpoint `address` is a NUMERIC IP (L1).
+    const EDS_CLUSTER: &str = "\
+name: eds_backend
+type: EDS
+lb_policy: ROUND_ROBIN
+eds_cluster_config:
+  eds_config:
+    path_config_source:
+      path: /etc/eds.yaml
+load_assignment:
+  cluster_name: eds_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: 127.0.0.1
+            port_value: 8080
+";
+
+    /// A STATIC cluster named `static_backend` (no EDS) — used by the inertness
+    /// test (only STATIC/STRICT_DNS ⇒ no EndpointsConfigDump entry).
+    const STATIC_BACKEND_CLUSTER: &str = "\
+name: static_backend
+type: STATIC
+lb_policy: ROUND_ROBIN
+load_assignment:
+  cluster_name: static_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: 127.0.0.1
+            port_value: 9000
+";
+
+    /// A STRICT_DNS cluster named `dns_backend` (no EDS) — second inertness arm.
+    const DNS_BACKEND_CLUSTER: &str = "\
+name: dns_backend
+type: STRICT_DNS
+lb_policy: ROUND_ROBIN
+load_assignment:
+  cluster_name: dns_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: backend.example.com
+            port_value: 8080
+";
+
+    /// Bootstrap WITH `cds_config` configured (so the ClustersConfigDump entry
+    /// lands at configs[1] and the EndpointsConfigDump entry must order AFTER it
+    /// at configs[2]).
+    const CDS_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    /// Bootstrap with NO `dynamic_resources` (so the EndpointsConfigDump entry
+    /// lands at configs[1], directly after the Bootstrap entry).
+    const PLAIN_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    fn parse_cluster(yaml: &str) -> envoy_config::Cluster {
+        serde_yaml::from_str(yaml).expect("cluster yaml parses")
+    }
+
+    fn parse_bootstrap(yaml: &str) -> Bootstrap {
+        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
+    }
+
+    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+        )
+    }
+
+    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
+        let resp = AdminEndpoint::ConfigDump.render_with(handler);
+        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
+        serde_json::from_str(body_str).expect("valid JSON")
+    }
+
+    const ENDPOINTS_TYPE: &str = "type.googleapis.com/envoy.admin.v3.EndpointsConfigDump";
+
+    fn endpoints_entry_index(value: &serde_json::Value) -> Option<usize> {
+        value
+            .get("configs")
+            .and_then(|c| c.as_array())
+            .unwrap()
+            .iter()
+            .position(|e| e.get("@type").and_then(|v| v.as_str()) == Some(ENDPOINTS_TYPE))
+    }
+
+    // (a) query-strip: /config_dump?include_eds routes to ConfigDump, not 404.
+    #[test]
+    fn query_string_strips_to_config_dump() {
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/config_dump?include_eds"),
+            Dispatch::Endpoint(AdminEndpoint::ConfigDump)
+        ));
+        // The bare path still resolves (no regression).
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/config_dump"),
+            Dispatch::Endpoint(AdminEndpoint::ConfigDump)
+        ));
+        // A genuinely-unknown path with a query string still 404s.
+        assert!(matches!(
+            AdminEndpoint::dispatch("GET", "/nope?x=1"),
+            Dispatch::NotFound
+        ));
+    }
+
+    // (b) conditional emission: an EDS cluster (load_assignment populated) ⇒
+    // an EndpointsConfigDump entry carrying static_endpoint_configs[0].
+    #[test]
+    fn eds_cluster_emits_endpoints_config_dump() {
+        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        let idx = endpoints_entry_index(&value).expect("EndpointsConfigDump entry present");
+        let entry = &value.get("configs").and_then(|c| c.as_array()).unwrap()[idx];
+        // outer @type ends with EndpointsConfigDump.
+        assert!(
+            entry
+                .get("@type")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .ends_with("EndpointsConfigDump")
+        );
+        // static_endpoint_configs[0].endpoint_config carries the nested @type +
+        // the resolved CLA cluster_name.
+        assert_eq!(
+            entry
+                .pointer("/static_endpoint_configs/0/endpoint_config/@type")
+                .and_then(|v| v.as_str()),
+            Some("type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment")
+        );
+        assert_eq!(
+            entry
+                .pointer("/static_endpoint_configs/0/endpoint_config/cluster_name")
+                .and_then(|v| v.as_str()),
+            Some("eds_backend")
+        );
+        // The resolved endpoints are carried through.
+        assert_eq!(
+            entry
+                .pointer("/static_endpoint_configs/0/endpoint_config/endpoints/0/lb_endpoints/0/endpoint/address/socket_address/address")
+                .and_then(|v| v.as_str()),
+            Some("127.0.0.1")
+        );
+        // No version_info / last_updated on the EndpointsConfigDump (L5).
+        assert!(entry.get("version_info").is_none());
+        assert!(
+            entry
+                .pointer("/static_endpoint_configs/0/last_updated")
+                .is_none()
+        );
+    }
+
+    // (c) inertness: only STATIC/STRICT_DNS clusters ⇒ NO EndpointsConfigDump.
+    #[test]
+    fn non_eds_clusters_emit_no_endpoints_config_dump() {
+        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        bootstrap.static_resources.clusters = vec![
+            parse_cluster(STATIC_BACKEND_CLUSTER),
+            parse_cluster(DNS_BACKEND_CLUSTER),
+        ];
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        assert!(
+            endpoints_entry_index(&value).is_none(),
+            "no EDS cluster ⇒ no EndpointsConfigDump entry; value was {value}"
+        );
+        // The plain bootstrap with no EDS cluster is a single Bootstrap entry.
+        assert_eq!(
+            value
+                .get("configs")
+                .and_then(|c| c.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // (d) ordering: with cds_config + an EDS cluster ⇒ Endpoints at configs[2]
+    // (Bootstrap[0], Clusters[1], Endpoints[2]); with NO cds ⇒ configs[1].
+    #[test]
+    fn endpoints_entry_orders_after_clusters() {
+        // cds present ⇒ Endpoints at configs[2].
+        let mut bootstrap = parse_bootstrap(CDS_BOOTSTRAP);
+        bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        assert_eq!(
+            endpoints_entry_index(&value),
+            Some(2),
+            "with cds_config the EndpointsConfigDump lands at configs[2]; value was {value}"
+        );
+
+        // no cds ⇒ Endpoints at configs[1].
+        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
+        let handler = handler_from_bootstrap(bootstrap);
+        let value = dump_value(&handler);
+        assert_eq!(
+            endpoints_entry_index(&value),
+            Some(1),
+            "with no cds_config the EndpointsConfigDump lands at configs[1]; value was {value}"
+        );
     }
 }
