@@ -30,6 +30,20 @@ pub const LDS_CONTAINER_PATH: &str = "/etc/envoy-lds/lds.yaml";
 /// proxies accept, so a single SHARED `rds.yaml` is rendered per-side.
 pub const RDS_CONTAINER_PATH: &str = "/etc/envoy-rds/rds.yaml";
 
+/// 21 Task 6 (ADR-0054, mirrors the CDS L1 constraint): the container-internal
+/// path the rendered SHARED EDS file is copied to for the upstream Envoy. The
+/// path MUST end in `.yaml` — Envoy selects its config-file parser by extension,
+/// and a non-`.yaml` path would make it parse the YAML-content EDS file as
+/// JSON-only and fail. The `{{EDS_PATH}}` marker in the upstream `envoy.yaml`
+/// (cluster `eds_cluster_config.eds_config.path_config_source.path`) is
+/// substituted to this constant; the subject side substitutes a host temp path
+/// instead. LIKE CDS (a single SHARED `eds.yaml` rendered per-side through each
+/// side's kv map) and UNLIKE LDS (per-side files) — but the rendered endpoint
+/// `socket_address.address` differs per side via the `{{EDS_BACKEND_IP}}`
+/// numeric-IP marker (Envoy → the discovered host-gateway IP; envoy-rust →
+/// `127.0.0.1`), since EDS rejects hostnames (L1).
+pub const EDS_CONTAINER_PATH: &str = "/etc/envoy-eds/eds.yaml";
+
 use anyhow::{Context, Result};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -121,6 +135,12 @@ pub async fn start(
     // exactly. `None` for fixtures with no `{{RDS_PATH}}` marker (all pre-20
     // fixtures).
     rds_file: Option<&Path>,
+    // 21 Task 6 (ADR-0054 L1): host path of the rendered SHARED upstream EDS
+    // file. When `Some`, it is copied into the container at `EDS_CONTAINER_PATH`
+    // (`.yaml`-suffixed per L1) via `with_copy_to`, mirroring `cds_file`
+    // exactly. `None` for fixtures with no `{{EDS_PATH}}` marker (all pre-21
+    // fixtures).
+    eds_file: Option<&Path>,
     // 06.2 D4.2.c (revised CI fix #2): bind-mount each (host_dir, container_dir)
     // pair so the container's access-log writes surface on the host where
     // the harness reads them. The PARENT DIRECTORY of the access-log file
@@ -200,6 +220,17 @@ pub async fn start(
             .with_context(|| format!("canonicalizing RDS file {}", rds.display()))?;
         request = request.with_copy_to(RDS_CONTAINER_PATH, rds_abs);
     }
+    // 21 Task 6 (ADR-0054 L1): copy the rendered SHARED upstream EDS file into
+    // the container at `EDS_CONTAINER_PATH` (a constant ending in `.yaml`). Same
+    // `with_copy_to` shape as the CDS/LDS/RDS mounts above; the host source path
+    // is canonicalized so a relative temp path resolves regardless of the
+    // container's working directory.
+    if let Some(eds) = eds_file {
+        let eds_abs = eds
+            .canonicalize()
+            .with_context(|| format!("canonicalizing EDS file {}", eds.display()))?;
+        request = request.with_copy_to(EDS_CONTAINER_PATH, eds_abs);
+    }
     // 06.2 D4.2.c: bind-mount access-log file paths so the container's
     // append-mode writes surface on the host where the harness's
     // `std::fs::read_to_string(path)` call reads them.
@@ -273,7 +304,7 @@ static_resources:
     #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
     async fn starts_upstream_envoy_and_exposes_host_port() {
         let yaml = tmp_envoy_yaml();
-        let proxy = start(yaml.path(), false, None, false, None, None, None, &[])
+        let proxy = start(yaml.path(), false, None, false, None, None, None, None, &[])
             .await
             .unwrap();
         assert!(proxy.host_port() > 0);

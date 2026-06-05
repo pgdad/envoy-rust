@@ -969,6 +969,56 @@ pub fn uses_host_gateway(sources: &[&str]) -> bool {
     sources.iter().any(|s| s.contains("host.docker.internal"))
 }
 
+/// 21 Task 6 (ADR-0054; §6.2 L9): discover the NUMERIC IPv4 host-gateway IP the
+/// upstream Envoy container uses to reach the host backend. File-based EDS
+/// rejects hostnames (L1 — `malformed IP address` → `update_rejected`), so the
+/// EDS file's endpoint `socket_address.address` must be a numeric IP — and that
+/// IP varies by platform (`192.168.65.254` on macOS Docker Desktop; the bridge
+/// gateway e.g. `172.17.0.1` on Linux CI). Resolve it portably by running
+/// `getent` inside a throwaway container with the host-gateway mapping (the
+/// pinned Envoy image is Ubuntu-based and ships `getent`; NO new image
+/// dependency). The bridge-network-inspect shortcut is WRONG on macOS, so
+/// getent-in-container is the only cross-platform method.
+///
+/// Uses the `ahostsv4` database (NOT the PLAN-sketched `hosts`): on macOS Docker
+/// Desktop `getent hosts host.docker.internal` returns ONLY the IPv6 mapping
+/// (`fdc4:f303:9324::254`), which is unusable for an IPv4 `socket_address`;
+/// `ahostsv4` forces IPv4-only resolution and yields `192.168.65.254`. Each
+/// `ahostsv4` output line is `<ip>  <SOCKTYPE>  [canonname]`, so the parse scans
+/// EVERY whitespace token across ALL lines and takes the first that parses as an
+/// `Ipv4Addr` (robust to the leading non-IP tokens and the repeated
+/// STREAM/DGRAM/RAW rows).
+///
+/// The image is pinned to the `ENVOY_TARGET.md` value via the
+/// `upstream::IMAGE_NAME`/`upstream::IMAGE_TAG` constants the rest of the
+/// harness uses (NOT a fresh literal). Gated to EDS fixtures — `run_fixture`
+/// only calls this when `needs_eds`.
+pub fn discover_host_gateway_ip() -> anyhow::Result<String> {
+    let image = format!("{}:{}", upstream::IMAGE_NAME, upstream::IMAGE_TAG);
+    let out = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--add-host=host.docker.internal:host-gateway",
+            "--entrypoint",
+            "getent",
+            &image,
+            "ahostsv4",
+            "host.docker.internal",
+        ])
+        .output()
+        .context("running getent to discover the host-gateway IP")?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let ip = text
+        .split_whitespace()
+        .find(|s| s.parse::<std::net::Ipv4Addr>().is_ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("getent did not return a numeric IPv4 host-gateway IP: {text:?}")
+        })?
+        .to_string();
+    Ok(ip)
+}
+
 /// 18 Task 6 (ADR-0049): scan a CDS rendition for any residual `{{MARKER}}`
 /// token left behind by `render_yaml` (which intentionally leaves unmatched
 /// tokens in place). Returns the first offending marker name (the text between
@@ -2302,6 +2352,46 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let subject_rds_path = tmp.path().join("rds-subject.yaml");
     let subject_rds_path_str = subject_rds_path.to_string_lossy().into_owned();
 
+    // 21 Task 6 (ADR-0054): detect file-based EDS. When either main template
+    // references `{{EDS_PATH}}`, the fixture carries a SINGLE SHARED `eds.yaml`
+    // template — LIKE CDS (one shared `cds.yaml` rendered twice through each
+    // side's own kv map) and UNLIKE LDS (per-side `lds-envoy.yaml`/
+    // `lds-envoy-rust.yaml`): an EDS file carries only a bare
+    // `ClusterLoadAssignment` (cluster_name + endpoints), which both proxies
+    // accept, so ONE shared template is rendered twice. BUT the endpoint
+    // `socket_address.address` must be a NUMERIC IP that differs per side (L1 —
+    // EDS rejects hostnames), so the shared template carries a NEW
+    // `{{EDS_BACKEND_IP}}` marker resolved per-side (upstream → the
+    // runtime-discovered numeric host-gateway IP; subject → `127.0.0.1`).
+    //   - upstream side: `{{EDS_PATH}}` → `EDS_CONTAINER_PATH` (a `.yaml`-
+    //     suffixed container constant per L1); the rendered upstream file is
+    //     copied into the container via `upstream::start(.., eds_file, ..)`.
+    //   - subject side: `{{EDS_PATH}}` → the host temp path of the rendered
+    //     subject EDS file (the subject runs as a host subprocess and reads
+    //     the file directly).
+    let needs_eds =
+        upstream_template.contains("{{EDS_PATH}}") || subject_template.contains("{{EDS_PATH}}");
+    let eds_template = if needs_eds {
+        Some(
+            std::fs::read_to_string(fixture_dir.join("eds.yaml"))
+                .context("reading eds.yaml (fixture references {{EDS_PATH}})")?,
+        )
+    } else {
+        None
+    };
+    let subject_eds_path = tmp.path().join("eds-subject.yaml");
+    let subject_eds_path_str = subject_eds_path.to_string_lossy().into_owned();
+    // 21 Task 6 (ADR-0054; §6.2 L9): discover the NUMERIC host-gateway IP the
+    // upstream Envoy container uses to reach the host backend — gated to EDS
+    // fixtures, run ONCE when `needs_eds` (the only consumer today is fixture
+    // 0029). EDS rejects hostnames, so the upstream EDS file's endpoint address
+    // must be this numeric IP; the subject side uses `127.0.0.1`.
+    let host_gateway_ip = if needs_eds {
+        Some(discover_host_gateway_ip()?)
+    } else {
+        None
+    };
+
     // Spawn a host-local backend if either template needs one. Holding the
     // backend in a binding outside the proxies' lifetime ensures the child
     // process outlives the fixture run; Drop fires after `run_fixture`'s
@@ -2350,12 +2440,22 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // still spawn the backend, else a CI-only 503 hides until Linux). Empty
     // string when the fixture carries no RDS template.
     let rds_scan = rds_template.as_deref().unwrap_or("");
-    let backend_scan_sources: [&str; 5] = [
+    // 21 Task 6 (ADR-0054): the combined backend-launch scan must ALSO cover the
+    // shared EDS template. For fixture 0029 the backend endpoint lives ONLY in
+    // `eds.yaml` (the cluster is `type: EDS` and carries no inline
+    // `load_assignment`), so the `{{HTTP1_BACKEND_PORT}}` marker that drives the
+    // echo-backend spawn is present ONLY in the unrendered EDS template — the
+    // phase-18 carryforward-disposition-2 bug-class lesson (a marker living only
+    // in a dynamic file must still spawn the backend, else a CI-only 503 hides
+    // until Linux). Empty string when the fixture carries no EDS template.
+    let eds_scan = eds_template.as_deref().unwrap_or("");
+    let backend_scan_sources: [&str; 6] = [
         &upstream_template,
         &subject_template,
         cds_scan,
         lds_scan,
         rds_scan,
+        eds_scan,
     ];
     let needs_backend = scan_needs_marker(&backend_scan_sources, "BACKEND_PORT");
     // 13.1 D9.1 / Task 7: fixture 0020 reuses `HealthAwareHttp1Backend` but
@@ -2557,6 +2657,17 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // rendered SHARED upstream RDS file is copied to.
             v.push(("RDS_PATH", upstream::RDS_CONTAINER_PATH.to_string()));
         }
+        if needs_eds {
+            // 21 Task 6 (ADR-0054 L1): the container-internal `.yaml` path the
+            // rendered SHARED upstream EDS file is copied to.
+            v.push(("EDS_PATH", upstream::EDS_CONTAINER_PATH.to_string()));
+            // 21 Task 6 (ADR-0054 L9): the NUMERIC host-gateway IP the upstream
+            // EDS endpoint must use (EDS rejects hostnames). Discovered above
+            // via `discover_host_gateway_ip` when `needs_eds`.
+            if let Some(ip) = host_gateway_ip.as_deref() {
+                v.push(("EDS_BACKEND_IP", ip.to_string()));
+            }
+        }
         v
     };
     let subject_kvs: Vec<(&str, String)> = {
@@ -2603,6 +2714,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // 20 Task 6 (ADR-0052): host temp path of the rendered SHARED subject
             // RDS file; the subject subprocess reads it directly from the host FS.
             v.push(("RDS_PATH", subject_rds_path_str.clone()));
+        }
+        if needs_eds {
+            // 21 Task 6 (ADR-0054): host temp path of the rendered SHARED subject
+            // EDS file; the subject subprocess reads it directly from the host FS.
+            v.push(("EDS_PATH", subject_eds_path_str.clone()));
+            // 21 Task 6 (ADR-0054 L9): the subject reaches the host backend over
+            // loopback, so its EDS endpoint address is the numeric `127.0.0.1`
+            // (NOT the host-gateway IP the container uses).
+            v.push(("EDS_BACKEND_IP", "127.0.0.1".to_string()));
         }
         v
     };
@@ -2713,6 +2833,40 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         None
     };
 
+    // 21 Task 6 (ADR-0054): render + write the SHARED EDS file per-side. LIKE
+    // CDS/RDS (one shared `eds.yaml` template rendered twice through each side's
+    // own kv map) and UNLIKE LDS (per-side templates). The upstream rendition is
+    // copied into the container at `EDS_CONTAINER_PATH`; the subject rendition
+    // stays at its host temp path (`subject_eds_path`, already injected into the
+    // subject kv map as `{{EDS_PATH}}`). The per-side `{{EDS_BACKEND_IP}}` marker
+    // resolves to the numeric host-gateway IP (upstream) vs `127.0.0.1`
+    // (subject) — EDS rejects hostnames (L1), so unlike CDS/RDS the two
+    // renditions carry DIFFERENT numeric endpoint addresses, not the shared
+    // `host.docker.internal` string. The rendered upstream EDS string is
+    // retained so the `host_uses_host_gateway` scan below can cover it too.
+    let mut upstream_eds_yaml: Option<String> = None;
+    let upstream_eds_path: Option<PathBuf> = if let Some(tpl) = eds_template.as_ref() {
+        let up_eds = render_yaml(tpl, &upstream_kvs_refs);
+        let subject_eds = render_yaml(tpl, &subject_kvs_refs);
+        // Fail fast, EDS-scoped, naming any unsubstituted marker (a token
+        // present in `eds.yaml` but absent from the kv map). Mirrors the CDS
+        // residual-marker guard above.
+        if let Some(marker) = residual_marker(&up_eds) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream eds.yaml");
+        }
+        if let Some(marker) = residual_marker(&subject_eds) {
+            bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject eds.yaml");
+        }
+        let up_path = write_temp(tmp.path(), "eds-upstream.yaml", &up_eds)?;
+        // Write the subject rendition at the exact path injected into the
+        // subject kv map so `{{EDS_PATH}}` resolves to a file that exists.
+        write_temp(tmp.path(), "eds-subject.yaml", &subject_eds)?;
+        upstream_eds_yaml = Some(up_eds);
+        Some(up_path)
+    } else {
+        None
+    };
+
     let upstream_yaml = render_yaml(&upstream_template, &upstream_kvs_refs);
     let subject_yaml = render_yaml(&subject_template, &subject_kvs_refs);
     let upstream_path = write_temp(tmp.path(), "envoy.yaml", &upstream_yaml)?;
@@ -2737,11 +2891,22 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // 20 Task 6 (ADR-0052): the scan also covers the rendered upstream RDS file
     // (a `host.docker.internal` reference could in principle live only in an
     // RDS-carried route). Empty string when the fixture carries no RDS file.
+    // 21 Task 6 (ADR-0054): the scan also covers the rendered upstream EDS file.
+    // For fixture 0029 the EDS endpoint address is the NUMERIC host-gateway IP
+    // (NOT the `host.docker.internal` string — EDS rejects hostnames, L1), so
+    // the EDS rendition alone does NOT trigger this flag; the host-gateway
+    // `--add-host` mapping is still applied because the MAIN config references
+    // `host.docker.internal` (via `{{BACKEND_HOST}}` for the echo backend the
+    // fixture also reserves an `HTTP1_BACKEND_PORT` for). The EDS source is
+    // scanned anyway for symmetry/safety per the phase-18/19/20 carryforward-
+    // disposition-2 bug-class lesson. Empty string when the fixture carries no
+    // EDS file.
     let host_uses_host_gateway = uses_host_gateway(&[
         &upstream_yaml,
         upstream_cds_yaml.as_deref().unwrap_or(""),
         upstream_lds_yaml.as_deref().unwrap_or(""),
         upstream_rds_yaml.as_deref().unwrap_or(""),
+        upstream_eds_yaml.as_deref().unwrap_or(""),
     ]);
     // (e) Thread tls_pki through to upstream::start. 06.1: also thread
     // `needs_admin_port` so the container exposes ADMIN_CONTAINER_PORT for
@@ -2816,6 +2981,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         upstream_cds_path.as_deref(),
         upstream_lds_path.as_deref(),
         upstream_rds_path.as_deref(),
+        upstream_eds_path.as_deref(),
         &upstream_access_log_mounts,
     )
     .await?;
@@ -7279,5 +7445,61 @@ driver:
             msg.contains("a.b."),
             "error must include the offending path, got: {msg}",
         );
+    }
+}
+
+/// 21 Task 6 (ADR-0054; §6.2 L9): the file-based-EDS harness primitives — the
+/// `{{EDS_PATH}}`-marker scan (the `needs_eds` inertness gate) and the
+/// host-gateway-IP discovery. Sibling `#[cfg(test)]` block placed AFTER
+/// `admin_action_extension_tests` per the per-task placement convention.
+#[cfg(test)]
+mod eds_harness_tests {
+    use super::discover_host_gateway_ip;
+
+    /// The EDS-marker scan. A fixture template that references `{{EDS_PATH}}`
+    /// (the file-based EDS path marker) drives `needs_eds == true`; one without
+    /// it stays `false`. The gate is what keeps the new `{{EDS_PATH}}`
+    /// shared-template + `{{EDS_BACKEND_IP}}` + host-gateway-IP-discovery
+    /// machinery entirely inert for fixtures 0001-0028, mirroring the existing
+    /// `needs_cds`/`needs_lds`/`needs_rds` detection (the
+    /// `contains("{{EDS_PATH}}")` check `run_fixture` uses).
+    #[test]
+    fn eds_marker_scan_detects_eds_path_token() {
+        // A main template (either side) that references `{{EDS_PATH}}` sets the
+        // need. Mirrors `run_fixture`'s `needs_eds` disjunction over the two
+        // main templates.
+        let with_eds = "  eds_config:\n    path_config_source:\n      path: {{EDS_PATH}}";
+        let without_eds = "  load_assignment:\n    cluster_name: c1";
+
+        let needs_eds_upstream =
+            with_eds.contains("{{EDS_PATH}}") || without_eds.contains("{{EDS_PATH}}");
+        assert!(
+            needs_eds_upstream,
+            "a template carrying {{{{EDS_PATH}}}} must set needs_eds == true",
+        );
+
+        let needs_eds_neither =
+            without_eds.contains("{{EDS_PATH}}") || without_eds.contains("{{EDS_PATH}}");
+        assert!(
+            !needs_eds_neither,
+            "templates with no {{{{EDS_PATH}}}} must leave needs_eds == false (fixtures 0001-0028 inert)",
+        );
+    }
+
+    /// The host-gateway-IP discovery returns a NUMERIC IPv4 string. EDS rejects
+    /// hostnames (L1), so the EDS file's endpoint address must be a numeric IP —
+    /// discovered at runtime by running `getent hosts host.docker.internal`
+    /// inside a throwaway pinned-Envoy container with the host-gateway mapping.
+    /// Docker-gated per the existing `#[ignore = "requires Docker; ..."]`
+    /// discipline (e.g. `upstream::tests::starts_upstream_envoy_and_exposes_host_port`);
+    /// under `cargo test --workspace` in CI / locally where Docker is available
+    /// it runs and asserts the result parses as `std::net::Ipv4Addr`.
+    #[test]
+    #[ignore = "requires Docker; runs under `cargo test --workspace` in CI"]
+    fn discover_host_gateway_ip_returns_numeric_ipv4() {
+        let ip = discover_host_gateway_ip().expect("discovery must succeed when Docker is present");
+        ip.parse::<std::net::Ipv4Addr>().unwrap_or_else(|e| {
+            panic!("discovered host-gateway IP {ip:?} must be numeric IPv4: {e}")
+        });
     }
 }
