@@ -225,3 +225,15 @@ Pending — see `PLAN.md` for the full per-task steps. The executor appends a Co
   - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0, 0 warnings).
   - `cargo fmt --all` → applied (one pre-fmt unused-variable removed in the (ii) test; no other reformatting).
   - No production code changed — purely an additive new test file.
+
+### Task 9 — Completion (this commit — code `0fb5b493a`)
+
+- **What landed:** the fuzz corpus seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_eds.yaml` — a minimal bootstrap with a `type: EDS` cluster `eds_backend` whose `eds_cluster_config.eds_config.path_config_source.path` → `/etc/envoy-eds/eds.yaml`, NO inline `load_assignment`, plus a STATIC HCM listener INLINE-routing `/` → `eds_backend` (mirrors the `dynamic_resources_cds/lds.yaml` + `hcm_rds_route_config.yaml` scaffold). The corpus grows **31 → 32** seeds.
+- **`connect_timeout` DROPPED:** the PLAN seed sketch (lines 710–749) carried `connect_timeout: 1s`, but envoy-rust's `Cluster` struct is `#[serde(deny_unknown_fields)]` and has NO `connect_timeout` field (Task 7 finding; the PLAN Step-1 note "Confirm `connect_timeout` is a valid `Cluster` field — if not, drop it" applies). Dropping it is REQUIRED for the seed to parse — and the precedent seeds (`dynamic_resources_cds.yaml`/`strict_dns_cluster.yaml`) carry no `connect_timeout` either.
+- **Parse-clean confirmation (schema-only, NO file read):** `parse_bootstrap` parses-and-validates the SCHEMA only — it NEVER reads the referenced EDS file (that is `load_dynamic_resources`, a separate entry point the fuzz target does not call). The exactly-one-of check passes (EDS + `eds_cluster_config`, no `load_assignment`); the EDS cluster's `load_assignment` is `None` at parse, so `validate_cluster` skips the endpoint checks. The new seed is added to the "should parse" list in the `fuzz_corpus_seeds_parse_or_reject_cleanly` corpus-walk test (`crates/envoy-config/src/bootstrap.rs`), matching the phase-18/19/20 Task-9 precedent (same commit as the seed + `.gitignore` allow-list line — corpus-consistency discipline).
+- **`.gitignore` allow-list:** `!corpus/parse_bootstrap/cluster_eds.yaml` added (matching the existing convention; same commit as the seed).
+- **Verification outputs:**
+  - `cargo test -p envoy-config` → 392 passed; 0 failed (incl. `fuzz_corpus_seeds_parse_or_reject_cleanly` covering the new seed).
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+  - `cargo fmt --all` → applied (comment-alignment only on the new corpus-list line).
+  - No production code changed — additive corpus seed + test-list line only.
