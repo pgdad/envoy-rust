@@ -1,0 +1,76 @@
+# Phase 21 fixture-0029 expectations: file-based EDS (ADR-0053 SPEC / ADR-0054
+# reconciliation) — the xDS-family 4th member (CDS + LDS + RDS + EDS). A STATIC
+# cluster `eds_backend` declared `type: EDS` with NO inline `load_assignment`;
+# its endpoints arrive ENTIRELY from the SHARED eds.yaml loaded at boot via
+# `eds_cluster_config.eds_config.path_config_source.path`. ONE GET over an H1
+# keep-alive conn (Driver::Http1KeepAlive):
+#
+#   GET /  (host: eds_backend) -> routed to cluster `eds_backend` -> 200.
+#       The probe is the data-plane witness that the EDS file loaded: a proxy
+#       that ignored `eds_cluster_config` would have a cluster with NO endpoints
+#       and 503 (no healthy upstream). A 200 + the echoed body proves the EDS
+#       endpoint was installed and reachable.
+#
+# The echoed body is asserted byte-exact on EACH side. The SHARED eds.yaml
+# carries NO Envoy-only header-stripping, so the Envoy side strips the
+# proxy-injected upstream headers in its MAIN config (see envoy.yaml's inline
+# comment): `generate_request_id: false` + a header_mutation filter
+# (x-forwarded-for/proto removal + response re-add of x-envoy-upstream-service-time)
+# + the router's `suppress_envoy_headers: true`. With those, both sides forward
+# the SAME request to the echo helper, so only `host` survives in the echoed body.
+# `require_header_present: x-envoy-upstream-service-time` asserts both proxies
+# emit the router timing header (presence-only; the value differs per side).
+#
+# expected_stats (L3): the conditional per-cluster `cluster.eds_backend.update_*`
+# 4-name subset that only registers when the cluster's `cluster_type == EDS`
+# (attempt/success 1/1, failure/empty 0/0), plus the data-plane witness
+# `cluster.eds_backend.upstream_rq_total` (1) and the HCM downstream counters.
+#
+# NOT asserted (intentional — see README "L3 Envoy-only stat enumeration"):
+# `membership_healthy`/`membership_total` — envoy-rust gates `membership_healthy`
+# on `health_checks` (absent here) and has no `membership_total` at all (the L3
+# narrowing); Envoy emits both for every cluster, allow-listed envoy-only. Also
+# Envoy-only: `update_no_rebuild`, `update_rejected`, `update_time`,
+# `update_duration` (histogram), `membership_change`, `version`/`version_text`,
+# `warming_state`, `assignment_*`. The named-stat scrape does NO set-diff.
+driver:
+  kind: http1_keep_alive
+  requests:
+    - method: GET
+      path: /
+      host: eds_backend
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "method: GET\npath: /\nheaders:\n  host: eds_backend\nbody: \n" }
+      require_header_present: x-envoy-upstream-service-time
+  settle_ms: 200
+  expected_stats:
+    # EDS load (L3 — the conditional per-cluster 4-name subset):
+    - { name: cluster.eds_backend.update_attempt, value: 1 }
+    - { name: cluster.eds_backend.update_success, value: 1 }
+    - { name: cluster.eds_backend.update_failure, value: 0 }
+    - { name: cluster.eds_backend.update_empty,   value: 0 }
+    # Data-plane through the EDS-supplied endpoint (the discriminating witness):
+    - { name: cluster.eds_backend.upstream_rq_total, value: 1 }
+    # HCM downstream (stat_prefix ingress_http; one probe):
+    - { name: http.ingress_http.downstream_rq_total, value: 1 }
+    - { name: http.ingress_http.downstream_rq_2xx,   value: 1 }
+  admin_scrapes:
+    # /config_dump?include_eds (L5): the conditional EndpointsConfigDump. Envoy
+    # OMITS it from the default /config_dump — only ?include_eds surfaces it; the
+    # file-based EDS endpoints land under static_endpoint_configs[] (NOT dynamic).
+    # Per-side index: Envoy Bootstrap[0]/Clusters[1]/Endpoints[2]; envoy-rust
+    # Bootstrap[0]/Endpoints[1] (no cds_config -> no ClustersConfigDump). The Task
+    # 6 per-side path override (JsonSubtreeRule path_envoy / path_envoy_rust) pins
+    # each side's index; both sides agree the first static_endpoint_configs entry's
+    # endpoint_config.cluster_name is the EDS-supplied `eds_backend`.
+    - path: /config_dump?include_eds
+      expected_status: 200
+      expected_content_type: application/json
+      expected_body_rule:
+        kind: json_shape
+        required_keys: ["configs"]
+        required_subtree:
+          path_envoy: configs.2.static_endpoint_configs.0.endpoint_config.cluster_name
+          path_envoy_rust: configs.1.static_endpoint_configs.0.endpoint_config.cluster_name
+          expected: eds_backend
+        value_may_differ_keys: ["configs"]

@@ -1,0 +1,21 @@
+# The SHARED EDS file (L1 / L9 / ADR-0053-0054): a bare `resources:` envelope
+# with one `@type`-tagged ClusterLoadAssignment payload named `eds_backend`.
+# Like fixture 0028's rds.yaml, the EDS file is a SINGLE SHARED template
+# rendered per-side through each side's kv map (Task 6 supports one shared
+# `eds.yaml`). It therefore carries NO Envoy-only fields.
+#
+# L1 / L9 — NUMERIC IP, per-side: EDS REJECTS hostnames (`malformed IP address`
+# → update_rejected). The backend `socket_address.address` MUST be a numeric IP
+# that differs per side, so it uses the `{{EDS_BACKEND_IP}}` marker (NOT
+# `{{BACKEND_HOST}}`): the harness renders it to the runtime-discovered numeric
+# host-gateway IP on the upstream (Envoy) side (`192.168.65.254` on macOS Docker
+# Desktop) and `127.0.0.1` on the subject (envoy-rust) side. `{{HTTP1_BACKEND_PORT}}`
+# resolves to the http1-echo-server helper port per side.
+resources:
+  - "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment
+    cluster_name: eds_backend
+    endpoints:
+      - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: { address: {{EDS_BACKEND_IP}}, port_value: {{HTTP1_BACKEND_PORT}} }
