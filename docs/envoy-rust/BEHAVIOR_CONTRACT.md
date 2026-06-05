@@ -294,6 +294,44 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 
 **The Envoy-only enumeration paragraph.** After a successful RDS update Envoy emits a fuller `http.<prefix>.rds.<name>.*` family; envoy-rust emits the **5** above. The Envoy-only unasserted names (ignored by fixture 0028's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `version`, `version_text`, `update_time`, `config_reload_time_ms`, `update_empty`, `init_fetch_timeout`, `update_duration`. (Envoy additionally carries an `rds.<name>.control_plane.*` family, irrelevant to the filesystem transport.)
 
+**21 entries (file-based EDS):**
+
+> The xDS-family continuation (ADR-0053 SPEC / ADR-0054 PLAN). file-based EDS
+> loads a cluster's `ClusterLoadAssignment` (endpoints) from
+> `eds_cluster_config.eds_config.path_config_source.path` at startup, for a
+> cluster declared `type: EDS`. Unlike the manager-level CDS/LDS singletons
+> (`cluster_manager.*` / `listener_manager.*`) and the per-HCM RDS family
+> (`http.<prefix>.rds.<name>.*`), these stats live under the **per-cluster**
+> `cluster.<name>.*` namespace — the EDS subscription is scoped to the cluster
+> it feeds, so the `update_*` family extends the existing per-cluster
+> namespace rather than introducing a new top-level scope. All derived from the
+> §6.2 empirical lock-in **L3** (verified against `envoyproxy/envoy:v1.33.0`,
+> digest `sha256:56da5afd…`, 2026-06-05; ran LOCALLY). Envoy emits a fuller
+> `cluster.<name>.` EDS-related family after a successful initial load; envoy-rust's
+> minimum-viable subset is **4 names**. Registered at the per-cluster stat site
+> (`crates/envoy-cluster/src/cluster.rs`), **conditionally** — ONLY for clusters
+> whose `cluster_type == Eds`.
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `cluster.<name>.update_attempt` | value-exact (fixture 0029: 1) | Counter; one increment per EDS subscription update attempt. envoy-rust's synchronous `load_dynamic_resources` ticks it once at the file-read+parse step. Both proxies emit 1 on the single initial load (no hot-reload at phase-21 scope). |
+| `cluster.<name>.update_success` | value-exact (fixture 0029: 1) | Counter; one increment per EDS update that produced an installed endpoint set. The load-bearing differential proof of the phase: `update_success: 1` can only pass if real Envoy genuinely loaded the EDS file's `ClusterLoadAssignment` (fixture 0029 asserts it bilaterally). |
+| `cluster.<name>.update_failure` | value-exact (fixture 0029: 0) | Counter; in Envoy, `+1` per EDS update that hit a **parse error** (malformed envelope / missing `@type`) — Envoy then warms-and-503s. **In envoy-rust this is structurally 0:** all EDS load errors are FATAL pre-construction (the L4 all-fatal posture, ADR-0049 decision 2 extended to EDS by ADR-0054 — see the xDS-wire-state-machine EDS §(c)), so the process exits rather than reach a non-zero `update_failure` state. Registered at 0 and **structurally unreachable non-zero**. Bilaterally satisfiable at 0 on fixture 0029 (a successful load). |
+| `cluster.<name>.update_empty` | value-exact (fixture 0029: 0) | Counter; in Envoy, `+1` per EDS update whose `resources:` list was **empty** (`update_empty: 1` co-fires with `update_success: 1`, route 503). **In envoy-rust this is structurally 0:** an empty endpoint set is FATAL pre-construction (the existing `EmptyClusterEndpoints` validator under the all-fatal posture; the process exits instead). Registered at 0 and **structurally unreachable non-zero**. Bilaterally satisfiable at 0 on fixture 0029. |
+
+> Plus the **data-plane witness** `cluster.<name>.upstream_rq_total` (value-exact
+> 1 on fixture 0029) — registered **unconditionally** (it predates EDS; it is not
+> part of the conditional EDS family) and asserted to prove the EDS-supplied
+> endpoint actually served the single GET.
+
+**The per-cluster scoping paragraph (L3).** The 4-name `update_*` subset is prefixed `cluster.<name>.` — the same per-cluster namespace that owns `upstream_rq_total`, `upstream_cx_total`, the `circuit_breakers.*` family, etc. (fixture 0029's concrete prefix is `cluster.eds_backend.`). These EDS-subscription counters extend that existing per-cluster namespace; they are NOT a new top-level-scope family (contrast the phase-18 `cluster_manager.*` / phase-19 `listener_manager.*` manager singletons and the phase-20 per-HCM `http.<prefix>.rds.<name>.*` family). `update_rejected` is the only `update_*` name that is EDS-exclusive in Envoy (L10); it is **not** in the asserted subset (structurally 0 in envoy-rust — the all-fatal posture).
+
+**The §5.2 conditional-registration narrowing (recorded divergence, L10/ADR-0054).** envoy-rust registers the `update_*` family ONLY for clusters whose `cluster_type == Eds` — a deliberate, recorded narrowing vs Envoy. Envoy emits `cluster.<name>.update_{attempt,success,failure,empty,no_rebuild}` (all at 0) for **every** cluster regardless of type (STATIC/STRICT_DNS included — PRE-EXISTING Envoy behavior, true since phase 06.1); only `cluster.<name>.update_rejected` is EDS-exclusive on Envoy. envoy-rust's per-cluster `cluster_type == Eds` gate adds **ZERO** new names to the existing 28 fixtures (whose clusters are non-EDS — the names were already on the envoy-only allow-list / excluded by fixture 0011's set-diff), preserving the regression baseline with zero edits. The inertness backstop verifies envoy-rust emits no `cluster.<name>.update_*` for a STATIC-only bootstrap. Recorded explicitly per doctrine D-3.3.
+
+**The membership-gauge narrowing (recorded divergence, L3/ADR-0054).** For a non-health-checked EDS cluster, envoy-rust does **NOT** emit `cluster.<name>.membership_healthy` or `cluster.<name>.membership_total`. `membership_healthy` registers only when `health_checks` is configured (`crates/envoy-cluster/src/cluster.rs:926`; the explicit "no membership_healthy gauge for a plain cluster" inertness test at `:2227`), and `membership_total` does NOT exist in envoy-rust at all; fixture 0029 has no health checks. Envoy emits **both** (`membership_healthy: 1`, `membership_total: 1`) for every cluster → these are **allow-listed envoy-only, NOT broadened** — broadening would change the `:2227` inertness test + existing-fixture stat output, out of the minimum-viable scope. The endpoint set is differentially proven instead by `upstream_rq_total: 1` (the data-plane witness) + `update_success: 1`.
+
+**The L3 Envoy-only enumeration paragraph (EDS).** After a successful initial load Envoy emits a fuller `cluster.<name>.` EDS-related family; envoy-rust emits the **4** `update_*` names above (+ the unconditional `upstream_rq_total` witness). The Envoy-only unasserted names (ignored by fixture 0029's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `update_no_rebuild`, `update_rejected` (structurally unreachable in envoy-rust — the all-fatal posture, L4), `update_time`, `update_duration` (histogram), `membership_change`, `membership_healthy`, `membership_total`, `membership_degraded` (`degraded`), `membership_excluded` (`excluded`), `assignment_stale`/`assignment_timeout_received`/`assignment_use_cached` (`assignment_*`), `version`, `version_text`, `warming_state`. (None of the 4 emitted `update_*` values change pre- vs post-GET — request counters live under the other `cluster.<name>.*` names.)
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments
@@ -337,6 +375,7 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 | `/config_dump` `ClustersConfigDump` (phase 18, L5/ADR-0049) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when `dynamic_resources.cds_config` is configured; on non-CDS fixtures it is absent (fixture 0014's single-`BootstrapConfigDump`-entry shape preserved). When present, it lands at `configs[1]` on **both** proxies (Envoy's order: `BootstrapConfigDump`[0], `ClustersConfigDump`[1], …). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.ClustersConfigDump", "dynamic_active_clusters": [ { "cluster": { "@type": "type.googleapis.com/envoy.config.cluster.v3.Cluster", <full cluster config> }, "last_updated": <ISO-8601> } ], "static_clusters": [ … when non-empty ] }`. The inner `cluster` object carries its own `@type` plus the full flattened cluster config. **Empty-key omission (proto3-JSON style):** `static_clusters` and `dynamic_active_clusters` are each `skip_serializing_if = Vec::is_empty` on both sides — a static-only Envoy emits the entry with ONLY a `static_clusters` key (no `dynamic_active_clusters`); there is NO `version_info` key (the CDS file had none — proto3 JSON omits empty fields). `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Bilateral anchor (fixture 0026):** `configs.1.dynamic_active_clusters.0.cluster.name == dynamic_backend` (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array content otherwise differs substantially per side (envoy emits its full protobuf-canonical projection; envoy-rust the narrower parsed-bootstrap projection) — `value_may_differ_keys: ["configs"]`, mirroring fixture 0014. Note: envoy-rust's cluster JSON uses snake_case field names while Envoy's proto3-JSON defaults to camelCase for multi-word fields — irrelevant for the `name` anchor (single-word, identical) but binding if a future fixture asserts deeper nested cluster fields. |
 | `/config_dump` `ListenersConfigDump` (phase 19, L5/ADR-0050) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when `dynamic_resources.lds_config` is configured; on non-LDS fixtures it is absent (the backstop inertness path (vi) verifies `/config_dump` does NOT contain `"ListenersConfigDump"` on a CDS-only bootstrap). When present with **both** LDS+CDS configured, it lands at `configs[2]` on **both** proxies — **AFTER** the `ClustersConfigDump` at `configs[1]` (Envoy's verified order: `BootstrapConfigDump`[0], `ClustersConfigDump`[1], `ListenersConfigDump`[2], …; fixture 0026's `configs[1]` Clusters assertion needs NO amendment). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.ListenersConfigDump", "dynamic_listeners": [ { "name": "dynamic_listener", "active_state": { "listener": { "@type": "type.googleapis.com/envoy.config.listener.v3.Listener", <full listener config> }, "last_updated": <ISO-8601> } } ], "static_listeners": [ … when non-empty ] }`. **Note the DIFFERENT nesting from the CDS dump:** the listener is nested under `dynamic_listeners[].active_state.listener` (vs the CDS dump's flatter `dynamic_active_clusters[].cluster`), and each entry carries a top-level `name` key. **No `version_info` key** — `active_state` has NO `version_info` (file-based LDS; the LDS file had none — proto3 JSON omits empty fields). **Empty-key omission:** `static_listeners` and `dynamic_listeners` are each `skip_serializing_if = Vec::is_empty` — a static-only Envoy emits the entry with ONLY `static_listeners`. `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Bilateral anchor (fixture 0027):** `configs.2.dynamic_listeners.0.name == dynamic_listener` (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array otherwise differs per side — `value_may_differ_keys: ["configs"]`. **Known narrowing (LDS-only bootstrap):** on an LDS-only (no-CDS) bootstrap, envoy-rust's Listeners entry would land at `configs[1]` vs Envoy's `configs[2]` (Envoy emits a `ClustersConfigDump` for static clusters unconditionally, occupying `[1]`; envoy-rust's `ClustersConfigDump` is CDS-conditional per phase-18 L10, so it is absent and Listeners shifts up). Fixture 0027 configures BOTH LDS+CDS so the indices align at `[2]`; the divergence is recorded for any future LDS-only fixture (none exercises it today). |
 | `/config_dump` `RoutesConfigDump` (phase 20, L5/ADR-0052) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when **some HCM uses `rds`**; on non-RDS fixtures it is absent (vs Envoy's **always-emitted** `RoutesConfigDump`, which carries `static_route_configs` even without any RDS). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.RoutesConfigDump", "dynamic_route_configs": [ { "route_config": { "@type": "type.googleapis.com/envoy.config.route.v3.RouteConfiguration", "name": "local_route", "virtual_hosts": [ … ] }, "last_updated": <ISO-8601> } ] }`. **No `version_info` key** — the RDS file had none (proto3 JSON omits empty fields; same posture as the CDS/LDS dumps). `last_updated` name-required-value-may-differ (wall-clock; reuses the BootstrapConfigDump ISO-8601 emitter). **Index divergence + per-side reconciliation:** the entry lands at **`configs[4]`** on Envoy (Bootstrap[0]/Clusters[1]/Listeners[2]/ScopedRoutes[3]/Routes[4]/Secrets[5]) but **`configs[2]`** on envoy-rust on fixture 0028 (Bootstrap[0]/Clusters[1]/Routes[2] — Listeners gated off, no `lds_config` on 0028) — bridged by a **per-side `JsonSubtreeRule` path override** in the harness (Envoy `configs.4.…` vs envoy-rust `configs.2.…`). **Bilateral anchor (fixture 0028):** the `route_config.name == local_route` subtree (`JsonShape::required_subtree`; both sides equal the expected value AND each other). The surrounding `configs` array otherwise differs per side — `value_may_differ_keys: ["configs"]`. Fixtures 0026/0027 hold (the RoutesConfigDump entry is RDS-conditional and absent there; their Clusters[1]/Listeners[2] assertions are NOT displaced). |
+| `/config_dump` `EndpointsConfigDump` (phase 21, L5/ADR-0054) | GET | JSON object (a `configs[]` entry) | **Conditional emission:** envoy-rust emits this entry ONLY when **some cluster is `type: EDS`**; on non-EDS fixtures it is absent. **`?include_eds` divergence:** Envoy surfaces `EndpointsConfigDump` ONLY under `/config_dump?include_eds` (omitted from the default `/config_dump`); envoy-rust emits it on **every** `/config_dump` for an EDS bootstrap, **unconditional of `?include_eds`** (a recorded narrowing — envoy-rust's admin path dispatch STRIPS the query string, routing `/config_dump?include_eds` to the `ConfigDump` endpoint; Envoy does the same; no existing fixture uses query strings, so it is inert there). **Static, not dynamic:** file-based EDS endpoints land under `static_endpoint_configs[]`, NOT `dynamic_endpoint_configs[]` (Envoy classifies file/path-based EDS as "static"). Shape: `{ "@type": "type.googleapis.com/envoy.admin.v3.EndpointsConfigDump", "static_endpoint_configs": [ { "endpoint_config": { "@type": "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment", "cluster_name": "eds_backend", "endpoints": [ … ], "policy": { … } } } ] }`. **No `version_info`/`last_updated` keys** — file-based (proto3 JSON omits empty fields; same posture as the CDS/LDS/RDS dumps). **Index divergence + per-side reconciliation:** the entry lands at **`configs[2]`** on Envoy (under `?include_eds`: Bootstrap[0]/Clusters[1]/Endpoints[2]/Listeners[3]/ScopedRoutes[4]/Routes[5]/Secrets[6]) but **`configs[1]`** on envoy-rust on fixture 0029 (Bootstrap[0]/Endpoints[1] — no `cds_config` on 0029 → no ClustersConfigDump) — bridged by a **per-side `JsonSubtreeRule` path override** in the harness (Envoy `configs.2.…` vs envoy-rust `configs.1.…`), REUSING the ADR-0052 path-override mechanism (no new harness JSON machinery). **Bilateral anchor (fixture 0029):** `static_endpoint_configs[0].endpoint_config.cluster_name == eds_backend` (`JsonShape::required_subtree`; both sides equal the expected value AND each other; the probe scrapes `/config_dump?include_eds`). The surrounding `configs` array otherwise differs per side — `value_may_differ_keys: ["configs"]`. **C19 note:** the EDS pass mutates `load_assignment` in-place, so the `BootstrapConfigDump` entry (`configs[0]`) shows the **populated** `load_assignment` for the static EDS cluster (a known minor divergence vs Envoy, which shows it as-configured) — NOT asserted; the `EndpointsConfigDump` is the faithful resolved-endpoints surface. Fixtures 0014/0026/0027/0028 hold (no EDS cluster → no Endpoints entry → their `configs[]` indices NOT displaced). |
 | `/server_info` | GET | JSON object | Required keys `state`, `version`, `node`, `uptime_current_epoch_seconds`, `uptime_all_epochs_seconds`, `hot_restart_version`, `command_line_options`. `state` value-exact, sourced from `DrainState::current()` via the mapping `Live | HealthcheckFailing → "LIVE"`, `Draining → "DRAINING"` (08.1 emitted the literal constant `"LIVE"` as a placeholder; 08.2's D5e patches the value-binding source at Task 5 — the struct shape is unchanged at the 08.1 → 08.2 boundary); `node.*` value-exact from the parsed bootstrap; `version` + `hot_restart_version` + `command_line_options` allowlist-each-side (envoy-rust emits its own version string; Envoy emits its own); `uptime_*` name-required-value-may-differ (wall clock). |
 | `/clusters` | GET | text/plain | Set-equal `<cluster_name>::observability_name::<name>` + `<cluster_name>::default_priority::endpoints` lines per Envoy v1.33's plain-text format. Per-endpoint numeric fields (success/error/timeout counts) name-required-value-may-differ; envoy-rust at 08.1 emits only the minimum two lines per cluster (architecture-decision lock-in #10) — Envoy's richer output is allow-listed envoy-only on fixture 0014. Cluster output order is deterministic by name (sorted in `ClusterManager::clusters()`). |
 | `/listeners` | GET | text/plain | Set-equal `<listener_name>::<address>:<port>` lines. Order: sorted-by-name (deterministic on both sides). **LDS extension (phase 19, L5/ADR-0050):** LDS-supplied listeners appear in the output alongside static ones — envoy-rust migrated the endpoint to enumerate the merged `all_listeners()` set (static + LDS-delivered), so fixture 0027's `dynamic_listener` line is emitted on both sides. The per-side address shapes are **prefix-matched** (Envoy binds `dynamic_listener::0.0.0.0:<port>`; envoy-rust binds `dynamic_listener::127.0.0.1:<kernel-ephemeral>`) — the differential harness matches on the `dynamic_listener::` line prefix bilaterally with per-side `allowlist_*_line_prefixes` for the address+port tail. |
@@ -786,6 +825,178 @@ and by the 27 pre-existing fixtures seeing zero new names.
 **Note (L11): version is Envoy-only.** Envoy's RDS update carries a `version_info`
 (load-bearing on the wire); envoy-rust accepts-and-ignores it (per §(a)), and the
 `rds.<name>.version` / `version_text` stats are **Envoy-only, not asserted** (per
+the §Stat-name mapping Envoy-only enumeration).
+
+### Filesystem transport (`path_config_source`) — phase 21 EDS extension
+
+> The xDS-family continuation (ADR-0053 SPEC / ADR-0054 PLAN). file-based EDS
+> loads a cluster's `ClusterLoadAssignment` (endpoints) from
+> `eds_cluster_config.eds_config.path_config_source.path` for a cluster declared
+> `type: EDS` at startup — extending the filesystem-dynamic-config surface to the
+> endpoint layer. The lock-ins below (L1–L11) are the §6.2 empirical findings,
+> verified against `envoyproxy/envoy:v1.33.0` (digest `sha256:56da5afd…`,
+> 2026-06-05; ran LOCALLY) and reconciled by ADR-0054; what is bilaterally
+> asserted lives in fixture 0029, the negative/fatal paths + the exactly-one-of
+> dispositions live in the in-process backstop
+> (`crates/envoy-bin/tests/xds_file_based_eds.rs`). The EDS transport mirrors the
+> phase-18 CDS / phase-19 LDS / phase-20 RDS transports structurally — the
+> per-finding letters below intentionally parallel the CDS/LDS/RDS §(a)–(f).
+
+**(a) The EDS file envelope (L1) + the numeric-IP constraint.** Same dual-envelope
+posture as CDS/LDS/RDS: both the bare `resources:` list AND the full
+`DiscoveryResponse` shape (`version_info` + `resources`) are accepted; Envoy treats
+`version_info` as load-bearing, envoy-rust accepts-and-ignores it. Each resource
+MUST carry an `@type` with the type URL
+`type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment` (omitting it →
+Envoy `update_failure: 1`); EDS files carry **ClusterLoadAssignment** resources
+only. The minimal working CLA is `cluster_name` + `endpoints[].lb_endpoints[].endpoint.address.socket_address`.
+**NEW CONSTRAINT (L1): the `socket_address.address` MUST be a NUMERIC IP** — a
+hostname (`host.docker.internal`) is rejected at load (Envoy: `malformed IP
+address: … Consider setting resolver_name or setting cluster type to 'STRICT_DNS'`
+→ `update_rejected: 1`, 503). EDS endpoints are treated as already-resolved socket
+addresses (the STATIC semantics, NOT STRICT_DNS); the envoy-rust `Eds` cluster-build
+arm shares the `Static` arm (numeric-IP `SocketAddr::from_str`). The
+`eds_cluster_config`-on-cluster config shape is `type: EDS` + `eds_cluster_config:
+{ eds_config: { path_config_source: { path }, resource_api_version? }, service_name? }`
+(no inline `load_assignment`); `resource_api_version` and `service_name` are both
+OPTIONAL. envoy-rust's EDS parse is **always-YAML** (`serde_yaml`, regardless of
+extension — the same strictly-more-lenient stance as `parse_cds_file`/`parse_lds_file`/
+`parse_rds_file`; the Envoy-side container path is structurally `.yaml`) and
+**requires** the `@type` per resource (the ADR-0014 internally-tagged-on-`@type`
+pattern; a non-ClusterLoadAssignment `@type` rejects loudly).
+
+**(b) Initial-load / readiness ordering (L2) — warming resolves synchronously.**
+Readiness implies loaded on both proxies; the EDS endpoint set is **active before
+`/ready` first returns 200** — **no warm-up window**, the first `GET /` succeeds
+immediately. An EDS cluster with no assignment "warms" in Envoy (held out of the
+active set until its first `ClusterLoadAssignment` arrives or `initial_fetch_timeout`
+fires), but for file-based EDS at initial load the file is read **synchronously** at
+startup so warming resolves immediately (`cm init: all clusters initialized` at
+boot; `cluster.<name>.warming_state: 0` after load). envoy-rust mirrors this
+naturally via a **synchronous load** (`load_dynamic_resources` reads the EDS file
+and populates `load_assignment` between bootstrap parse and `ClusterManager`
+construction, before listeners bind — no runtime endpoint mutability, no locks, no
+watch tasks); fixture 0029's GET fires after readiness and routes through the
+EDS-supplied endpoint.
+
+**(c) Negative-path disposition (L4) — recorded divergence (ADR-0054).** Envoy's
+EDS disposition is a **warm-and-503** posture (only the missing-FILE-PATH is fatal),
+which DIVERGES from envoy-rust's all-fatal posture on (b)–(d):
+
+| EDS load fault | Envoy | envoy-rust |
+|---|---|---|
+| Nonexistent `path` | hard startup failure (container exits non-zero; `paths must refer to an existing path in the system` — a bootstrap-level PGV check) | **FATAL** (`EdsFileError`; process exits) — agrees with Envoy on this one class |
+| File exists, malformed YAML / missing `@type` | **starts and serves** (`/ready` 200), `cluster.<name>.update_failure: 1`, 0 hosts, route 503 | **FATAL** (`EdsParseError`; process exits) — **diverges** |
+| Missing/mismatched `ClusterLoadAssignment` (the file lacks a CLA matching the `service_name`/cluster name) | starts and serves, `cluster.<name>.update_rejected: 1` (NOT `update_failure`), 0 hosts, `/ready`=LIVE, route 503 (`Unexpected EDS cluster (expecting <name>): <other>`) | **FATAL** (`EdsClusterLoadAssignmentNotFound`; process exits) — **diverges** |
+| Empty `resources: []` (no endpoints) | starts and serves, `cluster.<name>.update_empty: 1` **AND** `update_success: 1`, route 503 | **FATAL** (the existing `EmptyClusterEndpoints` validator; process exits) — **diverges** |
+| Unknown field inside a resource | **warn-accepted** (lenient protobuf parsing) | **FATAL** (`deny_unknown_fields`; process exits) — **diverges** |
+
+envoy-rust treats **ALL EDS load errors as FATAL at startup** — the ADR-0049
+decision-2 all-fatal posture extended to EDS: missing/unreadable file
+(`EdsFileError`), malformed YAML / missing `@type` (`EdsParseError`), missing/
+mismatched CLA (`EdsClusterLoadAssignmentNotFound`), empty endpoints
+(`EmptyClusterEndpoints`) all exit the process before construction completes.
+**Consequence for the stats contract:** `cluster.<name>.update_failure`,
+`…update_rejected`, and `…update_empty` register at 0 and are **structurally
+unreachable non-zero** in envoy-rust. fixture 0029 asserts `update_failure`/
+`update_empty` at 0 bilaterally (satisfiable on both sides — a successful load); the
+negative paths are **backstop-only** (Envoy exits the process only on a missing
+file PATH; its warm-and-503 dispositions cannot be observed as a clean differential
+data-plane response). Only the missing-FILE-PATH class is fatal on BOTH proxies.
+
+**(d) The exactly-one-of-and-consistent validation (L6) — 6b/6c match, 6a diverges
+(ADR-0054).** An EDS cluster's endpoint source is an **exactly-one-of-and-consistent**
+between the inline `load_assignment` and the `eds_cluster_config` reference, keyed
+on `cluster_type`:
+
+| Consistency fault | Envoy | envoy-rust |
+|---|---|---|
+| (6b) `type: STATIC` with `eds_cluster_config` | hard startup failure (`eds_cluster_config set in a non-EDS cluster`) | **FATAL** (`EdsConfigOnNonEdsCluster`) — **agrees** |
+| (6c) `type: EDS` with neither `eds_cluster_config` nor `load_assignment` | hard startup failure (`cannot create an EDS cluster without an EDS config`) | **FATAL** (`MissingEdsClusterConfig`) — **agrees** |
+| (6a) `type: EDS` with an inline `load_assignment` | **ACCEPTS** (runs the EDS subscription, silently ignores the inline `load_assignment`, serves 200) | **FATAL** (`LoadAssignmentOnEdsCluster` — STRICTER reject) — **diverges** |
+| A non-EDS cluster with no `load_assignment` (now that the field is `Option`) | accepted (zero-endpoint / per type) | **FATAL** (`MissingLoadAssignment` — the migration's new required-source check) — **diverges** |
+
+envoy-rust enforces the disposition at **validation time** before any EDS file is
+read, matching Envoy's startup-fatal disposition on the 6b/6c arms; the 6a arm is a
+**recorded narrow divergence** (envoy-rust rejects what Envoy accepts-and-ignores —
+the established fail-loud posture; backstop-only).
+
+**(e) The `service_name`-or-cluster-name selection (L8) — MATCH.**
+`eds_cluster_config.service_name` selects WHICH `ClusterLoadAssignment` in the EDS
+file feeds the cluster: when **unset**, the file's `ClusterLoadAssignment.cluster_name`
+must equal the **cluster name**; when `service_name: X` is **set**, the file's
+`cluster_name` must equal **X** (a mismatch → `update_rejected`, 503 on Envoy /
+`EdsClusterLoadAssignmentNotFound` fatal on envoy-rust, per §(c)). The selection key
+is `eds_cluster_config.service_name.unwrap_or(cluster.name)` on both proxies. (Note:
+the cluster-build name-mismatch check `LoadAssignmentNameMismatch` applies to inline
+non-EDS clusters only — an EDS cluster's populated CLA `cluster_name` equals
+`service_name`, not necessarily the cluster name, so re-checking it against the
+cluster name would falsely reject.)
+
+**(f) L5 EndpointsConfigDump emission + `configs[]` ordering (recorded divergence —
+ADR-0054).** Three Envoy behaviors diverge from the projection: **(1)** Envoy OMITS
+`EndpointsConfigDump` from the DEFAULT `/config_dump` — it surfaces ONLY under
+`/config_dump?include_eds`. **(2)** file-based EDS endpoints land under
+`static_endpoint_configs[]`, NOT `dynamic_endpoint_configs[]` (Envoy classifies
+file/path-based EDS as "static" config-dump-wise). **(3)** the `configs[]` order
+under `?include_eds` interposes Endpoints between Clusters and Listeners. envoy-rust
+emits a `EndpointsConfigDump` entry **ONLY when some cluster is `type: EDS`**, using
+`static_endpoint_configs[].endpoint_config` (matching Envoy's file-based-EDS-is-static
+taxonomy), pushed AFTER the (conditional) `ClustersConfigDump` and BEFORE the
+(conditional) `ListenersConfigDump`. envoy-rust emits it on **EVERY** `/config_dump`
+for an EDS bootstrap, **IGNORING** the `?include_eds` query param (a deliberate,
+recorded narrowing vs Envoy's `?include_eds`-gated emission); to make the bilateral
+scrape work, **envoy-rust's admin path dispatch strips the query string** (routing
+`/config_dump?include_eds` to the `ConfigDump` endpoint — Envoy does the same; no
+existing fixture uses query strings, so it is inert there). On fixture 0029 the entry
+lands at **different `configs[]` indices** per side, reconciled by a per-side
+`JsonSubtreeRule` path override in the harness (REUSING the ADR-0052 mechanism — no
+new harness JSON code):
+
+| Side | `configs[]` layout (fixture 0029, scraped with `?include_eds`) | EndpointsConfigDump index |
+|---|---|---|
+| Envoy | Bootstrap[0] / Clusters[1] / Endpoints[2] / Listeners[3] / ScopedRoutes[4] / Routes[5] / Secrets[6] | `configs[2]` |
+| envoy-rust | Bootstrap[0] / Endpoints[1] (no `cds_config` on 0029 → no ClustersConfigDump) | `configs[1]` |
+
+The per-side path override bridges the index gap; **fixtures 0014/0026/0027/0028
+hold** — no EDS cluster → no Endpoints entry → their `configs[]` indices are NOT
+displaced (§5.5). The `EndpointsConfigDump` is the **faithful resolved-endpoints
+surface**; the surrounding `configs` array otherwise differs per side
+(`value_may_differ_keys: ["configs"]`).
+
+**Note (L1/numeric-IP, the load-bearing harness reconciliation D6): the EDS file is
+a SHARED TEMPLATE with a per-side NUMERIC-IP marker.** A minimal `ClusterLoadAssignment`
+is accepted verbatim, BUT the endpoint `socket_address.address` must be a NUMERIC IP
+(per §(a)) that differs per side — the host backend is reachable from the Envoy
+container only via the host-gateway (numeric IP varies by platform: `192.168.65.254`
+on macOS Docker Desktop, the bridge gateway on Linux CI) and from the envoy-rust host
+subprocess via `127.0.0.1`. So the EDS file is a SHARED template (one `eds.yaml`)
+rendered per-side via a NEW `{{EDS_BACKEND_IP}}` kv marker (upstream → the
+runtime-discovered numeric host-gateway IP; subject → `127.0.0.1`); the harness
+DISCOVERS the numeric host-gateway IP at runtime (a one-shot `getent hosts
+host.docker.internal` in the pinned Envoy image, gated to EDS fixtures). The EDS
+rendition joins the backend-detection + `uses_host_gateway` scans (the phase-18
+scan-ALL-rendered-sources bug-class lesson — fixture 0029's backend lives ONLY in
+the EDS file). Contrast the SHAREABLE RDS file (§phase-20 Note L8): the RDS route
+table carries no per-side address.
+
+**Note (C19): the BootstrapConfigDump shows the POPULATED `load_assignment`.** The
+EDS pass mutates `load_assignment` in-place on the bootstrap, so the
+`BootstrapConfigDump` entry for a static EDS cluster shows the **populated**
+`load_assignment` (a known minor divergence vs Envoy, which shows the cluster
+as-configured with no resolved endpoints in BootstrapConfigDump). This is **NOT
+asserted** — fixture 0029's config_dump probe asserts only the `EndpointsConfigDump`
+`cluster_name` subtree; the surrounding `configs` array is `value_may_differ`. The
+`EndpointsConfigDump` (§(f)) is the faithful resolved-endpoints surface.
+
+**Note (L7): route-to-EDS-endpoint wire shape is MATCH.** A GET routed to an
+EDS-supplied endpoint is byte-identical to a static-endpoint response (200 + backend
+body byte-exact + `x-envoy-upstream-service-time` + `server: envoy` + the standard
+allow-list; NO EDS-specific response header).
+
+**Note (L11): version / warming gauges are Envoy-only.** `cluster.<name>.version` is
+a nonzero xxhash of the assignment, `version_text` echoes `version_info` when present
+(else `""`), `warming_state: 0` after load — all **Envoy-only, not asserted** (per
 the §Stat-name mapping Envoy-only enumeration).
 
 ---
