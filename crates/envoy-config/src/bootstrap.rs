@@ -7543,6 +7543,287 @@ resources:
         );
     }
 
+    // ── 21 D3: EDS load pass (load_dynamic_resources populates load_assignment) ──
+
+    /// A minimal EDS file body: the bare `resources:` envelope with one
+    /// @type-tagged ClusterLoadAssignment named `cla_name` carrying one numeric
+    /// endpoint (`127.0.0.1:port`). `empty_endpoints = true` emits a CLA with
+    /// zero endpoints (parses, but the post-merge validate rejects it).
+    fn eds_file(cla_name: &str, port: u16, empty_endpoints: bool) -> String {
+        let endpoints = if empty_endpoints {
+            "  endpoints: []".to_string()
+        } else {
+            format!(
+                r#"  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address: {{ address: 127.0.0.1, port_value: {port} }}"#
+            )
+        };
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment
+  cluster_name: {cla_name}
+{endpoints}
+"#
+        )
+    }
+
+    /// Build a bootstrap with a STATIC HCM listener routing `/` → `eds_backend`,
+    /// plus a `type: EDS` cluster `eds_backend` pointing at `eds_path` (with an
+    /// optional `service_name`). NO `dynamic_resources` block — a purely-static
+    /// EDS cluster (fixture-0029 shape, C16).
+    fn bootstrap_yaml_with_eds(eds_path: &str, service_name: Option<&str>) -> String {
+        let svc = match service_name {
+            Some(s) => format!("\n        service_name: {s}"),
+            None => String::new(),
+        };
+        format!(
+            r#"
+node: {{ id: t, cluster: c }}
+static_resources:
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          path_config_source: {{ path: {eds_path} }}{svc}
+  listeners:
+    - name: hcm_listener
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: rc
+                  validate_clusters: false
+                  virtual_hosts:
+                    - name: vh
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          route: {{ cluster: eds_backend }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+"#
+        )
+    }
+
+    /// (a) the EDS pass loads + populates: a static EDS cluster whose file CLA
+    /// (named `eds_backend`) has one endpoint → succeeds; load_assignment is
+    /// populated (Some) with the file's endpoint; eds_cluster_config stays Some.
+    #[test]
+    fn load_dynamic_eds_pass_loads_and_populates() {
+        let dir = tempfile::tempdir().unwrap();
+        let eds_path = dir.path().join("eds.yaml");
+        std::fs::write(&eds_path, eds_file("eds_backend", 9001, false)).unwrap();
+        let yaml = bootstrap_yaml_with_eds(eds_path.to_str().unwrap(), None);
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        // Pre-merge: no inline load_assignment on the EDS cluster.
+        assert!(b.static_resources.clusters[0].load_assignment.is_none());
+        crate::load_dynamic_resources(&mut b).unwrap();
+        let c = &b.static_resources.clusters[0];
+        let la = c.load_assignment.as_ref().expect("populated post-merge");
+        assert_eq!(la.cluster_name, "eds_backend");
+        assert_eq!(la.endpoints.len(), 1);
+        assert_eq!(single_endpoint_port(c), 9001);
+        // eds_cluster_config is retained (not consumed).
+        assert!(c.eds_cluster_config.is_some());
+    }
+
+    /// (b) service_name selection (L8): `service_name: my_svc` selects the
+    /// `my_svc` CLA from the file (NOT the cluster-name `eds_backend`).
+    #[test]
+    fn load_dynamic_eds_service_name_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let eds_path = dir.path().join("eds.yaml");
+        // The file defines my_svc (port 9002), not eds_backend.
+        std::fs::write(&eds_path, eds_file("my_svc", 9002, false)).unwrap();
+        let yaml = bootstrap_yaml_with_eds(eds_path.to_str().unwrap(), Some("my_svc"));
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        crate::load_dynamic_resources(&mut b).unwrap();
+        let c = &b.static_resources.clusters[0];
+        let la = c.load_assignment.as_ref().expect("populated post-merge");
+        assert_eq!(la.cluster_name, "my_svc");
+        assert_eq!(single_endpoint_port(c), 9002);
+    }
+
+    /// (c) missing EDS file is fatal (L4): `EdsFileError`.
+    #[test]
+    fn load_dynamic_eds_missing_file_is_fatal() {
+        let yaml = bootstrap_yaml_with_eds("/nonexistent/eds.yaml", None);
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::EdsFileError { ref path, .. } if path == "/nonexistent/eds.yaml"),
+            "got {err:?}"
+        );
+    }
+
+    /// (d) malformed EDS file is fatal (L4): `EdsParseError`.
+    #[test]
+    fn load_dynamic_eds_malformed_file_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let eds_path = dir.path().join("eds.yaml");
+        std::fs::write(&eds_path, "resources: [unclosed").unwrap();
+        let yaml = bootstrap_yaml_with_eds(eds_path.to_str().unwrap(), None);
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::EdsParseError { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// (e) missing/mismatched CLA is fatal (L4/L8): the file defines `other`,
+    /// the cluster wants `eds_backend` → `EdsClusterLoadAssignmentNotFound`.
+    #[test]
+    fn load_dynamic_eds_cla_mismatch_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let eds_path = dir.path().join("eds.yaml");
+        std::fs::write(&eds_path, eds_file("other", 9003, false)).unwrap();
+        let yaml = bootstrap_yaml_with_eds(eds_path.to_str().unwrap(), None);
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::EdsClusterLoadAssignmentNotFound { ref name, .. } if name == "eds_backend"),
+            "got {err:?}"
+        );
+    }
+
+    /// (f) empty CLA endpoints is fatal (L4 (d)): the matched CLA has zero
+    /// endpoints → the post-merge validate rejects with `EmptyClusterEndpoints`.
+    #[test]
+    fn load_dynamic_eds_empty_endpoints_is_fatal_post_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let eds_path = dir.path().join("eds.yaml");
+        std::fs::write(&eds_path, eds_file("eds_backend", 0, true)).unwrap();
+        let yaml = bootstrap_yaml_with_eds(eds_path.to_str().unwrap(), None);
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::EmptyClusterEndpoints(ref c) if c == "eds_backend"),
+            "got {err:?}"
+        );
+    }
+
+    /// (g) the §5.7 ordering — a CDS-supplied cluster is composition-ready: a
+    /// bootstrap with BOTH a `cds_config` (a STRICT_DNS `dynamic_backend`) and a
+    /// static EDS cluster → the EDS pass walks the full static+CDS set;
+    /// `dynamic_backend` is untouched, `eds_backend` is populated.
+    #[test]
+    fn load_dynamic_eds_walks_static_and_cds_clusters() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        std::fs::write(&cds_path, MINIMAL_CDS).unwrap();
+        let eds_path = dir.path().join("eds.yaml");
+        std::fs::write(&eds_path, eds_file("eds_backend", 9004, false)).unwrap();
+        let yaml = format!(
+            r#"
+node: {{ id: t, cluster: c }}
+static_resources:
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          path_config_source: {{ path: {eds} }}
+  listeners: []
+admin:
+  address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }}
+dynamic_resources:
+  cds_config:
+    path_config_source: {{ path: {cds} }}
+"#,
+            eds = eds_path.to_str().unwrap(),
+            cds = cds_path.to_str().unwrap(),
+        );
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        crate::load_dynamic_resources(&mut b).unwrap();
+        // The CDS-supplied dynamic_backend (STRICT_DNS, inline LA) is untouched.
+        let dyn_c = b
+            .all_clusters()
+            .find(|c| c.name == "dynamic_backend")
+            .expect("CDS cluster present");
+        assert_eq!(single_endpoint_port(dyn_c), 8124);
+        // The static EDS cluster is populated from its file.
+        let eds_c = b
+            .all_clusters()
+            .find(|c| c.name == "eds_backend")
+            .expect("EDS cluster present");
+        assert_eq!(single_endpoint_port(eds_c), 9004);
+    }
+
+    /// (h) the validate-gate fires for a static-only EDS bootstrap (C16): NO
+    /// `dynamic_resources`/`rds`, but a static EDS cluster whose file CLA has a
+    /// bad shape (empty endpoints) → the post-merge validate STILL runs and
+    /// rejects (proving `had_eds_cluster` extends the gate). This is distinct
+    /// from (f) only in that it asserts the GATE — without the extension, the
+    /// post-merge validate would be skipped and the load would WRONGLY succeed.
+    #[test]
+    fn load_dynamic_eds_validate_gate_fires_static_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let eds_path = dir.path().join("eds.yaml");
+        std::fs::write(&eds_path, eds_file("eds_backend", 0, true)).unwrap();
+        let yaml = bootstrap_yaml_with_eds(eds_path.to_str().unwrap(), None);
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        // No dynamic_resources / rds — only the EDS cluster drives the gate.
+        assert!(b.dynamic_clusters.is_none());
+        assert!(b.dynamic_listeners.is_none());
+        assert!(
+            crate::load_dynamic_resources(&mut b).is_err(),
+            "the validate gate must fire for a static-only EDS bootstrap"
+        );
+    }
+
+    /// Step 4: a CDS file whose cluster is `type: EDS` carrying an inline
+    /// `load_assignment` → `LoadAssignmentOnEdsCluster`. The CDS file bypasses
+    /// `parse_bootstrap`'s endpoint-source check; `load_dynamic_resources` must
+    /// re-run `check_endpoint_sources` over the merged static+CDS set BEFORE the
+    /// EDS pass populates anything, so a malformed CDS-supplied EDS cluster is
+    /// rejected.
+    #[test]
+    fn load_dynamic_eds_cds_eds_with_inline_load_assignment_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cds_path = dir.path().join("cds.yaml");
+        // A CDS cluster that is type: EDS but carries an inline load_assignment.
+        let cds = r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
+  name: bad_eds
+  type: EDS
+  lb_policy: ROUND_ROBIN
+  eds_cluster_config:
+    eds_config:
+      path_config_source: { path: /x }
+  load_assignment:
+    cluster_name: bad_eds
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address: { address: 127.0.0.1, port_value: 8124 }
+"#;
+        std::fs::write(&cds_path, cds).unwrap();
+        let yaml = bootstrap_yaml_with_cds_route_to(cds_path.to_str().unwrap(), "bad_eds");
+        let mut b = crate::parse_bootstrap(&yaml).unwrap();
+        let err = crate::load_dynamic_resources(&mut b).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::LoadAssignmentOnEdsCluster { ref cluster } if cluster == "bad_eds"),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn parses_cluster_with_type_strict_dns() {
         // 05.1 NEW: ClusterType gains StrictDns variant. The serde tag STRICT_DNS

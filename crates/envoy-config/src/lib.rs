@@ -738,6 +738,16 @@ pub fn load_dynamic_resources(bootstrap: &mut Bootstrap) -> Result<(), ConfigErr
     // and the RDS population below cannot falsely trip the "both" arm.
     bootstrap::check_route_sources(bootstrap)?;
 
+    // ---- 21 D3 Step 4: re-check endpoint-source cardinality over the MERGED set ----
+    // A CDS-supplied cluster could itself be a malformed `type: EDS` carrying an
+    // inline `load_assignment` (the CDS file bypasses `parse_bootstrap`'s
+    // endpoint-source check). Runs AFTER the CDS merge but BEFORE the EDS pass
+    // populates anything — so a CDS cluster's bad endpoint-source state fails
+    // here (`LoadAssignmentOnEdsCluster`) and the populated `(Eds, Some, Some)`
+    // post-merge shape (which `validate_cluster` tolerates) is not yet present.
+    // `check_endpoint_sources` walks `all_clusters()` (static + dynamic-CDS).
+    bootstrap::check_endpoint_sources(bootstrap)?;
+
     // ---- 20 D3: RDS pass — load + name-select + populate route_config ----
     // Walk every HCM across the EFFECTIVE listener set (static + dynamic-LDS).
     // The HCMs must be MUTATED (route_config populated), so a disjoint two-field
@@ -786,15 +796,76 @@ pub fn load_dynamic_resources(bootstrap: &mut Bootstrap) -> Result<(), ConfigErr
         }
     }
 
-    // ---- §5.7: ONE post-merge re-validation after ALL merges + the RDS pass ----
+    // ---- 21 D3: EDS pass (ADR-0053/0054; §6.2 L1/L4/L8; §5.7) ----
+    // Walk every cluster across the EFFECTIVE set (static + CDS-merged dynamic);
+    // for each `type: EDS` cluster, read its file, name-select the
+    // ClusterLoadAssignment by service_name-or-cluster-name (L8), and populate
+    // the effective `load_assignment` (§5.3 uniform downstream shape). Runs AFTER
+    // the CDS merge so a CDS-supplied cluster that is ALSO type: EDS gets its
+    // endpoints loaded (composition-ready; §4 defers the bilateral fixture). The
+    // post-merge validate() below re-validates the populated endpoints. NO
+    // dynamic_resources block is required — a purely-static EDS cluster (fixture
+    // 0029) triggers this pass too (C16). The split-borrow of the static +
+    // dynamic cluster collections ends with the loop; `had_eds_cluster` is a
+    // Copy `bool`, so the `&mut` borrow is released before `validate(bootstrap)`.
+    let mut had_eds_cluster = false;
+    {
+        let (static_clusters, dynamic_clusters) = (
+            &mut bootstrap.static_resources.clusters,
+            &mut bootstrap.dynamic_clusters,
+        );
+        for cluster in static_clusters
+            .iter_mut()
+            .chain(dynamic_clusters.iter_mut().flatten())
+        {
+            if cluster.cluster_type != ClusterType::Eds {
+                continue;
+            }
+            had_eds_cluster = true;
+            let eds = cluster
+                .eds_cluster_config
+                .as_ref()
+                .expect("EDS cluster has eds_cluster_config — validated at parse");
+            let path = eds.eds_config.path_config_source.path.clone();
+            // L8: service_name-or-cluster-name selection key.
+            let select_name = eds
+                .service_name
+                .clone()
+                .unwrap_or_else(|| cluster.name.clone());
+            let contents =
+                std::fs::read_to_string(&path).map_err(|source| ConfigError::EdsFileError {
+                    path: path.clone(),
+                    source,
+                })?;
+            let mut parsed = eds::parse_eds_file(&path, &contents)?;
+            let selected = parsed
+                .iter()
+                .position(|la| la.cluster_name == select_name)
+                .map(|i| parsed.remove(i))
+                .ok_or(ConfigError::EdsClusterLoadAssignmentNotFound {
+                    name: select_name,
+                    path,
+                })?;
+            // §5.3: populate load_assignment for the uniform downstream shape.
+            cluster.load_assignment = Some(selected);
+        }
+    }
+
+    // ---- §5.7: ONE post-merge re-validation after ALL merges + the RDS + EDS passes ----
     // cds_configured_but_unloaded() / lds_configured_but_unloaded() are now
     // false (both side-fields are Some when their config source is set), so the
     // deferred cluster-reference checks (UnknownCluster + the H2-from-H1 gate)
     // and the deferred NoRuntime gate re-enforce against the full effective
     // state. A dynamic-listener route may reference a dynamic cluster (resolved
     // because CDS merged above); a reference to a cluster in NEITHER list is
-    // fatal (the L6 recorded divergence vs Envoy's runtime-503).
-    if bootstrap.dynamic_clusters.is_some() || bootstrap.dynamic_listeners.is_some() || had_rds_hcm
+    // fatal (the L6 recorded divergence vs Envoy's runtime-503). The gate also
+    // fires for `had_eds_cluster` (C16) so a purely-static EDS bootstrap — which
+    // has NO dynamic_resources/rds — still re-validates its now-populated
+    // (EDS-loaded) `load_assignment` (e.g. empty-endpoints → EmptyClusterEndpoints).
+    if bootstrap.dynamic_clusters.is_some()
+        || bootstrap.dynamic_listeners.is_some()
+        || had_rds_hcm
+        || had_eds_cluster
     {
         bootstrap::validate(bootstrap)?;
     }
