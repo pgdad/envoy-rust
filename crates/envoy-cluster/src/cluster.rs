@@ -954,6 +954,28 @@ pub async fn from_bootstrap(
         } else {
             None
         };
+        // 21 D4 (ADR-0053/0054; §6.2 L3/L10): the per-cluster EDS update_* family
+        // — registered ONLY for `type: EDS` clusters (the §5.2 conditional-
+        // registration discipline; STATIC/STRICT_DNS clusters emit no update_*).
+        // All values deterministic at a successful initial load (the all-fatal
+        // posture makes update_failure/update_empty structurally 0 — L4), so
+        // register-and-set directly (no handle threading). membership_healthy is
+        // health-check-gated above and membership_total does not exist in
+        // envoy-rust — neither is in this family (a recorded narrowing vs Envoy).
+        if cfg.cluster_type == envoy_config::ClusterType::Eds {
+            let mk = |suffix: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
+                registry
+                    .register_counter(&format!("cluster.{}.{suffix}", cfg.name))
+                    .map_err(|e| ClusterError::StatsRegistration {
+                        cluster: cfg.name.clone(),
+                        message: e.to_string(),
+                    })
+            };
+            mk("update_attempt")?.add(1);
+            mk("update_success")?.add(1);
+            mk("update_failure")?; // registers at 0 (L4)
+            mk("update_empty")?; // registers at 0 (L4)
+        }
         // 14.1 D5/D6 (parent-14 D3/D5/D6): if the cluster configures outlier_detection,
         // build the cluster-level state (per-endpoint EndpointEjection Vec +
         // max_ejection_percent + ejections_overflow). Envoy v3 defaults (§6.2 item-1):
@@ -3395,6 +3417,134 @@ admin:
             stat_value(&registry, "cluster_manager.active_clusters"),
             Some(2),
             "active_clusters must count static + dynamic clusters"
+        );
+    }
+
+    // ---- 21 Task 4 (ADR-0053/0054 §6.2 L3/L10): per-cluster EDS update_* ----
+
+    /// Build a `type: EDS` `Cluster` with its `load_assignment` already
+    /// populated (numeric IP, so the Static-shared build arm resolves it) and
+    /// `eds_cluster_config` present — mirrors the post-EDS-pass shape the
+    /// `cluster_type == Eds` stat predicate keys on (independent of HOW the
+    /// load_assignment got there).
+    fn mk_eds_cluster(name: &str, port: u16) -> envoy_config::Cluster {
+        use envoy_config::bootstrap::EdsClusterConfig;
+        use envoy_config::{
+            Address, Cluster, ClusterType, ConfigSource, Endpoint, LbEndpoint, LbPolicy,
+            LoadAssignment, LocalityLbEndpoints, PathConfigSource, SocketAddress,
+        };
+        Cluster {
+            name: name.into(),
+            cluster_type: ClusterType::Eds,
+            lb_policy: LbPolicy::RoundRobin,
+            load_assignment: Some(LoadAssignment {
+                cluster_name: name.into(),
+                endpoints: vec![LocalityLbEndpoints {
+                    lb_endpoints: vec![LbEndpoint {
+                        endpoint: Endpoint {
+                            address: Address {
+                                socket_address: SocketAddress {
+                                    address: "127.0.0.1".into(),
+                                    port_value: port,
+                                },
+                            },
+                        },
+                    }],
+                }],
+            }),
+            eds_cluster_config: Some(EdsClusterConfig {
+                eds_config: ConfigSource {
+                    path_config_source: PathConfigSource {
+                        path: "/tmp/eds.yaml".into(),
+                    },
+                    resource_api_version: None,
+                },
+                service_name: None,
+            }),
+            transport_socket: None,
+            dns_lookup_family: None,
+            typed_extension_protocol_options: None,
+            health_checks: vec![],
+            common_lb_config: None,
+            circuit_breakers: None,
+            outlier_detection: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn eds_stats_not_registered_for_non_eds_clusters() {
+        // §5.2 inertness: a bootstrap whose clusters are all STATIC/STRICT_DNS
+        // (incl. a CDS-configured one — the fixture-0026 inertness witness)
+        // registers NO `cluster.<name>.update_*` name.
+        let bootstrap = mk_bootstrap(
+            vec![mk_static_cluster("static-backend", 10030)],
+            Some(cds_dynamic_resources()),
+            Some(vec![mk_static_cluster("dyn-backend", 10031)]),
+        );
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let update_names: Vec<String> = registry
+            .snapshot()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.starts_with("cluster.") && n.contains(".update_"))
+            .collect();
+        assert!(
+            update_names.is_empty(),
+            "no cluster.<name>.update_* may register for non-EDS clusters; got {update_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eds_stats_registered_for_eds_cluster() {
+        // The 4-name subset on an EDS cluster reads 1 / 1 / 0 / 0.
+        let bootstrap = mk_bootstrap(vec![mk_eds_cluster("eds_backend", 10040)], None, None);
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        assert_eq!(
+            stat_value(&registry, "cluster.eds_backend.update_attempt"),
+            Some(1)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster.eds_backend.update_success"),
+            Some(1)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster.eds_backend.update_failure"),
+            Some(0)
+        );
+        assert_eq!(
+            stat_value(&registry, "cluster.eds_backend.update_empty"),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn eds_stats_register_no_membership_gauges() {
+        // L3 narrowing: this task registers ONLY the 4 update_* names. An EDS
+        // cluster with no health checks must NOT get membership_total (absent
+        // from envoy-rust entirely) nor membership_healthy (HC-gated at :926).
+        let bootstrap = mk_bootstrap(vec![mk_eds_cluster("eds_backend", 10050)], None, None);
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let _mgr = crate::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("construct");
+        let names: Vec<String> = registry.snapshot().into_iter().map(|(n, _)| n).collect();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "cluster.eds_backend.membership_total"),
+            "membership_total does not exist in envoy-rust; got {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "cluster.eds_backend.membership_healthy"),
+            "membership_healthy is HC-gated and must not register for a non-HC EDS cluster; got {names:?}"
         );
     }
 }
