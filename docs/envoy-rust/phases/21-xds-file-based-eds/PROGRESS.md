@@ -71,3 +71,17 @@ Pending — see `PLAN.md` for the full per-task steps. The executor appends a Co
 - **Task 9** — fuzz seed `cluster_eds.yaml` (corpus 31 → 32).
 - **Task 10** — BEHAVIOR_CONTRACT extensions (EDS stat rows + xDS EDS extension + EndpointsConfigDump row).
 - **Task 11** — state-4 phase-done verification + STATE advance to state-5-next.
+
+### Task 2 — Completion (this commit — code `527cd0573`)
+
+- **What landed:**
+  - New `crates/envoy-config/src/eds.rs` — the EDS file parser, mirroring `cds.rs`/`lds.rs`/`rds.rs` verbatim (the C18 decision: a NEW sibling module, NOT the deferred `xds_file.rs` N=4 consolidation). The `@type`-tagged single-variant enum `EdsResource::ClusterLoadAssignment` renamed `type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment`; the per-resource payload is the existing `bootstrap::LoadAssignment` struct (envoy-rust's name for `ClusterLoadAssignment`), reused verbatim.
+  - `pub fn parse_eds_file(path: &str, contents: &str) -> Result<Vec<LoadAssignment>, crate::ConfigError>` — `serde_yaml::from_str` + error mapping to the Task-1 `ConfigError::EdsParseError { path, message }`. NO validation here (the name-selection + per-cluster endpoint checks run at merge time in Task 3, against the merged state — like `parse_rds_file`, unlike `parse_cds_file`).
+  - `version_info` handling matches `CdsFile`/`LdsFile`/`RdsFile` EXACTLY: the envelope has `#[serde(default)] resources` and NO `deny_unknown_fields`, so `version_info` (and `type_url`/`nonce`/…) is accept-and-ignore by omission — the existing idiom, NOT the PLAN draft's explicit `version_info: Option<String>` + `#[allow(dead_code)]` field (which the "match the existing modules exactly" instruction overrides; dropping it also keeps clippy clean with no `dead_code` allow).
+  - `lib.rs`: `pub mod eds;` (beside `pub mod rds;`) + `pub use eds::parse_eds_file;` (beside `pub use rds::parse_rds_file;` — matching the cds/lds/rds re-export idiom).
+- **TDD:** the 6 `eds_parse_*` tests (groups a–f) written FIRST and confirmed RED (compile error `cannot find function parse_eds_file`, 6 errors) BEFORE implementing, then GREEN: (a) bare `resources:` envelope, (b) full DiscoveryResponse + `version_info` (ignored), (c) multiple CLAs (returned in order — name-selection is Task 3), (d) non-ClusterLoadAssignment `@type` rejected, (e) malformed YAML → `EdsParseError` carrying the path, (f) missing `@type` → `EdsParseError` mentioning `@type`.
+- **Verification outputs:**
+  - `cargo test -p envoy-config eds_parse` → `test result: ok. 7 passed; 0 failed; 0 ignored` (the 6 `eds_parse_*` + the fuzz-corpus seed test matched by the filter).
+  - `cargo test -p envoy-config` (full crate) → `test result: ok. 383 passed; 0 failed; 0 ignored` (377 from Task 1 + 6 new). Doc-tests: `0 passed; 0 failed`.
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+  - `cargo fmt --all` → applied (the `parse_eds_file` signature wrapped to multi-line; no other reformatting).
