@@ -127,6 +127,36 @@ pub enum ConfigError {
     /// raised by the Task-3 RDS loader.
     #[error("RDS route_config_name {name:?} not found in {path:?}")]
     RdsRouteConfigNotFound { name: String, path: String },
+    /// 21 D1 (ADR-0053/0054): a non-EDS cluster carries neither an inline
+    /// `load_assignment` nor (validly) an `eds_cluster_config`.
+    #[error("cluster {cluster:?}: a non-EDS cluster requires `load_assignment`")]
+    MissingLoadAssignment { cluster: String },
+    /// 21 D1: a `type: EDS` cluster carries no `eds_cluster_config` (L6 6c).
+    #[error("cluster {cluster:?}: a `type: EDS` cluster requires `eds_cluster_config`")]
+    MissingEdsClusterConfig { cluster: String },
+    /// 21 D1: `eds_cluster_config` set on a non-EDS cluster (L6 6b).
+    #[error("cluster {cluster:?}: `eds_cluster_config` set on a non-EDS cluster")]
+    EdsConfigOnNonEdsCluster { cluster: String },
+    /// 21 D1: an inline `load_assignment` on a `type: EDS` cluster (L6 6a —
+    /// envoy-rust is stricter than Envoy, which accepts-and-ignores).
+    #[error(
+        "cluster {cluster:?}: a `type: EDS` cluster must not carry an inline `load_assignment`"
+    )]
+    LoadAssignmentOnEdsCluster { cluster: String },
+    /// 21 D2: reading the EDS file at the configured path failed (I/O error).
+    #[error("EDS file error reading {path:?}: {source}")]
+    EdsFileError {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// 21 D2: parsing the EDS file's contents failed.
+    #[error("EDS file parse error in {path:?}: {message}")]
+    EdsParseError { path: String, message: String },
+    /// 21 D3: the EDS `ClusterLoadAssignment` selected by name was not found in
+    /// the EDS file.
+    #[error("EDS ClusterLoadAssignment {name:?} not found in {path:?}")]
+    EdsClusterLoadAssignmentNotFound { name: String, path: String },
     #[error(
         "cluster '{cluster}' declares load_assignment.cluster_name '{assignment}'; these must match"
     )]
@@ -574,6 +604,12 @@ pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
     // file is read and before validate(), so an `rds` HCM (route_config: None)
     // survives validate()'s inline-route walk (which early-returns on None).
     bootstrap::check_route_sources(&bootstrap)?;
+    // 21 D1 (C16; L6 6a): the parse-time-only endpoint-source check — reject an
+    // inline `load_assignment` on a `type: EDS` cluster (stricter than Envoy).
+    // Runs here, before validate() and before any EDS file is read, so it does
+    // not false-positive the post-merge loaded state (validate_cluster tolerates
+    // an EDS cluster carrying both load_assignment and eds_cluster_config).
+    bootstrap::check_endpoint_sources(&bootstrap)?;
     bootstrap::validate(&mut bootstrap)?;
     Ok(bootstrap)
 }

@@ -122,6 +122,21 @@ pub struct PathConfigSource {
     pub path: String,
 }
 
+/// 21 D1 (ADR-0053/0054): `eds_cluster_config` — an EDS cluster's endpoint
+/// source. `eds_config` reuses the phase-18 `ConfigSource`/`PathConfigSource`
+/// verbatim (filesystem transport only; `api_config_source`/`ads`/
+/// `watched_directory` stay rejected by `ConfigSource`'s own
+/// `deny_unknown_fields`).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EdsClusterConfig {
+    pub eds_config: ConfigSource,
+    /// Selects the `ClusterLoadAssignment` by name; defaults to the cluster
+    /// name (L8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+}
+
 /// 20 D1 (ADR-0051/0052): RDS — a route table loaded from a file. `config_source`
 /// reuses the phase-18 `ConfigSource`/`PathConfigSource` verbatim (filesystem
 /// transport only; `api_config_source`/`ads`/`watched_directory` stay rejected by
@@ -178,7 +193,18 @@ pub struct Cluster {
     #[serde(rename = "type")]
     pub cluster_type: ClusterType,
     pub lb_policy: LbPolicy,
-    pub load_assignment: LoadAssignment,
+    /// 21 D1 (ADR-0053/0054): the inline endpoint list. EXACTLY ONE of
+    /// `load_assignment` (inline; STATIC/STRICT_DNS) or `eds_cluster_config`
+    /// (file; EDS) per cluster, consistent with `cluster_type` (enforced at
+    /// validation — §5.8). After `load_dynamic_resources` populates an EDS
+    /// cluster's `load_assignment` from its file, it is `Some` (§5.3);
+    /// downstream endpoint construction reads it uniformly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_assignment: Option<LoadAssignment>,
+    /// 21 D1: EDS — endpoints loaded from a file (reuses `ConfigSource`
+    /// verbatim). EXACTLY ONE of this or `load_assignment` per cluster (§5.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eds_cluster_config: Option<EdsClusterConfig>,
     #[serde(default)]
     pub transport_socket: Option<TransportSocket>,
     /// 05.4 NEW per ADR-0024: optional DNS lookup family override for
@@ -236,6 +262,12 @@ pub enum ClusterType {
     /// semantics with default `dns_refresh_rate`). 05.1 NEW per ADR-0023;
     /// `LOGICAL_DNS` deferred to a later phase.
     StrictDns,
+    /// 21 D1 (ADR-0053/0054): endpoints loaded from a ClusterLoadAssignment file
+    /// via `eds_cluster_config` (initial-load-only). Endpoints are resolved
+    /// numeric socket addresses (STATIC semantics — L1), populated by
+    /// `load_dynamic_resources`. The `rename_all = "SCREAMING_SNAKE_CASE"` maps
+    /// this variant to `EDS` (no per-variant rename needed).
+    Eds,
 }
 
 /// DNS lookup family for STRICT_DNS / LOGICAL_DNS clusters. Mirrors Envoy
@@ -2259,18 +2291,52 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
 /// this function — they require the full cluster list and listener context, so
 /// they stay in `validate()` / `validate_hcm` / `load_dynamic_resources`.
 pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigError> {
-    if cluster.load_assignment.cluster_name != cluster.name {
+    // 21 D1 (§5.8; L6): exactly-one-of-and-consistent endpoint source. At PARSE
+    // time an EDS cluster has `load_assignment: None` + `eds_cluster_config:
+    // Some`. Post-merge the EDS cluster carries BOTH `Some` (the loaded state) —
+    // the `(true, _, true)` arm tolerates it. The `LoadAssignmentOnEdsCluster`
+    // reject (an inline `load_assignment` on EDS, L6 6a) is NOT here: it would
+    // false-positive the post-merge loaded `(Eds, Some, Some)` state. It lives
+    // in the parse-time-only `check_endpoint_sources` pass instead.
+    let is_eds = cluster.cluster_type == ClusterType::Eds;
+    let la_some = cluster.load_assignment.is_some();
+    let eds_some = cluster.eds_cluster_config.is_some();
+    match (is_eds, la_some, eds_some) {
+        (true, _, false) => {
+            return Err(crate::ConfigError::MissingEdsClusterConfig {
+                cluster: cluster.name.clone(),
+            });
+        }
+        (false, false, _) => {
+            return Err(crate::ConfigError::MissingLoadAssignment {
+                cluster: cluster.name.clone(),
+            });
+        }
+        (false, _, true) => {
+            return Err(crate::ConfigError::EdsConfigOnNonEdsCluster {
+                cluster: cluster.name.clone(),
+            });
+        }
+        _ => {}
+    }
+    // 21 D1: endpoint checks run only when `load_assignment` is present (an EDS
+    // cluster pre-merge has `None` — its endpoints are validated post-merge,
+    // after `load_dynamic_resources` populates `load_assignment`; this function
+    // re-runs then, so the transport_socket / typed_extension / health-check /
+    // circuit-breaker / outlier checks below are not skipped permanently).
+    let Some(la) = cluster.load_assignment.as_ref() else {
+        return Ok(());
+    };
+    // The name-mismatch check applies to INLINE (non-EDS) clusters only: an EDS
+    // cluster's populated CLA `cluster_name` equals `service_name` (L8), NOT the
+    // cluster name — re-checking against `cluster.name` would falsely reject.
+    if !is_eds && la.cluster_name != cluster.name {
         return Err(crate::ConfigError::LoadAssignmentNameMismatch {
             cluster: cluster.name.clone(),
-            assignment: cluster.load_assignment.cluster_name.clone(),
+            assignment: la.cluster_name.clone(),
         });
     }
-    let total_endpoints: usize = cluster
-        .load_assignment
-        .endpoints
-        .iter()
-        .map(|le| le.lb_endpoints.len())
-        .sum();
+    let total_endpoints: usize = la.endpoints.iter().map(|le| le.lb_endpoints.len()).sum();
     if total_endpoints == 0 {
         return Err(crate::ConfigError::EmptyClusterEndpoints(
             cluster.name.clone(),
@@ -2520,6 +2586,24 @@ pub(crate) fn check_route_sources(bootstrap: &Bootstrap) -> Result<(), crate::Co
                     _ => {}
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// 21 D1 (ADR-0053/0054; L6 6a): the parse-time-only exactly-one-of endpoint-
+/// source pass — reject an inline `load_assignment` on a `type: EDS` cluster
+/// (stricter than Envoy, which accepts-and-ignores). This runs in
+/// `parse_bootstrap` (and is re-callable over the merged static+CDS cluster set
+/// in Task 3) BEFORE any EDS file is read, so it does NOT false-positive the
+/// post-merge loaded `(Eds, Some, Some)` state (which `validate_cluster`
+/// tolerates). Mirrors phase-20's `check_route_sources`.
+pub(crate) fn check_endpoint_sources(bootstrap: &Bootstrap) -> Result<(), crate::ConfigError> {
+    for cluster in bootstrap.all_clusters() {
+        if cluster.cluster_type == ClusterType::Eds && cluster.load_assignment.is_some() {
+            return Err(crate::ConfigError::LoadAssignmentOnEdsCluster {
+                cluster: cluster.name.clone(),
+            });
         }
     }
     Ok(())
@@ -3803,11 +3887,16 @@ static_resources:
         assert_eq!(c.name, "backend");
         assert!(matches!(c.cluster_type, ClusterType::Static));
         assert!(matches!(c.lb_policy, LbPolicy::RoundRobin));
-        assert_eq!(c.load_assignment.cluster_name, "backend");
-        assert_eq!(c.load_assignment.endpoints.len(), 1);
-        assert_eq!(c.load_assignment.endpoints[0].lb_endpoints.len(), 3);
+        assert_eq!(c.load_assignment.as_ref().unwrap().cluster_name, "backend");
+        assert_eq!(c.load_assignment.as_ref().unwrap().endpoints.len(), 1);
         assert_eq!(
-            c.load_assignment.endpoints[0].lb_endpoints[2]
+            c.load_assignment.as_ref().unwrap().endpoints[0]
+                .lb_endpoints
+                .len(),
+            3
+        );
+        assert_eq!(
+            c.load_assignment.as_ref().unwrap().endpoints[0].lb_endpoints[2]
                 .endpoint
                 .address
                 .socket_address
@@ -4059,7 +4148,12 @@ admin:
 "#;
         let b = crate::parse_bootstrap(yaml).expect("serde accepts; SocketAddr parse defers");
         assert_eq!(
-            b.static_resources.clusters[0].load_assignment.endpoints[0].lb_endpoints[0]
+            b.static_resources.clusters[0]
+                .load_assignment
+                .as_ref()
+                .unwrap()
+                .endpoints[0]
+                .lb_endpoints[0]
                 .endpoint
                 .address
                 .socket_address
@@ -6764,7 +6858,7 @@ dynamic_resources:
 
     /// Extract the single endpoint port_value of a cluster (test convenience).
     fn single_endpoint_port(cluster: &Cluster) -> u16 {
-        cluster.load_assignment.endpoints[0].lb_endpoints[0]
+        cluster.load_assignment.as_ref().unwrap().endpoints[0].lb_endpoints[0]
             .endpoint
             .address
             .socket_address
@@ -7484,7 +7578,7 @@ admin:
         );
         assert_eq!(c.name, "backend");
         assert_eq!(
-            c.load_assignment.endpoints[0].lb_endpoints[0]
+            c.load_assignment.as_ref().unwrap().endpoints[0].lb_endpoints[0]
                 .endpoint
                 .address
                 .socket_address
@@ -7636,7 +7730,7 @@ admin:
         let bootstrap = crate::parse_bootstrap(yaml).expect("parses + validates");
         let c = &bootstrap.static_resources.clusters[0];
         assert!(matches!(c.cluster_type, ClusterType::StrictDns));
-        let lbe = &c.load_assignment.endpoints[0].lb_endpoints;
+        let lbe = &c.load_assignment.as_ref().unwrap().endpoints[0].lb_endpoints;
         assert_eq!(lbe.len(), 2);
         assert_eq!(lbe[0].endpoint.address.socket_address.address, "localhost");
         assert_eq!(lbe[0].endpoint.address.socket_address.port_value, 7000);
@@ -7683,7 +7777,7 @@ admin:
         let c = &bootstrap.static_resources.clusters[0];
         assert!(matches!(c.cluster_type, ClusterType::StrictDns));
         assert_eq!(
-            c.load_assignment.endpoints[0].lb_endpoints[0]
+            c.load_assignment.as_ref().unwrap().endpoints[0].lb_endpoints[0]
                 .endpoint
                 .address
                 .socket_address
@@ -11615,6 +11709,284 @@ dynamic_resources:
     path_config_source: { path: /tmp/lds.yaml }
 "#;
         assert!(crate::parse_bootstrap(yaml).is_ok());
+    }
+
+    // ----------------------------------------------------------------------
+    // 21 D1 (ADR-0053/0054): EDS schema + exactly-one-of-and-consistent
+    // endpoint-source validation. Groups (a)-(i) per PLAN Task 1 Step 1.
+    // Each fixture carries an `admin` block so validate() reaches the cluster
+    // checks (the NoRuntime gate fires for a no-admin / no-listener bootstrap).
+    // ----------------------------------------------------------------------
+
+    /// (a) An EDS cluster (`type: EDS` + `eds_cluster_config` with `service_name`,
+    /// NO inline `load_assignment`) parses; the schema round-trips faithfully.
+    #[test]
+    fn eds_schema_eds_cluster_parses() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          path_config_source:
+            path: /x
+        service_name: svc
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("EDS cluster parses");
+        let c = &b.static_resources.clusters[0];
+        assert_eq!(c.cluster_type, ClusterType::Eds);
+        assert_eq!(
+            c.eds_cluster_config,
+            Some(EdsClusterConfig {
+                eds_config: ConfigSource {
+                    path_config_source: PathConfigSource {
+                        path: "/x".to_string(),
+                    },
+                    resource_api_version: None,
+                },
+                service_name: Some("svc".to_string()),
+            })
+        );
+        assert!(c.load_assignment.is_none());
+    }
+
+    /// (b) `service_name` + `resource_api_version` are both optional inside
+    /// `eds_cluster_config` / `eds_config`.
+    #[test]
+    fn eds_schema_service_name_optional() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          path_config_source:
+            path: /x
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("EDS cluster parses");
+        let c = &b.static_resources.clusters[0];
+        let ecc = c.eds_cluster_config.as_ref().expect("eds_cluster_config");
+        assert_eq!(ecc.service_name, None);
+        assert_eq!(ecc.eds_config.resource_api_version, None);
+    }
+
+    /// (c) Regression-equivalence: an inline STATIC cluster still parses, with
+    /// `load_assignment: Some` and `eds_cluster_config: None`.
+    #[test]
+    fn eds_schema_inline_static_still_parses() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("inline STATIC parses");
+        let c = &b.static_resources.clusters[0];
+        assert!(c.load_assignment.is_some());
+        assert!(c.eds_cluster_config.is_none());
+        assert_eq!(c.load_assignment.as_ref().unwrap().cluster_name, "backend");
+    }
+
+    /// (d) EDS cluster with neither `eds_cluster_config` nor `load_assignment`
+    /// → `MissingEdsClusterConfig` (L6 6c).
+    #[test]
+    fn eds_schema_eds_missing_config_rejected() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::MissingEdsClusterConfig { ref cluster } if cluster == "eds_backend"),
+            "expected MissingEdsClusterConfig; got {err:?}",
+        );
+    }
+
+    /// (e) EDS cluster carrying an inline `load_assignment` →
+    /// `LoadAssignmentOnEdsCluster` (L6 6a — stricter than Envoy; PARSE-time,
+    /// driven through `parse_bootstrap`'s `check_endpoint_sources` pass).
+    #[test]
+    fn eds_schema_eds_inline_load_assignment_rejected() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          path_config_source:
+            path: /x
+      load_assignment:
+        cluster_name: eds_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::LoadAssignmentOnEdsCluster { ref cluster } if cluster == "eds_backend"),
+            "expected LoadAssignmentOnEdsCluster; got {err:?}",
+        );
+    }
+
+    /// (f) STATIC cluster carrying `eds_cluster_config` →
+    /// `EdsConfigOnNonEdsCluster` (L6 6b).
+    #[test]
+    fn eds_schema_static_with_eds_config_rejected() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+      eds_cluster_config:
+        eds_config:
+          path_config_source:
+            path: /x
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::EdsConfigOnNonEdsCluster { ref cluster } if cluster == "backend"),
+            "expected EdsConfigOnNonEdsCluster; got {err:?}",
+        );
+    }
+
+    /// (g) Non-EDS cluster with no `load_assignment` → `MissingLoadAssignment`.
+    #[test]
+    fn eds_schema_static_missing_load_assignment_rejected() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::MissingLoadAssignment { ref cluster } if cluster == "backend"),
+            "expected MissingLoadAssignment; got {err:?}",
+        );
+    }
+
+    /// (h) An unknown field inside `eds_cluster_config` is rejected
+    /// (`deny_unknown_fields`).
+    #[test]
+    fn eds_schema_unknown_field_in_eds_cluster_config_rejected() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          path_config_source:
+            path: /x
+        ads: {}
+"#;
+        let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("ads"),
+            "expected deny_unknown_fields rejection; got {msg}",
+        );
+    }
+
+    /// (i) `ConfigSource`'s `deny_unknown_fields` still rejects
+    /// `api_config_source`/`ads`/`watched_directory` inside `eds_config`.
+    #[test]
+    fn eds_schema_unknown_field_in_eds_config_rejected() {
+        let yaml = r#"
+static_resources:
+  clusters:
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          path_config_source:
+            path: /x
+          api_config_source: {}
+"#;
+        let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("api_config_source"),
+            "expected deny_unknown_fields rejection; got {msg}",
+        );
     }
 }
 

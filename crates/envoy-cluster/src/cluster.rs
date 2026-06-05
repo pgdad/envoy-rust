@@ -731,12 +731,22 @@ pub async fn from_bootstrap(
         // and we resolve each endpoint to a SocketAddr (which envoy-config
         // does NOT do — neither the literal-IP parse for STATIC nor the DNS
         // lookup for STRICT_DNS).
+        // 21 D1 (§5.3): every cluster has `load_assignment: Some` after
+        // `load_dynamic_resources` (inline from parse; EDS populated by the
+        // merge). The expect is the structural witness of that invariant.
+        let load_assignment = cfg
+            .load_assignment
+            .as_ref()
+            .expect("load_assignment populated post-load — §5.3 invariant");
         let mut endpoints: Vec<SocketAddr> = Vec::new();
-        for locality in &cfg.load_assignment.endpoints {
+        for locality in &load_assignment.endpoints {
             for lbe in &locality.lb_endpoints {
                 let sa = &lbe.endpoint.address.socket_address;
                 match cfg.cluster_type {
-                    envoy_config::ClusterType::Static => {
+                    // 21 D1 (L1): EDS endpoints are resolved numeric socket
+                    // addresses, parsed exactly like STATIC (NOT DNS-resolved
+                    // like STRICT_DNS).
+                    envoy_config::ClusterType::Static | envoy_config::ClusterType::Eds => {
                         // EXISTING path (phase 02.1): each endpoint's address
                         // parses as a literal SocketAddr via SocketAddr::from_str.
                         // Failure surfaces as ClusterError::EndpointParse —
@@ -1351,10 +1361,11 @@ admin:
                     name: "backend".into(),
                     cluster_type: ClusterType::Static,
                     lb_policy: LbPolicy::RoundRobin,
-                    load_assignment: LoadAssignment {
+                    load_assignment: Some(LoadAssignment {
                         cluster_name: "backend".into(),
                         endpoints: vec![],
-                    },
+                    }),
+                    eds_cluster_config: None,
                     transport_socket: None,
                     dns_lookup_family: None,
                     typed_extension_protocol_options: None,
@@ -1390,7 +1401,7 @@ admin:
             name: "backend".into(),
             cluster_type: ClusterType::Static,
             lb_policy: LbPolicy::RoundRobin,
-            load_assignment: LoadAssignment {
+            load_assignment: Some(LoadAssignment {
                 cluster_name: "backend".into(),
                 endpoints: vec![LocalityLbEndpoints {
                     lb_endpoints: vec![LbEndpoint {
@@ -1404,7 +1415,8 @@ admin:
                         },
                     }],
                 }],
-            },
+            }),
+            eds_cluster_config: None,
             transport_socket: None,
             dns_lookup_family: None,
             typed_extension_protocol_options: None,
@@ -3222,7 +3234,7 @@ admin:
             name: name.into(),
             cluster_type: ClusterType::Static,
             lb_policy: LbPolicy::RoundRobin,
-            load_assignment: LoadAssignment {
+            load_assignment: Some(LoadAssignment {
                 cluster_name: name.into(),
                 endpoints: vec![LocalityLbEndpoints {
                     lb_endpoints: vec![LbEndpoint {
@@ -3236,7 +3248,8 @@ admin:
                         },
                     }],
                 }],
-            },
+            }),
+            eds_cluster_config: None,
             transport_socket: None,
             dns_lookup_family: None,
             typed_extension_protocol_options: None,
