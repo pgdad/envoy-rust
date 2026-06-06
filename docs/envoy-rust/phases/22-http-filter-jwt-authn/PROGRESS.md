@@ -47,7 +47,7 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 | Task | Title | State | Code commit | PROGRESS commit |
 |---|---|---|---|---|
 | — | state-2 PLAN-write (PLAN.md + this skeleton + Task-1 preamble + ADR-0056) | **done (this commit)** | — | — |
-| 1 | envoy-jwt scaffold + base64url | pending | — | — |
+| 1 | envoy-jwt scaffold + base64url | **done** | `745cf8da1` | (this commit) |
 | 2 | envoy-jwt JWKS parse | pending | — | — |
 | 3 | envoy-jwt RS256 verify + claim validation | pending | — | — |
 | 4 | envoy-jwt fuzz target | pending | — | — |
@@ -74,3 +74,15 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 - Per `project_state3_arc_skips_clippy`, run `cargo clippy -p envoy-jwt --all-targets -- -D warnings` before the Task-1 commit.
 
 **Commit shape:** one code commit `phase 22 Task 1: …` then one PROGRESS commit updating this ledger row + appending a Task-2 preamble.
+
+**Task 1 outcome (controller verification):** code commit `745cf8da1` — 8 files, only `crates/envoy-jwt` added to workspace `members` (the `crates/envoy-jwt/fuzz` member correctly deferred to Task 4). Crate root carries `#![forbid(unsafe_code)]` (D-3.8, no exemption). `JwtError` (10 variants), hand-rolled base64url decoder (`#[allow(dead_code)]` targeted on `decode` while the stubs are in place — Task 2 consumes it), `jwks.rs`/`verify.rs` minimal stubs. `cargo test -p envoy-jwt` 2/2 green; `cargo clippy -p envoy-jwt --all-targets -- -D warnings` clean; fmt clean. `aws-lc-rs` 1.16 builds natively. Not a review centerpiece → controller diff-verification only (per the phase-16→21 cadence; centerpieces are Tasks 3 + 7).
+
+---
+
+## Task 2 preamble (pre-execution notes for the second state-3 subagent)
+
+**Goal:** replace the `jwks.rs` stub with real inline-JWKS (RSA-only) parsing: `JwkSet::parse(&str) -> Result<Self, JwtError>` keeping only `kty == "RSA"` keys, base64url-decoding `n`/`e`, stripping any leading `0x00` byte (§6.2 L1 — `aws-lc-rs` `PublicKeyComponents` rejects leading zeros), `JwtError::InvalidJwks` on non-JSON / missing `keys` / missing-or-undecodable `n`/`e` / empty resulting RSA set; `keys()` accessor returning `&[RsaKey]` where `RsaKey { kid: Option<String>, n: Vec<u8>, e: Vec<u8> }`. TDD: structural tests (`rejects_non_json`, `rejects_empty_keyset`, `skips_non_rsa_keys_but_errors_if_none_remain`, `parses_rsa_key`) — the structural ones need no real modulus; for `parses_rsa_key` a real base64url RSA-2048 `n` is ideal but a well-formed small `n` suffices for the `e == [0x01,0x00,0x01]` ("AQAB") assertion + key count. The decoder's `#[allow(dead_code)]` from Task 1 can stay or be removed once `jwks.rs` consumes `base64url::decode` (resolve whatever clippy reports). Clippy `-p envoy-jwt` per task.
+
+**Watch-outs:** the `decode` consumption removes the Task-1 dead-code condition — re-check clippy. `RsaKey`/`JwkSet` derive `Debug, Clone, PartialEq, Eq`. Full code is in PLAN.md Task 2 Step 3 (controller pastes it into the subagent prompt verbatim).
+
+**Commit shape:** one code commit `phase 22 Task 2: …`; controller does the PROGRESS commit.
