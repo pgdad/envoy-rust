@@ -687,6 +687,55 @@ fn default_denominator() -> DenominatorType {
     DenominatorType::Hundred
 }
 
+/// `envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication` config
+/// (phase 22, minimum-viable per ADR-0055/SPEC §3). RS256, inline `local_jwks`,
+/// a single `provider_name` per matched rule, default `Authorization: Bearer`
+/// extraction, `iss`/`aud`/`exp`/`nbf` validation. Deferred fields
+/// (`requirement_map`, `bypass_cors_preflight`, `strip_failure_response`, …)
+/// are rejected by `deny_unknown_fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JwtAuthnConfig {
+    pub providers: std::collections::BTreeMap<String, JwtProvider>,
+    #[serde(default)]
+    pub rules: Vec<RequirementRule>,
+}
+
+/// One JWT provider. `local_jwks` reuses the existing `DataSource`
+/// (inline_string only at phase-22 scope — the validator enforces it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JwtProvider {
+    pub issuer: String,
+    #[serde(default)]
+    pub audiences: Vec<String>,
+    pub local_jwks: DataSource,
+    /// Envoy default `false` ⇒ strip `Authorization` upstream on success
+    /// (§6.2 L6). Deferred: remote_jwks, from_headers/params/cookies,
+    /// forward_payload_header, payload_in_metadata, claim_to_headers,
+    /// clock_skew_seconds, jwks_cache_duration, jwt_cache_config.
+    #[serde(default)]
+    pub forward: bool,
+}
+
+/// One `{ match: RouteMatch, requires: JwtRequirement }` rule. `match` reuses
+/// the 04.x `RouteMatch`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementRule {
+    pub r#match: RouteMatch,
+    pub requires: JwtRequirement,
+}
+
+/// Minimum-viable single-provider requirement. Deferred: `requires_any`,
+/// `requires_all`, `allow_missing`, `allow_missing_or_failed`, named
+/// requirements (rejected by `deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JwtRequirement {
+    pub provider_name: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "@type", deny_unknown_fields)]
 pub enum HttpFilterTypedConfig {
@@ -708,6 +757,11 @@ pub enum HttpFilterTypedConfig {
 
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.fault.v3.HTTPFault")]
     Fault(FaultConfig),
+
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication"
+    )]
+    JwtAuthn(JwtAuthnConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -2682,6 +2736,8 @@ pub(crate) fn validate_http_filters(
                 }
                 validate_fault_config(cfg, listener_name)?;
             }
+            // Task 5 (phase 22): schema only; JWT semantic validation arrives in Task 6.
+            crate::HttpFilterTypedConfig::JwtAuthn(_) => {}
         }
     }
 
@@ -12486,5 +12542,53 @@ static_resources:
 admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
 "#
         )
+    }
+
+    mod jwt_authn_tests {
+        #[test]
+        fn parses_jwt_authn_filter_config() {
+            let yaml = r#"
+name: envoy.filters.http.jwt_authn
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+  providers:
+    provider1:
+      issuer: "testing@secure.istio.io"
+      audiences: ["aud1"]
+      local_jwks:
+        inline_string: '{"keys":[]}'
+      forward: true
+  rules:
+    - match: { prefix: "/" }
+      requires: { provider_name: "provider1" }
+"#;
+            let hf: crate::HttpFilter = serde_yaml::from_str(yaml).expect("parses");
+            match hf.typed_config {
+                crate::HttpFilterTypedConfig::JwtAuthn(cfg) => {
+                    assert_eq!(cfg.providers.len(), 1);
+                    let p = &cfg.providers["provider1"];
+                    assert_eq!(p.issuer, "testing@secure.istio.io");
+                    assert_eq!(p.audiences, vec!["aud1".to_string()]);
+                    assert!(p.forward);
+                    assert_eq!(cfg.rules.len(), 1);
+                    assert_eq!(cfg.rules[0].requires.provider_name, "provider1");
+                }
+                other => panic!("expected JwtAuthn, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn jwt_provider_forward_defaults_false() {
+            let yaml = r#"
+issuer: "i"
+local_jwks: { inline_string: "{}" }
+"#;
+            let p: crate::JwtProvider = serde_yaml::from_str(yaml).expect("parses");
+            assert!(
+                !p.forward,
+                "forward defaults false (§6.2 L6 — strip Authorization)"
+            );
+            assert!(p.audiences.is_empty());
+        }
     }
 }

@@ -20,14 +20,15 @@ pub use bootstrap::{
     FractionalPercent, HeaderMatcher, HeaderMatcherMode, HeaderMutationConfig, HeaderMutationEntry,
     HeaderValue, HeaderValueOption, HealthCheck, Http1ProtocolOptions, Http2ProtocolOptions,
     HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpHealthCheck,
-    HttpProtocolOptions, HttpStatus, Int64Range, LbEndpoint, LbPolicy, Listener, LoadAssignment,
-    LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter, Node, OutlierDetection,
-    PathConfigSource, Percent, Permission, PermissionSet, Policy, Principal, PrincipalSet,
-    RbacConfig, Rds, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
-    RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, SafeRegex, SocketAddress,
-    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate,
-    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
-    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
+    HttpProtocolOptions, HttpStatus, Int64Range, JwtAuthnConfig, JwtProvider, JwtRequirement,
+    LbEndpoint, LbPolicy, Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints,
+    Mutations, NetworkFilter, Node, OutlierDetection, PathConfigSource, Percent, Permission,
+    PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig,
+    RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch,
+    RouterConfig, RoutingPriority, Rules, SafeRegex, SocketAddress, StaticResources, StringMatcher,
+    StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket, TransportSocket,
+    TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext,
+    VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;
 pub use eds::parse_eds_file;
