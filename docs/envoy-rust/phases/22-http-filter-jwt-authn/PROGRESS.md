@@ -49,7 +49,7 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 | — | state-2 PLAN-write (PLAN.md + this skeleton + Task-1 preamble + ADR-0056) | **done (this commit)** | — | — |
 | 1 | envoy-jwt scaffold + base64url | **done** | `745cf8da1` | (this commit) |
 | 2 | envoy-jwt JWKS parse | **done** | `ea02c3b7d` | (this commit) |
-| 3 | envoy-jwt RS256 verify + claim validation | pending | — | — |
+| 3 | envoy-jwt RS256 verify + claim validation | **done** | `747590a2e` | (this commit) |
 | 4 | envoy-jwt fuzz target | pending | — | — |
 | 5 | envoy-config schema + variant | pending | — | — |
 | 6 | envoy-config validator + arm + ConfigError | pending | — | — |
@@ -100,3 +100,15 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 **Review:** this is review centerpiece #1 → full TWO-STAGE review (spec-compliance subagent THEN code-quality subagent) after the implementer's self-review, with re-review loops until both pass. Clippy `-p envoy-jwt` per task. Also restore the real `pub use verify::{VerifiedJwt, verify_rs256};` in `lib.rs` (it already points there from Task 1; confirm signatures line up).
 
 **Commit shape:** one code commit `phase 22 Task 3: …`; controller does the PROGRESS commit after both reviews pass.
+
+**Task 3 outcome (REVIEW CENTERPIECE #1 — full two-stage review):** code commit `747590a2e` (amended once to fold in recommended test coverage). TDD honored (26 compile-errors on the stub at Step 2 → green at Step 5). **Production verify path is the §6.2-L1-locked `PublicKeyComponents{n,e}.verify(&RSA_PKCS1_2048_8192_SHA256, signing_input, sig)` — UNCHANGED.** All 10 checks present in spec order with correct `JwtError` variants. **Authoring-risk resolution (PROGRESS correction #6):** the plan's guessed test-signing API `pk.as_be_bytes()`/`AsBigEndian` does NOT exist for RSA in `aws-lc-rs` 1.16.3 — the TEST helper (only) uses `PublicKeyComponents::from(pk)` (the `From<&PublicKey>` impl, gated by the default `ring-io` feature). Production path untouched; test key is RSA-2048. **Spec review: ✅ SPEC COMPLIANT** (all 10 checks, no extra API, tests sign real RSA-2048 tokens, slice `&token.as_bytes()[..h.len()+1+p.len()]` correct). **Code-quality review: ✅ APPROVED** (0 Critical/0 Important; slice-panic path — the key fuzz worry — statically confirmed safe; 6 advisory Minors). Folded M3 (no-`kid`→all-keys branch test), M4 (multi-element `aud` partial-intersection test), M1 (drop redundant `.as_str()`), M6 (`iss`-always-`Some` doc) into the amend → **12 tests pass**; clippy `-p envoy-jwt --all-targets -D warnings` clean (controller re-verified). Deferred advisory Minors M2 (split the 4-assert test) + M5 (`nbf==now` boundary test) — non-blocking.
+
+---
+
+## Task 4 preamble (pre-execution notes for the fourth state-3 subagent)
+
+**Goal:** add the `envoy-jwt` fuzz target (§7.4) over the JWKS/JWT parse+verify surface — mirroring the existing `crates/envoy-config/fuzz/` crate. Create `crates/envoy-jwt/fuzz/{Cargo.toml, fuzz_targets/jwt_parse.rs, .gitignore, corpus/jwt_parse/*}` and add `"crates/envoy-jwt/fuzz",` to the workspace `members` (NOW the dir exists). The target: split input on first NUL → bytes-before = JWKS JSON, bytes-after = token; `if let Ok(set) = JwkSet::parse(jwks_str) { let _ = verify_rs256(token, &set, "iss", &[], 0); }`. `#![no_main] #![forbid(unsafe_code)]`. Both surfaces must NEVER panic — only return `JwtError` (Task 3 quality review statically confirmed the slice path is panic-safe; the fuzzer is the dynamic backstop). 3 seed files: `empty` (0 bytes), `jwks.json` (real RSA JWKS + `\0` + valid token), `token.txt` (`\0`-prefixed garbage token).
+
+**Watch-outs:** mirror `crates/envoy-config/fuzz/Cargo.toml` for manifest shape (`cargo-fuzz = true`, `libfuzzer-sys = "0.4"`, `[[bin]]` with `test=false doc=false bench=false`, `edition = "2024"`). `cargo fuzz` needs the NIGHTLY toolchain (the envoy-config/fuzz precedent). Build via `cargo +nightly fuzz build jwt_parse` then a smoke run `cargo +nightly fuzz run jwt_parse -- -runs=50000 -max_total_time=30` — expect builds + no crash. The real RSA JWKS for the seed can be generated however convenient (or reuse the `PublicKeyComponents::from` approach in a throwaway), but a committed real RSA-2048 JWKS is ideal so the verify path actually executes; if generating one is awkward at this task, a syntactically-valid small RSA JWKS that `JwkSet::parse` accepts is acceptable for corpus-seed purposes (the fuzzer explores from there). Task 10 later commits the canonical fixture JWKS. NOTE: this task may need the nightly toolchain installed; if `cargo +nightly fuzz` is unavailable, report it — the build can still be validated structurally and the smoke-run deferred to the state-4 CI gate (Task 12).
+
+**Commit shape:** one code commit `phase 22 Task 4: …`; controller does the PROGRESS commit.
