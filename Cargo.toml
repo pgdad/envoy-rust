@@ -8,6 +8,7 @@ members = [
     "crates/envoy-config",
     "crates/envoy-filter",
     "crates/envoy-health",
+    "crates/envoy-jwt",
     "crates/envoy-http1",
     "crates/envoy-http2",
     "crates/envoy-listener",
