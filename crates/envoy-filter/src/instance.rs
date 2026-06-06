@@ -176,6 +176,38 @@ mod tests {
         Arc::new(StatsRegistry::new())
     }
 
+    fn jwt_authn_cfg_for_test() -> envoy_config::JwtAuthnConfig {
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "provider1".to_string(),
+            envoy_config::JwtProvider {
+                issuer: "testing@secure.istio.io".to_string(),
+                audiences: vec![],
+                local_jwks: envoy_config::DataSource {
+                    filename: None,
+                    inline_string: Some(
+                        r#"{"keys":[{"kty":"RSA","kid":"k1","n":"sXche4iX","e":"AQAB"}]}"#
+                            .to_string(),
+                    ),
+                },
+                forward: false,
+            },
+        );
+        envoy_config::JwtAuthnConfig {
+            providers,
+            rules: vec![envoy_config::RequirementRule {
+                r#match: envoy_config::RouteMatch {
+                    prefix: Some("/".to_string()),
+                    path: None,
+                    headers: vec![],
+                },
+                requires: envoy_config::JwtRequirement {
+                    provider_name: "provider1".to_string(),
+                },
+            }],
+        }
+    }
+
     #[test]
     fn build_router_succeeds() {
         let hf = envoy_config::HttpFilter {
@@ -236,5 +268,40 @@ mod tests {
         let instance =
             HttpFilterInstance::build(&hf, &registry, "test_prefix").expect("Rbac build succeeds");
         assert!(matches!(instance, HttpFilterInstance::Rbac(_)));
+    }
+
+    #[test]
+    fn builds_jwt_authn_instance_and_dispatches() {
+        let registry = test_registry();
+        let hf = envoy_config::HttpFilter {
+            name: "envoy.filters.http.jwt_authn".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::JwtAuthn(jwt_authn_cfg_for_test()),
+        };
+        let mut inst = HttpFilterInstance::build(&hf, &registry, "ingress_http")
+            .expect("JwtAuthn build succeeds");
+        assert!(matches!(inst, HttpFilterInstance::JwtAuthn(_)));
+
+        // missing Authorization header → filter must short-circuit with 401
+        let mut req = FilterRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![("host".into(), "envoy.test".into())],
+            body: None,
+        };
+        match inst.decode_headers(&mut req) {
+            Decision::StopAndSend(r) => assert_eq!(r.status, 401),
+            Decision::Continue => {
+                panic!("expected StopAndSend(401) for missing token, got Continue")
+            }
+        }
+
+        // encode_headers is a no-op for JwtAuthn — must return Continue
+        let mut resp = FilterResponse {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
     }
 }
