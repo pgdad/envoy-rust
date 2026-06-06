@@ -25,6 +25,7 @@ members = [
 ]
 exclude = [
     "crates/envoy-config/fuzz",
+    "crates/envoy-jwt/fuzz",
 ]
 
 # Workspace members grow as later phases introduce crates. Phase 00 lands the

@@ -1,0 +1,7 @@
+target/
+artifacts/
+Cargo.lock
+corpus/jwt_parse/*
+!corpus/jwt_parse/jwks.json
+!corpus/jwt_parse/token.txt
+!corpus/jwt_parse/empty
