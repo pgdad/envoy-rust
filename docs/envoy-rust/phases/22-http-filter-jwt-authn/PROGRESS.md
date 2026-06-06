@@ -48,7 +48,7 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 |---|---|---|---|---|
 | — | state-2 PLAN-write (PLAN.md + this skeleton + Task-1 preamble + ADR-0056) | **done (this commit)** | — | — |
 | 1 | envoy-jwt scaffold + base64url | **done** | `745cf8da1` | (this commit) |
-| 2 | envoy-jwt JWKS parse | pending | — | — |
+| 2 | envoy-jwt JWKS parse | **done** | `ea02c3b7d` | (this commit) |
 | 3 | envoy-jwt RS256 verify + claim validation | pending | — | — |
 | 4 | envoy-jwt fuzz target | pending | — | — |
 | 5 | envoy-config schema + variant | pending | — | — |
@@ -86,3 +86,17 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 **Watch-outs:** the `decode` consumption removes the Task-1 dead-code condition — re-check clippy. `RsaKey`/`JwkSet` derive `Debug, Clone, PartialEq, Eq`. Full code is in PLAN.md Task 2 Step 3 (controller pastes it into the subagent prompt verbatim).
 
 **Commit shape:** one code commit `phase 22 Task 2: …`; controller does the PROGRESS commit.
+
+**Task 2 outcome (controller verification):** code commit `ea02c3b7d` — 2 files (`jwks.rs` filled; `base64url.rs` shed its now-redundant `#[allow(dead_code)]` since `JwkSet::parse` consumes `decode`). TDD honored (test failed on stub, passed after impl). `RsaKey { kid, n, e }` + `JwkSet::{parse, keys}`; RSA-only filter, leading-zero strip (§6.2 L1), `InvalidJwks` on non-JSON/missing-keys/undecodable/empty. The plan's placeholder `n` (`"sXch4i4X..."`, contains a `.`) was replaced with valid base64url `"sXche4iX"` (only key-count/kid/`e==[1,0,1]` are asserted). `cargo test -p envoy-jwt` 6/6; clippy `-p envoy-jwt` gate re-verified clean by controller; fmt clean. Not a centerpiece → controller diff-verification only.
+
+---
+
+## Task 3 preamble (pre-execution notes — REVIEW CENTERPIECE #1)
+
+**Goal:** replace the `verify.rs` stub with the real `verify_rs256(token, &JwkSet, expected_issuer, &[String] allowed_audiences, now_unix: i64) -> Result<VerifiedJwt, JwtError>` — the crypto orchestration. Production verify path is the §6.2-L1-confirmed `aws_lc_rs::rsa::PublicKeyComponents { n, e }.verify(&RSA_PKCS1_2048_8192_SHA256, signing_input, sig)`. Order of checks (PLAN Task 3 Step 3): (1) exactly 3 non-empty dot segments else `NotInForm`; (2/3) b64-decode+JSON header/payload (`BadHeaderJson`/`BadPayloadJson`; decode failure → `NotInForm`); (4) b64-decode sig; (5) `alg != "RS256"` → `NoMatchingKey` (Envoy folds unsupported-alg here); (6) candidate keys by `kid` (else all), empty → `NoMatchingKey`; (7) verify over `header.payload` signing input, fail → `VerificationFails`; (8) issuer mismatch → `IssuerMismatch`; (9) `now>=exp` → `Expired`, `now<nbf` → `NotYetValid`; (10) audience (empty allowed_audiences ⇒ skip; §6.2 L7, `aud` is `string|string[]`). `VerifiedJwt { iss, aud, exp, nbf }`.
+
+**THE ONE AUTHORING RISK (PROGRESS correction #6):** the TEST signing helper uses `aws-lc-rs` 1.16.3 signing APIs (`RsaKeyPair::generate(KeySize::Rsa2048)`, `public_key().as_be_bytes()` → `PublicKeyComponents<Vec<u8>>`, `kp.sign(&RSA_PKCS1_SHA256, &SystemRandom::new(), msg, &mut sig)`). If exact 1.16.3 method/trait names differ (`as_be_bytes` vs `as_big_endian`; `AsBigEndian` import path; `KeySize` path), the implementer ADJUSTS THE TEST HELPER ONLY — the production path (`PublicKeyComponents::verify`) is L1-confirmed and must NOT change. The test key MUST be RSA-2048 (the `RSA_PKCS1_2048_8192_SHA256` 2048-bit floor). The let-chain `if let Some(x)=.. && cond` syntax is stable on 1.95.0 but if clippy flags it, rewrite as nested `if let`.
+
+**Review:** this is review centerpiece #1 → full TWO-STAGE review (spec-compliance subagent THEN code-quality subagent) after the implementer's self-review, with re-review loops until both pass. Clippy `-p envoy-jwt` per task. Also restore the real `pub use verify::{VerifiedJwt, verify_rs256};` in `lib.rs` (it already points there from Task 1; confirm signatures line up).
+
+**Commit shape:** one code commit `phase 22 Task 3: …`; controller does the PROGRESS commit after both reviews pass.
