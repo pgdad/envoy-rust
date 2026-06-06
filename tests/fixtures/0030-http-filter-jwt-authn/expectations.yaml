@@ -1,0 +1,83 @@
+# Phase 22: 5-probe sequential burst against the HCM filter chain
+#   [envoy.filters.http.jwt_authn, envoy.filters.http.router]
+# with a single provider `provider1` (issuer testing@secure.istio.io,
+# audiences [jwt-fixture-aud], inline RSA-2048 JWKS kid k1) required on the
+# prefix "/" route. Both proxies must produce the deterministic status
+# sequence [200, 401, 401, 401, 403] for the 5 probes below.
+#
+# Probe sequence (all GET / with Host: envoy.test):
+#   1. valid          — 200 / "ok\n"                          (RS256 verify OK)
+#   2. missing         — 401 / "Jwt is missing"               (no Authorization header)
+#   3. tampered        — 401 / "Jwt verification fails"       (last sig char flipped)
+#   4. expired         — 401 / "Jwt is expired"               (exp = 1500000000, year 2017)
+#   5. wrong-audience  — 403 / "Audiences in Jwt are not allowed"
+#
+# The bodies are byte-exact across proxies (upstream Envoy v1.33's
+# JwtAuthentication source-hardcodes these strings; envoy-rust matches them
+# in crates/envoy-filter/src/jwt_authn.rs). The `www-authenticate` header
+# value (`Bearer realm="http://envoy.test/"` on probe 2; with a
+# `, error="invalid_token"` suffix on probes 3/4/5) is byte-exact
+# cross-proxy: both proxies receive the SAME Host + path so the realm is
+# identical → it is NOT on the harness allow-list and is compared value-exact
+# by set_equal_modulo_allow_list (§6.2 L3 lock; ADR-0055/0056).
+#
+# The 4 tokens + the inline JWKS are committed static (inputs/gen.sh,
+# openssl RSA-2048 + RS256). `exp` is far-future (year 2100) / far-past
+# (year 2017) → ZERO clock sensitivity, so the verdicts are stable forever.
+#
+# set_equal_modulo_allow_list compares header SETS modulo the documented
+# allow-list at docs/envoy-rust/BEHAVIOR_CONTRACT.md (`server` + `date` rows
+# cover implementation-identifying / wall-clock divergences); the remaining
+# standard headers (content-length / content-type / connection) plus
+# www-authenticate are value-exact across proxies under the harness's
+# Connection: close request framing.
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-valid-200
+      method: get
+      path: "/"
+      host: "envoy.test"
+      extra_headers:
+        - ["authorization", "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyIsImF1ZCI6WyJqd3QtZml4dHVyZS1hdWQiXSwiZXhwIjo0MTAyNDQ0ODAwfQ.aZbLHegW9Z6sAXNL-D14IFuXrfJuj_K4vWCE4tUK0wBQacEp697raigKjp8c0585xe583iZUqoveFtqXF9qlTjXzQlChS-ba6eoDf7uEnVxmESTzEKBiSbbVrexKfvrJNW3QmnhzAA65ZOb7xhrg8vzsHvnR9f-GUGxbUI4Xxf3zOyDLhAMG6ssIal99YmvR-oWzC2_ly0XWAyVnMKNXfv8RX-D011vkgmRSuZMgjREkQOpD-cs2LUqs0BNCdd2Xkm8UJuiwsIuA8LIAKYTd3ya_ClANkUQ46qyrJsT15eTdYqrqNu4PH5LBqSxS3Bm4mrizADdwSOhVKWrqHGjRSQ"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-missing-401
+      method: get
+      path: "/"
+      host: "envoy.test"
+      extra_headers: []
+      expected_status: 401
+      expected_body: { kind: byte_exact, body: "Jwt is missing" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-tampered-401
+      method: get
+      path: "/"
+      host: "envoy.test"
+      extra_headers:
+        - ["authorization", "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyIsImF1ZCI6WyJqd3QtZml4dHVyZS1hdWQiXSwiZXhwIjo0MTAyNDQ0ODAwfQ.aZbLHegW9Z6sAXNL-D14IFuXrfJuj_K4vWCE4tUK0wBQacEp697raigKjp8c0585xe583iZUqoveFtqXF9qlTjXzQlChS-ba6eoDf7uEnVxmESTzEKBiSbbVrexKfvrJNW3QmnhzAA65ZOb7xhrg8vzsHvnR9f-GUGxbUI4Xxf3zOyDLhAMG6ssIal99YmvR-oWzC2_ly0XWAyVnMKNXfv8RX-D011vkgmRSuZMgjREkQOpD-cs2LUqs0BNCdd2Xkm8UJuiwsIuA8LIAKYTd3ya_ClANkUQ46qyrJsT15eTdYqrqNu4PH5LBqSxS3Bm4mrizADdwSOhVKWrqHGjRSB"]
+      expected_status: 401
+      expected_body: { kind: byte_exact, body: "Jwt verification fails" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-4-expired-401
+      method: get
+      path: "/"
+      host: "envoy.test"
+      extra_headers:
+        - ["authorization", "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyIsImF1ZCI6WyJqd3QtZml4dHVyZS1hdWQiXSwiZXhwIjoxNTAwMDAwMDAwfQ.GJiQRUrdhigMHUoRYEHBh1AJ1m6qi857vx-iLrUKvDH0DJGizJWsttmLYPz-LhTalqzmCZLkIXRiM4rpt2XrZdQRfDWFnX4JxIcSJlANpQt6Bt06c-R7CEikPk2Jqsyeskf5QEoRTM2y900bPEVZddWaGrQhkBInxkyM_Y0VhQHWeHrC_BzIm76hFSGDcSs3GzuR2pVs1YHNmI_3KMmJ0HtU3LgFPwqr4dC9_j85truS-AOlpLkxZL_hLti1eT2Fvc0o89vF_zg0mwgRnT5UpJPGNPvDXsjQv_Ok287yd2HzTtKQVBY5a9kyzdan2pZeLMyNYh6Kj6qEpxbhizY4pg"]
+      expected_status: 401
+      expected_body: { kind: byte_exact, body: "Jwt is expired" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-5-wrong-audience-403
+      method: get
+      path: "/"
+      host: "envoy.test"
+      extra_headers:
+        - ["authorization", "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyIsImF1ZCI6WyJvdGhlci1hdWQiXSwiZXhwIjo0MTAyNDQ0ODAwfQ.etnKuLttA3_ODRK4sd5IVNWh8tf_xWXQjV0nfhIUQaqdmOkey8JN-TbP4fQujesa3TGIPZOE7D5euTjiPjKriGIfDFs4OVDNqYWAbIky3lFhLw2hiOeTallecUsCFn8sXIn_2UonZIFxtB_DMUCbv3aUE1gop4vXKFjB0ZBKH5nPoX0J_NHgQoZZ3tyt8p1LsCxIEyYb3ew9OByaumLkOqrT5m7sBW3K7urFRf_SZkt6V49HK6WU3DLn7aVsZInicyoUr33XgnrWdfjMjoPG_MVjj_JLymZWLxQd7Oc4qCZo0avjTG1p2c3fhFbJJvd6-tELa44adyGwuHGG00o4DQ"]
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "Audiences in Jwt are not allowed" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: { kind: byte_exact }
