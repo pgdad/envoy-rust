@@ -501,6 +501,25 @@ pub enum ConfigError {
         denominator: u32,
     },
 
+    /// Phase 22: jwt_authn filter has no providers (at least one required).
+    #[error("jwt_authn filter on listener `{listener}` has no providers; at least one is required")]
+    JwtAuthnNoProviders { listener: String },
+
+    /// Phase 22: jwt_authn rule references a provider name not in the providers map.
+    #[error(
+        "jwt_authn rule on listener `{listener}` references unknown provider `{provider_name}`"
+    )]
+    JwtAuthnUnknownProvider {
+        listener: String,
+        provider_name: String,
+    },
+
+    /// Phase 22: jwt_authn provider's local_jwks is not inline or fails to parse.
+    #[error(
+        "jwt_authn provider `{provider}` on listener `{listener}` has an invalid or non-inline local_jwks"
+    )]
+    JwtAuthnInvalidJwks { listener: String, provider: String },
+
     /// 12.1: cluster has more than one `health_checks` entry (phase-12 supports 0 or 1).
     #[error(
         "cluster '{cluster}' has more than one health_checks entry; phase 12 supports at most one"

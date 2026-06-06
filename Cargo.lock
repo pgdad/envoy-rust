@@ -399,6 +399,7 @@ dependencies = [
 name = "envoy-config"
 version = "0.0.0"
 dependencies = [
+ "envoy-jwt",
  "regex",
  "serde",
  "serde_json",

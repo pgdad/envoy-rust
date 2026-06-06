@@ -2736,8 +2736,14 @@ pub(crate) fn validate_http_filters(
                 }
                 validate_fault_config(cfg, listener_name)?;
             }
-            // Task 5 (phase 22): schema only; JWT semantic validation arrives in Task 6.
-            crate::HttpFilterTypedConfig::JwtAuthn(_) => {}
+            crate::HttpFilterTypedConfig::JwtAuthn(cfg) => {
+                if f.name != "envoy.filters.http.jwt_authn" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_jwt_authn_config(cfg, listener_name)?;
+            }
         }
     }
 
@@ -2899,6 +2905,58 @@ fn validate_rbac_config(
                 &format!("principals[{idx}]"),
                 1,
             )?;
+        }
+    }
+    Ok(())
+}
+
+/// Phase 22: validate a jwt_authn filter config (minimum-viable). All errors
+/// are config-load-time fatal (ADR-0049 all-fatal posture).
+pub(crate) fn validate_jwt_authn_config(
+    cfg: &crate::JwtAuthnConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if cfg.providers.is_empty() {
+        return Err(crate::ConfigError::JwtAuthnNoProviders {
+            listener: listener_name.to_string(),
+        });
+    }
+    for (name, provider) in &cfg.providers {
+        let jwks = provider
+            .local_jwks
+            .inline_string
+            .as_deref()
+            .ok_or_else(|| crate::ConfigError::JwtAuthnInvalidJwks {
+                listener: listener_name.to_string(),
+                provider: name.clone(),
+            })?;
+        envoy_jwt::JwkSet::parse(jwks).map_err(|_| crate::ConfigError::JwtAuthnInvalidJwks {
+            listener: listener_name.to_string(),
+            provider: name.clone(),
+        })?;
+    }
+    for rule in &cfg.rules {
+        if !cfg.providers.contains_key(&rule.requires.provider_name) {
+            return Err(crate::ConfigError::JwtAuthnUnknownProvider {
+                listener: listener_name.to_string(),
+                provider_name: rule.requires.provider_name.clone(),
+            });
+        }
+        // RouteMatch structural validity: exactly one of prefix/path must be set.
+        // Inlined because the existing inline check in validate_http_connection_manager
+        // is not extracted into a standalone function; mirrors the same logic at ~2543.
+        match (rule.r#match.prefix.is_some(), rule.r#match.path.is_some()) {
+            (true, false) | (false, true) => {}
+            (true, true) => {
+                return Err(crate::ConfigError::UnsupportedRouteMatcher {
+                    matcher: "both prefix and path are set",
+                });
+            }
+            (false, false) => {
+                return Err(crate::ConfigError::UnsupportedRouteMatcher {
+                    matcher: "neither prefix nor path is set",
+                });
+            }
         }
     }
     Ok(())
@@ -12542,6 +12600,115 @@ static_resources:
 admin: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: 9901 }} }} }}
 "#
         )
+    }
+
+    mod jwt_authn_validator_tests {
+        use super::super::validate_jwt_authn_config;
+
+        const VALID_JWKS: &str = r#"{"keys":[{"kty":"RSA","kid":"k1","n":"sXche4iX","e":"AQAB"}]}"#;
+
+        #[test]
+        fn jwt_authn_validator_rejects_empty_providers() {
+            let cfg = crate::JwtAuthnConfig {
+                providers: std::collections::BTreeMap::new(),
+                rules: vec![],
+            };
+            let err = validate_jwt_authn_config(&cfg, "l0").unwrap_err();
+            assert!(matches!(
+                err,
+                crate::ConfigError::JwtAuthnNoProviders { .. }
+            ));
+        }
+
+        #[test]
+        fn jwt_authn_validator_rejects_dangling_provider_ref() {
+            let mut providers = std::collections::BTreeMap::new();
+            providers.insert(
+                "p1".to_string(),
+                crate::JwtProvider {
+                    issuer: "i".to_string(),
+                    audiences: vec![],
+                    local_jwks: crate::DataSource {
+                        filename: None,
+                        inline_string: Some(VALID_JWKS.to_string()),
+                    },
+                    forward: false,
+                },
+            );
+            let cfg = crate::JwtAuthnConfig {
+                providers,
+                rules: vec![crate::RequirementRule {
+                    r#match: crate::RouteMatch {
+                        prefix: Some("/".to_string()),
+                        path: None,
+                        headers: vec![],
+                    },
+                    requires: crate::JwtRequirement {
+                        provider_name: "nope".to_string(),
+                    },
+                }],
+            };
+            assert!(matches!(
+                validate_jwt_authn_config(&cfg, "l0").unwrap_err(),
+                crate::ConfigError::JwtAuthnUnknownProvider { .. }
+            ));
+        }
+
+        #[test]
+        fn jwt_authn_validator_rejects_bad_jwks() {
+            let mut providers = std::collections::BTreeMap::new();
+            providers.insert(
+                "p1".to_string(),
+                crate::JwtProvider {
+                    issuer: "i".to_string(),
+                    audiences: vec![],
+                    local_jwks: crate::DataSource {
+                        filename: None,
+                        inline_string: Some("not json".to_string()),
+                    },
+                    forward: false,
+                },
+            );
+            let cfg = crate::JwtAuthnConfig {
+                providers,
+                rules: vec![],
+            };
+            assert!(matches!(
+                validate_jwt_authn_config(&cfg, "l0").unwrap_err(),
+                crate::ConfigError::JwtAuthnInvalidJwks { .. }
+            ));
+        }
+
+        #[test]
+        fn jwt_authn_validator_accepts_valid() {
+            let mut providers = std::collections::BTreeMap::new();
+            providers.insert(
+                "p1".to_string(),
+                crate::JwtProvider {
+                    issuer: "i".to_string(),
+                    audiences: vec![],
+                    local_jwks: crate::DataSource {
+                        filename: None,
+                        inline_string: Some(VALID_JWKS.to_string()),
+                    },
+                    forward: false,
+                },
+            );
+            let cfg = crate::JwtAuthnConfig {
+                providers,
+                rules: vec![crate::RequirementRule {
+                    r#match: crate::RouteMatch {
+                        prefix: Some("/".to_string()),
+                        path: None,
+                        headers: vec![],
+                    },
+                    requires: crate::JwtRequirement {
+                        provider_name: "p1".to_string(),
+                    },
+                }],
+            };
+            assert!(validate_jwt_authn_config(&cfg, "l0").is_ok());
+        }
     }
 
     mod jwt_authn_tests {
