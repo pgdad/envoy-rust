@@ -54,7 +54,7 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 | 5 | envoy-config schema + variant | **done** | `6d6a7f38e` | (this commit) |
 | 6 | envoy-config validator + arm + ConfigError | **done** | `f6b0fe418` | (this commit) |
 | 7 | envoy-filter JwtAuthnFilter + stats + wire map + BEHAVIOR_CONTRACT | **done** | `89420b608` | (this commit) |
-| 8 | HttpFilterInstance::JwtAuthn variant + dispatch | **dispatch landed in Task 7 (`89420b608`); dedicated instance test pending** | (in `89420b608`) | — |
+| 8 | HttpFilterInstance::JwtAuthn variant + dispatch | **done** (dispatch in `89420b608`; instance test in `767f2218c`) | `767f2218c` | (this commit) |
 | 9 | parse_bootstrap fuzz seed | pending | — | — |
 | 10 | fixture 0030 + Docker wrapper + static inputs | pending | — | — |
 | 11 | in-process backstop | pending | — | — |
@@ -162,3 +162,15 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 **Watch-outs:** the test needs a one-provider `JwtAuthnConfig` with a parseable inline JWKS — reuse the same real-RSA-JWKS helper approach the jwt_authn.rs tests use, OR a minimal structurally-valid RSA JWKS const (build_from_config calls `JwkSet::parse`, structural only — a minimal `{"keys":[{"kty":"RSA","kid":"k1","n":"sXche4iX","e":"AQAB"}]}` parses). Mirror the EXISTING per-variant instance build tests in `instance.rs` for style (`StatsRegistry::new()`, the `HttpFilter`/`HttpFilterTypedConfig` construction, `FilterRequest`/`FilterResponse` literals). Confirm the exact existing test signatures by reading the file. Clippy `-p envoy-filter` per task.
 
 **Commit shape:** one code commit `phase 22 Task 8: …` (just the test); controller does the PROGRESS commit.
+
+**Task 8 outcome (controller verification):** code commit `767f2218c` — `instance.rs` only (+67). Confirmed real shapes: `HttpFilter { name: String, typed_config: HttpFilterTypedConfig }`; `HttpFilterInstance::build(hf, &Arc<StatsRegistry>, hcm_stat_prefix) -> Result<Self, FilterError>`. Test `builds_jwt_authn_instance_and_dispatches` builds the `JwtAuthn` instance, asserts `matches!(.., JwtAuthn(_))`, missing-token `GET /` → `StopAndSend{401}`, `encode_headers` → `Continue`. `cargo test -p envoy-filter` 82/82; clippy clean. Not a centerpiece → controller diff-verification only.
+
+---
+
+## Task 9 preamble (pre-execution notes for the ninth state-3 subagent)
+
+**Goal:** add ONE `parse_bootstrap` fuzz seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_jwt_authn_filter.yaml` — a full minimal bootstrap with an H1 HCM whose `http_filters` is `[jwt_authn, router]` (one provider, inline RSA JWKS, one `prefix:"/"` rule) — that PARSES successfully. Wire it into the curated-seed allow-list + the in-test SUCCESS array.
+
+**Watch-outs (PLAN correction #7 — DO NOT trust a projected count):** (1) add `!corpus/parse_bootstrap/hcm_jwt_authn_filter.yaml` to `crates/envoy-config/fuzz/.gitignore` alongside the other `!corpus/parse_bootstrap/hcm_*_filter.yaml` allow entries. (2) READ the ACTUAL `fuzz_corpus_seeds_parse_or_reject_cleanly` test in `crates/envoy-config/src/bootstrap.rs` (grep for it; the PLAN guessed `:4270` but line numbers drifted +structs added in Task 5/6) — add `"fuzz/corpus/parse_bootstrap/hcm_jwt_authn_filter.yaml",` to its SUCCESS list, and if the test has a COUNT-assertion constant (e.g. asserts the corpus has N seeds), bump it by exactly 1. Read the test body; mirror whatever an existing `hcm_*_filter.yaml` seed entry (e.g. `hcm_fault_filter.yaml`) does — copy that bootstrap YAML shape and swap the filter to jwt_authn (the existing `hcm_fault_filter.yaml` is the closest template; read it). The inline JWKS must be one `JwkSet::parse` accepts AND `validate_jwt_authn_config` accepts (structural RSA JWKS) AND the whole bootstrap must pass `validate_http_filters` (so the issuer/provider_name/rule are coherent). Run `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → PASS. NOTE: this is a curated parse-seed (must PARSE), distinct from the Task-4 `envoy-jwt` fuzz corpus.
+
+**Commit shape:** one code commit `phase 22 Task 9: …`; controller does the PROGRESS commit.
