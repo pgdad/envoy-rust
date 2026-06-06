@@ -19,7 +19,9 @@ bytes = "1"
 thiserror = "2"
 envoy-config = { path = "../envoy-config" }
 envoy-stats = { path = "../envoy-stats" }
+envoy-jwt = { path = "../envoy-jwt" }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync"] }
 serde_yaml = "0.9"
+aws-lc-rs = "1.16"

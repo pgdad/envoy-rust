@@ -332,6 +332,88 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 
 **The L3 Envoy-only enumeration paragraph (EDS).** After a successful initial load Envoy emits a fuller `cluster.<name>.` EDS-related family; envoy-rust emits the **4** `update_*` names above (+ the unconditional `upstream_rq_total` witness). The Envoy-only unasserted names (ignored by fixture 0029's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `update_no_rebuild`, `update_rejected` (structurally unreachable in envoy-rust — the all-fatal posture, L4), `update_time`, `update_duration` (histogram), `membership_change`, `membership_healthy`, `membership_total`, `membership_degraded` (`degraded`), `membership_excluded` (`excluded`), `assignment_stale`/`assignment_timeout_received`/`assignment_use_cached` (`assignment_*`), `version`, `version_text`, `warming_state`. (None of the 4 emitted `update_*` values change pre- vs post-GET — request counters live under the other `cluster.<name>.*` names.)
 
+**22 entries (jwt_authn filter):**
+
+> The HTTP-filter-family continuation (ADR-0055 SPEC / ADR-0056 PLAN). The
+> `envoy.filters.http.jwt_authn` filter is a decode-side authentication gate:
+> it selects the first `rules[]` entry whose `RouteMatch` matches the request,
+> extracts the JWT from `Authorization: Bearer`, verifies RS256 against the
+> rule's provider JWKS, and validates `iss`/`aud`/`exp`/`nbf` (the `envoy-jwt`
+> crate). On success → `Decision::Continue` + `allowed` increment + (when the
+> provider's `forward` is `false`, the Envoy default) the `Authorization`
+> header is stripped upstream (§6.2 L6). On failure → `denied` increment + a
+> `Decision::StopAndSend` 401/403 local reply (the Envoy-faithful body + a
+> `www-authenticate` header). A request matching **no** rule is allowed and
+> ticks `allowed` (§6.2 L4). The 2 stats live under the HCM-embedded
+> `http.<hcm_stat_prefix>.jwt_authn.*` namespace — the same threading as RBAC
+> (phase 10) and Fault (phase 11), sourced from the parent HCM's `stat_prefix`
+> (the jwt_authn filter has no `stat_prefix` field of its own). All derived
+> from the §6.2 empirical lock-in (verified against `envoyproxy/envoy:v1.33.0`;
+> differential fixture 0030). Envoy emits a fuller `http.<prefix>.jwt_authn.*`
+> family; envoy-rust's minimum-viable subset is **2 names**.
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `http.<hcm_stat_prefix>.jwt_authn.allowed` | value-exact | Counter; one increment per request the filter lets through. Two pass paths both tick it: (a) a rule matched AND the JWT verified+validated successfully; (b) **no rule matched** the request (the §6.2 L4 pass-through — an unmatched request is not subject to any JWT requirement at minimum scope). Incremented synchronously in `JwtAuthnFilter::decode_headers` before returning `Decision::Continue`. Never ticks on a denied (401/403) request. Upstream Envoy v1.33 emits the same name at the `http.<prefix>.jwt_authn.*` namespace; the no-rule pass-through folds into Envoy's allowed count identically. |
+| `http.<hcm_stat_prefix>.jwt_authn.denied` | value-exact | Counter; one increment per request the filter rejects. Ticks on **every** failure class: each 401 (missing/non-Bearer token, NotInForm, BadHeaderJson, BadPayloadJson, NoMatchingKey, VerificationFails, IssuerMismatch, Expired, NotYetValid) **and** the single 403 (AudienceNotAllowed). Incremented synchronously before constructing the `Decision::StopAndSend(FilterResponse)` local reply. Both proxies emit one increment per denied request. |
+
+> **Envoy-only sibling stats (unasserted, NOT broadened).** Upstream Envoy
+> emits 5 additional `http.<prefix>.jwt_authn.*` siblings that envoy-rust does
+> **NOT** emit at minimum scope (per §6.2 L5): `cors_preflight_bypassed`,
+> `jwks_fetch_success`, `jwks_fetch_failed`, `jwt_cache_hit`, `jwt_cache_miss`.
+> The last four belong to the deferred remote-JWKS + JWT-cache features (local
+> inline JWKS only at phase-22 scope); `cors_preflight_bypassed` belongs to the
+> deferred CORS-preflight bypass. These are **Envoy-only-unasserted** — fixture
+> 0030's named-stat scrape lists only the 2 emitted names, so there is **no
+> set-diff** on the scrape (the harness asserts the named values, not set
+> equality of the `jwt_authn.*` sub-scope), and the 5 siblings need no
+> allow-list entry.
+
+**Response body — jwt_authn 401/403 local replies**
+
+> The §6.2 L2 failure-class → HTTP-wire mapping. Each `envoy-jwt` `JwtError`
+> class (plus the filter-local missing/non-Bearer case) maps to a fixed HTTP
+> status + a byte-exact response body + a `www-authenticate` header. Bodies are
+> the upstream Envoy v1.33 source-hardcoded strings (§6.2 L2 verified against
+> `envoyproxy/envoy:v1.33.0`); they carry **NO trailing newline** and the local
+> reply sets `content-type: text/plain`. **Equivalence = byte-exact body +
+> status + `www-authenticate` value.** Emitted by `error_reply` / `missing_reply`
+> in `crates/envoy-filter/src/jwt_authn.rs`.
+
+| Failure class | Status | Body (byte-exact) | Body length | `www-authenticate` |
+|---|---|---|---|---|
+| Missing token / non-Bearer Authorization | 401 | `Jwt is missing` | 14 | `Bearer realm="{realm}"` (NO `error=`) |
+| NotInForm | 401 | `Jwt is not in the form of Header.Payload.Signature with two dots and 3 sections` | 79 | `Bearer realm="{realm}", error="invalid_token"` |
+| BadHeaderJson | 401 | `Jwt header is an invalid JSON` | 29 | `…, error="invalid_token"` |
+| BadPayloadJson | 401 | `Jwt payload is an invalid JSON` | 30 | `…, error="invalid_token"` |
+| NoMatchingKey | 401 | `Jwks doesn't have key to match kid or alg from Jwt` | 50 | `…, error="invalid_token"` |
+| VerificationFails | 401 | `Jwt verification fails` | 22 | `…, error="invalid_token"` |
+| IssuerMismatch | 401 | `Jwt issuer is not configured` | 28 | `…, error="invalid_token"` |
+| Expired | 401 | `Jwt is expired` | 14 | `…, error="invalid_token"` |
+| NotYetValid | 401 | `Jwt not yet valid` | 17 | `…, error="invalid_token"` |
+| AudienceNotAllowed | **403** | `Audiences in Jwt are not allowed` | 32 | `…, error="invalid_token"` |
+
+> Only the missing/non-Bearer case omits `error="invalid_token"` (it is a
+> credentials-absent, not a credentials-invalid, condition per RFC 6750
+> §3.1); every other class carries `www-authenticate: Bearer realm="{realm}",
+> error="invalid_token"`. The `JwtError::InvalidJwks` class is config-load-time
+> fatal (ADR-0049 all-fatal posture — the process never reaches a request with
+> an unparseable JWKS), so it has no request-time wire mapping; the filter folds
+> it defensively into the `Jwt verification fails` 401 row, but it is
+> structurally unreachable at request time. The 401 reply sets reason
+> `Unauthorized`; the single 403 reply sets reason `Forbidden`.
+
+**The `www-authenticate` value-exact paragraph (L3).** The `www-authenticate`
+header is **value-exact across proxies** — it is NOT on the response-header
+allow-list (it is compared byte-for-byte by `set_equal_modulo_allow_list`). The
+realm is reproduced byte-for-byte as `http://<Host-header><path>`, and the
+differential fixture 0030 drives a **fixed** `Host: envoy.test` (§6.2 L3) so the
+realm is deterministic across proxies (`http://envoy.test<path>`). The
+`Authorization`-stripping on the success path (§6.2 L6, `forward: false` default)
+is observed upstream as the absence of the request header — the differential
+fixture's echo-backend reflects request headers so the strip is bilaterally
+witnessed.
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments

@@ -20,6 +20,7 @@ use envoy_stats::StatsRegistry;
 use crate::error::FilterError;
 use crate::fault::FaultFilter;
 use crate::header_mutation::HeaderMutationFilter;
+use crate::jwt_authn::JwtAuthnFilter;
 use crate::local_rate_limit::LocalRateLimitFilter;
 use crate::pipeline::Decision;
 use crate::rbac::RbacFilter;
@@ -41,6 +42,13 @@ pub enum HttpFilterInstance {
     /// status; 1 stat counter registered under
     /// `http.{hcm_stat_prefix}.fault.aborts_injected` at build time).
     Fault(FaultFilter),
+    /// Phase-22 Task 7: the `envoy.filters.http.jwt_authn` filter (decode-side
+    /// authentication gate; selects the first matching rule, verifies the
+    /// `Authorization: Bearer` RS256 JWT against the provider JWKS, and
+    /// short-circuits failures with a 401/403 local reply; 2 stat counters
+    /// registered under `http.{hcm_stat_prefix}.jwt_authn.{allowed,denied}` at
+    /// build time).
+    JwtAuthn(JwtAuthnFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -99,6 +107,9 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::Fault(cfg) => Ok(HttpFilterInstance::Fault(
                 FaultFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
             )),
+            envoy_config::HttpFilterTypedConfig::JwtAuthn(cfg) => Ok(HttpFilterInstance::JwtAuthn(
+                JwtAuthnFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
+            )),
         }
     }
 
@@ -109,6 +120,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::LocalRateLimit(f) => f.decode_headers(req),
             HttpFilterInstance::Rbac(f) => f.decode_headers(req),
             HttpFilterInstance::Fault(f) => f.decode_headers(req),
+            HttpFilterInstance::JwtAuthn(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -125,6 +137,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::LocalRateLimit(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Rbac(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Fault(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::JwtAuthn(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]

@@ -413,8 +413,10 @@ dependencies = [
 name = "envoy-filter"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "envoy-config",
+ "envoy-jwt",
  "envoy-stats",
  "serde_yaml",
  "thiserror",
