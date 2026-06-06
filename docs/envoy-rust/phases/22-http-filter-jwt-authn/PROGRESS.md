@@ -1,0 +1,76 @@
+# Phase 22 (`22-http-filter-jwt-authn`) — PROGRESS
+
+> Running log, updated on each task completion (one PROGRESS commit per task,
+> after the task's code commit). State-2 PLAN-write landed `PLAN.md` + this
+> skeleton + the Task-1 preamble in one standalone pre-Task-1 commit (the
+> 06.2 → 21 cadence). State-3 executes Tasks 1–11 via
+> `superpowers:subagent-driven-development` (SERIAL dispatch,
+> `feedback_serial_subagent_dispatch`; TDD per task; clippy PER TASK per
+> `project_state3_arc_skips_clippy`). State-4 runs Task 12
+> (`superpowers:verification-before-completion`).
+
+---
+
+## State-2 PLAN-write summary
+
+- **Predecessor HEAD:** `7b0281d6b` (phase-22 state-1 brainstorm). This PLAN-write commit is the next; it flips ROADMAP row `22` `planned → in-progress` (invariant 4.1.3) and advances STATE to `22` state-2-complete / state-3-next.
+- **Split-gate (§6.1): NOT triggered → SINGLE-PHASE.** The §6.2 crypto-API resolution (lock-in L1) found the CLEAN `aws_lc_rs::rsa::PublicKeyComponents::verify` path (no DER assembly, no feature flag, ~15 LoC) — the swing factor resolved small. The PLAN is 12 tasks / ~1350–1500 LoC, inside the ~25-task / ~1500-LoC gate. **ADR-0057 (split) does NOT fire.**
+- **ADR-0056 FIRES** (the §6.2 empirical reconciliation — appended to DECISIONS.md at this commit). Multiple material divergences from the SPEC projections (see the lock-in summary below).
+
+## §6.2 empirical lock-ins (LOCAL Docker, `envoyproxy/envoy:v1.33.0` digest `sha256:56da5afd…`, 2026-06-06)
+
+The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
+
+- **L1 (crypto API):** `PublicKeyComponents { n, e }.verify(&RSA_PKCS1_2048_8192_SHA256, msg, sig)` — direct, no DER. Constraints: modulus **2048..=8192 bits** (test key MUST be RSA-2048); strip leading `0x00` from `n`/`e`.
+- **L2 (failure taxonomy):** 10 byte-exact classes. **Audience-not-allowed → 403** (all others 401). Body strings corrected vs SPEC §2.2 ("Jwt header is an invalid **JSON**", not "JWT"; issuer → "Jwt issuer is not configured"; malformed-form → the 79-byte "…two dots and 3 sections"; unsupported-alg folds into "Jwks doesn't have key to match kid or alg from Jwt").
+- **L3 (`www-authenticate`):** DYNAMIC = `Bearer realm="http://<Host-header><path>"` (+ `, error="invalid_token"` for all non-missing classes). Reproducible byte-exact → value-exact with a fixed-Host fixture.
+- **L4:** no-matching-rule → ALLOW (200, counts in `allowed`).
+- **L5:** stat namespace `http.<hcm_stat_prefix>.jwt_authn.{allowed,denied}` CONFIRMED; 5 Envoy-only siblings unasserted.
+- **L6:** `forward` default `false` ⇒ strip `Authorization` on success.
+- **L7:** `aud` is `string | string[]`; empty provider audiences ⇒ no aud check.
+
+## PLAN-write SPEC corrections (mechanical drift flagged against HEAD `7b0281d6b`)
+
+1. **`DataSource` ALREADY EXISTS** at `crates/envoy-config/src/bootstrap.rs:556` (`{ filename, inline_string }`) — REUSE for `local_jwks` (SPEC §D2 left this open; resolved: do NOT author a new type).
+2. **`RouteMatch`** at `bootstrap.rs:1386` is `{ prefix: Option<String>, path: Option<String>, headers: Vec<HeaderMatcher> }`; its HCM evaluator `route_matches` (`crates/envoy-http1/src/hcm.rs:1248`) is H1-private — the filter re-implements the same ~6-line prefix-XOR-path + AND-headers logic over `FilterRequest` (Task 7 `route_match_matches`; `HeaderMatcher::matches` at `matcher.rs:19` is public and reused).
+3. **`HttpFilterTypedConfig`** at `bootstrap.rs:692` is `#[serde(tag="@type", deny_unknown_fields)]` with 5 variants — a jwt_authn `@type` currently FAILS TO PARSE (unknown variant); adding the variant IS the enablement (there is no separate runtime reject-list to remove; the per-arm `f.name` check in `validate_http_filters` at `bootstrap.rs:2628` is the only name guard). Task 1 should grep for any existing `jwt_authn` reject test to update.
+4. **Fixture number is `0030`** (29 pre-existing 0001–0029). (A recon agent transiently mislabeled it `0022`; the SPEC + this PLAN use `0030`.)
+5. **`build_from_config(cfg, &Arc<StatsRegistry>, &str)`** — the phase-10 3-arg `hcm_stat_prefix` threading is reused UNCHANGED (no signature widening); confirmed against `fault.rs:39` + `instance.rs:74`.
+6. **aws-lc-rs TEST signing API** (`RsaKeyPair::generate` / `public_key().as_be_bytes()` for `PublicKeyComponents<Vec<u8>>`) is the ONE detail to confirm at Task-3 authoring — the *production* verify path (`PublicKeyComponents::verify`) is confirmed (L1). If method names differ in 1.16.3, adjust the test helper only.
+7. **Fuzz corpus count:** the `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array currently lists ~28 named seeds (+ `minimal.yaml`); the SPEC's "32→33" counts the full curated corpus differently. Task 9 reads the actual test + `.gitignore` and increments BOTH the allow-list and the SUCCESS array (and any in-test count constant) correctly — do not trust a projected number.
+8. **`http1_probe_list` driver** key + `extra_headers` shape: confirm the exact serde key against `tests/differential/src/lib.rs` (`Http1ProbeList`/`Http1Probe`) at Task-10 authoring.
+
+---
+
+## Task ledger
+
+| Task | Title | State | Code commit | PROGRESS commit |
+|---|---|---|---|---|
+| — | state-2 PLAN-write (PLAN.md + this skeleton + Task-1 preamble + ADR-0056) | **done (this commit)** | — | — |
+| 1 | envoy-jwt scaffold + base64url | pending | — | — |
+| 2 | envoy-jwt JWKS parse | pending | — | — |
+| 3 | envoy-jwt RS256 verify + claim validation | pending | — | — |
+| 4 | envoy-jwt fuzz target | pending | — | — |
+| 5 | envoy-config schema + variant | pending | — | — |
+| 6 | envoy-config validator + arm + ConfigError | pending | — | — |
+| 7 | envoy-filter JwtAuthnFilter + stats + wire map + BEHAVIOR_CONTRACT | pending | — | — |
+| 8 | HttpFilterInstance::JwtAuthn variant + dispatch | pending | — | — |
+| 9 | parse_bootstrap fuzz seed | pending | — | — |
+| 10 | fixture 0030 + Docker wrapper + static inputs | pending | — | — |
+| 11 | in-process backstop | pending | — | — |
+| 12 | state-4 verification + STATE advance | pending | — | — |
+
+---
+
+## Task 1 preamble (pre-execution notes for the first state-3 subagent)
+
+**Goal:** create the `envoy-jwt` workspace member (crate root `#![forbid(unsafe_code)]`, D-3.8 — no exemption; `aws-lc-rs` encapsulates its FFI internally), the `JwtError` taxonomy, and the hand-rolled base64url decoder, all green via TDD.
+
+**Watch-outs:**
+- Add ONLY `"crates/envoy-jwt",` to the workspace `members` in Task 1; add `"crates/envoy-jwt/fuzz",` in Task 4 (the dir must exist for the member to resolve).
+- `lib.rs` declares `mod jwks;` + `mod verify;` which Tasks 2/3 fill — Task 1 commits minimal stubs so each commit stays green (PLAN Task 1 Step 5 note), OR the executor may fold Tasks 1–3 into one commit (one crate) — reviewer's call; the PLAN keeps them separate for granularity.
+- base64url: reject `=` padding and any non-`[A-Za-z0-9-_]` char (JWT/JWKS are unpadded URL-safe). Tests cover known vectors + rejection.
+- `edition = "2024"` (matches `envoy-health`); `aws-lc-rs = "1.16"` default features (L1 — no feature flag needed).
+- Per `project_state3_arc_skips_clippy`, run `cargo clippy -p envoy-jwt --all-targets -- -D warnings` before the Task-1 commit.
+
+**Commit shape:** one code commit `phase 22 Task 1: …` then one PROGRESS commit updating this ledger row + appending a Task-2 preamble.
