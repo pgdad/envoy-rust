@@ -3,7 +3,6 @@
 
 /// Decode an unpadded base64url string. Rejects `=` padding and any character
 /// outside the URL-safe alphabet (`A-Za-z0-9-_`).
-#[allow(dead_code)]
 pub(crate) fn decode(s: &str) -> Result<Vec<u8>, ()> {
     fn val(c: u8) -> Option<u32> {
         Some(match c {
