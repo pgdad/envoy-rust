@@ -60,7 +60,7 @@ jobs:
         run: cargo deny check
 
   fuzz:
-    name: fuzz (parse_bootstrap, 30s)
+    name: fuzz (parse_bootstrap + jwt_parse, 30s each)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -71,10 +71,12 @@ jobs:
         with:
           components: rust-src
 
-      - name: cargo cache (fuzz subcrate)
+      - name: cargo cache (fuzz subcrates)
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "crates/envoy-config/fuzz -> target"
+          workspaces: |
+            crates/envoy-config/fuzz -> target
+            crates/envoy-jwt/fuzz -> target
 
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -85,3 +87,9 @@ jobs:
         # (which pins stable 1.95.0); cargo-fuzz requires nightly for
         # -Zsanitizer and sancov flags.
         run: cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30
+
+      - name: fuzz jwt_parse
+        working-directory: crates/envoy-jwt
+        # Phase-22 §7.4 fuzz target over the JWKS/JWT parse + RS256-verify
+        # surface (the envoy-jwt crate). Same `+nightly` rationale as above.
+        run: cargo +nightly fuzz run jwt_parse -- -max_total_time=30

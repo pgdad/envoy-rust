@@ -234,8 +234,20 @@ mod tests {
             "RS256",
             r#"{"iss":"testing@secure.istio.io","exp":4102444800}"#,
         );
-        tok.pop();
-        tok.push(if tok.ends_with('A') { 'B' } else { 'A' });
+        // Corrupt the signature's FIRST base64url char (its value owns the top
+        // 6 bits of signature byte 0, so a guaranteed-different replacement
+        // always alters the decoded signature). NOT the last char: a 256-byte
+        // RSA signature's final base64url char carries only 2 meaningful bits,
+        // so replacing it can be a no-op under non-canonical-tolerant base64url
+        // decoding (~1/4 of random keys) — which made the previous
+        // `pop()`+`push('A'/'B')` tamper flaky.
+        let sig_start = tok.rfind('.').unwrap() + 1;
+        let repl = if tok.as_bytes()[sig_start] == b'A' {
+            'B'
+        } else {
+            'A'
+        };
+        tok.replace_range(sig_start..sig_start + 1, &repl.to_string());
         assert_eq!(
             verify_rs256(&tok, &set, ISS, &[], 1_700_000_000).unwrap_err(),
             JwtError::VerificationFails

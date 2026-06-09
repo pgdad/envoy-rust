@@ -216,3 +216,41 @@ The full table lives in `PLAN.md` (L1–L7) + ADR-0056. Headlines:
 All 11 implementation tasks landed + verified this session (the phase-13.2/19/20/21 single-session-arc shape; here single-session). Code commits: T1 `745cf8da1` / T2 `ea02c3b7d` / T3 `747590a2e` (centerpiece #1, spec+quality APPROVED) / T4 `e514d88f2` / T5 `6d6a7f38e` / T6 `f6b0fe418` / T7 `89420b608` (centerpiece #2 + folded T8 dispatch, spec+quality APPROVED) / T8 `767f2218c` / T9 `010cc48af` / T10 `dd5d288de` (**fixture 0030 differential GREEN vs Envoy v1.33.0; all 5 probes byte-identical; www-authenticate value-exact**) / T11 `a0fdaa04a`. New crate `envoy-jwt` (leaf, `aws-lc-rs` RS256). All per-task clippy clean; `cargo build --workspace` green; the differential proof landed. **Plan corrections logged: #7 (fuzz SUCCESS array 27→28, not the projected 32→33), #8 (real harness YAML shapes `{kind: byte_exact, body}`/`set_equal_modulo_allow_list`), #9 (fuzz crate is `exclude` not member), #10 (fuzz Cargo.lock untracked).** Plan-ordering note: T5's config-enum variant broke `envoy-filter`'s `instance.rs` exhaustive match → T7 folded in the T8 dispatch wiring to restore the green build (run `cargo build --workspace` at config-variant tasks).
 
 **STATE advanced to `22` state-3-complete / state-4-next.** Per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session) + the PLAN's Task-12 header ("the state-4 session's task, NOT part of the state-3 execution arc"), **Task 12 (the state-4 §7.5 phase-done verification via `superpowers:verification-before-completion`) is the NEXT session.** It runs the FULL gate suite (`cargo build --workspace --all-targets`; workspace clippy `--all-features`; fmt; `cargo test --workspace`; `cargo deny check` over the now-direct `aws-lc-rs`; `cargo build -p envoy-jwt` + `-p envoy-filter` standalone per `project_isolated_crate_build_blindspot`; the `jwt_parse` + `parse_bootstrap` short-budget fuzz; the Docker-gated differential across all 30 fixtures 0001–0030 + h2spec ≥95% on Linux CI), quotes outputs into this PROGRESS, and advances STATE to state-4-complete / state-5-next. The state-5 code review is a SEPARATE later session.
+
+---
+
+## Task 12 — STATE-4 PHASE-DONE VERIFICATION (`superpowers:verification-before-completion`)
+
+> The state-4 session. Re-runs the full §7.5 gate suite (it does NOT re-implement
+> or re-pick — scope locked by ADR-0055; L1–L7 locked by ADR-0056). Predecessor
+> HEAD entering this session = `98a0c745f` (the state-3 arc-complete commit).
+
+### In-arc defect found at the gate + fixed (flaky tamper test — TEST-ONLY, no ADR)
+
+The first `cargo test --workspace` run failed `envoy-filter` `jwt_authn::tests::tampered_signature_401_verification_fails` ("expected StopAndSend" — the tampered token *verified*). Routed through `superpowers:systematic-debugging`:
+
+- **Root cause (confirmed analytically + empirically — ~20–25% flake):** the test (and its twin `envoy-jwt` `verify::tests::tampered_signature_fails`) tampered a token by replacing the **last** base64url char of the signature with `'A'`/`'B'`. An RSA-2048 signature is 256 bytes; its final base64url char carries only **2 meaningful bits** (the other 4 are discarded by the non-canonical-tolerant `base64url::decode`, which is correct/standard). Both `'A'`(0) and `'B'`(1) contribute top-2-bits `00`, so whenever the random signature's last byte ≡ 0 mod 4 the "tampered" token decodes to the **byte-identical** signature → verifies OK → `Continue`. Reproduced: **40/200 (20%)** failures on the unfixed `envoy-filter` test (the lenient decoder confirmed at `crates/envoy-jwt/src/base64url.rs`; the canonical test encoder confirmed at the `b64url` helpers).
+- **Not a production defect, no divergence, no ADR:** the production verify path + the lenient decoder are correct (accepting a re-encoded *valid* signature is not a forgery). The static fixture-0030 `tampered.jwt` is genuinely tampered (valid ends `…HGjRSQ` / `'Q'` low-2-bits `01` → flipped to `'B'` `00` → last byte changes → real failure; proven by Task-10's green differential on both proxies). Only the two **dynamic-keypair unit tests** were flaky.
+- **Fix (deterministic, all three sites):** tamper the signature's **first** base64url char instead (its value owns the top 6 bits of signature byte 0, so a guaranteed-different replacement always alters the decoded signature). Applied to `crates/envoy-filter/src/jwt_authn.rs`, `crates/envoy-jwt/src/verify.rs`, and the fixture generator `tests/fixtures/0030-http-filter-jwt-authn/inputs/gen.sh` (the latter forward-safe — the committed proven-green tokens are NOT regenerated). **Verified: 0/250 failures on each fixed test.** Test-only change; no production code, no behavior/contract change → no ADR.
+- **Second gate hiccup (infra, not a regression):** `envoy-bin` `upstream_h2_connection_pooling` (a phase-13.2 backstop, untouched by phase 22) timed out at the 30s backend-readiness budget — because the mid-gate source edits invalidated the build cache and the test's in-process `cargo run --manifest-path http2-echo-server` recompiled the stale chain (`envoy-config`, etc.) on demand. This is the documented `project_flaky_access_log_fixture_0012` "pre-build `tests/helpers/*` first" requirement (CI builds everything before `cargo test`). Resolved by rebuilding the workspace post-edit; the helper `cargo run` then started in ~1s and the full non-Docker suite went green.
+
+### §7.5 local gate outputs (HEAD post-fix; macOS, toolchain 1.95.0 pin + nightly for fuzz)
+
+| Gate | Command | Result |
+|---|---|---|
+| build (e) | `cargo build --workspace --all-targets` | **exit 0** — `Finished` |
+| clippy (e) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **exit 0** — clean (4m52s post-fix) |
+| fmt (e) | `cargo fmt --all -- --check` | **exit 0** — no diff |
+| test (e) | `cargo test --workspace --exclude differential --exclude h2spec-conformance` | **exit 0** — **1051 passed; 0 failed** (the Docker `differential` + `h2spec-conformance` crates are the Linux-CI authority per Step 2) |
+| deny (e) | `cargo deny check` | **exit 0** — `advisories ok, bans ok, licenses ok, sources ok` (the now-DIRECT `aws-lc-rs` is admitted — already transitive; only benign `license-not-encountered` warnings) |
+| isolated | `cargo build -p envoy-jwt` / `-p envoy-filter` | **exit 0 / exit 0** (`project_isolated_crate_build_blindspot`) |
+| fuzz (d) | `cargo +nightly fuzz run jwt_parse -- -max_total_time=30` | **exit 0** — **6,726,209 runs / 0 crashes** (the NEW §7.4 target) |
+| fuzz (d) | `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` | **exit 0** — **299,659 runs / 0 crashes** |
+
+Remaining gates (a)(b)(c) — the Docker-gated differential across all 30 fixtures (0001–0030) + `h2spec` ≥95% — run on Linux CI (Step 2 below).
+
+### Step 2 — single green CI run (gates a–e simultaneously over 30 fixtures)
+
+CI workflow `.github/workflows/ci.yml` (this commit also wires the NEW **`jwt_parse`** fuzz job into the `fuzz` job — required for gate (d) on the new target; `crates/envoy-config/fuzz/Cargo.lock` carries the now-transitive `aws-lc-rs` pulled in via the `envoy-config → envoy-jwt` path-dep). The `build` job runs fmt → clippy → build → `cargo test --workspace` (**includes the Docker differential over all 30 fixtures + h2spec**) → `cargo deny check`; the `fuzz` job runs `parse_bootstrap` + `jwt_parse`.
+
+**CI anchor: _recorded at the STATE-advance commit below (Step 3) once the run is green._**

@@ -47,16 +47,22 @@ mk_jwt '{"iss":"testing@secure.istio.io","aud":["jwt-fixture-aud"],"exp":4102444
 mk_jwt '{"iss":"testing@secure.istio.io","aud":["jwt-fixture-aud"],"exp":1500000000}' "$HERE/expired.jwt"
 mk_jwt '{"iss":"testing@secure.istio.io","aud":["other-aud"],"exp":4102444800}'        "$HERE/wrong_aud.jwt"
 
-# 4. tampered.jwt: copy valid.jwt and flip its LAST signature char to a
+# 4. tampered.jwt: copy valid.jwt and flip its FIRST signature char to a
 #    DIFFERENT valid base64url char (still base64url-decodable, but the
-#    signature no longer verifies).
+#    signature no longer verifies). The FIRST sig char's value owns the top 6
+#    bits of signature byte 0, so a guaranteed-different replacement always
+#    alters the decoded signature. NOT the LAST char: a 256-byte RSA signature's
+#    final base64url char carries only 2 meaningful bits (the rest are discarded
+#    by non-canonical-tolerant base64url decoding), so flipping it can be a
+#    no-op for ~1/4 of fresh keys — which would make a regenerated tampered.jwt
+#    silently verify.
 python3 - "$HERE/valid.jwt" "$HERE/tampered.jwt" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 t = open(src).read()
-last = t[-1]
-repl = 'B' if last != 'B' else 'C'   # any different valid base64url char
-open(dst, 'w').write(t[:-1] + repl)
+i = t.rfind('.') + 1                  # first char of the signature segment
+repl = 'B' if t[i] == 'A' else 'A'    # guaranteed-different valid base64url char
+open(dst, 'w').write(t[:i] + repl + t[i + 1:])
 PY
 
 # 5. Sanity: each token has exactly 3 non-empty dot-segments.
