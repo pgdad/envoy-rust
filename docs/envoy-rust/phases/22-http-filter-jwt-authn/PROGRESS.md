@@ -253,4 +253,8 @@ Remaining gates (a)(b)(c) — the Docker-gated differential across all 30 fixtur
 
 CI workflow `.github/workflows/ci.yml` (this commit also wires the NEW **`jwt_parse`** fuzz job into the `fuzz` job — required for gate (d) on the new target; `crates/envoy-config/fuzz/Cargo.lock` carries the now-transitive `aws-lc-rs` pulled in via the `envoy-config → envoy-jwt` path-dep). The `build` job runs fmt → clippy → build → `cargo test --workspace` (**includes the Docker differential over all 30 fixtures + h2spec**) → `cargo deny check`; the `fuzz` job runs `parse_bootstrap` + `jwt_parse`.
 
-**CI anchor: _recorded at the STATE-advance commit below (Step 3) once the run is green._**
+**CI anchor — GREEN:** run **`27179560746`** (workflow `ci`, `event: push`), HEAD **`04b9e97c4fb83409055686b255766894f89f2f8f`**, `2026-06-09T02:14:10Z → 02:18:19Z`, `conclusion: success`. Both jobs green:
+- **`build + test + lint`** — fmt + clippy + `cargo build --workspace --all-targets` + `cargo test --workspace` (**includes the Docker differential harness over all 30 fixtures 0001–0030 against `envoyproxy/envoy:v1.33.0`**) + `cargo deny check`. Load evidence: `test http_filter_jwt_authn_fixture ... ok` (**fixture 0030 differential GREEN on Linux**), `test http_filter_jwt_authn_in_process_backstop ... ok`, `test h2spec_pass_rate_gate ... ok` (**h2spec ≥95% gate met**). Zero `FAILED` lines in the full 20,545-line run log.
+- **`fuzz (parse_bootstrap + jwt_parse, 30s each)`** — both targets clean (the NEW `jwt_parse` §7.4 target wired this commit; gate (d)).
+
+All six §7.5 gates (a)–(f-pending-review) are satisfied: (a) the new fixture 0030 is green; (b) all 29 pre-existing fixtures still green; (c) h2spec ≥95%; (d) both fuzzers clean for their short-budget CI run; (e) build/clippy/fmt/test/deny all clean. Gate (f) `REVIEW.md` is the SEPARATE state-5 session. **STATE advanced to `22` state-4-complete / state-5-next at the docs-only commit recording this anchor.**
