@@ -467,6 +467,21 @@ async fn run_attempt(
             };
             match send_result {
                 Ok(upstream_response) => {
+                    // 23 D8.1: if the upstream responded with `Connection: close`
+                    // (e.g. the http1-echo-server, which sets it unconditionally),
+                    // the upstream peer has closed / will close the TCP connection
+                    // after this response. Invalidate a pooled stream so Drop
+                    // destroys it instead of returning it to the idle list — a
+                    // stale connection in the idle list causes the next request to
+                    // read UnexpectedEof. Matches Envoy's connection-management
+                    // behaviour: upstream `Connection: close` signals single-use.
+                    let upstream_close = upstream_response.headers.iter().any(|(n, v)| {
+                        n.eq_ignore_ascii_case(headers::CONNECTION)
+                            && v.eq_ignore_ascii_case("close")
+                    });
+                    if upstream_close && let StreamHandle::Pooled(g) = &mut handle {
+                        g.invalidate();
+                    }
                     let elapsed_ms = start.elapsed().as_millis();
                     let response = crate::router::construct_proxied_response(
                         upstream_response,
@@ -1406,7 +1421,7 @@ fn synth_overflow(close: bool) -> Response {
     }
 }
 
-/// Decorate a filter-synth response with the 5 standard HTTP/1.1 response
+/// Decorate a filter-synth response with the standard HTTP/1.1 response
 /// headers (`server`, `date`, `content-length`, `content-type`, `connection`)
 /// per phase-09 ADR-0033. Called from both writer-arm sites where a filter
 /// emits `Decision::StopAndSend` (decode-side `RequestPath::SynthFromDecode`
@@ -1424,12 +1439,14 @@ fn synth_overflow(close: bool) -> Response {
 /// - `content-length` is ALWAYS set from `resp.body.len()` (overwrites any
 ///   filter-provided value). The filter's body is the source of truth; a
 ///   stale filter-provided `content-length` would corrupt downstream parsing.
-/// - `server`, `date`, `content-type`, `connection` are added only-if-missing
-///   (case-insensitive name check) — matches the 06.1 D1 / 08.1 D1 dedupe
-///   precedent at `crates/envoy-admin/src/handler.rs::serialize_response`.
-///   If a filter chooses to set its own `server`/`date`/`content-type`/
-///   `connection` (e.g., a `server: my-proxy` override), the filter's value
-///   wins; the decorator does not override.
+/// - `server`, `date`, `connection` are added only-if-missing (case-insensitive
+///   name check) — matches the 06.1 D1 / 08.1 D1 dedupe precedent at
+///   `crates/envoy-admin/src/handler.rs::serialize_response`. If a filter
+///   chooses to set its own value (e.g., `server: my-proxy`), the filter wins.
+/// - `content-type` is added only-if-missing AND only when the body is
+///   non-empty. Empty-body local replies (e.g. CORS preflight 200) get no
+///   `content-type` — matching Envoy v1.33 empirical behaviour confirmed by
+///   fixture 0031 §6.2 verification.
 ///
 /// Symmetric to `synth_status` at lines 866-887 — same defaults
 /// (`DEFAULT_SERVER_NAME`, `DEFAULT_CONTENT_TYPE`, `now_imf_fixdate()`,
@@ -1449,11 +1466,25 @@ fn decorate_filter_synth_response(resp: &mut Response, close: bool) {
         resp.headers
             .push((headers::CONTENT_LENGTH.to_string(), cl_value));
     }
-    // server / date / content-type / connection: add only-if-missing.
-    let standards: [(&str, String); 4] = [
+    // server / date / connection: add only-if-missing (always).
+    // content-type: add only-if-missing AND only when the body is non-empty —
+    // upstream Envoy v1.33 does not emit content-type on empty-body local
+    // replies (e.g. the CORS preflight 200). The §6.2 empirical verification
+    // for fixture 0031-http-filter-cors confirms: upstream returns no
+    // content-type header when body length is 0.
+    let has_content_type = resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(headers::CONTENT_TYPE));
+    if !has_content_type && !resp.body.is_empty() {
+        resp.headers.push((
+            headers::CONTENT_TYPE.to_string(),
+            DEFAULT_CONTENT_TYPE.to_string(),
+        ));
+    }
+    let standards: [(&str, String); 3] = [
         (headers::SERVER, DEFAULT_SERVER_NAME.to_string()),
         (headers::DATE, now_imf_fixdate()),
-        (headers::CONTENT_TYPE, DEFAULT_CONTENT_TYPE.to_string()),
         (headers::CONNECTION, connection_value(close).to_string()),
     ];
     for (name, value) in standards {
@@ -2003,6 +2034,40 @@ static_resources:
         // / connection). The decorator did NOT add an extra `server`/`content-length`
         // duplicate; it edited content-length in place and skipped server.
         assert_eq!(resp.headers.len(), 6, "headers: {:?}", resp.headers);
+    }
+
+    #[test]
+    fn decorate_omits_content_type_when_body_is_empty() {
+        // Empty-body local reply (e.g. CORS preflight 200): content-type must
+        // NOT be added, matching Envoy v1.33 empirical behaviour. server/date
+        // MUST still be added (they are unconditional on body size).
+        let mut resp = Response {
+            status: 200,
+            reason: Some("OK"),
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        };
+        super::decorate_filter_synth_response(&mut resp, false);
+        let name = |n: &str| -> Option<&str> {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.as_str())
+        };
+        // content-length must be "0".
+        assert_eq!(name(headers::CONTENT_LENGTH), Some("0"));
+        // server and date MUST be added.
+        assert!(name(headers::SERVER).is_some(), "server header missing");
+        let date = name(headers::DATE).expect("date header added");
+        assert!(!date.is_empty(), "date header empty: {date:?}");
+        // connection added (keep-alive for close=false).
+        assert_eq!(name(headers::CONNECTION), Some("keep-alive"));
+        // content-type MUST NOT be added for empty body.
+        assert!(
+            name(headers::CONTENT_TYPE).is_none(),
+            "content-type must NOT be added for empty body; headers: {:?}",
+            resp.headers
+        );
     }
 
     // ── 04.2 header-matcher HCM integration tests ────────────────────────────

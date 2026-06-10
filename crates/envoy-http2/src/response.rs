@@ -54,11 +54,19 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
 /// — minus `connection`, which is an H2-forbidden hop-by-hop header stripped by
 /// `build_http_response` per `H2_FORBIDDEN_HOP_BY_HOP` (RFC 7540 §8.1.2.2).
 ///
-/// Adds `content-length` always (overwritten from `resp.body.len()`); adds
-/// `server` / `date` / `content-type` only-if-missing (a filter that sets its
-/// own value wins). Closes the 09 REVIEW M2 implementation arm (phase 11 D6):
-/// the H1 writer path has decorated filter-synth responses since 09 ADR-0033
-/// Commit C; this brings the H2 writer path to parity.
+/// - `content-length` is ALWAYS set from `resp.body.len()` (overwrites any
+///   filter-provided value).
+/// - `server` / `date` are added only-if-missing (a filter that sets its own
+///   value wins).
+/// - `content-type` is added only-if-missing AND only when the body is
+///   non-empty. Empty-body local replies (e.g. CORS preflight 200) get no
+///   `content-type` — matching Envoy v1.33 empirical behaviour confirmed by
+///   fixture 0031 §6.2 verification. Symmetric with the H1 fix at
+///   `crates/envoy-http1/src/hcm.rs` `decorate_filter_synth_response`.
+///
+/// Closes the 09 REVIEW M2 implementation arm (phase 11 D6): the H1 writer
+/// path has decorated filter-synth responses since 09 ADR-0033 Commit C; this
+/// brings the H2 writer path to parity.
 pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response) {
     // content-length: always derived from body.len(); overwrite if present.
     let cl_value = resp.body.len().to_string();
@@ -73,11 +81,22 @@ pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response) {
     if !cl_set {
         resp.headers.push(("content-length".to_string(), cl_value));
     }
-    // server / date / content-type: add only-if-missing. NO connection (H2-forbidden).
-    let standards: [(&str, String); 3] = [
+    // server / date: add only-if-missing (always). NO connection (H2-forbidden).
+    // content-type: add only-if-missing AND only when the body is non-empty —
+    // upstream Envoy v1.33 does not emit content-type on empty-body local
+    // replies (e.g. the CORS preflight 200). Symmetric with the H1 fix at
+    // envoy-http1/src/hcm.rs `decorate_filter_synth_response`.
+    let has_content_type = resp
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    if !has_content_type && !resp.body.is_empty() {
+        resp.headers
+            .push(("content-type".to_string(), "text/plain".to_string()));
+    }
+    let standards: [(&str, String); 2] = [
         ("server", "envoy-rust".to_string()),
         ("date", envoy_http1::date::now_imf_fixdate()),
-        ("content-type", "text/plain".to_string()),
     ];
     for (name, value) in standards {
         if !resp
@@ -234,6 +253,43 @@ mod tests {
         );
         // 4 standard headers; no more, no fewer (filter contributed 0).
         assert_eq!(resp.headers.len(), 4, "headers: {:?}", resp.headers);
+    }
+
+    #[test]
+    fn decorate_h2_omits_content_type_when_body_is_empty() {
+        // Empty-body local reply (e.g. CORS preflight 200): content-type must
+        // NOT be added, matching Envoy v1.33 empirical behaviour. server/date
+        // MUST still be added (unconditional on body size). No connection (H2).
+        let mut resp = Response {
+            status: 200,
+            reason: None,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        };
+        super::decorate_filter_synth_response_h2(&mut resp);
+        let name = |n: &str| -> Option<&str> {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.as_str())
+        };
+        // content-length must be "0".
+        assert_eq!(name("content-length"), Some("0"));
+        // server and date MUST be added.
+        assert!(name("server").is_some(), "server header missing");
+        let date = name("date").expect("date header added");
+        assert!(!date.is_empty(), "date header empty: {date:?}");
+        // H2: NO connection header.
+        assert!(
+            name("connection").is_none(),
+            "connection must NOT be added on H2"
+        );
+        // content-type MUST NOT be added for empty body.
+        assert!(
+            name("content-type").is_none(),
+            "content-type must NOT be added for empty body; headers: {:?}",
+            resp.headers
+        );
     }
 
     #[test]

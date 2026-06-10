@@ -742,12 +742,17 @@ pub fn parse_prometheus_samples(body: &[u8]) -> std::collections::BTreeMap<Strin
 pub enum Http1Method {
     Get,
     // 04.3 may add Post for upstream-proxy fixture; otherwise 04.x is GET-only.
+    /// Phase-23 NEW: OPTIONS is required by the CORS preflight probe (fixture
+    /// 0031). The harness builds the request line from `method.as_str()` so
+    /// `OPTIONS / HTTP/1.1` is emitted on the wire; no other behaviour changes.
+    Options,
 }
 
 impl Http1Method {
     pub fn as_str(&self) -> &'static str {
         match self {
             Http1Method::Get => "GET",
+            Http1Method::Options => "OPTIONS",
         }
     }
 }
@@ -1652,8 +1657,8 @@ pub async fn drive_http2(
     use tokio::net::TcpStream;
 
     debug_assert!(
-        matches!(method, Http1Method::Get),
-        "drive_http2 currently only supports GET; widen the helper if/when a fixture needs body request methods"
+        matches!(method, Http1Method::Get | Http1Method::Options),
+        "drive_http2 currently only supports GET/OPTIONS; widen the helper if/when a fixture needs body request methods"
     );
 
     let tcp = TcpStream::connect(addr)

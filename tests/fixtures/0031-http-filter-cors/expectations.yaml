@@ -1,0 +1,79 @@
+# Phase-23: 4-probe sequential burst against the HCM filter chain
+#   [envoy.filters.http.cors, envoy.filters.http.router]
+# with a CorsPolicy attached via typed_per_filter_config to a prefix "/" route
+# that proxies to a real http1-echo-server cluster (ADR-0058 L6 lock-in:
+# Envoy's CORS filter does NOT engage on direct_response routes).
+#
+# CorsPolicy: allow_origin_string_match: [exact: "http://allowed.example.com"],
+#             allow_methods: "GET, POST, OPTIONS",
+#             allow_headers: "x-custom-header, content-type",
+#             max_age: "3600"
+#
+# Probe sequence (all HOST: cors.test):
+#   1. preflight   — OPTIONS / + Origin: http://allowed.example.com
+#                    + Access-Control-Request-Method: GET
+#                    → 200, empty body, access-control-allow-origin (echoed),
+#                    access-control-allow-methods, access-control-allow-headers,
+#                    access-control-max-age (all value-exact §6.2 L3 lock).
+#   2. allowed-GET — GET / + Origin: http://allowed.example.com
+#                    → 200, echo body, access-control-allow-origin: http://allowed.example.com
+#   3. evil-origin  — GET / + Origin: http://evil.example.com
+#                    → 200, echo body, NO access-control-* headers
+#   4. no-origin   — GET / (no Origin header)
+#                    → 200, echo body, NO access-control-* headers
+#
+# The access-control-* header values are a pure function of the policy + the
+# request origin (identical on both proxies) → they are NOT on the harness
+# allow-list (BEHAVIOR_CONTRACT.md). set_equal_modulo_allow_list compares them
+# value-exact. The header NAME SET check (inside set_equal_modulo_allow_list)
+# also catches probe-3/probe-4 absence: if only one proxy emits
+# access-control-allow-origin but not the other, the name sets differ → FAIL.
+#
+# The server/date/x-envoy-upstream-service-time headers stay allow-listed
+# (same 3-entry HEADER_ALLOW_LIST as all prior H1 router fixtures).
+#
+# Top-level equivalence: both proxies must agree on status (exact) AND body
+# (byte_exact). The echo-server body is byte-equal because request_headers_to_remove
+# on the upstream Envoy side strips the Envoy-injected headers (x-forwarded-for
+# etc.) and envoy-rust does not inject them — so both proxies forward the same
+# upstream request to the echo server (same method, path, host, origin,
+# connection headers → identical echo body).
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-preflight-allowed-200
+      method: options
+      path: "/"
+      host: "cors.test"
+      extra_headers:
+        - ["origin", "http://allowed.example.com"]
+        - ["access-control-request-method", "GET"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-allowed-get-200
+      method: get
+      path: "/"
+      host: "cors.test"
+      extra_headers:
+        - ["origin", "http://allowed.example.com"]
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-evil-origin-get-200
+      method: get
+      path: "/"
+      host: "cors.test"
+      extra_headers:
+        - ["origin", "http://evil.example.com"]
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-4-no-origin-get-200
+      method: get
+      path: "/"
+      host: "cors.test"
+      extra_headers: []
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: { kind: byte_exact }
