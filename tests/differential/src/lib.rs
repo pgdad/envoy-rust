@@ -1084,6 +1084,22 @@ pub async fn wait_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> 
     }
 }
 
+/// Poll `path` until it exists with len > 0, or `budget` expires.
+/// Returns whether the file became non-empty. Non-fatal by design: callers
+/// fall through to the byte-level assertion, which reports the real diff.
+async fn wait_file_nonempty(path: &std::path::Path, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Drive `payload` at `addr`: open TCP, write payload, read exactly
 /// `payload.len()` bytes of echoed response, then confirm the peer writes
 /// no further bytes before shutting down the write side and dropping the
@@ -3829,6 +3845,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             let subject_resp = drive_http1(subject_addr, &http1_method, path, host, extra_headers)
                 .await
                 .context("envoy-rust http1 drive (Http1WithAccessLog)")?;
+
+            // envoy-rust's access-log emit is a fire-and-forget task that runs after the
+            // response completes; subject.shutdown() is SIGKILL (subject.rs TODO on
+            // graceful drain). Wait for the line to land BEFORE killing the process —
+            // CI run 27059869720 lost the race (`envoy=1 envoy-rust=0`) because the old
+            // post-shutdown poll could never observe a write from a dead process.
+            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+            wait_file_nonempty(&envoy_rust_path, std::time::Duration::from_secs(5)).await;
+
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
 
@@ -3870,33 +3895,14 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 }
             }
 
-            // Access-log files. Wait up to 5s for both files to be NON-EMPTY
-            // (the fire-and-forget access-log emit task on envoy-rust runs
-            // after the response completes, so post-exists the file may still
-            // be empty for tens of ms while the OS buffers the write). 13.1
-            // state-5 fold-in (REVIEW §4 access-log flake mitigation):
-            // previously the loop waited for files to EXIST, which was racy —
-            // CI run `26375100437` at HEAD `13bb5cc` failed with `envoy=1
-            // envoy-rust=0` because envoy-rust's path existed (the FileSink
-            // creates the file at open time) but the emit task had not yet
-            // flushed when the harness reached the post-exists 100ms sleep.
-            // Polling for non-empty contents closes the race deterministically.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Envoy-side flush is driven by container stop (SIGTERM) above. The
+            // non-empty poll (rather than an exists check) preserves the fix for CI run
+            // 26375100437: the FileSink creates the file at open time, so existence
+            // alone does not imply the line landed.
             let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
-            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
-            loop {
-                let both_nonempty = envoy_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
-                    && envoy_rust_path
-                        .metadata()
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false);
-                if both_nonempty || std::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            // One final yield to let the OS flush any in-flight bytes that
-            // crossed the metadata-len threshold but haven't fully landed.
+            wait_file_nonempty(&envoy_path, std::time::Duration::from_secs(5)).await;
+            // One final yield to let the OS flush any in-flight bytes that crossed the
+            // metadata-len threshold but haven't fully landed.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
@@ -5552,6 +5558,35 @@ driver:
         drop(listener);
         let result = wait_accept_ready(addr, Duration::from_millis(200)).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_file_nonempty_true_for_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "line\n").unwrap();
+        assert!(wait_file_nonempty(&p, Duration::from_millis(200)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_file_nonempty_false_when_budget_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "").unwrap();
+        assert!(!wait_file_nonempty(&p, Duration::from_millis(200)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_file_nonempty_true_when_content_arrives_mid_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "").unwrap();
+        let p2 = p.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            std::fs::write(&p2, "line\n").unwrap();
+        });
+        assert!(wait_file_nonempty(&p, Duration::from_secs(2)).await);
     }
 
     // Mirrors upstream Envoy v1.33.0's echo filter semantics per ADR-0006: the
