@@ -209,3 +209,25 @@ Between Task 5 and Task 6, per a user request, pulled the merged GitHub CI-flake
 **No new fuzz target** (CORS reuses `StringMatcher`): the new untrusted surface — the `typed_per_filter_config` map + `CorsPolicy` — is covered by the EXISTING `parse_bootstrap` fuzz target (it parses arbitrary bootstrap YAML). No `fuzz/fuzz_targets/` change (confirmed). The implementer also added the required per-seed exception to the fuzz crate's allowlist `.gitignore` (`crates/envoy-config/fuzz/.gitignore` — the established corpus pattern, NOT the top-level scratch `.gitignore`).
 
 **Verification:** `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → PASS (the seed parses to `Ok`; cors filter present so the absent-filter validator is satisfied; route→defined cluster). fmt clean. 3 files / +48 lines.
+
+---
+
+## Task 9 — D8.3 in-process backstop — DONE (code commit `980bc9416`)
+
+**Deliverable:** `crates/envoy-bin/tests/http_filter_cors.rs` (449 lines, new) — boots `envoy-bin` (`CARGO_BIN_EXE_envoy-bin`, debug, `kill_on_drop`) with a synthesized CORS bootstrap (cors+router chain, route `typed_per_filter_config` CorsPolicy) proxying to an in-test `spawn_http1_upstream` backend (the `http1_router_upstream` multi-conn-loop pattern — a real upstream per ADR-0058 L6), readiness wait + `dump_stderr_and_kill`. The fast in-process guard complementing the bilateral fixture-0031 differential.
+
+**Probes + GENUINE assertions (phase-10 M1 lesson — headers asserted, SPEC §6.4):**
+1. preflight allowed → **200**, body empty, `access-control-allow-origin: http://allowed.example.com` (echo, value-exact), `access-control-allow-methods` present, `access-control-allow-headers` present, `access-control-max-age: 3600` (value-exact), **`content-type` ABSENT** (ADR-0059 empty-body rule).
+2. allowed GET → 200, body `ok\n`, `access-control-allow-origin: http://allowed.example.com`.
+3. disallowed-origin GET → 200, body `ok\n`, `access-control-allow-origin` ABSENT.
+4. no-origin GET → 200, body `ok\n`, NO `access-control-*` headers at all.
+
+**L7 absent-filter negative path:** deferred to the existing Task-2 unit test `cors_per_route_config_without_cors_filter_is_fatal` (exercises the exact `parse_bootstrap` `PerRouteConfigForAbsentFilter` error before any runtime starts — a second boot-expecting-exit would add poll/timeout machinery for zero coverage gain). Noted in a file-level comment. Stats scrape skipped (no admin-scrape helper in the backstop templates; units + the §6.2 verification cover the stat semantics) — the shared-test-support-crate consolidation (M18-9/M21-3/M22, now N≥8 backstops) stays deferred per the standing decision.
+
+**Verification:** `cargo test -p envoy-bin --test http_filter_cors -- --nocapture` → PASS (`1 passed`, 0.77s). clippy `-D warnings` + fmt clean. Assertions independently confirmed genuine (not weakened) by controller-read of `http_filter_cors.rs:391-442`.
+
+---
+
+## Implementation arc (Tasks 1–9) COMPLETE
+
+All 9 implementation tasks landed (one code commit + one PROGRESS commit each; substantive tasks 3/4/5/6/7 two-stage-reviewed). The full `envoy.filters.http.cors` feature + the per-route `typed_per_filter_config` infrastructure are implemented, wired on H1 + H2, fixture-0031 differential GREEN (live, 2×), fuzz-seeded, and backstopped. **Task 10 (the §7.5 state-4 verification gate — the full 31-fixture Linux-CI differential + h2spec + the 5 stable gates + the standalone-crate builds) is the SEPARATE state-4 session** (per `BOOTSTRAP_PROMPT.md` §5.1 one-state-per-session). Mid-arc, the upstream CI-fix PR was merged into local `main` (merge `5c672e792`), and ADR-0059 landed (the Task-7 differential-driven shared-code corrections). STATE advances to `23` state-3-complete / state-4-next at this session's end.
