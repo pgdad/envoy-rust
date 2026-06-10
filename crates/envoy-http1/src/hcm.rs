@@ -236,7 +236,7 @@ fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
                             headers: r.r#match.headers.clone(),
                         },
                         action: clone_route_action(&r.action),
-                        typed_per_filter_config: Default::default(),
+                        typed_per_filter_config: r.typed_per_filter_config.clone(),
                     })
                     .collect(),
             })
@@ -599,6 +599,15 @@ async fn serve_connection(
         // fields after the decode pass.
         let mut req = req;
         let mut pipeline = (*config.filter_pipeline).clone();
+        // Phase-23 D2: resolve the matched route up-front and thread its
+        // per-filter config into the pipeline before decode (inert for every
+        // non-CORS filter — the 07.1 foundation-slice property). MUST be
+        // placed after the pipeline clone but BEFORE the mem::take below
+        // (mem::take empties req's path + headers which resolve_route needs).
+        // apply_route_config clones the policy into the Cors instance, so the
+        // borrow of `config` via `matched_route` ends before mem::take of `req`.
+        let matched_route = resolve_route(&config, &req);
+        pipeline.apply_route_config(matched_route);
 
         // Boundary conversion: construct FilterRequest from the
         // filter-visible subset of envoy_http1::Request, invoke
@@ -1159,6 +1168,26 @@ pub enum BuildOutcome {
 enum RequestPath {
     Match(BuildOutcome),
     SynthFromDecode(Response),
+}
+
+/// Phase-23 D2: resolve the matched route up-front (vh-match + route-match),
+/// for threading per-route filter config into the pipeline BEFORE the decode
+/// pass. Returns `None` for missing/empty Host, no matching vh, or no matching
+/// route — the no-route paths carry no per-route config (a 404'd request has no
+/// CORS policy). Shares `vh_matches`/`route_matches` with `build_response`, so
+/// the up-front resolution and `build_response`'s internal re-match are
+/// guaranteed identical (the 30-fixture regression-equivalence guarantee).
+pub fn resolve_route<'a>(config: &'a HCMConfig, req: &Request) -> Option<&'a envoy_config::Route> {
+    let host_raw = find_header(&req.headers, headers::HOST).filter(|h| !h.is_empty())?;
+    let host = strip_port(host_raw);
+    let vh = config
+        .route_config
+        .virtual_hosts
+        .iter()
+        .find(|vh| vh_matches(vh, host))?;
+    vh.routes
+        .iter()
+        .find(|r| route_matches(r, &req.path, &req.headers))
 }
 
 pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
@@ -4892,5 +4921,243 @@ static_resources:
             "backend contacted exactly once"
         );
         assert_eq!(cluster.upstream_rq_total().value(), 1, "rq_total 1");
+    }
+
+    // ── Phase-23 D2: resolve_route unit tests ────────────────────────────────
+
+    /// Helper: build an HCMConfig with a single VH `domains: ["*"]` and one
+    /// prefix-"/" DirectResponse route. Async to allow `cluster_mgr_empty()`.
+    async fn resolve_route_test_config() -> HCMConfig {
+        HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("test"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+        }
+    }
+
+    /// Build a minimal `Request` with the given path and Host header value.
+    fn make_req(path: &str, host: &str) -> Request {
+        use crate::codec::HttpVersion;
+        Request {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            version: HttpVersion::Http11,
+            headers: if host.is_empty() {
+                vec![]
+            } else {
+                vec![(headers::HOST.to_string(), host.to_string())]
+            },
+            bytes_consumed: 0,
+            body: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_route_matches_vh_and_route() {
+        let config = resolve_route_test_config().await;
+        let req = make_req("/healthz", "localhost");
+        let route = resolve_route(&config, &req).expect("route resolves");
+        assert!(
+            matches!(route.action, RouteAction::DirectResponse(_)),
+            "expected DirectResponse action"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_none_on_empty_host() {
+        let config = resolve_route_test_config().await;
+        // No Host header → None (mirrors build_response's 400 path)
+        let req = make_req("/", "");
+        assert!(
+            resolve_route(&config, &req).is_none(),
+            "empty host must yield None"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_none_on_no_route_match() {
+        // Config with a specific path-only route; a request for a different path
+        // must return None (no matching route).
+        let config = HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("test"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "specific".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: None,
+                            path: Some("/exact".to_string()),
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("hit".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+        };
+        let req = make_req("/other", "localhost");
+        assert!(
+            resolve_route(&config, &req).is_none(),
+            "no matching route must yield None"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_strips_port_from_host() {
+        // VH matches only "myhost"; request with "myhost:8080" must still resolve.
+        let config = HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("test"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "myhost_vh".to_string(),
+                    domains: vec!["myhost".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("hit".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+        };
+        let req = make_req("/foo", "myhost:8080");
+        let route = resolve_route(&config, &req).expect("port-stripped host must match");
+        assert!(matches!(route.action, RouteAction::DirectResponse(_)));
+    }
+
+    // ---------------------------------------------------------------------------
+    // clone_route_config: regression test for typed_per_filter_config preservation
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn clone_route_config_preserves_typed_per_filter_config() {
+        use std::collections::BTreeMap;
+
+        // Build a Route that carries a non-empty typed_per_filter_config (CORS).
+        let cors_policy = envoy_config::CorsPolicy {
+            allow_origin_string_match: vec![envoy_config::StringMatcher {
+                mode: envoy_config::StringMatcherMode::Exact("http://a.test".to_string()),
+                ignore_case: false,
+            }],
+            allow_methods: None,
+            allow_headers: None,
+            expose_headers: None,
+            max_age: None,
+            allow_credentials: None,
+        };
+        let mut tpfc: BTreeMap<String, envoy_config::PerFilterConfig> = BTreeMap::new();
+        tpfc.insert(
+            "envoy.filters.http.cors".to_string(),
+            envoy_config::PerFilterConfig::Cors(cors_policy),
+        );
+
+        let route = Route {
+            r#match: RouteMatch {
+                prefix: Some("/".to_string()),
+                path: None,
+                headers: vec![],
+            },
+            action: RouteAction::DirectResponse(DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("ok".to_string()),
+                },
+            }),
+            typed_per_filter_config: tpfc,
+        };
+
+        assert!(
+            !route.typed_per_filter_config.is_empty(),
+            "precondition: source route must have typed_per_filter_config"
+        );
+
+        let rc = RouteConfiguration {
+            name: "local_route".to_string(),
+            validate_clusters: None,
+            virtual_hosts: vec![VirtualHost {
+                name: "default".to_string(),
+                domains: vec!["*".to_string()],
+                include_attempt_count_in_response: false,
+                routes: vec![route],
+            }],
+        };
+
+        let cloned = super::clone_route_config(&rc);
+
+        assert!(
+            !cloned.virtual_hosts[0].routes[0]
+                .typed_per_filter_config
+                .is_empty(),
+            "clone_route_config must preserve typed_per_filter_config (was dropped)"
+        );
+        assert!(
+            cloned.virtual_hosts[0].routes[0]
+                .typed_per_filter_config
+                .contains_key("envoy.filters.http.cors"),
+            "clone_route_config must preserve the cors key in typed_per_filter_config"
+        );
     }
 }
