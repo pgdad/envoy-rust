@@ -456,6 +456,16 @@ async fn handle_one_stream(
     // `envoy_http1::codec::Request` ↔ `envoy_filter::FilterRequest` via
     // `mem::take` + write-back (same shape as Task 6 at envoy-http1).
     let mut pipeline = (*config.inner.filter_pipeline).clone();
+    // Phase-23 D2: symmetric to H1 — resolve the route up-front and thread its
+    // per-filter config in. H2's `envoy_req` is an `envoy_http1::Request`, and
+    // H2 already imports H1's `build_response`, so reuse
+    // `envoy_http1::hcm::resolve_route`.
+    // MUST be placed after the pipeline clone but BEFORE the mem::take below
+    // (mem::take empties envoy_req's path + headers which resolve_route needs).
+    // apply_route_config clones the policy into the Cors instance, so the borrow
+    // of `config.inner` via `matched_route` ends before mem::take of `envoy_req`.
+    let matched_route = envoy_http1::hcm::resolve_route(&config.inner, &envoy_req);
+    pipeline.apply_route_config(matched_route);
     let mut filter_req = envoy_filter::FilterRequest {
         method: std::mem::take(&mut envoy_req.method),
         path: std::mem::take(&mut envoy_req.path),
@@ -3498,5 +3508,246 @@ static_resources:
             "backend contacted exactly once"
         );
         assert_eq!(cluster.upstream_rq_total().value(), 1, "rq_total 1");
+    }
+
+    // ── Phase-23 D2: H2 route-early-resolution + apply_route_config threading ──
+
+    /// Phase-23 D2 (compile + unit): confirm `envoy_http1::hcm::resolve_route`
+    /// is reachable from the H2 crate and returns the expected Route for an
+    /// `Http1HCMConfig` + `Request` carrying a CORS per-route policy.
+    ///
+    /// This test does NOT spin up a TCP listener — it exercises only the
+    /// function-call boundary between the H2 crate and the H1 `resolve_route`
+    /// export.  If it compiles and passes, the import surface is sound; the
+    /// end-to-end threading correctness is covered by
+    /// `h2_cors_preflight_short_circuits_via_threading` below.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_resolve_route_reachable_and_returns_cors_route() {
+        use envoy_config::{
+            CorsConfig, CorsPolicy, PerFilterConfig, StringMatcher, StringMatcherMode,
+        };
+        use std::collections::BTreeMap;
+
+        // Build an Http1HCMConfig with a single VH + a route carrying a CORS policy.
+        let cors_policy = CorsPolicy {
+            allow_origin_string_match: vec![StringMatcher {
+                mode: StringMatcherMode::Exact("http://allowed.example".to_string()),
+                ignore_case: false,
+            }],
+            allow_methods: Some("GET".to_string()),
+            allow_headers: None,
+            expose_headers: None,
+            max_age: None,
+            allow_credentials: None,
+        };
+        let mut pfcfg: BTreeMap<String, PerFilterConfig> = BTreeMap::new();
+        pfcfg.insert(
+            "envoy.filters.http.cors".to_string(),
+            PerFilterConfig::Cors(cors_policy.clone()),
+        );
+        let cfg = envoy_config::HttpConnectionManagerConfig {
+            stat_prefix: "test_resolve_route".to_string(),
+            codec_type: envoy_config::CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(envoy_config::RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![envoy_config::VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["test.example".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![envoy_config::Route {
+                        r#match: envoy_config::RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: envoy_config::RouteAction::DirectResponse(
+                            envoy_config::DirectResponse {
+                                status: 200,
+                                body: envoy_config::DataSource {
+                                    filename: None,
+                                    inline_string: Some("ok\n".to_string()),
+                                },
+                            },
+                        ),
+                        typed_per_filter_config: pfcfg,
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![
+                envoy_config::HttpFilter {
+                    name: "envoy.filters.http.cors".to_string(),
+                    typed_config: envoy_config::HttpFilterTypedConfig::Cors(CorsConfig {}),
+                },
+                envoy_config::HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                        envoy_config::RouterConfig {},
+                    ),
+                },
+            ],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let h1cfg = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCMConfig");
+
+        // Build an envoy_http1::Request that matches the VH + route.
+        let req = envoy_http1::Request {
+            method: "OPTIONS".to_string(),
+            path: "/api".to_string(),
+            version: envoy_http1::HttpVersion::Http11,
+            headers: vec![
+                ("host".to_string(), "test.example".to_string()),
+                ("origin".to_string(), "http://allowed.example".to_string()),
+                (
+                    "access-control-request-method".to_string(),
+                    "GET".to_string(),
+                ),
+            ],
+            bytes_consumed: 0,
+            body: None,
+        };
+
+        // Invoke resolve_route — the key import under test.
+        let route = envoy_http1::hcm::resolve_route(&h1cfg, &req)
+            .expect("route must resolve for test.example / /api prefix match");
+
+        // The resolved route must carry the CORS per-filter config we seeded.
+        assert!(
+            route
+                .typed_per_filter_config
+                .contains_key("envoy.filters.http.cors"),
+            "resolved route must carry the CORS per-filter config: {:?}",
+            route.typed_per_filter_config,
+        );
+    }
+
+    /// Phase-23 D2 (end-to-end): CORS preflight (`OPTIONS + Origin + ACRM`)
+    /// through the H2 HCM path MUST short-circuit with 200 +
+    /// `access-control-allow-origin` once the route's per-filter CORS policy
+    /// is threaded into the pipeline via `apply_route_config`.
+    ///
+    /// **Why this fails before the threading lands:** without
+    /// `resolve_route` + `apply_route_config` in `handle_one_stream`, the
+    /// CorsFilter's `active_policy` is `None`, so `decode_headers` returns
+    /// `Continue`, and the request falls through to `build_response` which
+    /// returns the `DirectResponse(200 "ok\n")` — no CORS headers.  The
+    /// assertion `access-control-allow-origin` present is the discriminator.
+    ///
+    /// **Why it passes after:** `apply_route_config` slots the `CorsPolicy` in;
+    /// the preflight triggers `StopAndSend(build_preflight_response(...))`,
+    /// which carries `access-control-allow-origin`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_cors_preflight_short_circuits_via_threading() {
+        use envoy_config::{
+            CorsConfig, CorsPolicy, PerFilterConfig, StringMatcher, StringMatcherMode,
+        };
+        use std::collections::BTreeMap;
+
+        // Build a CORS policy that allows http://allowed.example.
+        let cors_policy = CorsPolicy {
+            allow_origin_string_match: vec![StringMatcher {
+                mode: StringMatcherMode::Exact("http://allowed.example".to_string()),
+                ignore_case: false,
+            }],
+            allow_methods: Some("GET, POST".to_string()),
+            allow_headers: None,
+            expose_headers: None,
+            max_age: None,
+            allow_credentials: None,
+        };
+        let mut pfcfg: BTreeMap<String, PerFilterConfig> = BTreeMap::new();
+        pfcfg.insert(
+            "envoy.filters.http.cors".to_string(),
+            PerFilterConfig::Cors(cors_policy),
+        );
+
+        let cfg = envoy_config::HttpConnectionManagerConfig {
+            stat_prefix: "test_cors_h2".to_string(),
+            codec_type: envoy_config::CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(envoy_config::RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![envoy_config::VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![envoy_config::Route {
+                        r#match: envoy_config::RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: envoy_config::RouteAction::DirectResponse(
+                            envoy_config::DirectResponse {
+                                status: 200,
+                                body: envoy_config::DataSource {
+                                    filename: None,
+                                    inline_string: Some("ok\n".to_string()),
+                                },
+                            },
+                        ),
+                        typed_per_filter_config: pfcfg,
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![
+                envoy_config::HttpFilter {
+                    name: "envoy.filters.http.cors".to_string(),
+                    typed_config: envoy_config::HttpFilterTypedConfig::Cors(CorsConfig {}),
+                },
+                envoy_config::HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                        envoy_config::RouterConfig {},
+                    ),
+                },
+            ],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let h1cfg = Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+                .await
+                .expect("build HCMConfig"),
+        );
+
+        let (addr, _server) = spawn_h2_hcm(h1cfg).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // Send a CORS preflight: OPTIONS + Origin + Access-Control-Request-Method.
+        let req = http::Request::builder()
+            .method("OPTIONS")
+            .uri("http://test.example/api")
+            .header("origin", "http://allowed.example")
+            .header("access-control-request-method", "GET")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "CORS preflight must receive 200: {:?}",
+            resp.headers()
+        );
+        assert!(
+            resp.headers().contains_key("access-control-allow-origin"),
+            "CORS preflight response must carry access-control-allow-origin; \
+             got headers: {:?}",
+            resp.headers()
+        );
     }
 }
