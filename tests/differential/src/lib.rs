@@ -1130,13 +1130,16 @@ fn clusters_warm_from_stats_text(stats: &str) -> bool {
 async fn wait_clusters_warm(admin_addr: SocketAddr, budget: Duration) {
     let deadline = std::time::Instant::now() + budget;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = drive_http_get(admin_addr, "/stats", "localhost").await
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(remaining, drive_http_get(admin_addr, "/stats", "localhost")).await
             && clusters_warm_from_stats_text(&String::from_utf8_lossy(&resp.body))
         {
             return;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    tracing::warn!(%admin_addr, ?budget, "wait_clusters_warm: budget expired without all clusters warm; proceeding ungated");
 }
 
 /// Drive `payload` at `addr`: open TCP, write payload, read exactly
