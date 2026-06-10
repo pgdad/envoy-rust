@@ -914,16 +914,40 @@ pub fn load_expectations(path: &Path) -> Result<Expectations> {
 /// Reserve a free TCP port on 127.0.0.1. Binds `:0`, reads the assigned port,
 /// drops the listener, and returns the number.
 ///
+/// Intra-process dedup: the kernel may hand back the same ephemeral port for
+/// successive binds within a test process (CI run 26861955222 returned 40875 for
+/// both data + admin listeners, causing envoy-rust to fail `Address already in use`).
+/// This function tracks all ports handed out in the current process and retries the
+/// ephemeral bind if a duplicate is encountered.
+///
 /// TOCTOU: between the drop and the subsequent bind by envoy-rust, another
 /// process on the host could grab this port. This is accepted for a
 /// pre-production harness per SPEC §6 point 6. If CI flakes materialize, this
 /// becomes its own split phase with a port-range reservation strategy.
 pub fn reserve_port() -> Result<u16> {
-    let listener =
-        StdTcpListener::bind(("127.0.0.1", 0)).context("binding 127.0.0.1:0 to reserve a port")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
+    reserve_port_with(|| {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0))
+            .context("binding 127.0.0.1:0 to reserve a port")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        Ok(port)
+    })
+}
+
+/// Core of `reserve_port` with an injectable ephemeral-port allocator so the
+/// dedup logic is unit-testable. Ports are never returned to the set: a test
+/// process reserves a few dozen ports at most.
+fn reserve_port_with(mut bind_ephemeral: impl FnMut() -> Result<u16>) -> Result<u16> {
+    static RESERVED_PORTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    for _ in 0..64 {
+        let port = bind_ephemeral()?;
+        if RESERVED_PORTS.lock().unwrap().insert(port) {
+            return Ok(port);
+        }
+    }
+    bail!("64 consecutive ephemeral-port reservations were duplicates of already-handed-out ports")
 }
 
 /// Template-render a fixture YAML by substituting literal `{{KEY}}` tokens.
@@ -5471,6 +5495,26 @@ driver:
     fn reserve_port_returns_nonzero() {
         let p = reserve_port().unwrap();
         assert!(p > 0);
+    }
+
+    #[test]
+    fn reserve_port_with_skips_port_already_handed_out() {
+        // Simulate the kernel returning the same ephemeral port twice in a row
+        // (CI run 26861955222: data + admin listener both got 40875).
+        let mut calls = 0u32;
+        let first = reserve_port_with(|| {
+            calls += 1;
+            Ok(61001)
+        })
+        .unwrap();
+        assert_eq!(first, 61001);
+        let second = reserve_port_with(|| {
+            calls += 1;
+            // Kernel hands back 61001 again; helper must reject it and retry.
+            Ok(if calls <= 2 { 61001 } else { 61002 })
+        })
+        .unwrap();
+        assert_eq!(second, 61002);
     }
 
     #[tokio::test]
