@@ -521,6 +521,15 @@ pub enum ConfigError {
     )]
     JwtAuthnInvalidJwks { listener: String, provider: String },
 
+    /// 23 D3 (ADR-0058 / L7): a route carries `typed_per_filter_config` for a
+    /// filter that is NOT present in the enclosing HCM's http_filters chain.
+    /// envoy-rust rejects this as startup-fatal (the ADR-0049 all-fatal posture);
+    /// upstream Envoy accepts-and-ignores (recorded divergence, BEHAVIOR_CONTRACT).
+    #[error(
+        "route per-filter config names filter {filter:?} which is absent from the HTTP filter chain"
+    )]
+    PerRouteConfigForAbsentFilter { filter: String },
+
     /// 12.1: cluster has more than one `health_checks` entry (phase-12 supports 0 or 1).
     #[error(
         "cluster '{cluster}' has more than one health_checks entry; phase 12 supports at most one"

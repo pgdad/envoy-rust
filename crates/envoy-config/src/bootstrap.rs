@@ -2596,6 +2596,18 @@ fn validate_hcm(
         return Ok(()); // rds HCM, pre-load — nothing inline to validate yet
     };
 
+    // 23 D3 (ADR-0058 / L7): build the set of http_filter names present in
+    // this HCM's filter chain ONCE, before the route walk. A route carrying a
+    // `typed_per_filter_config` key that is NOT in this set is rejected as
+    // startup-fatal (PerRouteConfigForAbsentFilter). Upstream Envoy
+    // accepts-and-ignores; envoy-rust diverges to the stricter ADR-0049
+    // all-fatal posture (recorded divergence, BEHAVIOR_CONTRACT).
+    // Co-located here with the post-merge route walk so that RDS HCMs are
+    // checked against their post-merge route table (when route_config is None
+    // pre-merge the function already returned Ok above).
+    let present_http_filter_names: std::collections::BTreeSet<&str> =
+        hcm.http_filters.iter().map(|hf| hf.name.as_str()).collect();
+
     // route_config: walk virtual_hosts → routes.
     if route_config.virtual_hosts.is_empty() {
         return Err(crate::ConfigError::EmptyVirtualHosts {
@@ -2673,6 +2685,16 @@ fn validate_hcm(
                             cluster: ar.cluster.clone(),
                         });
                     }
+                }
+            }
+
+            // 23 D3: reject any typed_per_filter_config key not in
+            // the HCM's http_filters name set (PerRouteConfigForAbsentFilter).
+            for filter_name in r.typed_per_filter_config.keys() {
+                if !present_http_filter_names.contains(filter_name.as_str()) {
+                    return Err(crate::ConfigError::PerRouteConfigForAbsentFilter {
+                        filter: filter_name.clone(),
+                    });
                 }
             }
 
@@ -12927,5 +12949,187 @@ bogus_key: 1
     #[test]
     fn cors_config_filter_chain_entry_is_near_empty() {
         let _c = CorsConfig::default();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 23 D3: PerRouteConfigForAbsentFilter validator tests (ADR-0058 / L7)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod per_route_absent_filter_tests {
+    // ---- YAML helper constants ----
+
+    /// A minimal full-bootstrap YAML with a CorsPolicy on a route, but the
+    /// `cors` filter is NOT in the HCM's http_filters chain (only `router` is).
+    /// This must trigger ConfigError::PerRouteConfigForAbsentFilter.
+    ///
+    /// The route uses `direct_response` (no cluster reference needed) to keep
+    /// this fully self-contained.
+    const MINIMAL_HCM_BOOTSTRAP_WITH_CORS_POLICY_BUT_NO_CORS_FILTER: &str = r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                          typed_per_filter_config:
+                            envoy.filters.http.cors:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+                              allow_origin_string_match:
+                                - exact: "http://allowed.example.com"
+                              allow_methods: "GET, OPTIONS"
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+"#;
+
+    /// A minimal full-bootstrap YAML with an EMPTY `typed_per_filter_config`
+    /// on a route (the common case for all existing fixtures). The validator
+    /// must NOT fire for this case — this is the negative-validator regression
+    /// guard.
+    const MINIMAL_HCM_BOOTSTRAP_EMPTY_TYPED_PER_FILTER_CONFIG: &str = r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+"#;
+
+    /// NEGATIVE (primary deliverable): a route with `typed_per_filter_config`
+    /// keyed under `envoy.filters.http.cors` while only `envoy.filters.http.router`
+    /// is in the HCM's http_filters chain → must reject with
+    /// ConfigError::PerRouteConfigForAbsentFilter { filter: "envoy.filters.http.cors" }.
+    ///
+    /// ADR-0058 / L7 stricter-reject (recorded divergence vs upstream Envoy which
+    /// accepts-and-ignores). BEHAVIOR_CONTRACT.
+    #[test]
+    fn cors_per_route_config_without_cors_filter_is_fatal() {
+        let yaml = MINIMAL_HCM_BOOTSTRAP_WITH_CORS_POLICY_BUT_NO_CORS_FILTER;
+        let err = crate::parse_bootstrap(yaml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::PerRouteConfigForAbsentFilter { ref filter }
+                    if filter == "envoy.filters.http.cors"
+            ),
+            "expected PerRouteConfigForAbsentFilter(cors), got {err:?}"
+        );
+    }
+
+    /// REGRESSION GUARD: a route with no `typed_per_filter_config` (empty
+    /// BTreeMap — the common case for every existing fixture) must NOT trigger
+    /// the validator. This ensures the existing fixture suite stays valid.
+    #[test]
+    fn empty_typed_per_filter_config_does_not_trigger_validator() {
+        let yaml = MINIMAL_HCM_BOOTSTRAP_EMPTY_TYPED_PER_FILTER_CONFIG;
+        assert!(
+            crate::parse_bootstrap(yaml).is_ok(),
+            "empty typed_per_filter_config must not trigger PerRouteConfigForAbsentFilter"
+        );
+    }
+
+    /// POSITIVE CASE (ignored pending Task 4):
+    ///
+    /// Once Task 4 adds `HttpFilterTypedConfig::Cors` variant, this test should
+    /// be un-ignored. It verifies that a route with a CorsPolicy where the HCM's
+    /// http_filters chain INCLUDES `envoy.filters.http.cors` parses successfully
+    /// (the validator's present-filter path). Until that variant exists, a YAML
+    /// entry with `@type: .../Cors` fails to parse at the `HttpFilterTypedConfig`
+    /// deserialization stage.
+    #[test]
+    #[ignore = "needs HttpFilterTypedConfig::Cors from Task 4; un-ignore after that variant lands"]
+    fn cors_per_route_config_with_cors_filter_present_parses() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                          typed_per_filter_config:
+                            envoy.filters.http.cors:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+                              allow_origin_string_match:
+                                - exact: "http://allowed.example.com"
+                              allow_methods: "GET, OPTIONS"
+                http_filters:
+                  - name: envoy.filters.http.cors
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+"#;
+        assert!(
+            crate::parse_bootstrap(yaml).is_ok(),
+            "CorsPolicy on route + cors filter in chain must parse successfully"
+        );
     }
 }
