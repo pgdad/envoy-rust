@@ -72,3 +72,21 @@ content-length: 0
 ---
 
 _(execution entries appended below per task during state-3)_
+
+---
+
+## Task 1 — D1 per-route `typed_per_filter_config` schema — DONE (code commit `525346d05`)
+
+**Deliverable:** `PerFilterConfig` (`@type`-tagged enum, sole `Cors(CorsPolicy)` variant) + `CorsPolicy` + near-empty `CorsConfig` in `envoy-config`, plus the `Route.typed_per_filter_config: BTreeMap<String, PerFilterConfig>` field wired through the HAND-ROLLED `Route` de/serializer (SC1).
+
+**TDD:** 5 failing parse tests written first (`route_parses_typed_per_filter_config_cors`, `route_without_typed_per_filter_config_defaults_empty`, `cors_policy_rejects_unknown_field`, `route_rejects_unknown_top_level_key`, `cors_config_filter_chain_entry_is_near_empty`) → implemented → all green. 403 `envoy-config` tests pass; clippy + fmt clean.
+
+**Files:** `crates/envoy-config/src/bootstrap.rs` (3 new types near `RouterConfig`; `Route` field; hand-rolled `visit_map` arm + duplicate-field guard + 4-key unknown-field allow-list `["match","direct_response","route","typed_per_filter_config"]`; serializer emits the map only when non-empty so existing fixtures round-trip byte-identical), `crates/envoy-config/src/lib.rs` (re-export `CorsConfig`/`CorsPolicy`/`PerFilterConfig`). **Mechanically-required fan-out:** the new non-defaulted `Route` field forced 36 struct-literal construction-site updates (`typed_per_filter_config: Default::default()`) — 26 in `crates/envoy-http1/src/hcm.rs`, 10 in `crates/envoy-http2/src/hcm.rs`; purely mechanical, no behavioral change (all 4 files committed together in `525346d05`).
+
+**Notes / deviations:**
+- **SC1 honored** — both hand-rolled impls extended (NOT replaced by derive); `Route` retains `#[derive(Debug, Clone, PartialEq)]` only. Verified by spec-compliance review.
+- **`PerFilterConfig`/`CorsPolicy`/`CorsConfig` all derive `Serialize` too** (PLAN Step-6 NOTE chosen approach) — required so the serializer's `serialize_entry("typed_per_filter_config", …)` compiles; `#[serde(tag="@type")]` round-trips.
+- **`cors_config_filter_chain_entry_is_near_empty` test adjusted** to `let _c = CorsConfig::default();` — a bare `CorsConfig` carries `deny_unknown_fields`, so directly deserializing `"@type": …`-tagged YAML into it would (correctly) reject the `@type` key; in production the `@type` is consumed by the enclosing `HttpFilterTypedConfig` `#[serde(tag="@type")]` (added Task 4), never reaching the inner struct. Documented inline.
+- **SC3 honored** — `StringMatcher` reused verbatim (zero diff lines); `allow_origin_string_match: Vec<StringMatcher>`.
+
+**Review:** spec-compliance review ✅ SPEC COMPLIANT (independently verified: exact derives/serde attrs, `max_age: Option<String>`, no stub variants, hand-rolled impls intact, conditional serialize length, mechanical fan-out, 403 tests green). Code-quality review reserved for the substantive tasks (3/4/5/6) per the PLAN execution-handoff.
