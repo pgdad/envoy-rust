@@ -6,6 +6,7 @@
 //! filter chain engines. Synchronous (non-async) iteration on the
 //! already-buffered request/response shape established by 04.1 + 05.2.
 
+pub mod cors;
 pub mod error;
 pub mod fault;
 pub mod header_mutation;
@@ -17,6 +18,7 @@ pub mod rbac;
 pub mod router;
 pub mod types;
 
+pub use cors::CorsFilter;
 pub use error::FilterError;
 pub use fault::FaultFilter;
 pub use header_mutation::HeaderMutationFilter;

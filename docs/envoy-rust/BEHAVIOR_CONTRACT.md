@@ -414,6 +414,90 @@ is observed upstream as the absence of the request header — the differential
 fixture's echo-backend reflects request headers so the strip is bilaterally
 witnessed.
 
+**23 entries (CORS filter):**
+
+> The HTTP-filter-family fifth phase (ADR-0057 SPEC / ADR-0058 PLAN). The
+> `envoy.filters.http.cors` filter performs origin allow-matching on every
+> request that reaches it (when the route carries a `typed_per_filter_config`
+> CORS policy). It provides a decode-side preflight short-circuit (OPTIONS +
+> origin + `access-control-request-method`) and an encode-side actual-request
+> decoration (push `access-control-allow-origin` + conditional siblings onto
+> the upstream response). The 2 stats live under the HCM-embedded
+> `http.<hcm_stat_prefix>.cors.*` namespace — the same threading as RBAC
+> (phase 10), Fault (phase 11), and jwt_authn (phase 22), sourced from the
+> parent HCM's `stat_prefix`. All derived from the §6.2 empirical lock-in
+> (verified against `envoyproxy/envoy:v1.33.0`; differential fixture 0031).
+> envoy-rust's minimum-viable subset is **2 names**.
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `http.<hcm_stat_prefix>.cors.origin_valid` | value-exact | Counter; one increment per request that carries an `origin` header whose value is **matched** by the route's `allow_origin_string_match` list (exact / prefix / suffix / regex / contains). Ticks on BOTH the preflight short-circuit path AND the actual-request decoration path — any present+allowed origin ticks it exactly once per `decode_headers` call. A **no-origin** request ticks neither counter (L5). Never ticks when `active_policy` is `None` (the filter is inert — either no filter-chain entry or the matched route carries no `typed_per_filter_config` CORS key). Upstream Envoy v1.33 emits the same name at the `http.<prefix>.cors.*` namespace. |
+| `http.<hcm_stat_prefix>.cors.origin_invalid` | value-exact | Counter; one increment per request that carries an `origin` header whose value is **not matched** by the allow-list. Ticks on the disallowed-origin path (both preflight pass-through and actual-request pass-through). A **no-origin** request ticks neither counter; an absent or inert filter ticks neither counter. Both proxies emit one increment per present-but-unmatched origin at the decision site in `CorsFilter::decode_headers`. |
+
+> **Envoy-only sibling stats (unasserted, NOT broadened).** Upstream Envoy
+> emits additional `http.<prefix>.cors.*` siblings that envoy-rust does
+> **NOT** emit at minimum scope: `downstream_rq_total`, `downstream_rq_success`,
+> `downstream_rq_failed`, `downstream_rq_cors_preflight` (various request-level
+> subtotals). These are **Envoy-only-unasserted** — fixture 0031's named-stat
+> scrape lists only the 2 emitted names, and the siblings need no allow-list
+> entry.
+
+**Response headers — cors `access-control-*`**
+
+> The §6.2 L2/L3 wire mapping for the CORS access-control header family.
+> These headers are NOT on the response-header allow-list; they are
+> compared value-exact by `set_equal_modulo_allow_list`. All headers
+> below are **absent** when the request carries no origin, or when
+> `active_policy` is `None`, or when the origin is disallowed (L4).
+
+**Preflight short-circuit set (L2)** — emitted ONLY on
+`OPTIONS + origin (matched) + access-control-request-method`; status 200,
+empty body:
+
+| Header name | Condition | Value |
+|---|---|---|
+| `access-control-allow-origin` | always (when origin matched) | Echoes the request `Origin` header verbatim (NOT `*`) |
+| `access-control-allow-credentials` | only if `allow_credentials: true` | `true` (literal string) |
+| `access-control-allow-methods` | only if `allow_methods` configured | configured value verbatim |
+| `access-control-allow-headers` | only if `allow_headers` configured | configured value verbatim |
+| `access-control-max-age` | only if `max_age` configured | configured value verbatim |
+| `access-control-expose-headers` | only if `expose_headers` configured | configured value verbatim |
+
+**Actual-request decoration set (L3)** — pushed onto the upstream response
+on the encode side for any non-preflight allowed-origin request (including
+`OPTIONS` without `access-control-request-method`):
+
+| Header name | Condition | Value |
+|---|---|---|
+| `access-control-allow-origin` | always (when origin matched) | Echoes the request `Origin` header verbatim |
+| `access-control-allow-credentials` | only if `allow_credentials: true` | `true` (literal string) |
+| `access-control-expose-headers` | only if `expose_headers` configured | configured value verbatim |
+
+> `access-control-allow-methods`, `access-control-allow-headers`, and
+> `access-control-max-age` are **preflight-only** — they do NOT appear on
+> actual-request decoration (L3). No `vary` header is emitted (verified
+> empirically vs Envoy v1.33.0; contrary to RFC 6454 §7.2 advice but
+> matches upstream Envoy behaviour). The `access-control-allow-origin` value
+> **always echoes the request Origin verbatim** — envoy-rust does NOT emit
+> the wildcard `*` under any configured-policy path.
+
+**Preflight local-reply wire shape (L2).**
+
+- Status: **200** (NOT 204; verified §6.2 L2 against Envoy v1.33.0).
+- Body: **empty** (zero bytes); `content-length: 0` is stamped by the
+  H1/H2 synth decorators downstream of the filter pipeline (same pattern
+  as `jwt_authn` / `rbac` local replies — `CorsFilter` does NOT set
+  `content-length` itself).
+- A **disallowed-origin** `OPTIONS + origin + ACRM` request is NOT
+  short-circuited — it proxies through to the upstream and gets no CORS
+  decoration (L4; `origin_invalid` ticks instead).
+- An `OPTIONS + origin` request **without** `access-control-request-method`
+  is treated as an **actual request** (not a preflight) — it continues
+  through the pipeline and receives the actual-request decoration set on
+  the encode side (L2 preflight detection requires all three signals).
+
+**Cross-reference:** ADR-0058 (phase-23 PLAN-write lock-in).
+
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
 > Upstream Envoy's Prometheus emitter projects dynamic name segments
