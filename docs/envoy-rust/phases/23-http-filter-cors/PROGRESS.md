@@ -106,3 +106,23 @@ _(execution entries appended below per task during state-3)_
 - **⚠ Task-4 carryover:** the positive test `cors_per_route_config_with_cors_filter_present_parses` is `#[ignore = "needs HttpFilterTypedConfig::Cors from Task 4"]` — a `cors` filter-chain entry can't parse until Task 4 registers `HttpFilterTypedConfig::Cors`. **Task 4 must un-ignore this test** and confirm it passes.
 
 **Review:** spec-compliance review ✅ SPEC COMPLIANT (placement/merge-ordering traced, logic + variant style + tests verified, +213 lines purely additive, 405 tests green). Code-quality review reserved for the substantive tasks per the PLAN execution-handoff.
+
+---
+
+## Task 3 — D4+D7 `CorsFilter` runtime + 2 stats + BEHAVIOR_CONTRACT (UNWIRED) — DONE (code commit `ddb4cb87c`)
+
+**Deliverable:** new `crates/envoy-filter/src/cors.rs` — `CorsFilter` (origin allow-match via reused `StringMatcher`, decode-side preflight short-circuit, encode-side actual-request decoration, 2 stats) + `CompiledCorsPolicy` lowering. Re-exported `pub use cors::CorsFilter;` from `lib.rs`. BEHAVIOR_CONTRACT.md gains the 23-entries CORS block. **Not yet wired into `HttpFilterInstance`/pipeline — that is Task 4.**
+
+**Recon findings (confirmed against codebase, for downstream tasks):** `Counter` read accessor is `.value()`; `register_counter` → `Result<Arc<Counter>, _>`; `FilterRequest.body: Option<Bytes>`, `FilterResponse.body: Bytes` (NOT Option); `Decision::Continue` / `Decision::StopAndSend(FilterResponse)`; `FilterError::InvalidConfig { message: String }`; `StringMatcher.mode` + `.ignore_case` both `pub` (test uses `StringMatcher { mode: StringMatcherMode::Exact(..), ignore_case: false }`).
+
+**Verified semantics implemented exactly (L2–L5):** 3-condition preflight detection (`OPTIONS` ∧ origin ∧ `access-control-request-method`); allowed preflight → `StopAndSend{200, empty body, 6 conditional headers in verified order}`; disallowed/no-ACRM → Continue; encode adds only allow-origin + allow-credentials(if) + expose-headers(if), never methods/headers/max-age; stats tick once per present origin (valid/invalid) BEFORE the short-circuit, no-origin ticks neither; `active_policy: None` → fully inert. `header_ci` duplicated locally per SC2.
+
+**TDD:** 12 unit tests (10 + 2 added in code-quality fix), all green. clippy + fmt + `cargo build --workspace` clean.
+
+**Reviews (two-stage, substantive task):**
+- Spec-compliance ✅ SPEC COMPLIANT — all 6 verified-semantics points checked against code (preflight detection, 200/header-order, disallowed→Continue, encode-only-3, stats-both-paths, inert-None); BEHAVIOR_CONTRACT rows accurate.
+- Code-quality → **Approve-with-minor-fixes**, all applied + commit amended (`aa3b7219f`→`ddb4cb87c`): **I-1** redundant double-clone in `encode_headers` removed; **M-1** `encode_headers` doc corrected (only allow-origin unconditional); **M-3** test `apply_route_config_route_without_cors_key_is_none`; **M-4** test `minimal_policy_encode_emits_only_allow_origin`.
+
+**⚠ Task-4 carryovers (from code-quality M-5 / M-2):**
+1. **Remove the module-level `#![allow(dead_code)]`** in `cors.rs` once Task 4 wires `CorsFilter` into `HttpFilterInstance` (it currently masks the unused filter; with the filter live it should be unnecessary — confirm clippy stays clean after removal).
+2. **`irrefutable_let_patterns` lint:** `apply_route_config` has `let envoy_config::PerFilterConfig::Cors(p) = pfc;` (single-variant enum → irrefutable). It does not fire today (dead-code-suppressed) but WILL once the path is live. Fix at Task 4 with `let-else`/`if-let` + `unreachable!()`, or equivalent, so wiring lands clippy-clean.
