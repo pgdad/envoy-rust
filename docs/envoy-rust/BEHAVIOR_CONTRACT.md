@@ -488,6 +488,13 @@ on the encode side for any non-preflight allowed-origin request (including
   H1/H2 synth decorators downstream of the filter pipeline (same pattern
   as `jwt_authn` / `rbac` local replies — `CorsFilter` does NOT set
   `content-length` itself).
+- **No `content-type` header** (ADR-0059). Upstream Envoy v1.33 does NOT
+  emit `content-type` on an **empty-body** local reply. The H1
+  `decorate_filter_synth_response` / H2 `decorate_filter_synth_response_h2`
+  decorators add `content-type: text/plain` only-if-missing AND only when
+  the body is non-empty — so the (empty-body) CORS preflight 200 carries no
+  `content-type`, while every non-empty filter local reply (rbac 403 / fault
+  / jwt_authn 401 / local_ratelimit 429 / overflow 503) is byte-unchanged.
 - A **disallowed-origin** `OPTIONS + origin + ACRM` request is NOT
   short-circuited — it proxies through to the upstream and gets no CORS
   decoration (L4; `origin_invalid` ticks instead).
@@ -496,7 +503,21 @@ on the encode side for any non-preflight allowed-origin request (including
   through the pipeline and receives the actual-request decoration set on
   the encode side (L2 preflight detection requires all three signals).
 
-**Cross-reference:** ADR-0058 (phase-23 PLAN-write lock-in).
+**Cross-reference:** ADR-0058 (phase-23 PLAN-write lock-in); ADR-0059 (the
+Task-7 empty-body `content-type` omission + the H1-pool `Connection: close`
+correction below).
+
+**H1 upstream connection-pool `Connection: close` single-use (ADR-0059).**
+
+> When an upstream H1 response carries `Connection: close`, the H1 connection
+> pool **invalidates** that connection (destroys it on `Drop` rather than
+> returning it to the idle list) — matching Envoy's single-use treatment of an
+> upstream `Connection: close`. A pooled connection to a `Connection: close`
+> backend (e.g. the `http1-echo-server`) is therefore never reused; reuse for
+> keep-alive upstreams (no `Connection: close` — the pooling fixtures 0020/0021
+> backends) is unaffected (the invalidate branch never fires). Surfaced by
+> fixture 0031's four sequential probes over one downstream connection (the
+> first multi-request fixture over a `Connection: close` upstream).
 
 **06.1 Prometheus exposition shape divergence (06.1 fixture 0011):**
 
