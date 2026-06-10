@@ -3018,9 +3018,26 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     wait_accept_ready(upstream_addr, budget)
         .await
         .context("upstream Envoy never became accept-ready")?;
-    wait_accept_ready(subject_addr, budget)
-        .await
-        .context("envoy-rust never became accept-ready")?;
+    // Like wait_accept_ready, but bail immediately if the subject process has
+    // already exited (e.g. a listener bind failure) — the connect loop would
+    // otherwise burn the whole budget and mask the real error (CI run
+    // 26861955222: data + admin listener port collision → instant exit →
+    // misleading 10s "never became accept-ready" timeout).
+    let subject_deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(status) = subject.try_exit_status() {
+            bail!("envoy-rust exited before accept-ready: {status}");
+        }
+        match tokio::net::TcpStream::connect(subject_addr).await {
+            Ok(_) => break,
+            Err(_) if std::time::Instant::now() < subject_deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => {
+                bail!("envoy-rust {subject_addr} not accept-ready within {budget:?}: {err}")
+            }
+        }
+    }
 
     match &expectations.driver {
         Driver::TcpEcho => {
