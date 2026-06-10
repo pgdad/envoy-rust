@@ -48,6 +48,21 @@ jobs:
             | sudo tar xz -C /usr/local/bin
           h2spec --version
 
+      - name: pre-pull upstream Envoy image (Docker Hub flake guard)
+        run: |
+          set -euo pipefail
+          # Tag is greped from the harness source so CI can never drift from
+          # tests/differential/src/upstream.rs (IMAGE_TAG).
+          TAG="$(grep -oP 'IMAGE_TAG: &str = "\K[^"]+' tests/differential/src/upstream.rs)"
+          IMG="envoyproxy/envoy:${TAG}"
+          for i in 1 2 3 4 5; do
+            if docker pull "$IMG"; then exit 0; fi
+            echo "docker pull $IMG failed (attempt $i); sleeping $((i*10))s"
+            sleep $((i*10))
+          done
+          echo "giving up after 5 attempts"
+          exit 1
+
       - name: test (includes differential harness → Docker)
         run: cargo test --workspace
 
