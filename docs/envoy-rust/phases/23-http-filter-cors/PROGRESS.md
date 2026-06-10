@@ -199,3 +199,13 @@ Between Task 5 and Task 6, per a user request, pulled the merged GitHub CI-flake
 **ADR-0059 FIRED** (the number ADR-0058 reserved-but-unfired for the §6.1 split, which did not fire — consumed here): records corrections #2 + #3 as differential-driven behavioral-equivalence corrections to shared production code (the ADR-0033/ADR-0056 mid-implementation-correction precedent). DECISIONS.md ledger head now **ADR-0059** (cumulative count 60). BEHAVIOR_CONTRACT.md gains the empty-body-`content-type`-omission rule (under the CORS preflight wire-shape note) + the H1-pool upstream-`Connection: close` single-use note.
 
 **⚠ State-4 (Task 10) MUST confirm** — given the shared-code changes #2/#3, the full §7.5 31-fixture differential must verify the local-reply fixtures (0016/0017/0018/0030) AND the pooling fixtures (0020/0021) stay green, plus the new 0031, on Linux CI.
+
+---
+
+## Task 8 — D8.2 `parse_bootstrap` fuzz seed (NO new target) — DONE (code commit `47f9c7c25`)
+
+**Deliverable:** corpus seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/route_cors_typed_per_filter_config.yaml` — a full minimal valid bootstrap (modeled on `route_retry_policy.yaml`: node + admin + static_resources + H1 HCM) with `http_filters: [cors, router]` and a route `match: {prefix: "/"}` → `route: {cluster: backend}` carrying a `CorsPolicy` via `typed_per_filter_config` (`allow_origin_string_match: [{exact: "http://allowed.example.com"}]`, `allow_methods`, `max_age`) + a defined STATIC `backend` cluster. Registered in the `fuzz_corpus_seeds_parse_or_reject_cleanly` SUCCESS array (`bootstrap.rs`).
+
+**No new fuzz target** (CORS reuses `StringMatcher`): the new untrusted surface — the `typed_per_filter_config` map + `CorsPolicy` — is covered by the EXISTING `parse_bootstrap` fuzz target (it parses arbitrary bootstrap YAML). No `fuzz/fuzz_targets/` change (confirmed). The implementer also added the required per-seed exception to the fuzz crate's allowlist `.gitignore` (`crates/envoy-config/fuzz/.gitignore` — the established corpus pattern, NOT the top-level scratch `.gitignore`).
+
+**Verification:** `cargo test -p envoy-config fuzz_corpus_seeds_parse_or_reject_cleanly` → PASS (the seed parses to `Ok`; cors filter present so the absent-filter validator is satisfied; route→defined cluster). fmt clean. 3 files / +48 lines.
