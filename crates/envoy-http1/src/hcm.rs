@@ -236,6 +236,7 @@ fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
                             headers: r.r#match.headers.clone(),
                         },
                         action: clone_route_action(&r.action),
+                        typed_per_filter_config: Default::default(),
                     })
                     .collect(),
             })
@@ -1624,6 +1625,7 @@ static_resources:
                                 inline_string: Some(body.to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -1706,6 +1708,7 @@ static_resources:
                                 inline_string: Some("hit\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -1751,6 +1754,7 @@ static_resources:
                                     inline_string: Some("first\n".to_string()),
                                 },
                             }),
+                            typed_per_filter_config: Default::default(),
                         },
                         Route {
                             r#match: RouteMatch {
@@ -1765,6 +1769,7 @@ static_resources:
                                     inline_string: Some("never\n".to_string()),
                                 },
                             }),
+                            typed_per_filter_config: Default::default(),
                         },
                     ],
                 }],
@@ -1822,6 +1827,7 @@ static_resources:
                                 inline_string: Some("ok\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -1988,6 +1994,7 @@ static_resources:
                     inline_string: Some("ok\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         }])
         .await;
         let req = b"GET /healthz HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -2014,6 +2021,7 @@ static_resources:
                     inline_string: Some("teapot\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         let default_route = Route {
             r#match: RouteMatch {
@@ -2028,6 +2036,7 @@ static_resources:
                     inline_string: Some("ok\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         let cfg = build_test_config(vec![matcher_route, default_route]).await;
         let req =
@@ -2057,6 +2066,7 @@ static_resources:
                     inline_string: Some("teapot\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         let default_route = Route {
             r#match: RouteMatch {
@@ -2071,6 +2081,7 @@ static_resources:
                     inline_string: Some("ok\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         let cfg = build_test_config(vec![matcher_route, default_route]).await;
         // /api/widgets but no X-Foo header → falls through to default 200.
@@ -2106,6 +2117,7 @@ static_resources:
                     inline_string: Some("teapot\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         let cfg = build_test_config(vec![matcher_route]).await;
         let req =
@@ -2140,6 +2152,7 @@ static_resources:
                     inline_string: Some("teapot\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         let default_route = Route {
             r#match: RouteMatch {
@@ -2154,6 +2167,7 @@ static_resources:
                     inline_string: Some("ok\n".into()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         let cfg = build_test_config(vec![matcher_route, default_route]).await;
         // X-A matches, X-B does not → matcher route fails, fall through to default.
@@ -2206,6 +2220,7 @@ static_resources:
                             headers: vec![],
                         },
                         action,
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -2553,6 +2568,7 @@ static_resources:
                                 inline_string: Some("ok\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -2623,6 +2639,7 @@ static_resources:
                                 inline_string: Some("body\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -2897,6 +2914,7 @@ static_resources:
                                 inline_string: Some("ok\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -3094,6 +3112,7 @@ static_resources:
                                 inline_string: Some("ok\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -3262,6 +3281,7 @@ static_resources:
                                 inline_string: Some("ok\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -3373,6 +3393,7 @@ static_resources:
                                 inline_string: Some(route_body.to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -3451,6 +3472,7 @@ static_resources:
                     inline_string: Some("matched\n".to_string()),
                 },
             }),
+            typed_per_filter_config: Default::default(),
         };
         Arc::new(HCMConfig {
             stat_prefix: "ingress_http".to_string(),
@@ -3515,6 +3537,7 @@ static_resources:
                                 inline_string: Some("ok\n".to_string()),
                             },
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -3824,6 +3847,7 @@ static_resources:
                             cluster: "backend".to_string(),
                             retry_policy: None,
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -4009,6 +4033,7 @@ static_resources:
                             cluster: "backend".to_string(),
                             retry_policy: None,
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),
@@ -4131,6 +4156,7 @@ static_resources:
                             cluster: cluster.to_string(),
                             retry_policy,
                         }),
+                        typed_per_filter_config: Default::default(),
                     }],
                 }],
             }),

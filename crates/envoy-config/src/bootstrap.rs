@@ -770,6 +770,55 @@ pub enum HttpFilterTypedConfig {
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {}
 
+// ---------------------------------------------------------------------------
+// 23 D1: per-route typed_per_filter_config types
+// ---------------------------------------------------------------------------
+
+/// 23 D1: per-route filter configuration map, keyed by filter name
+/// (`envoy.filters.http.cors`, …) → a `@type`-tagged per-filter config.
+/// The per-route counterpart to the filter-chain `HttpFilterTypedConfig`.
+/// Only the `Cors` variant is registered + consumed this phase; future
+/// filters slot in additively (§6.3 anti-pattern: no untested stub variants).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "@type")]
+pub enum PerFilterConfig {
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy")]
+    Cors(CorsPolicy),
+}
+
+/// 23 D1: the per-route CORS policy (attached via `typed_per_filter_config`).
+/// `allow_origin_string_match` reuses the 04.x `StringMatcher`. Deferred
+/// fields (`filter_enabled`, `shadow_enabled`, `allow_private_network_access`,
+/// `forward_not_matching_preflights`) are rejected by `deny_unknown_fields`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorsPolicy {
+    pub allow_origin_string_match: Vec<StringMatcher>,
+    #[serde(default)]
+    pub allow_methods: Option<String>,
+    #[serde(default)]
+    pub allow_headers: Option<String>,
+    #[serde(default)]
+    pub expose_headers: Option<String>,
+    #[serde(default)]
+    pub max_age: Option<String>,
+    #[serde(default)]
+    pub allow_credentials: Option<bool>,
+}
+
+/// 23 D5: the near-empty filter-chain `Cors` entry (declares the filter present).
+/// The actual policy lives per-route in `CorsPolicy`. The deferred
+/// `filter_enabled`/`shadow_enabled` runtime knobs are rejected by
+/// `deny_unknown_fields`. When used inside `HttpFilterTypedConfig` (Task 4),
+/// the `@type` field is consumed by the enum's `#[serde(tag = "@type")]` before
+/// this struct sees it — so `deny_unknown_fields` here correctly rejects any
+/// unexpected CORS filter-chain config fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {}
+
+// ---------------------------------------------------------------------------
+
 /// `envoy.extensions.filters.http.header_mutation.v3.HeaderMutation` config.
 /// The HeaderMutation filter appends/overwrites request and response headers.
 /// Phase 07.2.
@@ -1155,6 +1204,10 @@ pub struct Route {
 
     /// 04.3 NEW: the action to dispatch on a matched request.
     pub action: RouteAction,
+
+    /// 23 D1: per-route filter configuration (e.g. the CORS policy). Empty
+    /// when the route carries no `typed_per_filter_config:` map.
+    pub typed_per_filter_config: std::collections::BTreeMap<String, PerFilterConfig>,
 }
 
 /// 04.3 NEW (under SPEC §3 D2): the action variant a route's HCM router
@@ -1345,6 +1398,9 @@ impl<'de> serde::Deserialize<'de> for Route {
                 let mut r#match: Option<RouteMatch> = None;
                 let mut direct_response: Option<DirectResponse> = None;
                 let mut route_action: Option<RouteAction_Route> = None;
+                let mut typed_per_filter_config: Option<
+                    std::collections::BTreeMap<String, PerFilterConfig>,
+                > = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -1366,10 +1422,26 @@ impl<'de> serde::Deserialize<'de> for Route {
                             }
                             route_action = Some(map.next_value::<RouteAction_Route>()?);
                         }
+                        "typed_per_filter_config" => {
+                            if typed_per_filter_config.is_some() {
+                                return Err(M::Error::duplicate_field("typed_per_filter_config"));
+                            }
+                            typed_per_filter_config = Some(
+                                map.next_value::<std::collections::BTreeMap<
+                                    String,
+                                    PerFilterConfig,
+                                >>()?,
+                            );
+                        }
                         other => {
                             return Err(M::Error::unknown_field(
                                 other,
-                                &["match", "direct_response", "route"],
+                                &[
+                                    "match",
+                                    "direct_response",
+                                    "route",
+                                    "typed_per_filter_config",
+                                ],
                             ));
                         }
                     }
@@ -1393,7 +1465,11 @@ impl<'de> serde::Deserialize<'de> for Route {
                     (None, Some(ar)) => RouteAction::Route(ar),
                 };
 
-                Ok(Route { r#match, action })
+                Ok(Route {
+                    r#match,
+                    action,
+                    typed_per_filter_config: typed_per_filter_config.unwrap_or_default(),
+                })
             }
         }
 
@@ -1407,11 +1483,15 @@ impl serde::Serialize for Route {
         S: serde::Serializer,
     {
         use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(2))?;
+        let len = 2 + usize::from(!self.typed_per_filter_config.is_empty());
+        let mut map = serializer.serialize_map(Some(len))?;
         map.serialize_entry("match", &self.r#match)?;
         match &self.action {
             RouteAction::DirectResponse(dr) => map.serialize_entry("direct_response", dr)?,
             RouteAction::Route(ar) => map.serialize_entry("route", ar)?,
+        }
+        if !self.typed_per_filter_config.is_empty() {
+            map.serialize_entry("typed_per_filter_config", &self.typed_per_filter_config)?;
         }
         map.end()
     }
@@ -12758,5 +12838,94 @@ local_jwks: { inline_string: "{}" }
             );
             assert!(p.audiences.is_empty());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 23 D1: per-route typed_per_filter_config schema tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod typed_per_filter_config_tests {
+    use super::*;
+
+    #[test]
+    fn route_parses_typed_per_filter_config_cors() {
+        let yaml = r#"
+match: { prefix: "/" }
+route: { cluster: backend }
+typed_per_filter_config:
+  envoy.filters.http.cors:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+    allow_origin_string_match:
+      - exact: "http://allowed.example.com"
+    allow_methods: "GET, POST, OPTIONS"
+    allow_headers: "x-custom-header, content-type"
+    expose_headers: "x-exposed-header"
+    max_age: "3600"
+    allow_credentials: true
+"#;
+        let route: Route = serde_yaml::from_str(yaml).expect("parses");
+        let pfc = route
+            .typed_per_filter_config
+            .get("envoy.filters.http.cors")
+            .expect("cors per-filter config present");
+        let PerFilterConfig::Cors(p) = pfc;
+        assert_eq!(p.allow_origin_string_match.len(), 1);
+        assert!(p.allow_origin_string_match[0].matches("http://allowed.example.com"));
+        assert_eq!(p.allow_methods.as_deref(), Some("GET, POST, OPTIONS"));
+        assert_eq!(
+            p.allow_headers.as_deref(),
+            Some("x-custom-header, content-type")
+        );
+        assert_eq!(p.expose_headers.as_deref(), Some("x-exposed-header"));
+        assert_eq!(p.max_age.as_deref(), Some("3600"));
+        assert_eq!(p.allow_credentials, Some(true));
+    }
+
+    #[test]
+    fn route_without_typed_per_filter_config_defaults_empty() {
+        let yaml = r#"
+match: { prefix: "/" }
+route: { cluster: backend }
+"#;
+        let route: Route = serde_yaml::from_str(yaml).expect("parses");
+        assert!(route.typed_per_filter_config.is_empty());
+    }
+
+    #[test]
+    fn cors_policy_rejects_unknown_field() {
+        let yaml = r#"
+match: { prefix: "/" }
+route: { cluster: backend }
+typed_per_filter_config:
+  envoy.filters.http.cors:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+    allow_origin_string_match: [ { exact: "x" } ]
+    allow_private_network_access: true
+"#;
+        assert!(serde_yaml::from_str::<Route>(yaml).is_err());
+    }
+
+    #[test]
+    fn route_rejects_unknown_top_level_key() {
+        let yaml = r#"
+match: { prefix: "/" }
+route: { cluster: backend }
+bogus_key: 1
+"#;
+        assert!(serde_yaml::from_str::<Route>(yaml).is_err());
+    }
+
+    /// Verify `CorsConfig` can be constructed as a default (near-empty filter-chain entry).
+    /// NOTE: `CorsConfig` is used INSIDE `HttpFilterTypedConfig` (Task 4 adds the enum
+    /// variant), where the `@type` field is consumed by the enum's `#[serde(tag = "@type")]`
+    /// before the inner struct sees it. Deserializing a bare `CorsConfig` directly from
+    /// `"@type": ...` YAML would reject the `@type` key via `deny_unknown_fields`. The
+    /// meaningful test is that the struct exists, carries `Default`, and can be used —
+    /// which the filter-chain machinery does after the enum dispatches.
+    #[test]
+    fn cors_config_filter_chain_entry_is_near_empty() {
+        let _c = CorsConfig::default();
     }
 }
