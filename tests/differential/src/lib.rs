@@ -1100,6 +1100,45 @@ async fn wait_file_nonempty(path: &std::path::Path, budget: Duration) -> bool {
     }
 }
 
+/// Parse Envoy admin `/stats` plain text: warm iff at least one
+/// `cluster.<name>.membership_healthy` gauge exists and ALL such gauges
+/// are >= 1.
+fn clusters_warm_from_stats_text(stats: &str) -> bool {
+    let mut saw_any = false;
+    for line in stats.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.starts_with("cluster.") && name.trim_end().ends_with(".membership_healthy") {
+            saw_any = true;
+            if value.trim().parse::<u64>().map(|v| v >= 1) != Ok(true) {
+                return false;
+            }
+        }
+    }
+    saw_any
+}
+
+/// File-based xDS warm-up gate (CI runs 26862683687 / 26862493718: upstream
+/// answered 503 because the CDS-supplied STRICT_DNS cluster had not resolved
+/// when the measured request fired). Polls admin `/stats` until clusters
+/// report healthy membership. Budget expiry is deliberately NON-FATAL: the
+/// measured drive then fails with exactly the diff it would have produced
+/// without the gate, so the gate cannot mask a real differential bug.
+/// Admin-only on purpose: these fixtures assert exact data-plane counters,
+/// so throwaway data-plane probes would break them deterministically.
+async fn wait_clusters_warm(admin_addr: SocketAddr, budget: Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = drive_http_get(admin_addr, "/stats", "localhost").await
+            && clusters_warm_from_stats_text(&String::from_utf8_lossy(&resp.body))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Drive `payload` at `addr`: open TCP, write payload, read exactly
 /// `payload.len()` bytes of echoed response, then confirm the peer writes
 /// no further bytes before shutting down the write side and dropping the
@@ -3053,6 +3092,17 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 bail!("envoy-rust {subject_addr} not accept-ready within {budget:?}: {err}")
             }
         }
+    }
+
+    // Gate only fixtures whose clusters arrive via file-based xDS; static-cluster
+    // fixtures warm synchronously and some intentionally drive 503s. Upstream
+    // (real Envoy) side only — envoy-rust does not emit membership_healthy
+    // without active health checks.
+    if (upstream_cds_path.is_some() || upstream_eds_path.is_some())
+        && needs_admin_port
+        && let Some(p) = upstream.host_admin_port()
+    {
+        wait_clusters_warm(format!("127.0.0.1:{p}").parse()?, Duration::from_secs(10)).await;
     }
 
     match &expectations.driver {
@@ -7607,5 +7657,30 @@ mod eds_harness_tests {
         ip.parse::<std::net::Ipv4Addr>().unwrap_or_else(|e| {
             panic!("discovered host-gateway IP {ip:?} must be numeric IPv4: {e}")
         });
+    }
+}
+
+/// Task 4 (CI flake-fix): parser for the admin `/stats` cluster warm-up gate.
+/// Placed after `eds_harness_tests` per the per-task placement convention.
+#[cfg(test)]
+mod xds_warmup_tests {
+    use super::clusters_warm_from_stats_text;
+
+    #[test]
+    fn clusters_warm_requires_at_least_one_cluster() {
+        assert!(!clusters_warm_from_stats_text("server.live: 1\n"));
+    }
+
+    #[test]
+    fn clusters_warm_false_when_any_membership_unhealthy() {
+        let s = "cluster.a.membership_healthy: 1\ncluster.b.membership_healthy: 0\n";
+        assert!(!clusters_warm_from_stats_text(s));
+    }
+
+    #[test]
+    fn clusters_warm_true_when_all_memberships_healthy() {
+        let s =
+            "cluster.a.membership_healthy: 1\ncluster.b.membership_healthy: 2\nserver.live: 1\n";
+        assert!(clusters_warm_from_stats_text(s));
     }
 }
