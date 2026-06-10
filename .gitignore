@@ -1,3 +1,10 @@
 
 # git worktrees for isolated feature work
 /.worktrees/
+
+# Rust build artifacts
+/target/
+
+# operator scratch (session-local; never committed)
+/next-prompt.txt
+/.claude/
