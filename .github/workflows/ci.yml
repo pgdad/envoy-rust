@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,9 +44,24 @@ jobs:
         run: |
           set -euo pipefail
           H2SPEC_VERSION="2.6.0"  # pinned; revisit at phase 06+
-          curl -fsSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
+          curl -fsSL --retry 5 --retry-all-errors "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
             | sudo tar xz -C /usr/local/bin
           h2spec --version
+
+      - name: pre-pull upstream Envoy image (Docker Hub flake guard)
+        run: |
+          set -euo pipefail
+          # Tag is greped from the harness source so CI can never drift from
+          # tests/differential/src/upstream.rs (IMAGE_TAG).
+          TAG="$(grep -oP 'IMAGE_TAG: &str = "\K[^"]+' tests/differential/src/upstream.rs)"
+          IMG="envoyproxy/envoy:${TAG}"
+          for i in 1 2 3 4 5; do
+            if docker pull "$IMG"; then exit 0; fi
+            echo "docker pull $IMG failed (attempt $i); sleeping $((i*10))s"
+            sleep $((i*10))
+          done
+          echo "giving up after 5 attempts"
+          exit 1
 
       - name: test (includes differential harness → Docker)
         run: cargo test --workspace
@@ -64,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install nightly Rust toolchain
         uses: dtolnay/rust-toolchain@nightly

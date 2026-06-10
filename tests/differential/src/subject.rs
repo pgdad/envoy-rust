@@ -17,6 +17,15 @@ impl Subject {
         self.port
     }
 
+    /// Non-blocking liveness probe: `Some(status)` once the child has exited.
+    /// Used by the harness to abort the accept-ready wait immediately (with the
+    /// real exit reason) instead of timing out for 10s against a dead process.
+    pub fn try_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child
+            .as_mut()
+            .and_then(|c| c.try_wait().ok().flatten())
+    }
+
     /// Terminate the subprocess via SIGKILL (tokio's `start_kill`) and wait
     /// up to `budget` for it to exit. Graceful-drain on SIGTERM is covered by
     /// envoy-bin's own unit tests in Task 7; this harness path only needs the
@@ -106,6 +115,32 @@ pub async fn start(config_path: &Path, port: u16) -> Result<Subject> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn try_exit_status_reports_exited_child() {
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut s = Subject {
+            child: Some(child),
+            port: 0,
+        };
+        // Poll until the child is reaped (bounded).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while s.try_exit_status().is_none() {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn try_exit_status_none_for_running_child() {
+        let child = Command::new("sleep").arg("5").spawn().unwrap();
+        let mut s = Subject {
+            child: Some(child),
+            port: 0,
+        };
+        assert!(s.try_exit_status().is_none());
+        s.shutdown(Duration::from_secs(5)).await.unwrap();
+    }
 
     #[tokio::test]
     async fn locate_envoy_bin_points_at_target_dir() {

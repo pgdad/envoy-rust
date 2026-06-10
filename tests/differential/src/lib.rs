@@ -914,16 +914,40 @@ pub fn load_expectations(path: &Path) -> Result<Expectations> {
 /// Reserve a free TCP port on 127.0.0.1. Binds `:0`, reads the assigned port,
 /// drops the listener, and returns the number.
 ///
+/// Intra-process dedup: the kernel may hand back the same ephemeral port for
+/// successive binds within a test process (CI run 26861955222 returned 40875 for
+/// both data + admin listeners, causing envoy-rust to fail `Address already in use`).
+/// This function tracks all ports handed out in the current process and retries the
+/// ephemeral bind if a duplicate is encountered.
+///
 /// TOCTOU: between the drop and the subsequent bind by envoy-rust, another
 /// process on the host could grab this port. This is accepted for a
 /// pre-production harness per SPEC §6 point 6. If CI flakes materialize, this
 /// becomes its own split phase with a port-range reservation strategy.
 pub fn reserve_port() -> Result<u16> {
-    let listener =
-        StdTcpListener::bind(("127.0.0.1", 0)).context("binding 127.0.0.1:0 to reserve a port")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
+    reserve_port_with(|| {
+        let listener = StdTcpListener::bind(("127.0.0.1", 0))
+            .context("binding 127.0.0.1:0 to reserve a port")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        Ok(port)
+    })
+}
+
+/// Core of `reserve_port` with an injectable ephemeral-port allocator so the
+/// dedup logic is unit-testable. Ports are never returned to the set: a test
+/// process reserves a few dozen ports at most.
+fn reserve_port_with(mut bind_ephemeral: impl FnMut() -> Result<u16>) -> Result<u16> {
+    static RESERVED_PORTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    for _ in 0..64 {
+        let port = bind_ephemeral()?;
+        if RESERVED_PORTS.lock().unwrap().insert(port) {
+            return Ok(port);
+        }
+    }
+    bail!("64 consecutive ephemeral-port reservations were duplicates of already-handed-out ports")
 }
 
 /// Template-render a fixture YAML by substituting literal `{{KEY}}` tokens.
@@ -1058,6 +1082,64 @@ pub async fn wait_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> 
             Err(err) => bail!("{addr} not accept-ready within {budget:?}: {err}"),
         }
     }
+}
+
+/// Poll `path` until it exists with len > 0, or `budget` expires.
+/// Returns whether the file became non-empty. Non-fatal by design: callers
+/// fall through to the byte-level assertion, which reports the real diff.
+async fn wait_file_nonempty(path: &std::path::Path, budget: Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Parse Envoy admin `/stats` plain text: warm iff at least one
+/// `cluster.<name>.membership_healthy` gauge exists and ALL such gauges
+/// are >= 1.
+fn clusters_warm_from_stats_text(stats: &str) -> bool {
+    let mut saw_any = false;
+    for line in stats.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.starts_with("cluster.") && name.trim_end().ends_with(".membership_healthy") {
+            saw_any = true;
+            if value.trim().parse::<u64>().map(|v| v >= 1) != Ok(true) {
+                return false;
+            }
+        }
+    }
+    saw_any
+}
+
+/// File-based xDS warm-up gate (CI runs 26862683687 / 26862493718: upstream
+/// answered 503 because the CDS-supplied STRICT_DNS cluster had not resolved
+/// when the measured request fired). Polls admin `/stats` until clusters
+/// report healthy membership. Budget expiry is deliberately NON-FATAL: the
+/// measured drive then fails with exactly the diff it would have produced
+/// without the gate, so the gate cannot mask a real differential bug.
+/// Admin-only on purpose: these fixtures assert exact data-plane counters,
+/// so throwaway data-plane probes would break them deterministically.
+async fn wait_clusters_warm(admin_addr: SocketAddr, budget: Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(remaining, drive_http_get(admin_addr, "/stats", "localhost")).await
+            && clusters_warm_from_stats_text(&String::from_utf8_lossy(&resp.body))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    tracing::warn!(%admin_addr, ?budget, "wait_clusters_warm: budget expired without all clusters warm; proceeding ungated");
 }
 
 /// Drive `payload` at `addr`: open TCP, write payload, read exactly
@@ -2994,9 +3076,37 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     wait_accept_ready(upstream_addr, budget)
         .await
         .context("upstream Envoy never became accept-ready")?;
-    wait_accept_ready(subject_addr, budget)
-        .await
-        .context("envoy-rust never became accept-ready")?;
+    // Like wait_accept_ready, but bail immediately if the subject process has
+    // already exited (e.g. a listener bind failure) — the connect loop would
+    // otherwise burn the whole budget and mask the real error (CI run
+    // 26861955222: data + admin listener port collision → instant exit →
+    // misleading 10s "never became accept-ready" timeout).
+    let subject_deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(status) = subject.try_exit_status() {
+            bail!("envoy-rust exited before accept-ready: {status}");
+        }
+        match tokio::net::TcpStream::connect(subject_addr).await {
+            Ok(_) => break,
+            Err(_) if std::time::Instant::now() < subject_deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => {
+                bail!("envoy-rust {subject_addr} not accept-ready within {budget:?}: {err}")
+            }
+        }
+    }
+
+    // Gate only fixtures whose clusters arrive via file-based xDS; static-cluster
+    // fixtures warm synchronously and some intentionally drive 503s. Upstream
+    // (real Envoy) side only — envoy-rust does not emit membership_healthy
+    // without active health checks.
+    if (upstream_cds_path.is_some() || upstream_eds_path.is_some())
+        && needs_admin_port
+        && let Some(p) = upstream.host_admin_port()
+    {
+        wait_clusters_warm(format!("127.0.0.1:{p}").parse()?, Duration::from_secs(10)).await;
+    }
 
     match &expectations.driver {
         Driver::TcpEcho => {
@@ -3788,6 +3898,20 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             let subject_resp = drive_http1(subject_addr, &http1_method, path, host, extra_headers)
                 .await
                 .context("envoy-rust http1 drive (Http1WithAccessLog)")?;
+
+            // envoy-rust's access-log emit is a fire-and-forget task that runs after the
+            // response completes; subject.shutdown() is SIGKILL (subject.rs TODO on
+            // graceful drain). Wait for the line to land BEFORE killing the process —
+            // CI run 27059869720 lost the race (`envoy=1 envoy-rust=0`) because the old
+            // post-shutdown poll could never observe a write from a dead process.
+            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+            if !wait_file_nonempty(&envoy_rust_path, std::time::Duration::from_secs(5)).await {
+                tracing::warn!(
+                    "differential: envoy-rust access-log file {} still empty after 5s (pre-shutdown wait)",
+                    envoy_rust_path.display()
+                );
+            }
+
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
 
@@ -3829,33 +3953,19 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 }
             }
 
-            // Access-log files. Wait up to 5s for both files to be NON-EMPTY
-            // (the fire-and-forget access-log emit task on envoy-rust runs
-            // after the response completes, so post-exists the file may still
-            // be empty for tens of ms while the OS buffers the write). 13.1
-            // state-5 fold-in (REVIEW §4 access-log flake mitigation):
-            // previously the loop waited for files to EXIST, which was racy —
-            // CI run `26375100437` at HEAD `13bb5cc` failed with `envoy=1
-            // envoy-rust=0` because envoy-rust's path existed (the FileSink
-            // creates the file at open time) but the emit task had not yet
-            // flushed when the harness reached the post-exists 100ms sleep.
-            // Polling for non-empty contents closes the race deterministically.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Envoy-side flush is driven by container stop (SIGTERM) above. The
+            // non-empty poll (rather than an exists check) preserves the fix for CI run
+            // 26375100437: the FileSink creates the file at open time, so existence
+            // alone does not imply the line landed.
             let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
-            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
-            loop {
-                let both_nonempty = envoy_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
-                    && envoy_rust_path
-                        .metadata()
-                        .map(|m| m.len() > 0)
-                        .unwrap_or(false);
-                if both_nonempty || std::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !wait_file_nonempty(&envoy_path, std::time::Duration::from_secs(5)).await {
+                tracing::warn!(
+                    "differential: envoy access-log file {} still empty after 5s (post container-stop wait)",
+                    envoy_path.display()
+                );
             }
-            // One final yield to let the OS flush any in-flight bytes that
-            // crossed the metadata-len threshold but haven't fully landed.
+            // One final yield to let the OS flush any in-flight bytes that crossed the
+            // metadata-len threshold but haven't fully landed.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
@@ -5473,6 +5583,26 @@ driver:
         assert!(p > 0);
     }
 
+    #[test]
+    fn reserve_port_with_skips_port_already_handed_out() {
+        // Simulate the kernel returning the same ephemeral port twice in a row
+        // (CI run 26861955222: data + admin listener both got 40875).
+        let mut calls = 0u32;
+        let first = reserve_port_with(|| {
+            calls += 1;
+            Ok(61001)
+        })
+        .unwrap();
+        assert_eq!(first, 61001);
+        let second = reserve_port_with(|| {
+            calls += 1;
+            // Kernel hands back 61001 again; helper must reject it and retry.
+            Ok(if calls <= 2 { 61001 } else { 61002 })
+        })
+        .unwrap();
+        assert_eq!(second, 61002);
+    }
+
     #[tokio::test]
     async fn wait_accept_ready_succeeds_for_listening_socket() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -5491,6 +5621,35 @@ driver:
         drop(listener);
         let result = wait_accept_ready(addr, Duration::from_millis(200)).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_file_nonempty_true_for_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "line\n").unwrap();
+        assert!(wait_file_nonempty(&p, Duration::from_millis(200)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_file_nonempty_false_when_budget_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "").unwrap();
+        assert!(!wait_file_nonempty(&p, Duration::from_millis(200)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_file_nonempty_true_when_content_arrives_mid_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "").unwrap();
+        let p2 = p.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            std::fs::write(&p2, "line\n").unwrap();
+        });
+        assert!(wait_file_nonempty(&p, Duration::from_secs(10)).await);
     }
 
     // Mirrors upstream Envoy v1.33.0's echo filter semantics per ADR-0006: the
@@ -7501,5 +7660,30 @@ mod eds_harness_tests {
         ip.parse::<std::net::Ipv4Addr>().unwrap_or_else(|e| {
             panic!("discovered host-gateway IP {ip:?} must be numeric IPv4: {e}")
         });
+    }
+}
+
+/// Task 4 (CI flake-fix): parser for the admin `/stats` cluster warm-up gate.
+/// Placed after `eds_harness_tests` per the per-task placement convention.
+#[cfg(test)]
+mod xds_warmup_tests {
+    use super::clusters_warm_from_stats_text;
+
+    #[test]
+    fn clusters_warm_requires_at_least_one_cluster() {
+        assert!(!clusters_warm_from_stats_text("server.live: 1\n"));
+    }
+
+    #[test]
+    fn clusters_warm_false_when_any_membership_unhealthy() {
+        let s = "cluster.a.membership_healthy: 1\ncluster.b.membership_healthy: 0\n";
+        assert!(!clusters_warm_from_stats_text(s));
+    }
+
+    #[test]
+    fn clusters_warm_true_when_all_memberships_healthy() {
+        let s =
+            "cluster.a.membership_healthy: 1\ncluster.b.membership_healthy: 2\nserver.live: 1\n";
+        assert!(clusters_warm_from_stats_text(s));
     }
 }
