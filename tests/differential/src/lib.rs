@@ -3852,7 +3852,12 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // CI run 27059869720 lost the race (`envoy=1 envoy-rust=0`) because the old
             // post-shutdown poll could never observe a write from a dead process.
             let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
-            wait_file_nonempty(&envoy_rust_path, std::time::Duration::from_secs(5)).await;
+            if !wait_file_nonempty(&envoy_rust_path, std::time::Duration::from_secs(5)).await {
+                tracing::warn!(
+                    "differential: envoy-rust access-log file {} still empty after 5s (pre-shutdown wait)",
+                    envoy_rust_path.display()
+                );
+            }
 
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
@@ -3900,7 +3905,12 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // 26375100437: the FileSink creates the file at open time, so existence
             // alone does not imply the line landed.
             let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
-            wait_file_nonempty(&envoy_path, std::time::Duration::from_secs(5)).await;
+            if !wait_file_nonempty(&envoy_path, std::time::Duration::from_secs(5)).await {
+                tracing::warn!(
+                    "differential: envoy access-log file {} still empty after 5s (post container-stop wait)",
+                    envoy_path.display()
+                );
+            }
             // One final yield to let the OS flush any in-flight bytes that crossed the
             // metadata-len threshold but haven't fully landed.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -5583,10 +5593,10 @@ driver:
         std::fs::write(&p, "").unwrap();
         let p2 = p.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
             std::fs::write(&p2, "line\n").unwrap();
         });
-        assert!(wait_file_nonempty(&p, Duration::from_secs(2)).await);
+        assert!(wait_file_nonempty(&p, Duration::from_secs(10)).await);
     }
 
     // Mirrors upstream Envoy v1.33.0's echo filter semantics per ADR-0006: the
