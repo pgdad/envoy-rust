@@ -90,3 +90,19 @@ _(execution entries appended below per task during state-3)_
 - **SC3 honored** — `StringMatcher` reused verbatim (zero diff lines); `allow_origin_string_match: Vec<StringMatcher>`.
 
 **Review:** spec-compliance review ✅ SPEC COMPLIANT (independently verified: exact derives/serde attrs, `max_age: Option<String>`, no stub variants, hand-rolled impls intact, conditional serialize length, mechanical fan-out, 403 tests green). Code-quality review reserved for the substantive tasks (3/4/5/6) per the PLAN execution-handoff.
+
+---
+
+## Task 2 — D3 `PerRouteConfigForAbsentFilter` validator (L7 stricter-reject) — DONE (code commit `f22578e19`)
+
+**Deliverable:** new `ConfigError::PerRouteConfigForAbsentFilter { filter: String }` (`crates/envoy-config/src/lib.rs:531`) + a startup-fatal validator in `validate_hcm` (`crates/envoy-config/src/bootstrap.rs:~2693`) that collects the HCM's present filter names (`http_filters[].name`) and rejects any route `typed_per_filter_config` key not in that set. The ADR-0058 L7 divergence: Envoy accepts-and-ignores; envoy-rust all-fatal-rejects (ADR-0049 posture / ADR-0054 item-6a precedent).
+
+**Placement (verified by spec review):** co-located with the existing `UnknownCluster` cluster-reference check, inside the per-route loop, AFTER the `route_config.is_none()` early-return gate. **Merge-ordering correctness traced:** for inline HCMs `route_config` is `Some` → runs immediately; for `rds`-configured HCMs `route_config` is `None` at parse (skips, no false positive), then `load_dynamic_resources` populates it and re-invokes `bootstrap::validate()` → `validate_hcm` post-merge (`lib.rs:~900`), so the check sees the EFFECTIVE merged route table. Inherits the same merge guarantees as `UnknownCluster`.
+
+**TDD:** negative test `cors_per_route_config_without_cors_filter_is_fatal` (CorsPolicy on a route, only `router` in chain → `PerRouteConfigForAbsentFilter{filter:"envoy.filters.http.cors"}`) PASSES now; regression test `empty_typed_per_filter_config_does_not_trigger_validator` PASSES (guards all existing fixtures). 405 passed / 1 ignored; clippy + fmt + `cargo build --workspace` clean.
+
+**Notes / deviations:**
+- **`StringMatcher` structural validity** (D3 second half) is enforced automatically by `StringMatcher`'s hand-rolled `Deserialize` — no extra validator code (confirmed).
+- **⚠ Task-4 carryover:** the positive test `cors_per_route_config_with_cors_filter_present_parses` is `#[ignore = "needs HttpFilterTypedConfig::Cors from Task 4"]` — a `cors` filter-chain entry can't parse until Task 4 registers `HttpFilterTypedConfig::Cors`. **Task 4 must un-ignore this test** and confirm it passes.
+
+**Review:** spec-compliance review ✅ SPEC COMPLIANT (placement/merge-ordering traced, logic + variant style + tests verified, +213 lines purely additive, 405 tests green). Code-quality review reserved for the substantive tasks per the PLAN execution-handoff.
