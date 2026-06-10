@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use envoy_stats::StatsRegistry;
 
+use crate::cors::CorsFilter;
 use crate::error::FilterError;
 use crate::fault::FaultFilter;
 use crate::header_mutation::HeaderMutationFilter;
@@ -49,6 +50,13 @@ pub enum HttpFilterInstance {
     /// registered under `http.{hcm_stat_prefix}.jwt_authn.{allowed,denied}` at
     /// build time).
     JwtAuthn(JwtAuthnFilter),
+    /// Phase-23 Task 4: the `envoy.filters.http.cors` filter (decode-side
+    /// preflight short-circuit + encode-side actual-request decoration; the
+    /// per-route `CorsPolicy` is supplied via `apply_route_config`; 2 stat
+    /// counters registered under
+    /// `http.{hcm_stat_prefix}.cors.{origin_valid,origin_invalid}` at build
+    /// time).
+    Cors(CorsFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -110,6 +118,9 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::JwtAuthn(cfg) => Ok(HttpFilterInstance::JwtAuthn(
                 JwtAuthnFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
             )),
+            envoy_config::HttpFilterTypedConfig::Cors(cfg) => Ok(HttpFilterInstance::Cors(
+                CorsFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
+            )),
         }
     }
 
@@ -121,6 +132,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Rbac(f) => f.decode_headers(req),
             HttpFilterInstance::Fault(f) => f.decode_headers(req),
             HttpFilterInstance::JwtAuthn(f) => f.decode_headers(req),
+            HttpFilterInstance::Cors(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -138,12 +150,23 @@ impl HttpFilterInstance {
             HttpFilterInstance::Rbac(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Fault(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::JwtAuthn(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::Cors(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnEncode(resp) => {
                 Decision::StopAndSend(resp.clone())
             }
+        }
+    }
+
+    /// Phase-23 D2: thread the matched route's per-filter config into the
+    /// per-request filter instance. No-op for every filter that does not consume
+    /// per-route config (Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn);
+    /// only `Cors` reads it.
+    pub(crate) fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
+        if let HttpFilterInstance::Cors(f) = self {
+            f.apply_route_config(route);
         }
     }
 }

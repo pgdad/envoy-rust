@@ -60,6 +60,15 @@ impl FilterPipeline {
         Self { filters }
     }
 
+    /// Phase-23 D2: fan the matched route's per-filter config out to each filter
+    /// instance before the decode pass. Inert for all non-CORS filters → the
+    /// 07.1 foundation-slice property (all pre-existing fixtures unchanged).
+    pub fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
+        for filter in self.filters.iter_mut() {
+            filter.apply_route_config(route);
+        }
+    }
+
     /// Iterate the filter chain in **declaration order** on the decode side.
     ///
     /// Per parent-07 SPEC §6 Rule 6: decode walks `filters.iter_mut()`.
@@ -210,5 +219,83 @@ mod tests {
             headers: vec![("content-length".to_string(), "0".to_string())],
             body: bytes::Bytes::new(),
         }
+    }
+
+    // ---- Task 4: apply_route_config fan-out tests ----
+
+    fn cors_router_pipeline() -> FilterPipeline {
+        let filters = vec![
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.cors".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Cors(
+                    envoy_config::CorsConfig::default(),
+                ),
+            },
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            },
+        ];
+        FilterPipeline::build_from_config(&filters, &test_registry(), "ingress_http")
+            .expect("cors + router pipeline builds")
+    }
+
+    fn route_with_cors_policy() -> envoy_config::Route {
+        serde_yaml::from_str(
+            r#"
+match:
+  prefix: "/"
+route:
+  cluster: backend
+typed_per_filter_config:
+  envoy.filters.http.cors:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy
+    allow_origin_string_match:
+      - exact: "http://a.test"
+    allow_methods: "GET"
+"#,
+        )
+        .expect("route with cors policy parses")
+    }
+
+    fn preflight_request() -> FilterRequest {
+        FilterRequest {
+            method: "OPTIONS".to_string(),
+            path: "/".to_string(),
+            headers: vec![
+                ("origin".to_string(), "http://a.test".to_string()),
+                (
+                    "access-control-request-method".to_string(),
+                    "GET".to_string(),
+                ),
+            ],
+            body: None,
+        }
+    }
+
+    #[test]
+    fn apply_route_config_then_preflight_short_circuits() {
+        let mut pipeline = cors_router_pipeline();
+        let route = route_with_cors_policy();
+        pipeline.apply_route_config(Some(&route));
+        let mut req = preflight_request();
+        match pipeline.decode_headers(&mut req) {
+            Decision::StopAndSend(r) => assert_eq!(r.status, 200),
+            Decision::Continue => panic!("expected StopAndSend(200) for allowed preflight"),
+        }
+    }
+
+    #[test]
+    fn apply_route_config_none_leaves_cors_inert() {
+        let mut pipeline = cors_router_pipeline();
+        pipeline.apply_route_config(None);
+        let mut req = preflight_request();
+        // No policy → cors is inert → Router Continue → pipeline Continue
+        assert!(
+            matches!(pipeline.decode_headers(&mut req), Decision::Continue),
+            "inert CORS (no policy) + Router must return Continue for preflight"
+        );
     }
 }

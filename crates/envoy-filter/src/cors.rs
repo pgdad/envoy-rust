@@ -20,9 +20,6 @@
 //! scope; the `HttpFilterInstance::Cors` variant + `apply_route_config`
 //! fan-out land in Task 4.  Dead-code lints for the public-crate items are
 //! suppressed here until the Task-4 wiring activates them.
-// Task-3 intentional: filter not yet wired into HttpFilterInstance (Task 4).
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -118,9 +115,8 @@ impl CorsFilter {
     pub(crate) fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
         self.active_policy = route
             .and_then(|r| r.typed_per_filter_config.get(CORS_FILTER_NAME))
-            .map(|pfc| {
-                let envoy_config::PerFilterConfig::Cors(p) = pfc;
-                CompiledCorsPolicy::from(p)
+            .map(|pfc| match pfc {
+                envoy_config::PerFilterConfig::Cors(p) => CompiledCorsPolicy::from(p),
             });
     }
 

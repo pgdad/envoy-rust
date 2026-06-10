@@ -762,6 +762,9 @@ pub enum HttpFilterTypedConfig {
         rename = "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication"
     )]
     JwtAuthn(JwtAuthnConfig),
+
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors")]
+    Cors(CorsConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -2845,6 +2848,15 @@ pub(crate) fn validate_http_filters(
                     });
                 }
                 validate_jwt_authn_config(cfg, listener_name)?;
+            }
+            crate::HttpFilterTypedConfig::Cors(_cfg) => {
+                if f.name != "envoy.filters.http.cors" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                // CorsConfig is empty (near-zero; no per-filter-chain fields to validate);
+                // name/typed_config consistency check above is the sole gate.
             }
         }
     }
@@ -13084,7 +13096,6 @@ admin:
     /// entry with `@type: .../Cors` fails to parse at the `HttpFilterTypedConfig`
     /// deserialization stage.
     #[test]
-    #[ignore = "needs HttpFilterTypedConfig::Cors from Task 4; un-ignore after that variant lands"]
     fn cors_per_route_config_with_cors_filter_present_parses() {
         let yaml = r#"
 static_resources:
@@ -13131,5 +13142,21 @@ admin:
             crate::parse_bootstrap(yaml).is_ok(),
             "CorsPolicy on route + cors filter in chain must parse successfully"
         );
+    }
+
+    // ---- Task 4: HttpFilterTypedConfig::Cors variant ----
+
+    #[test]
+    fn cors_filter_chain_entry_parses_to_cors_variant() {
+        let yaml = r#"
+name: envoy.filters.http.cors
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+"#;
+        let hf: crate::HttpFilter = serde_yaml::from_str(yaml).expect("parses");
+        assert!(matches!(
+            hf.typed_config,
+            crate::HttpFilterTypedConfig::Cors(_)
+        ));
     }
 }
