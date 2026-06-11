@@ -231,3 +231,48 @@ Between Task 5 and Task 6, per a user request, pulled the merged GitHub CI-flake
 ## Implementation arc (Tasks 1–9) COMPLETE
 
 All 9 implementation tasks landed (one code commit + one PROGRESS commit each; substantive tasks 3/4/5/6/7 two-stage-reviewed). The full `envoy.filters.http.cors` feature + the per-route `typed_per_filter_config` infrastructure are implemented, wired on H1 + H2, fixture-0031 differential GREEN (live, 2×), fuzz-seeded, and backstopped. **Task 10 (the §7.5 state-4 verification gate — the full 31-fixture Linux-CI differential + h2spec + the 5 stable gates + the standalone-crate builds) is the SEPARATE state-4 session** (per `BOOTSTRAP_PROMPT.md` §5.1 one-state-per-session). Mid-arc, the upstream CI-fix PR was merged into local `main` (merge `5c672e792`), and ADR-0059 landed (the Task-7 differential-driven shared-code corrections). STATE advances to `23` state-3-complete / state-4-next at this session's end.
+
+---
+
+## Task 10 — State-4 verification gate (`superpowers:verification-before-completion`) — DONE (this commit)
+
+The §7.5 phase-done gate, run at HEAD `ff3721fd1` (the state-3-arc-complete commit). **Evidence before assertions — every result below is a fresh command output.** The authoritative differential + h2spec + fuzz Provenance is the **Linux CI run** (ADR-0049); the local Mac runs are the in-session pre-flight.
+
+### (a) The five stable-toolchain gates — ALL GREEN (local, stable 1.95.0)
+
+| Gate | Command | Result |
+|---|---|---|
+| build | `cargo build --workspace --all-targets` | `Finished \`dev\` profile … in 8m 40s` (exit 0) |
+| clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `Finished … in 10m 43s` — **zero warnings** (exit 0); the authoritative workspace clippy pass per `project_state3_arc_skips_clippy` |
+| fmt | `cargo fmt --all -- --check` | exit 0 (no diff) |
+| test | `cargo test --workspace` | all crates green — see note below |
+| deny | `cargo deny check` | `advisories ok, bans ok, licenses ok, sources ok` (the 4 `license-not-encountered` warnings are pre-existing allow-list entries, NOT violations; no new dependency this phase) |
+
+**`cargo test --workspace` note (the documented backstop flake — NOT a regression):** the non-Docker workspace tests (`--exclude differential --exclude h2spec-conformance`) all passed EXCEPT `envoy-bin`'s `upstream_h2_connection_pooling` backstop, which timed out at **30.45s** at line 296 `.expect("backend ready")` — i.e. **before envoy-bin is ever spawned** (the panic is in the backend-readiness wait, pre-proxy → categorically not a phase-23 regression). Root-caused: the backstop shells `cargo run --manifest-path tests/helpers/http2-echo-server/Cargo.toml`, whose feature-resolution differs from `cargo build --workspace --all-targets`, so the helper rebuilds from scratch (~mins) and blows the 30s in-test readiness budget (`project_flaky_access_log_fixture_0012`). **Fix/clearance:** pre-build the three backstop helpers via the SAME manifest-path invocation (`cargo build --manifest-path tests/helpers/{http2-echo-server,http1-echo-server,health-aware-http1-backend}/Cargo.toml`), then re-run standalone → **`test result: ok. 1 passed … finished in 2.05s`**. (Refines `project_workspace_test_nested_cargo_backstop_flake`: standalone passes in ~2s ONLY once the helper is pre-built via manifest-path; the `--all-targets` workspace build does NOT satisfy it, due to the feature-unification mismatch.)
+
+### (b) Standalone-crate builds — ALL GREEN (per `project_isolated_crate_build_blindspot`)
+
+```
+cargo build -p envoy-config   → Finished in 29.86s
+cargo build -p envoy-filter   → Finished in 31.97s
+cargo build -p envoy-http1    → Finished in 1m 46s
+cargo build -p envoy-http2    → Finished in 2m 07s
+cargo build -p envoy-bin      → Finished in 0.07s
+```
+
+No per-crate feature-unification failure (the blind-spot check is clean).
+
+### (c) Differential + h2spec + fuzz — AUTHORITATIVE GREEN on Linux CI
+
+**CI run `27317400787`** (HEAD `ff3721fd1`, `https://github.com/pgdad/envoy-rust/actions/runs/27317400787`) — pushed `a81c39a98..ff3721fd1 → origin/main` this session to trigger the authoritative Linux Provenance. **Both jobs `success`:**
+
+- **`build + test + lint`** → `success` — `cargo test --workspace` on Linux = the full **31-fixture Docker differential (0001–0031) green simultaneously** (incl. the new `0031-http-filter-cors`: `test http_filter_cors_fixture ... ok`; the in-process backstop `http_filter_cors_in_process_backstop ... ok`; all `cors::tests::*` + `bootstrap::*cors*` unit tests `... ok`) + **`test h2spec_pass_rate_gate ... ok`** (the ≥95% gate — confirms the H2 HCM route-early-resolution ordering change is non-regressive) + workspace build/clippy/fmt. **Zero `test result: FAILED` / `error[` / `panicked` anywhere in the run.**
+- **`fuzz (parse_bootstrap + jwt_parse, 30s each)`** → `success` — the `parse_bootstrap` short-budget fuzz on the extended corpus (incl. the new `route_cors_typed_per_filter_config.yaml` seed) + `jwt_parse`.
+
+**⚠ ADR-0059 shared-code regression watch — CONFIRMED non-regressive** (all green inside the CI workspace test): the local-reply fixtures **0016 rbac / 0017 / 0018 fault / 0030 jwt** (the empty-body `content-type`-omission change) AND the pooling fixtures **0020 / 0021** (the H1-pool `Connection: close` invalidation) — none regressed; the new **0031** passes. No `superpowers:systematic-debugging` drop needed.
+
+**Local Mac pre-flight (supporting, non-authoritative):** Docker is degraded on this Mac (container `start()` blocks ~5 min in the Docker-API create call before each fixture, 0% CPU — a Docker-Desktop slowness, not a code issue), so the full local serial run was stopped after confirming the fixtures it reached were green (`access_log_file_sink` 0012, `admin_config_dump_server_info` 0014, `admin_drain_listeners` 0015 all `... ok`). Fixture **0031's LIVE local differential was already GREEN 2× during Task 7** (`a3e01f9d6`). A local h2spec run (h2spec 2.6.0 darwin_amd64 under Rosetta, on PATH) hung in the same env-degraded manner before booting envoy-bin and was stopped — inconclusive locally; the authoritative h2spec evidence is the CI `h2spec_pass_rate_gate ... ok` above.
+
+### Gate verdict
+
+All six §7.5 gates satisfied: (a) fixture 0031 green [CI]; (b) all 30 prior fixtures still green [CI]; (c) h2spec ≥95% [CI `h2spec_pass_rate_gate ... ok`]; (d) `parse_bootstrap` fuzz clean [CI fuzz job]; (e) the 5 stable gates clean [local, all exit 0]; (f) `REVIEW.md` → the SEPARATE state-5 code-review session. **STATE advances `23` state-3-complete / state-4-next → state-4-complete / state-5-next** at this commit (per §5.1 one-state-per-session; the state-5 code review is the NEXT session, NOT this one). No new ADR (pure verification; DECISIONS.md ledger head stays **ADR-0059**, count 60). ADR-0014 in force; ADR-0028 open.
