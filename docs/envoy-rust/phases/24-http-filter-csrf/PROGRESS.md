@@ -11,7 +11,7 @@
 | 3 | D3 — `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + `validate_csrf_config` | DONE |
 | 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | DONE |
 | 5 | D6.2 — `parse_bootstrap` fuzz seed (no new target) | DONE |
-| 6 | D6.3 — in-process backstop | OPEN |
+| 6 | D6.3 — in-process backstop | DONE |
 | 7 | State-4 verification + STATE advance | OPEN |
 
 ---
@@ -162,5 +162,11 @@ Single curated corpus seed; NO new fuzz target (csrf reuses `StringMatcher`/`par
 - **gitignore trap handled:** the fuzz corpus dir is gitignored with an explicit allowlist; added `!corpus/parse_bootstrap/route_csrf_typed_per_filter_config.yaml` to `crates/envoy-config/fuzz/.gitignore` so the seed is genuinely git-tracked (without it the test would fail on a fresh CI checkout). Confirmed tracked via `git ls-files`.
 - **Gates:** `cargo test -p envoy-config fuzz_corpus_seeds` (1 passed), `cargo fmt --all -- --check` (clean).
 - **Review:** ✅ compliant (3-file scope: seed + .gitignore allowlist + 1 array entry; `@type`/CsrfPolicy shape matches the verified 0032 fixture; git-tracking confirmed).
+
+### Task 6 — D6.3 in-process backstop — DONE (code commit `e7441ab00`)
+
+`crates/envoy-bin/tests/http_filter_csrf.rs` (411 lines) — boots the real `envoy-bin` binary (NO Docker) with a synthesized `[csrf, router]` H1 bootstrap (chain `filter_enabled` 100%; route override `additional_origins: [exact: "additional.csrf.test"]`, same `@type` as fixture 0032), proxies to an in-process all-200 tokio backend (`ok\n`), and issues 5 sequential H1 probes asserting `[200,403,200,200,403]` + the two 403 bodies byte-exact `Invalid origin` (14 bytes). The 200 probes assert the backend's `ok\n` body → unforgeable proof the request proxied through (a local CSRF 403 would yield `Invalid origin`). Faithful mirror of `http_filter_cors.rs` (subprocess `.kill_on_drop(true)` + explicit kill/wait, exp-backoff readiness wait, ephemeral ports, kill-stderr-pipe-first ordering); `http_probe` extended with a `host` param; the cors-only `find_header` helper correctly dropped (csrf asserts bodies).
+- **Run STANDALONE** (`-p envoy-bin --test http_filter_csrf`, helpers pre-built — `project_workspace_test_nested_cargo_backstop_flake`): `http_filter_csrf_in_process_backstop ... ok`, 0.77s. `cargo fmt --all -- --check` clean.
+- **Review:** Approved (spec ✅, mechanism-faithful, no copy-paste defects, no orphan leak, `#![forbid(unsafe_code)]`); only cosmetic Minors inherited from the cors template (non-blocking).
 
 _(state-3 appends one entry per completed task here)_
