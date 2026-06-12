@@ -115,8 +115,9 @@ impl CorsFilter {
     pub(crate) fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
         self.active_policy = route
             .and_then(|r| r.typed_per_filter_config.get(CORS_FILTER_NAME))
-            .map(|pfc| match pfc {
-                envoy_config::PerFilterConfig::Cors(p) => CompiledCorsPolicy::from(p),
+            .and_then(|pfc| match pfc {
+                envoy_config::PerFilterConfig::Cors(p) => Some(CompiledCorsPolicy::from(p)),
+                _ => None,
             });
     }
 

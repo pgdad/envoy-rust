@@ -14,7 +14,7 @@ pub mod rds;
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, AttemptOutcome,
     Bootstrap, CertificateValidationContext, CircuitBreakers, Cluster, ClusterType, CodecType,
-    CommonLbConfig, CommonTlsContext, ConfigSource, CorsConfig, CorsPolicy, DataSource,
+    CommonLbConfig, CommonTlsContext, ConfigSource, CorsConfig, CorsPolicy, CsrfPolicy, DataSource,
     DenominatorType, DirectResponse, DnsLookupFamily, DownstreamTlsContext, DynamicResources,
     EdsClusterConfig, Endpoint, ExplicitHttpConfig, FaultAbort, FaultConfig, FileAccessLog,
     FilterChain, FilterChainMatch, FractionalPercent, HeaderMatcher, HeaderMatcherMode,
@@ -26,8 +26,8 @@ pub use bootstrap::{
     PathConfigSource, PerFilterConfig, Percent, Permission, PermissionSet, Policy, Principal,
     PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route,
     RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority,
-    Rules, SafeRegex, SocketAddress, StaticResources, StringMatcher, StringMatcherMode,
-    TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket, TransportSocket,
+    Rules, RuntimeFractionalPercent, SafeRegex, SocketAddress, StaticResources, StringMatcher,
+    StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket, TransportSocket,
     TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext,
     VirtualHost, parse_duration,
 };

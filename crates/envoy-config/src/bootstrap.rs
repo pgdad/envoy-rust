@@ -787,6 +787,36 @@ pub struct RouterConfig {}
 pub enum PerFilterConfig {
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.cors.v3.CorsPolicy")]
     Cors(CorsPolicy),
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy")]
+    Csrf(CsrfPolicy),
+}
+
+/// `envoy.config.core.v3.RuntimeFractionalPercent`. A `default_value`
+/// percentage plus an optional `runtime_key`. The csrf filter's `filter_enabled`
+/// is of this type (REQUIRED — §6.2/ADR-0061 L1). envoy-rust honors only the
+/// deterministic 0%/100% `default_value`; a present `runtime_key` is rejected
+/// (no RTDS runtime layer — ADR-0061 L6, the ADR-0049 all-fatal posture).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFractionalPercent {
+    pub default_value: FractionalPercent,
+    #[serde(default)]
+    pub runtime_key: Option<String>,
+}
+
+/// `envoy.extensions.filters.http.csrf.v3.CsrfPolicy` (phase 24, minimum-viable
+/// per ADR-0060/0061). The SAME message is used at the filter-chain level
+/// (`HttpFilterTypedConfig::Csrf`) AND the per-route level (`PerFilterConfig::Csrf`)
+/// — ADR-0061 L1. `filter_enabled` is REQUIRED (no `#[serde(default)]`).
+/// `additional_origins` reuses the 04.x `StringMatcher` and is matched against
+/// the scheme-stripped `host[:port]` source origin (ADR-0061 L3). The deferred
+/// `shadow_enabled` is rejected by `deny_unknown_fields`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CsrfPolicy {
+    pub filter_enabled: RuntimeFractionalPercent,
+    #[serde(default)]
+    pub additional_origins: Vec<StringMatcher>,
 }
 
 /// 23 D1: the per-route CORS policy (attached via `typed_per_filter_config`).
@@ -12905,7 +12935,9 @@ typed_per_filter_config:
             .typed_per_filter_config
             .get("envoy.filters.http.cors")
             .expect("cors per-filter config present");
-        let PerFilterConfig::Cors(p) = pfc;
+        let PerFilterConfig::Cors(p) = pfc else {
+            panic!("expected Cors variant")
+        };
         assert_eq!(p.allow_origin_string_match.len(), 1);
         assert!(p.allow_origin_string_match[0].matches("http://allowed.example.com"));
         assert_eq!(p.allow_methods.as_deref(), Some("GET, POST, OPTIONS"));
@@ -12916,6 +12948,88 @@ typed_per_filter_config:
         assert_eq!(p.expose_headers.as_deref(), Some("x-exposed-header"));
         assert_eq!(p.max_age.as_deref(), Some("3600"));
         assert_eq!(p.allow_credentials, Some(true));
+    }
+
+    #[test]
+    fn csrf_policy_parses_filter_enabled_and_additional_origins() {
+        let yaml = r#"
+filter_enabled:
+  default_value: { numerator: 100, denominator: HUNDRED }
+additional_origins:
+- exact: "additional.example.com"
+- suffix: ".trusted.example.com"
+"#;
+        let p: CsrfPolicy = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(p.filter_enabled.default_value.numerator, 100);
+        assert!(p.filter_enabled.default_value.selects_deterministic());
+        assert_eq!(p.filter_enabled.runtime_key, None);
+        assert_eq!(p.additional_origins.len(), 2);
+        assert!(p.additional_origins[0].matches("additional.example.com"));
+    }
+
+    #[test]
+    fn csrf_policy_parses_runtime_key() {
+        let yaml = r#"
+filter_enabled:
+  default_value: { numerator: 100, denominator: HUNDRED }
+  runtime_key: "csrf.enabled"
+"#;
+        let p: CsrfPolicy = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(
+            p.filter_enabled.runtime_key.as_deref(),
+            Some("csrf.enabled")
+        );
+    }
+
+    #[test]
+    fn csrf_policy_requires_filter_enabled() {
+        // filter_enabled has no #[serde(default)] → absence is a parse error.
+        let yaml = r#"
+additional_origins:
+- exact: "additional.example.com"
+"#;
+        assert!(serde_yaml::from_str::<CsrfPolicy>(yaml).is_err());
+    }
+
+    #[test]
+    fn csrf_policy_rejects_shadow_enabled() {
+        let yaml = r#"
+filter_enabled:
+  default_value: { numerator: 100, denominator: HUNDRED }
+shadow_enabled:
+  default_value: { numerator: 100, denominator: HUNDRED }
+"#;
+        assert!(
+            serde_yaml::from_str::<CsrfPolicy>(yaml).is_err(),
+            "deny_unknown_fields must reject shadow_enabled"
+        );
+    }
+
+    #[test]
+    fn route_parses_typed_per_filter_config_csrf() {
+        let yaml = r#"
+match: { prefix: "/" }
+route: { cluster: backend }
+typed_per_filter_config:
+  envoy.filters.http.csrf:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy
+    filter_enabled:
+      default_value: { numerator: 100, denominator: HUNDRED }
+    additional_origins:
+    - exact: "additional.example.com"
+"#;
+        let route: Route = serde_yaml::from_str(yaml).expect("parses");
+        let pfc = route
+            .typed_per_filter_config
+            .get("envoy.filters.http.csrf")
+            .expect("csrf pfc present");
+        match pfc {
+            PerFilterConfig::Csrf(p) => {
+                assert!(p.filter_enabled.default_value.selects_deterministic());
+                assert_eq!(p.additional_origins.len(), 1);
+            }
+            other => panic!("expected Csrf, got {other:?}"),
+        }
     }
 
     #[test]
