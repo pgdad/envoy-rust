@@ -14,16 +14,13 @@
 //! - Decode-side only; `encode_headers` is the trivial `Continue` arm.
 //!
 //! ## Wiring status
-//! The filter is intentionally NOT wired into `HttpFilterInstance` at this Task-2
-//! scope; the `HttpFilterInstance::Csrf` variant + `apply_route_config` fan-out
-//! land in Task 3 (mirroring how `cors.rs` was introduced before its Task-4
-//! wiring). Dead-code lints for the public-crate items are suppressed via the
-//! module-level `#![allow(dead_code)]` below until the Task-3 wiring activates
-//! them (the same posture `cors.rs` used at introduction).
+//! Wired into `HttpFilterInstance::Csrf` (build/decode/encode/`apply_route_config`)
+//! as of Task 3 — the module-level `#![allow(dead_code)]` used at Task-2
+//! introduction is no longer needed now that every item is reachable from the
+//! instance dispatch.
 //!
 //! `header_ci` is duplicated from jwt_authn/cors (now N=3); the shared-util
 //! extraction stays deferred (the standing M-track consolidation item).
-#![allow(dead_code)]
 use std::sync::Arc;
 
 use bytes::Bytes;

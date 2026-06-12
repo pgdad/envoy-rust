@@ -530,6 +530,21 @@ pub enum ConfigError {
     )]
     PerRouteConfigForAbsentFilter { filter: String },
 
+    /// 24 D3 (ADR-0061 L6): a csrf `filter_enabled.default_value` is neither 0%
+    /// nor 100%. envoy-rust honors only deterministic gating (the phase-11 fault
+    /// precedent); fractional gating needs the unimplemented RTDS runtime layer.
+    #[error(
+        "csrf filter_enabled on listener `{listener}` is non-deterministic (numerator must be 0 or the denominator value)"
+    )]
+    UnsupportedNonDeterministicCsrfFilterEnabled { listener: String },
+
+    /// 24 D3 (ADR-0061 L6): a csrf `filter_enabled.runtime_key` is present.
+    /// envoy-rust has no RTDS runtime layer to honor it (the ADR-0049 all-fatal posture).
+    #[error(
+        "csrf filter_enabled on listener `{listener}` has a runtime_key, which requires the unimplemented RTDS runtime layer"
+    )]
+    UnsupportedRuntimeKeyedCsrfFilterEnabled { listener: String },
+
     /// 12.1: cluster has more than one `health_checks` entry (phase-12 supports 0 or 1).
     #[error(
         "cluster '{cluster}' has more than one health_checks entry; phase 12 supports at most one"

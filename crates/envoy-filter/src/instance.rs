@@ -18,6 +18,7 @@ use std::sync::Arc;
 use envoy_stats::StatsRegistry;
 
 use crate::cors::CorsFilter;
+use crate::csrf::CsrfFilter;
 use crate::error::FilterError;
 use crate::fault::FaultFilter;
 use crate::header_mutation::HeaderMutationFilter;
@@ -57,6 +58,13 @@ pub enum HttpFilterInstance {
     /// `http.{hcm_stat_prefix}.cors.{origin_valid,origin_invalid}` at build
     /// time).
     Cors(CorsFilter),
+    /// Phase-24 Task 3: the `envoy.filters.http.csrf` filter (decode-side
+    /// cross-site-request-forgery guard; the chain-level `CsrfPolicy` is an
+    /// always-applied base, optionally REPLACED by a per-route `CsrfPolicy` via
+    /// `apply_route_config`; 3 stat counters registered under
+    /// `http.{hcm_stat_prefix}.csrf.{request_valid,request_invalid,missing_source_origin}`
+    /// at build time).
+    Csrf(CsrfFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -121,6 +129,9 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::Cors(cfg) => Ok(HttpFilterInstance::Cors(
                 CorsFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
             )),
+            envoy_config::HttpFilterTypedConfig::Csrf(cfg) => Ok(HttpFilterInstance::Csrf(
+                CsrfFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
+            )),
         }
     }
 
@@ -133,6 +144,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Fault(f) => f.decode_headers(req),
             HttpFilterInstance::JwtAuthn(f) => f.decode_headers(req),
             HttpFilterInstance::Cors(f) => f.decode_headers(req),
+            HttpFilterInstance::Csrf(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -151,6 +163,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Fault(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::JwtAuthn(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Cors(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::Csrf(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
@@ -160,13 +173,19 @@ impl HttpFilterInstance {
         }
     }
 
-    /// Phase-23 D2: thread the matched route's per-filter config into the
+    /// Phase-23 D2 / 24 D3: thread the matched route's per-filter config into the
     /// per-request filter instance. No-op for every filter that does not consume
     /// per-route config (Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn);
-    /// only `Cors` reads it.
+    /// `Cors` and `Csrf` read it.
     pub(crate) fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
-        if let HttpFilterInstance::Cors(f) = self {
-            f.apply_route_config(route);
+        match self {
+            HttpFilterInstance::Cors(f) => f.apply_route_config(route),
+            HttpFilterInstance::Csrf(f) => f.apply_route_config(route),
+            // Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn (and the
+            // test-only variants) consume no per-route config; only Cors/Csrf
+            // override. A future route-config-consuming filter must add an arm
+            // above rather than silently fall through here.
+            _ => {}
         }
     }
 }
@@ -319,6 +338,57 @@ mod tests {
         }
 
         // encode_headers is a no-op for JwtAuthn — must return Continue
+        let mut resp = FilterResponse {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
+    }
+
+    fn csrf_policy_100() -> envoy_config::CsrfPolicy {
+        envoy_config::CsrfPolicy {
+            filter_enabled: envoy_config::RuntimeFractionalPercent {
+                default_value: envoy_config::FractionalPercent {
+                    numerator: 100,
+                    denominator: envoy_config::DenominatorType::Hundred,
+                },
+                runtime_key: None,
+            },
+            additional_origins: vec![],
+        }
+    }
+
+    #[test]
+    fn builds_csrf_instance_and_dispatches() {
+        let registry = test_registry();
+        let hf = envoy_config::HttpFilter {
+            name: "envoy.filters.http.csrf".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::Csrf(csrf_policy_100()),
+        };
+        let mut inst =
+            HttpFilterInstance::build(&hf, &registry, "ingress_http").expect("Csrf build succeeds");
+        assert!(matches!(inst, HttpFilterInstance::Csrf(_)));
+
+        // No route override → chain base (100%) guards. A POST with a mismatched
+        // Origin must short-circuit with 403 (decode-side enforcement).
+        inst.apply_route_config(None);
+        let mut req = FilterRequest {
+            method: "POST".into(),
+            path: "/".into(),
+            headers: vec![
+                ("host".into(), "localhost:10000".into()),
+                ("origin".into(), "http://evil.example.com".into()),
+            ],
+            body: None,
+        };
+        match inst.decode_headers(&mut req) {
+            Decision::StopAndSend(r) => assert_eq!(r.status, 403),
+            Decision::Continue => panic!("expected StopAndSend(403) for cross-origin POST"),
+        }
+
+        // encode_headers is a no-op for Csrf — must return Continue.
         let mut resp = FilterResponse {
             status: 200,
             reason: None,

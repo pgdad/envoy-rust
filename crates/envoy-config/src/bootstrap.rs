@@ -765,6 +765,9 @@ pub enum HttpFilterTypedConfig {
 
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors")]
     Cors(CorsConfig),
+
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy")]
+    Csrf(CsrfPolicy),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -780,8 +783,9 @@ pub struct RouterConfig {}
 /// 23 D1: per-route filter configuration map, keyed by filter name
 /// (`envoy.filters.http.cors`, …) → a `@type`-tagged per-filter config.
 /// The per-route counterpart to the filter-chain `HttpFilterTypedConfig`.
-/// Only the `Cors` variant is registered + consumed this phase; future
-/// filters slot in additively (§6.3 anti-pattern: no untested stub variants).
+/// The `Cors` (phase 23) and `Csrf` (phase 24) variants are registered +
+/// consumed; future filters slot in additively (§6.3 anti-pattern: no
+/// untested stub variants).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "@type")]
 pub enum PerFilterConfig {
@@ -2731,6 +2735,16 @@ fn validate_hcm(
                 }
             }
 
+            // 24 D3 (ADR-0061 L6): a route-level csrf override is also subject to
+            // the deterministic-only / no-runtime-key gate. Runs AFTER the
+            // absent-filter check above, so a csrf override with NO csrf chain
+            // filter hits PerRouteConfigForAbsentFilter (not validate_csrf_config).
+            for pfc in r.typed_per_filter_config.values() {
+                if let crate::PerFilterConfig::Csrf(p) = pfc {
+                    validate_csrf_config(p, listener_name)?;
+                }
+            }
+
             // 04.2 NEW: walk the headers Vec.
             for hm in &mut r.r#match.headers {
                 validate_header_matcher(hm)?;
@@ -2887,6 +2901,14 @@ pub(crate) fn validate_http_filters(
                 }
                 // CorsConfig is empty (near-zero; no per-filter-chain fields to validate);
                 // name/typed_config consistency check above is the sole gate.
+            }
+            crate::HttpFilterTypedConfig::Csrf(cfg) => {
+                if f.name != "envoy.filters.http.csrf" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_csrf_config(cfg, listener_name)?;
             }
         }
     }
@@ -3138,6 +3160,36 @@ fn validate_fault_config(
             numerator,
             denominator,
         });
+    }
+    Ok(())
+}
+
+/// 24 D3 (ADR-0061 L6): validate a `CsrfPolicy.filter_enabled`. envoy-rust honors
+/// only deterministic 0%/100% gating (the phase-11 fault precedent) and has no
+/// RTDS runtime layer, so a present `runtime_key` or a fractional `default_value`
+/// is startup-fatal. The SAME message is used at the filter-chain level
+/// (`HttpFilterTypedConfig::Csrf`) and the per-route level (`PerFilterConfig::Csrf`),
+/// so this single validator gates both call sites.
+fn validate_csrf_config(
+    cfg: &crate::CsrfPolicy,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    let fe = &cfg.filter_enabled;
+    if fe.runtime_key.is_some() {
+        return Err(
+            crate::ConfigError::UnsupportedRuntimeKeyedCsrfFilterEnabled {
+                listener: listener_name.to_string(),
+            },
+        );
+    }
+    let p = &fe.default_value;
+    // Deterministic-only: numerator must be 0 (0%) or == denominator (100%).
+    if p.numerator != 0 && p.numerator != p.denominator.value() {
+        return Err(
+            crate::ConfigError::UnsupportedNonDeterministicCsrfFilterEnabled {
+                listener: listener_name.to_string(),
+            },
+        );
     }
     Ok(())
 }
@@ -13273,5 +13325,242 @@ typed_config:
             hf.typed_config,
             crate::HttpFilterTypedConfig::Cors(_)
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 24 D3: csrf filter-chain entry + validate_csrf_config tests (ADR-0061 L6/L7)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod csrf_validator_tests {
+    /// Build a minimal full-bootstrap YAML with a `csrf` filter in the HCM's
+    /// http_filters chain (`filter_enabled` numerator = `numerator` of HUNDRED,
+    /// optional `runtime_key`) followed by a `router` terminus. Self-contained
+    /// (direct_response route — no cluster reference needed).
+    fn bootstrap_with_csrf_chain(numerator: u32, runtime_key: Option<&str>) -> String {
+        let runtime_key_line = match runtime_key {
+            Some(k) => format!("\n                        runtime_key: \"{k}\""),
+            None => String::new(),
+        };
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok\n" }}
+                http_filters:
+                  - name: envoy.filters.http.csrf
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy
+                      filter_enabled:
+                        default_value:
+                          numerator: {numerator}
+                          denominator: HUNDRED{runtime_key_line}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 9901 }}
+"#
+        )
+    }
+
+    /// A route carrying a csrf `typed_per_filter_config` but NO csrf filter in
+    /// the chain (only `router`). Must hit `PerRouteConfigForAbsentFilter` (L7).
+    fn bootstrap_csrf_route_without_chain_filter() -> String {
+        r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                          typed_per_filter_config:
+                            envoy.filters.http.csrf:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy
+                              filter_enabled:
+                                default_value:
+                                  numerator: 100
+                                  denominator: HUNDRED
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+"#
+        .to_string()
+    }
+
+    /// A route carrying a csrf override (`filter_enabled` numerator = `numerator`
+    /// of HUNDRED, optional `runtime_key`) AND a csrf filter IN the chain (so the
+    /// absent-filter check passes and the route-level `validate_csrf_config` runs).
+    fn bootstrap_csrf_route_override(numerator: u32, runtime_key: Option<&str>) -> String {
+        let runtime_key_line = match runtime_key {
+            Some(k) => format!("\n                                runtime_key: \"{k}\""),
+            None => String::new(),
+        };
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok\n" }}
+                          typed_per_filter_config:
+                            envoy.filters.http.csrf:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy
+                              filter_enabled:
+                                default_value:
+                                  numerator: {numerator}
+                                  denominator: HUNDRED{runtime_key_line}
+                http_filters:
+                  - name: envoy.filters.http.csrf
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy
+                      filter_enabled:
+                        default_value:
+                          numerator: 100
+                          denominator: HUNDRED
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 9901 }}
+"#
+        )
+    }
+
+    #[test]
+    fn hcm_accepts_csrf_filter_chain_entry() {
+        let yaml = bootstrap_with_csrf_chain(100, None);
+        assert!(
+            crate::parse_bootstrap(&yaml).is_ok(),
+            "csrf filter chain entry (filter_enabled 100%) + router terminus must parse + validate clean"
+        );
+    }
+
+    #[test]
+    fn rejects_non_deterministic_csrf_filter_enabled() {
+        let yaml = bootstrap_with_csrf_chain(50, None); // numerator 50 of HUNDRED
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedNonDeterministicCsrfFilterEnabled { .. }
+            ),
+            "expected UnsupportedNonDeterministicCsrfFilterEnabled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_runtime_keyed_csrf_filter_enabled() {
+        let yaml = bootstrap_with_csrf_chain(100, Some("csrf.enabled"));
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedRuntimeKeyedCsrfFilterEnabled { .. }
+            ),
+            "expected UnsupportedRuntimeKeyedCsrfFilterEnabled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_csrf_per_route_policy_for_absent_filter() {
+        let yaml = bootstrap_csrf_route_without_chain_filter();
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::PerRouteConfigForAbsentFilter { ref filter }
+                    if filter == "envoy.filters.http.csrf"
+            ),
+            "expected PerRouteConfigForAbsentFilter(csrf), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_non_deterministic_csrf_route_override() {
+        let yaml = bootstrap_csrf_route_override(50, None);
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedNonDeterministicCsrfFilterEnabled { .. }
+            ),
+            "expected UnsupportedNonDeterministicCsrfFilterEnabled (route override), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_runtime_keyed_csrf_route_override() {
+        let yaml = bootstrap_csrf_route_override(100, Some("csrf.enabled"));
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedRuntimeKeyedCsrfFilterEnabled { .. }
+            ),
+            "expected UnsupportedRuntimeKeyedCsrfFilterEnabled (route override), got {err:?}"
+        );
     }
 }
