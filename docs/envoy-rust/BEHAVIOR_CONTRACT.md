@@ -507,6 +507,71 @@ on the encode side for any non-preflight allowed-origin request (including
 Task-7 empty-body `content-type` omission + the H1-pool `Connection: close`
 correction below).
 
+**24 entries (CSRF filter):**
+
+> The HTTP-filter-family sixth phase (ADR-0060 SPEC / ADR-0061 PLAN). The
+> `envoy.filters.http.csrf` filter is a decode-side cross-site-request-forgery
+> guard. For the modify-method set `{POST, PUT, DELETE, PATCH}` (L2) it compares
+> the request's **source origin** (`Origin`, falling back to `Referer`) against
+> the **target** (`Host` / `:authority`); the request is valid iff the source
+> matches the target OR an `additional_origins` `StringMatcher` matches it (L3).
+> All comparison is on the **scheme-stripped `host[:port]` authority** (Envoy
+> `Url::hostAndPort()` semantics, ADR-0061 L3 — no scheme, no path/query/fragment).
+> Invalid or missing-source modify requests get a 403 `Invalid origin` local
+> reply (L4); safe methods and a deterministic-0% policy pass through untouched.
+> The 3 stats live under the HCM-embedded `http.<hcm_stat_prefix>.csrf.*`
+> namespace — the same threading as RBAC (phase 10), Fault (phase 11), jwt_authn
+> (phase 22), and cors (phase 23), sourced from the parent HCM's `stat_prefix`.
+> All derived from the §6.2 empirical lock-in (verified against
+> `envoyproxy/envoy:v1.33.0`). envoy-rust's minimum-viable subset is **3 names**,
+> exactly **one** of which ticks per evaluated modify request (mutually
+> exclusive, L5); safe methods and a disabled policy tick nothing.
+
+| Stat name | Equivalence | Rationale |
+|---|---|---|
+| `http.<hcm_stat_prefix>.csrf.request_valid` | value-exact | Counter; one increment per evaluated **modify-method** request whose source origin is valid (source `host[:port]` == target `host[:port]`, OR an `additional_origins` matcher matches the source). Incremented synchronously in `CsrfFilter::decode_headers` before `Decision::Continue`. Mutually exclusive with `request_invalid` / `missing_source_origin` — exactly one of the three ticks per evaluated modify request. Never ticks for a safe method (`GET/HEAD/OPTIONS/TRACE/…`, L2) or a deterministic-0% policy (L6). Upstream Envoy v1.33 emits the same name at the `http.<prefix>.csrf.*` namespace. |
+| `http.<hcm_stat_prefix>.csrf.request_invalid` | value-exact | Counter; one increment per evaluated modify-method request that carries a source origin (`Origin`, fallback `Referer`) which does NOT match the target and is NOT in `additional_origins` → the 403 `Invalid origin` local reply (L4). Incremented synchronously before constructing the `Decision::StopAndSend(FilterResponse)`. Mutually exclusive with the sibling counters. Both proxies emit one increment per invalid-origin modify request at the decision site in `CsrfFilter::decode_headers`. |
+| `http.<hcm_stat_prefix>.csrf.missing_source_origin` | value-exact | Counter; one increment per evaluated modify-method request with **no usable source origin** (neither `Origin` nor `Referer` present, or both reduce to an empty authority) → the 403 `Invalid origin` local reply (L4). Incremented synchronously before the `Decision::StopAndSend`. Mutually exclusive with the sibling counters. A missing source is treated as invalid (fail-closed) but is counted separately from `request_invalid` for diagnosability. |
+
+> **Envoy-only sibling stats (unasserted, NOT broadened).** Upstream Envoy
+> emits additional `http.<prefix>.csrf.*` siblings that envoy-rust does **NOT**
+> emit at minimum scope (e.g. `request_invalid_origin_with_shadow` and related
+> shadow-mode subtotals — `shadow_enabled` is deferred). These are
+> **Envoy-only-unasserted** and need no allow-list entry.
+
+**CSRF local-reply wire shape (L4).**
+
+- Status: **403** (`Forbidden`).
+- Body: **`Invalid origin`** — exactly **14 bytes**, NO trailing newline.
+  Set verbatim by `CsrfFilter` via `Bytes::from_static`.
+- `content-type: text/plain` is stamped by the H1/H2 synth decorators
+  downstream of the filter pipeline (the non-empty-body branch — same pattern
+  as the rbac 403 / jwt_authn 401 / local_ratelimit 429 local replies);
+  `content-length` (`14`) is likewise stamped by the decorators. `CsrfFilter`
+  itself sets neither.
+- Fires for BOTH the invalid-origin path (`request_invalid` ticks) AND the
+  missing-source path (`missing_source_origin` ticks) — the same 403 body on
+  both.
+
+**CSRF chain-base / route-replace semantics (L6/L7).**
+
+> Unlike `cors` (which goes inert without a route `typed_per_filter_config`
+> entry), the chain-level `CsrfPolicy` is an **always-applied base**: every
+> request reaching the filter is guarded by it. A per-route `CsrfPolicy`
+> (attached via `typed_per_filter_config["envoy.filters.http.csrf"]`)
+> **REPLACES the base wholesale** for the matched route (ADR-0061 L6) — a route
+> override at 0% disables enforcement on a 100% chain, and an override at 100%
+> enables enforcement on a 0% chain. A route that carries NO csrf override is
+> still guarded by the chain base. The effective policy's `filter_enabled`
+> (validated 0%/100% — deterministic) gates enforcement. The
+> `PerRouteConfigForAbsentFilter` divergence applies to csrf (ADR-0061 L7): a
+> route may carry a csrf `typed_per_filter_config` even when the filter chain
+> has no csrf entry — Envoy validates the route config regardless; envoy-rust's
+> per-route override is only consulted when the chain DOES carry the filter.
+
+**Cross-reference:** ADR-0060 (phase-24 SPEC lock-in); ADR-0061 (PLAN-write
+lock-in — chain-base/route-replace, scheme-stripped origin, 403 body).
+
 **H1 upstream connection-pool `Connection: close` single-use (ADR-0059).**
 
 > When an upstream H1 response carries `Connection: close`, the H1 connection

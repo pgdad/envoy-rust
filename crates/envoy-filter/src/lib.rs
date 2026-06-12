@@ -7,6 +7,7 @@
 //! already-buffered request/response shape established by 04.1 + 05.2.
 
 pub mod cors;
+pub mod csrf;
 pub mod error;
 pub mod fault;
 pub mod header_mutation;
@@ -19,6 +20,7 @@ pub mod router;
 pub mod types;
 
 pub use cors::CorsFilter;
+pub use csrf::CsrfFilter;
 pub use error::FilterError;
 pub use fault::FaultFilter;
 pub use header_mutation::HeaderMutationFilter;
