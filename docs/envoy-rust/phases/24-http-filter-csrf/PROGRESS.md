@@ -10,7 +10,7 @@
 | 2 | D2+D4 — `CsrfFilter` runtime (chain-base/route-replace, scheme-stripped origin, 403) + 3 stats + BEHAVIOR_CONTRACT | DONE |
 | 3 | D3 — `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + `validate_csrf_config` | DONE |
 | 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | DONE |
-| 5 | D6.2 — `parse_bootstrap` fuzz seed (no new target) | OPEN |
+| 5 | D6.2 — `parse_bootstrap` fuzz seed (no new target) | DONE |
 | 6 | D6.3 — in-process backstop | OPEN |
 | 7 | State-4 verification + STATE advance | OPEN |
 
@@ -154,5 +154,13 @@ Differential fixture (envoy-rust vs real Envoy v1.33.0, Docker) + driver primiti
 - **Orthogonal-difference isolation (debug finding, NOT a CSRF bug):** the initial run FAILED on the 200-POST echo bodies — upstream Envoy auto-adds `content-length: 0` to a bodyless POST forwarded upstream; envoy-rust does not synthesize it (it DOES forward a client-supplied one). This is an H1-upstream-forwarding difference fully orthogonal to CSRF (the filter's allow/deny is a pure function of method + Origin/Referer/Host — `grep` confirms no `content-length` reference in `csrf.rs`). FIX: the two 200-POST probes (1, 3) send an explicit client `content-length: 0` header → both proxies forward identical framing upstream → echo bodies match. The fix is purely additive (NO assertion relaxed: status sequence, byte-exact 403 bodies, AND byte-exact 200 echo-body cross-proxy equivalence all intact); documented in-fixture. _(Follow-up candidate: close the envoy-rust bodyless-POST `content-length: 0` upstream-normalization gap in a future H1 phase — out of CSRF scope.)_
 - **Gates:** `cargo test -p differential --test http_filter_csrf` (1 passed, Docker), `cargo build -p differential --tests`, `cargo fmt --all -- --check` (clean).
 - **Review:** Approved (spec ✅ — content-length fix verified legitimate, not masking a CSRF bug; all required CSRF cases exercised; matcher/origin alignment correct). 1 Minor cosmetic (stale comment) fixed via amend.
+
+### Task 5 — D6.2 `parse_bootstrap` fuzz seed — DONE (code commit `0f5377dc0`)
+
+Single curated corpus seed; NO new fuzz target (csrf reuses `StringMatcher`/`parse_bootstrap`).
+- **`crates/envoy-config/fuzz/corpus/parse_bootstrap/route_csrf_typed_per_filter_config.yaml`** — complete concrete bootstrap (H1 listener + HCM `[csrf, router]` + a route csrf `typed_per_filter_config` override; `filter_enabled` 100% both levels, `additional_origins: [exact: "additional.csrf.test"]`, STATIC `backend` cluster). Parses CLEAN (deterministic 100%, no runtime_key → passes `validate_csrf_config`), so registered in the SUCCESS list of `fuzz_corpus_seeds_parse_or_reject_cleanly` (`bootstrap.rs`).
+- **gitignore trap handled:** the fuzz corpus dir is gitignored with an explicit allowlist; added `!corpus/parse_bootstrap/route_csrf_typed_per_filter_config.yaml` to `crates/envoy-config/fuzz/.gitignore` so the seed is genuinely git-tracked (without it the test would fail on a fresh CI checkout). Confirmed tracked via `git ls-files`.
+- **Gates:** `cargo test -p envoy-config fuzz_corpus_seeds` (1 passed), `cargo fmt --all -- --check` (clean).
+- **Review:** ✅ compliant (3-file scope: seed + .gitignore allowlist + 1 array entry; `@type`/CsrfPolicy shape matches the verified 0032 fixture; git-tracking confirmed).
 
 _(state-3 appends one entry per completed task here)_
