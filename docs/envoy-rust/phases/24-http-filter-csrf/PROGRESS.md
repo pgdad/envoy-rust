@@ -8,7 +8,7 @@
 |---|---|---|
 | 1 | D1 — `CsrfPolicy` + `RuntimeFractionalPercent` schema + `PerFilterConfig::Csrf` (per-route) | DONE |
 | 2 | D2+D4 — `CsrfFilter` runtime (chain-base/route-replace, scheme-stripped origin, 403) + 3 stats + BEHAVIOR_CONTRACT | DONE |
-| 3 | D3 — `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + `validate_csrf_config` | OPEN |
+| 3 | D3 — `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + `validate_csrf_config` | DONE |
 | 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | OPEN |
 | 5 | D6.2 — `parse_bootstrap` fuzz seed (no new target) | OPEN |
 | 6 | D6.3 — in-process backstop | OPEN |
@@ -133,5 +133,15 @@ The phase centerpiece. Implementer (TDD) + two-stage review (spec ✅ / code-qua
 - **Tests (9, all pass):** `host_and_port` stripping (incl. empty-authority `http://`→`""`); chain-base-guards-without-override; route-0%-disables / route-100%-enables; safe-methods-no-stat; modify-methods-guarded; origin matrix (`valid=4,invalid=1,missing=1`); deterministic-0% passthrough; `missing_source_ticks_missing_not_invalid` (pins the missing-vs-invalid stat boundary in isolation — review M3).
 - **Gates green:** `cargo test -p envoy-filter csrf` (9), `cargo build --workspace`, `cargo build -p envoy-filter`, `cargo fmt --all -- --check` (clean). Clippy clean per reviewer (full gate at Task 7).
 - **Review:** spec ✅ (exact scope, no `instance.rs`/validator over-build). Code-quality Approved (0 Critical/Important); 3 Minor polish items (M1 target comment, M2 empty-authority edge test, M3 dedicated missing-vs-invalid test) folded in via amend.
+
+### Task 3 — D3 `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + validator — DONE (code commit `e5d4a889b`)
+
+Implementer (TDD) + two-stage review (spec ✅ / code-quality Approved). The CSRF filter is now wired end-to-end:
+- **Chain variant:** `HttpFilterTypedConfig::Csrf(CsrfPolicy)` in `bootstrap.rs` (same `CsrfPolicy` type as the per-route variant, `@type`-renamed). Broke the two exhaustive `HttpFilterTypedConfig` consumers (SC2) — both fixed here: the `instance.rs` build match + the `bootstrap.rs` per-filter validator match (gated green by `cargo build --workspace`).
+- **Validator:** `validate_csrf_config(cfg, listener)` (placed by `validate_fault_config`) — rejects `filter_enabled.runtime_key.is_some()` (→ `UnsupportedRuntimeKeyedCsrfFilterEnabled`) and non-deterministic `default_value` (`numerator ∉ {0, denominator.value()}` → `UnsupportedNonDeterministicCsrfFilterEnabled`); accepts BOTH 0% and 100% (explicit check, NOT `selects_deterministic()` which is 100%-only). Two new `ConfigError` variants in `lib.rs`. Applied at BOTH the chain filter (name-check arm) AND route-level `PerFilterConfig::Csrf` overrides. **Route-walk ordering:** the absent-filter `keys()` check (`PerRouteConfigForAbsentFilter`, L7) fires BEFORE the csrf override `values()` validation — a csrf override with no csrf chain filter hits the absent-filter error (documented breadcrumb comment).
+- **Instance wiring:** `HttpFilterInstance::Csrf(CsrfFilter)` variant + build/decode/encode/`apply_route_config` arms (`apply_route_config` converted from a cors-only `if let` to a `match` dispatching both Cors+Csrf; `_ => {}` no-op breadcrumbed). Narrowed away csrf.rs's `#![allow(dead_code)]` (now wired → warning-clean).
+- **Tests (real `parse_bootstrap` YAML fixtures + instance build):** chain-entry-accept (100%), reject non-deterministic (50%) chain, reject runtime-keyed chain, absent-filter reject (asserts `filter == "envoy.filters.http.csrf"`), reject non-deterministic route override, reject runtime-keyed route override, `builds_csrf_instance_and_dispatches` (build → `Csrf(_)` + decode 403 + encode Continue). `cargo test -p envoy-config csrf` = 11; `-p envoy-filter` csrf = 10.
+- **Gates green:** `cargo build --workspace`, `cargo build -p envoy-config -p envoy-filter`, `cargo fmt --all -- --check`, clippy clean on both crates (per reviewer).
+- **Review:** spec ✅ (exact 4-file scope, no over-build; `parse_bootstrap` adaptation of the skeleton accepted). Code-quality Approved (0 Critical/Important); 2 Minor doc fixes folded in (instance.rs `_ => {}` breadcrumb naming the no-op variants; stale `PerFilterConfig` "only Cors" doc updated to Cors+Csrf).
 
 _(state-3 appends one entry per completed task here)_
