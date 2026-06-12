@@ -9,7 +9,7 @@
 | 1 | D1 — `CsrfPolicy` + `RuntimeFractionalPercent` schema + `PerFilterConfig::Csrf` (per-route) | DONE |
 | 2 | D2+D4 — `CsrfFilter` runtime (chain-base/route-replace, scheme-stripped origin, 403) + 3 stats + BEHAVIOR_CONTRACT | DONE |
 | 3 | D3 — `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + `validate_csrf_config` | DONE |
-| 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | OPEN |
+| 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | DONE |
 | 5 | D6.2 — `parse_bootstrap` fuzz seed (no new target) | OPEN |
 | 6 | D6.3 — in-process backstop | OPEN |
 | 7 | State-4 verification + STATE advance | OPEN |
@@ -143,5 +143,16 @@ Implementer (TDD) + two-stage review (spec ✅ / code-quality Approved). The CSR
 - **Tests (real `parse_bootstrap` YAML fixtures + instance build):** chain-entry-accept (100%), reject non-deterministic (50%) chain, reject runtime-keyed chain, absent-filter reject (asserts `filter == "envoy.filters.http.csrf"`), reject non-deterministic route override, reject runtime-keyed route override, `builds_csrf_instance_and_dispatches` (build → `Csrf(_)` + decode 403 + encode Continue). `cargo test -p envoy-config csrf` = 11; `-p envoy-filter` csrf = 10.
 - **Gates green:** `cargo build --workspace`, `cargo build -p envoy-config -p envoy-filter`, `cargo fmt --all -- --check`, clippy clean on both crates (per reviewer).
 - **Review:** spec ✅ (exact 4-file scope, no over-build; `parse_bootstrap` adaptation of the skeleton accepted). Code-quality Approved (0 Critical/Important); 2 Minor doc fixes folded in (instance.rs `_ => {}` breadcrumb naming the no-op variants; stale `PerFilterConfig` "only Cors" doc updated to Cors+Csrf).
+
+### Task 4 — D6.1 fixture `0032-http-filter-csrf` + `Http1Method::Post` — DONE (code commit `58120d4e1`)
+
+Differential fixture (envoy-rust vs real Envoy v1.33.0, Docker) + driver primitive + Docker wrapper. **Differential GREEN locally** (`http_filter_csrf_fixture ... ok`, 2.5s).
+- **Fixture `tests/fixtures/0032-http-filter-csrf/`** (modeled verbatim on 0031-http-filter-cors): H1 listener, HCM `http_filters: [csrf(100%), router]`, a `prefix:"/"` route with a `typed_per_filter_config[envoy.filters.http.csrf]` override (`filter_enabled` 100% + `additional_origins: [exact: "additional.csrf.test"]`), proxying to a REAL `http1-echo-server` upstream (ADR-0061 L8). Per-side YAML asymmetry per the 0031/0008 precedent (admin/bind/`generate_request_id`/`request_headers_to_remove` only on the upstream side; `{{BACKEND_HOST}}` host.docker.internal vs 127.0.0.1).
+- **5 probes → status `[200,403,200,200,403]`:** post-same-origin (200), post-evil-origin (403 `Invalid origin`), post-additional (200), get-evil-safe (200, safe-method bypass), post-no-source (403 `Invalid origin`). 403 bodies asserted byte-exact; all statuses + the 200 echo bodies compared cross-proxy byte-exact.
+- **`Http1Method::Post`** added to `tests/differential/src/lib.rs` (enum + `as_str`); no exhaustive-match breakage (H2 GET-only debug_assert untouched — fixture is H1-only). Removed an obsolete `// 04.3 may add Post` comment (review nit).
+- **Docker wrapper** `tests/differential/tests/http_filter_csrf.rs` (faithful `http_filter_cors.rs` clone).
+- **Orthogonal-difference isolation (debug finding, NOT a CSRF bug):** the initial run FAILED on the 200-POST echo bodies — upstream Envoy auto-adds `content-length: 0` to a bodyless POST forwarded upstream; envoy-rust does not synthesize it (it DOES forward a client-supplied one). This is an H1-upstream-forwarding difference fully orthogonal to CSRF (the filter's allow/deny is a pure function of method + Origin/Referer/Host — `grep` confirms no `content-length` reference in `csrf.rs`). FIX: the two 200-POST probes (1, 3) send an explicit client `content-length: 0` header → both proxies forward identical framing upstream → echo bodies match. The fix is purely additive (NO assertion relaxed: status sequence, byte-exact 403 bodies, AND byte-exact 200 echo-body cross-proxy equivalence all intact); documented in-fixture. _(Follow-up candidate: close the envoy-rust bodyless-POST `content-length: 0` upstream-normalization gap in a future H1 phase — out of CSRF scope.)_
+- **Gates:** `cargo test -p differential --test http_filter_csrf` (1 passed, Docker), `cargo build -p differential --tests`, `cargo fmt --all -- --check` (clean).
+- **Review:** Approved (spec ✅ — content-length fix verified legitimate, not masking a CSRF bug; all required CSRF cases exercised; matcher/origin alignment correct). 1 Minor cosmetic (stale comment) fixed via amend.
 
 _(state-3 appends one entry per completed task here)_
