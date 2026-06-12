@@ -6,7 +6,7 @@
 
 | Task | Deliverable | Status |
 |---|---|---|
-| 1 | D1 — `CsrfPolicy` + `RuntimeFractionalPercent` schema + `PerFilterConfig::Csrf` (per-route) | OPEN |
+| 1 | D1 — `CsrfPolicy` + `RuntimeFractionalPercent` schema + `PerFilterConfig::Csrf` (per-route) | DONE |
 | 2 | D2+D4 — `CsrfFilter` runtime (chain-base/route-replace, scheme-stripped origin, 403) + 3 stats + BEHAVIOR_CONTRACT | OPEN |
 | 3 | D3 — `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + `validate_csrf_config` | OPEN |
 | 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | OPEN |
@@ -110,5 +110,16 @@ Eight mechanical corrections, recorded as SC1–SC8 in `PLAN.md`. The load-beari
 ---
 
 ## Execution log
+
+### Task 1 — D1 schema + `PerFilterConfig::Csrf` — DONE (code commit `f97440f9`)
+
+`superpowers:subagent-driven-development` (SERIAL): implementer subagent (TDD) + two-stage review (spec ✅ / code-quality). Landed in `crates/envoy-config`:
+- **`RuntimeFractionalPercent { default_value: FractionalPercent, runtime_key: Option<String> }`** (NEW) + **`CsrfPolicy { filter_enabled: RuntimeFractionalPercent (REQUIRED), additional_origins: Vec<StringMatcher> (default) }`** in `bootstrap.rs`, both `#[derive(Debug,Clone,PartialEq,Serialize,Deserialize)] #[serde(deny_unknown_fields)]` (ADR-0061 L1). Reuses existing `FractionalPercent::selects_deterministic()` + `StringMatcher`.
+- **`PerFilterConfig::Csrf(CsrfPolicy)`** per-route variant (the SECOND `PerFilterConfig` consumer after `Cors`) with the `@type` rename `...csrf.v3.CsrfPolicy`.
+- **SC1 exhaustive-consumer fixes:** `crates/envoy-filter/src/cors.rs` `apply_route_config` match → `.and_then(.. { Cors(p)=>Some, _=>None })`; the irrefutable `let PerFilterConfig::Cors(p) = pfc;` test in `bootstrap.rs` → refutable `let .. else { panic!() }`.
+- Re-exported `CsrfPolicy` + `RuntimeFractionalPercent` from `lib.rs`.
+- **Tests (5, all pass):** `csrf_policy_parses_filter_enabled_and_additional_origins`, `csrf_policy_requires_filter_enabled`, `csrf_policy_rejects_shadow_enabled`, `csrf_policy_parses_runtime_key`, `route_parses_typed_per_filter_config_csrf`.
+- **Gates green:** `cargo test -p envoy-config` (full crate, no cors regression), `cargo build --workspace`, `cargo build -p envoy-config` (blind-spot), `cargo fmt --all -- --check` (clean after review-driven amend).
+- **Review:** spec ✅ (exact scope, no over-build — chain-level `HttpFilterTypedConfig::Csrf` correctly deferred to Task 3). Code-quality flagged one Important (commit not fmt-clean) + Minor (no `runtime_key` round-trip test) → both fixed via commit amend.
 
 _(state-3 appends one entry per completed task here)_
