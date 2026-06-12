@@ -1,0 +1,99 @@
+# Phase-24: 5-probe sequential burst against the HCM filter chain
+#   [envoy.filters.http.csrf, envoy.filters.http.router]
+# with a CsrfPolicy attached via typed_per_filter_config to a prefix "/" route
+# that proxies to a real http1-echo-server cluster (ADR-0061 L8 lock-in:
+# a valid CSRF modify-method request must reach a real upstream to yield a 200;
+# direct_response does NOT engage the per-route filter config).
+#
+# CsrfPolicy: filter_enabled: { default_value: { numerator: 100, denominator: HUNDRED } }
+#             additional_origins: [ exact: "additional.csrf.test" ]
+#
+# CSRF guard (ADR-0061 L3/L4): on a modify method (POST/PUT/DELETE/PATCH), the
+# source Origin (or Referer) is scheme-stripped to host[:port] via host_and_port()
+# and compared to (a) the target authority (same-origin) and (b) each
+# additional_origins matcher. No match → 403 with byte-exact body "Invalid origin"
+# (14 bytes, no newline; content-type: text/plain auto-added by the H1
+# filter-synth helper). Safe methods (GET/HEAD/OPTIONS/TRACE) bypass the guard.
+#
+# Probe sequence (all HOST: csrf.test) → status [200, 403, 200, 200, 403]:
+#   1. post-same-origin — POST + Origin: http://csrf.test
+#                         (host_and_port → "csrf.test" == target authority)
+#                         → 200, echo body.
+#   2. post-evil-origin — POST + Origin: http://evil.example.com
+#                         (matches neither same-origin nor additional_origins)
+#                         → 403, body "Invalid origin".
+#   3. post-additional  — POST + Origin: http://additional.csrf.test
+#                         (host_and_port → "additional.csrf.test" == matcher)
+#                         → 200, echo body.
+#   4. get-evil-safe    — GET + Origin: http://evil.example.com
+#                         (safe method bypasses the guard) → 200, echo body.
+#   5. post-no-source   — POST + no Origin/Referer (missing source origin)
+#                         → 403, body "Invalid origin".
+#
+# Both proxies see byte-identical config + headers, so the 200/403 split is
+# deterministic cross-proxy. The 403 body bytes are asserted byte-exact
+# per-probe (expected_body). The 200 echo bodies are compared cross-proxy via
+# the top-level equivalence.response_body (byte_exact) — both proxies forward
+# the same upstream request (upstream Envoy strips its auto-injected headers via
+# request_headers_to_remove; envoy-rust does not inject them) → identical echo.
+#
+# expected_headers: set_equal_modulo_allow_list compares the response header sets
+# value-exact modulo the server/date/x-envoy-upstream-service-time allow-list
+# (same 3-entry HEADER_ALLOW_LIST as all prior H1 router fixtures).
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-post-same-origin-200
+      method: post
+      path: "/"
+      host: "csrf.test"
+      extra_headers:
+        # Explicit content-length: 0 so BOTH proxies forward the same framing
+        # header upstream. Upstream Envoy auto-adds content-length: 0 to a
+        # bodyless POST forwarded upstream; envoy-rust does not synthesize it
+        # but DOES forward a client-supplied one. Sending it from the client
+        # makes the echoed upstream request byte-identical across both proxies
+        # (this header divergence is orthogonal to CSRF — fixture 0032 is the
+        # first POST-to-real-upstream differential probe to surface it).
+        - ["content-length", "0"]
+        - ["origin", "http://csrf.test"]
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-post-evil-origin-403
+      method: post
+      path: "/"
+      host: "csrf.test"
+      extra_headers:
+        - ["origin", "http://evil.example.com"]
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "Invalid origin" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-post-additional-200
+      method: post
+      path: "/"
+      host: "csrf.test"
+      extra_headers:
+        # See probe-1: explicit content-length: 0 for cross-proxy framing parity.
+        - ["content-length", "0"]
+        - ["origin", "http://additional.csrf.test"]
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-4-get-evil-safe-200
+      method: get
+      path: "/"
+      host: "csrf.test"
+      extra_headers:
+        - ["origin", "http://evil.example.com"]
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-5-post-no-source-403
+      method: post
+      path: "/"
+      host: "csrf.test"
+      extra_headers: []
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "Invalid origin" }
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: { kind: byte_exact }

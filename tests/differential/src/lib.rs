@@ -741,11 +741,16 @@ pub fn parse_prometheus_samples(body: &[u8]) -> std::collections::BTreeMap<Strin
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Http1Method {
     Get,
-    // 04.3 may add Post for upstream-proxy fixture; otherwise 04.x is GET-only.
     /// Phase-23 NEW: OPTIONS is required by the CORS preflight probe (fixture
     /// 0031). The harness builds the request line from `method.as_str()` so
     /// `OPTIONS / HTTP/1.1` is emitted on the wire; no other behaviour changes.
     Options,
+    /// Phase-24 NEW: POST is required by the CSRF modify-method probes (fixture
+    /// 0032). The H1 driver builds the request line from `method.as_str()`; POST
+    /// probes carry no request body (the CSRF guard is header-only). POST is
+    /// never driven over H2 this phase — fixture 0032 is H1-only, so
+    /// `drive_http2`'s `matches!(GET | OPTIONS)` debug_assert stays unwidened.
+    Post,
 }
 
 impl Http1Method {
@@ -753,6 +758,7 @@ impl Http1Method {
         match self {
             Http1Method::Get => "GET",
             Http1Method::Options => "OPTIONS",
+            Http1Method::Post => "POST",
         }
     }
 }
