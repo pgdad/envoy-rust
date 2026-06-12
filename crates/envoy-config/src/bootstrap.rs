@@ -4611,6 +4611,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/hcm_rds_route_config.yaml",  // 20 Task 9
             "fuzz/corpus/parse_bootstrap/cluster_eds.yaml",           // 21 Task 9
             "fuzz/corpus/parse_bootstrap/route_cors_typed_per_filter_config.yaml", // 23 Task 8
+            "fuzz/corpus/parse_bootstrap/route_csrf_typed_per_filter_config.yaml", // 24 Task 5
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
