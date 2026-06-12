@@ -7,7 +7,7 @@
 | Task | Deliverable | Status |
 |---|---|---|
 | 1 | D1 — `CsrfPolicy` + `RuntimeFractionalPercent` schema + `PerFilterConfig::Csrf` (per-route) | DONE |
-| 2 | D2+D4 — `CsrfFilter` runtime (chain-base/route-replace, scheme-stripped origin, 403) + 3 stats + BEHAVIOR_CONTRACT | OPEN |
+| 2 | D2+D4 — `CsrfFilter` runtime (chain-base/route-replace, scheme-stripped origin, 403) + 3 stats + BEHAVIOR_CONTRACT | DONE |
 | 3 | D3 — `HttpFilterTypedConfig::Csrf` + `HttpFilterInstance::Csrf` wiring + `validate_csrf_config` | OPEN |
 | 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | OPEN |
 | 5 | D6.2 — `parse_bootstrap` fuzz seed (no new target) | OPEN |
@@ -121,5 +121,17 @@ Eight mechanical corrections, recorded as SC1–SC8 in `PLAN.md`. The load-beari
 - **Tests (5, all pass):** `csrf_policy_parses_filter_enabled_and_additional_origins`, `csrf_policy_requires_filter_enabled`, `csrf_policy_rejects_shadow_enabled`, `csrf_policy_parses_runtime_key`, `route_parses_typed_per_filter_config_csrf`.
 - **Gates green:** `cargo test -p envoy-config` (full crate, no cors regression), `cargo build --workspace`, `cargo build -p envoy-config` (blind-spot), `cargo fmt --all -- --check` (clean after review-driven amend).
 - **Review:** spec ✅ (exact scope, no over-build — chain-level `HttpFilterTypedConfig::Csrf` correctly deferred to Task 3). Code-quality flagged one Important (commit not fmt-clean) + Minor (no `runtime_key` round-trip test) → both fixed via commit amend.
+
+### Task 2 — D2+D4 `CsrfFilter` runtime + stats + BEHAVIOR_CONTRACT (unwired) — DONE (code commit `cd0c51ead`)
+
+The phase centerpiece. Implementer (TDD) + two-stage review (spec ✅ / code-quality Approved). Created `crates/envoy-filter/src/csrf.rs`:
+- **`CsrfFilter`** (decode-side only; UNWIRED — `HttpFilterInstance::Csrf` lands Task 3; module carries a breadcrumbed `#![allow(dead_code)]` matching cors.rs's introduction posture). `CompiledCsrfPolicy { enabled, additional_origins }` lowered via `From<&CsrfPolicy>` (`enabled = filter_enabled.default_value.selects_deterministic()`).
+- **Chain-base / route-replace (ADR-0061 L6):** `base_policy` = compiled chain policy; `active_policy` starts as a clone of base; `apply_route_config(Some(route))` REPLACES `active_policy` with the route's `PerFilterConfig::Csrf` override if present, else `.unwrap_or_else(|| base_policy.clone())` — a route with no override is STILL guarded by the chain base (the key cors divergence).
+- **Origin compute (L3):** source = scheme-stripped `host[:port]` of `Origin` (fallback `Referer`, Origin precedence) via `host_and_port` (strips `scheme://`, trims at `/?#`, borrowing); target = `host_and_port(Host)`. Valid iff `source==target || additional_origins matcher matches source`.
+- **403 (L4):** `FilterResponse { 403, Some("Forbidden"), [], b"Invalid origin" }` (14 bytes, no newline). **Stats (L5):** 3 mutually-exclusive HCM-prefixed counters `http.<prefix>.csrf.{request_valid,request_invalid,missing_source_origin}`. **Modify set (L2):** `{POST,PUT,DELETE,PATCH}` guarded; safe methods + deterministic-0% → Continue, no stat. `encode_headers` = trivial `Continue` (SC7). `header_ci` duplicated per SC5 (N=3, deferred extraction).
+- **BEHAVIOR_CONTRACT.md:** csrf stat rows + 403/`Invalid origin` body row + scheme-stripped-origin (L3) + chain-base/route-replace (L6) + absent-filter divergence (L7), mirroring the cors rows.
+- **Tests (9, all pass):** `host_and_port` stripping (incl. empty-authority `http://`→`""`); chain-base-guards-without-override; route-0%-disables / route-100%-enables; safe-methods-no-stat; modify-methods-guarded; origin matrix (`valid=4,invalid=1,missing=1`); deterministic-0% passthrough; `missing_source_ticks_missing_not_invalid` (pins the missing-vs-invalid stat boundary in isolation — review M3).
+- **Gates green:** `cargo test -p envoy-filter csrf` (9), `cargo build --workspace`, `cargo build -p envoy-filter`, `cargo fmt --all -- --check` (clean). Clippy clean per reviewer (full gate at Task 7).
+- **Review:** spec ✅ (exact scope, no `instance.rs`/validator over-build). Code-quality Approved (0 Critical/Important); 3 Minor polish items (M1 target comment, M2 empty-authority edge test, M3 dedicated missing-vs-invalid test) folded in via amend.
 
 _(state-3 appends one entry per completed task here)_
