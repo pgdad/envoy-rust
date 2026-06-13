@@ -73,3 +73,38 @@ This commit is the parent-25 state-2 PLAN-write + the §6.1 split (ADR-0064): it
 ## State-3 close-out
 
 All 3 tasks complete (code + PROGRESS commits each; plus one fmt fixup). Phase `25.1` is at **state-3-complete / state-4-next**. Commit chain at close: `20ce64010` (Task 1 code) → `60ed197ea` (Task 1 PROGRESS) → `2fcf8fcee` (Task 2 code) → `6fcb96e44` (Task 2 PROGRESS) → `c98dafcf5` (fmt fixup) → `2b97667de` (Task 3 docs) → this PROGRESS commit. Per §5.1 the NEXT session runs state-4 `superpowers:verification-before-completion` (the full §7.5 gate incl. the Docker 32-fixture differential LOCALLY per `feedback_state4_runs_docker_differential`, with the AUTHORITATIVE Linux CI anchor per ADR-0049; mind the flake family `project_flaky_access_log_fixture_0012` + the nested-cargo backstop flake). NO new fixture is added by `25.1`; the body-forwarding capability is differentially proven by `25.2`'s fixture `0033`.
+
+---
+
+## State-4 verification (§7.5 phase-done gate) — ALL GREEN
+
+State-4 `superpowers:verification-before-completion` ran the full §7.5 phase-done gate at code-HEAD `ca023ce48` (the state-3 implementation chain is its ancestry — the load-bearing `hcm.rs` change landed in `20ce64010`). Evidence before assertions; every command was run fresh this session.
+
+### (e) Static + workspace gates — GREEN (run LOCALLY at HEAD `ca023ce48`)
+
+- `cargo fmt --all -- --check` → clean (no diff).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → **0 warnings** (`Finished` clean).
+- `cargo build --workspace --all-targets` → ok.
+- `cargo build -p envoy-http1` (isolated-crate, per `project_isolated_crate_build_blindspot`) → ok.
+- `cargo deny check` → **`advisories ok, bans ok, licenses ok, sources ok`** (the `Zlib`/`Unicode-DFS-2016` lines are benign unmatched-license-allowance warnings, non-fatal — identical on CI).
+- `cargo test -p envoy-http1` (the changed crate) → **110 passed; 0 failed** (incl. `h1_forwards_request_body_upstream` + the 4 Task-2 regression tests).
+- `cargo test -p envoy-bin` (backstops standalone, per `project_workspace_test_nested_cargo_backstop_flake`) → emitted 11 passing `test result: ok` blocks (0 failed) then a backstop shelling nested `cargo run` hung past the ~2 s expectation — the known nested-cargo backstop flake, NOT a regression; envoy-bin is authoritatively GREEN under `cargo test --workspace` on Linux CI (run `27476243121`, below).
+
+### (a)(b)(c) Differential + conformance — GREEN (run LOCALLY this session, Docker 28.0.4 + `envoyproxy/envoy:v1.33.0`)
+
+- Pre-built `cargo test -p differential -p h2spec-conformance --no-run` first (exit 0); the workspace + helper binaries (`envoy-bin` + the 5 `tests/helpers/*` echo-servers) were already built by `cargo build --workspace --all-targets`, so the Docker run raced no cargo build (per `project_flaky_access_log_fixture_0012`).
+- `cargo test -p differential -p h2spec-conformance` → **`DIFFERENTIAL_EXIT=0`**, **zero failures / zero panics**. The differential unit suite `136 passed; 0 failed; 2 ignored` (the 2 ignored are the Docker-requiring unit probes that run under `--workspace`; `tcp_proxy_backend_{spawns_and_echoes,drop_terminates_child}` PASSED this run — no readiness-timeout flake). The 32 pre-existing Docker-gated fixtures (`0001`–`0032`) ran as their integration-test binaries, **all `1 passed; 0 failed`** (the load-bearing regression-equivalence invariant: all 32 green SIMULTANEOUSLY — the relocated H1 body read is a body-wise no-op for every bodyless / `content-length: 0` fixture). **`h2spec_pass_rate_gate ... ok`** (h2spec conformance ≥95%).
+
+### (d) Fuzz — covered (no new fuzz target this phase)
+
+`25.1` introduces NO new parser/codec and NO new fuzz target (it forwards client-supplied bytes), so §7.5(d) requires no new short-run. The existing fuzzers (`parse_bootstrap` + `jwt_parse`, 30 s each) ran GREEN in the CI fuzz job `81215959916` at this HEAD.
+
+### AUTHORITATIVE Linux CI anchor (ADR-0049 Provenance) — FRESH, GREEN
+
+**Run `27476243121` at code-HEAD `ca023ce48`** (`gh run view 27476243121` → `completed success`, both jobs green: `build + test + lint` 3m41s + `fuzz` 2m5s). `ci.yml` runs the complete §7.5 gate on Linux — `fmt --check` + `clippy -D warnings` + `build --workspace --all-targets` + `cargo test --workspace` (which **includes** the Docker differential harness + `h2spec-conformance`) + `cargo deny check` (`advisories ok, bans ok, licenses ok, sources ok`) + the two fuzzers. The differential genuinely engaged Docker (every fixture integration test — `http1_router_upstream`, `tcp_proxy`, `tls_downstream`, `http_filter_*`, … — `1 passed; 0 failed`); `envoy-http1` `110 passed`; whole job `0 failed`. **This supersedes the stale anchor `27457698815`** (which was at code-HEAD `9b0e7b925`, PREDATING the `25.1` `hcm.rs` change) as the project's differential evidence of record. The local differential above is corroborating; the Linux CI run is authoritative.
+
+### §7.5 gate disposition
+
+(a) no new/changed fixture → the body-forwarding capability is proven by the in-process `h1_forwards_request_body_upstream` test (differentially proven later by `25.2`'s `0033`); (b) all 32 pre-existing fixtures green simultaneously ✅ (local + CI); (c) h2spec ≥95% ✅; (d) no new fuzzer; existing fuzzers green ✅; (e) build/clippy/fmt/test/deny clean ✅; (f) `REVIEW.md` approved — that is state 5, the NEXT session. **States (a)–(e) are GREEN; the state-4 gate is COMPLETE.**
+
+Per §5.1 (one state per session) this session advances `STATE.md` → state-4-complete / state-5-next (next expected skill `superpowers:requesting-code-review`) and EXITS. It does NOT begin the state-5 code review.
