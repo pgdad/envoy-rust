@@ -2654,16 +2654,13 @@ static_resources:
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     loop {
-                        match tokio::time::timeout(
-                            Duration::from_millis(200),
-                            sock.read(&mut buf),
-                        )
-                        .await
+                        match tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf))
+                            .await
                         {
-                            Ok(Ok(0)) => break,            // peer closed
+                            Ok(Ok(0)) => break, // peer closed
                             Ok(Ok(n)) => captured_conn.lock().unwrap().extend_from_slice(&buf[..n]),
-                            Ok(Err(_)) => break,           // io error
-                            Err(_elapsed) => break,        // request fully arrived
+                            Ok(Err(_)) => break,    // io error
+                            Err(_elapsed) => break, // request fully arrived
                         }
                     }
                     let _ = sock.write_all(response).await;
@@ -2679,8 +2676,7 @@ static_resources:
         // 25.1 D1: an H1 POST with a Content-Length-delimited body must reach the
         // upstream with its body intact (today it does not — the router forwards an
         // always-empty body and drains-and-discards the downstream body).
-        let upstream_response: &'static [u8] =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let upstream_response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         let (upstream_port, captured) = spawn_recording_upstream(upstream_response).await;
         let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
         let cfg = hcm_config_with_cluster(
@@ -2694,7 +2690,10 @@ static_resources:
         let req = b"POST /submit HTTP/1.1\r\nHost: x.test\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world";
         let resp = drive(cfg, req).await;
         let s = String::from_utf8_lossy(&resp);
-        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "downstream got 200: {s}");
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "downstream got 200: {s}"
+        );
 
         let got = captured.lock().unwrap().clone();
         let got_str = String::from_utf8_lossy(&got);
@@ -2754,10 +2753,16 @@ static_resources:
             "bodyless GET proxies"
         );
         let got = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
-        assert!(got.starts_with("GET /g HTTP/1.1\r\n"), "upstream got the GET: {got}");
+        assert!(
+            got.starts_with("GET /g HTTP/1.1\r\n"),
+            "upstream got the GET: {got}"
+        );
         // No request body bytes were appended after the head terminator.
         let body_after_head = got.split("\r\n\r\n").nth(1).unwrap_or("");
-        assert!(body_after_head.is_empty(), "no body forwarded for a GET: {got:?}");
+        assert!(
+            body_after_head.is_empty(),
+            "no body forwarded for a GET: {got:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2784,9 +2789,11 @@ static_resources:
         )
         .await;
         assert_eq!(resps.len(), 2, "two responses");
-        assert!(resps
-            .iter()
-            .all(|r| String::from_utf8_lossy(r).starts_with("HTTP/1.1 200 OK")));
+        assert!(
+            resps
+                .iter()
+                .all(|r| String::from_utf8_lossy(r).starts_with("HTTP/1.1 200 OK"))
+        );
         let got = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
         assert!(got.contains("POST /one"), "upstream saw request 1: {got}");
         assert!(got.contains("aaa"), "upstream saw body 1: {got}");
@@ -2827,15 +2834,14 @@ static_resources:
                             .await
                         {
                             Ok(Ok(0)) => break,
-                            Ok(Ok(m)) => {
-                                captured_conn.lock().unwrap().extend_from_slice(&buf[..m])
-                            }
+                            Ok(Ok(m)) => captured_conn.lock().unwrap().extend_from_slice(&buf[..m]),
                             Ok(Err(_)) => break,
                             Err(_elapsed) => break,
                         }
                     }
                     let resp: Vec<u8> = if n == 0 {
-                        format!("HTTP/1.1 {fail_status} X\r\nContent-Length: 0\r\n\r\n").into_bytes()
+                        format!("HTTP/1.1 {fail_status} X\r\nContent-Length: 0\r\n\r\n")
+                            .into_bytes()
                     } else {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
                     };
