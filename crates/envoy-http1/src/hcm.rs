@@ -352,8 +352,11 @@ async fn run_attempt(
         version: HttpVersion::Http11,
         headers: out_headers,
         bytes_consumed: 0,
-        // Chunked-request-body forwarding is a SPEC §4 non-goal.
-        body: Some(Bytes::new()),
+        // 25.1 D1: forward the downstream request body (read before the pipeline)
+        // upstream. Cloned per attempt → replay-safe across retries (mirrors the
+        // H2 buffered-clone, ADR-0044). Chunked/streaming bodies remain a non-goal
+        // (chunked is 501-rejected before any body read; `req.body` is then empty).
+        body: req.body.clone(),
     };
 
     let start = std::time::Instant::now();
@@ -624,6 +627,45 @@ async fn serve_connection(
         let matched_route = resolve_route(&config, &req);
         pipeline.apply_route_config(matched_route);
 
+        // 25.1 D1: read the Content-Length-delimited request body into `req.body`
+        // BEFORE the filter pipeline, so a body-dependent filter (phase 25.2's
+        // buffer) can length-check it and so the router arm can forward it
+        // upstream. This REPLACES the former post-response discard-drain. Chunked
+        // requests carry no Content-Length (`body_len == 0`) and are 501-rejected
+        // below without a body read. The idle-read-timeout → `Ok(())` graceful
+        // close, the `UnexpectedEof`, and the io-error dispositions match the
+        // former drain loop verbatim.
+        let consumed = req.bytes_consumed;
+        buf.advance(consumed);
+        let request_body: Bytes = if body_len > 0 {
+            let mut body_buf = BytesMut::with_capacity(body_len);
+            let from_buf = buf.len().min(body_len);
+            body_buf.extend_from_slice(&buf[..from_buf]);
+            buf.advance(from_buf);
+            let mut remaining = body_len - from_buf;
+            while remaining > 0 {
+                let mut chunk = [0u8; 4096];
+                let to_read = chunk.len().min(remaining);
+                let n = match tokio::time::timeout(
+                    IDLE_READ_TIMEOUT,
+                    downstream.read(&mut chunk[..to_read]),
+                )
+                .await
+                {
+                    Ok(Ok(0)) => return Err(Http1Error::UnexpectedEof),
+                    Ok(Ok(n)) => n,
+                    Ok(Err(source)) => return Err(Http1Error::Io { source }),
+                    Err(_elapsed) => return Ok(()),
+                };
+                body_buf.extend_from_slice(&chunk[..n]);
+                remaining -= n;
+            }
+            body_buf.freeze()
+        } else {
+            Bytes::new()
+        };
+        req.body = Some(request_body);
+
         // Boundary conversion: construct FilterRequest from the
         // filter-visible subset of envoy_http1::Request, invoke
         // decode_headers, write back. The codec-state fields (`version`,
@@ -671,30 +713,6 @@ async fn serve_connection(
                 })
             }
         };
-
-        // 6. Advance the buffer past the consumed request + body.
-        let consumed = req.bytes_consumed;
-        buf.advance(consumed);
-        // 7. Drain body bytes (read_exact-style; up to body_len).
-        let drained_so_far = buf.len().min(body_len);
-        buf.advance(drained_so_far);
-        let mut remaining = body_len - drained_so_far;
-        while remaining > 0 {
-            let mut throwaway = [0u8; 4096];
-            let to_read = throwaway.len().min(remaining);
-            let n = match tokio::time::timeout(
-                IDLE_READ_TIMEOUT,
-                downstream.read(&mut throwaway[..to_read]),
-            )
-            .await
-            {
-                Ok(Ok(0)) => return Err(Http1Error::UnexpectedEof),
-                Ok(Ok(n)) => n,
-                Ok(Err(source)) => return Err(Http1Error::Io { source }),
-                Err(_elapsed) => return Ok(()),
-            };
-            remaining -= n;
-        }
 
         // 06.2 Task 6: per-request access-log state. The proxy-success arm
         // captures the resolved upstream endpoint for the access-log
@@ -2563,6 +2581,89 @@ static_resources:
             buf
         });
         (port, h)
+    }
+
+    /// 25.1 D1: like `spawn_in_process_upstream`, but RECORDS the bytes the
+    /// upstream received (request head + body) into the returned shared buffer,
+    /// so a test can assert the forwarded request body. Reads in a loop with a
+    /// short per-read timeout; once a read times out (the small test request has
+    /// fully arrived) it stops reading and writes the canned `response`. Returns
+    /// `(port, captured)`.
+    ///
+    /// NOTE: named `spawn_recording_upstream` to avoid colliding with the
+    /// pre-existing `spawn_capturing_upstream` (which returns a `JoinHandle`,
+    /// single-connection, single-read). This loop-with-timeout + `Arc<Mutex>`
+    /// form is required so the test can read the captured bytes synchronously
+    /// after `drive` and so a body arriving in a second TCP segment is still
+    /// captured.
+    async fn spawn_recording_upstream(
+        response: &'static [u8],
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_acceptor = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured_conn = captured_acceptor.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        match tokio::time::timeout(
+                            Duration::from_millis(200),
+                            sock.read(&mut buf),
+                        )
+                        .await
+                        {
+                            Ok(Ok(0)) => break,            // peer closed
+                            Ok(Ok(n)) => captured_conn.lock().unwrap().extend_from_slice(&buf[..n]),
+                            Ok(Err(_)) => break,           // io error
+                            Err(_elapsed) => break,        // request fully arrived
+                        }
+                    }
+                    let _ = sock.write_all(response).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (port, captured)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_forwards_request_body_upstream() {
+        // 25.1 D1: an H1 POST with a Content-Length-delimited body must reach the
+        // upstream with its body intact (today it does not — the router forwards an
+        // always-empty body and drains-and-discards the downstream body).
+        let upstream_response: &'static [u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let (upstream_port, captured) = spawn_recording_upstream(upstream_response).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+                retry_policy: None,
+            }),
+            cluster_mgr,
+        );
+        let req = b"POST /submit HTTP/1.1\r\nHost: x.test\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "downstream got 200: {s}");
+
+        let got = captured.lock().unwrap().clone();
+        let got_str = String::from_utf8_lossy(&got);
+        assert!(
+            got_str.starts_with("POST /submit HTTP/1.1\r\n"),
+            "upstream received the request line: {got_str}"
+        );
+        assert!(
+            got_str.ends_with("hello world"),
+            "upstream received the request body bytes: {got_str}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
