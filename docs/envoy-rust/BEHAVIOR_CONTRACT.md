@@ -38,6 +38,21 @@
 
 ---
 
+## Request body forwarding (HTTP/1.1)
+
+As of phase 25.1, the HTTP/1.1 router forwards the **Content-Length-delimited**
+downstream request body to the upstream verbatim (it is read into a `Bytes`
+before the filter pipeline runs, exposed to the pipeline as `FilterRequest.body`,
+and cloned per upstream attempt — replay-safe across retries). This closes the
+pre-existing phase-04.3 gap where H1 forwarded an always-empty body. The body is
+compared cross-proxy byte-exact under the existing `response_body` / echo-server
+fixtures (differentially proven by fixture `0033-http-filter-buffer` in phase
+25.2). **Chunked / streaming request bodies remain a non-goal** — a
+`Transfer-Encoding: chunked` request is 501-rejected before any body read.
+HTTP/2 already buffers and forwards request bodies (unchanged).
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**
