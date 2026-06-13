@@ -1729,6 +1729,48 @@ static_resources:
         buf
     }
 
+    /// 25.1 D1: drive multiple requests over ONE keep-alive connection, mirroring
+    /// `drive`'s single-connection serve-and-connect idiom. Writes every request
+    /// up front (the LAST request must carry `Connection: close` so the server
+    /// returns and the client sees EOF), reads the concatenated responses to EOF,
+    /// then splits them on the `HTTP/1.1 ` status-line boundary. Used to prove
+    /// that request 1's body is fully consumed from `buf` so request 2 parses
+    /// cleanly on the same connection.
+    async fn drive_keep_alive(config: Arc<HCMConfig>, requests: &[&[u8]]) -> Vec<Vec<u8>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = serve_connection(config, sock).await;
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        for req in requests {
+            client.write_all(req).await.unwrap();
+        }
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        drop(client);
+        let _ = server.await;
+        // Split the concatenated responses on the status-line boundary.
+        let marker = b"HTTP/1.1 ";
+        let mut starts: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i + marker.len() <= buf.len() {
+            if &buf[i..i + marker.len()] == marker {
+                starts.push(i);
+                i += marker.len();
+            } else {
+                i += 1;
+            }
+        }
+        let mut out = Vec::new();
+        for (k, &start) in starts.iter().enumerate() {
+            let end = starts.get(k + 1).copied().unwrap_or(buf.len());
+            out.push(buf[start..end].to_vec());
+        }
+        out
+    }
+
     #[tokio::test]
     async fn direct_response_returns_status_and_body() {
         let config = hcm_config_single_route("/", 200, "ok\n").await;
@@ -2663,6 +2705,184 @@ static_resources:
         assert!(
             got_str.ends_with("hello world"),
             "upstream received the request body bytes: {got_str}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_chunked_request_still_501_after_body_forwarding() {
+        // 25.1 D1 regression: chunked requests carry no Content-Length, so the
+        // body-read is skipped (body_len == 0) and the existing 501 rejection stands.
+        let (upstream_port, _captured) =
+            spawn_recording_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+                retry_policy: None,
+            }),
+            cluster_mgr,
+        );
+        let req = b"POST /c HTTP/1.1\r\nHost: x.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 501 "),
+            "chunked request is 501-rejected: {s}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_bodyless_get_unchanged_after_body_forwarding() {
+        // 25.1 D1 regression: a GET with no body proxies exactly as before
+        // (body_len == 0 → the body-read block is a no-op beyond the head advance).
+        let (upstream_port, captured) =
+            spawn_recording_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+                retry_policy: None,
+            }),
+            cluster_mgr,
+        );
+        let req = b"GET /g HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(cfg, req).await;
+        assert!(
+            String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK\r\n"),
+            "bodyless GET proxies"
+        );
+        let got = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(got.starts_with("GET /g HTTP/1.1\r\n"), "upstream got the GET: {got}");
+        // No request body bytes were appended after the head terminator.
+        let body_after_head = got.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert!(body_after_head.is_empty(), "no body forwarded for a GET: {got:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_keep_alive_two_bodied_posts_do_not_bleed() {
+        // 25.1 D1 regression: on a single keep-alive connection, request 1's body
+        // bytes must be fully consumed from `buf` so request 2 parses cleanly.
+        let (upstream_port, captured) =
+            spawn_recording_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+                retry_policy: None,
+            }),
+            cluster_mgr,
+        );
+        let resps = drive_keep_alive(
+            cfg,
+            &[
+                b"POST /one HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\naaa",
+                b"POST /two HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbbbb",
+            ],
+        )
+        .await;
+        assert_eq!(resps.len(), 2, "two responses");
+        assert!(resps
+            .iter()
+            .all(|r| String::from_utf8_lossy(r).starts_with("HTTP/1.1 200 OK")));
+        let got = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(got.contains("POST /one"), "upstream saw request 1: {got}");
+        assert!(got.contains("aaa"), "upstream saw body 1: {got}");
+        assert!(
+            got.contains("POST /two"),
+            "upstream saw request 2 (clean parse): {got}"
+        );
+        assert!(got.contains("bbbb"), "upstream saw body 2: {got}");
+    }
+
+    /// 25.1 D1: stateful recording upstream for the retry-replay regression.
+    /// RECORDS every received connection's bytes into the shared buffer (so the
+    /// test can assert the body bytes appear once per attempt), and returns
+    /// `fail_status` (CL: 0) for the first connection then 200 for all later
+    /// connections — exercising the retry path. Mirrors `spawn_recording_upstream`
+    /// (loop-accept + per-connection read-until-timeout into a shared `Arc<Mutex>`)
+    /// fused with `spawn_fail_then_ok_upstream`'s stateful status selection.
+    async fn spawn_fail_then_ok_recording_upstream(
+        fail_status: u16,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_acceptor = captured.clone();
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let captured_conn = captured_acceptor.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    loop {
+                        match tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(0)) => break,
+                            Ok(Ok(m)) => {
+                                captured_conn.lock().unwrap().extend_from_slice(&buf[..m])
+                            }
+                            Ok(Err(_)) => break,
+                            Err(_elapsed) => break,
+                        }
+                    }
+                    let resp: Vec<u8> = if n == 0 {
+                        format!("HTTP/1.1 {fail_status} X\r\nContent-Length: 0\r\n\r\n").into_bytes()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&resp).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (port, captured)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_retried_post_replays_body() {
+        // 25.1 D1 regression: a POST whose first upstream attempt 503s is retried,
+        // and BOTH attempts carry the request body — proving the per-attempt
+        // `req.body.clone()` replays the body (the only body source) on each try.
+        let (port, captured) = spawn_fail_then_ok_recording_upstream(503).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let cfg = hcm_config_with_retry(
+            "/",
+            "backend",
+            Some(envoy_config::RetryPolicy {
+                retry_on: "5xx".into(),
+                num_retries: Some(1),
+                retriable_status_codes: vec![],
+            }),
+            false,
+            cluster_mgr,
+        );
+        let req = b"POST /r HTTP/1.1\r\nHost: x.test\r\nContent-Length: 8\r\nConnection: close\r\n\r\nreplayme";
+        let resp = drive(cfg, req).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.starts_with("HTTP/1.1 200 OK\r\n"),
+            "downstream is 200 after the retry: {s}"
+        );
+        let got = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        // The body bytes appear once per attempt (original + retry).
+        let body_count = got.matches("replayme").count();
+        assert_eq!(
+            body_count, 2,
+            "body must be replayed on each of the two attempts: {got:?}"
+        );
+        assert_eq!(
+            got.matches("POST /r HTTP/1.1\r\n").count(),
+            2,
+            "two upstream attempts: {got:?}"
         );
     }
 
