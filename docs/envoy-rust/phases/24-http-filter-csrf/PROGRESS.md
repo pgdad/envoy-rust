@@ -12,7 +12,7 @@
 | 4 | D6.1 — fixture `0032-http-filter-csrf` + Docker wrapper + `Http1Method::Post` | DONE |
 | 5 | D6.2 — `parse_bootstrap` fuzz seed (no new target) | DONE |
 | 6 | D6.3 — in-process backstop | DONE |
-| 7 | State-4 verification + STATE advance | OPEN |
+| 7 | State-4 verification + STATE advance | DONE |
 
 ---
 
@@ -168,5 +168,25 @@ Single curated corpus seed; NO new fuzz target (csrf reuses `StringMatcher`/`par
 `crates/envoy-bin/tests/http_filter_csrf.rs` (411 lines) — boots the real `envoy-bin` binary (NO Docker) with a synthesized `[csrf, router]` H1 bootstrap (chain `filter_enabled` 100%; route override `additional_origins: [exact: "additional.csrf.test"]`, same `@type` as fixture 0032), proxies to an in-process all-200 tokio backend (`ok\n`), and issues 5 sequential H1 probes asserting `[200,403,200,200,403]` + the two 403 bodies byte-exact `Invalid origin` (14 bytes). The 200 probes assert the backend's `ok\n` body → unforgeable proof the request proxied through (a local CSRF 403 would yield `Invalid origin`). Faithful mirror of `http_filter_cors.rs` (subprocess `.kill_on_drop(true)` + explicit kill/wait, exp-backoff readiness wait, ephemeral ports, kill-stderr-pipe-first ordering); `http_probe` extended with a `host` param; the cors-only `find_header` helper correctly dropped (csrf asserts bodies).
 - **Run STANDALONE** (`-p envoy-bin --test http_filter_csrf`, helpers pre-built — `project_workspace_test_nested_cargo_backstop_flake`): `http_filter_csrf_in_process_backstop ... ok`, 0.77s. `cargo fmt --all -- --check` clean.
 - **Review:** Approved (spec ✅, mechanism-faithful, no copy-paste defects, no orphan leak, `#![forbid(unsafe_code)]`); only cosmetic Minors inherited from the cors template (non-blocking).
+
+### Task 7 — State-4 verification + STATE advance — DONE (verification commit; no production code)
+
+Ran the full §7.5 gate suite LOCALLY (Docker 28.0.4 restored on this Mac per `feedback_state4_runs_docker_differential`; clippy first surfaces here per `project_state3_arc_skips_clippy`; isolated-crate spot-check per `project_isolated_crate_build_blindspot`; helper/backstop crates run standalone per `project_workspace_test_nested_cargo_backstop_flake`). Every gate green:
+
+| Gate | Command | Result |
+|---|---|---|
+| build | `cargo build --workspace --all-targets` | exit 0 |
+| clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0, 0 warnings (forced fresh recompile of `envoy-config` + `envoy-filter` → still 0) |
+| isolated build | `cargo build -p envoy-config -p envoy-filter` | exit 0 (both crates compile standalone) |
+| fmt | `cargo fmt --all -- --check` | exit 0, clean |
+| test (product) | `cargo test --workspace --exclude envoy-bin --exclude differential --exclude h2spec-conformance` | 0 failures across the 13 product crates; csrf tests green — `csrf_validator_tests` (6: rejects non-deterministic / runtime-keyed `filter_enabled` + route override, rejects per-route policy for absent filter, accepts chain entry), `typed_per_filter_config_tests` (4: parses `filter_enabled`+`additional_origins`, parses `runtime_key`, rejects shadow-enabled, requires `filter_enabled`), `envoy-filter` csrf (9) |
+| test (helpers) | `cargo test -p http1-echo-server -p http2-echo-server -p tcp-echo-server -p tls-echo-server -p health-aware-http1-backend` | exit 0, 32 passed, 0 failed (run standalone — the startup-stall flake makes them spuriously slow under the workspace umbrella) |
+| deny | `cargo deny check` | exit 0 — advisories ok, bans ok, licenses ok, sources ok (no new dependency) |
+| differential + h2spec | `cargo test -p differential -p h2spec-conformance` | exit 0, 0 failures, 37 `test result: ok` blocks; **`http_filter_csrf_fixture ... ok`** (fixture `0032-http-filter-csrf` green against real Envoy v1.33.0) alongside all 31 pre-existing fixtures (regression-equivalence, invariant 5.5); **`h2spec_pass_rate_gate ... ok`** (≥95% conformance) |
+| fuzz | `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=60` | `Done 755067 runs in 61 second(s)`, 0 crashes, no artifacts (exercises the new `route_csrf_typed_per_filter_config.yaml` seed among 22,813 corpus files) |
+
+- **Gate (b) confirmed:** the 31 pre-existing fixtures (`0001`–`0031`) pass simultaneously with `0032` — the additive `PerFilterConfig::Csrf` / `HttpFilterTypedConfig::Csrf` / `HttpFilterInstance::Csrf` enum arms are non-regressive.
+- **STATE advanced** → phase-24 **state-4-complete / state-5-next**; superseded state-2/3 top-section narratives relocated verbatim to `STATE_HISTORY.md` (ADR-0035 / §4.1 inv. 9).
+- **Next (state 5):** `superpowers:requesting-code-review` authoring `REVIEW.md` (per `SKILL_ROUTING.md`). Per §5.1 (one state per session) this session STOPS after the STATE advance + push; CI runs the 32-fixture differential on the pushed stack.
 
 _(state-3 appends one entry per completed task here)_
