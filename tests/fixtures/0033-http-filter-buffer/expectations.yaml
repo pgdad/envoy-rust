@@ -1,0 +1,49 @@
+# Phase-25.2: 5-probe sequential burst against the HCM filter chain
+#   [envoy.filters.http.buffer, envoy.filters.http.router]
+# Buffer chain limit 10; per-route disable on /disabled; per-route limit 4 on
+# /small. Over-limit (body.len() > effective_max, strict >) → 413 with body
+# "Payload Too Large" (17 bytes, no newline; content-type: text/plain
+# auto-added by the H1 filter-synth helper). Within-limit → 200 + echoed body.
+# Status sequence → [200, 413, 200, 413, 200].
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-post-within-limit-200
+      method: post
+      path: "/"
+      host: "buffer.test"
+      body: "hello"            # 5 bytes <= chain limit 10
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-post-over-limit-413
+      method: post
+      path: "/"
+      host: "buffer.test"
+      body: "hello world!!"    # 13 bytes > chain limit 10
+      expected_status: 413
+      expected_body: { kind: byte_exact, body: "Payload Too Large" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-post-route-disabled-200
+      method: post
+      path: "/disabled"
+      host: "buffer.test"
+      body: "hello world!!"    # 13 bytes, but the route disables the filter
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-4-post-route-lowered-413
+      method: post
+      path: "/small"
+      host: "buffer.test"
+      body: "hello"            # 5 bytes > the route's lowered limit 4
+      expected_status: 413
+      expected_body: { kind: byte_exact, body: "Payload Too Large" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-5-get-no-body-200
+      method: get
+      path: "/"
+      host: "buffer.test"
+      expected_status: 200
+      expected_headers: set_equal_modulo_allow_list
+equivalence:
+  response_status: exact
+  response_body: { kind: byte_exact }
