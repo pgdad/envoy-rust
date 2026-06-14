@@ -6,6 +6,7 @@
 //! filter chain engines. Synchronous (non-async) iteration on the
 //! already-buffered request/response shape established by 04.1 + 05.2.
 
+pub mod buffer;
 pub mod cors;
 pub mod csrf;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod rbac;
 pub mod router;
 pub mod types;
 
+pub use buffer::BufferFilter;
 pub use cors::CorsFilter;
 pub use csrf::CsrfFilter;
 pub use error::FilterError;
