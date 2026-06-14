@@ -21,6 +21,15 @@ use tokio::net::TcpStream;
 const DEFAULT_SERVER_NAME: &str = "envoy-rust";
 const DEFAULT_CONTENT_TYPE: &str = "text/plain";
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 25.2 M25.1-1: cap the UP-FRONT body-buffer reservation so an untrusted,
+/// uncapped client `Content-Length` cannot trigger a proportional allocation
+/// before any body byte arrives (a client sending only `Content-Length:
+/// 4000000000` and no body would otherwise reserve ~4 GB). The buffer still
+/// grows on demand via `extend_from_slice`, so the bytes actually buffered are
+/// unchanged — this bounds the RESERVATION, not the read. A true per-request
+/// cap tied to the buffer filter's effective limit is a deferred non-goal (the
+/// effective limit is resolved later in the pipeline, not at this read site).
+const INITIAL_BODY_BUF_CAP: usize = 64 * 1024;
 const READ_BUFFER_INITIAL_CAPACITY: usize = 8192;
 
 /// 06.1 D4.c: per-HCM counters registered against the global StatsRegistry.
@@ -596,7 +605,7 @@ async fn serve_connection(
             n.eq_ignore_ascii_case(headers::CONNECTION) && v.eq_ignore_ascii_case("close")
         }) || req.version == HttpVersion::Http10;
 
-        // 4. Compute body length (for drain) before consuming.
+        // 4. Compute body length (for the body read + the M25.1-1 reservation bound) before consuming.
         let body_len = parse_content_length(&req.headers)?;
         let chunked = req.headers.iter().any(|(n, v)| {
             n.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
@@ -638,7 +647,7 @@ async fn serve_connection(
         let consumed = req.bytes_consumed;
         buf.advance(consumed);
         let request_body: Bytes = if body_len > 0 {
-            let mut body_buf = BytesMut::with_capacity(body_len);
+            let mut body_buf = BytesMut::with_capacity(body_len.min(INITIAL_BODY_BUF_CAP));
             let from_buf = buf.len().min(body_len);
             body_buf.extend_from_slice(&buf[..from_buf]);
             buf.advance(from_buf);
@@ -1729,6 +1738,30 @@ static_resources:
         buf
     }
 
+    /// 25.2 M25.1-2: like `drive`, but writes the request HEAD and BODY in two
+    /// separate `write_all`s with a flush + sleep between them, forcing the kernel
+    /// to deliver them in distinct reads on loopback (so the body-read reassembly
+    /// loop `while remaining > 0` actually runs). Reuses `drive`'s single-connection
+    /// serve-and-connect idiom.
+    async fn drive_split(config: Arc<HCMConfig>, head: &[u8], body: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = serve_connection(config, sock).await;
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(head).await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await; // force a segment boundary
+        client.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        drop(client);
+        let _ = server.await;
+        buf
+    }
+
     /// 25.1 D1: drive multiple requests over ONE keep-alive connection, mirroring
     /// `drive`'s single-connection serve-and-connect idiom. Writes every request
     /// up front (the LAST request must carry `Connection: close` so the server
@@ -2704,6 +2737,76 @@ static_resources:
         assert!(
             got_str.ends_with("hello world"),
             "upstream received the request body bytes: {got_str}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_forwards_body_split_across_tcp_segments() {
+        // 25.2 M25.1-2: head and body arrive in SEPARATE reads, so the body-read
+        // reassembly loop (`while remaining > 0`) actually runs. Assert the upstream
+        // still receives the full forwarded body.
+        let (upstream_port, captured) =
+            spawn_recording_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+                retry_policy: None,
+            }),
+            cluster_mgr,
+        );
+        let resp = drive_split(
+            cfg,
+            b"POST /seg HTTP/1.1\r\nHost: x.test\r\nContent-Length: 11\r\nConnection: close\r\n\r\n",
+            b"hello world",
+        )
+        .await;
+        assert!(
+            String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK\r\n"),
+            "downstream got 200"
+        );
+        let got = captured.lock().unwrap().clone();
+        let got_str = String::from_utf8_lossy(&got);
+        assert!(
+            got_str.starts_with("POST /seg HTTP/1.1\r\n"),
+            "upstream got the request: {got_str}"
+        );
+        assert!(
+            got_str.ends_with("hello world"),
+            "upstream got the reassembled body: {got_str}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_forwards_large_body_grows_on_demand() {
+        // 25.2 M25.1-1: a body larger than one 4 KiB read chunk is forwarded
+        // byte-exact even though the up-front reservation is now bounded — proves
+        // `extend_from_slice` grows the buffer correctly.
+        let (upstream_port, captured) =
+            spawn_recording_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
+        let cfg = hcm_config_with_cluster(
+            "/",
+            RouteAction::Route(RouteAction_Route {
+                cluster: "backend".into(),
+                retry_policy: None,
+            }),
+            cluster_mgr,
+        );
+        let body = vec![b'z'; 10_000]; // > one 4 KiB read chunk
+        let mut req = format!(
+            "POST /big HTTP/1.1\r\nHost: x.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(&body);
+        let resp = drive(cfg, &req).await;
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
+        let got = captured.lock().unwrap().clone();
+        assert!(
+            got.ends_with(&body),
+            "upstream received the full 10 KB body verbatim"
         );
     }
 
