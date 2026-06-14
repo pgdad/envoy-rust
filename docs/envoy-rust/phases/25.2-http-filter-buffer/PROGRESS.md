@@ -93,3 +93,23 @@ _(appended per task by the state-3 `superpowers:subagent-driven-development` ses
 - **No new ADR** (T4 closes the two adjudicated-non-blocking `25.1` REVIEW carry-forwards under the existing ADR-0064/ADR-0044 scope; no decision surfaced). No `unsafe`. Ledger head stays **ADR-0064**.
 - **Commit:** `d7ea6f0fd` (`crates/envoy-http1/src/hcm.rs` only).
 - **Next:** T5 — differential harness extension: `Http1Probe.body` + `drive_http1` request-body support (`tests/differential/src/lib.rs`).
+
+### T5 — differential harness: `Http1Probe.body` + `drive_http1` request-body support (DONE)
+
+- **Skill:** `superpowers:subagent-driven-development` (one implementer subagent, serial per `feedback_serial_subagent_dispatch`; TDD — the failing harness unit test written first [arity mismatch], then the `body` param). Two-stage review: spec-compliance ✅ then code-quality ✅ (Approved; one Important test-robustness note + one Minor clippy-bait pre-empt, both applied — see below).
+- **Production/test change — `tests/differential/src/lib.rs` (ONE file, +97/−20 net):**
+  - **`drive_http1` (`:1531`):** new trailing `body: Option<&[u8]>` param. Request assembly now appends `Content-Length: {b.len()}\r\n` as a real header (inside `if let Some(b) = body`, BEFORE the `Connection: close\r\n\r\n` terminator), then — after `req.into_bytes()` produces the head — `wire.extend_from_slice(b)` appends the body bytes AFTER the `\r\n\r\n`. The `None` path is byte-identical to the prior behavior (no `Content-Length`, no trailing body). The response-read loop is UNCHANGED.
+  - **`Http1Probe` (`:817`):** new `#[serde(default)] pub body: Option<String>` field (placed after `extra_headers`, before the `expected_*` assertion fields — it is a request-shaping field) with a doc-comment noting the driver auto-adds `Content-Length` and the probe must NOT also list `content-length` in `extra_headers`.
+  - **`Driver::Http1ProbeList` arm (`:3679`):** both `drive_http1` calls (upstream `:3711`, subject `:3721`) now thread `probe.body.as_deref().map(str::as_bytes)` as the new last arg.
+  - **All other `drive_http1` call sites pass `None`** (mechanical compile fix): `:1920` (multi-probe pre-request), `:1941`+`:2079` (admin scrape helpers), `:3265`/`:3268` (`Http1` arm), `:3365`/`:3368` (`Http1AfterSettle` arm), `:3934`/`:3945` (`Http1WithAccessLog` arm), `:4224`/`:4232` (multi-probe pre-requests). (`Http1WithAccessLog` keeps no `body` field — intentionally body-less; out of T5 scope.)
+  - New `#[cfg(test)] mod drive_http1_body_tests` → `drive_http1_sends_request_body`: spins an in-process `TcpListener` that records received bytes (read-until-200ms-idle), drives a `POST /` with `Some(b"hello")`, asserts the recorded request `contains("Content-Length: 5")` and `ends_with("hello")`.
+- **Review fixes applied (amended into the commit):** (Important) the test's driver call uses `.expect("drive_http1 must succeed")` instead of `let _ = …` so a driver/server failure surfaces clearly rather than as a confusing empty-recording assertion; (Minor) `String::from_utf8_lossy(…).into_owned()` instead of `.to_string()` (single allocation; pre-empts a later clippy `-D warnings` lint). The probe-list threading kept the PLAN's exact `…map(str::as_bytes)` form (correct after `as_deref()`).
+- **Verification (state-3 per-task gate — build/test/fmt; clippy deferred to state-4 per `project_state3_arc_skips_clippy`):**
+  - `cargo test -p differential drive_http1_sends_request_body` → `test result: ok. 1 passed; 0 failed`.
+  - `cargo test -p differential --no-run` → compiles (the real Docker differential is a state-4 concern, NOT this task — every `drive_http1` call site fixed).
+  - `cargo build -p differential` → clean (per-crate, per `project_isolated_crate_build_blindspot`).
+  - `cargo build --workspace` → clean (still green after T4).
+  - `cargo fmt -p differential` applied; the unit test re-confirmed green.
+- **No new ADR** (T5 is a harness extension under the locked ADR-0062/0063/0064 scope; no decision surfaced). No `unsafe`. Ledger head stays **ADR-0064**.
+- **Commit:** `61229f844` (amended; `tests/differential/src/lib.rs` only).
+- **Next:** T6 — fixture `0033-http-filter-buffer` (H1 → real `http1-echo-server`; chain `Buffer { max_request_bytes: 10 }`; per-route disable on `/disabled`, lowered limit `4` on `/small`; 5 probes → status `[200, 413, 200, 413, 200]`) + the differential acceptance test `tests/differential/tests/http_filter_buffer.rs`.
