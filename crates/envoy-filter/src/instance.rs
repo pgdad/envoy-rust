@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use envoy_stats::StatsRegistry;
 
+use crate::buffer::BufferFilter;
 use crate::cors::CorsFilter;
 use crate::csrf::CsrfFilter;
 use crate::error::FilterError;
@@ -65,6 +66,12 @@ pub enum HttpFilterInstance {
     /// `http.{hcm_stat_prefix}.csrf.{request_valid,request_invalid,missing_source_origin}`
     /// at build time).
     Csrf(CsrfFilter),
+    /// Phase-25.2: the `envoy.filters.http.buffer` filter (decode-side request-
+    /// body length guard; the chain-level `Buffer.max_request_bytes` is the base
+    /// limit, optionally DISABLED or OVERRIDDEN per-route via `BufferPerRoute`
+    /// through `apply_route_config`; over-limit → 413 `Payload Too Large`. NO
+    /// stats — ADR-0063 finding 4).
+    Buffer(BufferFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -132,6 +139,9 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::Csrf(cfg) => Ok(HttpFilterInstance::Csrf(
                 CsrfFilter::build_from_config(cfg, registry, hcm_stat_prefix)?,
             )),
+            envoy_config::HttpFilterTypedConfig::Buffer(cfg) => {
+                Ok(HttpFilterInstance::Buffer(BufferFilter::new(cfg)))
+            }
         }
     }
 
@@ -145,6 +155,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::JwtAuthn(f) => f.decode_headers(req),
             HttpFilterInstance::Cors(f) => f.decode_headers(req),
             HttpFilterInstance::Csrf(f) => f.decode_headers(req),
+            HttpFilterInstance::Buffer(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -164,6 +175,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::JwtAuthn(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Cors(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Csrf(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::Buffer(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
@@ -176,15 +188,16 @@ impl HttpFilterInstance {
     /// Phase-23 D2 / 24 D3: thread the matched route's per-filter config into the
     /// per-request filter instance. No-op for every filter that does not consume
     /// per-route config (Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn);
-    /// `Cors` and `Csrf` read it.
+    /// `Cors`, `Csrf`, and `Buffer` read it.
     pub(crate) fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
         match self {
             HttpFilterInstance::Cors(f) => f.apply_route_config(route),
             HttpFilterInstance::Csrf(f) => f.apply_route_config(route),
+            HttpFilterInstance::Buffer(f) => f.apply_route_config(route),
             // Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn (and the
-            // test-only variants) consume no per-route config; only Cors/Csrf
-            // override. A future route-config-consuming filter must add an arm
-            // above rather than silently fall through here.
+            // test-only variants) consume no per-route config; only
+            // Cors/Csrf/Buffer override. A future route-config-consuming filter
+            // must add an arm above rather than silently fall through here.
             _ => {}
         }
     }
@@ -396,5 +409,105 @@ mod tests {
             body: bytes::Bytes::new(),
         };
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
+    }
+
+    #[test]
+    fn buffer_pipeline_backstop_all_dispositions() {
+        use crate::FilterPipeline;
+        use envoy_config::{
+            Buffer, BufferPerRoute, DataSource, DirectResponse, HttpFilter, HttpFilterTypedConfig,
+            PerFilterConfig, Route, RouteAction, RouteMatch, RouterConfig,
+        };
+        use std::collections::BTreeMap;
+
+        let buffer_hf = HttpFilter {
+            name: "envoy.filters.http.buffer".to_string(),
+            typed_config: HttpFilterTypedConfig::Buffer(Buffer {
+                max_request_bytes: 10,
+            }),
+        };
+        let router_hf = HttpFilter {
+            name: "envoy.filters.http.router".to_string(),
+            typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+        };
+        let registry = test_registry();
+        let mut pipe =
+            FilterPipeline::build_from_config(&[buffer_hf, router_hf], &registry, "ingress_http")
+                .expect("pipeline builds");
+
+        let mk_req = |body: &[u8]| FilterRequest {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            headers: vec![],
+            body: if body.is_empty() {
+                None
+            } else {
+                Some(bytes::Bytes::copy_from_slice(body))
+            },
+        };
+
+        fn route_with_buffer_pr(pr: BufferPerRoute) -> Route {
+            let mut pfc = BTreeMap::new();
+            pfc.insert(
+                "envoy.filters.http.buffer".to_string(),
+                PerFilterConfig::Buffer(pr),
+            );
+            Route {
+                r#match: RouteMatch {
+                    prefix: Some("/".to_string()),
+                    path: None,
+                    headers: vec![],
+                },
+                action: RouteAction::DirectResponse(DirectResponse {
+                    status: 200,
+                    body: DataSource {
+                        filename: None,
+                        inline_string: None,
+                    },
+                }),
+                typed_per_filter_config: pfc,
+            }
+        }
+
+        // (1) within-limit (no route override) → Continue (reaches the router).
+        pipe.apply_route_config(None);
+        assert!(matches!(
+            pipe.decode_headers(&mut mk_req(b"hello")),
+            Decision::Continue
+        ));
+
+        // (2) over-limit → StopAndSend 413 "Payload Too Large".
+        pipe.apply_route_config(None);
+        match pipe.decode_headers(&mut mk_req(b"hello world!!")) {
+            Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 413);
+                assert_eq!(&resp.body[..], b"Payload Too Large");
+            }
+            _ => panic!("expected 413"),
+        }
+
+        // (3) per-route disabled → Continue even when over the chain limit.
+        let disabled_route = route_with_buffer_pr(BufferPerRoute {
+            disabled: true,
+            buffer: None,
+        });
+        pipe.apply_route_config(Some(&disabled_route));
+        assert!(matches!(
+            pipe.decode_headers(&mut mk_req(b"way over the limit")),
+            Decision::Continue
+        ));
+
+        // (4) per-route lowered (max=4) → 413 for a 5-byte body.
+        let lowered_route = route_with_buffer_pr(BufferPerRoute {
+            disabled: false,
+            buffer: Some(Buffer {
+                max_request_bytes: 4,
+            }),
+        });
+        pipe.apply_route_config(Some(&lowered_route));
+        assert!(matches!(
+            pipe.decode_headers(&mut mk_req(b"hello")),
+            Decision::StopAndSend(_)
+        ));
     }
 }
