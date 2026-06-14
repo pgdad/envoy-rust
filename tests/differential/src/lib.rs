@@ -824,6 +824,11 @@ pub struct Http1Probe {
     /// (`Host`, `Connection: close`). Empty Vec means no extras.
     #[serde(default)]
     pub extra_headers: Vec<(String, String)>,
+    /// Optional request body. When present, the driver automatically adds a
+    /// `Content-Length` header; do NOT also list `content-length` in
+    /// `extra_headers`.
+    #[serde(default)]
+    pub body: Option<String>,
     #[serde(default)]
     pub expected_status: Option<u16>,
     #[serde(default)]
@@ -1529,6 +1534,7 @@ pub async fn drive_http1(
     path: &str,
     host: &str,
     extra_headers: &[(String, String)],
+    body: Option<&[u8]>,
 ) -> Result<DriveHttp1Result> {
     use tokio::net::TcpStream;
     let mut stream = TcpStream::connect(addr)
@@ -1543,8 +1549,15 @@ pub async fn drive_http1(
     for (n, v) in extra_headers {
         req.push_str(&format!("{n}: {v}\r\n"));
     }
+    if let Some(b) = body {
+        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+    }
     req.push_str("Connection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await?;
+    let mut wire: Vec<u8> = req.into_bytes();
+    if let Some(b) = body {
+        wire.extend_from_slice(b);
+    }
+    stream.write_all(&wire).await?;
 
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let read_timeout = Duration::from_secs(5);
@@ -1904,7 +1917,7 @@ pub async fn drive_admin_scrape(
                 "PreRequest.method {other:?} not supported in 06.1 (only GET); widen drive_admin_scrape to add more"
             ),
         };
-        let _ = drive_http1(addr, &method, &pre.path, &pre.host, &[])
+        let _ = drive_http1(addr, &method, &pre.path, &pre.host, &[], None)
             .await
             .with_context(|| {
                 format!(
@@ -1925,9 +1938,16 @@ pub async fn drive_admin_scrape(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    drive_http1(admin_addr, &Http1Method::Get, path, "admin.local", &[])
-        .await
-        .with_context(|| format!("admin scrape GET {path}"))
+    drive_http1(
+        admin_addr,
+        &Http1Method::Get,
+        path,
+        "admin.local",
+        &[],
+        None,
+    )
+    .await
+    .with_context(|| format!("admin scrape GET {path}"))
 }
 
 /// 13.1 D10 Task 7: read one HTTP/1.1 response from `stream` (status
@@ -2056,9 +2076,16 @@ where
 /// Both proxies emit the same `<name>: <value>\n` per-line shape so the
 /// per-line parse here is shared across the bilateral assertion.
 pub async fn scrape_admin_stat(admin_addr: SocketAddr, stat_name: &str) -> Result<u64> {
-    let resp = drive_http1(admin_addr, &Http1Method::Get, "/stats", "admin.local", &[])
-        .await
-        .with_context(|| format!("GET /stats from {admin_addr}"))?;
+    let resp = drive_http1(
+        admin_addr,
+        &Http1Method::Get,
+        "/stats",
+        "admin.local",
+        &[],
+        None,
+    )
+    .await
+    .with_context(|| format!("GET /stats from {admin_addr}"))?;
     let body = std::str::from_utf8(&resp.body).context("/stats body is not UTF-8")?;
     for line in body.lines() {
         if let Some((name, value)) = line.split_once(": ")
@@ -3235,10 +3262,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_body,
             expected_headers,
         } => {
-            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[])
+            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[], None)
                 .await
                 .context("upstream envoy http1 drive")?;
-            let subject_resp = drive_http1(subject_addr, method, path, host, &[])
+            let subject_resp = drive_http1(subject_addr, method, path, host, &[], None)
                 .await
                 .context("envoy-rust http1 drive")?;
             subject.shutdown(Duration::from_secs(5)).await.ok();
@@ -3335,10 +3362,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             );
             tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
 
-            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[])
+            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[], None)
                 .await
                 .context("upstream envoy http1 drive (after settle)")?;
-            let subject_resp = drive_http1(subject_addr, method, path, host, &[])
+            let subject_resp = drive_http1(subject_addr, method, path, host, &[], None)
                 .await
                 .context("envoy-rust http1 drive (after settle)")?;
             subject.shutdown(Duration::from_secs(5)).await.ok();
@@ -3687,6 +3714,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     &probe.path,
                     &probe.host,
                     &probe.extra_headers,
+                    probe.body.as_deref().map(str::as_bytes),
                 )
                 .await
                 .with_context(|| format!("upstream envoy http1 drive (probe {})", probe.name))?;
@@ -3696,6 +3724,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     &probe.path,
                     &probe.host,
                     &probe.extra_headers,
+                    probe.body.as_deref().map(str::as_bytes),
                 )
                 .await
                 .with_context(|| format!("envoy-rust http1 drive (probe {})", probe.name))?;
@@ -3902,13 +3931,20 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 "GET" => Http1Method::Get,
                 other => bail!("Driver::Http1WithAccessLog: unsupported method {:?}", other),
             };
-            let upstream_resp =
-                drive_http1(upstream_addr, &http1_method, path, host, extra_headers)
+            let upstream_resp = drive_http1(
+                upstream_addr,
+                &http1_method,
+                path,
+                host,
+                extra_headers,
+                None,
+            )
+            .await
+            .context("upstream envoy http1 drive (Http1WithAccessLog)")?;
+            let subject_resp =
+                drive_http1(subject_addr, &http1_method, path, host, extra_headers, None)
                     .await
-                    .context("upstream envoy http1 drive (Http1WithAccessLog)")?;
-            let subject_resp = drive_http1(subject_addr, &http1_method, path, host, extra_headers)
-                .await
-                .context("envoy-rust http1 drive (Http1WithAccessLog)")?;
+                    .context("envoy-rust http1 drive (Http1WithAccessLog)")?;
 
             // envoy-rust's access-log emit is a fire-and-forget task that runs after the
             // response completes; subject.shutdown() is SIGKILL (subject.rs TODO on
@@ -4185,7 +4221,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 let subject_pre_addr = *subject_hcm.get(&pre.port_key).ok_or_else(|| {
                     anyhow::anyhow!("unknown PreRequest.port_key on subject: {}", pre.port_key)
                 })?;
-                drive_http1(upstream_pre_addr, &method, &pre.path, &pre.host, &[])
+                drive_http1(upstream_pre_addr, &method, &pre.path, &pre.host, &[], None)
                     .await
                     .with_context(|| {
                         format!(
@@ -4193,7 +4229,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                             pre.method, pre.path, pre.host, pre.port_key,
                         )
                     })?;
-                drive_http1(subject_pre_addr, &method, &pre.path, &pre.host, &[])
+                drive_http1(subject_pre_addr, &method, &pre.path, &pre.host, &[], None)
                     .await
                     .with_context(|| {
                         format!(
@@ -7696,5 +7732,48 @@ mod xds_warmup_tests {
         let s =
             "cluster.a.membership_healthy: 1\ncluster.b.membership_healthy: 2\nserver.live: 1\n";
         assert!(clusters_warm_from_stats_text(s));
+    }
+}
+
+#[cfg(test)]
+mod drive_http1_body_tests {
+    use super::{Http1Method, drive_http1};
+
+    #[tokio::test]
+    async fn drive_http1_sends_request_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let rec = recorded.clone();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    sock.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => rec.lock().unwrap().extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = sock.shutdown().await;
+        });
+        drive_http1(addr, &Http1Method::Post, "/", "x.test", &[], Some(b"hello"))
+            .await
+            .expect("drive_http1 must succeed");
+        let got = String::from_utf8_lossy(&recorded.lock().unwrap()).into_owned();
+        assert!(
+            got.contains("Content-Length: 5"),
+            "driver set content-length: {got}"
+        );
+        assert!(got.ends_with("hello"), "driver appended the body: {got}");
     }
 }
