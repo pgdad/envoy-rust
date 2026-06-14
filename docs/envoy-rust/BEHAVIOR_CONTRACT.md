@@ -587,6 +587,32 @@ correction below).
 **Cross-reference:** ADR-0060 (phase-24 SPEC lock-in); ADR-0061 (PLAN-write
 lock-in — chain-base/route-replace, scheme-stripped origin, 403 body).
 
+**25 entries (Buffer filter):**
+
+> The HTTP-filter-family seventh phase (ADR-0062 SPEC / ADR-0063 PLAN-write).
+> `envoy.filters.http.buffer` is a decode-side request-body length guard. With
+> the full request body available as `FilterRequest.body` (H1 via phase 25.1;
+> H2 via the codec), the filter rejects iff `body.len() > effective_max_request_bytes`
+> (strict `>`, ADR-0063 finding 6) with a 413 local reply; else the body flows
+> upstream. The effective limit is the chain-level `Buffer.max_request_bytes`,
+> optionally DISABLED or OVERRIDDEN per-route via `BufferPerRoute`
+> (`apply_route_config` — the third per-route `typed_per_filter_config` consumer
+> after cors + csrf). **NO buffer-scoped stats** (ADR-0063 finding 4 — Envoy
+> v1.33 emits none; the over-limit 413 is reflected only in the generic HCM
+> `downstream_rq_too_large`, not asserted by the fixture).
+
+**Buffer over-limit local-reply wire shape (ADR-0063 finding 1).**
+
+- Status: **413** (`Payload Too Large`).
+- Body: **`Payload Too Large`** — exactly **17 bytes**, NO trailing newline
+  (hex `50 61 79 6c 6f 61 64 20 54 6f 6f 20 4c 61 72 67 65`). Set verbatim by
+  `BufferFilter` via `Bytes::from_static`.
+- `content-type: text/plain` + `content-length: 17` are stamped by the H1/H2
+  synth decorators (`decorate_filter_synth_response{,_h2}`) — the rbac/csrf
+  precedent (non-empty filter local reply → `content-type` added only-if-missing).
+- Verified byte-exact at BOTH the chain level AND a `BufferPerRoute`-lowered
+  per-route limit against `envoyproxy/envoy:v1.33.0` (ADR-0063 finding 1).
+
 **H1 upstream connection-pool `Connection: close` single-use (ADR-0059).**
 
 > When an upstream H1 response carries `Connection: close`, the H1 connection

@@ -11,6 +11,7 @@
 //!   3. post-route-disabled — POST /disabled 13B (disabled) → 200, echo body
 //!   4. post-route-lowered  — POST /small 5B (>4) → 413 "Payload Too Large"
 //!   5. get-no-body         — GET / (no body) → 200 passthrough echo
+//!
 //! The 413 body (`Payload Too Large`, 17 bytes, no newline) is byte-exact
 //! cross-proxy (asserted per-probe); the 200 echo bodies are compared via the
 //! top-level `equivalence.response_body` (byte_exact). Docker-gated by the
