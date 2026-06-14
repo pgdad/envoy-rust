@@ -31,3 +31,21 @@
 ## State-3 implementation
 
 _(appended per task by the state-3 `superpowers:subagent-driven-development` session)_
+
+### T1 — `Buffer` + `BufferPerRoute` config schema + the two enum variants + the validation arm (DONE)
+
+- **Skill:** `superpowers:subagent-driven-development` (one implementer subagent dispatched serially per `feedback_serial_subagent_dispatch`; TDD — failing serde tests first, then schema). Two-stage review: spec-compliance ✅ then code-quality ✅.
+- **Production change — `crates/envoy-config/src/bootstrap.rs`:**
+  - New `pub struct Buffer { pub max_request_bytes: u32 }` — a REQUIRED non-`Option` `u32` with `#[serde(deny_unknown_fields)]` (the ADR-0063 residual disposition, resolved in PLAN: absent → serde missing-field → fatal [ADR-0049 all-fatal]; negative/malformed → u32-parse → fatal; `0` accepted = reject iff `body.len() > 0`). Derives `Debug, Clone, PartialEq, Serialize, Deserialize` (matched the local Cors/Csrf cluster ordering).
+  - New `pub struct BufferPerRoute { #[serde(default)] disabled: bool, #[serde(default)] buffer: Option<Buffer> }` (ADR-0063 finding 3 oneof `{ disabled, buffer }`; empty `{}` → chain base at apply time).
+  - `HttpFilterTypedConfig::Buffer(Buffer)` (`@type` = `…buffer.v3.Buffer`, after the `Csrf` arm) + `PerFilterConfig::Buffer(BufferPerRoute)` (`@type` = `…buffer.v3.BufferPerRoute`, the THIRD `PerFilterConfig` variant after Cors/Csrf).
+  - New validation arm `HttpFilterTypedConfig::Buffer(_cfg)` in the per-filter name↔typed_config match — rejects with `ConfigError::UnsupportedHttpFilter { name }` iff `f.name != "envoy.filters.http.buffer"`; no further validation (the generic `PerRouteConfigForAbsentFilter` covers per-route for free — ADR-0063: NO stats, NO new `ConfigError` variant).
+  - 7 serde tests (chain plain-int / `0`-accepted / absent-fatal / negative-fatal / per-route-disabled / per-route-lowered-limit / unknown-field-rejected).
+- **Deviation from PLAN (sound):** added `Buffer, BufferPerRoute` to the `crates/envoy-config/src/lib.rs` crate-root `pub use bootstrap::{…}` re-export, mirroring how `CsrfPolicy`/`CorsPolicy` are re-exported (the PLAN's tests + downstream T2/T3 consume `crate::Buffer` / `crate::BufferPerRoute`). PLAN expected one file; this is the correct precedent-matching second file.
+- **`@type` × `deny_unknown_fields` safety (code-quality reviewer verified):** both enums are internally tagged (`#[serde(tag = "@type")]`), so serde consumes `@type` into variant selection before the inner struct deserializes — `deny_unknown_fields` on `Buffer`/`BufferPerRoute` never sees `@type`. Identical to the Cors/Csrf precedent (mechanism documented at `CorsConfig`'s doc-comment).
+- **Verification (state-3 per-task gate — build/test/fmt; clippy deferred to state-4 per `project_state3_arc_skips_clippy`):**
+  - `cargo test -p envoy-config buffer_` → `test result: ok. 7 passed; 0 failed`.
+  - `cargo build -p envoy-config` → clean (per-crate, per `project_isolated_crate_build_blindspot`).
+  - `cargo test -p envoy-config` → `test result: ok. 425 passed; 0 failed`.
+- **No new ADR** (T1 surfaces no decision beyond ADR-0062/0063/0064; the `max_request_bytes` disposition was already resolved in the PLAN-write → ADR-0065 stays unfired). No `unsafe`. Ledger head stays **ADR-0064**.
+- **Next:** T2 — `BufferFilter` runtime (`crates/envoy-filter/src/buffer.rs`, ninth `HttpFilterInstance` variant) + decode-side backstop unit tests.

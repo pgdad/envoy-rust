@@ -768,6 +768,9 @@ pub enum HttpFilterTypedConfig {
 
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy")]
     Csrf(CsrfPolicy),
+
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer")]
+    Buffer(Buffer),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -793,6 +796,8 @@ pub enum PerFilterConfig {
     Cors(CorsPolicy),
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.csrf.v3.CsrfPolicy")]
     Csrf(CsrfPolicy),
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.buffer.v3.BufferPerRoute")]
+    Buffer(BufferPerRoute),
 }
 
 /// `envoy.config.core.v3.RuntimeFractionalPercent`. A `default_value`
@@ -821,6 +826,31 @@ pub struct CsrfPolicy {
     pub filter_enabled: RuntimeFractionalPercent,
     #[serde(default)]
     pub additional_origins: Vec<StringMatcher>,
+}
+
+/// `envoy.extensions.filters.http.buffer.v3.Buffer` — the chain-level buffer
+/// config. `max_request_bytes` is a proto `UInt32Value` accepted on the wire as
+/// a plain integer (ADR-0063 finding 2); modeled as a REQUIRED non-Option u32
+/// (absent → serde missing-field error → fatal at startup, the ADR-0049
+/// all-fatal posture; `0` is a valid limit → reject iff body.len() > 0).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Buffer {
+    pub max_request_bytes: u32,
+}
+
+/// `envoy.extensions.filters.http.buffer.v3.BufferPerRoute` — the per-route
+/// override. Envoy's `override` oneof is `{ disabled: bool; buffer: Buffer }`
+/// (ADR-0063 finding 3); modeled as two fields where `disabled: true` bypasses
+/// the filter for the route and `buffer` lowers/overrides the limit. An empty
+/// `{}` (neither set) falls back to the chain-level base at apply time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BufferPerRoute {
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub buffer: Option<Buffer>,
 }
 
 /// 23 D1: the per-route CORS policy (attached via `typed_per_filter_config`).
@@ -2909,6 +2939,16 @@ pub(crate) fn validate_http_filters(
                     });
                 }
                 validate_csrf_config(cfg, listener_name)?;
+            }
+            crate::HttpFilterTypedConfig::Buffer(_cfg) => {
+                if f.name != "envoy.filters.http.buffer" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                // Buffer.max_request_bytes is a required u32 (serde-enforced;
+                // absent/malformed → fatal parse error); `0` is a valid limit.
+                // No further validation (ADR-0063 — NO stats, NO new ConfigError).
             }
         }
     }
@@ -13083,6 +13123,99 @@ typed_per_filter_config:
             }
             other => panic!("expected Csrf, got {other:?}"),
         }
+    }
+
+    // 25.2 Task 1: buffer filter config schema parse tests (ADR-0063/0064)
+    #[test]
+    fn buffer_chain_config_parses_plain_integer() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+max_request_bytes: 10
+"#;
+        let cfg: crate::HttpFilterTypedConfig = serde_yaml::from_str(yaml).unwrap();
+        match cfg {
+            crate::HttpFilterTypedConfig::Buffer(b) => assert_eq!(b.max_request_bytes, 10),
+            _ => panic!("expected Buffer"),
+        }
+    }
+
+    #[test]
+    fn buffer_chain_config_zero_is_accepted() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+max_request_bytes: 0
+"#;
+        let cfg: crate::HttpFilterTypedConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(cfg, crate::HttpFilterTypedConfig::Buffer(b) if b.max_request_bytes == 0));
+    }
+
+    #[test]
+    fn buffer_chain_config_absent_max_request_bytes_is_fatal() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+"#;
+        let r: Result<crate::HttpFilterTypedConfig, _> = serde_yaml::from_str(yaml);
+        assert!(
+            r.is_err(),
+            "absent max_request_bytes must be a fatal parse error"
+        );
+    }
+
+    #[test]
+    fn buffer_chain_config_negative_max_request_bytes_is_fatal() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+max_request_bytes: -1
+"#;
+        let r: Result<crate::HttpFilterTypedConfig, _> = serde_yaml::from_str(yaml);
+        assert!(
+            r.is_err(),
+            "negative max_request_bytes must be a fatal parse error"
+        );
+    }
+
+    #[test]
+    fn buffer_per_route_disabled_parses() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.BufferPerRoute
+disabled: true
+"#;
+        let pfc: crate::PerFilterConfig = serde_yaml::from_str(yaml).unwrap();
+        match pfc {
+            crate::PerFilterConfig::Buffer(b) => {
+                assert!(b.disabled);
+                assert!(b.buffer.is_none());
+            }
+            _ => panic!("expected Buffer per-route"),
+        }
+    }
+
+    #[test]
+    fn buffer_per_route_lowered_limit_parses() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.BufferPerRoute
+buffer:
+  max_request_bytes: 4
+"#;
+        let pfc: crate::PerFilterConfig = serde_yaml::from_str(yaml).unwrap();
+        match pfc {
+            crate::PerFilterConfig::Buffer(b) => {
+                assert!(!b.disabled);
+                assert_eq!(b.buffer.unwrap().max_request_bytes, 4);
+            }
+            _ => panic!("expected Buffer per-route"),
+        }
+    }
+
+    #[test]
+    fn buffer_chain_config_rejects_unknown_field() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer
+max_request_bytes: 10
+bogus: 1
+"#;
+        let r: Result<crate::HttpFilterTypedConfig, _> = serde_yaml::from_str(yaml);
+        assert!(r.is_err(), "deny_unknown_fields must reject unknown field");
     }
 
     #[test]
