@@ -74,3 +74,22 @@ _(appended per task by the state-3 `superpowers:subagent-driven-development` ses
   - `cargo fmt -p envoy-filter` applied (cosmetic reflow); tests re-confirmed green.
 - **No new ADR** (T2/T3 surface no decision beyond ADR-0062/0063/0064; the co-landing is a sequencing reconciliation). No `unsafe`. Ledger head stays **ADR-0064**.
 - **Next:** T4 — M25.1-1 (bound the H1 body up-front allocation to `min(body_len, 64 KiB)`, grow-on-demand) + M25.1-2 (cross-TCP-segment body-reassembly forwarding test) in `crates/envoy-http1/src/hcm.rs`.
+
+### T4 — M25.1-1 (bound the H1 body up-front allocation) + M25.1-2 (cross-TCP-segment forwarding test) (DONE)
+
+- **Skill:** `superpowers:subagent-driven-development` (one implementer subagent, serial per `feedback_serial_subagent_dispatch`; M25.1-2 test written first — it PASSES against the unmodified reassembly loop, pinning existing-correct behavior). Two-stage review: spec-compliance ✅ then code-quality ✅ (Approved; only Minor notes — the 50 ms loopback sleep is an accepted convention in this test module; no changes required).
+- **Production change — `crates/envoy-http1/src/hcm.rs` (ONE file, +105/−2):**
+  - **M25.1-1:** new `const INITIAL_BODY_BUF_CAP: usize = 64 * 1024;` (with rationale doc comment) immediately after `IDLE_READ_TIMEOUT`; the body-read reservation changed from `BytesMut::with_capacity(body_len)` to `BytesMut::with_capacity(body_len.min(INITIAL_BODY_BUF_CAP))`. **Behavior-preserving:** for any real small body (`body_len <= 64 KiB`) `.min` is a no-op (byte-identical allocation); for an oversized declared `Content-Length` it reserves at most 64 KiB up front and grows on demand via the unchanged `extend_from_slice` path — bounding the RESERVATION, not the read. The `while remaining > 0` loop, 4096-byte read chunk, and timeout/EOF/io-error dispositions are byte-for-byte unchanged. (A true per-request cap tied to the buffer filter's effective limit stays a deferred non-goal — the effective limit is resolved later in the pipeline, not at this read site.)
+  - **M25.1-7 (cosmetic):** the stale `// 4. Compute body length (for drain) …` comment now reads `(for the body read + the M25.1-1 reservation bound)`.
+- **Tests added (in `#[cfg(test)] mod tests`):**
+  - `drive_split` helper — writes the request HEAD, `flush`es, `sleep(50ms)`, then writes the BODY in a separate `write_all`, forcing a TCP segment boundary so head+body land in distinct reads. Reuses `serve_connection` exactly as `drive` does (NO new HCM entry point).
+  - `h1_forwards_body_split_across_tcp_segments` (M25.1-2) — drives `drive_split` against `spawn_recording_upstream` (the `Arc<Mutex<Vec<u8>>>` loop-with-timeout helper, robust to a second-segment body — NOT the single-read `spawn_capturing_upstream`); asserts the upstream received the full reassembled body (`ends_with("hello world")`). This is the first coverage of the multi-read `while remaining > 0` path (the `25.1` tests wrote head+body in one `write_all` so it never ran).
+  - `h1_forwards_large_body_grows_on_demand` — a 10 000-byte body (> one 4 KiB read chunk) forwarded byte-exact (`got.ends_with(&body)`), proving `extend_from_slice` grows past the now-bounded 64 KiB reservation.
+- **Verification (state-3 per-task gate — build/test/fmt; clippy deferred to state-4 per `project_state3_arc_skips_clippy`):**
+  - `cargo test -p envoy-http1` → `test result: ok. 112 passed; 0 failed` (the 3 new/target tests + ALL pre-existing `25.1` body-forwarding tests still green — the allocation bound is behavior-preserving; no regressions).
+  - `cargo build -p envoy-http1` → clean (per-crate, per `project_isolated_crate_build_blindspot`).
+  - `cargo build --workspace` → clean (still green after T3).
+  - `cargo fmt -p envoy-http1` → no changes.
+- **No new ADR** (T4 closes the two adjudicated-non-blocking `25.1` REVIEW carry-forwards under the existing ADR-0064/ADR-0044 scope; no decision surfaced). No `unsafe`. Ledger head stays **ADR-0064**.
+- **Commit:** `d7ea6f0fd` (`crates/envoy-http1/src/hcm.rs` only).
+- **Next:** T5 — differential harness extension: `Http1Probe.body` + `drive_http1` request-body support (`tests/differential/src/lib.rs`).
