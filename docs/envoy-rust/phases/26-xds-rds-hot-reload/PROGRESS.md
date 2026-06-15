@@ -113,7 +113,90 @@ Docker differential is deferred to the state-4 gate per this phase's cadence.
 
 ## Task 3 — `RdsWatcher` periodic primitive (skeleton) [§6.2-INDEPENDENT]
 
-_(pending)_
+**Done (state-3).** The 5th periodic-background primitive — a poll-based file-mtime watcher
+that mirrors the 12.2 `envoy_health::Scheduler` topology. SKELETON only: the per-target
+`reload` is a no-op `Ok(())` stub (the real reparse→revalidate→atomic-swap is Task 4, BLOCKED
+on the Linux §6.2 verification; the `rds.*` counter ticks are Task 5). No reload semantics,
+no counters this task — only the spawn/loop/shutdown lifecycle + the envoy-bin target-walk +
+drain wiring + the lifecycle test.
+
+**File + spawn site.** New `crates/envoy-http1/src/rds_watcher.rs`; declared `pub mod
+rds_watcher` + re-exported `pub use rds_watcher::{RdsWatcher, WatchTarget}` from
+`crates/envoy-http1/src/lib.rs`. envoy-bin wires it in `crates/envoy-bin/src/main.rs`: a
+`let mut rds_targets: Vec<envoy_http1::WatchTarget>` declared BEFORE the listener-serve block,
+populated inside the `HCM_FILTER` dispatch arm (right after the h1 `Arc<HCMConfig>` is built),
+then `RdsWatcher::spawn(rds_targets, token.clone())` AFTER the listener block (before the admin
+block) and drained via `rds_watcher.shutdown().await` on the runtime drain path alongside the
+health scheduler + outlier manager (both clean-exit and error-exit paths).
+
+**`spawn` signature: INFALLIBLE (`-> Self`), justified.** Unlike `Scheduler::spawn`
+(`Result<_>`, because it registers per-cluster counters + re-parses durations), the skeleton
+does NO fallible work at spawn time: it registers no counters (Task 5) and its `reload` stub
+cannot fail. So `spawn(targets, cancel) -> Self`. Documented inline that when Task 5 adds
+counter registration, spawn may become fallible — and the envoy-bin call site already
+`?`-threads its neighbours, so that change stays local.
+
+**`WatchTarget` shape + the H2-inner-handle finding.**
+```
+pub struct WatchTarget {
+    pub path: PathBuf,                 // rds.config_source.path_config_source.path
+    pub route_config_name: String,     // rds.route_config_name (unused by no-op reload; Task 4 selects by it)
+    pub store: Arc<envoy_http1::HCMConfig>, // Task-2 swappable-handle owner; Task 4 calls store.store_route_config(...)
+    // Task 5 adds: the registered rds.* Arc<Counter> handles.
+}
+```
+The H2 wrapping was investigated: `envoy_http2::HCMConfig { inner: Arc<envoy_http1::HCMConfig>,
+h2_pool_mgr }` (`crates/envoy-http2/src/hcm.rs:37`) — the H2 wrapper holds NO swappable cell;
+the `RwLock<Arc<RouteConfiguration>>` lives only on the inner h1 `HCMConfig`. envoy-bin builds
+that h1 `Arc<HCMConfig>` (`main.rs:333`) BEFORE the H2 wrap (`HCMConfig::wrap(Arc::clone(&hcm_config), …)`),
+so the target's `store` is `Arc::clone(&hcm_config)` (the inner h1 handle) and BOTH the H1 and
+H2 dispatch paths observe the same swappable cell a watcher swap would update. The target-walk
+reads `hcm_cfg.rds` once for either codec, BEFORE the codec dispatch — so it is codec-agnostic.
+
+**Poll cadence.** `const POLL_INTERVAL: Duration = 1s`, a named placeholder with a comment that
+Task 1's §6.2 settle/poll-bound output may TUNE it. The per-target `watch_loop` burns the
+immediate t=0 `interval.tick()`, seeds `last_mtime` from the file at spawn, then
+`tokio::select!`s `{ cancel.cancelled() => break, interval.tick() => stat+compare }`; only a
+CHANGED present mtime calls `reload(&target)` (a vanished file or stable mtime is a no-op — the
+0028 idle witness).
+
+**No-op reload seam for Task 4.** `fn reload(_target: &WatchTarget) -> Result<(), io::Error> {
+Ok(()) }` carries the marker `// Task 4: real reparse+revalidate+store_route_config; warm-reject
+per §5.5`. The loop's call site already handles `Err(_)` (tracing::warn) so Task 4 fills in the
+body WITHOUT touching the spawn/loop/target-walk/drain plumbing.
+
+**§5.2 inertness confirmed.** Empty target list ⇒ zero watch tasks (`task_count() == 0`); the
+target-walk only pushes for an HCM with `hcm_cfg.rds.is_some()`, so every non-rds fixture spawns
+NOTHING. Fixture `0028-xds-file-based-rds` (rds-configured, `rds.yaml` whose mtime never changes
+during the test) ⇒ ONE watch task that idles (no reload fires). The `--workspace` suite (0028 +
+the 33-fixture suite) stays behavior-unchanged.
+
+**No new deps.** envoy-http1 already had `tokio` (`time`/`sync`/`macros`) + `tokio-util` (`rt`,
+the `CancellationToken`) + dev-dep `tempfile`; the skeleton needed nothing new (confirms reload
+logic did NOT creep in — that stays Task 4 in envoy-config-dependent territory).
+
+**Verification.**
+- `cargo test -p envoy-http1 rds_watcher -- --nocapture` → 3 passed (idles-when-stable+shutdown,
+  empty-targets-zero-tasks, external-cancel-terminates; all on `#[tokio::test(start_paused = true)]`,
+  no real sleeps). TDD: test authored first.
+- `cargo test -p envoy-http1` → 116 passed, 0 failed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean.
+- Isolated builds `cargo build -p envoy-config -p envoy-http1 -p envoy-http2 -p envoy-bin` → all green.
+- `cargo test --workspace` → the run progressed through 29 test-result groups (the
+  `differential` lib's 137 tests + envoy-config / envoy-http1 / envoy-http2 + the envoy-bin
+  integration binaries, including 0028's now-spawned-but-idle watcher path) with ZERO
+  `FAILED`/`panicked`/non-zero-`failed` lines, then the run wedged at the documented
+  startup-stall flake family: a freshly-spawned Rust test binary (`upstream_retry`, then the
+  `envoy_bin` lib unittest binary) hung at 0% CPU. A `sample` of the stalled process showed it
+  wedged in `_dyld_start` — the macOS dynamic loader, BEFORE `main`/any test code — i.e. an
+  acute, environment-level process-spawn stall, NOT a regression (the identical
+  `cargo test -p envoy-http1 rds_watcher` + `-p envoy-http1` runs passed earlier THIS session
+  with the SAME binaries; the stall reproduced on the standalone re-runs and even on direct
+  binary/shell-wrapper spawns, confirming it is the documented macOS dyld flake in a sustained
+  phase). Per the project's flake guidance a stall is not treated as a failure; the
+  workspace-green re-confirmation should be re-run once the host recovers (it was green through
+  every group that the loader allowed to start). All per-crate gates that completed before the
+  stall onset (rds_watcher 3/3, envoy-http1 116/116, isolated builds, clippy) were clean.
 
 ## Task 4 — reload pipeline (re-parse → re-validate → atomic swap; warm-reject) [BLOCKED on Task 1]
 
