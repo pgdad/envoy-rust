@@ -18,6 +18,7 @@ mod error;
 pub mod hcm;
 pub mod headers;
 pub mod pool; // 13.1 NEW (Task 3): per-cluster H1 connection pool.
+pub mod rds_watcher; // 26 NEW (Task 3): the 5th periodic-background primitive.
 pub mod response;
 pub mod router; // 04.3 NEW (Task 8)
 
@@ -26,5 +27,6 @@ pub use codec::{Http1Codec, HttpVersion, Request};
 pub use error::Http1Error;
 pub use hcm::{BuildOutcome, HCM, HCMConfig, HCMStats, build_response};
 pub use pool::{H1Pool, H1PoolManager, PoolError, PoolGuard}; // 13.1 NEW (Task 3)
+pub use rds_watcher::{RdsWatcher, WatchTarget}; // 26 NEW (Task 3)
 pub use response::{Http1Response, Response};
 pub use router::RouterError; // 04.3 NEW (Task 8)

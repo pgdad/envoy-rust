@@ -224,6 +224,16 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // 26 Task 3: the 5th periodic-background primitive — the `RdsWatcher`.
+    // Built by walking the listeners for HCMs with `rds` configured (the §5.2
+    // inertness invariant: empty target list ⇒ zero watch tasks when no HCM
+    // uses rds). Populated in the HCM dispatch arm below — it needs the
+    // post-construction `Arc<HCMConfig>` (the Task-2 swappable route-table
+    // handle) plus the rds file path/name — then spawned AFTER the
+    // listener-serve block and drained via `shutdown().await` on the runtime
+    // drain path, mirroring the 12.2 health scheduler / 14.2 outlier manager.
+    let mut rds_targets: Vec<envoy_http1::WatchTarget> = Vec::new();
+
     if let Some(listener_cfg) = bootstrap.all_listeners().next() {
         // The validator guarantees `filter_chains.len() ≥ 1` and at least one
         // filter; we read the single first filter (phase 02.2 supports one
@@ -340,6 +350,25 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     .await?,
                 );
 
+                // 26 Task 3: if this HCM is rds-configured, register a watch
+                // target. `hcm_config` (the h1 `Arc<HCMConfig>`) is the
+                // swappable route-table owner — for the H2 path below it is
+                // wrapped as the `.inner` of `envoy_http2::HCMConfig`, so this
+                // SAME h1 handle is the one both dispatch paths read; the
+                // watcher's `store` must be it (NOT the H2 wrapper, which
+                // holds no swappable cell). Path/name come from the parsed
+                // `rds` block (`rds.config_source.path_config_source.path` +
+                // `rds.route_config_name`). §5.2: HCMs WITHOUT rds add nothing.
+                if let Some(rds) = hcm_cfg.rds.as_ref() {
+                    rds_targets.push(envoy_http1::WatchTarget {
+                        path: std::path::PathBuf::from(
+                            &rds.config_source.path_config_source.path,
+                        ),
+                        route_config_name: rds.route_config_name.clone(),
+                        store: std::sync::Arc::clone(&hcm_config),
+                    });
+                }
+
                 // 05.2 NEW: H1-vs-H2 dispatch on hcm_cfg.codec_type.
                 // - AUTO / HTTP1 → envoy_http1::HCM (existing 04.x path)
                 // - HTTP2       → envoy_http2::HCM (new in 05.2)
@@ -443,6 +472,16 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // 26 Task 3: spawn the `RdsWatcher` AFTER the listeners/HCMs are
+    // constructed (the target list is now populated). Cancellation wired to
+    // the existing signal token so SIGTERM/SIGINT terminates every watch loop
+    // at its next `tokio::select!` boundary. Inert (zero watch tasks) when
+    // `rds_targets` is empty — the §5.2 inertness invariant. `spawn` is
+    // infallible (the skeleton registers no counters and its `reload` is a
+    // no-op stub; the real reparse+revalidate+store is Task 4, the `rds.*`
+    // counter ticks are Task 5). Drained via `shutdown().await` below.
+    let rds_watcher = envoy_http1::RdsWatcher::spawn(rds_targets, token.clone());
+
     if let Some(admin_cfg) = bootstrap.admin.as_ref() {
         let admin_config = std::sync::Arc::new(
             envoy_admin::AdminConfig::from_envoy_config(admin_cfg)
@@ -498,6 +537,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // already propagated through each sweeper's `tokio::select!`; `shutdown().await` cancels
     // its token clone + joins every sweeper task before `cluster_mgr`'s stats handles drop.
     outlier_mgr.shutdown().await;
+    // 26 Task 3: drain the rds watcher alongside the health scheduler +
+    // outlier manager on BOTH clean-exit and error-exit paths. The signal
+    // token cancellation has already propagated through each watch loop's
+    // `tokio::select!`; `shutdown().await` cancels its token clone + joins
+    // every watch task before envoy-bin returns. Inert (immediate) when no
+    // rds target was configured.
+    rds_watcher.shutdown().await;
     if let Some(e) = first_err {
         return Err(e);
     }
