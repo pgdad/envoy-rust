@@ -39,7 +39,77 @@ _(pending — state-3, Linux)_
 
 ## Task 2 — route-table-handle migration (`Arc<RouteConfiguration>` → swappable handle) [§6.2-INDEPENDENT]
 
-_(pending)_
+**Done (state-3).** Behavior-preserving migration of the HCM route table from an owned
+`Arc<RouteConfiguration>` to a swappable handle, in preparation for the RDS atomic-swap
+reload (Task 4). No reload logic, no watcher this task — only the field-type change + the
+read-once accessor + the writer.
+
+**Handle type chosen + WHY (the sharing-model finding).**
+`HCMConfig.route_config: RwLock<Arc<RouteConfiguration>>` — dep-free (`std::sync::RwLock`,
+no `arc-swap`, no `tokio::sync::watch`), **no outer `Arc`**. Investigation of the sharing
+model (the one real design judgment): `HCMConfig` is built once at startup and shared to
+every live request handler via a single `Arc<HCMConfig>` — the H1 `HCM { config:
+Arc<HCMConfig> }` and the H2 `HCM { config: Arc<HCMConfig> }` (whose `config.inner:
+Arc<Http1HCMConfig>` re-wraps the same H1 config). The per-connection `self.config.clone()`
+in both connection handlers is an `Arc::clone` (pointer-bump), **never** a deep struct clone;
+the only struct-literal `HCMConfig {…}` constructions outside `from_config` are `#[cfg(test)]`.
+Because all handlers AND the future watcher hold the *same* `Arc<HCMConfig>`, they all reach
+the *same* `RwLock` cell — so a watcher `store_route_config(new)` is automatically visible to
+every connection without an extra `Arc` layer. (An outer `Arc<RwLock<…>>` would only be
+required if `HCMConfig` itself were cloned per-connection, which it is not.)
+
+**API added (exact names kept for downstream consistency — Task 4 calls `store_route_config`,
+Task 6 calls `current_route_config`):**
+- `HCMConfig::current_route_config(&self) -> Arc<RouteConfiguration>` — the **§5.4 read-once**
+  accessor: takes the read lock, clones the inner `Arc` (refcount bump), releases, returns the
+  owned clone. A per-request handler reads ONCE at entry and holds that snapshot for the
+  request lifetime, so a concurrent `store` does not affect an in-flight request.
+- `HCMConfig::store_route_config(&self, rc: Arc<RouteConfiguration>)` — write-locks the cell and
+  replaces the inner `Arc`. No production caller this task (Task 4's reload pipeline drives it);
+  it is exercised by the new unit test, so clippy `--all-targets` does NOT flag it dead — **no
+  `#[allow(dead_code)]` was needed.**
+- `resolve_route` previously returned `Option<&'a Route>` borrowed from `&'a HCMConfig` (valid
+  because the field was an owned `Arc` living in the config). With the table now behind a
+  swappable handle, the snapshot is a temporary, so `resolve_route` now returns a new
+  `pub struct ResolvedRoute` that **owns** the snapshot `Arc<RouteConfiguration>` and exposes the
+  matched route by stored vhost/route indices via `ResolvedRoute::route(&self) -> &Route`.
+  Holding it pins the §5.4 snapshot for the request. Both call sites
+  (`serve_connection` in http1, `handle_one_stream` in http2) updated to
+  `matched_route.as_ref().map(ResolvedRoute::route)` before `pipeline.apply_route_config(...)`;
+  `apply_route_config`'s `Option<&Route>` signature is unchanged. `build_response` snapshots once
+  at entry and walks the local `Arc`.
+
+**Enumeration count (the grep checklist — every `route_config` read/literal in both crates):**
+- envoy-http1: field type (`:122`), construct site (`:209`, wraps `clone_route_config` in
+  `RwLock::new(Arc::new(...))`), 2 read sites (`resolve_route`, `build_response`), and **17**
+  `route_config: Arc::new(RouteConfiguration {…})` runtime-field constructors (16 test helpers +
+  the 2 `resolve_route` test struct-literals counted among them) wrapped to
+  `RwLock::new(Arc::new(...))`; 4 `resolve_route(...)` test assertions updated to `.route()`.
+- envoy-http2: 1 `Http1HCMConfig` struct-literal test constructor (`:2430`) wrapped; the H2 read
+  path delegates to `envoy_http1::hcm::resolve_route(&config.inner, …)` (updated to
+  `.map(ResolvedRoute::route)`); 1 H2 `resolve_route` test updated to `.route()`; `RwLock` added
+  to the H2 test-module imports. The `route_config: Some(RouteConfiguration {…})` sites in BOTH
+  crates are the config-INPUT type (`HttpConnectionManagerConfig.route_config: Option<…>`,
+  consumed at `:209`) and were correctly left untouched.
+
+**Verification.**
+- New TDD unit test `route_table_handle_swap_is_read_once` (http1 `#[cfg(test)]`): asserts
+  (a) a reader sees the CURRENT table, (b) a `store(new)` is visible to the NEXT read, (c) an
+  in-flight reader's owned snapshot is UNAFFECTED by a later `store` (§5.4). Written first,
+  observed FAIL (no swap API: E0599), then PASS after migration.
+- `cargo test -p envoy-http1 -p envoy-http2` → green (http1 lib 113 passed; http2 lib 72 passed; 0 failed).
+- `cargo clippy -p envoy-http1 -p envoy-http2 --all-targets -- -D warnings` → clean (exit 0).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean (exit 0).
+- Isolated builds `cargo build -p envoy-config -p envoy-http1 -p envoy-http2 -p envoy-bin` → all green.
+- `cargo test --workspace --exclude differential --exclude h2spec-conformance` → green (the Docker
+  differential + h2spec are NOT run per-task; they fire only at the state-4 gate / on Linux CI).
+
+**§5.2 regression confirmation.** The migration is behavior-preserving for every non-reloading
+request: route matching is per-request stateless, the snapshot is taken once at entry and the
+walk is byte-for-byte the prior `route_config.virtual_hosts.iter()` walk. Fixture 0028's path
+(and the rest of the 33-fixture suite) is unaffected — the only observable change is that the
+field is now swappable. The full per-task local cargo suite is the regression witness here; the
+Docker differential is deferred to the state-4 gate per this phase's cadence.
 
 ## Task 3 — `RdsWatcher` periodic primitive (skeleton) [§6.2-INDEPENDENT]
 
