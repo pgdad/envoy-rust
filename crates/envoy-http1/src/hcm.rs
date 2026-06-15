@@ -13,7 +13,7 @@ use envoy_config::{
     RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, VirtualHost,
 };
 use envoy_listener::{BoxFuture, ConnectionHandler};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -119,7 +119,24 @@ impl HCMStats {
 #[derive(Debug)]
 pub struct HCMConfig {
     pub stat_prefix: String,
-    pub route_config: Arc<RouteConfiguration>,
+    /// 26 Task 2: the route table is now a SWAPPABLE handle to support
+    /// file-based RDS hot-reload (atomic pointer swap; route matching is
+    /// per-request stateless). The inner `Arc<RouteConfiguration>` is the
+    /// live table; an `RwLock` guards the cell so the RDS watcher (Task 4)
+    /// can `store_route_config(new)` while concurrent request handlers read.
+    ///
+    /// No OUTER `Arc` is needed: `HCMConfig` itself is shared across all
+    /// connections via a single `Arc<HCMConfig>` (it is never deep-cloned —
+    /// `self.config.clone()` in the connection handlers is an `Arc::clone`
+    /// pointer-bump), so every handler and the watcher reach this same
+    /// `RwLock` cell, and a watcher `store` is visible to all of them.
+    ///
+    /// Readers MUST go through [`HCMConfig::current_route_config`], which takes
+    /// the read lock, clones the inner `Arc`, and releases — yielding an OWNED
+    /// snapshot. A per-request handler reads ONCE at entry and holds that clone
+    /// for the request's lifetime, so a concurrent `store` does not affect an
+    /// in-flight request (the §5.4 read-once guarantee).
+    pub route_config: RwLock<Arc<RouteConfiguration>>,
     pub cluster_mgr: Arc<envoy_cluster::ClusterManager>,
     /// 05.2 NEW: listener-side HTTP/2 protocol options. Ignored on the H1
     /// dispatch path (envoy-http1's HCM doesn't read this); consumed on the
@@ -206,11 +223,11 @@ impl HCMConfig {
         )?);
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
-            route_config: Arc::new(clone_route_config(
+            route_config: RwLock::new(Arc::new(clone_route_config(
                 cfg.route_config
                     .as_ref()
                     .expect("route_config populated post-load — §5.3 invariant"),
-            )),
+            ))),
             cluster_mgr,
             http2_protocol_options: cfg.http2_protocol_options.clone(),
             stats,
@@ -218,6 +235,38 @@ impl HCMConfig {
             filter_pipeline,
             pool_mgr,
         })
+    }
+
+    /// 26 Task 2: read the CURRENT route table — the §5.4 read-once accessor.
+    /// Takes the read lock, clones the inner `Arc` (a cheap refcount bump),
+    /// releases the lock, and returns the OWNED clone. A per-request handler
+    /// calls this once at entry; holding the returned `Arc` snapshots the table
+    /// for the request's lifetime, so a concurrent [`store_route_config`] swap
+    /// does NOT affect the in-flight request.
+    ///
+    /// [`store_route_config`]: HCMConfig::store_route_config
+    pub fn current_route_config(&self) -> Arc<RouteConfiguration> {
+        // A poisoned lock means a writer panicked mid-store; the inner Arc is
+        // never left in a torn state (Arc swap is a single move), so recover
+        // the guard and read the (consistent) current table.
+        self.route_config
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// 26 Task 2: atomically replace the live route table. Acquires the write
+    /// lock and swaps the inner `Arc` for `rc`. In-flight readers that already
+    /// hold an `Arc` clone from [`current_route_config`] keep their snapshot;
+    /// the NEXT `current_route_config` observes `rc`. The RDS watcher (Task 4)
+    /// drives this on a file change; it has no production caller this task.
+    ///
+    /// [`current_route_config`]: HCMConfig::current_route_config
+    pub fn store_route_config(&self, rc: Arc<RouteConfiguration>) {
+        *self
+            .route_config
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = rc;
     }
 }
 
@@ -634,7 +683,7 @@ async fn serve_connection(
         // apply_route_config clones the policy into the Cors instance, so the
         // borrow of `config` via `matched_route` ends before mem::take of `req`.
         let matched_route = resolve_route(&config, &req);
-        pipeline.apply_route_config(matched_route);
+        pipeline.apply_route_config(matched_route.as_ref().map(ResolvedRoute::route));
 
         // 25.1 D1: read the Content-Length-delimited request body into `req.body`
         // BEFORE the filter pipeline, so a body-dependent filter (phase 25.2's
@@ -1212,6 +1261,28 @@ enum RequestPath {
     SynthFromDecode(Response),
 }
 
+/// 26 Task 2: a matched route that OWNS its route-table snapshot. With the
+/// route table now behind a swappable handle ([`HCMConfig::current_route_config`]),
+/// `resolve_route` can no longer return a `&Route` borrowed from the config —
+/// the snapshot is a temporary. So it returns this value, which keeps the
+/// snapshot `Arc<RouteConfiguration>` alive and exposes the matched route by
+/// stored vhost/route indices via [`ResolvedRoute::route`]. Holding it pins the
+/// §5.4 snapshot for the request's lifetime regardless of a concurrent `store`.
+pub struct ResolvedRoute {
+    route_config: Arc<RouteConfiguration>,
+    vh_idx: usize,
+    route_idx: usize,
+}
+
+impl ResolvedRoute {
+    /// Borrow the matched route out of the held snapshot. The indices were
+    /// computed against this exact `route_config` snapshot in `resolve_route`,
+    /// so they are always in-bounds.
+    pub fn route(&self) -> &Route {
+        &self.route_config.virtual_hosts[self.vh_idx].routes[self.route_idx]
+    }
+}
+
 /// Phase-23 D2: resolve the matched route up-front (vh-match + route-match),
 /// for threading per-route filter config into the pipeline BEFORE the decode
 /// pass. Returns `None` for missing/empty Host, no matching vh, or no matching
@@ -1219,17 +1290,30 @@ enum RequestPath {
 /// CORS policy). Shares `vh_matches`/`route_matches` with `build_response`, so
 /// the up-front resolution and `build_response`'s internal re-match are
 /// guaranteed identical (the 30-fixture regression-equivalence guarantee).
-pub fn resolve_route<'a>(config: &'a HCMConfig, req: &Request) -> Option<&'a envoy_config::Route> {
+///
+/// 26 Task 2: snapshots the swappable route table once (§5.4 read-once) and
+/// returns a [`ResolvedRoute`] that owns that snapshot, so the borrowed route
+/// stays valid even if the RDS watcher swaps the table mid-request.
+pub fn resolve_route(config: &HCMConfig, req: &Request) -> Option<ResolvedRoute> {
     let host_raw = find_header(&req.headers, headers::HOST).filter(|h| !h.is_empty())?;
     let host = strip_port(host_raw);
-    let vh = config
-        .route_config
+    // 26 Task 2: snapshot the route table once (§5.4 read-once). The returned
+    // route is held inside the snapshot Arc, so we yield BOTH so the caller
+    // keeps the table alive while borrowing the matched route.
+    let route_config = config.current_route_config();
+    let vh_idx = route_config
         .virtual_hosts
         .iter()
-        .find(|vh| vh_matches(vh, host))?;
-    vh.routes
+        .position(|vh| vh_matches(vh, host))?;
+    let route_idx = route_config.virtual_hosts[vh_idx]
+        .routes
         .iter()
-        .find(|r| route_matches(r, &req.path, &req.headers))
+        .position(|r| route_matches(r, &req.path, &req.headers))?;
+    Some(ResolvedRoute {
+        route_config,
+        vh_idx,
+        route_idx,
+    })
 }
 
 pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
@@ -1248,9 +1332,14 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
     };
     let host = strip_port(host_raw);
 
+    // 26 Task 2: snapshot the swappable route table ONCE at entry (§5.4
+    // read-once). `route_config` is an owned `Arc` clone that lives for the
+    // rest of this function, so the `vh`/`route` borrows below stay valid even
+    // if the RDS watcher swaps the table concurrently.
+    let route_config = config.current_route_config();
+
     // Walk virtual_hosts first-match-wins on Host.
-    let vh = match config
-        .route_config
+    let vh = match route_config
         .virtual_hosts
         .iter()
         .find(|vh| vh_matches(vh, host))
@@ -1692,7 +1781,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1715,7 +1804,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         })
     }
 
@@ -1841,7 +1930,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1864,7 +1953,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         });
         let req = b"GET / HTTP/1.1\r\nHost: foo.example.com:8080\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -1886,7 +1975,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1926,7 +2015,7 @@ static_resources:
                         },
                     ],
                 }],
-            }),
+            })),
         });
         let req = b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
         let resp = drive(config, req).await;
@@ -1960,7 +2049,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -1983,7 +2072,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         });
         // Host doesn't match any VH → 404.
         let req = b"GET / HTTP/1.1\r\nHost: other.example.com\r\nConnection: close\r\n\r\n";
@@ -2050,7 +2139,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "test_rc".into(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2059,7 +2148,7 @@ static_resources:
                     include_attempt_count_in_response: false,
                     routes,
                 }],
-            }),
+            })),
         })
     }
 
@@ -2393,7 +2482,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2410,7 +2499,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         })
     }
 
@@ -3418,7 +3507,7 @@ static_resources:
             access_log: sinks,
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -3441,7 +3530,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         })
     }
 
@@ -3616,7 +3705,7 @@ static_resources:
             access_log: sinks,
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -3639,7 +3728,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         });
         (config, registry)
     }
@@ -3897,7 +3986,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: pipeline,
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -3920,7 +4009,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         })
     }
 
@@ -4006,7 +4095,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: pipeline,
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -4015,7 +4104,7 @@ static_resources:
                     include_attempt_count_in_response: false,
                     routes: vec![matcher_route],
                 }],
-            }),
+            })),
         })
     }
 
@@ -4041,7 +4130,7 @@ static_resources:
             access_log: vec![sink],
             filter_pipeline: pipeline,
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "local_route".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -4064,7 +4153,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         })
     }
 
@@ -4354,7 +4443,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: Some(Arc::clone(&pool_mgr)),
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -4374,7 +4463,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         });
 
         // Re-register the shared cx_total handle for assertion.
@@ -4540,7 +4629,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: Some(Arc::clone(&pool_mgr)),
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -4560,7 +4649,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         });
 
         // Re-register the SHARED cx_active handle for assertion.
@@ -4663,7 +4752,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "rc".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -4683,7 +4772,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         })
     }
 
@@ -5431,7 +5520,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -5454,7 +5543,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         }
     }
 
@@ -5481,7 +5570,7 @@ static_resources:
         let req = make_req("/healthz", "localhost");
         let route = resolve_route(&config, &req).expect("route resolves");
         assert!(
-            matches!(route.action, RouteAction::DirectResponse(_)),
+            matches!(route.route().action, RouteAction::DirectResponse(_)),
             "expected DirectResponse action"
         );
     }
@@ -5509,7 +5598,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -5532,7 +5621,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         };
         let req = make_req("/other", "localhost");
         assert!(
@@ -5552,7 +5641,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: test_router_only_pipeline(),
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -5575,11 +5664,11 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         };
         let req = make_req("/foo", "myhost:8080");
         let route = resolve_route(&config, &req).expect("port-stripped host must match");
-        assert!(matches!(route.action, RouteAction::DirectResponse(_)));
+        assert!(matches!(route.route().action, RouteAction::DirectResponse(_)));
     }
 
     // ---------------------------------------------------------------------------
@@ -5653,6 +5742,80 @@ static_resources:
                 .typed_per_filter_config
                 .contains_key("envoy.filters.http.cors"),
             "clone_route_config must preserve the cors key in typed_per_filter_config"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Phase-26 Task 2: route-table handle (RwLock<Arc<RouteConfiguration>>)
+    // swap semantics — the §5.4 read-once guarantee.
+    // ---------------------------------------------------------------------------
+
+    /// Helper: a minimal single-vhost RouteConfiguration whose vhost name is
+    /// `name` (so a test can tell two route tables apart by identity).
+    fn named_route_config(name: &str) -> RouteConfiguration {
+        RouteConfiguration {
+            name: name.to_string(),
+            validate_clusters: None,
+            virtual_hosts: vec![VirtualHost {
+                name: name.to_string(),
+                domains: vec!["*".to_string()],
+                include_attempt_count_in_response: false,
+                routes: vec![Route {
+                    r#match: RouteMatch {
+                        prefix: Some("/".to_string()),
+                        path: None,
+                        headers: vec![],
+                    },
+                    action: RouteAction::DirectResponse(DirectResponse {
+                        status: 200,
+                        body: DataSource {
+                            filename: None,
+                            inline_string: Some("ok".to_string()),
+                        },
+                    }),
+                    typed_per_filter_config: Default::default(),
+                }],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn route_table_handle_swap_is_read_once() {
+        // Build an HCMConfig whose route table starts as "v1".
+        let config = build_test_config(vec![Route {
+            r#match: RouteMatch {
+                prefix: Some("/".to_string()),
+                path: None,
+                headers: vec![],
+            },
+            action: RouteAction::DirectResponse(DirectResponse {
+                status: 200,
+                body: DataSource {
+                    filename: None,
+                    inline_string: Some("ok".to_string()),
+                },
+            }),
+            typed_per_filter_config: Default::default(),
+        }])
+        .await;
+        // Seed a known v1 table via the writer so we control the name.
+        config.store_route_config(Arc::new(named_route_config("v1")));
+
+        // (a) A request reads the CURRENT Arc once at entry. Capture that snapshot.
+        let snapshot = config.current_route_config();
+        assert_eq!(snapshot.name, "v1", "reader must observe the current table");
+
+        // (b) A store(new_arc) is visible to the NEXT read.
+        config.store_route_config(Arc::new(named_route_config("v2")));
+        let next = config.current_route_config();
+        assert_eq!(next.name, "v2", "the next read must observe the stored table");
+
+        // (c) The in-flight reader keeps its snapshot — the §5.4 read-once
+        // guarantee. `snapshot` was an OWNED Arc clone taken before the store,
+        // so the swap does NOT mutate it out from under the in-flight reader.
+        assert_eq!(
+            snapshot.name, "v1",
+            "an in-flight reader's owned snapshot is unaffected by a later store (§5.4)"
         );
     }
 }

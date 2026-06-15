@@ -465,7 +465,11 @@ async fn handle_one_stream(
     // apply_route_config clones the policy into the Cors instance, so the borrow
     // of `config.inner` via `matched_route` ends before mem::take of `envoy_req`.
     let matched_route = envoy_http1::hcm::resolve_route(&config.inner, &envoy_req);
-    pipeline.apply_route_config(matched_route);
+    pipeline.apply_route_config(
+        matched_route
+            .as_ref()
+            .map(envoy_http1::hcm::ResolvedRoute::route),
+    );
     let mut filter_req = envoy_filter::FilterRequest {
         method: std::mem::take(&mut envoy_req.method),
         path: std::mem::take(&mut envoy_req.path),
@@ -1001,7 +1005,7 @@ mod tests {
     use envoy_http1::HCMConfig as Http1HCMConfig;
     use envoy_listener::ConnectionHandler;
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
 
     /// RAII handle that aborts the spawned listener task when dropped. Used
     /// by the per-test `_server` binding to stop per-test task leaks without
@@ -2427,7 +2431,7 @@ static_resources:
             access_log: vec![],
             filter_pipeline: pipeline,
             pool_mgr: None,
-            route_config: Arc::new(RouteConfiguration {
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
                 name: "r".to_string(),
                 validate_clusters: None,
                 virtual_hosts: vec![VirtualHost {
@@ -2453,7 +2457,7 @@ static_resources:
                         typed_per_filter_config: Default::default(),
                     }],
                 }],
-            }),
+            })),
         })
     }
 
@@ -3620,10 +3624,11 @@ static_resources:
         // The resolved route must carry the CORS per-filter config we seeded.
         assert!(
             route
+                .route()
                 .typed_per_filter_config
                 .contains_key("envoy.filters.http.cors"),
             "resolved route must carry the CORS per-filter config: {:?}",
-            route.typed_per_filter_config,
+            route.route().typed_per_filter_config,
         );
     }
 
