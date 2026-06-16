@@ -1128,6 +1128,9 @@ fn atomic_rename_over(target: &Path, new_content: &str) -> std::io::Result<()> {
     // subsequent `rename` is a same-fs atomic swap rather than a cross-device
     // copy). On success the temp is consumed by the rename; on the write path
     // failing before the rename we remove it so no `.reload-tmp` leftover remains.
+    // The fixed suffix is collision-safe under the current contract: each fixture
+    // runs in its own tempdir and reloads at most once per run (one `Http1RdsReload`
+    // step). A future multi-reload-per-fixture driver would need a per-reload nonce.
     let mut tmp = target.as_os_str().to_owned();
     tmp.push(".reload-tmp");
     let tmp = PathBuf::from(tmp);
@@ -1260,6 +1263,10 @@ async fn wait_for_reload_convergence(
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + budget;
     let poll = Duration::from_millis(25);
+    // Retain the most recent drive error so a budget-exhaustion failure can name
+    // the underlying cause (an opaque "did not converge" timeout on the CI-only
+    // path is far harder to diagnose than one carrying the last attempt's error).
+    let mut last_err: Option<String> = None;
     loop {
         // A drive error (connection reset mid-reload, etc.) is non-fatal while
         // the budget remains — treat it as "not converged yet" and retry.
@@ -1281,15 +1288,22 @@ async fn wait_for_reload_convergence(
                 };
                 status_ok && body_ok
             }
-            Err(_) => false,
+            Err(e) => {
+                last_err = Some(e.to_string());
+                false
+            }
         };
         if matched {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
+            let last = last_err
+                .as_deref()
+                .map(|e| format!("; last drive error: {e}"))
+                .unwrap_or_default();
             bail!(
                 "RDS reload did not converge on {addr} within {budget:?} \
-                 (discriminator probe {})",
+                 (discriminator probe {}){last}",
                 probe.name,
             );
         }
