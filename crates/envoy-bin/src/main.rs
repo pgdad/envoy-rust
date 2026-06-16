@@ -506,6 +506,16 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // infallible (the skeleton registers no counters and its `reload` is a
     // no-op stub; the real reparse+revalidate+store is Task 4, the `rds.*`
     // counter ticks are Task 5). Drained via `shutdown().await` below.
+    // 26 Task 6: capture the live, swappable route-table sources (keyed by
+    // `rds.route_config_name`) BEFORE `RdsWatcher::spawn` consumes `rds_targets`.
+    // These share the same `Arc<HCMConfig>` swap-owners the watcher holds, so
+    // `/config_dump`'s RoutesConfigDump renders the HOT-RELOADED table. Built
+    // here (not lazily) so the Vec outlives the move of `rds_targets`.
+    let live_route_configs: Vec<(String, std::sync::Arc<envoy_http1::HCMConfig>)> = rds_targets
+        .iter()
+        .map(|t| (t.route_config_name.clone(), std::sync::Arc::clone(&t.store)))
+        .collect();
+
     let rds_watcher = envoy_http1::RdsWatcher::spawn(rds_targets, token.clone());
 
     if let Some(admin_cfg) = bootstrap.admin.as_ref() {
@@ -526,6 +536,9 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
             start_instant,
             command_line_options.clone(),
             std::sync::Arc::clone(&drain),
+            // 26 Task 6: hand the live route-table sources to the admin handler
+            // so `/config_dump` reflects hot reloads (not the startup snapshot).
+            live_route_configs,
         ));
         let shutdown = token.clone();
         set.spawn(async move {

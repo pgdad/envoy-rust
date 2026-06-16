@@ -74,6 +74,14 @@ pub struct AdminHandler {
     /// (reader/observer per D12). Held as `Arc<DrainState>` so the handler
     /// can stay `Send + Sync`.
     drain: Arc<DrainState>,
+    /// 26 Task 6: the live, swappable route-table sources for the rds-configured
+    /// HCMs, keyed by `rds.route_config_name`. `/config_dump`'s RoutesConfigDump
+    /// renders through `HCMConfig::current_route_config()` so it reflects the
+    /// HOT-RELOADED table, not the startup bootstrap snapshot. envoy-bin builds
+    /// this from the same `Arc<HCMConfig>` swap-owners the RdsWatcher holds, so
+    /// they share the one `RwLock<Arc<RouteConfiguration>>` cell a reload swaps.
+    /// Empty for non-rds processes (the fallback path renders the bootstrap copy).
+    live_route_configs: Vec<(String, Arc<envoy_http1::HCMConfig>)>,
 }
 
 impl AdminHandler {
@@ -86,7 +94,13 @@ impl AdminHandler {
     /// #7 refines that to 6-arg by capturing `command_line_options` at
     /// construction time. 08.2 PLAN architecture-decision lock-in #13 binds
     /// the 7th parameter as the trailing `Arc<DrainState>` (additive — every
-    /// existing call site updates by appending one arg, no reordering).
+    /// existing call site updates by appending one arg, no reordering). 26 Task
+    /// 6 widens further to 8-arg by appending `live_route_configs` so
+    /// `/config_dump` renders the hot-reloaded route table (additive, same
+    /// pattern). The handle-aggregating constructor legitimately exceeds clippy's
+    /// 7-arg threshold; the alternative (a params struct) would obscure the
+    /// documented widening lineage.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<AdminConfig>,
         registry: Arc<StatsRegistry>,
@@ -95,6 +109,9 @@ impl AdminHandler {
         start_instant: Instant,
         command_line_options: BTreeMap<String, serde_yaml::Value>,
         drain: Arc<DrainState>,
+        // 26 Task 6: appended trailing param (additive widening per the
+        // documented call-site pattern — no reordering of existing args).
+        live_route_configs: Vec<(String, Arc<envoy_http1::HCMConfig>)>,
     ) -> Self {
         Self {
             config,
@@ -104,6 +121,7 @@ impl AdminHandler {
             start_instant,
             command_line_options,
             drain,
+            live_route_configs,
         }
     }
 
@@ -158,6 +176,14 @@ impl AdminHandler {
     /// borrowed `&DrainState`).
     pub(crate) fn drain(&self) -> &Arc<DrainState> {
         &self.drain
+    }
+
+    /// 26 Task 6 accessor: the live, swappable route-table sources keyed by
+    /// `rds.route_config_name`. Consumed by `render_config_dump` to render the
+    /// RoutesConfigDump through `HCMConfig::current_route_config()` (the
+    /// hot-reloaded table) rather than the startup bootstrap snapshot.
+    pub(crate) fn live_route_configs(&self) -> &[(String, Arc<envoy_http1::HCMConfig>)] {
+        &self.live_route_configs
     }
 
     /// Read at most `MAX_REQUEST_HEAD` bytes until CRLF-CRLF; parse via
@@ -335,6 +361,10 @@ impl ConnectionHandler for AdminHandler {
             // process-wide DrainState (writes from one connection are
             // immediately visible to subsequent reads from any connection).
             drain: Arc::clone(&self.drain),
+            // 26 Task 6: extend the per-connection handle-clone to the live
+            // route-table sources (cheap — String + Arc bump per entry) so each
+            // spawned task's `/config_dump` reads the same swappable cells.
+            live_route_configs: self.live_route_configs.clone(),
         });
         Box::pin(Self::handle_inner(cloned, downstream))
     }
@@ -475,6 +505,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::new(envoy_listener::DrainState::new(&registry)),
+            Vec::new(),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -510,6 +541,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::new(envoy_listener::DrainState::new(&registry)),
+            Vec::new(),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -541,6 +573,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::new(envoy_listener::DrainState::new(&registry)),
+            Vec::new(),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -571,6 +604,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::new(envoy_listener::DrainState::new(&registry)),
+            Vec::new(),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -602,6 +636,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::new(envoy_listener::DrainState::new(&registry)),
+            Vec::new(),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -640,6 +675,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::new(envoy_listener::DrainState::new(&registry)),
+            Vec::new(),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(serve(lst, handler, async move {
@@ -697,6 +733,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::clone(&drain),
+            Vec::new(),
         );
         // Verify the new accessor returns the same Arc (pointer equality).
         assert!(Arc::ptr_eq(handler.drain(), &drain));
@@ -722,6 +759,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::clone(&drain),
+            Vec::new(),
         );
         assert_eq!(drain.current(), envoy_listener::DrainStage::Live);
         let resp = crate::endpoint::AdminEndpoint::DrainListeners.render_with(&handler);
@@ -742,6 +780,7 @@ mod tests {
             Instant::now(),
             BTreeMap::new(),
             Arc::new(envoy_listener::DrainState::new(&registry)),
+            Vec::new(),
         ));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
@@ -981,6 +1020,7 @@ mod admin_handler_new_6arg_tests {
             start_instant,
             command_line_options,
             drain,
+            Vec::new(),
         );
 
         // Sanity: the existing `config()` accessor still works post-widening.

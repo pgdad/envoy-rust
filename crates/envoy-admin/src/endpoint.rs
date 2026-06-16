@@ -665,21 +665,62 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
     // uses rds. Pushed after the (conditional) Listeners entry — on fixture 0028
     // (cds yes, lds no) it lands at configs[2]; the per-side index mismatch vs
     // Envoy's configs[4] is reconciled in the harness.
-    let dynamic_route_configs: Vec<DynamicRouteConfigEntry> = bootstrap
+    // 26 Task 6: render the RoutesConfigDump through the LIVE, swappable route
+    // table (read via `HCMConfig::current_route_config()`) so the dump reflects
+    // the HOT-RELOADED table after an RDS reload, not the frozen startup
+    // bootstrap snapshot. For each rds HCM we look up its live handle by
+    // `rds.route_config_name`; if found we render that live `Arc` snapshot, else
+    // we fall back to the bootstrap `route_config` borrow (the empty-handle path
+    // used by tests and non-rds-watch processes — a defensive no-op in
+    // production where every rds HCM always has a handle).
+    //
+    // Because the entries borrow `&RouteConfiguration`, we first materialize an
+    // OWNED Vec of snapshots (`RouteSnapshot`) that lives until serialization,
+    // then build the borrowing entries from it. The live arm owns an `Arc`; the
+    // fallback arm borrows from `bootstrap` (which outlives this whole fn) —
+    // `RouteConfiguration` is not `Clone`, so a borrow is the only fallback.
+    enum RouteSnapshot<'a> {
+        Live(std::sync::Arc<envoy_config::RouteConfiguration>),
+        Bootstrap(&'a envoy_config::RouteConfiguration),
+    }
+    impl RouteSnapshot<'_> {
+        fn as_ref(&self) -> &envoy_config::RouteConfiguration {
+            match self {
+                RouteSnapshot::Live(arc) => arc.as_ref(),
+                RouteSnapshot::Bootstrap(rc) => rc,
+            }
+        }
+    }
+    let route_snapshots: Vec<RouteSnapshot<'_>> = bootstrap
         .all_listeners()
         .flat_map(|l| l.filter_chains.iter())
         .flat_map(|c| c.filters.iter())
         .filter_map(|f| match f.typed_config.as_ref() {
             Some(envoy_config::TypedConfig::HttpConnectionManager(hcm)) if hcm.rds.is_some() => {
-                hcm.route_config.as_ref().map(|rc| DynamicRouteConfigEntry {
-                    route_config: TaggedRouteConfig {
-                        type_url: ROUTE_CONFIG_TYPE_URL,
-                        route_config: rc,
-                    },
-                    last_updated: last_updated.clone(),
-                })
+                let name = &hcm.rds.as_ref().unwrap().route_config_name;
+                if let Some((_, handle)) = handler
+                    .live_route_configs()
+                    .iter()
+                    .find(|(n, _)| n == name)
+                {
+                    // Live: read-once the swappable table (the reloaded one).
+                    Some(RouteSnapshot::Live(handle.current_route_config()))
+                } else {
+                    // Fallback: the bootstrap snapshot borrow.
+                    hcm.route_config.as_ref().map(RouteSnapshot::Bootstrap)
+                }
             }
             _ => None,
+        })
+        .collect();
+    let dynamic_route_configs: Vec<DynamicRouteConfigEntry> = route_snapshots
+        .iter()
+        .map(|snap| DynamicRouteConfigEntry {
+            route_config: TaggedRouteConfig {
+                type_url: ROUTE_CONFIG_TYPE_URL,
+                route_config: snap.as_ref(),
+            },
+            last_updated: last_updated.clone(),
         })
         .collect();
     if !dynamic_route_configs.is_empty() {
@@ -1109,6 +1150,7 @@ mod config_dump_tests {
             Instant::now(),
             BTreeMap::new(),
             drain,
+            Vec::new(),
         )
     }
 
@@ -1291,6 +1333,7 @@ static_resources:
             Instant::now(),
             BTreeMap::new(),
             drain,
+            Vec::new(),
         )
     }
 
@@ -1570,6 +1613,7 @@ load_assignment:
             Instant::now(),
             BTreeMap::new(),
             drain,
+            Vec::new(),
         )
     }
 
@@ -1817,6 +1861,7 @@ mod routes_config_dump_tests {
             Instant::now(),
             BTreeMap::new(),
             drain,
+            Vec::new(),
         )
     }
 
@@ -2099,6 +2144,179 @@ static_resources:
             configs[3].get("@type").and_then(|v| v.as_str()),
             Some(ROUTES_TYPE),
             "configs[3] must be Routes (after Listeners)"
+        );
+    }
+
+    // 26 Task 6: a `RouteConfiguration` with a recognizable vhost name/domain
+    // marker so initial-vs-reloaded tables are distinguishable in the dump.
+    fn marker_route_config(route_name: &str, marker: &str) -> RouteConfiguration {
+        RouteConfiguration {
+            name: route_name.to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: marker.to_string(),
+                domains: vec![format!("{marker}.example")],
+                // Empty routes ⇒ NO cluster references ⇒ validation passes
+                // against the empty ClusterManager in HCMConfig::from_config.
+                routes: vec![],
+                include_attempt_count_in_response: false,
+            }],
+            validate_clusters: None,
+        }
+    }
+
+    // 26 Task 6: build a Listener whose single rds HCM carries the given initial
+    // route_config (the bootstrap snapshot), so the renderer's bootstrap walk
+    // finds the rds HCM and looks up the live handle by route_config_name.
+    fn rds_listener_with_route(route_name: &str, route_config: RouteConfiguration) -> Listener {
+        let hcm = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: CodecType::AUTO,
+            http2_protocol_options: None,
+            route_config: Some(route_config),
+            rds: Some(Rds {
+                route_config_name: route_name.to_string(),
+                config_source: envoy_config::ConfigSource {
+                    path_config_source: envoy_config::PathConfigSource {
+                        path: "/etc/rds.yaml".to_string(),
+                    },
+                    resource_api_version: None,
+                },
+            }),
+            http_filters: vec![],
+            access_log: vec![],
+        };
+        Listener {
+            name: "rds_listener".to_string(),
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "0.0.0.0".to_string(),
+                    port_value: 10000,
+                },
+            },
+            filter_chains: vec![FilterChain {
+                filters: vec![NetworkFilter {
+                    name: "envoy.filters.network.http_connection_manager".to_string(),
+                    typed_config: Some(TypedConfig::HttpConnectionManager(hcm)),
+                }],
+                filter_chain_match: None,
+                transport_socket: None,
+            }],
+            listener_filters: vec![],
+        }
+    }
+
+    // 26 Task 6 (TDD core): `/config_dump`'s RoutesConfigDump must render the
+    // LIVE, hot-reloaded route table read through the swappable
+    // `HCMConfig::current_route_config()` handle — NOT the startup bootstrap
+    // snapshot. After an RDS reload calls `store_route_config`, a subsequent
+    // `/config_dump` must reflect the NEW table. (Before this task the renderer
+    // read the bootstrap copy, so the post-swap assertion FAILED.)
+    #[tokio::test]
+    async fn config_dump_reflects_hot_reloaded_route_table() {
+        // 1. Build the rds HCM config with an INITIAL distinguishing table.
+        let initial = marker_route_config("local_route", "vh_initial");
+        let hcm_cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: CodecType::AUTO,
+            http2_protocol_options: None,
+            route_config: Some(marker_route_config("local_route", "vh_initial")),
+            rds: Some(Rds {
+                route_config_name: "local_route".to_string(),
+                config_source: envoy_config::ConfigSource {
+                    path_config_source: envoy_config::PathConfigSource {
+                        path: "/etc/rds.yaml".to_string(),
+                    },
+                    resource_api_version: None,
+                },
+            }),
+            // A terminal Router filter is required for a valid HCM chain.
+            http_filters: vec![envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            }],
+            access_log: vec![],
+        };
+
+        // 2. Construct the live, swappable HCMConfig (validation against an
+        //    empty ClusterManager passes because the table has empty routes).
+        let registry = Arc::new(StatsRegistry::new());
+        let hcm_config: Arc<envoy_http1::HCMConfig> = Arc::new(
+            envoy_http1::HCMConfig::from_config(
+                &hcm_cfg,
+                Arc::new(ClusterManager::empty()),
+                registry,
+                None,
+            )
+            .await
+            .expect("HCMConfig::from_config"),
+        );
+
+        // 3. Build a Bootstrap whose listener carries the SAME rds HCM (so the
+        //    renderer's bootstrap walk finds it) and an AdminHandler wired with
+        //    the live route-table source keyed by route_config_name.
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
+        bootstrap.static_resources.listeners =
+            vec![rds_listener_with_route("local_route", initial)];
+
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let handler_registry = Arc::new(StatsRegistry::new());
+        let drain = Arc::new(envoy_listener::DrainState::new(&handler_registry));
+        let handler = AdminHandler::new(
+            cfg,
+            handler_registry,
+            Arc::new(bootstrap),
+            Arc::new(ClusterManager::empty()),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+            vec![("local_route".to_string(), Arc::clone(&hcm_config))],
+        );
+
+        // 4. Render — must reflect the INITIAL table (marker `vh_initial`).
+        let value = dump_value(&handler);
+        let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
+        let entry = configs
+            .iter()
+            .find(|e| e.get("@type").and_then(|v| v.as_str()) == Some(ROUTES_TYPE))
+            .expect("RoutesConfigDump entry present");
+        assert_eq!(
+            entry
+                .pointer("/dynamic_route_configs/0/route_config/virtual_hosts/0/name")
+                .and_then(|v| v.as_str()),
+            Some("vh_initial"),
+            "initial render must reflect the live handle's initial table; entry was {entry}"
+        );
+
+        // 5. Swap the live table (simulates an RDS reload).
+        hcm_config.store_route_config(Arc::new(marker_route_config("local_route", "vh_reloaded")));
+
+        // 6. Render AGAIN — must reflect the RELOADED table (marker
+        //    `vh_reloaded`). This is the assertion that FAILS before this task
+        //    (the renderer read the frozen bootstrap copy) and PASSES after.
+        let value2 = dump_value(&handler);
+        let configs2 = value2.get("configs").and_then(|c| c.as_array()).unwrap();
+        let entry2 = configs2
+            .iter()
+            .find(|e| e.get("@type").and_then(|v| v.as_str()) == Some(ROUTES_TYPE))
+            .expect("RoutesConfigDump entry present after reload");
+        assert_eq!(
+            entry2
+                .pointer("/dynamic_route_configs/0/route_config/virtual_hosts/0/name")
+                .and_then(|v| v.as_str()),
+            Some("vh_reloaded"),
+            "post-reload render must reflect the HOT-RELOADED table, not the \
+             bootstrap snapshot; entry was {entry2}"
         );
     }
 }
@@ -2426,6 +2644,7 @@ filter_chains:
             Instant::now(),
             BTreeMap::new(),
             drain,
+            Vec::new(),
         );
 
         let resp = AdminEndpoint::Listeners.render_with(&handler);
@@ -2701,6 +2920,7 @@ mod ready_drain_tests {
             Instant::now(),
             BTreeMap::new(),
             drain,
+            Vec::new(),
         )
     }
 
@@ -2906,6 +3126,7 @@ static_resources:
             Instant::now(),
             BTreeMap::new(),
             drain,
+            Vec::new(),
         )
     }
 
