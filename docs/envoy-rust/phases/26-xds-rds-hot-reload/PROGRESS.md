@@ -401,9 +401,65 @@ action; reviewer agreed it is correct.)
 `-p envoy-config -p envoy-http1 -p envoy-http2 -p envoy-admin -p envoy-bin` green. No `unsafe`. (The Docker
 differential + the `0034` reload are the state-4 / native-Linux-CI gate, not run per-task.)
 
-## Task 7 — harness mid-test file-rewrite + settle-then-probe [BLOCKED on Task 1]
+## Task 7 — harness mid-test file-rewrite (ATOMIC-RENAME) + bounded wait-for-convergence [§6.2-LOCKED P1/P2]
 
-_(pending)_
+**Done (state-3, Linux).** Added the differential-harness "reload step": a `Driver::Http1RdsReload`
+variant that runs pre-reload probes (bilateral), atomic-renames the post-reload RDS YAML over the
+watched path on BOTH proxy sides, waits — bounded, on a discriminating observable, NOT a fixed sleep —
+for both proxies to converge on the new table, then runs post-reload probes (bilateral). TDD'd on the
+locally-testable mechanics (3 harness-unit tests first → FAIL → implement → PASS), clippy-clean,
+two-stage reviewed (spec ✅ + quality ✅ Approve, two Minor hardening fixes folded in). **Commits:**
+`585e844` `feat(differential): add Http1RdsReload driver — atomic-rename reload step + bounded
+wait-for-convergence [phase 26 Task 7]` + `bb41eb8` `fix(differential): surface last drive error on
+reload-convergence timeout + document single-reload temp-name assumption [phase 26 Task 7]`.
+
+**§6.2-LOCKED (P2 / ADR-0066) — atomic-rename is mandatory on BOTH sides.** Envoy's default file-watch
+ignores in-place truncate-rewrite and reloads ONLY on atomic-rename (verified at Task 1). So:
+- **Subject side (envoy-rust):** `atomic_rename_over(target, new_content)` — write a SAME-DIR sibling
+  `<target>.reload-tmp` then `std::fs::rename` (same-fs atomic swap, never a cross-device copy). The
+  RDS file is the host temp `subject_rds_path` (`{tmpdir}/rds-subject.yaml`).
+- **Upstream side (Envoy container):** `UpstreamProxy::reload_rds_atomic(new_content)` — base64-encode
+  on the host, then `docker exec sh -c "set -e; printf %s '<b64>' | base64 -d > <path>.reload-tmp;
+  mv -f <tmp> <RDS_CONTAINER_PATH>"`. The rewrite MUST happen INSIDE the container (virtiofs bind-mount
+  inotify does not propagate — the §5.7 finding), and `mv -f` on a sibling of the watched file is the
+  same-fs atomic swap. `set -e` aborts before the `mv` if `base64 -d` fails, so a decode failure leaves
+  the live file untouched (no partial/garbage atomic install); errors on non-zero exit code.
+
+**What landed (4 files — `tests/differential/src/lib.rs` +413 / `upstream.rs` +40 / `Cargo.toml` +base64 / `Cargo.lock`).**
+- **Schema:** `Driver::Http1RdsReload { pre_probes: Vec<Http1Probe>, reload: RdsReloadStep, post_probes:
+  Vec<Http1Probe> }` (matched the enum's `#[serde(tag="kind", rename_all="snake_case", deny_unknown_fields)]`
+  discipline) + `RdsReloadStep { reload_file [default `rds-reload.yaml`], settle_budget_ms, discriminator:
+  Http1Probe }`. The `Http1Probe` type is reused verbatim for probes + the discriminator.
+- **`wait_for_reload_convergence(addr, probe, budget)`:** drives the discriminator probe at a 25 ms poll
+  until its `expected_status` (+ optional `expected_body`) match, bounded by `budget` (= `settle_budget_ms`);
+  a drive error mid-reload is "not converged yet" (retry), and the LAST drive error is folded into the
+  budget-exhaustion `bail!` (review Minor #1 — diagnosability on the CI-only path). This is the 12.2
+  wait-for-convergence pattern on a routed-to observable, NOT a fixed sleep.
+- **`run_http1_probe_bilateral(...)`:** extracted the per-probe bilateral status/body/header equivalence
+  cascade from the existing `Http1ProbeList` arm (which was LEFT UNCHANGED — no behavior change to any
+  unrelated arm) so the new arm reuses it for pre+post probes with a `pre`/`post` label.
+- **Dispatch arm** in `run_fixture`: pre_probes (bilateral) → read `fixture_dir/<reload_file>` + render
+  per-side (`upstream_kvs_refs`/`subject_kvs_refs`, residual-marker guards) → `atomic_rename_over` subject
+  + `upstream.reload_rds_atomic` container → `wait_for_reload_convergence` on BOTH `upstream_addr` and
+  `subject_addr` → post_probes (bilateral) → teardown. Bails if the fixture is not file-based-RDS
+  (`upstream_rds_path.is_none()`). On an error-path `?` the subject (Drop → SIGKILL) and the container
+  (testcontainers Drop) are reclaimed by RAII — no leak, same graceful-shutdown-skip as the existing arm.
+  Also added the variant to the `port_key` `"PORT"` arm.
+- **Dep:** `base64 = "0.22"` added to `tests/differential/Cargo.toml` (already in the workspace lock).
+
+**Verification.** 3 new harness-unit tests (TDD, all LOCAL / no docker): `driver_http1_rds_reload_round_trips_through_serde`
+(serde round-trip exercising the `reload_file` default), `atomic_rename_over_swaps_content_and_leaves_no_temp`
+(content swapped + exactly one dir entry = no leftover temp), `rds_reload_template_renders_per_side` (per-side
+render distinctness). `cargo test -p differential --lib` **140 passed / 2 ignored**; `cargo clippy -p differential
+--all-targets --all-features -- -D warnings` clean; `cargo build -p differential --all-targets` green. No `unsafe`.
+
+**The docker-only path is NOT exercised locally — by design.** `reload_rds_atomic` + the dispatch arm's
+reload/convergence sequence COMPILE but require docker AND a native-Linux runner (under Docker Desktop
+virtiofs the upstream reload is unobservable — §5.7 / ADR-0066). They run on **native-Linux CI** via Task 8's
+fixture `0034`; locally the host-side half of every mechanism (atomic-rename, per-side render, schema) IS
+unit-tested and the container-side half is a thin, documented mirror. Code-quality review confirmed the
+shell-script robustness (base64 alphabet has no shell metacharacters, the path is a constant, no arg-length
+risk for KB-scale RDS, `set -e` prevents partial installs) — the review IS the safety net for the CI-only path.
 
 ## Task 8 — fixture `0034-xds-rds-hot-reload` + Docker wrapper (Linux-CI-authoritative) + in-process backstop [BLOCKED on Task 1]
 
