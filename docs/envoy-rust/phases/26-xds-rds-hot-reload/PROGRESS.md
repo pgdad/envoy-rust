@@ -342,9 +342,64 @@ NOT a private copy. The base name is the shared `envoy_listener::rds_counter_bas
 separate commit — folded into `355e2b3` + `8439261` because the reload pipeline (Task 4) cannot tick
 counters without the handles.
 
-## Task 6 — `/config_dump` `RoutesConfigDump` through the swappable handle + version update [BLOCKED on Task 1]
+## Task 6 — `/config_dump` `RoutesConfigDump` through the swappable handle [§6.2-LOCKED P6] — NARROWED to read-through-handle
 
-_(pending)_
+**Done (state-3, Linux).** `GET /config_dump`'s `RoutesConfigDump` now renders the **live,
+hot-reloaded** route table — read through the runtime swappable handle
+(`HCMConfig::current_route_config()`) — instead of the frozen startup bootstrap snapshot, so a
+`/config_dump` AFTER an RDS reload reflects the NEW table. TDD'd (test first → FAIL → implement →
+PASS), clippy-clean, two-stage reviewed (spec ✅ + quality ✅ Approve, two Minor hardening fixes
+folded in). **Commits:** `13d035c` `feat(admin): render /config_dump RoutesConfigDump through live
+swappable route handle [phase 26 Task 6]` (code) + `4b647fc` `fix(admin): warn-on-miss + uniqueness
+comment …` (the code-quality review fixes).
+
+**§6.2-LOCKED narrowing (P6 / ADR-0066).** Task 6 shrank to ONE thing — read-through-handle —
+because §6.2 confirmed: NO `version_info` for file-RDS (already absent in the phase-20
+`RoutesConfigDump` shape, added NOTHING), and `last_updated` is already render-time `now()` (already
+changes per dump). So NO version field and NO timestamp plumbing this task.
+
+**What landed (3 files; renderer is a pure reader — request/data path untouched).**
+- **`envoy-admin` (`handler.rs`):** new `AdminHandler.live_route_configs: Vec<(String, Arc<envoy_http1::HCMConfig>)>`
+  (the live swappable route-table sources, keyed by `rds.route_config_name`) + the `pub(crate)
+  live_route_configs()` accessor. `AdminHandler::new` widened 7-arg → **8-arg by APPENDING** the
+  trailing param (the documented additive-widening lineage — no reorder; every prior phase relied on
+  it). The per-connection `ConnectionHandler` struct-literal clone populates the new field
+  (`live_route_configs: self.live_route_configs.clone()`) so cloned handlers also reflect reloads.
+  One `#[allow(clippy::too_many_arguments)]` (8 args; a params struct would obscure the widening
+  lineage — reviewer concurred this is the right call, not a struct).
+- **`envoy-admin` (`endpoint.rs`):** `render_config_dump` materializes an OWNED `Vec<RouteSnapshot>`
+  (a local enum `Live(Arc<RouteConfiguration>)` / `Bootstrap(&RouteConfiguration)`) that **outlives
+  serialization**, then builds the borrowing `DynamicRouteConfigEntry` list from it. Per rds HCM: look
+  up the live handle by `rds.route_config_name` → render `current_route_config()` (read-once Arc snapshot);
+  **fallback** to the bootstrap `route_config` borrow when no handle exists. **Key finding: `envoy_config::RouteConfiguration`
+  is NOT `Clone`** (only `Debug/Serialize/Deserialize/PartialEq` + the private `clone_route_config`
+  hand-clone), so the fallback BORROWS from `bootstrap` (which outlives the fn) rather than deep-cloning
+  into an `Arc` — the `RouteSnapshot` enum is what reconciles the owned-live vs borrowed-fallback arms
+  under one `&RouteConfiguration` serialize surface. Emission stays rds-conditional; ordering, `last_updated`,
+  and the absent `version_info` unchanged; 0026/0027 untouched.
+- **`envoy-bin` (`main.rs`):** build `live_route_configs` from `rds_targets` (clone `route_config_name`
+  + `Arc::clone(&store)`) **BEFORE** `RdsWatcher::spawn(rds_targets, …)` consumes them — the SAME
+  `Arc<HCMConfig>` swap-owners the watcher holds, so the admin reader and the watcher writer share the
+  one `RwLock<Arc<RouteConfiguration>>` cell. Passed as the new trailing `AdminHandler::new` arg.
+
+**Code-quality review fixes folded in (Minor #1 + #2, `4b647fc`).** (1) **Observability:** a live-handle
+lookup miss against a NON-empty handle set means the wiring drifted (e.g. a `route_config_name` mismatch
+between envoy-bin and the renderer) and the dump would SILENTLY fall back to the stale startup table —
+the exact failure this task removes. Now emits a `tracing::warn!` on that path (an EMPTY handle set stays
+the legitimate tests / non-rds path → no warn). (2) Documented the first-wins-by-`route_config_name`
+uniqueness assumption on the linear `find`. (Minor #3 — the `#[allow(too_many_arguments)]` — needed no
+action; reviewer agreed it is correct.)
+
+**Verification.** New TDD test `routes_config_dump_tests::config_dump_reflects_hot_reloaded_route_table`
+(`#[tokio::test]`): builds a real `HCMConfig::from_config` with an initial table (marker vhost
+`vh_initial`), wires it via `live_route_configs`, asserts the dump shows `vh_initial`, then
+`store_route_config(Arc::new(…vh_reloaded…))` swaps it and asserts the next dump reflects `vh_reloaded`
+(JSON pointer `/dynamic_route_configs/0/route_config/virtual_hosts/0/name`) — observed FAIL pre-change
+(read the bootstrap copy: `vh_initial` vs `vh_reloaded`), PASS post-change. `cargo test -p envoy-admin`
+**96** / `-p envoy-http1` **120** / `-p envoy-bin` **8** (the widened call sites compile+pass); `cargo clippy
+--workspace --all-targets --all-features -- -D warnings` clean; isolated builds
+`-p envoy-config -p envoy-http1 -p envoy-http2 -p envoy-admin -p envoy-bin` green. No `unsafe`. (The Docker
+differential + the `0034` reload are the state-4 / native-Linux-CI gate, not run per-task.)
 
 ## Task 7 — harness mid-test file-rewrite + settle-then-probe [BLOCKED on Task 1]
 
