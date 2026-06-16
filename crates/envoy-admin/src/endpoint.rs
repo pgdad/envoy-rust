@@ -698,6 +698,9 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
         .filter_map(|f| match f.typed_config.as_ref() {
             Some(envoy_config::TypedConfig::HttpConnectionManager(hcm)) if hcm.rds.is_some() => {
                 let name = &hcm.rds.as_ref().unwrap().route_config_name;
+                // First-wins by `route_config_name`: each rds HCM maps to exactly
+                // one live handle, and `route_config_name` is unique across a valid
+                // bootstrap, so the linear `find` over the tiny Vec is unambiguous.
                 if let Some((_, handle)) = handler
                     .live_route_configs()
                     .iter()
@@ -706,7 +709,20 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
                     // Live: read-once the swappable table (the reloaded one).
                     Some(RouteSnapshot::Live(handle.current_route_config()))
                 } else {
-                    // Fallback: the bootstrap snapshot borrow.
+                    // Fallback: the bootstrap snapshot borrow. In production every
+                    // rds HCM has a live handle, so a miss against a NON-empty
+                    // handle set means the wiring drifted (e.g. a name mismatch
+                    // between envoy-bin and here) and the dump would silently show
+                    // the STALE startup table — the exact failure this task removes.
+                    // Surface it rather than fall back silently. (An empty handle
+                    // set is the legitimate tests / non-rds-watch path — no warn.)
+                    if !handler.live_route_configs().is_empty() {
+                        tracing::warn!(
+                            route_config_name = %name,
+                            "no live RDS route-table handle for an rds HCM; /config_dump \
+                             falling back to the startup bootstrap snapshot (table may be stale)"
+                        );
+                    }
                     hcm.route_config.as_ref().map(RouteSnapshot::Bootstrap)
                 }
             }
