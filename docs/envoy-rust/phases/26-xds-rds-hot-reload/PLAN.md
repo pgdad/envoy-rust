@@ -118,7 +118,7 @@ Projected surface (SPEC §6.1): D1 ~120 (+120 tests) · D2 ~150 (+100) · D3 ~14
 - [ ] **Step 4: Run + clippy.** PASS; warm-reject paths assert the table is byte-unchanged after a bad reload.
 - [ ] **Step 5: Commit** + PROGRESS commit.
 
-### Task 5: Per-HCM `rds.*` counters tick per reload (thread the phase-20 stat handles to the watcher target) — §6.2-INDEPENDENT wiring (values from Task 1)
+### Task 5: Per-HCM `rds.*` counters tick per reload (thread the phase-20 stat handles to the watcher target) — ✅ FOLDED INTO Task 4 (the reload pipeline cannot tick counters without the handles)
 
 **Files:** `crates/envoy-http1/src/hcm.rs` (expose the phase-20-registered `rds.*` `Arc<Counter>` handles); `crates/envoy-bin/src/main.rs` (pass them into the Task-3 target build); `rds_watcher.rs` (consume).
 

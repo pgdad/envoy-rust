@@ -270,13 +270,77 @@ logic did NOT creep in — that stays Task 4 in envoy-config-dependent territory
   every group that the loader allowed to start). All per-crate gates that completed before the
   stall onset (rds_watcher 3/3, envoy-http1 116/116, isolated builds, clippy) were clean.
 
-## Task 4 — reload pipeline (re-parse → re-validate → atomic swap; warm-reject) [BLOCKED on Task 1]
+## Task 4 — reload pipeline (re-parse → re-validate → atomic swap; warm-reject) [§6.2-LOCKED] — Task 5 FOLDED IN
 
-_(pending)_
+**Done (state-3, Linux).** Implemented the real RDS reload pipeline replacing the Task-3 no-op
+stub, TDD'd (tests first → FAIL → implement → PASS), clippy-clean, two-stage reviewed
+(spec-compliance ✅ + code-quality ✅ after one fix round). **Commits:** `355e2b3`
+`feat(http): implement RDS reload pipeline …` (code) + `8439261`
+`fix(http): review fixes for RDS reload pipeline …` (the code-quality-review fixes). **Task 5
+(thread the phase-20 `rds.*` stat handles into the watcher target) was FOLDED IN here** — the
+reload cannot tick counters without the handles, so doing both together is the only coherent
+intermediate state.
 
-## Task 5 — per-HCM `rds.*` counters tick per reload (thread phase-20 handles)
+**What landed.**
+- **`envoy-config` (`rds.rs`):** new `pub fn reparse_and_select_route_config(path, route_config_name,
+  known_cluster: &dyn Fn(&str) -> bool) -> Result<RouteConfiguration, ConfigError>` — read (IO err →
+  `RdsFileError`) → `parse_rds_file` (parse err → `RdsParseError`) → select by name (absent →
+  `RdsRouteConfigNotFound`) → re-validate route→cluster refs via the predicate (unknown → `UnknownCluster`).
+  **Design (cycle-avoidance, accepted at review):** the cluster check is a `&dyn Fn(&str)->bool`
+  predicate, NOT `&ClusterManager` — `envoy-cluster` depends on `envoy-config`, so passing the manager
+  would form a dependency cycle; the watcher passes `|n| cluster_mgr.get(n).is_some()`. 6 unit tests
+  (happy / IO / parse / name-not-found / unknown-cluster / direct-response-needs-no-cluster).
+- **`envoy-http1` (`rds_watcher.rs`):** the real `reload` — reparse/revalidate **OUTSIDE the write lock**
+  (carry-forward (a)), then on `Ok` a single `store.store_route_config(Arc::new(rc))` + tick
+  `update_attempt`+`update_success`+`config_reload`; on `Err` KEEP the table + tick `update_attempt` +
+  the failure/rejected counter per the §6.2-LOCKED taxonomy {IO/parse → `update_failure`;
+  name-absent / unknown-cluster → `update_rejected`}. New `RdsCounters` struct (5 `Arc<Counter>`) on
+  `WatchTarget`. The error classifier uses explicit arms + an `unreachable!()` final arm (no silent
+  wildcard — review fix M2). 4 reload tests assert the swap (`2/2/0/0/2`) + `Arc::ptr_eq` byte-unchanged
+  last-good after each bad-reload class.
+- **`envoy-bin` (`main.rs`) + `envoy-listener` (`lib.rs`):** the target-walk re-resolves the 5 `rds.*`
+  counter handles from the `StatsRegistry` by name (idempotent register-by-name ⇒ the SAME handles
+  `register_rds_stats` created at initial load, continuing the `1/1/0/0/1` series → scrape-visible).
+  A shared `pub fn envoy_listener::rds_counter_base(stat_prefix, route_config_name) -> String` is the
+  single source of truth for the base name, routed through all three call sites (`register_rds_stats`
+  + the target-walk + the tests) so the names cannot drift (review fix M1).
+- **Carry-forwards folded in:** **(a)** the `store_route_config` poison-recovery-safety comment +
+  reparse-outside-the-lock discipline; **(b)** the stale `resolve_route` "we yield BOTH …" comment
+  tidied to reflect the single owned `ResolvedRoute`.
 
-_(pending)_
+**THE RECORDED DIVERGENCE (ADR-0066 P5(iii)).** An unknown-cluster reload is **warm-rejected**
+(`update_rejected` + keep last-good), NOT applied — deliberately diverging from real Envoy
+(which accepts + serves 503/`no_cluster`) because the H1/H2 request path resolves the route's
+cluster via `cluster_mgr.get(name).expect(…)` (`hcm.rs:818`); installing an unknown-cluster route
+would PANIC the proxy. Test `reload_unknown_cluster_keeps_last_good_and_ticks_rejected`.
+
+**Verification.** `cargo test -p envoy-config` 431 / `-p envoy-http1` 120 (incl. all 10 new tests);
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` clean; isolated builds
+`-p envoy-config -p envoy-http1 -p envoy-http2 -p envoy-bin` all green; no `unsafe`. (The Docker
+differential + the `0034` reload are the state-4 / native-Linux-CI gate, not run per-task.)
+
+**CARRY-FORWARD recorded at this task (the code-quality review's I1, controller-resolved as a
+deliberate deferral):** the reload re-validates ONLY the cluster-EXISTENCE reference. Phase-20's
+initial-LOAD validator's `RouteAction::Route` arm enforces a SECOND check — `Http2ClusterFromHttp1Listener`
+(an H1/AUTO listener routing to an H2-only upstream cluster, ADR-0028). The reload does NOT re-validate
+that gate, so a hot-reload can install an H1→H2-only route that the initial bootstrap load would have
+rejected as fatal. **Resolution (controller decision):** this is a deliberate deferral consistent with
+the project-wide OPEN ADR-0028 deferral (H1×H2 dispatch is unimplemented project-wide). The principled
+line: the reload REJECTS what would PANIC the request path (the unknown-cluster `.expect()`), but DEFERS
+(per ADR-0028) what would merely misnegotiate silently (the H1→H2-only case — the pre-06.3 behavior, no
+panic, no stability threat). Threading the listener codec into the watch target for a full re-validation
+is deferred with ADR-0028. The `reparse_and_select_route_config` doc comment states this honestly (no
+overclaim). Revisit if/when ADR-0028 (H1×H2 dispatch) is engaged.
+
+## Task 5 — per-HCM `rds.*` counters tick per reload (thread phase-20 handles) — FOLDED INTO Task 4
+
+**Done (folded into Task 4 above).** The watcher target carries the SAME `rds.*` `Arc<Counter>`
+handles the HCM registered at construction (`register_rds_stats`), re-resolved from the
+`StatsRegistry` by name in the envoy-bin target-walk (idempotent register-by-name), so a reload
+increments the scrape-visible registry counters (continuing the initial-load `1/1/0/0/1` series),
+NOT a private copy. The base name is the shared `envoy_listener::rds_counter_base` (no drift). No
+separate commit — folded into `355e2b3` + `8439261` because the reload pipeline (Task 4) cannot tick
+counters without the handles.
 
 ## Task 6 — `/config_dump` `RoutesConfigDump` through the swappable handle + version update [BLOCKED on Task 1]
 
