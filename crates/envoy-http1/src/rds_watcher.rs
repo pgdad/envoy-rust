@@ -14,21 +14,39 @@
 //! mirroring how the health scheduler / outlier manager spawn nothing when
 //! their feature is unconfigured.
 //!
-//! SCOPING (26 Task 3 is a SKELETON): the per-target `reload` is a no-op
-//! `Ok(())` stub this task. The real reparse → revalidate → atomic
-//! `store_route_config` swap is Task 4 (BLOCKED on a Linux §6.2 verification);
-//! the `rds.*` counter ticks are Task 5. The struct fields and the loop's
-//! reload call site are shaped so Tasks 4 & 5 fill them in WITHOUT re-plumbing
-//! the envoy-bin wiring.
+//! 26 Task 4: the per-target `reload` now runs the real §6.2 pipeline (ADR-0066)
+//! — reparse → revalidate → atomic `store_route_config` swap, with a WARM-REJECT
+//! on any failure (the last-good table is kept; the proxy never crashes). The
+//! `rds.*` counters live on each [`WatchTarget`] and are ticked per the locked
+//! taxonomy (Task 5's counter wiring was folded in here — the envoy-bin
+//! target-walk re-resolves the same registered handles by name).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use envoy_stats::Counter;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::hcm::HCMConfig;
+
+/// 26 Task 4: the 5 `rds.*` counter handles a watch target ticks on each reload,
+/// per the §6.2-LOCKED taxonomy (ADR-0066). Every attempt ticks `update_attempt`;
+/// a success additionally ticks `update_success` + `config_reload`; an
+/// {IO, parse} failure ticks `update_failure`; a {name-not-found, unknown-cluster}
+/// rejection ticks `update_rejected`. These are the SAME handles
+/// `envoy_listener::register_rds_stats` registers (by hierarchical name) at
+/// initial load — re-registering a name returns the same underlying counter, so
+/// the watcher continues the same series the initial load seeded at `1/1/0/0/1`.
+#[derive(Debug, Clone)]
+pub struct RdsCounters {
+    pub update_attempt: Arc<Counter>,
+    pub update_success: Arc<Counter>,
+    pub update_failure: Arc<Counter>,
+    pub update_rejected: Arc<Counter>,
+    pub config_reload: Arc<Counter>,
+}
 
 /// 26 Task 3: the rds file poll cadence. A `tokio::time::interval` ticks every
 /// `POLL_INTERVAL`; on each tick the loop stats the file and compares its
@@ -37,11 +55,12 @@ use crate::hcm::HCMConfig;
 /// other periodic primitives' "sensible default" cadence).
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// 26 Task 3: one rds watch target — the seam Tasks 4 & 5 fill in.
+/// 26 Task 4: one rds watch target — the reload pipeline's per-HCM context.
 ///
-/// Task 4 calls `store.store_route_config(...)` after a successful
-/// reparse+revalidate of `path` (a warm-reject per §5.5 on failure). Task 5
-/// adds the registered `rds.*` `Arc<Counter>` handles. The envoy-bin
+/// On a detected file change the watcher runs the §6.2 pipeline against this
+/// target: reparse+revalidate `path`, then on success atomically
+/// `store.store_route_config(...)` (a warm-reject keeps the live table on any
+/// failure); the `counters` are ticked per the locked taxonomy. The envoy-bin
 /// target-walk builds one of these per rds-configured HCM; the watcher spawns
 /// one `watch_loop` per target.
 ///
@@ -61,12 +80,17 @@ pub struct WatchTarget {
     /// uses it to pick the matching `RouteConfiguration` out of the parsed
     /// rds file.
     pub route_config_name: String,
-    /// The Task-2 swappable-handle owner. Task 4 calls
+    /// The Task-2 swappable-handle owner. `reload` calls
     /// `store.store_route_config(new)` to atomically swap the live route table
-    /// after a successful reparse+revalidate.
+    /// after a successful reparse+revalidate. `store.cluster_mgr` is the
+    /// immutable live cluster set the revalidation checks route references
+    /// against.
     pub store: Arc<HCMConfig>,
-    // Task 5 will add: the registered `rds.*` Arc<Counter> handles
-    // (attempt/success/failure/version) so the loop can tick them.
+    /// 26 Task 4: the registered `rds.*` counter handles this target ticks per
+    /// the §6.2-LOCKED taxonomy (ADR-0066). Wired from envoy-bin's registry —
+    /// re-resolving the names `register_rds_stats` registered returns the same
+    /// underlying counters, so the watcher continues the initial-load series.
+    pub counters: RdsCounters,
 }
 
 /// 26 Task 3: the rds watcher. Holds the JoinHandles of every spawned
@@ -157,14 +181,18 @@ async fn watch_loop(target: WatchTarget, cancel: CancellationToken) {
                     && last_mtime != Some(now)
                 {
                     last_mtime = Some(now);
-                    // Task 4: real reparse+revalidate+store_route_config;
-                    // warm-reject per §5.5. STUBBED to a no-op Ok(()) this task.
+                    // 26 Task 4: run the real reparse+revalidate+atomic-swap
+                    // pipeline. A failed reload is WARM-REJECTED (the live table
+                    // is kept and the failure-class counter ticked inside
+                    // `reload`); we log it here and keep watching for the next
+                    // edit. The loop never propagates a reload error — a bad
+                    // RDS file must NOT take the proxy down.
                     if let Err(err) = reload(&target) {
                         tracing::warn!(
                             path = %target.path.display(),
                             route_config_name = %target.route_config_name,
                             error = ?err,
-                            "rds reload failed (skeleton no-op stub should never fail)",
+                            "rds reload warm-rejected; keeping last-good route table",
                         );
                     }
                 }
@@ -180,18 +208,61 @@ fn read_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-/// 26 Task 3 SKELETON STUB: the rds reload pipeline.
+/// 26 Task 4 (ADR-0066): the rds reload pipeline.
 ///
-/// Task 4: real reparse+revalidate+store_route_config; warm-reject per §5.5.
-/// This task leaves it a no-op `Ok(())` so the watch loop's call site, error
-/// handling, and envoy-bin wiring are all in place for Task 4 to fill in
-/// WITHOUT touching the spawn/target-walk/drain plumbing.
-fn reload(_target: &WatchTarget) -> Result<(), std::io::Error> {
-    // Task 4: read `target.path`, `parse_rds_file`, select
-    // `target.route_config_name`, revalidate, then
-    // `target.store.store_route_config(Arc::new(new))` on success (warm-reject
-    // — keep the live table — on any failure, per §5.5).
-    Ok(())
+/// Every call ticks `update_attempt`. Steps 1-4 (read+parse+select+revalidate)
+/// run via `envoy_config::reparse_and_select_route_config` — pure work producing
+/// a candidate `RouteConfiguration` OUTSIDE any lock (CARRY-FORWARD (a): the
+/// write critical section must stay a single Arc move). On success the candidate
+/// is atomically installed via `store_route_config` and `update_success` +
+/// `config_reload` tick. On ANY failure the live table is KEPT (warm-reject) and
+/// the failure-class counter ticks: `update_failure` for {IO, parse},
+/// `update_rejected` for {route_config_name-not-found, unknown-cluster}. The
+/// unknown-cluster rejection is the recorded divergence vs Envoy — see the
+/// module + `reparse_and_select_route_config` docs.
+fn reload(target: &WatchTarget) -> Result<(), envoy_config::ConfigError> {
+    target.counters.update_attempt.add(1);
+    // Steps 1-4, OUTSIDE the write lock. The cluster predicate resolves names
+    // through the live (immutable) ClusterManager; `get(..).is_some()` is the
+    // existence check the request path relies on.
+    let cluster_mgr = Arc::clone(&target.store.cluster_mgr);
+    let result = envoy_config::reparse_and_select_route_config(
+        &target.path,
+        &target.route_config_name,
+        &move |name| cluster_mgr.get(name).is_some(),
+    );
+    match result {
+        Ok(new_rc) => {
+            // Step 5: atomic swap — the ONLY part touching the write lock.
+            target.store.store_route_config(Arc::new(new_rc));
+            target.counters.update_success.add(1);
+            target.counters.config_reload.add(1);
+            Ok(())
+        }
+        Err(err) => {
+            // Warm-reject: classify the error and tick the matching counter; the
+            // live route table is left untouched (we never reached step 5).
+            match &err {
+                // {IO error, malformed YAML/parse error} → update_failure.
+                envoy_config::ConfigError::RdsFileError { .. }
+                | envoy_config::ConfigError::RdsParseError { .. } => {
+                    target.counters.update_failure.add(1);
+                }
+                // {route_config_name absent, route→unknown-cluster} → update_rejected.
+                envoy_config::ConfigError::RdsRouteConfigNotFound { .. }
+                | envoy_config::ConfigError::UnknownCluster(_) => {
+                    target.counters.update_rejected.add(1);
+                }
+                // Defensive: any other ConfigError variant is a failure class.
+                // `reparse_and_select_route_config` only produces the four above,
+                // so this arm is unreachable in practice.
+                _ => {
+                    target.counters.update_failure.add(1);
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +272,250 @@ mod tests {
     use envoy_config::RouteConfiguration;
     use std::sync::RwLock;
     use std::time::Duration;
+
+    // 26 Task 4: build the 5 rds.* counters from a fresh test registry. Mirrors
+    // the names `register_rds_stats` (envoy-listener) emits — re-registering by
+    // name returns the same underlying Arc<Counter>, so a test that seeds them
+    // at `1/1/0/0/1` (the post-initial-load state) and the watcher's reload tick
+    // share one set of counters.
+    fn test_counters(
+        registry: &envoy_stats::StatsRegistry,
+        base: &str,
+    ) -> RdsCounters {
+        let mk = |suffix: &str| {
+            registry
+                .register_counter(&format!("{base}.{suffix}"))
+                .expect("register rds counter")
+        };
+        RdsCounters {
+            update_attempt: mk("update_attempt"),
+            update_success: mk("update_success"),
+            update_failure: mk("update_failure"),
+            update_rejected: mk("update_rejected"),
+            config_reload: mk("config_reload"),
+        }
+    }
+
+    // An RDS file naming `local_route` whose single route forwards to `cluster`.
+    fn rds_file_body(cluster: &str) -> String {
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: local_route
+  virtual_hosts:
+  - name: backend
+    domains: ["*"]
+    routes:
+    - match: {{ prefix: "/" }}
+      route: {{ cluster: {cluster} }}
+"#
+        )
+    }
+
+    // Build an `Arc<HCMConfig>` whose cluster_mgr contains exactly one cluster
+    // named `cluster_name`, plus the seeded `1/1/0/0/1` rds counters. Returns
+    // the store, the counters, and the registry (kept alive by the caller).
+    async fn store_with_cluster(
+        cluster_name: &str,
+    ) -> (Arc<HCMConfig>, RdsCounters, Arc<envoy_stats::StatsRegistry>) {
+        let yaml = format!(
+            r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+  - name: {cluster_name}
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: {cluster_name}
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 8080
+"#
+        );
+        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("cluster mgr"),
+        );
+        let stats = Arc::new(HCMStats::register(&registry, "ingress_http").expect("stats"));
+        let filter_pipeline = Arc::new(
+            envoy_filter::FilterPipeline::build_from_config(
+                &[envoy_config::HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                        envoy_config::RouterConfig {},
+                    ),
+                }],
+                &registry,
+                "ingress_http",
+            )
+            .expect("router pipeline"),
+        );
+        let store = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats,
+            access_log: vec![],
+            filter_pipeline,
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![],
+            })),
+        });
+        // Seed the rds.* counters at the post-initial-load `1/1/0/0/1` state, so
+        // a successful reload moves them to `2/2/0/0/2` (the §6.2 expectation).
+        let counters = test_counters(&registry, "http.ingress_http.rds.local_route");
+        counters.update_attempt.add(1);
+        counters.update_success.add(1);
+        counters.config_reload.add(1);
+        (store, counters, registry)
+    }
+
+    fn write_rds(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).expect("write rds file");
+    }
+
+    /// §6.2 happy reload: a valid edited RDS file (route → a KNOWN cluster) is
+    /// reparsed, revalidated, and ATOMICALLY swapped into the live table.
+    /// Counters move `1/1/0/0/1` → `2/2/0/0/2`.
+    #[tokio::test]
+    async fn reload_happy_swaps_table_and_ticks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        write_rds(&path, &rds_file_body("known_cluster"));
+        let (store, counters, _reg) = store_with_cluster("known_cluster").await;
+
+        // Before: the seeded last-good table has zero virtual hosts.
+        assert!(store.current_route_config().virtual_hosts.is_empty());
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        reload(&target).expect("happy reload returns Ok");
+
+        // After: the live table is the freshly-parsed one (one virtual host).
+        let live = store.current_route_config();
+        assert_eq!(live.name, "local_route");
+        assert_eq!(live.virtual_hosts.len(), 1, "table was swapped");
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(counters.update_success.value(), 2);
+        assert_eq!(counters.config_reload.value(), 2);
+        assert_eq!(counters.update_failure.value(), 0);
+        assert_eq!(counters.update_rejected.value(), 0);
+    }
+
+    /// §6.2 warm-reject (update_failure): malformed YAML keeps the last-good
+    /// table byte-unchanged and ticks attempt + failure only.
+    #[tokio::test]
+    async fn reload_malformed_keeps_last_good_and_ticks_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        write_rds(&path, "resources: [unclosed");
+        let (store, counters, _reg) = store_with_cluster("known_cluster").await;
+        let before = store.current_route_config();
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        reload(&target).expect_err("malformed reload returns Err");
+
+        // The live Arc is byte-unchanged (same pointer, same content).
+        let after = store.current_route_config();
+        assert!(Arc::ptr_eq(&before, &after), "last-good table kept");
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(counters.update_failure.value(), 1);
+        assert_eq!(counters.update_success.value(), 1, "no success tick");
+        assert_eq!(counters.update_rejected.value(), 0);
+        assert_eq!(counters.config_reload.value(), 1, "no reload tick");
+    }
+
+    /// §6.2 warm-reject (update_rejected): the requested route_config_name is
+    /// absent from the edited file → keep last-good, tick attempt + rejected.
+    #[tokio::test]
+    async fn reload_missing_route_config_name_keeps_last_good_and_ticks_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        // File names a DIFFERENT route config than the target.
+        write_rds(
+            &path,
+            &rds_file_body("known_cluster").replace("local_route", "other_route"),
+        );
+        let (store, counters, _reg) = store_with_cluster("known_cluster").await;
+        let before = store.current_route_config();
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        reload(&target).expect_err("name-not-found reload returns Err");
+
+        let after = store.current_route_config();
+        assert!(Arc::ptr_eq(&before, &after), "last-good table kept");
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(counters.update_rejected.value(), 1);
+        assert_eq!(counters.update_failure.value(), 0);
+        assert_eq!(counters.update_success.value(), 1);
+        assert_eq!(counters.config_reload.value(), 1);
+    }
+
+    /// §6.2 warm-reject (update_rejected) — THE RECORDED DIVERGENCE (ADR-0066):
+    /// an edited file whose route references a cluster NOT in the live manager
+    /// is REJECTED (envoy-rust diverges from Envoy's accept-and-503 because the
+    /// request path `.expect()`s cluster existence). Keep last-good; tick
+    /// attempt + rejected.
+    #[tokio::test]
+    async fn reload_unknown_cluster_keeps_last_good_and_ticks_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        // Route forwards to a cluster the manager does NOT contain.
+        write_rds(&path, &rds_file_body("ghost_cluster"));
+        let (store, counters, _reg) = store_with_cluster("known_cluster").await;
+        let before = store.current_route_config();
+
+        let target = WatchTarget {
+            path,
+            route_config_name: "local_route".to_string(),
+            store: Arc::clone(&store),
+            counters: counters.clone(),
+        };
+        reload(&target).expect_err("unknown-cluster reload returns Err");
+
+        let after = store.current_route_config();
+        assert!(Arc::ptr_eq(&before, &after), "last-good table kept");
+
+        assert_eq!(counters.update_attempt.value(), 2);
+        assert_eq!(counters.update_rejected.value(), 1);
+        assert_eq!(counters.update_failure.value(), 0);
+        assert_eq!(counters.update_success.value(), 1);
+        assert_eq!(counters.config_reload.value(), 1);
+    }
 
     // A minimal `Arc<HCMConfig>` for the WatchTarget's `store` field. The
     // skeleton's no-op `reload` never touches it, so this only needs to be a
@@ -264,10 +579,12 @@ static_resources:
         let path = dir.path().join("rds.yaml");
         std::fs::write(&path, "resources: []\n").expect("write rds file");
 
+        let reg = envoy_stats::StatsRegistry::new();
         let target = WatchTarget {
             path: path.clone(),
             route_config_name: "local_route".to_string(),
             store: minimal_store().await,
+            counters: test_counters(&reg, "http.ingress_http.rds.local_route"),
         };
         let cancel = CancellationToken::new();
         let watcher = RdsWatcher::spawn(vec![target], cancel.clone());
@@ -309,10 +626,12 @@ static_resources:
         let path = dir.path().join("rds.yaml");
         std::fs::write(&path, "resources: []\n").expect("write rds file");
 
+        let reg = envoy_stats::StatsRegistry::new();
         let target = WatchTarget {
             path,
             route_config_name: "local_route".to_string(),
             store: minimal_store().await,
+            counters: test_counters(&reg, "http.ingress_http.rds.local_route"),
         };
         let cancel = CancellationToken::new();
         let watcher = RdsWatcher::spawn(vec![target], cancel.clone());

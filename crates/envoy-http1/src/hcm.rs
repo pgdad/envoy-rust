@@ -263,6 +263,12 @@ impl HCMConfig {
     ///
     /// [`current_route_config`]: HCMConfig::current_route_config
     pub fn store_route_config(&self, rc: Arc<RouteConfiguration>) {
+        // Poison-recovery (`unwrap_or_else(|p| p.into_inner())`) is safe ONLY
+        // while this write critical section stays a single Arc move: a panic
+        // mid-`*guard = rc` cannot tear the inner Arc (the move is atomic at the
+        // pointer level), so a recovered guard always observes a consistent
+        // table. The RDS reload pipeline (rds_watcher::reload) deliberately does
+        // its reparse+revalidate OUTSIDE this lock so this section never widens.
         *self
             .route_config
             .write()
@@ -1297,9 +1303,10 @@ impl ResolvedRoute {
 pub fn resolve_route(config: &HCMConfig, req: &Request) -> Option<ResolvedRoute> {
     let host_raw = find_header(&req.headers, headers::HOST).filter(|h| !h.is_empty())?;
     let host = strip_port(host_raw);
-    // 26 Task 2: snapshot the route table once (§5.4 read-once). The returned
-    // route is held inside the snapshot Arc, so we yield BOTH so the caller
-    // keeps the table alive while borrowing the matched route.
+    // 26 Task 2: snapshot the route table once (§5.4 read-once). The matched
+    // route lives inside the snapshot Arc, so we return a single owned
+    // `ResolvedRoute` that holds that snapshot — keeping the table alive while
+    // the caller borrows the matched route, even across a concurrent swap.
     let route_config = config.current_route_config();
     let vh_idx = route_config
         .virtual_hosts

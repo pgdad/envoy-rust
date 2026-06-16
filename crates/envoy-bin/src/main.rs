@@ -360,12 +360,35 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 // `rds` block (`rds.config_source.path_config_source.path` +
                 // `rds.route_config_name`). §5.2: HCMs WITHOUT rds add nothing.
                 if let Some(rds) = hcm_cfg.rds.as_ref() {
+                    // 26 Task 4 (Task 5 folded in): re-resolve the 5 `rds.*`
+                    // counters the initial-load `register_rds_stats` already
+                    // registered (line ~116). `register_counter` is idempotent
+                    // by name, so this returns the SAME underlying handles —
+                    // the watcher continues the series initial load seeded at
+                    // `1/1/0/0/1`, ticking it per the §6.2 taxonomy on reload.
+                    let base = format!(
+                        "http.{}.rds.{}",
+                        hcm_cfg.stat_prefix, rds.route_config_name
+                    );
+                    let mk = |suffix: &str| {
+                        registry
+                            .register_counter(&format!("{base}.{suffix}"))
+                            .map_err(|e| anyhow::anyhow!(e))
+                    };
+                    let counters = envoy_http1::RdsCounters {
+                        update_attempt: mk("update_attempt")?,
+                        update_success: mk("update_success")?,
+                        update_failure: mk("update_failure")?,
+                        update_rejected: mk("update_rejected")?,
+                        config_reload: mk("config_reload")?,
+                    };
                     rds_targets.push(envoy_http1::WatchTarget {
                         path: std::path::PathBuf::from(
                             &rds.config_source.path_config_source.path,
                         ),
                         route_config_name: rds.route_config_name.clone(),
                         store: std::sync::Arc::clone(&hcm_config),
+                        counters,
                     });
                 }
 

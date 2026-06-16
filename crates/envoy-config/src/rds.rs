@@ -64,6 +64,69 @@ pub fn parse_rds_file(
         .collect())
 }
 
+/// 26 Task 4 (ADR-0066): the file-based RDS hot-reload pipeline's pure prefix —
+/// steps 1-4 of the §6.2-LOCKED reload sequence, producing a validated candidate
+/// `RouteConfiguration` WITHOUT touching any live state. The watcher
+/// (`envoy-http1::rds_watcher`) calls this OUTSIDE its write lock; only the
+/// final atomic `store_route_config` swap (step 5) is its concern.
+///
+/// Steps, with the failure class each error maps to (the watcher classifies on
+/// the `ConfigError` variant):
+///  1. **read** `path` — IO error → [`ConfigError::RdsFileError`] (update_failure).
+///  2. **parse** via [`parse_rds_file`] — malformed → [`ConfigError::RdsParseError`]
+///     (update_failure).
+///  3. **select** the `RouteConfiguration` whose `.name == route_config_name` —
+///     absent → [`ConfigError::RdsRouteConfigNotFound`] (update_rejected).
+///  4. **revalidate** every `RouteAction::Route` reference against the live
+///     cluster set via `known_cluster` — a reference to a cluster NOT present →
+///     [`ConfigError::UnknownCluster`] (update_rejected). This is the recorded
+///     warm-reject divergence vs Envoy (ADR-0066): envoy-rust's request path
+///     `.expect()`s cluster existence, so installing an unknown-cluster route
+///     would panic — we reject the reload and keep the last-good table instead.
+///
+/// `known_cluster` is a predicate over cluster names rather than a
+/// `&ClusterManager` deliberately: `envoy-cluster` depends on `envoy-config`, so
+/// taking the manager here would form a dependency cycle. The watcher (which
+/// owns the `Arc<ClusterManager>`) supplies `|name| cluster_mgr.get(name).is_some()`.
+pub fn reparse_and_select_route_config(
+    path: &std::path::Path,
+    route_config_name: &str,
+    known_cluster: &dyn Fn(&str) -> bool,
+) -> Result<RouteConfiguration, crate::ConfigError> {
+    let path_str = path.display().to_string();
+    // Step 1: re-read.
+    let contents =
+        std::fs::read_to_string(path).map_err(|source| crate::ConfigError::RdsFileError {
+            path: path_str.clone(),
+            source,
+        })?;
+    // Step 2: re-parse (RdsParseError on malformed YAML / bad envelope).
+    let mut parsed = parse_rds_file(&path_str, &contents)?;
+    // Step 3: name-select (RdsRouteConfigNotFound if absent).
+    let selected = parsed
+        .iter()
+        .position(|rc| rc.name == route_config_name)
+        .map(|i| parsed.remove(i))
+        .ok_or_else(|| crate::ConfigError::RdsRouteConfigNotFound {
+            name: route_config_name.to_string(),
+            path: path_str.clone(),
+        })?;
+    // Step 4: revalidate route→cluster references against the live cluster set.
+    // Mirrors the phase-20 post-merge UnknownCluster check (bootstrap::validate's
+    // RouteAction::Route arm) but resolves names through the live manager rather
+    // than a static cluster list. DirectResponse routes reference no cluster.
+    for vh in &selected.virtual_hosts {
+        for route in &vh.routes {
+            if let crate::RouteAction::Route(ar) = &route.action
+                && !known_cluster(&ar.cluster)
+            {
+                return Err(crate::ConfigError::UnknownCluster(ar.cluster.clone()));
+            }
+        }
+    }
+    Ok(selected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +238,119 @@ resources:
                 if message.contains("@type")),
             "expected RdsParseError mentioning @type, got: {err:?}"
         );
+    }
+
+    // ---- 26 Task 4: reparse_and_select_route_config (the reload pipeline's
+    // steps 1-4: read + parse + select + revalidate). ----
+
+    // An RDS file body naming one RouteConfiguration `rc_name` whose single
+    // route forwards to `cluster`. Used to exercise the happy path + the
+    // route_config_name-not-found / unknown-cluster reject classes.
+    fn rds_body(rc_name: &str, cluster: &str) -> String {
+        format!(
+            r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: {rc_name}
+  virtual_hosts:
+  - name: backend
+    domains: ["*"]
+    routes:
+    - match: {{ prefix: "/" }}
+      route: {{ cluster: {cluster} }}
+"#
+        )
+    }
+
+    fn write_temp(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rds.yaml");
+        std::fs::write(&path, contents).expect("write rds file");
+        (dir, path)
+    }
+
+    #[test]
+    fn reparse_happy_path_reads_selects_and_validates() {
+        let (_dir, path) = write_temp(&rds_body("local_route", "known_cluster"));
+        // known-cluster predicate: only "known_cluster" exists.
+        let rc = reparse_and_select_route_config(&path, "local_route", &|name| {
+            name == "known_cluster"
+        })
+        .expect("happy reload");
+        assert_eq!(rc.name, "local_route");
+        assert_eq!(rc.virtual_hosts.len(), 1);
+    }
+
+    #[test]
+    fn reparse_io_error_when_file_missing() {
+        // step 1: an unreadable/missing file → RdsFileError (the update_failure class).
+        let missing = std::path::Path::new("/no/such/rds/file.yaml");
+        let err = reparse_and_select_route_config(missing, "local_route", &|_| true).unwrap_err();
+        assert!(
+            matches!(&err, crate::ConfigError::RdsFileError { .. }),
+            "expected RdsFileError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reparse_parse_error_on_malformed_yaml() {
+        // step 2: malformed YAML → RdsParseError (the update_failure class).
+        let (_dir, path) = write_temp("resources: [unclosed");
+        let err = reparse_and_select_route_config(&path, "local_route", &|_| true).unwrap_err();
+        assert!(
+            matches!(&err, crate::ConfigError::RdsParseError { .. }),
+            "expected RdsParseError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reparse_route_config_name_not_found_rejects() {
+        // step 3: the requested name is absent from the envelope →
+        // RdsRouteConfigNotFound (the update_rejected class).
+        let (_dir, path) = write_temp(&rds_body("other_route", "known_cluster"));
+        let err =
+            reparse_and_select_route_config(&path, "local_route", &|_| true).unwrap_err();
+        assert!(
+            matches!(&err, crate::ConfigError::RdsRouteConfigNotFound { name, .. }
+                if name == "local_route"),
+            "expected RdsRouteConfigNotFound for local_route, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reparse_unknown_cluster_route_rejects() {
+        // step 4: the selected table references a cluster NOT in the live set →
+        // UnknownCluster (the update_rejected class — the recorded warm-reject
+        // divergence vs Envoy, ADR-0066).
+        let (_dir, path) = write_temp(&rds_body("local_route", "ghost_cluster"));
+        let err = reparse_and_select_route_config(&path, "local_route", &|name| {
+            name == "known_cluster"
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, crate::ConfigError::UnknownCluster(c) if c == "ghost_cluster"),
+            "expected UnknownCluster(ghost_cluster), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reparse_direct_response_route_needs_no_cluster() {
+        // A direct_response route references no cluster, so revalidation passes
+        // regardless of the known-cluster predicate.
+        let yaml = r#"
+resources:
+- "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+  name: local_route
+  virtual_hosts:
+  - name: backend
+    domains: ["*"]
+    routes:
+    - match: { prefix: "/" }
+      direct_response: { status: 200, body: { inline_string: "ok" } }
+"#;
+        let (_dir, path) = write_temp(yaml);
+        let rc = reparse_and_select_route_config(&path, "local_route", &|_| false)
+            .expect("direct_response needs no cluster");
+        assert_eq!(rc.name, "local_route");
     }
 }

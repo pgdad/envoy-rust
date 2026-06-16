@@ -27,6 +27,6 @@ pub use codec::{Http1Codec, HttpVersion, Request};
 pub use error::Http1Error;
 pub use hcm::{BuildOutcome, HCM, HCMConfig, HCMStats, build_response};
 pub use pool::{H1Pool, H1PoolManager, PoolError, PoolGuard}; // 13.1 NEW (Task 3)
-pub use rds_watcher::{RdsWatcher, WatchTarget}; // 26 NEW (Task 3)
+pub use rds_watcher::{RdsCounters, RdsWatcher, WatchTarget}; // 26 NEW (Task 3/4)
 pub use response::{Http1Response, Response};
 pub use router::RouterError; // 04.3 NEW (Task 8)
