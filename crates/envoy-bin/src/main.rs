@@ -366,9 +366,12 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     // by name, so this returns the SAME underlying handles —
                     // the watcher continues the series initial load seeded at
                     // `1/1/0/0/1`, ticking it per the §6.2 taxonomy on reload.
-                    let base = format!(
-                        "http.{}.rds.{}",
-                        hcm_cfg.stat_prefix, rds.route_config_name
+                    // Shared base-name helper: MUST stay byte-identical to the
+                    // initial-load `register_rds_stats` (idempotent register-by-name
+                    // returns the SAME handles); see `envoy_listener::rds_counter_base`.
+                    let base = envoy_listener::rds_counter_base(
+                        &hcm_cfg.stat_prefix,
+                        &rds.route_config_name,
                     );
                     let mk = |suffix: &str| {
                         registry

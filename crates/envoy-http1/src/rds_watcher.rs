@@ -253,11 +253,17 @@ fn reload(target: &WatchTarget) -> Result<(), envoy_config::ConfigError> {
                 | envoy_config::ConfigError::UnknownCluster(_) => {
                     target.counters.update_rejected.add(1);
                 }
-                // Defensive: any other ConfigError variant is a failure class.
-                // `reparse_and_select_route_config` only produces the four above,
-                // so this arm is unreachable in practice.
-                _ => {
-                    target.counters.update_failure.add(1);
+                // `reparse_and_select_route_config` can return ONLY the four
+                // variants matched above. Any other `ConfigError` here means the
+                // producer grew a new returnable variant without updating this
+                // classifier — fail loud rather than silently misbucket it. If a
+                // new variant is added, this match must be extended explicitly.
+                other => {
+                    unreachable!(
+                        "reparse_and_select_route_config returned an unexpected \
+                         ConfigError variant not handled by the reload classifier: \
+                         {other:?}"
+                    )
                 }
             }
             Err(err)
@@ -380,7 +386,10 @@ static_resources:
         });
         // Seed the rds.* counters at the post-initial-load `1/1/0/0/1` state, so
         // a successful reload moves them to `2/2/0/0/2` (the §6.2 expectation).
-        let counters = test_counters(&registry, "http.ingress_http.rds.local_route");
+        let counters = test_counters(
+            &registry,
+            &envoy_listener::rds_counter_base("ingress_http", "local_route"),
+        );
         counters.update_attempt.add(1);
         counters.update_success.add(1);
         counters.config_reload.add(1);
@@ -584,7 +593,10 @@ static_resources:
             path: path.clone(),
             route_config_name: "local_route".to_string(),
             store: minimal_store().await,
-            counters: test_counters(&reg, "http.ingress_http.rds.local_route"),
+            counters: test_counters(
+                &reg,
+                &envoy_listener::rds_counter_base("ingress_http", "local_route"),
+            ),
         };
         let cancel = CancellationToken::new();
         let watcher = RdsWatcher::spawn(vec![target], cancel.clone());
@@ -631,7 +643,10 @@ static_resources:
             path,
             route_config_name: "local_route".to_string(),
             store: minimal_store().await,
-            counters: test_counters(&reg, "http.ingress_http.rds.local_route"),
+            counters: test_counters(
+                &reg,
+                &envoy_listener::rds_counter_base("ingress_http", "local_route"),
+            ),
         };
         let cancel = CancellationToken::new();
         let watcher = RdsWatcher::spawn(vec![target], cancel.clone());

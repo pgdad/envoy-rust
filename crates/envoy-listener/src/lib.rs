@@ -399,6 +399,19 @@ pub fn register_lds_stats(
 /// posture), so update_failure/update_rejected register at 0 and never tick;
 /// config_reload ticks 1 at initial load (L3). Called once from envoy-bin
 /// main(), after load_dynamic_resources + register_lds_stats.
+/// 26 Task 4: the SINGLE source of truth for the `http.<stat_prefix>.rds.<route_config_name>`
+/// counter-name base. `register_rds_stats` (initial load) and the envoy-bin
+/// target-walk + the rds_watcher test helper (reload) ALL re-resolve the SAME
+/// `rds.*` counter handles by name — `register_counter` is idempotent by name,
+/// so the byte-identical base string is what guarantees they share one handle
+/// set. Constructing it in one place removes the drift risk across those sites.
+/// The five suffixes (`update_attempt`/`update_success`/`update_failure`/
+/// `update_rejected`/`config_reload`) are appended by each caller as
+/// `{base}.{suffix}`.
+pub fn rds_counter_base(stat_prefix: &str, route_config_name: &str) -> String {
+    format!("http.{stat_prefix}.rds.{route_config_name}")
+}
+
 pub fn register_rds_stats(
     bootstrap: &envoy_config::Bootstrap,
     registry: &envoy_stats::StatsRegistry,
@@ -414,7 +427,7 @@ pub fn register_rds_stats(
                 let Some(rds) = hcm.rds.as_ref() else {
                     continue;
                 };
-                let base = format!("http.{}.rds.{}", hcm.stat_prefix, rds.route_config_name);
+                let base = rds_counter_base(&hcm.stat_prefix, &rds.route_config_name);
                 let mk = |suffix: &str| {
                     registry
                         .register_counter(&format!("{base}.{suffix}"))

@@ -112,9 +112,24 @@ pub fn reparse_and_select_route_config(
             path: path_str.clone(),
         })?;
     // Step 4: revalidate route→cluster references against the live cluster set.
-    // Mirrors the phase-20 post-merge UnknownCluster check (bootstrap::validate's
-    // RouteAction::Route arm) but resolves names through the live manager rather
-    // than a static cluster list. DirectResponse routes reference no cluster.
+    //
+    // This re-validation is DELIBERATELY PARTIAL. It checks ONLY the
+    // cluster-EXISTENCE reference: a route to a cluster absent from the live
+    // cluster set → `UnknownCluster` → warm-rejected. That check is
+    // non-negotiable because the request path `.expect()`s cluster existence at
+    // `crates/envoy-http1/src/hcm.rs:818` — installing an unknown-cluster route
+    // would PANIC the proxy.
+    //
+    // It does NOT re-validate the phase-20 `Http2ClusterFromHttp1Listener`
+    // (H1/AUTO-listener × H2-only-cluster) reachability gate. That gate is
+    // deferred on reload, consistent with the project-wide OPEN ADR-0028
+    // deferral: H1×H2 dispatch is unimplemented project-wide, so an H1→H2-only
+    // route misnegotiates silently at request time rather than panicking —
+    // unlike the unknown-cluster case it does not threaten proxy stability.
+    // Threading the listener codec into the watch target for a full
+    // re-validation is deferred with ADR-0028.
+    //
+    // DirectResponse routes reference no cluster.
     for vh in &selected.virtual_hosts {
         for route in &vh.routes {
             if let crate::RouteAction::Route(ar) = &route.action
