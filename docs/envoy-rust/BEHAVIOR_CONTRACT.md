@@ -309,6 +309,19 @@ The remaining 13 Envoy-side names under `cluster.<name>.outlier_detection.*` (th
 
 **The Envoy-only enumeration paragraph.** After a successful RDS update Envoy emits a fuller `http.<prefix>.rds.<name>.*` family; envoy-rust emits the **5** above. The Envoy-only unasserted names (ignored by fixture 0028's named-stat scrape — no set-diff on the `Http1KeepAlive` driver) are: `version`, `version_text`, `update_time`, `config_reload_time_ms`, `update_empty`, `init_fetch_timeout`, `update_duration`. (Envoy additionally carries an `rds.<name>.control_plane.*` family, irrelevant to the filesystem transport.)
 
+**26 entries (RDS hot-reload — the phase-20 `rds.*` rows gain per-reload semantics; §6.2-verified by ADR-0066 on Linux against `envoyproxy/envoy:v1.33.0`):**
+
+The 5 phase-20 `http.<stat_prefix>.rds.<route_config_name>.*` rows above were locked at their **initial-load-only** values (`update_attempt/update_success/update_failure/update_rejected/config_reload` = `1/1/0/0/1`). Phase 26 makes the route table hot-reloadable, so these counters now **advance per reload** — no NEW stat names, only a per-reload increment semantic (§6.2 P4 verified):
+
+| Reload event | Increment semantics |
+|---|---|
+| **Successful reload** (valid file change → new route table atomically applied) | `update_attempt` **+1**, `update_success` **+1**, `config_reload` **+1** per successful reload. Verified bilaterally: `1/1/0/0/1` (boot) → `2/2/0/0/2` (after one reload) → `3/3/0/0/3` (after two). Fixture 0034 asserts `2/2/…/2` after its one reload. |
+| **Bad reload — malformed YAML / IO / parse error** | `update_attempt` **+1**, `update_failure` **+1**; the last-good table is KEPT (warm-reject, §5.5). Both proxies agree. Fixture 0034's bad-reload probe exercises this case (`update_failure` ticks; `/probe` still routes to the last-good cluster). |
+| **Bad reload — `route_config_name` absent from the reloaded envelope** | `update_attempt` **+1**, `update_rejected` **+1**; last-good KEPT. Both proxies agree. Backstop-only (the differential fixture does not drive it). |
+| **Bad reload — route references an UNKNOWN cluster** | envoy-rust: `update_attempt` **+1**, `update_rejected` **+1**; last-good KEPT (re-validation against the immutable live cluster set rejects it). **Recorded divergence (ADR-0066):** Envoy instead ACCEPTS the update (`update_success`+`config_reload` tick) and serves `503`/`no_cluster` on that route. envoy-rust diverges because its request path `.expect()`s cluster existence (`crates/envoy-http1/src/hcm.rs:818`); matching Envoy would require a request-time missing-cluster→503 synth path (out of minimum-viable scope). Unobservable in fixture 0034 (which exercises only the malformed bad-reload, where both agree); surfaces only in the in-process backstop. |
+
+The §5.2 conditional-registration invariant is unchanged (names register only for `rds`-configured HCMs; the 33 pre-existing fixtures including the idle-watcher 0028 see no new names and no value change). The Envoy-only `rds.<name>.{version,version_text,update_time,config_reload_time_ms,update_duration,update_empty,init_fetch_timeout}` names stay unasserted (they advance on Envoy's side per reload but remain outside the 5-name subset).
+
 **21 entries (file-based EDS):**
 
 > The xDS-family continuation (ADR-0053 SPEC / ADR-0054 PLAN). file-based EDS
@@ -1119,6 +1132,74 @@ and by the 27 pre-existing fixtures seeing zero new names.
 (load-bearing on the wire); envoy-rust accepts-and-ignores it (per §(a)), and the
 `rds.<name>.version` / `version_text` stats are **Envoy-only, not asserted** (per
 the §Stat-name mapping Envoy-only enumeration).
+
+### Filesystem transport (`path_config_source`) — phase 26 RDS HOT-RELOAD extension
+
+> Phase 26 (`26-xds-rds-hot-reload`, ADR-0065 SPEC / ADR-0066 §6.2 reconciliation)
+> makes the phase-20 file-based RDS route table **hot-reloadable**: a running HCM
+> whose route table is RDS-supplied re-reads the edited file and atomically swaps
+> the new table onto live traffic WITHOUT a restart. The lock-ins below are the
+> §6.2 empirical findings, verified against `envoyproxy/envoy:v1.33.0` (digest
+> `sha256:56da5afd…`, 2026-06-16, on Linux) — see ADR-0066 for the full probe
+> transcript. **Fixture 0034's differential reload is Linux-CI-authoritative on a
+> NATIVE-Linux runner** (the reload trigger is unobservable under macOS / Docker
+> Desktop virtiofs — §5.7 / ADR-0049 Provenance); the in-process backstop
+> (`tokio::time`-controlled) is the deterministic local complement for the negative
+> paths. Initial-load semantics are unchanged (the phase-20 §(a)–(f) above hold).
+
+**(g) Watch trigger + mechanism divergence (§6.2 P1/P2).** Envoy's default
+file-watch (no `watched_directory`) reloads on **atomic-rename / move-into-path
+ONLY** — an **in-place truncate-rewrite is NEVER detected** (verified 3× — Envoy's
+filesystem subscription keys on the directory rename/move event, not on content
+mtime), and `watched_directory` does **not** change that (it only redirects WHICH
+directory's move events Envoy watches, e.g. for k8s ConfigMap symlink swaps).
+**Consequence:** the differential harness must rewrite the RDS file via
+**atomic-rename** (write-temp-then-`rename`) so BOTH proxies reload deterministically;
+in-place rewrite would silently reload only envoy-rust. envoy-rust's watcher is
+**poll-based on `std::fs::metadata().modified()` (mtime)** — the recorded mechanism
+divergence (Envoy = inotify-on-move, near-instant; envoy-rust = interval poll) — and
+mtime detects BOTH an atomic-rename (the moved-in inode carries a fresh mtime) AND an
+in-place rewrite, so envoy-rust is strictly more permissive; both CONVERGE post-settle.
+No `watched_directory` config schema is added (ADR-0066 — Task 9 N/A). Settle latency
+~50 ms on Envoy; the harness waits for convergence on a discriminating observable
+(the routed-to cluster / the `config_reload` counter advancing), never a fixed sleep.
+
+**(h) Atomic-apply + in-flight isolation (§6.2 P1/P7).** The reload swaps the route
+table with no listener drop and no dropped traffic (verified under concurrent load).
+A request that began under the old table **completes under the old table** — each
+request reads the current route-table `Arc` ONCE at entry and holds that snapshot for
+its lifetime (§5.4 read-once); only NEW requests see the swapped table. Verified
+bilaterally on Envoy (a 5 s in-flight request completed under the pre-reload route
+table when the reload landed mid-flight).
+
+**(i) Reload disposition — the warm-reject taxonomy (§6.2 P5; §5.5; ADR-0066).** At
+RELOAD the proxy is already serving, so — unlike the ADR-0049 all-fatal STARTUP
+posture — a bad reload is **warm-rejected** (last-good table KEPT, the failure counter
+ticked, NO crash, NO dropped traffic):
+
+| Reloaded-file fault | Envoy | envoy-rust |
+|---|---|---|
+| Valid change (new route table) | apply; `update_attempt`+`update_success`+`config_reload` each +1 | apply (atomic `store`); same counters +1 — **agrees** |
+| Malformed YAML / IO / parse error | keep last-good; `update_failure` +1 | keep last-good; `update_failure` +1 — **agrees** |
+| `route_config_name` absent from the envelope | keep last-good; `update_rejected` +1 | keep last-good; `update_rejected` +1 — **agrees** |
+| Route → UNKNOWN cluster | **ACCEPT + apply** the broken table; `update_success`+`config_reload` +1; serve `503`/`no_cluster` on that route; last-good NOT kept | **keep last-good; `update_rejected` +1** (re-validates route→cluster refs against the immutable live cluster set) — **RECORDED DIVERGENCE (ADR-0066)** |
+
+The unknown-cluster divergence exists because envoy-rust's request path resolves a
+route's cluster via `cluster_mgr.get(name).expect(…)` (`crates/envoy-http1/src/hcm.rs:818`)
+— installing an unknown-cluster route would panic the proxy (worse than Envoy's 503).
+Matching Envoy's accept-and-503 would need a request-time missing-cluster→503 synth
+path on both codecs (out of minimum-viable scope). The divergence is **unobservable in
+fixture 0034** (its bad-reload probe drives the malformed → `update_failure` case, where
+both proxies agree) and surfaces only in the envoy-rust-only in-process backstop.
+
+**(j) `/config_dump` `RoutesConfigDump` on reload (§6.2 P6).** The
+`dynamic_route_configs[]` entry reflects the reload: its embedded `route_config`
+shows the NEW table and `last_updated` (RFC3339 ms timestamp) changes. **No
+`version_info` key** is emitted for file-based RDS on EITHER proxy (it is simply never
+populated — already the phase-20 envoy-rust `RoutesConfigDump` shape, §(f); confirmed
+unchanged on reload). Fixtures 0026/0027 `configs[]` indices are unaffected. The
+renderer reads through the swappable route-table handle (`current_route_config()`) so a
+post-reload dump is current (Task 6). Emission stays RDS-conditional (phase-20 §(f)).
 
 ### Filesystem transport (`path_config_source`) — phase 21 EDS extension
 

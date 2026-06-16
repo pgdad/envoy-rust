@@ -10,32 +10,27 @@
 
 ---
 
-## ⚠️ STATUS: DRAFT — §6.2 EMPIRICAL VERIFICATION DEFERRED TO STATE-3 TASK 1 (LINUX-ONLY)
+## ✅ STATUS: §6.2 EMPIRICALLY VERIFIED at state-3 Task 1 (Linux) — ADR-0066 FIRED — Tasks 4/6/7/8/9 UNBLOCKED
 
-**This PLAN was authored in macOS-deferred mode (a deliberate, user-approved departure from the verify-at-PLAN-write cadence).** The phase-26 §6.2 empirical verification **MUST run on Linux** — the RDS hot-reload trigger (a file change observed inside the Envoy container) is unobservable on macOS Docker Desktop virtiofs (SPEC §0 finding 4 / §5.7 / ADR-0049 Provenance). The PLAN-write session was on macOS, so §6.2 was NOT run and the §6.2-dependent shapes are NOT yet locked.
+**The macOS-deferred §6.2 empirical verification was run on Linux as state-3 Task 1 (2026-06-16) against `envoyproxy/envoy:v1.33.0` and the shapes are now LOCKED.** The DRAFT projections below are replaced by verified facts; **ADR-0066 FIRED** (P2, P5(iii), and P6 diverged materially — see DECISIONS.md ADR-0066 + the §6.2-VERIFIED section below + PROGRESS Task 1). DECISIONS.md ledger head is now **ADR-0066** (count 67). The §6.2-DEPENDENT tasks (Task 4 reload pipeline; Task 6 config_dump; Task 7 harness reload op; Task 8 fixture 0034) are UNBLOCKED. **Task 9 (`watched_directory`) does NOT fire** (no schema change). **The §6.1 split does NOT fire** (single phase confirmed; ADR-0067 stays unfired).
 
-**Consequence — the standard cadence is shifted by one state:**
+**Cadence note (historical):** §6.2 normally runs at the state-2 PLAN-write; here it was deferred to state-3 Task 1 because the reload trigger is unobservable on macOS Docker Desktop virtiofs (SPEC §0 finding 4 / §5.7 / ADR-0049). The foundation Tasks 2 + 3 (route-table-handle migration; `RdsWatcher` skeleton) landed BEFORE Task 1 (they are §6.2-independent). **Important environment caveat carried forward:** even this Linux host runs Docker Desktop (virtiofs bind-mounts do NOT propagate inotify into the container) — the Task-1 probe got real reloads only via a Docker volume + `docker exec`. Fixture 0034's differential reload therefore remains **Linux-CI-authoritative on a NATIVE-Linux runner** (real bind-mount inotify), NOT locally observable here. Local verification = the in-process backstop (Task 8).
 
-- Normally §6.2 runs at the state-2 PLAN-write and locks the shapes + fires the reconciliation ADR before any code. Here, **§6.2 becomes Task 1 of state-3** — run on Linux, FIRST, before any §6.2-dependent task.
-- **ADR-0066 is NOT fired at this PLAN-write** (it cannot be evaluated without §6.2). It is fired **inline during Task 1** if §6.2 diverges materially from the projections below (the `watched_directory` schema field / the reload-counter values / the bad-reload disposition / the config_dump-version shape). DECISIONS.md ledger head stays **ADR-0065** until Task 1.
-- The §6.2-INDEPENDENT foundation tasks (Task 2 the route-table-handle migration; Task 3 the watcher poll-loop skeleton) **may be implemented before Task 1** — they depend on the code anchors (verified on macOS below), not on Envoy's reload semantics. The §6.2-DEPENDENT tasks (Task 4 reload-pipeline stat/disposition semantics; Task 6 config_dump version; Task 7 the harness reload operation; Task 8 fixture 0034) are **BLOCKED on Task 1** and carry projected values clearly labelled "§6.2-PENDING — confirm/replace from Task 1's record."
-- **Projected values below are the SPEC's projections, NOT verified facts.** Every one marked `[§6.2-PENDING]` is a hypothesis Task 1 confirms or corrects.
-
-**Recommended state-3 ordering:** Task 1 (Linux §6.2) → Task 2 + Task 3 (foundation; can also precede Task 1) → Tasks 4–9 (§6.2-locked).
+**State-3 ordering (Task 1 DONE):** ~~Task 1 (Linux §6.2)~~ ✅ → ~~Task 2 + Task 3 (foundation)~~ ✅ → **Tasks 4 → 5 → 6 → 7 → 8 → (9 N/A) → 10** (§6.2-locked, the next unstarted is Task 4).
 
 ---
 
-## §6.2 projections (UNVERIFIED — to be confirmed/replaced by state-3 Task 1 on Linux)
+## §6.2 VERIFIED (state-3 Task 1, Linux, 2026-06-16 — ADR-0066) — the locked facts the downstream tasks consume
 
-The SPEC §6.2 7-item checklist (`docs/envoy-rust/phases/26-xds-rds-hot-reload/SPEC.md`). Projected dispositions the downstream tasks assume until Task 1 records the truth:
+The SPEC §6.2 7-item checklist, RESOLVED (full transcript: PROGRESS Task 1; decision record: ADR-0066):
 
-- **P1 (reload happens + readiness)** `[§6.2-PENDING]` — editing the RDS file under a running Envoy re-routes traffic without a restart; the listener stays up. Settle latency informs the Task 7 harness wait bound.
-- **P2 (file-change operation — THE most consequential)** `[§6.2-PENDING]` — projected: in-place truncate-rewrite triggers Envoy's default file-watch; atomic-rename may be MISSED without `watched_directory`. **If atomic-rename is required → phase 26 adds `ConfigSource.watched_directory` (parse-and-honor) + one fuzz seed (Task 9) + ADR-0066 fires.** The Task 7 harness uses whatever operation Task 1 proves triggers BOTH proxies.
-- **P3 (distinguishable backends)** `[§6.2-PENDING]` — projected: two real `http1-echo-server` clusters distinguished by the per-cluster `cluster.<name>.upstream_rq_total` discriminator (no echo-body marker needed). Confirm a single-endpoint-per-cluster pair suffices.
-- **P4 (reload counter values)** `[§6.2-PENDING]` — projected `update_attempt/update_success/config_reload = 2/2/2` after one successful reload; `config_reload` ticks on each reload.
-- **P5 (bad-reload disposition — locks §5.5 + Task 4)** `[§6.2-PENDING]` — projected: malformed YAML → `update_failure`+last-good kept; missing `route_config_name` / unknown-cluster route → `update_rejected`+last-good kept; no traffic dropped. envoy-rust MATCHES (warm-reject, not all-fatal — the one ADR-0049 carve-out).
-- **P6 (config_dump on reload)** `[§6.2-PENDING]` — projected: `dynamic_route_configs[].route_config` reflects the NEW routes; `version_info` and/or `last_updated` change; fixtures 0026/0027 `configs[]` indices unaffected.
-- **P7 (in-flight isolation — opportunistic)** `[§6.2-PENDING]` — projected: a request begun pre-reload completes under the old table (backstop-only; §5.4).
+- **P1 (reload happens + readiness) — MATCHES.** Editing the RDS file under a running Envoy re-routes live traffic with no restart; **settle latency ~50 ms** (6–60 ms observed → the Task-7 harness wait bound is a bounded wait-for-convergence on a discriminating observable, NOT a fixed sleep); the listener stays up (zero drops under concurrent load).
+- **P2 (file-change operation) — DIVERGES → drives Task 7 + drops Task 9.** Envoy's default file-watch reloads on **ATOMIC-RENAME ONLY** (write-temp-then-`mv`); **in-place truncate-rewrite is NEVER detected** (confirmed 3×), and `watched_directory` does NOT rescue in-place. **`watched_directory` is NOT required → Task 9 does NOT fire (no config-schema change).** The Task-7 harness MUST rewrite the fixture file via atomic-rename so BOTH proxies reload. envoy-rust's poll-based mtime watcher detects atomic-rename (fresh inode mtime) → the landed Task-3 skeleton needs no change.
+- **P3 (distinguishable backends) — MATCHES.** `cluster.backend_a.upstream_rq_total` vs `cluster.backend_b.upstream_rq_total` cleanly discriminates the routed-to cluster; one STATIC endpoint per cluster suffices.
+- **P4 (reload counter values) — MATCHES.** `update_attempt/update_success/update_failure/update_rejected/config_reload` = `1/1/0/0/1` (boot) → `2/2/0/0/2` (one reload) → `3/3/0/0/3` (two). `update_attempt`+`update_success`+`config_reload` each +1 per successful reload. Fixture 0034 asserts `2/2/…/2` after its one reload.
+- **P5 (bad-reload disposition — locks §5.5 + Task 4) — PARTIALLY DIVERGES.** {malformed YAML / IO / parse → `update_failure` +1, last-good KEPT} — MATCHES; {`route_config_name` absent → `update_rejected` +1, last-good KEPT} — MATCHES; {route → UNKNOWN cluster → **Envoy ACCEPTS** (`update_success`+`config_reload` +1, serves 503/`no_cluster`, last-good NOT kept)} — **DIVERGES**. **envoy-rust does NOT mirror the unknown-cluster acceptance**: it re-validates route→cluster refs against the immutable live cluster set and **warm-rejects** (`update_rejected` +1, last-good KEPT) — a recorded deliberate divergence (ADR-0066), because the request path `.expect()`s cluster existence (`hcm.rs:818`) and matching Envoy would need a request-time 503 synth path out of scope; unobservable in fixture 0034 (backstop-only).
+- **P6 (config_dump on reload) — MINOR DIVERGENCE (already-correct in envoy-rust).** `dynamic_route_configs[]` keys are `[@type, route_config, last_updated]` — **NO `version_info`** for file-RDS (already the phase-20 `RoutesConfigDump` shape — endpoint.rs); `last_updated` changes; `route_config` reflects the NEW table. Task 6 only needs the renderer to read through the swappable handle. 0026/0027 indices unaffected.
+- **P7 (in-flight isolation) — MATCHES (resolved).** A request begun pre-reload completes under the OLD table (verified on Envoy with a 5 s in-flight request); only NEW requests see the swap (§5.4 read-once). Backstop asserts the same for envoy-rust.
 
 ---
 
@@ -50,9 +45,9 @@ The SPEC §6.2 7-item checklist (`docs/envoy-rust/phases/26-xds-rds-hot-reload/S
 
 ---
 
-## §6.1 split-gate decision (projected SINGLE PHASE — split NOT fired at this PLAN-write; re-evaluate at Task 1)
+## §6.1 split-gate decision — RE-EVALUATED at Task 1: SINGLE PHASE CONFIRMED (ADR-0067 stays UNFIRED)
 
-Projected surface (SPEC §6.1): D1 ~120 (+120 tests) · D2 ~150 (+100) · D3 ~140 (+150) · D4 ~60 (+50) · D5 ~70 (+50) · D6 ~160 (+60) · D7 ~220 · D8 ~200 = **~1200–1600 LoC / 9 implementation tasks + a §6.2 task + a state-4 task**. **Under the §6.1 ~1500-LoC / ~25-task gate — single phase.** Re-evaluate at Task 1: if §6.2 forces `watched_directory` (Task 9) + materially grows D3/D7, and the refined estimate crosses the gate, split at the SPEC §1 seam (`26.1` = Tasks 1–3 + the in-process backstop [foundation; regression-equivalence incl. 0028's idle watcher] / `26.2` = Tasks 4–9 [stat-tick + config_dump + harness + fixture 0034 + close]) with **ADR-0067** — a Task-1 decision.
+Projected surface (SPEC §6.1): D1 ~120 (+120 tests) · D2 ~150 (+100) · D3 ~140 (+150) · D4 ~60 (+50) · D5 ~70 (+50) · D6 ~160 (+60) · D7 ~220 · D8 ~200 = **~1200–1600 LoC / 9 implementation tasks + a §6.2 task + a state-4 task**. **Re-evaluated at Task 1 (§6.2 verified): the refined surface is at or UNDER the projection — Task 9 (`watched_directory`) does NOT fire (no schema change), Task 4's unknown-cluster handling is the already-planned re-validate-and-reject (no extra request-time code), and Task 6 shrinks (`version_info` already absent — read-through-handle only). Below the ~1500-LoC / ~25-task gate → SINGLE PHASE CONFIRMED; ADR-0067 stays UNFIRED.**
 
 ---
 
@@ -72,7 +67,9 @@ Projected surface (SPEC §6.1): D1 ~120 (+120 tests) · D2 ~150 (+100) · D3 ~14
 
 ---
 
-### Task 1: §6.2 empirical verification on LINUX (run FIRST; fires ADR-0066 if divergent)
+### Task 1: §6.2 empirical verification on LINUX (run FIRST; fires ADR-0066 if divergent) — ✅ DONE (2026-06-16; ADR-0066 FIRED)
+
+**✅ DONE.** Ran on Linux against `envoyproxy/envoy:v1.33.0` (digest `sha256:56da5afd…`). Findings locked in the "§6.2 VERIFIED" section above; reconciliation in **ADR-0066** (P2 atomic-rename-only + Task-9-N/A; P5(iii) unknown-cluster recorded divergence; P6 `version_info`-absent already-correct; §6.1 single-phase confirmed). Full probe transcript: PROGRESS Task 1. All 6 steps below completed.
 
 **This task MUST run on a Linux host / Linux CI** — the reload trigger is macOS-unobservable (SPEC §5.7 / ADR-0049). It replaces the PLAN-write §6.2 the macOS session could not run.
 
@@ -107,13 +104,17 @@ Projected surface (SPEC §6.1): D1 ~120 (+120 tests) · D2 ~150 (+100) · D3 ~14
 - [ ] **Step 5: Run + clippy + workspace.** `cargo test -p envoy-http1`, `cargo test --workspace` (incl. 0028's now-spawned-but-idle watcher path), `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - [ ] **Step 6: Commit** + PROGRESS commit.
 
-### Task 4: The reload pipeline (re-parse → re-validate → atomic swap; stat-tick + warm-reject) — §6.2-DEPENDENT (P4/P5), BLOCKED on Task 1
+### Task 4: The reload pipeline (re-parse → re-validate → atomic swap; stat-tick + warm-reject) — §6.2-LOCKED (P4/P5), UNBLOCKED (Task 1 done) — NEXT TASK
 
 **Files:** `crates/envoy-http1/src/rds_watcher.rs` (the real `reload`); `crates/envoy-config/src/lib.rs`/`rds.rs` (expose a `reparse_and_select_route_config(path, name, &cluster_set) -> Result<RouteConfiguration, ConfigError>` reusing the phase-20 parser+validator).
 
-- [ ] **Step 1: Write the failing reload tests (happy + warm-reject).** Happy: a valid file change → `store_route_config` lands the new table + `update_attempt`/`update_success`/`config_reload` tick **the Task-1-recorded values** (P4). Warm-reject: a malformed file → last-good kept + `update_failure` ticks (P5); a vanished `route_config_name` / unknown-cluster route → last-good kept + `update_rejected` ticks (P5). Drive via `tokio::time` + temp files in-process.
+**§6.2-LOCKED bad-reload taxonomy (ADR-0066 P5 — map error class → counter):** {file unreadable / IO error / malformed YAML / parse error → `update_attempt`+`update_failure`, KEEP last-good}; {`route_config_name` not present in the reloaded envelope → `update_attempt`+`update_rejected`, KEEP last-good}; {a reloaded route references an UNKNOWN cluster → `update_attempt`+`update_rejected`, KEEP last-good — the **recorded deliberate divergence** from Envoy's accept-and-503, because the request path `.expect()`s cluster existence at `crates/envoy-http1/src/hcm.rs:818`; envoy-rust re-validates route→cluster refs against the immutable live cluster set and warm-rejects}. Happy path (P4): `update_attempt`+`update_success`+`config_reload` each +1.
+
+**CARRY-FORWARD review notes folded in here (from the Task-2 code-quality review, non-blocking):** **(a)** add a one-line note at `hcm.rs` `store_route_config` that the poison-recovery (`unwrap_or_else(|p| p.into_inner())`) is safe ONLY while the write critical section is a single `*guard = rc` Arc move — so this reload pipeline MUST do the reparse/revalidate **OUTSIDE the write lock**, then a single `store_route_config` (do NOT widen the write critical section; load-bearing for warm-reject correctness). **(b)** tidy the stale `resolve_route` inline comment ("we yield BOTH …") — a leftover from the pre-`ResolvedRoute` two-value design; it now yields one owned `ResolvedRoute`.
+
+- [ ] **Step 1: Write the failing reload tests (happy + warm-reject).** Happy: a valid file change → `store_route_config` lands the new table + `update_attempt`/`update_success`/`config_reload` each +1 (P4 = `2/2/…/2` after one reload). Warm-reject: a malformed file → last-good kept + `update_failure` +1; a vanished `route_config_name` → last-good kept + `update_rejected` +1; an unknown-cluster route → last-good kept + `update_rejected` +1 (the recorded divergence). Drive via `tokio::time` + temp files in-process; rewrite the temp file via **atomic-rename** to mirror the harness (though in-process the mtime poll catches either).
 - [ ] **Step 2: Run — expect FAIL** (reload is the Task-3 no-op stub).
-- [ ] **Step 3: Implement `reload`.** Re-read file → `reparse_and_select_route_config` (reuse phase-20 `rds.rs` parse + the route→cluster validator against the immutable live cluster set) → on `Ok`: `store_route_config(Arc::new(new))` + tick attempt/success/config_reload + bump the config_dump version (Task 6 hook) ; on `Err`: KEEP the handle + tick attempt + failure/rejected per the error class (the §5.5 warm-reject — **NOT** all-fatal). Map error classes to counters per the Task-1 P5 record.
+- [ ] **Step 3: Implement `reload`.** Re-read file → `reparse_and_select_route_config` (reuse phase-20 `rds.rs` parse + the route→cluster validator against the immutable live cluster set) **OUTSIDE the write lock** (carry-forward (a)) → on `Ok`: a single `store_route_config(Arc::new(new))` + tick attempt/success/config_reload (config_dump version is handled by Task 6 reading through the handle — no separate bump needed) ; on `Err`: KEEP the handle + tick attempt + failure/rejected per the §6.2-LOCKED taxonomy above (the §5.5 warm-reject — **NOT** all-fatal). Apply carry-forwards (a) + (b).
 - [ ] **Step 4: Run + clippy.** PASS; warm-reject paths assert the table is byte-unchanged after a bad reload.
 - [ ] **Step 5: Commit** + PROGRESS commit.
 
@@ -124,27 +125,31 @@ Projected surface (SPEC §6.1): D1 ~120 (+120 tests) · D2 ~150 (+100) · D3 ~14
 - [ ] **Step 1: Write the failing test** — the watcher target carries the SAME `Arc<Counter>` handles the HCM registered at construction (phase-20 `register_rds_stats`), and a reload increments THOSE registry counters (scrape-visible), not a private copy.
 - [ ] **Step 2: Run — FAIL.** **Step 3: Thread the handles** from the HCM construction site into the target list build (the 06.x `Arc<Counter>`-shared-handle idiom). **Step 4: Run + clippy.** **Step 5: Commit** + PROGRESS.
 
-### Task 6: `/config_dump` `RoutesConfigDump` reads through the swappable handle + version/`last_updated` on reload — §6.2-DEPENDENT (P6), BLOCKED on Task 1
+### Task 6: `/config_dump` `RoutesConfigDump` reads through the swappable handle — §6.2-LOCKED (P6), UNBLOCKED (Task 1 done) — NARROWED
 
 **Files:** `crates/envoy-admin/src/endpoint.rs` (`ConfigDumpEntry::Routes`).
 
-- [ ] **Step 1: Write the failing test** — after a reload, `/config_dump` `RoutesConfigDump` reflects the NEW route table + the Task-1-recorded version/`last_updated` shape (P6); pre-reload it shows the initial table. **Step 2: Run — FAIL** (renderer reads a startup snapshot). **Step 3: Implement** — render through `current_route_config()` (Task 2) + carry the version/timestamp updated by Task 4; keep emission conditional on `rds` (phase-20 conditionality; 0026/0027 untouched). **Step 4: Run + clippy.** **Step 5: Commit** + PROGRESS.
+**§6.2-LOCKED (P6 / ADR-0066):** NO `version_info` for file-RDS (already the phase-20 `RoutesConfigDump` shape — endpoint.rs already omits it); `last_updated` is already render-time `now()` (already changes per dump). **So Task 6 shrinks to ONE thing: render `route_config` THROUGH the swappable handle (`current_route_config()`) so a post-reload `/config_dump` reflects the NEW table** — no version field, no separate timestamp plumbing.
 
-### Task 7: Harness — mid-test fixture-file rewrite + settle-then-probe — §6.2-DEPENDENT (P1/P2), BLOCKED on Task 1
+- [ ] **Step 1: Write the failing test** — after a reload (drive via Task-4 `store_route_config`), `/config_dump` `RoutesConfigDump.route_config` reflects the NEW route table; pre-reload it shows the initial table. **Step 2: Run — FAIL** (renderer reads a startup snapshot). **Step 3: Implement** — render through `current_route_config()` (Task 2); keep `last_updated` as-is (render-now); NO `version_info` (unchanged); keep emission conditional on `rds` (phase-20 conditionality; 0026/0027 untouched). **Step 4: Run + clippy.** **Step 5: Commit** + PROGRESS.
+
+### Task 7: Harness — mid-test fixture-file rewrite (ATOMIC-RENAME) + settle-then-probe — §6.2-LOCKED (P1/P2), UNBLOCKED (Task 1 done)
 
 **Files:** `crates/.../tests/differential/src/lib.rs` (a new probe-step type + the expectations schema extension).
 
-- [ ] **Step 1: Write the failing harness-unit test** — a "reload step" writes per-side-rendered new contents to the SAME mounted path using the **Task-1-confirmed file-change operation** (P2: in-place rewrite, or atomic-rename if `watched_directory`), then settles via bounded wait-for-convergence on a discriminating observable (the routed-to cluster, or `config_reload` advancing — the 12.2 pattern, NOT a fixed sleep, bounded by the Task-1 settle latency). **Step 2: Run — FAIL.** **Step 3: Implement** the reload step + the expectations "reload" + post-reload probe/assert block (generalize the phase-20 `{{RDS_PATH}}` machinery). **Step 4: Run.** **Step 5: Commit** + PROGRESS.
+**§6.2-LOCKED (P2 / ADR-0066):** the reload step MUST rewrite the mounted RDS file via **ATOMIC-RENAME** (render new per-side contents to a temp file ON THE SAME MOUNT, then `std::fs::rename`/`mv` over the watched path) — the ONLY operation that triggers BOTH proxies (Envoy's default file-watch ignores in-place truncate-rewrite). Settle via bounded wait-for-convergence (the 12.2 pattern), bounded by the ~50 ms Task-1 settle latency (with generous slack). **NOTE:** under Docker Desktop virtiofs (this host) the Envoy-side reload is NOT observable locally — fixture 0034's differential evidence is **native-Linux-CI-authoritative** (§5.7 / ADR-0066); the harness step is unit-tested in isolation locally, the full differential runs on CI.
 
-### Task 8: Fixture `0034-xds-rds-hot-reload` + Docker-gated wrapper + in-process backstop — §6.2-DEPENDENT, BLOCKED on Task 1
+- [ ] **Step 1: Write the failing harness-unit test** — a "reload step" writes per-side-rendered new contents to a temp file on the mount then atomic-renames over the SAME mounted path, then settles via bounded wait-for-convergence on a discriminating observable (the routed-to cluster, or `config_reload` advancing — NOT a fixed sleep). **Step 2: Run — FAIL.** **Step 3: Implement** the atomic-rename reload step + the expectations "reload" + post-reload probe/assert block (generalize the phase-20 `{{RDS_PATH}}` machinery). **Step 4: Run.** **Step 5: Commit** + PROGRESS.
+
+### Task 8: Fixture `0034-xds-rds-hot-reload` + Docker-gated wrapper + in-process backstop — §6.2-LOCKED, UNBLOCKED (Task 1 done; fixture differential is NATIVE-Linux-CI-authoritative, backstop is the local complement)
 
 **Files:** Create `tests/fixtures/0034-xds-rds-hot-reload/` (`envoy.yaml`/`envoy-rust.yaml`/initial+reload+malformed RDS templates/`expectations.yaml`/`README.md`), `tests/differential/tests/xds_rds_hot_reload.rs` (Docker-gated; **Linux-CI-authoritative — README notes macOS-local-unobservability**), `crates/envoy-bin/tests/xds_rds_hot_reload.rs` (the `tokio::time`-controlled backstop: happy reload + the 4 negative paths + in-flight isolation; the deterministic local complement to the Linux-only differential).
 
 - [ ] **Step 1: Author the fixture** (two distinguishable `http1-echo-server` clusters per P3; the §1 three-phase pre→reload→post sequence + the bad-reload probe; assert P4 counter values + P6 config_dump). **Step 2: Author the backstop** (covers the paths the Linux-only fixture can't cleanly drive). **Step 3: Run the backstop locally** (`cargo test -p envoy-bin xds_rds_hot_reload`) — pre-build `tests/helpers/*` first (per `project_flaky_access_log_fixture_0012`). **Step 4: Verify the fixture on Linux CI** (the differential evidence). **Step 5: Commit** + PROGRESS.
 
-### Task 9: Conditional — `ConfigSource.watched_directory` field + fuzz seed — FIRES ONLY IF Task 1 P2 requires it
+### Task 9: ~~Conditional — `ConfigSource.watched_directory` field + fuzz seed~~ — ❌ DOES NOT FIRE (Task 1 P2 / ADR-0066)
 
-**Files (conditional):** `crates/envoy-config/src/bootstrap.rs` (`ConfigSource.watched_directory: Option<WatchedDirectory>` parse-and-honor; today rejected by `deny_unknown_fields`); `crates/envoy-config/fuzz/corpus/parse_bootstrap/config_source_watched_directory.yaml` (corpus +1). Only if Task 1 proved Envoy needs `watched_directory` for the reload operation. If unfired, record "Task 9 N/A — in-place rewrite triggered both proxies" in PROGRESS.
+**N/A — no work.** Task 1 P2 proved Envoy reloads on ATOMIC-RENAME with NO `watched_directory` needed (and `watched_directory` does not even rescue the in-place case). The Task-7 harness uses atomic-rename; envoy-rust's mtime poll detects it. **NO config-schema change, NO new fuzz seed.** Recorded "Task 9 N/A" in PROGRESS + ADR-0066. Skip to Task 10.
 
 ### Task 10: State-4 phase-done verification + STATE advance to state-5-next
 

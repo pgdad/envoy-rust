@@ -33,9 +33,81 @@ Task 1 (PLAN §"Task 1") runs the SPEC §6.2 7-item checklist on a Linux host / 
 
 ---
 
-## Task 1 — §6.2 empirical verification on Linux (fires ADR-0066 if divergent)
+## Task 1 — §6.2 empirical verification on Linux (ADR-0066 FIRED)
 
-_(pending — state-3, Linux)_
+**Done (state-3, Linux, 2026-06-16).** Ran the SPEC §6.2 7-item checklist on a Linux host
+against `envoyproxy/envoy:v1.33.0` (digest
+`sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`) via a read-only
+probe rig (the ADR-0063 sidecar methodology). **ADR-0066 FIRES** — P2, P5(iii), and P6 diverged
+materially from the SPEC projections. No production/test code changed this task (docs +
+DECISIONS only): PLAN.md `[§6.2-PENDING]` projections replaced with verified facts, the
+BEHAVIOR_CONTRACT §2.1 RDS-reload-semantics rows + §2.2 hot-reload subsection authored, and
+ADR-0066 landed.
+
+**Probe rig + the load-bearing environment caveat (REINFORCES §5.7 / ADR-0049).** The Linux host
+runs **Docker Desktop (a VM)**: (i) `--network host` binds the VM's net not the real host →
+used bridge networking + published ports; (ii) **host bind-mounts do NOT propagate inotify into
+the container** (virtiofs — the SAME limitation as macOS) → Envoy saw new file *content* but
+never got a watch event, so NO reload fired for host-side edits. The probe got real reloads only
+by putting the RDS file in a **Docker volume** and editing it **inside the container via
+`docker exec`** (writes on the container's real ext4, where inotify works). Rig: admin `9901`,
+H1 HCM listener `10000` (`stat_prefix: ingress_http`, `rds: { route_config_name: local_route,
+config_source: { path_config_source: { path: /data/rds.yaml }}}`, router-only filter chain), two
+STATIC clusters `backend_a`/`backend_b` → one backend container (`STRICT_DNS backend:18080`),
+distinguished by `cluster.<name>.upstream_rq_total`. **CONSEQUENCE for Task 8: fixture 0034's
+differential reload is Linux-CI-authoritative on a NATIVE-Linux runner** (real bind-mount
+inotify), NOT locally observable under Docker Desktop; local verification = the in-process
+backstop.
+
+**Findings (P1–P7) — verbatim evidence:**
+
+- **P1 (reload + readiness) — MATCHES.** Atomic-rename backend_a→backend_b under 60 concurrent
+  probes: `RELOAD settled (update_success 1->2) after .048110191s`; routing after =
+  `backend_a:3 / backend_b:61`; listener codes during reload = `404 ×60, ZERO 000` (no drop).
+  Settle ~50 ms (6–60 ms range).
+- **P2 (file-change operation) — DIVERGES (load-bearing).** Default config (no `watched_directory`),
+  edits INSIDE the container: **in-place truncate-rewrite** (`cat >`, `python open('w')`,
+  truncate-append) → **3/3 NO reload** (counters frozen at 1). **atomic-rename** (`cp tmp; mv -f
+  tmp rds.yaml`) → **3/3 RELOAD** (~6–60 ms, counters +1, routing flips). `watched_directory`
+  re-test (it lives under `path_config_source`, NOT `config_source` — the latter fails boot
+  `no such field`): in-place STILL 0/3, atomic still works. **⇒ atomic-rename ONLY;
+  `watched_directory` NOT required and does NOT rescue in-place.** Inverts the projection.
+- **P3 (distinguishable backends) — MATCHES.** After reload#2 (→backend_a): `backend_a 3→5`,
+  `backend_b` held at 61. Per-cluster `upstream_rq_total` discriminates cleanly; one endpoint
+  per cluster suffices.
+- **P4 (counter values) — MATCHES.** `update_attempt/update_success/update_failure/update_rejected/config_reload`
+  = `1/1/0/0/1` (boot) → `2/2/0/0/2` (reload#1) → `3/3/0/0/3` (reload#2). Each successful reload
+  ticks attempt+success+config_reload by exactly 1. (Other Envoy-only `rds.local_route.*`:
+  `version` [64-bit hash], `version_text: ""`, `update_time`, `config_reload_time_ms`,
+  `update_duration`, `update_empty: 0`, `init_fetch_timeout: 0` — unasserted.)
+- **P5 (bad-reload disposition) — PARTIALLY DIVERGES.** While serving backend_b, atomic-rename to:
+  (i) malformed YAML → `update_failure +1`, last-good KEPT (backend_b, no drop) — MATCHES;
+  (ii) wrong `route_config_name` → `update_rejected +1`, last-good KEPT — MATCHES;
+  (iii) route → unknown cluster → **`update_success +1` + `config_reload +1` (Envoy ACCEPTS +
+  APPLIES the broken table)**, then `/probe` → **503** with `http.ingress_http.no_cluster`
+  incrementing, last-good NOT kept (re-confirmed 2×) — **DIVERGES**. Envoy does NOT cross-check
+  cluster existence on a filesystem-RDS update. **envoy-rust DECISION (ADR-0066): re-validate +
+  warm-REJECT (`update_rejected` + keep last-good)** — because the request path
+  `.expect()`s cluster existence at `hcm.rs:818` (installing the route would panic, worse than
+  503); recorded divergence, unobservable in fixture 0034 (backstop-only).
+- **P6 (config_dump) — MINOR DIVERGENCE (already-correct in envoy-rust).** `dynamic_route_configs[]`
+  keys = `[@type, route_config, last_updated]`. **`version_info` ABSENT** (never populated for
+  file-RDS — already the phase-20 envoy-rust shape). `last_updated` changes (`2026-06-16T08:37:53.875Z`
+  → `…08:42:47.532Z`); `route_config.virtual_hosts[].routes[].route.cluster` reflects
+  `backend_a`→`backend_b`. 0026/0027 indices unaffected.
+- **P7 (in-flight isolation) — MATCHES (resolved).** Routed `/probe`→`backend_slow` (5 s delay),
+  started request, atomic-reloaded →backend_a mid-flight: `SLOW-RESP|HTTP=200|t=5.002849`;
+  `backend_a:0 / backend_slow:1`. The in-flight request completed under the OLD table.
+
+**ADR posture.** **ADR-0066 FIRED** (commit title carries `[ADR-0066]`). DECISIONS ledger head
+→ **ADR-0066** (count 67). Decisions: (1) Task 9 N/A — no `watched_directory`, no schema change;
+(2) Task-7 harness uses atomic-rename; (3) the warm-reject taxonomy {IO/parse→failure, name-absent
+→rejected, unknown-cluster→rejected [recorded divergence]}; (4) Task 6 narrows to read-through-handle
+(`version_info` already absent); (5) §6.1 single phase CONFIRMED — **ADR-0067 stays UNFIRED**.
+Containers/volume/network all cleaned up; no repo files touched by the probe (all scratch in
+`/tmp` + Docker objects).
+
+**Task 9 N/A — atomic-rename triggers the reload; `watched_directory` not required** (P2 / ADR-0066).
 
 ## Task 2 — route-table-handle migration (`Arc<RouteConfiguration>` → swappable handle) [§6.2-INDEPENDENT]
 
