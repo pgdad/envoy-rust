@@ -86,6 +86,46 @@ impl UpstreamProxy {
     pub fn host_admin_port(&self) -> Option<u16> {
         self.host_admin_port
     }
+
+    /// 26 Task 7: atomic-rename `new_content` over the in-container RDS file
+    /// (`RDS_CONTAINER_PATH`) via `docker exec` — base64-decode into a temp path on the
+    /// container's own filesystem, then `mv -f` over the watched path (atomic, same fs).
+    /// Must run INSIDE the container: virtiofs bind-mounts do not propagate inotify, so a
+    /// host-side rewrite would not trigger the container Envoy's watch (§6.2/ADR-0066).
+    ///
+    /// NOT locally unit-tested (requires Docker) — exercised by the Task-8 fixture on
+    /// native-Linux CI. `new_content` is base64-encoded on the host so it survives the
+    /// `sh -c` argv transit intact (arbitrary YAML bytes, newlines, quotes).
+    pub async fn reload_rds_atomic(&self, new_content: &str) -> Result<()> {
+        use base64::Engine as _;
+        use testcontainers::core::ExecCommand;
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(new_content.as_bytes());
+        // Decode into a temp path on the container's OWN filesystem (a sibling of
+        // the watched file, so `mv -f` is a same-fs atomic rename — the ONLY
+        // rewrite Envoy's default file-watch observes), then atomically swap.
+        let tmp = format!("{RDS_CONTAINER_PATH}.reload-tmp");
+        let script = format!(
+            "set -e; printf %s '{b64}' | base64 -d > '{tmp}'; mv -f '{tmp}' '{RDS_CONTAINER_PATH}'"
+        );
+        let result = self
+            ._container
+            .exec(ExecCommand::new(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                script,
+            ]))
+            .await
+            .context("docker exec for in-container RDS atomic-rename reload")?;
+        let code = result
+            .exit_code()
+            .await
+            .context("reading exit code of in-container RDS reload exec")?;
+        if code != Some(0) {
+            anyhow::bail!("in-container RDS atomic-rename reload exited with code {code:?}");
+        }
+        Ok(())
+    }
 }
 
 /// Start upstream Envoy with `envoy_yaml_path` bind-mounted to

@@ -272,6 +272,42 @@ pub enum Driver {
         #[serde(default)]
         post_admin_assertions: Vec<AdminAssertion>,
     },
+    /// 26 Task 7: an RDS hot-reload differential step. Runs `pre_probes` (bilateral
+    /// equivalence), then atomic-renames the post-reload RDS content over the watched
+    /// path on BOTH sides (subject host file + upstream container file), waits — bounded —
+    /// for both proxies to converge on the new table (polling `reload.discriminator`,
+    /// NOT a fixed sleep), then runs `post_probes` (bilateral equivalence). The
+    /// post-reload differential is NATIVE-Linux-CI-authoritative (the upstream reload is
+    /// unobservable under Docker Desktop virtiofs); the harness mechanics are unit-tested locally.
+    Http1RdsReload {
+        pre_probes: Vec<Http1Probe>,
+        reload: RdsReloadStep,
+        post_probes: Vec<Http1Probe>,
+    },
+}
+
+/// 26 Task 7: the reload directive inside `Driver::Http1RdsReload`. Carries the
+/// post-reload RDS template path (rendered per-side like `rds.yaml`), the
+/// convergence-wait bound, and the discriminating probe whose NEW-table response
+/// signals each side has converged.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RdsReloadStep {
+    /// Fixture-relative file holding the POST-reload RDS content, rendered per-side
+    /// exactly like `rds.yaml`. Default `rds-reload.yaml`.
+    #[serde(default = "default_reload_file")]
+    pub reload_file: String,
+    /// Bound (ms) for the wait-for-convergence poll. Generous slack over the ~50 ms
+    /// Task-1 settle latency (e.g. fixtures set 5000).
+    pub settle_budget_ms: u64,
+    /// The discriminating probe polled (each side) until its response reflects the NEW
+    /// table — its `expected_status` / `expected_body` define "converged". Bounded by
+    /// `settle_budget_ms`.
+    pub discriminator: Http1Probe,
+}
+
+fn default_reload_file() -> String {
+    "rds-reload.yaml".to_string()
 }
 
 /// 08.1 Task 11: one admin-listener sub-case inside `Driver::AdminScrape`.
@@ -1080,6 +1116,185 @@ pub fn write_temp(dir: &Path, name: &str, content: &str) -> Result<PathBuf> {
         std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
     f.write_all(content.as_bytes())?;
     Ok(path)
+}
+
+/// 26 Task 7: atomic-rename `new_content` over `target` — write to a sibling temp file
+/// in the SAME directory (so `rename` is a same-filesystem atomic swap, never a
+/// cross-device copy), then `std::fs::rename`. The ONLY rewrite operation that triggers
+/// Envoy's default file-watch (in-place truncate-rewrite does NOT — §6.2/ADR-0066).
+fn atomic_rename_over(target: &Path, new_content: &str) -> std::io::Result<()> {
+    // Deterministic sibling temp name in the SAME dir as `target` (appending a
+    // suffix to the file name keeps it on the same filesystem/mount, so the
+    // subsequent `rename` is a same-fs atomic swap rather than a cross-device
+    // copy). On success the temp is consumed by the rename; on the write path
+    // failing before the rename we remove it so no `.reload-tmp` leftover remains.
+    let mut tmp = target.as_os_str().to_owned();
+    tmp.push(".reload-tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, new_content.as_bytes())?;
+    match std::fs::rename(&tmp, target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup; propagate the original rename error.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// 26 Task 7: drive a single `Http1Probe` through BOTH proxies and apply the
+/// per-probe equivalence cascade (response_status / response_body / probe
+/// expected_status / expected_body / expected_headers) — the SAME cascade the
+/// `Driver::Http1ProbeList` arm runs inline. Factored out so the
+/// `Http1RdsReload` arm can reuse it for `pre_probes` AND `post_probes` without
+/// duplicating the cascade. `label` (e.g. "pre" / "post") prefixes the probe
+/// name in failure messages so a pre/post-reload mismatch is unambiguous.
+async fn run_http1_probe_bilateral(
+    upstream_addr: SocketAddr,
+    subject_addr: SocketAddr,
+    equivalence: &Equivalence,
+    probe: &Http1Probe,
+    label: &str,
+) -> Result<()> {
+    let upstream_resp = drive_http1(
+        upstream_addr,
+        &probe.method,
+        &probe.path,
+        &probe.host,
+        &probe.extra_headers,
+        probe.body.as_deref().map(str::as_bytes),
+    )
+    .await
+    .with_context(|| format!("upstream envoy http1 drive ({label} probe {})", probe.name))?;
+    let subject_resp = drive_http1(
+        subject_addr,
+        &probe.method,
+        &probe.path,
+        &probe.host,
+        &probe.extra_headers,
+        probe.body.as_deref().map(str::as_bytes),
+    )
+    .await
+    .with_context(|| format!("envoy-rust http1 drive ({label} probe {})", probe.name))?;
+
+    // Status: envoy ↔ envoy-rust under `response_status: exact`.
+    if matches!(equivalence.response_status, Some(StatusRule::Exact))
+        && upstream_resp.status != subject_resp.status
+    {
+        bail!(
+            "{label} probe {}: response status mismatch under `response_status: exact`\n  \
+             upstream: {}\n  subject:  {}",
+            probe.name,
+            upstream_resp.status,
+            subject_resp.status,
+        );
+    }
+    if let Some(es) = probe.expected_status {
+        if upstream_resp.status != es {
+            bail!(
+                "{label} probe {}: upstream status {} != expected {}",
+                probe.name,
+                upstream_resp.status,
+                es,
+            );
+        }
+        if subject_resp.status != es {
+            bail!(
+                "{label} probe {}: subject status {} != expected {}",
+                probe.name,
+                subject_resp.status,
+                es,
+            );
+        }
+    }
+
+    // Body.
+    if let Some(rule) = &equivalence.response_body {
+        assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
+            .with_context(|| format!("{label} probe {}", probe.name))?;
+    }
+    if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
+        let expected = body.as_bytes();
+        if upstream_resp.body != expected {
+            bail!(
+                "{label} probe {}: upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                probe.name,
+                upstream_resp.body,
+                expected,
+            );
+        }
+        if subject_resp.body != expected {
+            bail!(
+                "{label} probe {}: subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                probe.name,
+                subject_resp.body,
+                expected,
+            );
+        }
+    }
+
+    // Headers.
+    if matches!(
+        probe.expected_headers,
+        Some(Http1HeaderRule::SetEqualModuloAllowList)
+    ) {
+        diff_headers(
+            &upstream_resp.headers,
+            &subject_resp.headers,
+            HEADER_ALLOW_LIST,
+        )
+        .with_context(|| format!("{label} probe {}: diff_headers", probe.name))?;
+    }
+    Ok(())
+}
+
+/// 26 Task 7: drive `probe` against `addr` repeatedly (bounded by `budget`) until the
+/// response matches the probe's `expected_status` (and `expected_body`, if set) — the
+/// signal the proxy has converged on the reloaded table. Returns Ok on convergence,
+/// Err on budget exhaustion. NOT a fixed sleep — this is the 12.2 wait-for-convergence
+/// pattern on a discriminating observable (the routed-to behavior). Polls every 25ms.
+async fn wait_for_reload_convergence(
+    addr: SocketAddr,
+    probe: &Http1Probe,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    let poll = Duration::from_millis(25);
+    loop {
+        // A drive error (connection reset mid-reload, etc.) is non-fatal while
+        // the budget remains — treat it as "not converged yet" and retry.
+        let matched = match drive_http1(
+            addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+            probe.body.as_deref().map(str::as_bytes),
+        )
+        .await
+        {
+            Ok(resp) => {
+                let status_ok = probe.expected_status.is_none_or(|es| resp.status == es);
+                let body_ok = match &probe.expected_body {
+                    Some(Http1BodyRule::ByteExact { body }) => resp.body == body.as_bytes(),
+                    None => true,
+                };
+                status_ok && body_ok
+            }
+            Err(_) => false,
+        };
+        if matched {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "RDS reload did not converge on {addr} within {budget:?} \
+                 (discriminator probe {})",
+                probe.name,
+            );
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 /// Poll `addr` with exponential backoff (starting at 50ms, doubling, capped at
@@ -2338,7 +2553,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
         // HCM-shaped drivers. The admin listener is separately substituted
         // via {{ADMIN_PORT}} (see admin_host_port reservation below).
-        | Driver::AdminScrape { .. } => "PORT",
+        | Driver::AdminScrape { .. }
+        // 26 Task 7: the RDS-hot-reload driver runs over an HCM `{{PORT}}`
+        // listener like the other HTTP drivers; the reload swaps the
+        // file-based RouteConfiguration out from under that listener.
+        | Driver::Http1RdsReload { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
     };
 
@@ -3805,6 +4024,92 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
         }
+        // 26 Task 7: file-based RDS hot-reload differential step. Runs
+        // `pre_probes` bilaterally, atomic-renames the post-reload RDS content
+        // over the watched path on BOTH sides (subject host file + upstream
+        // container file), waits — bounded, polling the discriminator, NOT a
+        // fixed sleep — for both proxies to converge on the new table, then runs
+        // `post_probes` bilaterally. The post-reload differential is
+        // NATIVE-Linux-CI-authoritative: the upstream container reload is
+        // unobservable under Docker Desktop virtiofs (bind-mount inotify does
+        // not propagate), so the in-container atomic-rename + convergence is
+        // only meaningful on native Linux CI.
+        Driver::Http1RdsReload {
+            pre_probes,
+            reload,
+            post_probes,
+        } => {
+            // An RDS-reload fixture MUST carry an `rds.yaml` (the reload swaps
+            // the file-based RouteConfiguration). `subject_rds_path` is always
+            // bound, but its file only exists when the fixture is RDS-based.
+            if upstream_rds_path.is_none() {
+                bail!(
+                    "Driver::Http1RdsReload requires a file-based RDS fixture \
+                     (no {{{{RDS_PATH}}}} marker / rds.yaml found)"
+                );
+            }
+
+            // 1. pre_probes — bilateral equivalence on the ORIGINAL table.
+            for probe in pre_probes {
+                run_http1_probe_bilateral(
+                    upstream_addr,
+                    subject_addr,
+                    &expectations.equivalence,
+                    probe,
+                    "pre",
+                )
+                .await?;
+            }
+
+            // 2. Read + render the POST-reload RDS template per-side, exactly
+            //    like rds.yaml (same kv ref slices, same residual-marker guard).
+            let reload_tpl = std::fs::read_to_string(fixture_dir.join(&reload.reload_file))
+                .with_context(|| format!("reading RDS reload file {}", reload.reload_file))?;
+            let upstream_reload = render_yaml(&reload_tpl, &upstream_kvs_refs);
+            let subject_reload = render_yaml(&reload_tpl, &subject_kvs_refs);
+            if let Some(marker) = residual_marker(&upstream_reload) {
+                bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream reload RDS");
+            }
+            if let Some(marker) = residual_marker(&subject_reload) {
+                bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject reload RDS");
+            }
+
+            // 3. Reload BOTH sides via atomic-rename (the ONLY rewrite Envoy's
+            //    default file-watch observes — §6.2/ADR-0066). Subject = host
+            //    file; upstream = in-container file via docker exec.
+            atomic_rename_over(&subject_rds_path, &subject_reload)
+                .context("atomic-rename of reloaded subject RDS file")?;
+            upstream
+                .reload_rds_atomic(&upstream_reload)
+                .await
+                .context("atomic-rename of reloaded upstream container RDS file")?;
+
+            // 4. Wait — bounded — for BOTH sides to converge on the new table,
+            //    polling the discriminator (its expected_status/body define
+            //    "converged"). NOT a fixed sleep.
+            let budget = Duration::from_millis(reload.settle_budget_ms);
+            wait_for_reload_convergence(upstream_addr, &reload.discriminator, budget)
+                .await
+                .context("upstream Envoy never converged on reloaded RDS table")?;
+            wait_for_reload_convergence(subject_addr, &reload.discriminator, budget)
+                .await
+                .context("envoy-rust never converged on reloaded RDS table")?;
+
+            // 5. post_probes — bilateral equivalence on the RELOADED table.
+            for probe in post_probes {
+                run_http1_probe_bilateral(
+                    upstream_addr,
+                    subject_addr,
+                    &expectations.equivalence,
+                    probe,
+                    "post",
+                )
+                .await?;
+            }
+
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+        }
         // 11 NEW: HTTP/2 probe-list driver. Mirrors Driver::Http1ProbeList
         // verbatim, swapping drive_http1 → drive_http2 (H2 cleartext
         // prior-knowledge per drive_http2's handshake). The Http1Probe struct
@@ -5221,6 +5526,112 @@ resources:
             subject_rds_path_str,
             upstream::RDS_CONTAINER_PATH,
             "subject RDS path must be a host temp path, not the container constant",
+        );
+    }
+
+    // ---- 26 Task 7: file-based RDS hot-reload step (local unit tests) ----
+    // The Docker-gated end-to-end reload differential is native-Linux-CI
+    // authoritative (Task 8's fixture); here we lock in the schema + the
+    // locally-testable helpers (`atomic_rename_over`, per-side reload render).
+
+    /// 26 Task 7: a `Driver::Http1RdsReload` expectations YAML round-trips
+    /// through the snake_case-tagged serde representation. The `reload.reload_file`
+    /// key is OMITTED on purpose to exercise the `default_reload_file` default
+    /// (`rds-reload.yaml`); `pre_probes`, `post_probes`, and the discriminator
+    /// probe parse into the expected `RdsReloadStep`. Mirrors
+    /// `driver_http1_keep_alive_round_trips_through_serde`.
+    #[test]
+    fn driver_http1_rds_reload_round_trips_through_serde() {
+        let yaml = r#"
+driver:
+  kind: http1_rds_reload
+  pre_probes:
+    - name: pre-route
+      method: get
+      path: /v1
+      host: backend_cluster
+      expected_status: 200
+  reload:
+    settle_budget_ms: 5000
+    discriminator:
+      name: discriminator
+      method: get
+      path: /v2
+      host: backend_cluster
+      expected_status: 200
+  post_probes:
+    - name: post-route
+      method: get
+      path: /v2
+      host: backend_cluster
+      expected_status: 200
+"#;
+        let exp: crate::Expectations = serde_yaml::from_str(yaml).expect("yaml parses");
+        let Driver::Http1RdsReload {
+            pre_probes,
+            reload,
+            post_probes,
+        } = exp.driver
+        else {
+            panic!("expected Driver::Http1RdsReload");
+        };
+        // reload_file omitted ⇒ default applied.
+        assert_eq!(reload.reload_file, "rds-reload.yaml");
+        assert_eq!(reload.settle_budget_ms, 5000);
+        assert_eq!(reload.discriminator.name, "discriminator");
+        assert_eq!(reload.discriminator.path, "/v2");
+        assert_eq!(reload.discriminator.expected_status, Some(200));
+        assert_eq!(pre_probes.len(), 1);
+        assert_eq!(pre_probes[0].name, "pre-route");
+        assert_eq!(pre_probes[0].path, "/v1");
+        assert_eq!(post_probes.len(), 1);
+        assert_eq!(post_probes[0].name, "post-route");
+        assert_eq!(post_probes[0].path, "/v2");
+    }
+
+    /// 26 Task 7: `atomic_rename_over` swaps new content over the target via a
+    /// same-dir temp sibling + `rename` — the ONLY rewrite that triggers Envoy's
+    /// default file-watch (§6.2/ADR-0066). Asserts the post-swap content AND that
+    /// no leftover sibling temp file remains (exactly one dir entry afterward —
+    /// the same-dir invariant that keeps the rename a same-filesystem atomic swap).
+    #[test]
+    fn atomic_rename_over_swaps_content_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("rds-subject.yaml");
+        std::fs::write(&target, "A").unwrap();
+
+        atomic_rename_over(&target, "B").expect("atomic rename succeeds");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "B");
+        // No leftover sibling temp file — exactly the target remains.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected only the target file to remain, found {entries:?}",
+        );
+        assert_eq!(entries[0], target.file_name().unwrap());
+    }
+
+    /// 26 Task 7: the POST-reload RDS template renders per-side exactly like
+    /// `rds.yaml` — the upstream (container-perspective) kv map resolves
+    /// `{{BACKEND_HOST}}` to `host.docker.internal`, the subject
+    /// (host-perspective) kv map to `127.0.0.1`, yielding per-side-distinct
+    /// output. Mirrors `rds_path_substitution_is_per_side_and_container_path_is_yaml`.
+    #[test]
+    fn rds_reload_template_renders_per_side() {
+        let reload_template = "  cluster: {{BACKEND_HOST}}";
+        let upstream_reload =
+            render_yaml(reload_template, &[("BACKEND_HOST", "host.docker.internal")]);
+        let subject_reload = render_yaml(reload_template, &[("BACKEND_HOST", "127.0.0.1")]);
+        assert_eq!(upstream_reload, "  cluster: host.docker.internal");
+        assert_eq!(subject_reload, "  cluster: 127.0.0.1");
+        assert_ne!(
+            upstream_reload, subject_reload,
+            "reload template must render per-side-distinct output",
         );
     }
 
