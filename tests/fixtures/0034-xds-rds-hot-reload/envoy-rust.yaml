@@ -1,5 +1,8 @@
 node: { id: envoy-rust-phase-26-fixture-0034, cluster: envoy-rust-phase-26 }
-admin: { address: { socket_address: { address: 0.0.0.0, port_value: {{ADMIN_PORT}} } } }
+# NO admin block on the subject side: the Http1RdsReload driver probes ONLY the
+# data listener (/probe) and never scrapes admin — matching the non-admin-scraping
+# subject convention (fixtures 0031/0033). (A literal {{ADMIN_PORT}} would not be
+# substituted for this driver and would fail envoy-bin's config parse.)
 static_resources:
   listeners:
     - name: http1_listener

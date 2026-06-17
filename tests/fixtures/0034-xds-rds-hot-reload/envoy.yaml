@@ -1,5 +1,12 @@
 node: { id: envoy-rust-phase-26-fixture-0034, cluster: envoy-rust-phase-26 }
-admin: { address: { socket_address: { address: 0.0.0.0, port_value: {{ADMIN_PORT}} } } }
+# Kernel-ephemeral admin (port 0): the Http1RdsReload driver probes ONLY the
+# data listener (/probe) and never scrapes admin — so this reference side
+# follows the non-admin-scraping convention (fixtures 0007/0031/0033), NOT the
+# {{ADMIN_PORT}} convention of the admin-scraping RDS sibling 0028. (The harness
+# `needs_admin_port` gate does not reserve/substitute {{ADMIN_PORT}} for this
+# driver, so a literal {{ADMIN_PORT}} here would crash Envoy with a yaml-cpp
+# "bad conversion" at boot.)
+admin: { address: { socket_address: { address: 0.0.0.0, port_value: 0 } } }
 static_resources:
   listeners:
     - name: http1_listener
