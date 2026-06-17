@@ -1,0 +1,21 @@
+# The POST-reload shared RDS file (Task 8). IDENTICAL shape to rds.yaml — same
+# `resources:` envelope, same RouteConfiguration name `local_route`, same single
+# vhost `domains: ["*"]`, same `/probe` match — but the `direct_response` body
+# is `rds-v2\n` instead of `rds-v1\n`. The SAME path now returns a DIFFERENT
+# body, proving the route table was re-read and atomically swapped.
+#
+# The harness renders this per-side exactly like rds.yaml, then atomic-renames
+# it over the watched RDS path on BOTH sides; each side's default file-watch
+# re-reads it and hot-swaps the route table (NATIVE-Linux-CI-authoritative —
+# see README: not observable under macOS/Docker-Desktop virtiofs).
+resources:
+  - "@type": type.googleapis.com/envoy.config.route.v3.RouteConfiguration
+    name: local_route
+    virtual_hosts:
+      - name: local_vh
+        domains: ["*"]
+        routes:
+          - match: { prefix: "/probe" }
+            direct_response:
+              status: 200
+              body: { inline_string: "rds-v2\n" }

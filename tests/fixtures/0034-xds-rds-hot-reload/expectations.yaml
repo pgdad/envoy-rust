@@ -1,0 +1,47 @@
+# Phase 26 fixture-0034 expectations: file-based RDS HOT-RELOAD (ADR-0065 SPEC /
+# ADR-0066 PLAN). A STATIC listener whose HCM is RDS-configured (NO inline
+# route_config); the route table arrives entirely from the watched RDS file.
+# Driver::Http1RdsReload runs a THREE-PHASE bilateral sequence:
+#
+#   pre_probes (before reload):  GET /probe -> 200 "rds-v1\n"  (initial table)
+#   reload: atomic-rename rds-reload.yaml over the watched RDS path on BOTH
+#           sides, then POLL the discriminator (GET /probe) until it returns
+#           "rds-v2\n" (= "converged"), bounded by settle_budget_ms.
+#   post_probes (after convergence): GET /probe -> 200 "rds-v2\n" (new table)
+#
+# The SAME path (/probe) returns a DIFFERENT body after the atomic rewrite,
+# proving the route table was re-read and hot-swapped — identically on both
+# sides. The body is a pure `direct_response` (no upstream, no proxy-injected
+# headers), so it is byte-identical bilaterally with zero stripping.
+#
+# NATIVE-LINUX-CI-AUTHORITATIVE: under macOS/Docker-Desktop virtiofs the host
+# bind-mount inotify does not propagate into the container, so the upstream
+# Envoy never observes the reload locally; the cluster/counter/config_dump
+# reload proofs live in the in-process backstop
+# (crates/envoy-bin/tests/xds_rds_hot_reload.rs). See README.
+driver:
+  kind: http1_rds_reload
+  pre_probes:
+    - name: probe_v1
+      method: get
+      path: /probe
+      host: anything
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "rds-v1\n" }
+  reload:
+    # reload_file omitted -> defaults to rds-reload.yaml.
+    settle_budget_ms: 5000
+    discriminator:
+      name: converge_v2
+      method: get
+      path: /probe
+      host: anything
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "rds-v2\n" }
+  post_probes:
+    - name: probe_v2
+      method: get
+      path: /probe
+      host: anything
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "rds-v2\n" }
