@@ -536,4 +536,51 @@ envoy-rust's mtime poll detects. **NO config-schema change, NO new fuzz seed.** 
 
 ## Task 10 — state-4 phase-done verification + STATE advance to state-5-next
 
-_(pending)_
+**In progress (state-4, Linux, 2026-06-17).** Ran the full §7.5 phase-done gate. **Skill:**
+`superpowers:verification-before-completion`. The local deterministic gates are ALL GREEN; the
+AUTHORITATIVE differential anchor is the native-Linux CI run (fixture 0034's reload is
+Docker-Desktop-virtiofs-unobservable on this host — §5.7 / ADR-0049), which had been RED for the
+entire phase and is unblocked by the fmt fix landed at this task.
+
+**THE LOAD-BEARING FINDING — CI was red at `fmt` for the whole phase.** `cargo fmt --all -- --check`
+(§7.5(e)) surfaced fmt drift in SIX files committed across Tasks 6/7/8 (`crates/envoy-admin/src/endpoint.rs`,
+`crates/envoy-bin/src/main.rs`, `crates/envoy-bin/tests/xds_rds_hot_reload.rs`,
+`crates/envoy-config/src/rds.rs`, `crates/envoy-http1/src/hcm.rs`, `crates/envoy-http1/src/rds_watcher.rs`).
+The per-task discipline ran clippy per task but DEFERRED `fmt --check` to this state-4 gate — so the
+drift was invisible until now. **Consequence:** the CI `build + test + lint` job is gated behind its
+`fmt` step (`.github/workflows/ci.yml:34`), so every phase-26 push (Tasks 1/4/8) FAILED at `fmt` and
+clippy/build/**test(differential incl. 0034)**/deny NEVER RAN on CI. The authoritative differential
+anchor therefore never executed. Verified by `gh run view 27608410401`: `X fmt` → `- clippy …`
+`- test …` (all skipped). The fix: `cargo fmt --all` (purely cosmetic line-wrapping, rustfmt 1.95.0,
+the pinned toolchain — no semantic change), committed as `e052fc6`. Re-check `cargo fmt --all -- --check`
+→ CLEAN (exit 0).
+
+**Local §7.5 gate evidence (fresh, this session):**
+- `cargo fmt --all -- --check` → **clean** (exit 0) after `e052fc6`.
+- Standalone-crate builds `cargo build -p envoy-config -p envoy-http1 -p envoy-http2 -p envoy-bin`
+  → **green** (exit 0) — the isolated-crate build blind spot.
+- `cargo build --workspace --all-targets` → **green** (exit 0, finished in 16.34s).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → **clean** (exit 0).
+- `cargo test --workspace --exclude differential --exclude h2spec-conformance` → **all pass**
+  (exit 0): every crate group `0 failed` (envoy-config 431, envoy-http1 120, envoy-http2 72/1-ignored,
+  envoy-admin 96, the envoy-bin `xds_rds_hot_reload` backstop **5 passed**, + all other crates + doc-tests).
+  The `differential` + `h2spec-conformance` crates are excluded LOCALLY (Docker/h2spec-dependent) and run
+  authoritatively on CI per the established per-task convention + §5.7.
+- `cargo deny check` → **`advisories ok, bans ok, licenses ok, sources ok`** (exit 0; the 3
+  `license-not-encountered` lines are pre-existing unused-allowance warnings, non-fatal). cargo-deny
+  v0.19.9 installed locally for this check.
+- **Fuzz (§7.5(d)):** phase 26 added **NO new fuzz target** (Task 9 N/A — no schema change, no new
+  parse surface). The pre-existing fuzzers (`parse_bootstrap` + `jwt_parse`) run in CI's SEPARATE `fuzz`
+  job, which is independent of the `fmt` gate and was already GREEN on the last push
+  (`✓ fuzz (parse_bootstrap + jwt_parse, 30s each) in 2m9s`, run `27608410401`). No new-fuzzer obligation
+  this phase.
+
+**Differential — the authoritative anchor (§7.5(a)(b)).** All 34 fixtures (the 33 pre-existing +
+`0034-xds-rds-hot-reload`) run via `cargo test --workspace` on native-Linux CI (`ubuntu-latest`), where
+real bind-mount inotify makes the 0034 reload observable (unlike this host's Docker Desktop virtiofs —
+§5.7 / ADR-0066). The fmt fix `e052fc6` unblocks that path for the first time this phase. **STATE does
+NOT advance to state-5-next until that CI run is GREEN** (verification-before-completion: the authoritative
+differential must be green, not merely triggered). The CI run for this push is recorded + confirmed below
+at the STATE-advance commit.
+
+_(STATE advance to state-4-complete / state-5-next follows on CI green — recorded in the next commit.)_
