@@ -98,7 +98,7 @@ impl UpstreamProxy {
     /// `sh -c` argv transit intact (arbitrary YAML bytes, newlines, quotes).
     pub async fn reload_rds_atomic(&self, new_content: &str) -> Result<()> {
         use base64::Engine as _;
-        use testcontainers::core::ExecCommand;
+        use testcontainers::core::{CmdWaitFor, ExecCommand};
 
         let b64 = base64::engine::general_purpose::STANDARD.encode(new_content.as_bytes());
         // Decode into a temp path on the container's OWN filesystem (a sibling of
@@ -108,15 +108,23 @@ impl UpstreamProxy {
         let script = format!(
             "set -e; printf %s '{b64}' | base64 -d > '{tmp}'; mv -f '{tmp}' '{RDS_CONTAINER_PATH}'"
         );
+        // `CmdWaitFor::exit_code(0)` makes `exec()` BLOCK until the command
+        // finishes (it polls `inspect_exec` until a non-None exit code appears),
+        // and errors on a non-zero code. Without it `ExecCommand` defaults to
+        // `CmdWaitFor::Nothing` — `exec()` returns as soon as the command is
+        // STARTED, so `exit_code()` reads Docker's `ExitCode: null` (None) on a
+        // still-running exec and the reload spuriously fails "exited with code
+        // None" even though the rename succeeds.
         let result = self
             ._container
-            .exec(ExecCommand::new(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                script,
-            ]))
+            .exec(
+                ExecCommand::new(vec!["sh".to_string(), "-c".to_string(), script])
+                    .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+            )
             .await
             .context("docker exec for in-container RDS atomic-rename reload")?;
+        // Belt-and-suspenders: the ready condition above already asserted exit 0,
+        // so this re-read returns Some(0); keep it as an explicit guard.
         let code = result
             .exit_code()
             .await
