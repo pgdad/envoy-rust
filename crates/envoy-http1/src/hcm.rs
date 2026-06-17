@@ -5675,7 +5675,10 @@ static_resources:
         };
         let req = make_req("/foo", "myhost:8080");
         let route = resolve_route(&config, &req).expect("port-stripped host must match");
-        assert!(matches!(route.route().action, RouteAction::DirectResponse(_)));
+        assert!(matches!(
+            route.route().action,
+            RouteAction::DirectResponse(_)
+        ));
     }
 
     // ---------------------------------------------------------------------------
@@ -5815,7 +5818,10 @@ static_resources:
         // (b) A store(new_arc) is visible to the NEXT read.
         config.store_route_config(Arc::new(named_route_config("v2")));
         let next = config.current_route_config();
-        assert_eq!(next.name, "v2", "the next read must observe the stored table");
+        assert_eq!(
+            next.name, "v2",
+            "the next read must observe the stored table"
+        );
 
         // (c) The in-flight reader keeps its snapshot — the §5.4 read-once
         // guarantee. `snapshot` was an OWNED Arc clone taken before the store,

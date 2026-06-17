@@ -701,10 +701,8 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
                 // First-wins by `route_config_name`: each rds HCM maps to exactly
                 // one live handle, and `route_config_name` is unique across a valid
                 // bootstrap, so the linear `find` over the tiny Vec is unambiguous.
-                if let Some((_, handle)) = handler
-                    .live_route_configs()
-                    .iter()
-                    .find(|(n, _)| n == name)
+                if let Some((_, handle)) =
+                    handler.live_route_configs().iter().find(|(n, _)| n == name)
                 {
                     // Live: read-once the swappable table (the reloaded one).
                     Some(RouteSnapshot::Live(handle.current_route_config()))

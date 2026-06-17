@@ -284,10 +284,7 @@ mod tests {
     // name returns the same underlying Arc<Counter>, so a test that seeds them
     // at `1/1/0/0/1` (the post-initial-load state) and the watcher's reload tick
     // share one set of counters.
-    fn test_counters(
-        registry: &envoy_stats::StatsRegistry,
-        base: &str,
-    ) -> RdsCounters {
+    fn test_counters(registry: &envoy_stats::StatsRegistry, base: &str) -> RdsCounters {
         let mk = |suffix: &str| {
             registry
                 .register_counter(&format!("{base}.{suffix}"))
@@ -613,8 +610,7 @@ static_resources:
 
         // Cancel must terminate the loop promptly (it exits the cancel branch,
         // not after the next tick). `shutdown()` joins the handle.
-        let drained =
-            tokio::time::timeout(Duration::from_secs(3), watcher.shutdown()).await;
+        let drained = tokio::time::timeout(Duration::from_secs(3), watcher.shutdown()).await;
         assert!(drained.is_ok(), "shutdown returned promptly on cancel");
     }
 
@@ -653,8 +649,7 @@ static_resources:
         tokio::time::advance(POLL_INTERVAL).await;
 
         cancel.cancel();
-        let drained =
-            tokio::time::timeout(Duration::from_secs(3), watcher.shutdown()).await;
+        let drained = tokio::time::timeout(Duration::from_secs(3), watcher.shutdown()).await;
         assert!(drained.is_ok(), "loop exits on external cancel");
     }
 }

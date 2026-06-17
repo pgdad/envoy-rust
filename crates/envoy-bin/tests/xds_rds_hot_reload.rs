@@ -444,10 +444,7 @@ struct Harness {
 /// 26 Task 8: boot a two-cluster harness whose initial rds routes `/probe` (and,
 /// when `extra_cluster` is `Some((name, port))`, that named cluster is appended to
 /// the static set so the in-flight test can route `/slow` to a slow backend).
-async fn boot_harness(
-    initial_rds: &str,
-    extra_cluster: Option<(&str, u16)>,
-) -> Harness {
+async fn boot_harness(initial_rds: &str, extra_cluster: Option<(&str, u16)>) -> Harness {
     let listener_port = reserve_port();
     let admin_port = reserve_port();
     let hcm: SocketAddr = format!("127.0.0.1:{listener_port}").parse().unwrap();
@@ -537,7 +534,10 @@ async fn happy_reload_flips_route_and_ticks_counters() {
 
     let s1 = scrape_admin_stats(h.admin).await;
     assert!(
-        s1.get("cluster.backend_b.upstream_rq_total").copied().unwrap_or(0) >= 1,
+        s1.get("cluster.backend_b.upstream_rq_total")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
         "post-reload request landed on backend_b"
     );
     // One successful reload ticks attempt + success + config_reload by 1.
@@ -590,11 +590,16 @@ async fn malformed_reload_warm_rejects_and_keeps_last_good() {
 
     // Last-good kept: /probe still routes to backend_a (NOT backend_b).
     let (status, _) = http1_oneshot(h.hcm, "/probe").await;
-    assert_eq!(status, 200, "post-warm-reject /probe → 200 (last-good kept)");
+    assert_eq!(
+        status, 200,
+        "post-warm-reject /probe → 200 (last-good kept)"
+    );
     let s2 = scrape_admin_stats(h.admin).await;
     assert_stat(&s2, "cluster.backend_a.upstream_rq_total", 2);
     assert_eq!(
-        s2.get("cluster.backend_b.upstream_rq_total").copied().unwrap_or(0),
+        s2.get("cluster.backend_b.upstream_rq_total")
+            .copied()
+            .unwrap_or(0),
         0,
         "no request ever routed to backend_b (reload was rejected)"
     );
@@ -624,11 +629,16 @@ async fn name_absent_reload_warm_rejects_and_keeps_last_good() {
 
     // Last-good kept: /probe still routes to backend_a.
     let (status, _) = http1_oneshot(h.hcm, "/probe").await;
-    assert_eq!(status, 200, "post-warm-reject /probe → 200 (last-good kept)");
+    assert_eq!(
+        status, 200,
+        "post-warm-reject /probe → 200 (last-good kept)"
+    );
     let s2 = scrape_admin_stats(h.admin).await;
     assert_stat(&s2, "cluster.backend_a.upstream_rq_total", 2);
     assert_eq!(
-        s2.get("cluster.backend_b.upstream_rq_total").copied().unwrap_or(0),
+        s2.get("cluster.backend_b.upstream_rq_total")
+            .copied()
+            .unwrap_or(0),
         0,
         "no request ever routed to backend_b (reload was rejected)"
     );
@@ -661,7 +671,10 @@ async fn unknown_cluster_reload_warm_rejects_recorded_divergence() {
 
     // Last-good kept: /probe still routes to backend_a (and never panics).
     let (status, _) = http1_oneshot(h.hcm, "/probe").await;
-    assert_eq!(status, 200, "post-warm-reject /probe → 200 (last-good kept)");
+    assert_eq!(
+        status, 200,
+        "post-warm-reject /probe → 200 (last-good kept)"
+    );
     let s2 = scrape_admin_stats(h.admin).await;
     assert_stat(&s2, "cluster.backend_a.upstream_rq_total", 2);
 }
@@ -719,5 +732,8 @@ async fn in_flight_request_completes_under_old_table() {
 
     // Sanity: the NEW table is live — /probe now routes (200), and /slow is gone.
     let (probe_status, _) = http1_oneshot(h.hcm, "/probe").await;
-    assert_eq!(probe_status, 200, "post-reload /probe → 200 (new table live)");
+    assert_eq!(
+        probe_status, 200,
+        "post-reload /probe → 200 (new table live)"
+    );
 }

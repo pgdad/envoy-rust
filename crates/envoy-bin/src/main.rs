@@ -386,9 +386,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         config_reload: mk("config_reload")?,
                     };
                     rds_targets.push(envoy_http1::WatchTarget {
-                        path: std::path::PathBuf::from(
-                            &rds.config_source.path_config_source.path,
-                        ),
+                        path: std::path::PathBuf::from(&rds.config_source.path_config_source.path),
                         route_config_name: rds.route_config_name.clone(),
                         store: std::sync::Arc::clone(&hcm_config),
                         counters,

@@ -288,10 +288,9 @@ resources:
     fn reparse_happy_path_reads_selects_and_validates() {
         let (_dir, path) = write_temp(&rds_body("local_route", "known_cluster"));
         // known-cluster predicate: only "known_cluster" exists.
-        let rc = reparse_and_select_route_config(&path, "local_route", &|name| {
-            name == "known_cluster"
-        })
-        .expect("happy reload");
+        let rc =
+            reparse_and_select_route_config(&path, "local_route", &|name| name == "known_cluster")
+                .expect("happy reload");
         assert_eq!(rc.name, "local_route");
         assert_eq!(rc.virtual_hosts.len(), 1);
     }
@@ -323,8 +322,7 @@ resources:
         // step 3: the requested name is absent from the envelope →
         // RdsRouteConfigNotFound (the update_rejected class).
         let (_dir, path) = write_temp(&rds_body("other_route", "known_cluster"));
-        let err =
-            reparse_and_select_route_config(&path, "local_route", &|_| true).unwrap_err();
+        let err = reparse_and_select_route_config(&path, "local_route", &|_| true).unwrap_err();
         assert!(
             matches!(&err, crate::ConfigError::RdsRouteConfigNotFound { name, .. }
                 if name == "local_route"),
@@ -338,10 +336,9 @@ resources:
         // UnknownCluster (the update_rejected class — the recorded warm-reject
         // divergence vs Envoy, ADR-0066).
         let (_dir, path) = write_temp(&rds_body("local_route", "ghost_cluster"));
-        let err = reparse_and_select_route_config(&path, "local_route", &|name| {
-            name == "known_cluster"
-        })
-        .unwrap_err();
+        let err =
+            reparse_and_select_route_config(&path, "local_route", &|name| name == "known_cluster")
+                .unwrap_err();
         assert!(
             matches!(&err, crate::ConfigError::UnknownCluster(c) if c == "ghost_cluster"),
             "expected UnknownCluster(ghost_cluster), got: {err:?}"
