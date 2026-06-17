@@ -461,13 +461,78 @@ unit-tested and the container-side half is a thin, documented mirror. Code-quali
 shell-script robustness (base64 alphabet has no shell metacharacters, the path is a constant, no arg-length
 risk for KB-scale RDS, `set -e` prevents partial installs) — the review IS the safety net for the CI-only path.
 
-## Task 8 — fixture `0034-xds-rds-hot-reload` + Docker wrapper (Linux-CI-authoritative) + in-process backstop [BLOCKED on Task 1]
+## Task 8 — fixture `0034-xds-rds-hot-reload` (Linux-CI-authoritative differential) + in-process backstop [§6.2-LOCKED]
 
-_(pending)_
+**Done (state-3, Linux).** The two end-to-end reload proofs: a Docker-gated **differential fixture** (the
+native-Linux-CI-authoritative bilateral proof, using the Task-7 `Http1RdsReload` driver) + an **in-process
+backstop** (the deterministic LOCAL complement that boots real `envoy-bin` and scrapes stats). Split into
+two separately-reviewed units (8a fixture+wrapper, 8b backstop), each two-stage reviewed (spec ✅ + quality
+✅ Approve). **Commits:** `7b2ba94` `test(differential): add fixture 0034-xds-rds-hot-reload + Docker-gated
+wrapper …` (8a) + `5c6ebc1` `test(envoy-bin): add in-process RDS hot-reload backstop …` (8b).
 
-## Task 9 — CONDITIONAL: `ConfigSource.watched_directory` field + fuzz seed (fires only if Task 1 P2 requires it)
+**DESIGN ADAPTATION (recorded — diverges from the PLAN's literal "two distinguishable clusters in the
+fixture").** The Task-7 `Http1RdsReload` driver converges on probe **status/body** (no `expected_stats`/
+`admin_scrapes` fields), and the differential harness spawns a SINGLE echo backend — so two clusters cannot
+be distinguished in a fixture response. The work therefore splits the §6.2 proofs by harness strength:
+- **The differential fixture (0034)** proves the reload BILATERALLY via a `direct_response` body change
+  (`rds-v1`→`rds-v2`) on the SAME `/probe` path — a genuine route-table swap, byte-exact and identical on
+  both sides with ZERO upstream-header noise (no clusters/backend, so none of fixture-0028's header-stripping
+  knobs are needed). This is the clean bilateral "the table reloaded" proof.
+- **The in-process backstop** carries the cluster-distinguishability (P3, via `cluster.<name>.upstream_rq_total`),
+  the **counter taxonomy** (P4), the **config_dump live-table reflect** (P6), the **warm-reject negative paths**,
+  and **in-flight isolation** — everything that needs deterministic stat-scraping, which the Linux-CI-only
+  differential can't cleanly drive. The PLAN's "assert P4 counters + P6 config_dump" is satisfied HERE.
 
-_(pending — conditional)_
+**8a — fixture `tests/fixtures/0034-xds-rds-hot-reload/` + `tests/differential/tests/xds_rds_hot_reload.rs`
+(commit `7b2ba94`, 7 files).** `rds.yaml` (initial: `local_route`, `/probe`→`direct_response` body `rds-v1\n`)
++ `rds-reload.yaml` (post: same shape, body `rds-v2\n`) + `envoy-rust.yaml` + `envoy.yaml` (both: admin + one
+RDS-configured H1 listener + router filter, `clusters: []`, no CDS) + `expectations.yaml`
+(`Driver::Http1RdsReload`: pre `rds-v1` → reload [`settle_budget_ms: 5000`, discriminator `/probe`→`rds-v2`]
+→ post `rds-v2`) + `README.md` (the three-phase sequence, the direct_response rationale, and the
+**NATIVE-LINUX-CI-AUTHORITATIVE** / Docker-Desktop-virtiofs-unobservable caveat) + the Docker-gated wrapper
+(mirrors `xds_file_based_rds.rs`). **Locally verified to the max without Docker:** the SUBJECT side was booted
+(`envoy-bin -c <rendered envoy-rust.yaml>`) → `GET /probe` → 200 `rds-v1`, atomic-renamed `rds-reload.yaml`
+over the watched path → `/probe` flips to `rds-v2` (the reload pipeline works end-to-end); `expectations.yaml`
+deserializes via `differential::load_expectations` → `Driver::Http1RdsReload` (default `reload_file`
+`rds-reload.yaml`); the wrapper compiles; clippy clean. The full bilateral `run_fixture` runs on native-Linux CI.
+
+**8b — `crates/envoy-bin/tests/xds_rds_hot_reload.rs` (commit `5c6ebc1`, 723 lines, 5 tests ALL PASS).**
+Boots real `envoy-bin` as a native subprocess (the poll-based mtime watcher, ~1s cadence, observes a host-side
+atomic-rename — the virtiofs limitation is container-only), reloads via `atomic_rename_rds` (same-dir sibling +
+`std::fs::rename`), and `wait_for_stat`-gates each assertion on the right convergence counter. Two static
+clusters `backend_a`/`backend_b` → one echo backend, distinguished by `upstream_rq_total`:
+- `happy_reload_flips_route_and_ticks_counters` — `1/1/0/0/1` → atomic-rename →`backend_b` → wait
+  `update_success==2` → `backend_b.upstream_rq_total>=1`, counters `2/2/0/0/2`, and `/config_dump`
+  `RoutesConfigDump` LIVE table walks `/probe`→`backend_b` (P6 reflect).
+- `malformed_reload_warm_rejects_and_keeps_last_good` — malformed YAML → `update_failure` (`2/1/1/0/1`),
+  routing still `backend_a` (`backend_b` total stays 0 ⇒ last-good provably kept).
+- `name_absent_reload_warm_rejects_and_keeps_last_good` — `route_config_name` mismatch → `update_rejected`
+  (`2/1/0/1/1`), routing still `backend_a`.
+- `unknown_cluster_reload_warm_rejects_recorded_divergence` — route→cluster `nope` → `update_rejected`
+  (`2/1/0/1/1`), routing still `backend_a`. **THE RECORDED DIVERGENCE** (commented in-test): real Envoy
+  ACCEPTS + serves 503/`no_cluster`; envoy-rust warm-REJECTS because the request path `.expect()`s cluster
+  existence (`hcm.rs:818`) — installing the route would PANIC. Unobservable in the differential ⇒ proven here.
+- `in_flight_request_completes_under_old_table` — a 2 s slow backend via `backend_slow`; a `/slow` request
+  started in-flight, reload DROPS `/slow` mid-flight, the in-flight request still completes **200** under the
+  snapshotted old table (end-to-end confirmation of the Task-2 §5.4 read-once; stable across 4 suite runs).
+Review verified NO spurious passes: each test waits on the convergence counter BEFORE asserting post-reload
+state, and the chosen gate is correct because `reload()` ticks `update_attempt` at entry + swaps the table
+BEFORE ticking `update_success` (so `success==2` ⇒ the swap landed; `attempt==2` ⇒ a reject fully ran and the
+table was never touched). No assertion was loosened; the reload pipeline matched the §6.2-locked taxonomy on
+the first run.
+
+**Verification.** `cargo test -p envoy-bin --test xds_rds_hot_reload` **5 passed**; `cargo test -p differential
+--lib` 140/2-ignored + the wrapper compiles; `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` clean. No `unsafe` (`#![forbid(unsafe_code)]` in the backstop). The fixture differential itself is the
+native-Linux-CI gate (Task 10 / CI), not run locally.
+
+## Task 9 — CONDITIONAL: `ConfigSource.watched_directory` field + fuzz seed — ❌ DOES NOT FIRE (N/A)
+
+**N/A — no work, confirmed at Task 1.** The §6.2 Linux verification (Task 1, ADR-0066 P2) proved Envoy reloads
+on **atomic-rename with NO `watched_directory`** (and `watched_directory` does not even rescue the in-place
+truncate-rewrite case). The Task-7 harness + the Task-8 fixture/backstop all use atomic-rename, which
+envoy-rust's mtime poll detects. **NO config-schema change, NO new fuzz seed.** Recorded in ADR-0066 + PLAN
+§"Task 9". Skip to Task 10.
 
 ## Task 10 — state-4 phase-done verification + STATE advance to state-5-next
 
