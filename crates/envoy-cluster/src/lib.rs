@@ -16,6 +16,7 @@ mod cluster;
 mod ejection;
 mod health;
 mod outlier;
+pub mod xds_watch;
 
 pub use budget::{BudgetAcquisition, BudgetState, RequestBudgetGuard, RetryBudgetGuard};
 pub use cluster::{
@@ -25,3 +26,4 @@ pub use cluster::{
 pub use ejection::{DetectorType, EjectionDecision, EndpointEjection, EndpointEjectionStats};
 pub use health::EndpointHealth;
 pub use outlier::{OutlierEjectionSweeper, OutlierManager};
+pub use xds_watch::{WatchTarget, XdsFileWatcher};

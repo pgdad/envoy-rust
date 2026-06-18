@@ -18,5 +18,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"] }
+filetime = "0.2"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }
 tokio-util = "0.7"

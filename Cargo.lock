@@ -390,6 +390,8 @@ version = "0.0.0"
 dependencies = [
  "envoy-config",
  "envoy-stats",
+ "filetime",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

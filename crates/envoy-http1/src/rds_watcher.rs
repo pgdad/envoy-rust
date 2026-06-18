@@ -1,12 +1,24 @@
-//! 26 Task 3: `RdsWatcher` — the 5th periodic-background primitive.
+//! 26 Task 3: `RdsWatcher` — the 5th periodic-background primitive. 27 Task 3
+//! (ADR-0067): now a thin RDS-domain adapter over the domain-free
+//! [`envoy_cluster::XdsFileWatcher`] poll/mtime/cancel core.
 //!
-//! Mirrors the 12.2 `envoy_health::Scheduler` topology: holds the
-//! `JoinHandle`s of every spawned watch task plus the shared
-//! `CancellationToken`; `shutdown(self)` cancels the token and awaits the
-//! handles for a clean drain. envoy-bin constructs it AFTER the HCMConfigs
-//! exist (it needs their swappable `Arc<HCMConfig>` route-table handles plus
-//! the rds file paths), passes `token.clone()`, and drains it via
-//! `shutdown().await` on the runtime drain path.
+//! The poll loop, mtime-detect, `JoinHandle` holding, and `shutdown`/drain all
+//! live in the generic core ([`envoy_cluster::xds_watch`]); this module keeps
+//! only the RDS-DOMAIN pieces: the [`WatchTarget`] context (path +
+//! route_config_name + the swappable [`HCMConfig`] store + the `rds.*`
+//! counters), the [`RdsCounters`] taxonomy handles, and the [`reload`] §6.2
+//! pipeline (reparse → revalidate → atomic `store_route_config` swap with a
+//! WARM-REJECT on any failure). `RdsWatcher::spawn` builds, for each RDS
+//! target, a `Box<dyn FnMut() + Send>` reload closure that runs `reload()` and
+//! logs a warm-reject (with the RDS path + route_config_name context) on
+//! failure, then constructs an inner `XdsFileWatcher` and delegates
+//! `shutdown`/`task_count` to it.
+//!
+//! The envoy-bin call site is UNCHANGED (`RdsWatcher::spawn(targets, token)` +
+//! `.shutdown().await`): `RdsWatcher`/`WatchTarget`/`RdsCounters` stay in this
+//! crate, only their loop machinery now lives in `envoy-cluster`. This is the
+//! "second instance reveals the abstraction" refactor — EDS (phase 27, a later
+//! task) consumes the SAME `XdsFileWatcher` core.
 //!
 //! §5.2 inertness: the target list is built by walking the listeners for HCMs
 //! with `rds` configured. A bootstrap with no rds HCM yields an empty target
@@ -14,19 +26,18 @@
 //! mirroring how the health scheduler / outlier manager spawn nothing when
 //! their feature is unconfigured.
 //!
-//! 26 Task 4: the per-target `reload` now runs the real §6.2 pipeline (ADR-0066)
+//! 26 Task 4: the per-target `reload` runs the real §6.2 pipeline (ADR-0066)
 //! — reparse → revalidate → atomic `store_route_config` swap, with a WARM-REJECT
 //! on any failure (the last-good table is kept; the proxy never crashes). The
 //! `rds.*` counters live on each [`WatchTarget`] and are ticked per the locked
-//! taxonomy (Task 5's counter wiring was folded in here — the envoy-bin
-//! target-walk re-resolves the same registered handles by name).
+//! taxonomy (the envoy-bin target-walk re-resolves the same registered handles
+//! by name).
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
 
+use envoy_cluster::{WatchTarget as XdsWatchTarget, XdsFileWatcher};
 use envoy_stats::Counter;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::hcm::HCMConfig;
@@ -48,21 +59,15 @@ pub struct RdsCounters {
     pub config_reload: Arc<Counter>,
 }
 
-/// 26 Task 3: the rds file poll cadence. A `tokio::time::interval` ticks every
-/// `POLL_INTERVAL`; on each tick the loop stats the file and compares its
-/// mtime against the last-seen value. Task 1's §6.2 settle/poll-bound output
-/// may TUNE this constant (it is a placeholder default here — 1s matches the
-/// other periodic primitives' "sensible default" cadence).
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// 26 Task 4: one rds watch target — the reload pipeline's per-HCM context.
 ///
 /// On a detected file change the watcher runs the §6.2 pipeline against this
 /// target: reparse+revalidate `path`, then on success atomically
 /// `store.store_route_config(...)` (a warm-reject keeps the live table on any
 /// failure); the `counters` are ticked per the locked taxonomy. The envoy-bin
-/// target-walk builds one of these per rds-configured HCM; the watcher spawns
-/// one `watch_loop` per target.
+/// target-walk builds one of these per rds-configured HCM; `RdsWatcher::spawn`
+/// adapts each into a generic `envoy_cluster::WatchTarget` reload closure that
+/// the inner `XdsFileWatcher` polls.
 ///
 /// For an H2 listener whose `envoy_http2::HCMConfig` wraps an inner
 /// `Arc<envoy_http1::HCMConfig>`, `store` MUST be that INNER h1 config — it
@@ -76,9 +81,8 @@ pub struct WatchTarget {
     /// the HCM's `rds.config_source.path_config_source.path`.
     pub path: PathBuf,
     /// The rds resource name to select from the file. Comes from the HCM's
-    /// `rds.route_config_name`. Unused by the skeleton's no-op reload; Task 4
-    /// uses it to pick the matching `RouteConfiguration` out of the parsed
-    /// rds file.
+    /// `rds.route_config_name`; [`reload`] uses it to pick the matching
+    /// `RouteConfiguration` out of the parsed rds file.
     pub route_config_name: String,
     /// The Task-2 swappable-handle owner. `reload` calls
     /// `store.store_route_config(new)` to atomically swap the live route table
@@ -93,99 +97,41 @@ pub struct WatchTarget {
     pub counters: RdsCounters,
 }
 
-/// 26 Task 3: the rds watcher. Holds the JoinHandles of every spawned
-/// `watch_loop` and the shared `CancellationToken`. Drop without `shutdown()`
-/// is safe — the tasks observe the runtime shutdown via the token — but
-/// `shutdown().await` is preferred for a clean drain (mirrors the 12.2
-/// `Scheduler`).
+/// 26 Task 3: the rds watcher. 27 Task 3 (ADR-0067): a thin RDS-domain adapter
+/// that delegates its poll/mtime/cancel/drain machinery to an inner
+/// [`XdsFileWatcher`]. Drop without `shutdown()` is safe — the inner tasks
+/// observe the runtime shutdown via the token — but `shutdown().await` is
+/// preferred for a clean drain (mirrors the 12.2 `Scheduler`).
 #[derive(Debug)]
 pub struct RdsWatcher {
-    handles: Vec<JoinHandle<()>>,
-    cancel: CancellationToken,
+    inner: XdsFileWatcher,
 }
 
 impl RdsWatcher {
-    /// 26 Task 3: spawn one `watch_loop` per target. Returns an `RdsWatcher`
-    /// holding the task handles. `cancel` is the shared shutdown token — a
-    /// caller cancelling it (via the envoy-bin signal token) or calling
-    /// `shutdown()` terminates every loop at its next `tokio::select!`
+    /// 26 Task 3: build the rds watcher. For each RDS [`WatchTarget`] this
+    /// constructs a domain-free `envoy_cluster::WatchTarget` whose reload
+    /// closure runs the §6.2 [`reload`] pipeline and logs a warm-reject (with
+    /// the RDS path + route_config_name context) on failure, then hands the
+    /// targets to an inner [`XdsFileWatcher`]. `cancel` is the shared shutdown
+    /// token — a caller cancelling it (via the envoy-bin signal token) or
+    /// calling `shutdown()` terminates every loop at its next `tokio::select!`
     /// boundary.
     ///
-    /// Spawn is INFALLIBLE (`-> Self`): the skeleton registers no counters
-    /// (that is Task 5) and the `reload` stub cannot fail, so there is no
-    /// fallible work at spawn time — unlike the 12.2 `Scheduler::spawn`, which
-    /// is `Result<_>` because it registers per-cluster counters and re-parses
-    /// durations. When Task 5 adds counter registration, spawn may need to
-    /// become fallible; the envoy-bin call site already `?`-threads the
-    /// neighbouring primitives, so that change is local.
+    /// Spawn is INFALLIBLE (`-> Self`): the generic core does no fallible work
+    /// at spawn time and the RDS reload closure handles its own errors (warm
+    /// reject) — unlike the 12.2 `Scheduler::spawn`. The envoy-bin call site is
+    /// UNCHANGED by the 27 Task 3 refactor.
     pub fn spawn(targets: Vec<WatchTarget>, cancel: CancellationToken) -> Self {
-        let mut handles = Vec::with_capacity(targets.len());
-        for target in targets {
-            let cancel = cancel.clone();
-            let handle = tokio::spawn(async move {
-                watch_loop(target, cancel).await;
-            });
-            handles.push(handle);
-        }
-        RdsWatcher { handles, cancel }
-    }
-
-    /// 26 Task 3: cancel every watch task and await their JoinHandles. Returns
-    /// once every loop has exited at its next `tokio::select!` boundary
-    /// (mirrors the 12.2 `Scheduler::shutdown`).
-    pub async fn shutdown(self) {
-        self.cancel.cancel();
-        for handle in self.handles {
-            let _ = handle.await;
-        }
-    }
-
-    /// 26 Task 3: test helper — count of spawned watch tasks (mirrors the 12.2
-    /// `Scheduler::task_count`). Zero when no rds HCM is configured (the §5.2
-    /// inertness witness).
-    pub fn task_count(&self) -> usize {
-        self.handles.len()
-    }
-}
-
-/// 26 Task 3: the per-target poll loop. `tokio::select!`s between
-/// `cancel.cancelled()` and a `tokio::time::interval` tick. On each tick it
-/// stats `target.path` and compares the mtime against the last-seen value; on
-/// a change it calls `reload(&target)`. The cancel branch exits the loop
-/// promptly (it does not wait for the next tick — the §5.x clean-drain
-/// discipline shared with the 12.2 `probe_loop`).
-async fn watch_loop(target: WatchTarget, cancel: CancellationToken) {
-    let mut interval = tokio::time::interval(POLL_INTERVAL);
-    // Burn the immediate first tick that `tokio::time::interval` fires at t=0
-    // so the first MTIME poll happens one `POLL_INTERVAL` after spawn (parity
-    // with the probe_loop / sweeper cadence — they observe a real interval
-    // before their first action).
-    interval.tick().await;
-
-    // Seed the last-seen mtime from the file as it stands at spawn time. A
-    // missing/unreadable file seeds `None`; the first successful stat that
-    // yields a different value (including: file appears) counts as a change.
-    let mut last_mtime: Option<SystemTime> = read_mtime(&target.path);
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                // Clean exit on shutdown — do not wait for the next tick.
-                break;
-            }
-            _ = interval.tick() => {
-                let current = read_mtime(&target.path);
-                // Only a CHANGED, present mtime triggers a reload. A stable
-                // mtime (the 0028 idle witness) or a vanished file is a no-op.
-                if let Some(now) = current
-                    && last_mtime != Some(now)
-                {
-                    last_mtime = Some(now);
+        let xds_targets = targets
+            .into_iter()
+            .map(|target| XdsWatchTarget {
+                path: target.path.clone(),
+                reload: Box::new(move || {
                     // 26 Task 4: run the real reparse+revalidate+atomic-swap
                     // pipeline. A failed reload is WARM-REJECTED (the live table
                     // is kept and the failure-class counter ticked inside
                     // `reload`); we log it here and keep watching for the next
-                    // edit. The loop never propagates a reload error — a bad
+                    // edit. The closure never propagates a reload error — a bad
                     // RDS file must NOT take the proxy down.
                     if let Err(err) = reload(&target) {
                         tracing::warn!(
@@ -195,17 +141,26 @@ async fn watch_loop(target: WatchTarget, cancel: CancellationToken) {
                             "rds reload warm-rejected; keeping last-good route table",
                         );
                     }
-                }
-            }
+                }),
+            })
+            .collect();
+        RdsWatcher {
+            inner: XdsFileWatcher::spawn(xds_targets, cancel),
         }
     }
-}
 
-/// 26 Task 3: stat `path` and return its mtime, or `None` if the file is
-/// missing/unreadable/exposes no mtime. The loop compares this against the
-/// last-seen value to detect a change.
-fn read_mtime(path: &std::path::Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    /// 26 Task 3: cancel every watch task and await its drain. Delegates to the
+    /// inner [`XdsFileWatcher`] (mirrors the 12.2 `Scheduler::shutdown`).
+    pub async fn shutdown(self) {
+        self.inner.shutdown().await;
+    }
+
+    /// 26 Task 3: test helper — count of spawned watch tasks (mirrors the 12.2
+    /// `Scheduler::task_count`). Zero when no rds HCM is configured (the §5.2
+    /// inertness witness). Delegates to the inner [`XdsFileWatcher`].
+    pub fn task_count(&self) -> usize {
+        self.inner.task_count()
+    }
 }
 
 /// 26 Task 4 (ADR-0066): the rds reload pipeline.
@@ -275,6 +230,7 @@ fn reload(target: &WatchTarget) -> Result<(), envoy_config::ConfigError> {
 mod tests {
     use super::*;
     use crate::hcm::HCMStats;
+    use envoy_cluster::xds_watch::POLL_INTERVAL;
     use envoy_config::RouteConfiguration;
     use std::sync::RwLock;
     use std::time::Duration;
@@ -524,9 +480,9 @@ static_resources:
     }
 
     // A minimal `Arc<HCMConfig>` for the WatchTarget's `store` field. The
-    // skeleton's no-op `reload` never touches it, so this only needs to be a
-    // structurally-valid handle (the swappable route-table cell is present so
-    // Task 4 can swap into it).
+    // lifecycle tests below never edit the watched file (the mtime stays
+    // stable, so `reload` never runs), so this only needs to be a
+    // structurally-valid handle (the swappable route-table cell is present).
     async fn minimal_store() -> Arc<HCMConfig> {
         let yaml = r#"
 admin:
@@ -600,10 +556,10 @@ static_resources:
         assert_eq!(watcher.task_count(), 1, "one watch task per target");
 
         // Advance several poll intervals WITHOUT touching the file. No reload
-        // fires (the no-op stub is reached only on an mtime CHANGE), and the
-        // loop keeps running — i.e. it idles. We can only observe "no panic /
-        // task still alive"; the stub has no side effect to assert on, which
-        // is the point (lifecycle, not reload semantics — §5.2).
+        // fires (the §6.2 pipeline runs only on an mtime CHANGE), and the loop
+        // keeps running — i.e. it idles. This asserts the `RdsWatcher` adapter
+        // wiring over the generic `XdsFileWatcher` core stays inert on a stable
+        // mtime (lifecycle, not reload semantics — §5.2).
         for _ in 0..5 {
             tokio::time::advance(POLL_INTERVAL).await;
         }
