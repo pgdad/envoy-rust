@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// 06.3 D15.3.b: RAII guard around `cluster.<name>.upstream_cx_active`.
 /// Construction increments via the cluster's `cx_active_guard()`; Drop
@@ -77,7 +77,20 @@ impl OutlierDetectionState {
 #[derive(Debug)]
 pub struct Cluster {
     pub(crate) name: String,
-    pub(crate) endpoints: Vec<SocketAddr>,
+    /// 27 D1 (§6.2 / ADR-0068): the endpoint address set behind a swappable
+    /// handle so a file-based EDS watcher (a later phase-27 task) can
+    /// `store_endpoints(new)` atomically while the round-robin LB reads it
+    /// per-request. `RwLock<Arc<…>>` mirrors the phase-26
+    /// `HCMConfig.route_config` precedent verbatim (std-only; no `arc-swap`).
+    ///
+    /// Readers MUST go through [`Cluster::current_endpoints`], which snapshots
+    /// the current `Arc` ONCE per selection (the §5.4 / M26-1 read-once
+    /// invariant): an in-flight `pick()` holds its snapshot for the whole
+    /// selection so a concurrent [`store_endpoints`] swap cannot tear the read.
+    /// The `Arc` clone is a cheap pointer bump, NOT a deep `Vec` clone.
+    ///
+    /// [`store_endpoints`]: Cluster::store_endpoints
+    pub(crate) endpoints: RwLock<Arc<Vec<SocketAddr>>>,
     pub(crate) cursor: AtomicUsize,
     /// 05.3 NEW per SPEC §3 D3: cluster-level upstream protocol selector.
     /// Set in `from_bootstrap` from the parsed cluster's
@@ -272,15 +285,22 @@ impl Cluster {
     /// `Relaxed` ordering is sufficient for the cursor and the health / ejection
     /// reads (single-writer per endpoint; no happens-before dependency).
     fn pick(&self) -> Option<SocketAddr> {
-        if self.endpoints.is_empty() {
-            // `from_bootstrap` rejects empty clusters; this is defense-in-depth.
+        // 27 D1 (§5.4 / M26-1): snapshot the current endpoint Arc ONCE at entry
+        // and use this snapshot for the whole selection. Never re-acquire the
+        // lock mid-selection — a concurrent `store_endpoints` swap then cannot
+        // tear an in-flight read (the read-once invariant).
+        let eps = self.current_endpoints();
+        if eps.is_empty() {
+            // `from_bootstrap` rejects empty clusters at startup; a hot-reload
+            // CAN apply an empty set (V4(d)) → short-circuit BEFORE any modulo
+            // (avoids `% 0`).
             return None;
         }
-        let total = self.endpoints.len();
+        let total = eps.len();
         // Fast path: nothing configured → phase-02 round-robin (byte-for-byte).
         if self.endpoint_health.is_none() && self.outlier_detection.is_none() {
             let i = self.cursor.fetch_add(1, Ordering::Relaxed);
-            return Some(self.endpoints[i % total]);
+            return Some(eps[i % total]);
         }
         // Slow path: at least one filter is configured. Eligibility = healthy AND
         // not-ejected (either filter being `None` is treated as `true`).
@@ -304,7 +324,7 @@ impl Cluster {
         // (`0.0 < 0.0` is false), so a 0-eligible cluster falls through to None.
         if eligible_percent < self.panic_threshold {
             let i = self.cursor.fetch_add(1, Ordering::Relaxed);
-            return Some(self.endpoints[i % total]);
+            return Some(eps[i % total]);
         }
         // Round-robin over the eligible endpoints only.
         let eligible_idx: Vec<usize> = (0..total).filter(|&i| is_eligible(i)).collect();
@@ -314,7 +334,53 @@ impl Cluster {
             return None;
         }
         let i = self.cursor.fetch_add(1, Ordering::Relaxed);
-        Some(self.endpoints[eligible_idx[i % eligible_idx.len()]])
+        Some(eps[eligible_idx[i % eligible_idx.len()]])
+    }
+
+    /// 27 D1 (§5.4 read-once): snapshot the current endpoint address set as a
+    /// cheap `Arc` pointer-clone. Every LB selection ([`pick`]) calls this ONCE
+    /// at entry and uses the returned snapshot for the whole selection, so a
+    /// concurrent [`store_endpoints`] swap cannot tear an in-flight read.
+    /// Mirrors the phase-26 `HCMConfig::current_route_config` poison-recovery
+    /// precedent: a poisoned lock means a writer panicked mid-store, but the
+    /// inner `Arc` is never left torn (the swap is a single atomic move), so we
+    /// recover the guard and read the consistent current set rather than
+    /// inheriting the panic. This matters concretely for phase 27 because Task 4
+    /// adds a second writer (the EDS reload pipeline calls [`store_endpoints`]),
+    /// so a *reader* must degrade gracefully instead of becoming a latent panic
+    /// site keyed on an unrelated writer-side poison.
+    ///
+    /// [`pick`]: Cluster::pick
+    /// [`store_endpoints`]: Cluster::store_endpoints
+    pub fn current_endpoints(&self) -> Arc<Vec<SocketAddr>> {
+        // Read-once: clone the `Arc` (pointer bump), then drop the guard.
+        self.endpoints
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// 27 D1 (§6.2 swap API): atomically replace the endpoint address set. A
+    /// later phase-27 EDS file-watcher task calls this when the assignment file
+    /// changes; the NEXT [`current_endpoints`] / [`pick`] observes `eps`, while
+    /// any in-flight selection that already snapshotted the previous `Arc`
+    /// keeps its snapshot. Task 2 adds this API but nothing calls it yet (the
+    /// reload pipeline lands later).
+    ///
+    /// [`current_endpoints`]: Cluster::current_endpoints
+    /// [`pick`]: Cluster::pick
+    pub fn store_endpoints(&self, eps: Arc<Vec<SocketAddr>>) {
+        // Single-statement swap: hold the write guard only for the pointer
+        // assignment. Poison-recovery (mirroring the phase-26
+        // `HCMConfig::store_route_config` precedent) is safe while this critical
+        // section stays a single `Arc` move — a panic mid-`*guard = eps` cannot
+        // tear the inner `Arc` — so a recovered guard always observes a
+        // consistent set. Phase-27 Task 4's EDS reload pipeline keeps its
+        // reparse+revalidate OUTSIDE this lock so the section never widens.
+        *self
+            .endpoints
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = eps;
     }
 
     /// 14.1 D3 (parent-14 D3/D4): record an upstream response status against an
@@ -344,7 +410,10 @@ impl Cluster {
         let Some(od) = self.outlier_detection.as_ref() else {
             return; // §5.3 inert
         };
-        let Some(idx) = self.endpoints.iter().position(|e| *e == endpoint) else {
+        // 27 D1 (§5.4 read-once): snapshot the address set once; the OD
+        // per-endpoint arrays (`od.endpoints`) are index-aligned with it.
+        let eps = self.current_endpoints();
+        let Some(idx) = eps.iter().position(|e| *e == endpoint) else {
             return; // defense-in-depth (lock-in #10)
         };
         let state = &od.endpoints[idx];
@@ -358,7 +427,7 @@ impl Cluster {
         if !decision.any() {
             return;
         }
-        let total = self.endpoints.len();
+        let total = eps.len();
         // 14.1 M6 (§6.2 item-4): cap_count = floor(total * max_ejection_percent / 100). When
         // max_ejection_percent == 0 ⇒ cap_count == 0 ⇒ active_count (0) >= cap_count (0) on
         // the first crossing ⇒ overflow, never ejecting (a deliberate "0% = eject nothing"
@@ -444,6 +513,17 @@ impl ClusterHandle {
     /// inert-when-unconfigured round-robin).
     pub fn pick_endpoint(&self) -> Option<SocketAddr> {
         self.inner.pick()
+    }
+
+    /// 27 D1 (§5.4 / §6.2): delegates to [`Cluster::current_endpoints`] — a
+    /// read-once `Arc` pointer-clone of the live endpoint address set.
+    /// `envoy-admin`'s `config_dump` (a later phase-27 task) reads the live set
+    /// through this handle; since `inner` is `pub(crate)`, a public accessor on
+    /// `ClusterHandle` is required for cross-crate reach.
+    ///
+    /// [`Cluster::current_endpoints`]: Cluster::current_endpoints
+    pub fn current_endpoints(&self) -> Arc<Vec<SocketAddr>> {
+        self.inner.current_endpoints()
     }
 
     /// 14.1 D3: delegates to `Cluster::record_response`. The 14.2 D4 response-receipt
@@ -582,10 +662,12 @@ impl ClusterHandle {
     /// invariant — no probe task should spawn).
     pub fn health_probe_targets(&self) -> Option<Vec<(SocketAddr, Arc<crate::EndpointHealth>)>> {
         let health = self.inner.endpoint_health.as_ref()?;
+        // 27 D1 (§5.4 read-once): snapshot the address set once; the health
+        // array is index-aligned with it. Probe targets are computed at
+        // bootstrap (health-checked clusters are not reloadable in phase 27).
+        let eps = self.inner.current_endpoints();
         Some(
-            self.inner
-                .endpoints
-                .iter()
+            eps.iter()
                 .copied()
                 .zip(health.iter().map(Arc::clone))
                 .collect(),
@@ -1066,7 +1148,7 @@ pub async fn from_bootstrap(
         };
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
-            endpoints,
+            endpoints: RwLock::new(Arc::new(endpoints)),
             cursor: AtomicUsize::new(0),
             upstream_protocol,
             cx_total,
@@ -1134,8 +1216,8 @@ pub async fn from_bootstrap(
 mod tests {
     use super::*;
     use std::net::SocketAddr;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, RwLock};
 
     fn mk_endpoints(n: u16) -> Vec<SocketAddr> {
         (0..n)
@@ -1177,7 +1259,7 @@ mod tests {
         ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
-                endpoints,
+                endpoints: RwLock::new(Arc::new(endpoints)),
                 cursor: AtomicUsize::new(0),
                 upstream_protocol: UpstreamProtocol::default(),
                 cx_total,
@@ -1193,6 +1275,92 @@ mod tests {
                 panic_threshold: 50.0,
                 outlier_detection: None,
             }),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // phase-27 Task 2 (D1 / §6.2-INDEPENDENT): the endpoint set is a
+    // swappable handle (`RwLock<Arc<Vec<SocketAddr>>>`). These tests pin the
+    // §5.4 read-once invariant + the V4(d)/V6 swap-safety foundations BEFORE
+    // any watcher exists. Task 2 adds the swap API only; nothing reloads yet.
+    // ---------------------------------------------------------------------
+
+    /// §5.4 (a)+(b): `pick()` reads the CURRENT endpoint Arc, and a
+    /// `store_endpoints(new)` is visible to the NEXT `pick()`.
+    #[test]
+    fn endpoint_handle_store_is_visible_to_next_pick() {
+        let initial = mk_endpoints(2); // 127.0.0.1:10000, :10001
+        let handle = mk_handle("backend", initial.clone());
+        // (a) reads current set.
+        assert_eq!(handle.pick_endpoint().unwrap(), initial[0]); // cursor 0
+        // (b) swap in a brand-new, disjoint set.
+        let replacement: Vec<SocketAddr> = vec![
+            "127.0.0.1:20000".parse().unwrap(),
+            "127.0.0.1:20001".parse().unwrap(),
+        ];
+        handle.inner.store_endpoints(Arc::new(replacement.clone()));
+        // The NEXT pick observes the replacement (cursor 1 → replacement[1]).
+        assert_eq!(handle.pick_endpoint().unwrap(), replacement[1]);
+        assert!(
+            replacement.contains(&handle.pick_endpoint().unwrap()),
+            "every subsequent pick reads the replacement set"
+        );
+    }
+
+    /// §5.4 (c): an in-flight selection that snapshotted the OLD Arc keeps its
+    /// snapshot — a `store_endpoints` landing after the snapshot does NOT tear
+    /// the read (the read-once guarantee). We emulate the in-flight task by
+    /// holding the `Arc` returned by `current_endpoints()` across a swap.
+    #[test]
+    fn endpoint_handle_inflight_snapshot_is_isolated_from_swap() {
+        let initial = mk_endpoints(2);
+        let handle = mk_handle("backend", initial.clone());
+        // An in-flight selection snapshots the current Arc once.
+        let snapshot = handle.inner.current_endpoints();
+        assert_eq!(&*snapshot, &initial);
+        // A reload lands mid-selection.
+        let replacement: Vec<SocketAddr> = vec!["127.0.0.1:30000".parse().unwrap()];
+        handle.inner.store_endpoints(Arc::new(replacement));
+        // The snapshot the in-flight selection holds is unchanged (no tear).
+        assert_eq!(
+            &*snapshot, &initial,
+            "the snapshot taken before the swap is isolated from it"
+        );
+        // The handle now points at the replacement.
+        assert_eq!(handle.inner.current_endpoints().len(), 1);
+    }
+
+    /// §5.4 (d) (V4(d) apply-empty foundation): swapping in an EMPTY set makes
+    /// the next `pick()` return `None` (no panic, no `% 0`).
+    #[test]
+    fn endpoint_handle_store_empty_yields_none_next_pick() {
+        let handle = mk_handle("backend", mk_endpoints(2));
+        assert!(handle.pick_endpoint().is_some());
+        handle.inner.store_endpoints(Arc::new(Vec::new()));
+        assert_eq!(
+            handle.pick_endpoint(),
+            None,
+            "an empty endpoint set short-circuits to None before any modulo"
+        );
+    }
+
+    /// §5.4 (e) (V6 cursor-bounds): a SHRINKING set (2→1) leaves the cursor
+    /// safe — `i % total` over the NEW snapshot stays in-bounds even after the
+    /// cursor has advanced past the new length.
+    #[test]
+    fn endpoint_handle_shrinking_set_keeps_cursor_in_bounds() {
+        let initial = mk_endpoints(2);
+        let handle = mk_handle("backend", initial);
+        // Advance the cursor past 1 (so a stale length would index out of range).
+        for _ in 0..5 {
+            assert!(handle.pick_endpoint().is_some());
+        }
+        // Shrink to a single endpoint.
+        let one: Vec<SocketAddr> = vec!["127.0.0.1:40000".parse().unwrap()];
+        handle.inner.store_endpoints(Arc::new(one.clone()));
+        // Every subsequent pick must be the sole survivor — never an OOB index.
+        for _ in 0..5 {
+            assert_eq!(handle.pick_endpoint().unwrap(), one[0]);
         }
     }
 
@@ -1480,7 +1648,7 @@ admin:
         let registry = envoy_stats::StatsRegistry::new();
         let c = Cluster {
             name: "backend".to_string(),
-            endpoints: mk_endpoints(1),
+            endpoints: RwLock::new(Arc::new(mk_endpoints(1))),
             cursor: AtomicUsize::new(0),
             upstream_protocol: UpstreamProtocol::default(),
             cx_total: registry
@@ -2103,7 +2271,7 @@ admin:
         let handle = ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
-                endpoints,
+                endpoints: RwLock::new(Arc::new(endpoints)),
                 cursor: AtomicUsize::new(0),
                 upstream_protocol: UpstreamProtocol::default(),
                 cx_total,
@@ -2505,7 +2673,7 @@ admin:
         let handle = ClusterHandle {
             inner: Arc::new(Cluster {
                 name: name.to_string(),
-                endpoints,
+                endpoints: RwLock::new(Arc::new(endpoints)),
                 cursor: AtomicUsize::new(0),
                 upstream_protocol: UpstreamProtocol::default(),
                 cx_total,
