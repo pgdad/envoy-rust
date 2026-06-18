@@ -48,3 +48,29 @@ Ran the SPEC §6.2 6-item checklist against `envoyproxy/envoy:v1.33.0` (digest `
 The state-3 arc dispatches PLAN Tasks 2–9 to fresh subagents SERIALLY (`feedback_serial_subagent_dispatch`), each with two-stage review (spec-compliance THEN code-quality), TDD per task, one code commit + one PROGRESS commit per task. **Task 1 (§6.2) is DONE** (this state-2 commit). The next unstarted task is **Task 2** (the D1 endpoint-set-handle migration — `Cluster.endpoints: Vec<SocketAddr>` → `RwLock<Arc<Vec<SocketAddr>>>`, the §6.2-independent foundation; regression witness = fixtures 0020–0029 green incl. 0029's idle watcher). Tasks 2 and 3 are §6.2-independent and may run in either order; Task 4 depends on both.
 
 ---
+
+## Task 2 — D1 endpoint-set-handle migration (`Vec<SocketAddr>` → `RwLock<Arc<Vec<SocketAddr>>>`)
+
+- **Skill:** `superpowers:test-driven-development` (failing test FIRST, watched it fail, then implemented).
+- **What migrated (`crates/envoy-cluster/src/cluster.rs`):**
+  - **Field:** `Cluster.endpoints: Vec<SocketAddr>` → `RwLock<Arc<Vec<SocketAddr>>>` (the phase-26 `HCMConfig.route_config` precedent, std-only — no `arc-swap`).
+  - **New accessors on `Cluster`:** `pub fn current_endpoints(&self) -> Arc<Vec<SocketAddr>>` (read-once: `self.endpoints.read().unwrap_or_else(|p| p.into_inner()).clone()`) + `pub fn store_endpoints(&self, eps: Arc<Vec<SocketAddr>>)` (single-statement `*guard = eps` swap, same poison-recovery form). Nothing calls `store_endpoints` yet except the new tests (the reload pipeline lands in a later task).
+  - **New delegate on `ClusterHandle`:** `pub fn current_endpoints(&self) -> Arc<Vec<SocketAddr>>` → `self.inner.current_endpoints()` (mandatory public reach for envoy-admin's later config_dump; `inner` is `pub(crate)`).
+  - **Read sites adapted (all enumerated via `grep -n 'endpoints'`):**
+    - `pick()` — snapshots ONCE at entry (`let eps = self.current_endpoints();`); empty short-circuit → `None` BEFORE any modulo (V4(d)/V6); `total = eps.len()`; fast-path + both slow-path index reads use `eps`. The slow-path eligibility arrays (`self.endpoint_health` / `self.outlier_detection.endpoints`) stay read from `self` (they do NOT live behind the handle — only the address Vec does); index-aligned with the `eps` snapshot.
+    - `record_response()` — snapshots `eps` once; `eps.iter().position(..)` for the index + `total = eps.len()` for the cap; OD per-endpoint array reads unchanged.
+    - `ClusterHandle::health_probe_targets()` — snapshots `eps` once, zips with the index-aligned health array (bootstrap-time; HC clusters are not reloadable in phase 27).
+  - **Construct/seed sites:** `from_bootstrap` struct literal + 4 test struct literals → `endpoints: RwLock::new(Arc::new(endpoints))`. The `from_bootstrap` empty-reject (startup all-fatal) is UNCHANGED.
+  - **Left untouched (verified):** `OutlierDetectionState.endpoints` (the per-endpoint ejection Vec), `load_assignment.endpoints` / `LocalityLbEndpoints` config literals, the test-helper local `endpoints` vars.
+- **Tests added (`#[cfg(test)]`, all PASS):** `endpoint_handle_store_is_visible_to_next_pick` (§5.4 a+b), `endpoint_handle_inflight_snapshot_is_isolated_from_swap` (§5.4 c — read-once isolation), `endpoint_handle_store_empty_yields_none_next_pick` (§5.4 d — V4(d) apply-empty foundation), `endpoint_handle_shrinking_set_keeps_cursor_in_bounds` (§5.4 e — V6 cursor-bounds 2→1).
+- **TDD evidence:** Step 2 ran `cargo test -p envoy-cluster endpoint_handle` → FAIL (6 `E0599` no-method errors — `store_endpoints`/`current_endpoints` absent). After Step 3 → 4 passed.
+- **Commands + results:**
+  - `cargo test -p envoy-cluster endpoint_handle` → **4 passed**.
+  - `cargo test -p envoy-cluster` → **95 passed, 0 failed**.
+  - `cargo clippy -p envoy-cluster --all-targets -- -D warnings` → **clean** (no `needless_borrow` / lock-guard / modulo lints).
+  - `cargo build -p envoy-config -p envoy-cluster` (isolated) → green; `cargo build --workspace --all-targets` → green.
+  - `cargo test --workspace` → all green EXCEPT one pre-existing, environment-dependent differential failure (see Concerns).
+  - Endpoint-set consumer crates `cargo test -p envoy-cluster -p envoy-http1 -p envoy-http2 -p envoy-admin -p envoy-bin` → **all green**.
+- **Code-quality review follow-up (Minor #1):** Both accessors now use poison-recovery (`.read()/.write().unwrap_or_else(|poison| poison.into_inner())`) to match the phase-26 `HCMConfig::current_route_config` / `store_route_config` precedent (`crates/envoy-http1/src/hcm.rs:248-278`) exactly — replacing the earlier `.expect("endpoints RwLock poisoned")`. Rationale (now in the accessor doc comment): a *reader* must never inherit a panic from an unrelated writer-side poison, which matters concretely because Task 4 adds a second writer (the EDS reload pipeline calls `store_endpoints`), so the lock degrades gracefully instead of becoming a latent panic site. `cargo test -p envoy-cluster` → **95 passed**; `cargo clippy -p envoy-cluster --all-targets -- -D warnings` → **clean** after the change.
+- **Concerns:** `differential::admin_config_dump_server_info` FAILS on this dev host — but it fails IDENTICALLY on the clean HEAD `f43d1a6` (verified via `git stash`), with Docker-internal host data (`192.168.65.2`, `host.docker.internal`). This is the known `host-docker-desktop-virtiofs-no-inotify` / Docker-differential class: native-CI-authoritative, NOT caused by this migration. The behavior-preserving migration (fixtures 0020–0029 read paths) leaves every non-reloading request green.
+
