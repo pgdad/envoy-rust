@@ -1,0 +1,53 @@
+# 28 fixture-0036 expectations (ADR-0070): RING_HASH consistent-hashing LB
+# cross-proxy differential. The Http1HashSweep driver sweeps a list of
+# `x-hash-key` header values against BOTH proxies (upstream envoyproxy/envoy
+# v1.33.0 and the subject envoy-rust) through a STATIC `lb_policy: RING_HASH`
+# cluster `ring_cluster` with TWO distinguishable echo backends
+# (`--body-marker backend_1`/`backend_2`). Each response body's leading
+# `backend: <marker>\n` line names which backend the ring selected for the
+# request hash xxh64(header value).
+#
+# The driver asserts THREE properties over the sweep:
+#
+#   STRONG (the core differential): for EACH key the marker chosen by envoy-rust
+#       is IDENTICAL to the one chosen by upstream Envoy — cross-proxy identical
+#       RING_HASH selection (the locked xxHash64 ring reproduced end-to-end).
+#   SPREAD: over the full sweep BOTH backend_1 AND backend_2 are selected on
+#       EACH side (the ring actually distributes; a one-backend sweep fails).
+#   STABILITY: each key is probed twice; a repeated key must hit the SAME
+#       backend on each proxy (same-key -> same-backend).
+#
+# The sweep keys include §6.2 oracle keys (key-0, key-2, user-alice, 1.2.3.4)
+# plus others chosen for spread (the §6.2 recon saw a ~14/13 split over 27 keys,
+# so 16 keys reliably hit both backends).
+#
+# LOCALLY observable: a plain request/response with NO file-watch/reload
+# trigger, so the Docker test runs and is authoritative on any host with a
+# Docker daemon. Docker-gated by the differential harness at the cluster level
+# (no per-test cfg gate; the harness skips when `DOCKER_HOST` is unavailable).
+driver:
+  kind: http1_hash_sweep
+  path: /
+  host: ring_cluster
+  expected_status: 200
+  keys:
+    - key-0
+    - key-1
+    - key-2
+    - key-3
+    - key-4
+    - key-5
+    - user-alice
+    - user-bob
+    - user-carol
+    - 1.2.3.4
+    - 10.0.0.1
+    - session-abcdef
+    - session-123456
+    - tenant-acme
+    - tenant-globex
+    - cart-99
+# `response_status: exact` adds a cross-proxy status equivalence belt over the
+# per-key driver assertions (the driver also asserts each side returns 200).
+equivalence:
+  response_status: exact

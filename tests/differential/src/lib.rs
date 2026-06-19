@@ -304,6 +304,40 @@ pub enum Driver {
         reload: EdsReloadStep,
         post_probes: Vec<Http1Probe>,
     },
+    /// 28 Task 7 (ADR-0070): RING_HASH consistent-hashing LB cross-proxy
+    /// differential. Sweeps a list of `x-hash-key` header values against BOTH
+    /// proxies through a STATIC `lb_policy: RING_HASH` cluster with two
+    /// distinguishable echo backends (`--body-marker backend_1`/`backend_2`),
+    /// extracting each response body's leading `backend: <marker>\n` line as
+    /// the selected-backend discriminator. Asserts THREE properties:
+    ///
+    ///   STRONG (the core differential): for each key the marker chosen by
+    ///   envoy-rust is IDENTICAL to the one chosen by upstream Envoy
+    ///   (cross-proxy identical RING_HASH selection — the locked xxHash64 ring
+    ///   reproduced end-to-end against the real Envoy).
+    ///
+    ///   SPREAD: over the full sweep BOTH markers appear on EACH side (the ring
+    ///   actually distributes; a sweep that collapses to one backend fails —
+    ///   it would not prove ring selection).
+    ///
+    ///   STABILITY: a repeated key yields the SAME marker on each proxy
+    ///   (same-key → same-backend; each key is probed twice).
+    ///
+    /// This differential is LOCALLY observable (a plain request/response with
+    /// NO file-watch/reload trigger), so the Docker test runs and is
+    /// authoritative on any host with a Docker daemon.
+    Http1HashSweep {
+        /// The `x-hash-key` header values to sweep. Each is sent (twice, for
+        /// the stability check) to both proxies; the response body marker is
+        /// compared cross-proxy per key.
+        keys: Vec<String>,
+        /// Request path (e.g. `/`). Routed to the RING_HASH cluster.
+        path: String,
+        /// Request `Host` header value.
+        host: String,
+        /// Expected status for every probe on both sides (e.g. 200).
+        expected_status: u16,
+    },
 }
 
 /// 26 Task 7: the reload directive inside `Driver::Http1RdsReload`. Carries the
@@ -1155,6 +1189,34 @@ pub fn discover_host_gateway_ip() -> anyhow::Result<String> {
         })?
         .to_string();
     Ok(ip)
+}
+
+/// 28 Task 7 (ADR-0070): discover the host's primary non-loopback IPv4 — the
+/// ONE address string the RING_HASH differential renders into BOTH proxies'
+/// endpoints (`{{BACKEND_IP}}`), so both build their ring from identical
+/// `ip:port` keys (the cross-proxy STRONG-selection precondition). Both the
+/// subject (a host process) and the upstream container reach the host's
+/// `0.0.0.0`-bound echo backends via this IP (loopback `127.0.0.1` is NOT
+/// usable — it is not reachable from inside the container, and the container's
+/// own loopback is a different namespace).
+///
+/// Discovery is route-based and sends NO packets: a UDP socket is "connected"
+/// to a public address so the kernel selects the egress interface, and its
+/// local address is read back. The target IP need not be reachable.
+pub fn discover_host_lan_ip() -> anyhow::Result<String> {
+    use std::net::UdpSocket;
+    let sock =
+        UdpSocket::bind("0.0.0.0:0").context("binding UDP socket for host-LAN-IP discovery")?;
+    sock.connect("8.8.8.8:53")
+        .context("connecting UDP socket to select egress interface")?;
+    let ip = sock
+        .local_addr()
+        .context("reading local_addr for host-LAN-IP discovery")?
+        .ip();
+    match ip {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Ok(v4.to_string()),
+        other => bail!("host-LAN-IP discovery returned an unusable address: {other}"),
+    }
 }
 
 /// 18 Task 6 (ADR-0049): scan a CDS rendition for any residual `{{MARKER}}`
@@ -2633,6 +2695,9 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // 26 Task 7: the RDS-hot-reload driver runs over an HCM `{{PORT}}`
         // listener like the other HTTP drivers; the reload swaps the
         // file-based RouteConfiguration out from under that listener.
+        // 28 Task 7 (ADR-0070): RING_HASH sweep uses the same {{PORT}}
+        // data-listener convention as the other HCM-shaped drivers.
+        | Driver::Http1HashSweep { .. }
         | Driver::Http1RdsReload { .. }
         // 27 Task 6 (D6): the EDS-hot-reload driver runs over an HCM `{{PORT}}`
         // listener like the other HTTP drivers; the reload swaps the file-based
@@ -2805,6 +2870,24 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // fixtures, run ONCE when `needs_eds` (the only consumer today is fixture
     // 0029). EDS rejects hostnames, so the upstream EDS file's endpoint address
     // must be this numeric IP; the subject side uses `127.0.0.1`.
+    // 28 Task 7 (ADR-0070): the RING_HASH differential needs BOTH proxies to
+    // build their ring from the *identical* endpoint address strings — the ring
+    // key is `xxh64("{ip:port}_{i}")`, so divergent address strings give
+    // divergent rings and the cross-proxy STRONG target cannot hold. The EDS
+    // per-side numeric-IP split (`{{EDS_BACKEND_IP}}` → host-gateway IP upstream
+    // / `127.0.0.1` subject) would defeat this. Instead the `{{BACKEND_IP}}`
+    // marker renders to ONE shared address on BOTH sides: the host's primary
+    // non-loopback LAN IPv4, which the subject (a host process) reaches directly
+    // and the upstream container reaches via the Docker bridge/VM NAT (verified
+    // reachable from both). A STATIC cluster also rejects hostnames, so this
+    // must be a numeric IP — the same numeric-IP requirement EDS has.
+    let needs_backend_ip =
+        upstream_template.contains("{{BACKEND_IP}}") || subject_template.contains("{{BACKEND_IP}}");
+    let shared_backend_ip = if needs_backend_ip {
+        Some(discover_host_lan_ip()?)
+    } else {
+        None
+    };
     let host_gateway_ip = if needs_eds {
         Some(discover_host_gateway_ip()?)
     } else {
@@ -3134,6 +3217,15 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 v.push(("EDS_BACKEND_IP", ip.to_string()));
             }
         }
+        if needs_backend_ip {
+            // 28 Task 7 (ADR-0070): the SHARED host LAN IP — IDENTICAL on both
+            // sides so both proxies build the same RING_HASH ring. The upstream
+            // container reaches the host's 0.0.0.0-bound backends via this IP
+            // (Docker bridge / Desktop-VM NAT).
+            if let Some(ip) = shared_backend_ip.as_deref() {
+                v.push(("BACKEND_IP", ip.to_string()));
+            }
+        }
         v
     };
     let subject_kvs: Vec<(&str, String)> = {
@@ -3198,6 +3290,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // loopback, so its EDS endpoint address is the numeric `127.0.0.1`
             // (NOT the host-gateway IP the container uses).
             v.push(("EDS_BACKEND_IP", "127.0.0.1".to_string()));
+        }
+        if needs_backend_ip {
+            // 28 Task 7 (ADR-0070): the SAME shared host LAN IP as the upstream
+            // side (NOT `127.0.0.1`) so BOTH proxies build their RING_HASH ring
+            // from the IDENTICAL endpoint address strings — the precondition for
+            // the cross-proxy STRONG selection target. The subject (a host
+            // process) reaches the 0.0.0.0-bound backends via this IP directly.
+            if let Some(ip) = shared_backend_ip.as_deref() {
+                v.push(("BACKEND_IP", ip.to_string()));
+            }
         }
         v
     };
@@ -4157,6 +4259,137 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     .with_context(|| format!("probe {}: diff_headers", probe.name))?;
                 }
             }
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+        }
+        // 28 Task 7 (ADR-0070): RING_HASH consistent-hashing cross-proxy
+        // differential. For each `x-hash-key` value: send GET <path> with that
+        // header to BOTH proxies (twice, for stability), extract each response
+        // body's leading `backend: <marker>\n` line, and assert per-key
+        // cross-proxy marker agreement (STRONG), full-sweep spread (BOTH markers
+        // appear on EACH side), and same-key stability. Locally observable — a
+        // plain request/response with no reload trigger.
+        Driver::Http1HashSweep {
+            keys,
+            path,
+            host,
+            expected_status,
+        } => {
+            use std::collections::BTreeSet;
+
+            if keys.is_empty() {
+                bail!("Driver::Http1HashSweep requires a non-empty `keys:` sweep");
+            }
+
+            // Extract the selected-backend marker from an echo response body's
+            // leading `backend: <marker>\n` line. The two backends are spawned
+            // `--body-marker backend_1`/`backend_2`, so this line names WHICH
+            // backend the RING_HASH ring selected for the request hash.
+            fn extract_marker(body: &[u8], side: &str, key: &str) -> Result<String> {
+                let text = std::str::from_utf8(body)
+                    .with_context(|| format!("{side} response body for key `{key}` is not utf8"))?;
+                let first = text.lines().next().unwrap_or("");
+                let marker = first.strip_prefix("backend: ").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{side} response body for key `{key}` does not begin with \
+                         `backend: <marker>`; got first line `{first}`"
+                    )
+                })?;
+                Ok(marker.trim().to_string())
+            }
+
+            // Probe one key once on one proxy; return the selected marker.
+            async fn probe_marker(
+                addr: SocketAddr,
+                path: &str,
+                host: &str,
+                key: &str,
+                expected_status: u16,
+                side: &str,
+            ) -> Result<String> {
+                let extra = vec![("x-hash-key".to_string(), key.to_string())];
+                let resp = drive_http1(addr, &Http1Method::Get, path, host, &extra, None)
+                    .await
+                    .with_context(|| format!("{side} http1 drive (key `{key}`)"))?;
+                if resp.status != expected_status {
+                    bail!(
+                        "{side} status {} != expected {} (key `{key}`)",
+                        resp.status,
+                        expected_status,
+                    );
+                }
+                extract_marker(&resp.body, side, key)
+            }
+
+            let mut upstream_markers: BTreeSet<String> = BTreeSet::new();
+            let mut subject_markers: BTreeSet<String> = BTreeSet::new();
+
+            for key in keys {
+                // First selection on each side.
+                let up1 =
+                    probe_marker(upstream_addr, path, host, key, *expected_status, "upstream")
+                        .await?;
+                let su1 = probe_marker(subject_addr, path, host, key, *expected_status, "subject")
+                    .await?;
+
+                // STRONG (the core differential): cross-proxy identical
+                // RING_HASH selection for this key.
+                if up1 != su1 {
+                    bail!(
+                        "RING_HASH cross-proxy selection mismatch for x-hash-key `{key}`:\n  \
+                         upstream Envoy -> `{up1}`\n  envoy-rust      -> `{su1}`\n\
+                         (the locked xxHash64 ring — ADR-0070 — must select the SAME backend)"
+                    );
+                }
+
+                // STABILITY: the SAME key must select the SAME backend on a
+                // repeat request, on each proxy independently.
+                let up2 =
+                    probe_marker(upstream_addr, path, host, key, *expected_status, "upstream")
+                        .await?;
+                let su2 = probe_marker(subject_addr, path, host, key, *expected_status, "subject")
+                    .await?;
+                if up2 != up1 {
+                    bail!(
+                        "RING_HASH instability on upstream Envoy for key `{key}`: \
+                         first=`{up1}` repeat=`{up2}` (same key must hit same backend)"
+                    );
+                }
+                if su2 != su1 {
+                    bail!(
+                        "RING_HASH instability on envoy-rust for key `{key}`: \
+                         first=`{su1}` repeat=`{su2}` (same key must hit same backend)"
+                    );
+                }
+
+                upstream_markers.insert(up1);
+                subject_markers.insert(su1);
+            }
+
+            // SPREAD: over the full sweep BOTH backends must be selected on EACH
+            // side. A sweep that collapses to a single backend does not exercise
+            // ring distribution and is treated as a failure.
+            let expected_spread: BTreeSet<String> =
+                ["backend_1".to_string(), "backend_2".to_string()]
+                    .into_iter()
+                    .collect();
+            if upstream_markers != expected_spread {
+                bail!(
+                    "RING_HASH spread failure on upstream Envoy: the {}-key sweep selected only \
+                     {:?} (expected BOTH backend_1 and backend_2)",
+                    keys.len(),
+                    upstream_markers,
+                );
+            }
+            if subject_markers != expected_spread {
+                bail!(
+                    "RING_HASH spread failure on envoy-rust: the {}-key sweep selected only \
+                     {:?} (expected BOTH backend_1 and backend_2)",
+                    keys.len(),
+                    subject_markers,
+                );
+            }
+
             subject.shutdown(Duration::from_secs(5)).await.ok();
             drop(upstream);
         }
@@ -5831,6 +6064,40 @@ driver:
         assert_eq!(post_probes.len(), 1);
         assert_eq!(post_probes[0].name, "post-route");
         assert_eq!(post_probes[0].path, "/v2");
+    }
+
+    /// 28 Task 7 (ADR-0070): a `Driver::Http1HashSweep` expectations YAML
+    /// round-trips through the serde grammar — lock in the schema (mirroring the
+    /// RDS/EDS round-trip tests). The fixture-0036 wire shape: a `keys:` list,
+    /// `path`, `host`, and `expected_status`.
+    #[test]
+    fn driver_http1_hash_sweep_round_trips_through_serde() {
+        let yaml = r#"
+driver:
+  kind: http1_hash_sweep
+  path: /
+  host: ring_cluster
+  expected_status: 200
+  keys:
+    - key-0
+    - key-2
+    - user-alice
+    - 1.2.3.4
+"#;
+        let exp: crate::Expectations = serde_yaml::from_str(yaml).expect("yaml parses");
+        let Driver::Http1HashSweep {
+            keys,
+            path,
+            host,
+            expected_status,
+        } = exp.driver
+        else {
+            panic!("expected Driver::Http1HashSweep");
+        };
+        assert_eq!(path, "/");
+        assert_eq!(host, "ring_cluster");
+        assert_eq!(expected_status, 200);
+        assert_eq!(keys, vec!["key-0", "key-2", "user-alice", "1.2.3.4"]);
     }
 
     /// 26 Task 7: `atomic_rename_over` swaps new content over the target via a
