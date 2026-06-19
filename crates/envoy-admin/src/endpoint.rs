@@ -598,19 +598,99 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
     // with cds_config it lands at configs[2]; with no cds, configs[1]. envoy-rust
     // emits it unconditional of ?include_eds (a recorded narrowing); the per-side
     // index mismatch is reconciled in the harness.
-    let static_endpoint_configs: Vec<StaticEndpointConfigEntry> = bootstrap
+    // 27 Task 5 (D5; §6.2-LOCKED V5 / ADR-0068): render the EndpointsConfigDump
+    // THROUGH the LIVE, swappable endpoint handle (read via
+    // `ClusterHandle::current_endpoints()`) so the dump reflects the HOT-RELOADED
+    // endpoint set after an EDS file reload, NOT the frozen startup bootstrap
+    // `load_assignment`. Mirrors the phase-26 RouteSnapshot live-read precedent:
+    // because `ClusterLoadAssignmentBody.endpoints` borrows
+    // `&Vec<LocalityLbEndpoints>`, we first materialize an OWNED Vec of
+    // reconstructed snapshots that lives until serialization, then build the
+    // borrowing entries from it.
+    //
+    // Shape: the live data is a flat `Vec<SocketAddr>`, but the phase-21 entry
+    // serializes `&Vec<LocalityLbEndpoints>` (the rich config locality structure)
+    // — so we RECONSTRUCT a single synthetic `LocalityLbEndpoints` from the live
+    // addresses (each `SocketAddr` → one `LbEndpoint` with
+    // `endpoint.address.socket_address.{address,port_value}`), feeding the
+    // EXISTING `ClusterLoadAssignmentBody` serializer. Reusing that serializer
+    // guarantees byte-identical JSON to phase-21 for an idle cluster (the
+    // fixture-0029 witness whose live endpoints == its initial endpoints). The
+    // 0029 differential pins only `endpoint_config.cluster_name`
+    // (`value_may_differ_keys: ["configs"]`); `cluster_name` is the cluster
+    // identity, unchanged by reload, so it stays sourced from the bootstrap
+    // `la.cluster_name` — only the ENDPOINTS come from the live handle.
+    //
+    // Fallback: if the cluster is not present in the live `ClusterManager` (the
+    // tests' `ClusterManager::empty()` path; never in production, where every EDS
+    // cluster has a live handle), we reconstruct from the bootstrap
+    // `load_assignment` flat addresses instead so the entry is still emitted.
+    struct EndpointSnapshot<'a> {
+        cluster_name: &'a str,
+        endpoints: Vec<envoy_config::LocalityLbEndpoints>,
+    }
+    // Reconstruct one synthetic locality from a flat address slice, matching the
+    // phase-21 `socket_address.{address,port_value}` shape exactly. An empty
+    // slice yields an empty `Vec<LocalityLbEndpoints>` (no synthetic locality).
+    fn reconstruct(addrs: &[std::net::SocketAddr]) -> Vec<envoy_config::LocalityLbEndpoints> {
+        if addrs.is_empty() {
+            return Vec::new();
+        }
+        vec![envoy_config::LocalityLbEndpoints {
+            lb_endpoints: addrs
+                .iter()
+                .map(|sa| envoy_config::LbEndpoint {
+                    endpoint: envoy_config::Endpoint {
+                        address: envoy_config::Address {
+                            socket_address: envoy_config::SocketAddress {
+                                address: sa.ip().to_string(),
+                                port_value: sa.port(),
+                            },
+                        },
+                    },
+                })
+                .collect(),
+        }]
+    }
+    let endpoint_snapshots: Vec<EndpointSnapshot<'_>> = bootstrap
         .all_clusters()
         .filter(|c| c.cluster_type == envoy_config::ClusterType::Eds)
         .filter_map(|c| {
-            c.load_assignment
-                .as_ref()
-                .map(|la| StaticEndpointConfigEntry {
-                    endpoint_config: ClusterLoadAssignmentBody {
-                        type_url: CLUSTER_LOAD_ASSIGNMENT_TYPE_URL,
-                        cluster_name: &la.cluster_name,
-                        endpoints: &la.endpoints,
-                    },
-                })
+            c.load_assignment.as_ref().map(|la| {
+                let endpoints = match handler.cluster_manager().get(&c.name) {
+                    // Live: read-once the swappable endpoint set (the reloaded
+                    // one) and reconstruct the locality shape from it.
+                    Some(handle) => reconstruct(&handle.current_endpoints()),
+                    // Fallback: reconstruct from the bootstrap flat addresses
+                    // (the empty-manager test path; production always hits Live).
+                    None => reconstruct(
+                        &la.endpoints
+                            .iter()
+                            .flat_map(|l| l.lb_endpoints.iter())
+                            .filter_map(|lbe| {
+                                let sa = &lbe.endpoint.address.socket_address;
+                                format!("{}:{}", sa.address, sa.port_value)
+                                    .parse::<std::net::SocketAddr>()
+                                    .ok()
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                };
+                EndpointSnapshot {
+                    cluster_name: &la.cluster_name,
+                    endpoints,
+                }
+            })
+        })
+        .collect();
+    let static_endpoint_configs: Vec<StaticEndpointConfigEntry> = endpoint_snapshots
+        .iter()
+        .map(|snap| StaticEndpointConfigEntry {
+            endpoint_config: ClusterLoadAssignmentBody {
+                type_url: CLUSTER_LOAD_ASSIGNMENT_TYPE_URL,
+                cluster_name: snap.cluster_name,
+                endpoints: &snap.endpoints,
+            },
         })
         .collect();
     if !static_endpoint_configs.is_empty() {
@@ -3250,6 +3330,117 @@ static_resources:
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// 27 Task 5 helper: build an `AdminHandler` whose `ClusterManager` is the
+    /// LIVE manager built via `envoy_cluster::from_bootstrap` (so its EDS
+    /// cluster's swappable endpoint handle is reachable + mutable through
+    /// `cluster_manager().get(name).store_endpoints(...)`). Mirrors
+    /// `handler_from_bootstrap` but threads in the real manager rather than
+    /// `ClusterManager::empty()`.
+    async fn handler_with_live_manager(bootstrap: Bootstrap) -> AdminHandler {
+        let registry = Arc::new(StatsRegistry::new());
+        let manager = envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("from_bootstrap");
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
+        AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            Arc::new(manager),
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+            Vec::new(),
+        )
+    }
+
+    // 27 Task 5 (TDD core / D5): `/config_dump?include_eds`'s EndpointsConfigDump
+    // must render the EDS cluster's endpoints THROUGH the swappable live handle
+    // (`ClusterHandle::current_endpoints()`), NOT the frozen startup bootstrap
+    // `load_assignment`. The pre-reload render shows the initial EDS endpoint;
+    // after a `store_endpoints` swap (simulating an EDS file reload) a fresh
+    // render must reflect the NEW endpoint. Before this task the renderer read
+    // the bootstrap snapshot, so the post-swap assertion FAILED.
+    #[tokio::test]
+    async fn config_dump_reflects_hot_reloaded_endpoints() {
+        // 1. Build a live manager whose `eds_backend` cluster starts at the
+        //    bootstrap load_assignment endpoint (127.0.0.1:8080).
+        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
+        let handler = handler_with_live_manager(bootstrap).await;
+
+        // 2. Pre-reload render — reflects the INITIAL endpoint address.
+        let value = dump_value(&handler);
+        let idx = endpoints_entry_index(&value).expect("EndpointsConfigDump entry present");
+        let entry = &value.get("configs").and_then(|c| c.as_array()).unwrap()[idx];
+        assert_eq!(
+            entry
+                .pointer("/static_endpoint_configs/0/endpoint_config/cluster_name")
+                .and_then(|v| v.as_str()),
+            Some("eds_backend"),
+        );
+        assert_eq!(
+            entry
+                .pointer("/static_endpoint_configs/0/endpoint_config/endpoints/0/lb_endpoints/0/endpoint/address/socket_address/address")
+                .and_then(|v| v.as_str()),
+            Some("127.0.0.1"),
+            "pre-reload render must show the initial EDS endpoint; entry was {entry}"
+        );
+        assert_eq!(
+            entry
+                .pointer("/static_endpoint_configs/0/endpoint_config/endpoints/0/lb_endpoints/0/endpoint/address/socket_address/port_value")
+                .and_then(|v| v.as_u64()),
+            Some(8080),
+        );
+
+        // 3. Swap the live endpoint set (simulates an EDS file reload to a NEW
+        //    address) through the swappable handle reached via the manager.
+        let new_addr: std::net::SocketAddr = "10.0.0.7:9443".parse().unwrap();
+        handler
+            .cluster_manager()
+            .get("eds_backend")
+            .expect("live eds_backend cluster present")
+            .store_endpoints(Arc::new(vec![new_addr]));
+
+        // 4. Post-reload render — must reflect the RELOADED endpoint. This is the
+        //    assertion that FAILS before this task (the renderer read the frozen
+        //    bootstrap load_assignment) and PASSES after.
+        let value2 = dump_value(&handler);
+        let idx2 = endpoints_entry_index(&value2).expect("EndpointsConfigDump entry present");
+        let entry2 = &value2.get("configs").and_then(|c| c.as_array()).unwrap()[idx2];
+        // cluster_name is identity — unchanged by the reload.
+        assert_eq!(
+            entry2
+                .pointer("/static_endpoint_configs/0/endpoint_config/cluster_name")
+                .and_then(|v| v.as_str()),
+            Some("eds_backend"),
+        );
+        assert_eq!(
+            entry2
+                .pointer("/static_endpoint_configs/0/endpoint_config/endpoints/0/lb_endpoints/0/endpoint/address/socket_address/address")
+                .and_then(|v| v.as_str()),
+            Some("10.0.0.7"),
+            "post-reload render must reflect the HOT-RELOADED endpoint, not the \
+             bootstrap snapshot; entry was {entry2}"
+        );
+        assert_eq!(
+            entry2
+                .pointer("/static_endpoint_configs/0/endpoint_config/endpoints/0/lb_endpoints/0/endpoint/address/socket_address/port_value")
+                .and_then(|v| v.as_u64()),
+            Some(9443),
         );
     }
 

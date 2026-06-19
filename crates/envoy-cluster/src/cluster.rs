@@ -561,6 +561,25 @@ impl ClusterHandle {
         self.inner.current_endpoints()
     }
 
+    /// 27 D5 (cross-crate test reach): delegates to [`Cluster::store_endpoints`]
+    /// — the atomic swap of the live endpoint address set. This is NOT a
+    /// production API: the production EDS reload pipeline drives the swap through
+    /// the in-crate `eds_reload` module (which reaches `inner` directly). This
+    /// delegate exists solely for cross-crate *tests* (e.g. `envoy-admin`'s
+    /// `/config_dump` read-through test) that hold only a `ClusterHandle` and
+    /// need to simulate a reload, since `inner` is `pub(crate)`.
+    ///
+    /// `#[doc(hidden)]` (not `#[cfg(test)]`) because the consumer is a test in
+    /// an *other* crate (envoy-admin), and `#[cfg(test)]` items are invisible to
+    /// downstream crates. Mirrors `ClusterManager::empty()` /
+    /// `is_endpoint_ejected_for_test`'s cross-crate-test-fixture posture.
+    ///
+    /// [`Cluster::store_endpoints`]: Cluster::store_endpoints
+    #[doc(hidden)]
+    pub fn store_endpoints(&self, eps: Arc<Vec<SocketAddr>>) {
+        self.inner.store_endpoints(eps);
+    }
+
     /// 27 Task 4: hand out the inner `Arc<Cluster>`. `pub(crate)` so the
     /// in-crate `eds_reload::build_eds_watch_targets` can reach the plainness
     /// fields (`endpoint_health` / `outlier_detection`) + the retained
