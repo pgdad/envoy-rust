@@ -253,6 +253,11 @@ pub struct Cluster {
     /// phase-28 Task 3; the ring-build + pick logic lands in later tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring_hash_lb_config: Option<RingHashLbConfig>,
+    /// 29 D1 (ADR-0071/0072): OPTIONAL MAGLEV tuning. `None` when absent. A present
+    /// `maglev_lb_config` on a non-MAGLEV cluster is accepted-and-ignored (validation
+    /// gated to MAGLEV clusters — see `validate_cluster`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maglev_lb_config: Option<MaglevLbConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -300,6 +305,25 @@ pub enum LbPolicy {
     /// (`ring_hash_lb_config`) lands in phase-28 Task 3; the ring-build + pick
     /// logic lands in later tasks.
     RingHash,
+    /// 29 D1 (ADR-0071/0072): Maglev consistent-hashing LB. The table build +
+    /// lookup land in later phase-29 tasks (maglev.rs).
+    Maglev,
+}
+
+/// 29 D1 (ADR-0071/0072): MAGLEV LB tuning knobs. Mirrors Envoy v1.33's
+/// `Cluster.MaglevLbConfig`. `table_size` default 65537 (Envoy proto default),
+/// must be prime, max 5000011 (validated in `validate_cluster`, Task 3). A
+/// present `maglev_lb_config` on a non-MAGLEV cluster is accepted-and-ignored
+/// (validation gated to MAGLEV clusters — Envoy parity + the ring precedent).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MaglevLbConfig {
+    #[serde(default = "default_maglev_table_size")]
+    pub table_size: u64,
+}
+
+fn default_maglev_table_size() -> u64 {
+    65537
 }
 
 /// 28 D1 (ADR-0069): RING_HASH LB tuning knobs. Mirrors Envoy v1.33's
@@ -4768,6 +4792,170 @@ static_resources:
         let c = &b.static_resources.clusters[0];
         assert!(matches!(c.lb_policy, LbPolicy::RoundRobin));
         assert!(c.ring_hash_lb_config.is_some());
+    }
+
+    // ---- Phase 29 Task 2: MAGLEV lb_policy + maglev_lb_config ----
+
+    #[test]
+    fn parses_lb_policy_maglev() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        assert!(
+            matches!(c.lb_policy, LbPolicy::Maglev),
+            "got {:?}",
+            c.lb_policy
+        );
+    }
+
+    #[test]
+    fn maglev_lb_config_empty_applies_default_table_size() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      maglev_lb_config: {}
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c
+            .maglev_lb_config
+            .as_ref()
+            .expect("maglev_lb_config present");
+        assert_eq!(cfg.table_size, 65537);
+    }
+
+    #[test]
+    fn maglev_lb_config_absent_is_none() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        assert!(c.maglev_lb_config.is_none());
+    }
+
+    #[test]
+    fn maglev_lb_config_explicit_table_size() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      maglev_lb_config:
+        table_size: 65537
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c
+            .maglev_lb_config
+            .as_ref()
+            .expect("maglev_lb_config present");
+        assert_eq!(cfg.table_size, 65537);
+    }
+
+    #[test]
+    fn accepts_maglev_lb_config_on_non_maglev_cluster() {
+        // Upstream Envoy accepts-and-ignores maglev_lb_config on a non-MAGLEV
+        // cluster; envoy-rust matches that (validation gated to MAGLEV clusters,
+        // landing in Task 3). For this task the field need only parse and be
+        // accepted on a ROUND_ROBIN cluster.
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      maglev_lb_config:
+        table_size: 65537
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML — accept-and-ignore");
+        let c = &b.static_resources.clusters[0];
+        assert!(matches!(c.lb_policy, LbPolicy::RoundRobin));
+        assert!(c.maglev_lb_config.is_some());
     }
 
     #[test]
