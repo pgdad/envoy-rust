@@ -537,3 +537,47 @@ composition are also noted as deferred (brief; SPEC §2.2).
 
 Docs-only task — no build/test. The two commits touch only BEHAVIOR_CONTRACT.md
 (commit 1) and this PROGRESS.md (commit 2).
+
+## State-4 verification gate (§7.5)
+
+Task 10 (state-4) — verification gate RUN locally at HEAD `0cec703` (clean tree,
+branch `main`). Each gate below quotes the ACTUAL observed result. Per the
+project's state-4 discipline, this dev host is Docker-Desktop/virtiofs: the
+NON-Docker workspace suite + clippy + fmt + build + deny are **locally
+authoritative**; the FULL differential matrix (fixtures 0001–0035) + h2spec ≥95%
++ the fuzz short-budget are **authoritative on the Linux CI run**. Fixture
+`0036-lb-ring-hash` (the NEW phase-28 differential) is LOCALLY observable this
+phase (plain request/response, no reload trigger) — so green locally is REAL
+cross-proxy evidence.
+
+| # | Gate | Command | Result | Marker |
+|---|------|---------|--------|--------|
+| 1 | fmt | `cargo fmt --all -- --check` | exit 0, no diff | **PASS** (local-authoritative) |
+| 2 | build | `cargo build --workspace --all-targets` | `Finished dev profile ... in 8.98s`, exit 0 | **PASS** (local-authoritative) |
+| 3 | clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `Finished ... in 2.00s`, exit 0 | **PASS** (local-authoritative) |
+| 4 | workspace test (`--exclude differential`) | `cargo test --workspace --exclude differential` | 69 `test result:` lines, ALL `0 failed`; 1 pre-existing `ignored`; 0 errors/panics; exit 0 | **PASS** (local-authoritative) |
+| 5 | differential fixture 0036 | `cargo test -p differential --test lb_ring_hash` | `test result: ok. 1 passed; 0 failed ... in 1.35s`, exit 0 (real Docker 28.1.1, envoy v1.33.0) | **PASS / GREEN** (locally observable — REAL cross-proxy witness) |
+| 6 | deny | `cargo deny check` | `advisories ok, bans ok, licenses ok, sources ok`, exit 0; 4 `license-not-encountered` WARNINGS (unmatched allowances in deny.toml — warnings, NOT errors) | **PASS** (local-authoritative) |
+| 7 | fuzz short-budget (`parse_bootstrap`) | `cargo +nightly fuzz --version` | `error: no such command: fuzz` (exit 101) — nightly IS installed, but `cargo-fuzz` is NOT installed locally; target `parse_bootstrap.rs` present | **CI-AUTHORITATIVE / DEFERRED** (could not run locally; covered by Linux CI fuzz gate) |
+
+### Gate 4 detail (per the host flakiness note)
+Full suite was clean on the FIRST run — every one of the 69 `test result:`
+lines reported `0 failed`, with no `FAILED`/`failures:`/`panicked`/`error[`
+lines anywhere in the log. The single `ignored` is pre-existing (not phase-28).
+**No test failed, so no isolation re-run was required** (no load-induced
+boot-timing flake observed this run).
+
+### Overall summary
+- **Local gates: GREEN.** fmt, build, clippy, the full non-Docker workspace
+  suite, and deny all pass with quoted exit-0 / zero-failure evidence.
+- **Fixture 0036: GREEN locally** — the phase-28 RING_HASH cross-proxy payoff
+  ran end-to-end against upstream Envoy v1.33.0 under real Docker (1 passed, 0
+  failed). This is REAL evidence, not CI-deferred.
+- **Deferred to Linux CI (authoritative there):** the full pre-existing
+  differential matrix (fixtures 0001–0035), h2spec conformance (≥95%), and the
+  `parse_bootstrap` fuzz short-budget (cargo-fuzz not installed on this dev
+  host). NOT run locally; NOT claimed green here.
+- **Known unrelated local Docker divergence:** the `admin_config_dump`
+  /`server_info` virtiofs issue is a pre-existing host artifact, NOT a phase-28
+  regression (not exercised by this gate).
+- **No regressions detected.** Nothing failed locally; nothing was faked.
