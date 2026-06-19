@@ -112,3 +112,61 @@ hand-reasoned/un-justified constant was used.
 
 **cargo clippy:** `cargo clippy -p envoy-cluster --all-targets --all-features -- -D warnings` →
 `Finished \`dev\` profile [unoptimized + debuginfo] target(s)` (clean, no warnings).
+
+## State-3 Task 3 — RingHash config + validators
+
+Added the `RING_HASH` config surface + validators to `crates/envoy-config` (no LB
+logic / request-path changes — deferred to later tasks). Strict TDD: the 8 tests
+below were written and run **failing first** (compile errors: missing `RingHash`
+variant, `ring_hash_lb_config` field, `HashFunction`, and the two `ConfigError`
+variants), then implementation made them green.
+
+**Implemented (`crates/envoy-config/src/bootstrap.rs`):**
+- `LbPolicy::RingHash` (wire `RING_HASH` via the enum's `SCREAMING_SNAKE_CASE` rename).
+- `RingHashLbConfig { minimum_ring_size: u64 (serde default 1024),
+  maximum_ring_size: u64 (serde default 8_388_608), hash_function: HashFunction
+  (serde default XxHash) }` — `#[serde(deny_unknown_fields)]`; defaults via
+  `default_minimum_ring_size` / `default_maximum_ring_size` fns + `#[serde(default)]`
+  on `hash_function`. A present-but-empty `ring_hash_lb_config: {}` therefore yields
+  min 1024 / max 8_388_608 / hash XX_HASH.
+- `HashFunction { XxHash, MurmurHash2 }` — `SCREAMING_SNAKE_CASE`, `#[default] XxHash`.
+  `XxHash → XX_HASH`. `MurmurHash2` carries an EXPLICIT `#[serde(rename = "MURMUR_HASH_2")]`
+  because serde's SCREAMING_SNAKE_CASE emits `MURMUR_HASH2` (no underscore before the
+  trailing digit) — the Envoy wire name is `MURMUR_HASH_2`. **Modeling choice:** both
+  Envoy wire values are RECOGNIZED at serde-parse so the phase-28 XX_HASH-only narrowing
+  surfaces as a precise `ConfigError::UnsupportedHashFunction` (a documented divergence,
+  ADR-0070) instead of an opaque serde unknown-variant error. A truly bogus value (e.g.
+  `BOGUS_HASH`) still fails at serde parse (test (e)).
+- `Cluster.ring_hash_lb_config: Option<RingHashLbConfig>` (serde default `None`,
+  `skip_serializing_if = "Option::is_none"`).
+
+**ConfigError (`crates/envoy-config/src/lib.rs` — that is where the enum lives):**
+- `UnsupportedHashFunction { cluster }` — MURMUR_HASH_2 rejected (ADR-0070).
+- `RingSizeInversion { cluster, minimum, maximum }` — min > max.
+  Both all-fatal (ADR-0049).
+
+**(g) accept-and-ignore decision + where validation is gated:** matching upstream
+Envoy, a `ring_hash_lb_config` present on a NON-`RING_HASH` cluster is
+ACCEPTED-AND-IGNORED (no error). To achieve this, the sub-config validation in
+`validate_cluster` is **gated to `lb_policy == LbPolicy::RingHash`** — a
+ROUND_ROBIN cluster's `ring_hash_lb_config` (even an otherwise-invalid one, e.g. a
+ring-size inversion) is never validated. The validation runs at the TOP of
+`validate_cluster`, BEFORE the EDS `load_assignment: None` early-return, so a
+`RING_HASH` EDS cluster's sub-config is still checked at parse time. This makes all
+of (d) [UnsupportedHashFunction], (f) [RingSizeInversion], and (g) [accept-and-ignore]
+pass.
+
+**Tests added (mirror `rejects_lb_policy_least_request` style; fixtures carry an
+`admin` block to satisfy the `parse_bootstrap` NoRuntime gate):**
+`parses_lb_policy_ring_hash` (a), `parses_ring_hash_lb_config_minimum_ring_size` (b),
+`ring_hash_lb_config_absent_is_none` + `ring_hash_lb_config_empty_applies_defaults` (c),
+`rejects_hash_function_murmur_hash_2` (d), `rejects_hash_function_bogus_value` (e,
+serde unknown-variant), `rejects_ring_size_inversion` (f),
+`accepts_ring_hash_lb_config_on_non_ring_hash_cluster` (g).
+
+**cargo test:** `cargo test -p envoy-config` →
+`test result: ok. 439 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+
+**cargo clippy:** `cargo clippy -p envoy-config --all-targets --all-features -- -D warnings` →
+`Finished \`dev\` profile [unoptimized + debuginfo] target(s)` (clean, no warnings;
+one `collapsible_if` was fixed via a `&&  let` chain, consistent with existing usage).
