@@ -79,7 +79,10 @@ impl TcpProxy {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let pick = self.cluster.pick_endpoint();
+        // 28 Task 6: TCP proxying has no HTTP-level `hash_policy` — pass `None`
+        // (RoundRobin clusters ignore the key; a RING_HASH cluster would fall
+        // back to the cursor path here).
+        let pick = self.cluster.pick_endpoint(None);
         let cluster_name = self.cluster_name.clone();
         let addr = pick.ok_or_else(|| {
             Box::new(TcpProxyError::NoHealthyEndpoint {

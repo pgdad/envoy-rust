@@ -24,7 +24,7 @@ mod xxhash;
 pub use budget::{BudgetAcquisition, BudgetState, RequestBudgetGuard, RetryBudgetGuard};
 pub use cluster::{
     Cluster, ClusterError, ClusterHandle, ClusterManager, ConnGaugeGuard, UpstreamProtocol,
-    from_bootstrap,
+    from_bootstrap, hash_request_key,
 };
 pub use eds_reload::build_eds_watch_targets;
 pub use ejection::{DetectorType, EjectionDecision, EndpointEjection, EndpointEjectionStats};

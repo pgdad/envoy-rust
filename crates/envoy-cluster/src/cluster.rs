@@ -600,6 +600,18 @@ impl Cluster {
     }
 }
 
+/// 28 Task 6: hash a request's hash-policy material into the per-request key
+/// consumed by [`ClusterHandle::pick_endpoint`]. This is the ONLY public hashing
+/// surface of `envoy-cluster` — the underlying `xxh64` stays crate-internal so
+/// the hash function is an implementation detail the ring and the request path
+/// share. The HCMs call this with the matched route's `hash_policy` header value
+/// bytes; an EMPTY value hashes deterministically to `xxh64(b"")` (NOT a
+/// fallback — see ADR-0070). Equivalent to the ring's internal hashing so the
+/// HCM-computed key lands on the same ring point.
+pub fn hash_request_key(value: &[u8]) -> u64 {
+    crate::xxhash::xxh64(value)
+}
+
 /// A handle to a `Cluster` that hands out endpoints via round-robin. Cheaply
 /// cloneable (`Arc`-internal); clones share the same cursor.
 #[derive(Clone, Debug)]
@@ -614,12 +626,14 @@ impl ClusterHandle {
     /// empty (`from_bootstrap` rejects empty clusters — defense-in-depth).
     /// Without health checks the cluster always yields an endpoint (the
     /// inert-when-unconfigured round-robin).
-    pub fn pick_endpoint(&self) -> Option<SocketAddr> {
-        // 28 Task 5: pass `None` FOR NOW (behavior-preserving no-op — RoundRobin
-        // ignores the key, and no RING_HASH cluster reaches a production caller
-        // yet). Task 6 changes this delegate to take its own `Option<u64>` and
-        // thread the real per-request hash key through the HCM call sites.
-        self.inner.pick(None)
+    /// 28 Task 6: `key_hash` carries the per-request hash key — the `xxh64` of
+    /// the matched route's `hash_policy` header material (computed by the HCM via
+    /// [`hash_request_key`]). `RING_HASH` clusters route by the ring on
+    /// `Some(key_hash)`; `RoundRobin` IGNORES it (the cursor path). `None`
+    /// (no `hash_policy`, or the header was ABSENT) falls back to the cursor
+    /// path. Delegates straight to the private [`Cluster::pick`].
+    pub fn pick_endpoint(&self, key_hash: Option<u64>) -> Option<SocketAddr> {
+        self.inner.pick(key_hash)
     }
 
     /// 27 D1 (§5.4 / §6.2): delegates to [`Cluster::current_endpoints`] — a
@@ -1579,6 +1593,60 @@ mod tests {
         assert_eq!(rr.inner.pick(None), Some(ep0), "cursor 2 % 2 = 0");
     }
 
+    /// 28 Task 6: the public `hash_request_key` helper is the ONLY public
+    /// hashing surface (xxh64 stays `pub(crate)`). It must equal `xxh64` so the
+    /// HCM-computed key matches the ring's internal hashing.
+    #[test]
+    fn hash_request_key_equals_xxh64() {
+        assert_eq!(
+            super::hash_request_key(b"key-0"),
+            crate::xxhash::xxh64(b"key-0")
+        );
+        assert_eq!(super::hash_request_key(b""), crate::xxhash::xxh64(b""));
+    }
+
+    /// 28 Task 6 (a): the PUBLIC `ClusterHandle::pick_endpoint` delegate now
+    /// takes its own `Option<u64>` request-hash-key and threads it to the
+    /// private `Cluster::pick`. A RING_HASH cluster routes by the ring (the §6.2
+    /// oracle: `xxh64("key-0")` → host 0); `None` falls back to a valid host.
+    #[test]
+    fn pick_endpoint_ring_hash_threads_key() {
+        let ep0: SocketAddr = "172.22.0.2:5678".parse().unwrap();
+        let ep1: SocketAddr = "172.22.0.3:5678".parse().unwrap();
+        let rh = mk_ring_hash_handle("rh_pub", vec![ep0, ep1], 1024);
+        // `Some(xxh64("key-0"))` → host 0 (the oracle).
+        assert_eq!(
+            rh.pick_endpoint(Some(crate::xxhash::xxh64(b"key-0"))),
+            Some(ep0),
+            "key-0 → host 0 through the public delegate"
+        );
+        // `None` (no-hash path) → a valid host (the ring is skipped; falls
+        // through to the cursor path which yields endpoints[0] first).
+        assert_eq!(
+            rh.pick_endpoint(None),
+            Some(ep0),
+            "None falls through to the cursor path → a valid host"
+        );
+    }
+
+    /// 28 Task 6 (b): a RoundRobin cluster IGNORES the key — `pick_endpoint(Some(123))`
+    /// behaves identically to `pick_endpoint(None)` (the cursor path; the key is
+    /// inert — regression-equivalence through the public delegate).
+    #[test]
+    fn pick_endpoint_round_robin_key_inert() {
+        let ep0: SocketAddr = "172.22.0.2:5678".parse().unwrap();
+        let ep1: SocketAddr = "172.22.0.3:5678".parse().unwrap();
+        let rr = mk_handle("rr_pub", vec![ep0, ep1]);
+        // The key is inert: the cursor advances regardless of Some/None.
+        assert_eq!(
+            rr.pick_endpoint(Some(123)),
+            Some(ep0),
+            "cursor 0, key ignored"
+        );
+        assert_eq!(rr.pick_endpoint(None), Some(ep1), "cursor 1, key ignored");
+        assert_eq!(rr.pick_endpoint(Some(123)), Some(ep0), "cursor 2 % 2 = 0");
+    }
+
     // ---------------------------------------------------------------------
     // phase-27 Task 2 (D1 / §6.2-INDEPENDENT): the endpoint set is a
     // swappable handle (`RwLock<Arc<Vec<SocketAddr>>>`). These tests pin the
@@ -1593,7 +1661,7 @@ mod tests {
         let initial = mk_endpoints(2); // 127.0.0.1:10000, :10001
         let handle = mk_handle("backend", initial.clone());
         // (a) reads current set.
-        assert_eq!(handle.pick_endpoint().unwrap(), initial[0]); // cursor 0
+        assert_eq!(handle.pick_endpoint(None).unwrap(), initial[0]); // cursor 0
         // (b) swap in a brand-new, disjoint set.
         let replacement: Vec<SocketAddr> = vec![
             "127.0.0.1:20000".parse().unwrap(),
@@ -1601,9 +1669,9 @@ mod tests {
         ];
         handle.inner.store_endpoints(Arc::new(replacement.clone()));
         // The NEXT pick observes the replacement (cursor 1 → replacement[1]).
-        assert_eq!(handle.pick_endpoint().unwrap(), replacement[1]);
+        assert_eq!(handle.pick_endpoint(None).unwrap(), replacement[1]);
         assert!(
-            replacement.contains(&handle.pick_endpoint().unwrap()),
+            replacement.contains(&handle.pick_endpoint(None).unwrap()),
             "every subsequent pick reads the replacement set"
         );
     }
@@ -1636,10 +1704,10 @@ mod tests {
     #[test]
     fn endpoint_handle_store_empty_yields_none_next_pick() {
         let handle = mk_handle("backend", mk_endpoints(2));
-        assert!(handle.pick_endpoint().is_some());
+        assert!(handle.pick_endpoint(None).is_some());
         handle.inner.store_endpoints(Arc::new(Vec::new()));
         assert_eq!(
-            handle.pick_endpoint(),
+            handle.pick_endpoint(None),
             None,
             "an empty endpoint set short-circuits to None before any modulo"
         );
@@ -1654,14 +1722,14 @@ mod tests {
         let handle = mk_handle("backend", initial);
         // Advance the cursor past 1 (so a stale length would index out of range).
         for _ in 0..5 {
-            assert!(handle.pick_endpoint().is_some());
+            assert!(handle.pick_endpoint(None).is_some());
         }
         // Shrink to a single endpoint.
         let one: Vec<SocketAddr> = vec!["127.0.0.1:40000".parse().unwrap()];
         handle.inner.store_endpoints(Arc::new(one.clone()));
         // Every subsequent pick must be the sole survivor — never an OOB index.
         for _ in 0..5 {
-            assert_eq!(handle.pick_endpoint().unwrap(), one[0]);
+            assert_eq!(handle.pick_endpoint(None).unwrap(), one[0]);
         }
     }
 
@@ -1669,7 +1737,9 @@ mod tests {
     fn pick_endpoint_cycles_over_three_endpoints() {
         let endpoints = mk_endpoints(3);
         let handle = mk_handle("backend", endpoints.clone());
-        let picks: Vec<SocketAddr> = (0..7).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..7)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         let expected = vec![
             endpoints[0],
             endpoints[1],
@@ -1700,7 +1770,7 @@ mod tests {
             let h = handle.clone();
             let c = Arc::clone(&counts);
             handles.push(thread::spawn(move || {
-                let ep = h.pick_endpoint().expect("non-empty");
+                let ep = h.pick_endpoint(None).expect("non-empty");
                 *c.lock().unwrap().entry(ep).or_insert(0) += 1;
             }));
         }
@@ -1731,10 +1801,10 @@ mod tests {
         // cursor, the sequence is alternating-index; with separate cursors
         // each handle would pick its own [0,1,0,1,...].
         let seq: Vec<SocketAddr> = vec![
-            a.pick_endpoint().unwrap(), // cursor=0 -> endpoints[0]
-            b.pick_endpoint().unwrap(), // cursor=1 -> endpoints[1]
-            a.pick_endpoint().unwrap(), // cursor=2 -> endpoints[0]
-            b.pick_endpoint().unwrap(), // cursor=3 -> endpoints[1]
+            a.pick_endpoint(None).unwrap(), // cursor=0 -> endpoints[0]
+            b.pick_endpoint(None).unwrap(), // cursor=1 -> endpoints[1]
+            a.pick_endpoint(None).unwrap(), // cursor=2 -> endpoints[0]
+            b.pick_endpoint(None).unwrap(), // cursor=3 -> endpoints[1]
         ];
         assert_eq!(
             seq,
@@ -1772,7 +1842,7 @@ admin:
             .await
             .expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
-        let picked = handle.pick_endpoint().expect("non-empty");
+        let picked = handle.pick_endpoint(None).expect("non-empty");
         assert_eq!(picked, "127.0.0.1:10042".parse::<SocketAddr>().unwrap());
     }
 
@@ -1816,7 +1886,9 @@ admin:
             .await
             .expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
-        let picks: Vec<SocketAddr> = (0..3).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..3)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert_eq!(
             picks,
             vec![
@@ -2001,7 +2073,7 @@ admin:
         // an endpoint compiles cleanly.
         let h = mk_handle("primary", mk_endpoints(2));
         let name = h.name();
-        let _ep = h.pick_endpoint();
+        let _ep = h.pick_endpoint(None);
         assert_eq!(name, "primary");
     }
 
@@ -2079,7 +2151,7 @@ admin:
             .await
             .expect("Static cluster constructs cleanly");
         let handle = mgr.get("backend").expect("cluster present");
-        let picked = handle.pick_endpoint().expect("non-empty");
+        let picked = handle.pick_endpoint(None).expect("non-empty");
         assert_eq!(picked, "127.0.0.1:7000".parse::<SocketAddr>().unwrap());
     }
 
@@ -2115,7 +2187,7 @@ admin:
             .await
             .expect("STRICT_DNS cluster resolves localhost cleanly");
         let handle = mgr.get("backend").expect("cluster present");
-        let picked = handle.pick_endpoint().expect("non-empty");
+        let picked = handle.pick_endpoint(None).expect("non-empty");
         assert_eq!(
             picked.port(),
             7000,
@@ -2605,7 +2677,9 @@ admin:
         let (handle, health) = mk_handle_with_health("b", eps.clone(), 1, 1, 0.0);
         // Make endpoint 0 healthy, endpoint 1 stays unhealthy.
         health[0].record_success();
-        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..4)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert!(
             picks.iter().all(|&p| p == eps[0]),
             "only the healthy endpoint is picked: {picks:?}"
@@ -2621,7 +2695,9 @@ admin:
         let (handle, health) = mk_handle_with_health("b", eps.clone(), 1, 1, 0.0);
         health[0].record_success();
         health[2].record_success();
-        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..4)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert_eq!(
             picks,
             vec![eps[0], eps[2], eps[0], eps[2]],
@@ -2634,7 +2710,7 @@ admin:
         let eps = mk_endpoints(2);
         let (handle, _health) = mk_handle_with_health("b", eps, 1, 1, 0.0);
         // All endpoints start Unhealthy; panic disabled → None.
-        assert!(handle.pick_endpoint().is_none());
+        assert!(handle.pick_endpoint(None).is_none());
     }
 
     #[test]
@@ -2642,7 +2718,9 @@ admin:
         let eps = mk_endpoints(2);
         // default 50% panic threshold; 0 healthy → 0% < 50% → panic → round-robin ALL.
         let (handle, _health) = mk_handle_with_health("b", eps.clone(), 1, 1, 50.0);
-        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..4)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert_eq!(
             picks,
             vec![eps[0], eps[1], eps[0], eps[1]],
@@ -2656,7 +2734,9 @@ admin:
         // 1 of 2 healthy = 50% ; threshold 50 ; 50 < 50 is false → no panic → only healthy.
         let (handle, health) = mk_handle_with_health("b", eps.clone(), 1, 1, 50.0);
         health[0].record_success();
-        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..4)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert!(
             picks.iter().all(|&p| p == eps[0]),
             "strictly-below: 50% is not < 50% so no panic: {picks:?}"
@@ -2669,7 +2749,9 @@ admin:
         // as phase-02 round-robin (endpoint_health is None).
         let mgr = build_cluster_mgr(THREE_ENDPOINT_YAML).await;
         let handle = mgr.get("backend").expect("cluster");
-        let picks: Vec<SocketAddr> = (0..3).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..3)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert_eq!(
             picks,
             vec![
@@ -2781,7 +2863,7 @@ admin:
         let mgr = build_cluster_mgr(yaml).await;
         let handle = mgr.get("hc_backend").expect("cluster");
         assert!(
-            handle.pick_endpoint().is_none(),
+            handle.pick_endpoint(None).is_none(),
             "all endpoints start unhealthy + panic disabled"
         );
     }
@@ -2849,7 +2931,7 @@ admin:
         // Simulate the call-site connect-then-increment pattern.
         let handle = mgr.get("backend_cluster").expect("cluster present");
         for _ in 0..3 {
-            let endpoint = handle.pick_endpoint().expect("endpoint");
+            let endpoint = handle.pick_endpoint(None).expect("endpoint");
             let _stream = tokio::net::TcpStream::connect(endpoint).await.unwrap();
             // 06.1 D4.b: this is the call-site increment pattern that
             // envoy-tcp / envoy_http1::Client::connect / envoy_http2::
@@ -3008,7 +3090,9 @@ admin:
         // outlier_detection are None, pick() must be byte-for-byte phase-02 round-robin.
         let endpoints = mk_endpoints(3);
         let handle = mk_handle("backend", endpoints.clone()); // unchanged 12.1 helper
-        let picks: Vec<SocketAddr> = (0..6).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..6)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert_eq!(
             picks,
             vec![
@@ -3035,7 +3119,7 @@ admin:
         ejection[0].eject(crate::DetectorType::Consecutive5xx);
         // pick() should now only return endpoint 1.
         for _ in 0..5 {
-            assert_eq!(handle.pick_endpoint().unwrap(), eps[1]);
+            assert_eq!(handle.pick_endpoint(None).unwrap(), eps[1]);
         }
     }
 
@@ -3049,7 +3133,7 @@ admin:
         ejection[0].eject(crate::DetectorType::Consecutive5xx);
         ejection[1].eject(crate::DetectorType::Consecutive5xx);
         assert!(
-            handle.pick_endpoint().is_none(),
+            handle.pick_endpoint(None).is_none(),
             "all ejected + panic=0 → None"
         );
     }
@@ -3064,7 +3148,9 @@ admin:
         health[1].record_success();
         ejection[0].eject(crate::DetectorType::Consecutive5xx);
         // 1 of 2 eligible (50.0 < 60.0) → panic → round-robin over ALL.
-        let picks: Vec<SocketAddr> = (0..4).map(|_| handle.pick_endpoint().unwrap()).collect();
+        let picks: Vec<SocketAddr> = (0..4)
+            .map(|_| handle.pick_endpoint(None).unwrap())
+            .collect();
         assert_eq!(picks, vec![eps[0], eps[1], eps[0], eps[1]]);
     }
 
@@ -3083,7 +3169,7 @@ admin:
         ejection[2].eject(crate::DetectorType::Consecutive5xx);
         // Eligible: only endpoint 3.
         for _ in 0..5 {
-            assert_eq!(handle.pick_endpoint().unwrap(), eps[3]);
+            assert_eq!(handle.pick_endpoint(None).unwrap(), eps[3]);
         }
     }
 
@@ -3283,7 +3369,7 @@ admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
             .expect("construct");
         let handle = mgr.get("c1").expect("cluster c1");
         let ep = handle
-            .pick_endpoint()
+            .pick_endpoint(None)
             .expect("endpoint pickable pre-ejection");
         // One 500 crosses consecutive_5xx=1 → ejects the sole endpoint.
         handle.record_response(ep, 500);
@@ -3295,7 +3381,7 @@ admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
         // yield None (→ the 12.2 no-healthy-upstream synth-503). The bug made this
         // return Some(ep) because panic_threshold wrongly defaulted to 50.0.
         assert!(
-            handle.pick_endpoint().is_none(),
+            handle.pick_endpoint(None).is_none(),
             "panic_threshold=0 + sole endpoint ejected ⇒ pick() == None",
         );
     }

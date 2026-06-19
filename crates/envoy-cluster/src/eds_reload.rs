@@ -532,7 +532,10 @@ static_resources:
 
         assert!(current(&cluster).is_empty(), "empty set applied");
         assert!(
-            mgr.get("eds_cluster").unwrap().pick_endpoint().is_none(),
+            mgr.get("eds_cluster")
+                .unwrap()
+                .pick_endpoint(None)
+                .is_none(),
             "pick() returns None on the empty set (503 path)"
         );
         assert_eq!(

@@ -9,8 +9,9 @@ use crate::response::{Http1Response, Response};
 
 use bytes::{Buf, Bytes, BytesMut};
 use envoy_config::{
-    AttemptOutcome, DataSource, DirectResponse, HttpConnectionManagerConfig, RetryConfig, Route,
-    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, VirtualHost,
+    AttemptOutcome, DataSource, DirectResponse, HashPolicy, HttpConnectionManagerConfig,
+    RetryConfig, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch,
+    VirtualHost,
 };
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::{Arc, RwLock};
@@ -320,8 +321,33 @@ fn clone_route_action(a: &RouteAction) -> RouteAction {
         RouteAction::Route(ar) => RouteAction::Route(RouteAction_Route {
             cluster: ar.cluster.clone(),
             retry_policy: ar.retry_policy.clone(),
+            // 28 Task 6: carry the route-level hash policies through the clone.
+            hash_policy: ar.hash_policy.clone(),
         }),
     }
+}
+
+/// 28 Task 6 (ADR-0070): resolve a request's per-request hash key from the
+/// matched route's `hash_policy`. MVP: use the FIRST `header` policy's
+/// `header_name` (multi-policy combination + non-header sources are deferred
+/// non-goals; config parse already rejects non-header sources). `lookup` returns
+/// the header value bytes if the header is PRESENT (even with an EMPTY value),
+/// or `None` if it is ABSENT.
+///
+/// THE LOAD-BEARING DISTINCTION: a PRESENT-but-EMPTY header hashes to
+/// `xxh64(b"")` (`Some` — deterministic, NOT the fallback); an ABSENT header is
+/// `None` (the random-host fallback). Do NOT collapse empty into absent: this is
+/// exactly `lookup(..).map(hash_request_key)`, never
+/// `lookup(..).filter(|v| !v.is_empty())`. An empty `hash_policy` (every
+/// non-RING_HASH route) returns `None` without consulting `lookup`.
+fn request_hash_key<'a>(
+    policies: &[HashPolicy],
+    lookup: impl Fn(&str) -> Option<&'a [u8]>,
+) -> Option<u64> {
+    // MVP single-header choice: first policy entry with a `header` source.
+    let header_name = policies.iter().find_map(|p| p.header.as_ref())?;
+    // map (NOT filter) — present-empty must map to Some(xxh64(b"")).
+    lookup(&header_name.header_name).map(envoy_cluster::hash_request_key)
 }
 
 pub struct HCM {
@@ -383,13 +409,14 @@ async fn run_attempt(
     req: &Request,
     host_header: &str,
     close: bool,
+    request_hash_key: Option<u64>,
 ) -> AttemptResult {
     // Re-pick the endpoint each attempt — Envoy re-runs LB on every retry (a
     // healthy host may have been ejected, or a round-robin cluster rotates).
     // When `pick() -> None`, no endpoint is attributable: emit the 19-byte
     // no-healthy synth-503 and return (not retriable; no record_response,
     // lock-in #8).
-    let Some(endpoint) = cluster.pick_endpoint() else {
+    let Some(endpoint) = cluster.pick_endpoint(request_hash_key) else {
         tracing::warn!(
             cluster = %cluster.name(),
             "no healthy endpoint for cluster — returning 503",
@@ -814,6 +841,7 @@ async fn serve_connection(
                     cluster: cluster_name,
                     retry_config,
                     include_attempt_count_in_response,
+                    request_hash_key,
                 } => {
                     // The validator (envoy-config Task 2) ensures every cluster
                     // name referenced from a RouteAction::Route exists in the
@@ -919,6 +947,7 @@ async fn serve_connection(
                                 &req,
                                 &host_header,
                                 close,
+                                request_hash_key,
                             )
                             .await;
 
@@ -1250,6 +1279,14 @@ pub enum BuildOutcome {
         /// `include_attempt_count_in_response` flag. Gates emission of the
         /// `x-envoy-attempt-count` downstream response header.
         include_attempt_count_in_response: bool,
+        /// 28 Task 6 (ADR-0070): the per-request hash key resolved from the
+        /// matched route's `hash_policy` against the request headers (via
+        /// [`request_hash_key`]). `Some(xxh64(value))` when the route has a
+        /// header `hash_policy` and that header is PRESENT (empty value →
+        /// `Some(xxh64(b""))`, NOT a fallback); `None` when there is no
+        /// `hash_policy` or the header is ABSENT. Threaded to
+        /// `ClusterHandle::pick_endpoint`; `RoundRobin` clusters ignore it.
+        request_hash_key: Option<u64>,
     },
 }
 
@@ -1391,6 +1428,15 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
             // 16 Task 4 (L6): the matched vhost's attempt-count flag travels to
             // the dispatch seam so the retry loop can gate x-envoy-attempt-count.
             include_attempt_count_in_response: vh.include_attempt_count_in_response,
+            // 28 Task 6 (ADR-0070): resolve the per-request hash key from the
+            // matched route's `hash_policy` against the request headers HERE
+            // (before the pick). `find_header` returns the value only when the
+            // header is PRESENT — `map` (not filter) preserves present-empty as
+            // `Some(xxh64(b""))`. Empty `hash_policy` → `None` (the common,
+            // allocation-free non-RING_HASH path).
+            request_hash_key: request_hash_key(&ar.hash_policy, |name| {
+                find_header(&req.headers, name).map(str::as_bytes)
+            }),
         },
     }
 }
@@ -1634,9 +1680,74 @@ fn synth_501(close: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envoy_config::HashPolicyHeader;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// 28 Task 6 (c) — THE load-bearing empty-vs-absent distinction (ADR-0070).
+    /// A header that is PRESENT but EMPTY hashes to `xxh64(b"")` (deterministic,
+    /// NOT the fallback); a header that is ABSENT yields `None` (the random-host
+    /// fallback). This guards against the classic `.filter(|v| !v.is_empty())`
+    /// collapse bug that wrongly treats present-empty as absent.
+    #[test]
+    fn request_hash_key_present_empty_is_some_not_none() {
+        let policies = vec![HashPolicy {
+            header: Some(HashPolicyHeader {
+                header_name: "x-hash-key".to_string(),
+            }),
+            ..Default::default()
+        }];
+
+        // PRESENT but EMPTY → Some(xxh64(b"")) — NOT None.
+        let present_empty = request_hash_key(&policies, |name| {
+            if name == "x-hash-key" {
+                Some(b"".as_slice())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            present_empty,
+            Some(envoy_cluster::hash_request_key(b"")),
+            "present-empty header must hash to xxh64(b\"\"), NOT fall back to None"
+        );
+
+        // ABSENT → None (the random-host fallback path).
+        let absent = request_hash_key(&policies, |_name| None);
+        assert_eq!(absent, None, "absent header must yield None (fallback)");
+    }
+
+    /// 28 Task 6 (d): a present, non-empty header value is hashed and threaded.
+    #[test]
+    fn request_hash_key_present_nonempty_is_hashed() {
+        let policies = vec![HashPolicy {
+            header: Some(HashPolicyHeader {
+                header_name: "x-hash-key".to_string(),
+            }),
+            ..Default::default()
+        }];
+        let key = request_hash_key(&policies, |name| {
+            if name == "x-hash-key" {
+                Some(b"key-0".as_slice())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            key,
+            Some(envoy_cluster::hash_request_key(b"key-0")),
+            "present non-empty header is hashed via hash_request_key"
+        );
+    }
+
+    /// 28 Task 6: an empty `hash_policy` (the regression-equivalence default for
+    /// every non-RING_HASH route) yields `None` without consulting the lookup.
+    #[test]
+    fn request_hash_key_empty_policy_is_none() {
+        let key = request_hash_key(&[], |_name| panic!("lookup must not be called"));
+        assert_eq!(key, None, "empty hash_policy → None");
+    }
 
     /// Build a ClusterManager with a single static cluster `name` whose only
     /// endpoint is `127.0.0.1:<port>`. Reused by the 04.3 Task 9 router-proxy
@@ -2596,6 +2707,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2654,6 +2766,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2688,6 +2801,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2712,6 +2826,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2813,6 +2928,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2849,6 +2965,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2887,6 +3004,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2918,6 +3036,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2942,6 +3061,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -2976,6 +3096,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -3107,6 +3228,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -3131,6 +3253,7 @@ static_resources:
             RouteAction::Route(RouteAction_Route {
                 cluster: "backend".into(),
                 retry_policy: None,
+                hash_policy: vec![],
             }),
             cluster_mgr,
         );
@@ -4466,6 +4589,7 @@ static_resources:
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
                             retry_policy: None,
+                            hash_policy: vec![],
                         }),
                         typed_per_filter_config: Default::default(),
                     }],
@@ -4652,6 +4776,7 @@ static_resources:
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: "backend".to_string(),
                             retry_policy: None,
+                            hash_policy: vec![],
                         }),
                         typed_per_filter_config: Default::default(),
                     }],
@@ -4775,6 +4900,7 @@ static_resources:
                         action: RouteAction::Route(RouteAction_Route {
                             cluster: cluster.to_string(),
                             retry_policy,
+                            hash_policy: vec![],
                         }),
                         typed_per_filter_config: Default::default(),
                     }],
