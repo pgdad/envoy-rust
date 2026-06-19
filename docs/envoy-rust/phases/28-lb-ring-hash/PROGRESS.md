@@ -440,3 +440,54 @@ diagnostic + remediation), a one-line egress-interface caveat to the
 `discover_host_lan_ip` doc comment, and a cosmetic `host: ring_cluster` →
 `host: localhost` in `expectations.yaml` (trivially safe — both vhosts are
 `domains: ["*"]`).
+
+## State-3 Task 8 — backstop + fuzz seed
+
+**In-process RING_HASH backstop** (`crates/envoy-bin/tests/lb_ring_hash.rs`) —
+the deterministic complement to the `0036-lb-ring-hash` cross-proxy differential.
+The differential proves consistent-hashing selection BILATERALLY, but only for a
+single shape: a PLAIN STATIC cluster where the `x-hash-key` header is ALWAYS
+present. The backstop drives the cluster through the PUBLIC production path
+(`parse_bootstrap` → `load_dynamic_resources` → `envoy_cluster::from_bootstrap`
+→ `ClusterHandle::pick_endpoint`, with the per-request key computed via the
+PUBLIC `envoy_cluster::hash_request_key`), construction via an admin-only
+bootstrap (the kernel-ephemeral `port_value: 0` admin satisfies the config
+NoRuntime gate — no listener/data-plane needed since the cluster is driven
+directly). Six characterization/regression cases (all PASS, would FAIL on a
+ring/fallback regression):
+
+1. **ring determinism + the §6.2 oracle subset** — the SAME six key→host pins
+   Task 5 locked: `key-0`→host 0, `key-2`→host 1, `key-10`→host 0,
+   `key-11`→host 1, `user-alice`→host 0, `1.2.3.4`→host 1 (host 0 =
+   `172.22.0.2:5678`, host 1 = `172.22.0.3:5678`, `minimum_ring_size: 1024`);
+   each key also re-picks deterministically. The §6.2 oracle is ground truth —
+   the test asserts against it, not against observed output.
+2. **spread** — over ~16 keys both hosts are selected at least once.
+3. **the no-hash-key fallback** — `pick_endpoint(None)` on a RING_HASH cluster
+   returns a VALID host (not a panic, not `None`). This is the ABSENT-header path
+   the differential never exercises (fixture 0036 always sends the header).
+4. **empty-header-value-is-HASHED** — `Some(hash_request_key(b""))` is a
+   DETERMINISTIC hashed selection (`xxh64("")`, stable across 8 repeats), NOT the
+   random/None fallback (the integration companion to Task 6's helper test (c)).
+5. **single-host ring** — a one-endpoint RING_HASH cluster: every key AND `None`
+   route to the one host.
+6. **ROUND_ROBIN-ignores-key regression** — `pick_endpoint(Some(123))` behaves
+   exactly like the cursor path / `pick_endpoint(None)` (the key is inert; no
+   ring is built for a non-RING_HASH cluster).
+
+(No HC/OD + RING_HASH skip-retry test — that composition is a §2.2 deferred
+non-goal; the MVP cluster is plain.)
+
+**Fuzz corpus seed** (`crates/envoy-config/fuzz/corpus/parse_bootstrap/cluster_ring_hash_lb.yaml`,
+force-added past the fuzz `.gitignore` like the other 36 tracked seeds) — a
+parse-valid bootstrap exercising the new config surface for the EXISTING
+`parse_bootstrap` fuzz target (no new target): a `RING_HASH` cluster with a full
+`ring_hash_lb_config` (`minimum_ring_size`/`maximum_ring_size`/
+`hash_function: XX_HASH`) AND a route `hash_policy: [{ header: { header_name:
+"x-hash-key" } }]`. Confirmed parse-valid via a throwaway in-test parse round-trip
+(removed before commit).
+
+**test:** `cargo test -p envoy-bin --test lb_ring_hash` → `test result: ok. 6
+passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`. **clippy:** `cargo
+clippy -p envoy-bin --all-targets --all-features -- -D warnings` → clean (exit 0).
+**fmt:** `cargo fmt --all -- --check` → clean.
