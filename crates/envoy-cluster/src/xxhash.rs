@@ -1,9 +1,11 @@
-//! From-scratch xxHash64 (seed 0) for the ring-hash load balancer.
+//! From-scratch seeded xxHash64 for the load balancers.
 //!
 //! Project doctrine D-3.2 forbids adding a hashing crate — load-balancing
 //! primitives are written from scratch in pure safe Rust (the crate root carries
-//! `#![forbid(unsafe_code)]`). This is the standard xxHash64 algorithm with the
-//! seed fixed to 0, which is Envoy's `RING_HASH` default.
+//! `#![forbid(unsafe_code)]`). This is the standard xxHash64 algorithm,
+//! parameterized on the seed: seed 0 is the phase-28 ring/request default
+//! (Envoy's `RING_HASH` default — byte-identical to the prior fixed-seed code),
+//! and seed 1 is the phase-29 maglev per-host `skip` hash.
 //!
 //! The canonical test vectors are LOCKED by project decision ADR-0070 (empirically
 //! validated 36/36 against live upstream Envoy v1.33.0). The implementation MUST
@@ -35,17 +37,23 @@ fn merge_round(mut h: u64, acc: u64) -> u64 {
     h.wrapping_mul(PRIME64_1).wrapping_add(PRIME64_4)
 }
 
-/// xxHash64 with the seed fixed to 0 (Envoy `RING_HASH` default).
+/// xxHash64 with the seed fixed to 0 (Envoy `RING_HASH` default); a thin wrapper
+/// over `xxh64_seed`.
 pub(crate) fn xxh64(data: &[u8]) -> u64 {
-    const SEED: u64 = 0;
+    xxh64_seed(data, 0)
+}
+
+/// Seeded xxHash64. Seed 0 is the ring/request default (byte-identical to the
+/// prior fixed-seed `xxh64`); seed 1 is the maglev per-host `skip` hash.
+pub(crate) fn xxh64_seed(data: &[u8], seed: u64) -> u64 {
     let len = data.len();
     let mut input = data;
 
     let mut h: u64 = if len >= 32 {
-        let mut v1 = SEED.wrapping_add(PRIME64_1).wrapping_add(PRIME64_2);
-        let mut v2 = SEED.wrapping_add(PRIME64_2);
-        let mut v3 = SEED;
-        let mut v4 = SEED.wrapping_sub(PRIME64_1);
+        let mut v1 = seed.wrapping_add(PRIME64_1).wrapping_add(PRIME64_2);
+        let mut v2 = seed.wrapping_add(PRIME64_2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(PRIME64_1);
 
         // Process 32-byte stripes (4 lanes of 8 bytes each).
         while input.len() >= 32 {
@@ -67,7 +75,7 @@ pub(crate) fn xxh64(data: &[u8]) -> u64 {
         acc = merge_round(acc, v4);
         acc
     } else {
-        SEED.wrapping_add(PRIME64_5)
+        seed.wrapping_add(PRIME64_5)
     };
 
     h = h.wrapping_add(len as u64);
@@ -158,5 +166,25 @@ mod tests {
     #[test]
     fn ring_key_shape() {
         assert_eq!(xxh64(b"172.22.0.2:5678_0"), 0xFB4D_1386_9ECA_FECD);
+    }
+
+    #[test]
+    fn seed1_host_key() {
+        // xxhash 3.7.0: xxh64(b"172.31.0.2:5678", seed=1) — the maglev `skip` hash.
+        // python3 -c "import xxhash; print(hex(xxhash.xxh64(b'172.31.0.2:5678', seed=1).intdigest()))"  -> 0x57a56bce7e3ae555
+        assert_eq!(xxh64_seed(b"172.31.0.2:5678", 1), 0x57A5_6BCE_7E3A_E555);
+    }
+
+    #[test]
+    fn seed0_equiv() {
+        // The seeded fn at seed 0 is byte-identical to the phase-28 xxh64.
+        assert_eq!(xxh64_seed(b"abc", 0), xxh64(b"abc"));
+        assert_eq!(xxh64_seed(b"", 0), 0xEF46_DB37_51D8_E999);
+        // >=32-byte input exercises the lane-initializer seed path at seed 0,
+        // which the short/empty cases above do not (43 bytes -> block loop).
+        assert_eq!(
+            xxh64_seed(b"The quick brown fox jumps over the lazy dog", 0),
+            xxh64(b"The quick brown fox jumps over the lazy dog")
+        );
     }
 }
