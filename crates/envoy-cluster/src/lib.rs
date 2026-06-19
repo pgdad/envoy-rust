@@ -16,6 +16,7 @@ mod cluster;
 mod eds_reload;
 mod ejection;
 mod health;
+mod maglev;
 mod outlier;
 mod ring_hash;
 pub mod xds_watch;

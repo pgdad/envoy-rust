@@ -1937,6 +1937,7 @@ admin:
                     circuit_breakers: None,
                     outlier_detection: None,   // 14.1 D1
                     ring_hash_lb_config: None, // 28 Task 3
+                    maglev_lb_config: None,    // 29 Task 2
                 }],
             },
             dynamic_resources: None,
@@ -1989,6 +1990,7 @@ admin:
             circuit_breakers: None,
             outlier_detection: None,   // 14.1 D1
             ring_hash_lb_config: None, // 28 Task 3
+            maglev_lb_config: None,    // 29 Task 2
         };
         let bootstrap = Bootstrap {
             node: None,
@@ -3843,6 +3845,7 @@ admin:
             circuit_breakers: None,
             outlier_detection: None,
             ring_hash_lb_config: None, // 28 Task 3
+            maglev_lb_config: None,    // 29 Task 2
         }
     }
 
@@ -4033,6 +4036,7 @@ admin:
             circuit_breakers: None,
             outlier_detection: None,
             ring_hash_lb_config: None, // 28 Task 3
+            maglev_lb_config: None,    // 29 Task 2
         }
     }
 
