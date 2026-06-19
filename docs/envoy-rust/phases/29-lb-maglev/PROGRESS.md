@@ -7,7 +7,23 @@
 
 ## Status
 
-**Lifecycle state:** **state-3 implementation COMPLETE → state-4-next** (verification). All 8 PLAN tasks landed + two-stage-reviewed (each spec ✅ + quality APPROVED; review minors folded). Per-crate `cargo test`/`clippy`/`fmt` green throughout; the fixture-0037 differential ran + PASSED LOCALLY (STRONG). The authoritative §7.5 gate (full `cargo build/clippy/fmt/test --workspace` + `cargo deny` + the `parse_bootstrap` short-budget fuzz + the Docker differential) is the state-4 Linux-CI run (`superpowers:verification-before-completion`) — CI's first real full execution per the `envoy-rust-state4-ci-first-execution` discipline.
+**Lifecycle state:** **state-4 verification COMPLETE → state-5-next** (code review). The §7.5 phase-done gate (a)-(e) is **GREEN at the AUTHORITATIVE Linux CI run [`27851283501`](https://github.com/pgdad/envoy-rust/actions/runs/27851283501) @ HEAD `1f2ad7b`** (both jobs ✓; see the §7.5 evidence block below). `REVIEW.md` ABSENT → the next step is the state-5 `superpowers:requesting-code-review`.
+
+## §7.5 verification gate (state-4 — CI's first full execution; AUTHORITATIVE = Linux CI)
+
+**CI run [`27851283501`](https://github.com/pgdad/envoy-rust/actions/runs/27851283501) (push, `main` @ `1f2ad7b`) — both jobs ✓ success:**
+- **`build + test + lint`** (4m2s) ran, per `.github/workflows/ci.yml`: `cargo fmt --all -- --check` → clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo build --workspace --all-targets` → ok; h2spec (conformance; unchanged — no H2 codec change this phase); `cargo test --workspace` (**includes the Docker differential harness**, pre-pulling upstream `envoyproxy/envoy:v1.33.0`) → **0 failed workspace-wide**; `cargo deny check` → clean.
+- **`fuzz`** (2m51s) ran `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` (corpus now incl. the new `cluster_maglev_lb.yaml` seed) + `jwt_parse` → clean.
+
+**§7.5 (a)-(e) mapping (evidence from the CI test-job log):**
+- **(a) new differential fixture green** — `Running tests/lb_maglev.rs` → `test lb_maglev_fixture ... ok` (fixture `0037-lb-maglev` cross-proxy STRONG witness, on Linux/Docker vs live Envoy v1.33.0).
+- **(b) pre-existing differential fixtures green** — all other fixture binaries `test result: ok` (`0001`–`0036`); NO `FAILED`/`panicked`/`error[` anywhere in the run. The M28-3 refactor is a verified no-op for ROUND_ROBIN + behavior-identical for RING_HASH 0036.
+- **(c) conformance** — h2spec in the green job; unchanged (no HTTP/2 change in the MAGLEV phase).
+- **(d) fuzz clean** — the `fuzz` job ✓ (`parse_bootstrap` 30s with the maglev seed; `jwt_parse` 30s).
+- **(e) build/clippy/fmt/test/deny** — all clean in the green `build + test + lint` job (representative workspace counts: envoy-cluster 139, envoy-config 456, differential lib 148 + the per-fixture integration binaries, all `0 failed`).
+- (f) `REVIEW.md` approved is the state-5 step (not part of state-4).
+
+No CI iteration needed — the run was green on the first (state-3) push (`cargo fmt --all -- --check` had already been run clean locally at the state-3 close, pre-empting the usual mid-phase fmt red). The one open **M29-1** minor (shared-driver RING_HASH-worded failure messages) is cosmetic and does NOT affect any gate.
 **§6.2 reconnaissance:** DONE at the PLAN-write — algorithm §6.2-LOCKED in `PLAN.md §A`
 (replica reproduced live Envoy v1.33.0 **80/80** at default `table_size`, **64/64** at M=17;
 STRONG differential target confirmed). ADR-0072 landed.
