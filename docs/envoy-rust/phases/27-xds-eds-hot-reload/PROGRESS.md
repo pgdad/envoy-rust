@@ -231,3 +231,26 @@ BOTH jobs GREEN:
 - (f) `REVIEW.md` ABSENT → next step is the state-5 code review ✓
 
 **Outcome:** STATE advances to **state-4 verification COMPLETE / state-5-next**; ROADMAP row `27` stays `in-progress` (flips `done` only at state-6). The next session runs `superpowers:requesting-code-review` (authors `REVIEW.md`; if issues → back to state-3 per §5.2; if approved → state-6 close-out). The superseded state-2 PLAN-write top-section narratives are relocated verbatim to `STATE_HISTORY.md` (ADR-0035 / §4.1 inv. 9); the `### Phase-27 state-2 PLAN-write` + `### Phase-27 state-1 brainstorm` Notes subsections STAY in STATE.md (phase 27 is still in-progress — they relocate at the state-6 close-out).
+
+## State-5 — code review (`superpowers:requesting-code-review`) — APPROVED
+
+The state-5 holistic phase review. **Review model:** each of the 8 state-3 tasks (D1–D8) was already individually two-stage-reviewed (spec-compliance THEN code-quality) during execution, so state-5 is the cross-cutting system-level pass — a single fresh `superpowers:code-reviewer` subagent given crafted context (not session history), tasked with the six integration seams + triage of the per-task Minors.
+
+- **Review range:** `f43d1a6` (state-2 PLAN-write base) … `acac6d4` (Task-8 BEHAVIOR_CONTRACT) — the full phase-27 production + test diff (+3682 / −179, 23 files). The state-4 STATE-advance commit `334c093` is docs-only, out of code scope.
+- **Differential anchor:** the AUTHORITATIVE native-Linux CI run **`27818702552`** @ `acac6d4` (fixture 0035 EDS-reload differential `xds_eds_hot_reload_fixture … ok` + all 35 fixtures + h2spec ≥95% + fuzz, GREEN).
+
+### Verdict — APPROVED (0 Critical / 0 Important / 3 Minor non-blocking)
+
+All SIX cross-cutting focus areas verified PASS:
+1. **D1 endpoint-handle correctness** — `pick()` snapshots the `Arc<Vec>` once at entry and returns `None` on empty BEFORE any `% total`, so a shrinking endpoint set (2→1) can neither index out of bounds nor divide by zero on either LB path; poison recovery (`.unwrap_or_else(|p| p.into_inner())`) consistent across read AND write sites; the hot-path RwLock read is the SPEC §5.1-accepted tradeoff.
+2. **D2 XdsFileWatcher generalization** — `xds_watch.rs` is genuinely domain-free; the `RdsWatcher` reload pipeline is byte-equivalent after the reseat (RDS witness = fixture 0034, green); NO crate cycle (`envoy-cluster` gained no `envoy-http1` dep; only dev-deps `filetime` + `tempfile` added).
+3. **V4 bad-reload taxonomy fidelity** — all IO/parse/validate outside the lock, single-move swap, no TOCTOU; the five dispatch arms tick exactly the right counter (apply-empty→`update_success`+503 MIRROR; IO/parse→`update_failure`; wrong-name/bad-IP→`update_rejected`; empty-envelope→`update_empty`); 503 body the correct 19-byte `"no healthy upstream"`.
+4. **C-1/C-2 encapsulation boundary** — writes only in-crate; reads via `pub current_endpoints()`; `store_endpoints` `#[doc(hidden)] pub`; `into_inner` `pub(crate)`.
+5. **EDS+HC/OD no-watcher safety** — `build_eds_watch_targets` emits a target only when `endpoint_health.is_none() && outlier_detection.is_none()`; desync closed by construction.
+6. **config_dump byte-parity** — `EndpointsConfigDump` reconstructs through the phase-21 serializer; fixture 0029 idle witness green.
+
+**Minors (M27-1..M27-3, all non-blocking hardening nits → phase-28 carry-forwards):** M27-1 tighten `Cluster::store_endpoints` `pub` → `pub(crate)` (effectively unreachable cross-crate today, not an actual leak); M27-2 add a slow-path `debug_assert_eq!(eps.len(), health.len())` length-coupling (defense-in-depth); M27-3 the 400ms in-flight-isolation backstop sleep is the sole non-bounded timing assumption (well-cushioned by a 2s slow-backend delay). The per-task Minors logged during state-3 (Task 5 config_dump fallback/substring; Task 6 RDS/EDS dispatch-arm duplication; Task 7 backstop-vs-fixture placement + the now-3rd atomic-rename-helper user + body-agnostic cursor test) were re-triaged and CONFIRMED non-blocking; the reviewer additionally reproduced the documented port-TOCTOU flake once under full parallel load (passes 8/8 isolated; CI-authoritative; reinforces — does not block — the deferred shared-test-support-crate extraction).
+
+This is the **twelfth consecutive clean state-5** (after 17–26). Per §5.2 an approved review with no Critical/Important does NOT re-enter state-3. **§7.5 gate (a)–(e) GREEN at CI `27818702552`; (f) satisfied by the approved `REVIEW.md`.**
+
+**Outcome:** STATE advances to **state-5 review COMPLETE (`REVIEW.md` APPROVED) / state-6-next**. The next session performs the state-6 deterministic close-out (one docs-only commit `phase 27: file-based EDS endpoint hot reload [ADR-0067, ADR-0068]` per §5.3; flip ROADMAP row `27` `in-progress` → `done`; advance STATE to the next phase / awaiting-next-planning; relocate the `### Phase-27 …` Notes subsections per ADR-0035; push). This docs-only state-5 commit adds `REVIEW.md` + this PROGRESS entry + the STATE advance (the superseded state-4 top-section blocks relocated verbatim to `STATE_HISTORY.md` per ADR-0035).
