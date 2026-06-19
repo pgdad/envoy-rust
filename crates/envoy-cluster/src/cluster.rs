@@ -196,6 +196,17 @@ pub struct Cluster {
     /// inert-when-unconfigured invariant. `pick()`'s fast path bypasses entirely
     /// when this AND `endpoint_health` are both `None`.
     pub(crate) outlier_detection: Option<OutlierDetectionState>,
+    /// 28 Task 5 (§6.2-LOCKED / ADR-0070): the consistent-hashing ring, built at
+    /// construction for `RING_HASH` clusters from the endpoint `ip:port` Display
+    /// strings (host index `i` = `endpoints[i]` at build time — the ring's
+    /// `host_index` aligns with the `endpoints` Vec ordering). `None` for
+    /// `ROUND_ROBIN` clusters (the inert-when-unconfigured discipline) — so
+    /// `ring.is_some()` is the single source of truth for "this cluster is
+    /// RING_HASH", and `pick()` dispatches on it (no separate `lb_policy` field).
+    /// The ring is built ONCE from the bootstrap endpoint set; a later EDS
+    /// hot-reload that swaps `endpoints` does NOT rebuild it (RING_HASH +
+    /// reloadable membership is out of phase-28 scope — STATIC fixtures only).
+    pub(crate) ring: Option<crate::ring_hash::HashRing>,
     /// 27 Task 4 (§6.2 / ADR-0068): EDS-reload state, `Some` ONLY for `type: EDS`
     /// clusters (`None` for STATIC / STRICT_DNS — the §5.2 inert-when-unconfigured
     /// discipline). Carries the assignment-file path, the CLA selection name, and
@@ -319,7 +330,16 @@ impl Cluster {
     /// threshold (§6.2 item-3) is honored against the eligible fraction.
     /// `Relaxed` ordering is sufficient for the cursor and the health / ejection
     /// reads (single-writer per endpoint; no happens-before dependency).
-    fn pick(&self) -> Option<SocketAddr> {
+    ///
+    /// 28 Task 5 (§6.2-LOCKED / ADR-0070): `key_hash` carries the per-request
+    /// hash key (the `xxh64` of the route's `hash_policy` material) for
+    /// `RING_HASH` clusters. `RoundRobin` IGNORES it entirely (no behavior
+    /// change — the phase-02 cursor path). `RingHash` with `Some(key_hash)` does
+    /// the consistent-hashing ring lookup; `None` falls back to the cursor path
+    /// (Task 6 + the request-path backstop cover the real no-hash fallback). The
+    /// PUBLIC `ClusterHandle::pick_endpoint` delegate passes `None` FOR NOW — Task
+    /// 6 threads the real key through.
+    fn pick(&self, key_hash: Option<u64>) -> Option<SocketAddr> {
         // 27 D1 (§5.4 / M26-1): snapshot the current endpoint Arc ONCE at entry
         // and use this snapshot for the whole selection. Never re-acquire the
         // lock mid-selection — a concurrent `store_endpoints` swap then cannot
@@ -332,6 +352,29 @@ impl Cluster {
             return None;
         }
         let total = eps.len();
+        // 28 Task 5 (§6.2-LOCKED): RING_HASH dispatch. The ring's `host_index`
+        // aligns with the `eps` Vec ordering (the ring was built from the SAME
+        // endpoint slice at construction — see `from_bootstrap`). `Some(key_hash)`
+        // → ring lookup → the endpoint at that host index. `None` → fall through
+        // to the cursor path below (the no-hash fallback; the real fallback lands
+        // in Task 6). HC/OD + RING_HASH composition is a deferred non-goal (SPEC
+        // §2.2): RING_HASH clusters are plain in phase 28, so the ring host is
+        // returned directly without an eligibility filter. `ring` is `Some` iff
+        // `lb_policy == RingHash` (built together in `from_bootstrap`), so gating
+        // on `ring.as_ref()` is equivalent to dispatching on `lb_policy` — a
+        // RoundRobin cluster has `ring == None` and falls straight through, its
+        // `key_hash` inert. The ring was built from the bootstrap endpoint set;
+        // for a plain RING_HASH cluster `eps` is that same set, so `host_index`
+        // indexes `eps` directly (a reload-shrunk set is out of phase-28 scope —
+        // the `host_index < total` guard is defense-in-depth). A `None` key (or a
+        // stale index) falls through to the cursor path below — the Task-6 /
+        // backstop no-hash fallback.
+        if let (Some(ring), Some(kh)) = (self.ring.as_ref(), key_hash)
+            && let Some(host_index) = ring.lookup(kh)
+            && host_index < total
+        {
+            return Some(eps[host_index]);
+        }
         // Fast path: nothing configured → phase-02 round-robin (byte-for-byte).
         if self.endpoint_health.is_none() && self.outlier_detection.is_none() {
             let i = self.cursor.fetch_add(1, Ordering::Relaxed);
@@ -341,6 +384,24 @@ impl Cluster {
         // not-ejected (either filter being `None` is treated as `true`).
         let health = self.endpoint_health.as_ref();
         let ejection = self.outlier_detection.as_ref().map(|od| &od.endpoints);
+        // M27-2 (phase-27 carry-forward): the slow path indexes `health[i]` and
+        // `ejection[i]` for `i in 0..total` (== `eps.len()`). Both per-endpoint
+        // arrays are built index-aligned with the endpoint set in `from_bootstrap`;
+        // this assertion guards a future HC/OD-wiring regression that desyncs them.
+        if let Some(h) = health {
+            debug_assert_eq!(
+                eps.len(),
+                h.len(),
+                "endpoint_health must align with endpoints"
+            );
+        }
+        if let Some(e) = ejection {
+            debug_assert_eq!(
+                eps.len(),
+                e.len(),
+                "outlier ejection must align with endpoints"
+            );
+        }
         let is_eligible = |i: usize| -> bool {
             let healthy = match health {
                 None => true,
@@ -404,7 +465,14 @@ impl Cluster {
     ///
     /// [`current_endpoints`]: Cluster::current_endpoints
     /// [`pick`]: Cluster::pick
-    pub fn store_endpoints(&self, eps: Arc<Vec<SocketAddr>>) {
+    ///
+    /// M27-1 (phase-27 carry-forward): tightened `pub` → `pub(crate)`. The only
+    /// callers are the in-crate `eds_reload` pipeline and the
+    /// `#[doc(hidden)] pub` `ClusterHandle::store_endpoints` delegate (the latter
+    /// is the real cross-crate surface — referenced by an `envoy-admin` test —
+    /// and stays `pub`). No external crate reaches `&Cluster` / `Arc<Cluster>`
+    /// directly (`ClusterHandle::inner` is `pub(crate)`), so this is safe.
+    pub(crate) fn store_endpoints(&self, eps: Arc<Vec<SocketAddr>>) {
         // Single-statement swap: hold the write guard only for the pointer
         // assignment. Poison-recovery (mirroring the phase-26
         // `HCMConfig::store_route_config` precedent) is safe while this critical
@@ -547,7 +615,11 @@ impl ClusterHandle {
     /// Without health checks the cluster always yields an endpoint (the
     /// inert-when-unconfigured round-robin).
     pub fn pick_endpoint(&self) -> Option<SocketAddr> {
-        self.inner.pick()
+        // 28 Task 5: pass `None` FOR NOW (behavior-preserving no-op — RoundRobin
+        // ignores the key, and no RING_HASH cluster reaches a production caller
+        // yet). Task 6 changes this delegate to take its own `Option<u64>` and
+        // thread the real per-request hash key through the HCM call sites.
+        self.inner.pick(None)
     }
 
     /// 27 D1 (§5.4 / §6.2): delegates to [`Cluster::current_endpoints`] — a
@@ -1276,6 +1348,27 @@ pub async fn from_bootstrap(
         } else {
             None
         };
+        // 28 Task 5 (§6.2-LOCKED / ADR-0070): build the consistent-hashing ring
+        // for RING_HASH clusters from the endpoint `ip:port` Display strings. The
+        // ring's `host_index` aligns with the `endpoints` Vec ordering (we build
+        // the address strings by iterating `endpoints` in order, so ring index `i`
+        // == `endpoints[i]`). `SocketAddr` Display gives `ip:port` for IPv4 (e.g.
+        // `172.22.0.2:5678`), matching Envoy's `address()->asString()`; IPv6 is a
+        // bracketed-form UNTESTED non-goal (the differential fixture is IPv4). The
+        // ring is built ONCE here — RING_HASH + reloadable membership is out of
+        // phase-28 scope (STATIC fixtures only). `minimum_ring_size` comes from the
+        // cluster's `ring_hash_lb_config` (Envoy proto default 1024 when absent).
+        let ring = if cfg.lb_policy == envoy_config::LbPolicy::RingHash {
+            let min_ring_size = cfg
+                .ring_hash_lb_config
+                .as_ref()
+                .map(|c| c.minimum_ring_size)
+                .unwrap_or(1024);
+            let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
+            Some(crate::ring_hash::HashRing::build(&addrs, min_ring_size))
+        } else {
+            None
+        };
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
             endpoints: RwLock::new(Arc::new(endpoints)),
@@ -1293,6 +1386,7 @@ pub async fn from_bootstrap(
             endpoint_health,
             panic_threshold,
             outlier_detection,
+            ring,
             eds_reload,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
@@ -1405,9 +1499,80 @@ mod tests {
                 endpoint_health: None,
                 panic_threshold: 50.0,
                 outlier_detection: None,
+                ring: None,
                 eds_reload: None,
             }),
         }
+    }
+
+    /// 28 Task 5: build a RING_HASH `ClusterHandle` with the given endpoints and
+    /// `minimum_ring_size`, mirroring `from_bootstrap`'s ring build (host index
+    /// `i` = `endpoints[i]`, address strings from `SocketAddr` Display).
+    fn mk_ring_hash_handle(
+        name: &str,
+        endpoints: Vec<SocketAddr>,
+        min_ring_size: u64,
+    ) -> ClusterHandle {
+        let handle = mk_handle(name, endpoints.clone());
+        let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
+        let ring = crate::ring_hash::HashRing::build(&addrs, min_ring_size);
+        // Rebuild the inner Cluster with RING_HASH policy + the ring (the
+        // `mk_handle` default is RoundRobin/no-ring). Reuse the registered stat
+        // Arcs by deconstructing the handle's inner Cluster.
+        let inner = handle.inner;
+        let new_inner = Cluster {
+            name: inner.name.clone(),
+            endpoints: RwLock::new(inner.current_endpoints()),
+            cursor: AtomicUsize::new(0),
+            upstream_protocol: inner.upstream_protocol,
+            cx_total: Arc::clone(&inner.cx_total),
+            cx_active: Arc::clone(&inner.cx_active),
+            upstream_rq_total: Arc::clone(&inner.upstream_rq_total),
+            upstream_rq_5xx: Arc::clone(&inner.upstream_rq_5xx),
+            upstream_rq_retry: Arc::clone(&inner.upstream_rq_retry),
+            upstream_rq_retry_success: Arc::clone(&inner.upstream_rq_retry_success),
+            upstream_rq_retry_limit_exceeded: Arc::clone(&inner.upstream_rq_retry_limit_exceeded),
+            upstream_rq_retry_overflow: Arc::clone(&inner.upstream_rq_retry_overflow),
+            budget: None,
+            endpoint_health: None,
+            panic_threshold: 50.0,
+            outlier_detection: None,
+            ring: Some(ring),
+            eds_reload: None,
+        };
+        ClusterHandle {
+            inner: Arc::new(new_inner),
+        }
+    }
+
+    /// 28 Task 5: a RING_HASH cluster's `pick(Some(key_hash))` routes by the ring
+    /// (consistent with the §6.2 oracle), while a RoundRobin cluster IGNORES the
+    /// key (the cursor path is inert to it).
+    #[test]
+    fn pick_ring_hash_dispatch_and_round_robin_key_inert() {
+        // host 0 = 172.22.0.2:5678 (ONE), host 1 = 172.22.0.3:5678 (TWO).
+        let ep0: SocketAddr = "172.22.0.2:5678".parse().unwrap();
+        let ep1: SocketAddr = "172.22.0.3:5678".parse().unwrap();
+        let rh = mk_ring_hash_handle("rh", vec![ep0, ep1], 1024);
+        // Oracle: key-0 → host 0, key-2 → host 1.
+        assert_eq!(
+            rh.inner.pick(Some(crate::xxhash::xxh64(b"key-0"))),
+            Some(ep0),
+            "key-0 → host 0 (the ONE backend)"
+        );
+        assert_eq!(
+            rh.inner.pick(Some(crate::xxhash::xxh64(b"key-2"))),
+            Some(ep1),
+            "key-2 → host 1 (the TWO backend)"
+        );
+
+        // RoundRobin: the key is inert — `pick(Some(123))` behaves like the
+        // cursor path (first call → endpoints[0], second → endpoints[1]).
+        let rr = mk_handle("rr", vec![ep0, ep1]);
+        assert_eq!(rr.inner.pick(Some(123)), Some(ep0), "cursor 0, key ignored");
+        assert_eq!(rr.inner.pick(Some(123)), Some(ep1), "cursor 1, key ignored");
+        // And matches a `None`-key call (proving the key is truly inert).
+        assert_eq!(rr.inner.pick(None), Some(ep0), "cursor 2 % 2 = 0");
     }
 
     // ---------------------------------------------------------------------
@@ -1694,7 +1859,8 @@ admin:
                     health_checks: vec![],
                     common_lb_config: None,
                     circuit_breakers: None,
-                    outlier_detection: None, // 14.1 D1
+                    outlier_detection: None,   // 14.1 D1
+                    ring_hash_lb_config: None, // 28 Task 3
                 }],
             },
             dynamic_resources: None,
@@ -1745,7 +1911,8 @@ admin:
             health_checks: vec![],
             common_lb_config: None,
             circuit_breakers: None,
-            outlier_detection: None, // 14.1 D1
+            outlier_detection: None,   // 14.1 D1
+            ring_hash_lb_config: None, // 28 Task 3
         };
         let bootstrap = Bootstrap {
             node: None,
@@ -1811,6 +1978,7 @@ admin:
             endpoint_health: None,
             panic_threshold: 50.0,
             outlier_detection: None,
+            ring: None,
             eds_reload: None,
         };
         assert_eq!(c.name(), "backend");
@@ -2419,6 +2587,7 @@ admin:
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: None,
+                ring: None,
                 eds_reload: None,
             }),
         };
@@ -2822,6 +2991,7 @@ admin:
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: Some(od_state),
+                ring: None,
                 eds_reload: None,
             }),
         };
@@ -3582,6 +3752,7 @@ admin:
             common_lb_config: None,
             circuit_breakers: None,
             outlier_detection: None,
+            ring_hash_lb_config: None, // 28 Task 3
         }
     }
 
@@ -3771,6 +3942,7 @@ admin:
             common_lb_config: None,
             circuit_breakers: None,
             outlier_detection: None,
+            ring_hash_lb_config: None, // 28 Task 3
         }
     }
 

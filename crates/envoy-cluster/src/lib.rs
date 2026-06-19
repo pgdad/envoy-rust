@@ -17,6 +17,7 @@ mod eds_reload;
 mod ejection;
 mod health;
 mod outlier;
+mod ring_hash;
 pub mod xds_watch;
 mod xxhash;
 
