@@ -18,6 +18,7 @@ mod ejection;
 mod health;
 mod outlier;
 pub mod xds_watch;
+mod xxhash;
 
 pub use budget::{BudgetAcquisition, BudgetState, RequestBudgetGuard, RetryBudgetGuard};
 pub use cluster::{
