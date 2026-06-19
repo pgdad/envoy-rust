@@ -284,6 +284,26 @@ pub enum Driver {
         reload: RdsReloadStep,
         post_probes: Vec<Http1Probe>,
     },
+    /// 27 Task 6 (D6 / §6.2-LOCKED V2 / ADR-0068): an EDS hot-reload differential
+    /// step — the EDS sibling of `Http1RdsReload`. Runs `pre_probes` (bilateral
+    /// equivalence on backend_1), atomic-renames the post-reload EDS content
+    /// (the endpoint swapped `[backend_1]` → `[backend_2]`) over the watched path
+    /// on BOTH sides, waits — bounded — for both proxies to converge on the new
+    /// endpoint set (polling `reload.discriminator`, NOT a fixed sleep), then
+    /// runs `post_probes` (bilateral equivalence on backend_2). The
+    /// discriminating observable is the per-backend body marker (`backend: backend_2`)
+    /// OR `cluster.eds_backend.update_success` advancing. The post-reload
+    /// differential is NATIVE-Linux-CI-authoritative (the upstream container
+    /// reload is unobservable under Docker Desktop virtiofs); the harness
+    /// mechanics are unit-tested locally. Folds the phase-26 M26-2 fix: the
+    /// dispatch arm `bail!`s if the discriminator has neither `expected_status`
+    /// nor `expected_body` (a both-None discriminator would report spurious
+    /// instant convergence — see `eds_reload_discriminator_is_load_bearing`).
+    Http1EdsReload {
+        pre_probes: Vec<Http1Probe>,
+        reload: EdsReloadStep,
+        post_probes: Vec<Http1Probe>,
+    },
 }
 
 /// 26 Task 7: the reload directive inside `Driver::Http1RdsReload`. Carries the
@@ -308,6 +328,48 @@ pub struct RdsReloadStep {
 
 fn default_reload_file() -> String {
     "rds-reload.yaml".to_string()
+}
+
+/// 27 Task 6 (D6 / §6.2-LOCKED V2 / ADR-0068): the reload directive inside
+/// `Driver::Http1EdsReload`. The EDS sibling of `RdsReloadStep`. Carries the
+/// post-reload EDS template path (rendered per-side like `eds.yaml`), the
+/// convergence-wait bound (~8 ms settle with generous slack, e.g. fixtures set
+/// 2000), and the discriminating probe whose POST-swap response (the
+/// `backend: backend_2` body marker, or an advanced `update_success`) signals
+/// each side has converged.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EdsReloadStep {
+    /// Fixture-relative file holding the POST-reload EDS content (the
+    /// `ClusterLoadAssignment` with the swapped endpoint), rendered per-side
+    /// exactly like `eds.yaml`. Default `eds-reload.yaml`.
+    #[serde(default = "default_eds_reload_file")]
+    pub reload_file: String,
+    /// Bound (ms) for the wait-for-convergence poll. Generous slack over the
+    /// ~8 ms settle latency (e.g. fixtures set 2000).
+    pub settle_budget_ms: u64,
+    /// The discriminating probe polled (each side) until its response reflects
+    /// the SWAPPED endpoint — its `expected_status` / `expected_body` define
+    /// "converged". Bounded by `settle_budget_ms`. MUST be load-bearing (carry
+    /// at least one of `expected_status` / `expected_body`) — the dispatch arm
+    /// `bail!`s otherwise (M26-2 guard, see `eds_reload_discriminator_is_load_bearing`).
+    pub discriminator: Http1Probe,
+}
+
+fn default_eds_reload_file() -> String {
+    "eds-reload.yaml".to_string()
+}
+
+/// 27 Task 6 (D6): the M26-2 spurious-convergence guard. A reload discriminator
+/// with NEITHER `expected_status` NOR `expected_body` makes
+/// `wait_for_reload_convergence` return Ok on the FIRST poll (`status_ok &&
+/// body_ok == true` when both expectations are absent), reporting instant
+/// "convergence" before the reload took effect (the phase-26 M26-2 trap — the
+/// RDS arm did not guard this). The `Http1EdsReload` dispatch arm calls this at
+/// its START and `bail!`s when it returns `false`. A discriminator is
+/// load-bearing iff it carries at least one expectation.
+pub fn eds_reload_discriminator_is_load_bearing(discriminator: &Http1Probe) -> bool {
+    discriminator.expected_status.is_some() || discriminator.expected_body.is_some()
 }
 
 /// 08.1 Task 11: one admin-listener sub-case inside `Driver::AdminScrape`.
@@ -2571,7 +2633,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // 26 Task 7: the RDS-hot-reload driver runs over an HCM `{{PORT}}`
         // listener like the other HTTP drivers; the reload swaps the
         // file-based RouteConfiguration out from under that listener.
-        | Driver::Http1RdsReload { .. } => "PORT",
+        | Driver::Http1RdsReload { .. }
+        // 27 Task 6 (D6): the EDS-hot-reload driver runs over an HCM `{{PORT}}`
+        // listener like the other HTTP drivers; the reload swaps the file-based
+        // EDS endpoint set out from under that listener's cluster.
+        | Driver::Http1EdsReload { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
     };
 
@@ -2936,6 +3002,44 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let http1_backend_port_str = _http1_backend.as_ref().map(|b| b.port().to_string());
 
+    // 27 Task 6 (D6 / §6.2-LOCKED V2 / ADR-0068): spawn a SECOND distinguishable
+    // echo backend when the fixture references the EDS-reload markers. The
+    // EDS-reload fixture (Task 7's 0035) needs TWO single-endpoint echo backends
+    // distinguishable by a per-backend body marker so the `[backend_1]` →
+    // `[backend_2]` endpoint swap is a REAL swap (a `GET /probe` response's
+    // leading `backend: <marker>\n` line identifies which one served it).
+    //
+    // `backend_1` and `backend_2` are spawned independently, each gated on its
+    // own `{{HTTP1_BACKEND_1_PORT}}` / `{{HTTP1_BACKEND_2_PORT}}` marker
+    // (mirroring the single-backend `{{HTTP1_BACKEND_PORT}}` convention). The
+    // markers' bare-token scan does NOT alias the existing `HTTP1_BACKEND_PORT`
+    // token (exact-token match in `scan_needs_marker`), so all pre-27 fixtures
+    // stay inert here. The `--body-marker` value is the fixed `backend_1` /
+    // `backend_2` string the discriminator's `expected_body` matches.
+    let needs_http1_backend_1 = scan_needs_marker(&backend_scan_sources, "HTTP1_BACKEND_1_PORT");
+    let _http1_backend_1: Option<crate::backend::Http1EchoBackend> = if needs_http1_backend_1 {
+        Some(
+            crate::backend::Http1EchoBackend::spawn_with_marker("backend_1")
+                .await
+                .context("spawning Http1EchoBackend backend_1")?,
+        )
+    } else {
+        None
+    };
+    let http1_backend_1_port_str = _http1_backend_1.as_ref().map(|b| b.port().to_string());
+
+    let needs_http1_backend_2 = scan_needs_marker(&backend_scan_sources, "HTTP1_BACKEND_2_PORT");
+    let _http1_backend_2: Option<crate::backend::Http1EchoBackend> = if needs_http1_backend_2 {
+        Some(
+            crate::backend::Http1EchoBackend::spawn_with_marker("backend_2")
+                .await
+                .context("spawning Http1EchoBackend backend_2")?,
+        )
+    } else {
+        None
+    };
+    let http1_backend_2_port_str = _http1_backend_2.as_ref().map(|b| b.port().to_string());
+
     // 05.3 NEW per SPEC §3 D6.b: spawn Http2EchoBackend if either template
     // needs one. Same alive-keeper binding-order discipline as _backend /
     // _tls_backend / _http1_backend above.
@@ -2967,12 +3071,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(hp) = http1_backend_port_str.as_deref() {
             v.push(("HTTP1_BACKEND_PORT", hp.to_string()));
         }
+        // 27 Task 6 (D6): the two distinguishable EDS-reload backends.
+        if let Some(hp) = http1_backend_1_port_str.as_deref() {
+            v.push(("HTTP1_BACKEND_1_PORT", hp.to_string()));
+        }
+        if let Some(hp) = http1_backend_2_port_str.as_deref() {
+            v.push(("HTTP1_BACKEND_2_PORT", hp.to_string()));
+        }
         if let Some(h2p) = http2_backend_port_str.as_deref() {
             v.push(("HTTP2_BACKEND_PORT", h2p.to_string()));
         }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
+            || http1_backend_1_port_str.is_some()
+            || http1_backend_2_port_str.is_some()
             || http2_backend_port_str.is_some()
         {
             // Per ADR-0015: container-side reaches the host backend via
@@ -3034,12 +3147,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(hp) = http1_backend_port_str.as_deref() {
             v.push(("HTTP1_BACKEND_PORT", hp.to_string()));
         }
+        // 27 Task 6 (D6): the two distinguishable EDS-reload backends.
+        if let Some(hp) = http1_backend_1_port_str.as_deref() {
+            v.push(("HTTP1_BACKEND_1_PORT", hp.to_string()));
+        }
+        if let Some(hp) = http1_backend_2_port_str.as_deref() {
+            v.push(("HTTP1_BACKEND_2_PORT", hp.to_string()));
+        }
         if let Some(h2p) = http2_backend_port_str.as_deref() {
             v.push(("HTTP2_BACKEND_PORT", h2p.to_string()));
         }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
+            || http1_backend_1_port_str.is_some()
+            || http1_backend_2_port_str.is_some()
             || http2_backend_port_str.is_some()
         {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
@@ -4110,6 +4232,114 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 .context("envoy-rust never converged on reloaded RDS table")?;
 
             // 5. post_probes — bilateral equivalence on the RELOADED table.
+            for probe in post_probes {
+                run_http1_probe_bilateral(
+                    upstream_addr,
+                    subject_addr,
+                    &expectations.equivalence,
+                    probe,
+                    "post",
+                )
+                .await?;
+            }
+
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+        }
+        // 27 Task 6 (D6 / §6.2-LOCKED V2 / ADR-0068): file-based EDS hot-reload
+        // differential step — the EDS sibling of `Http1RdsReload`. Runs
+        // `pre_probes` bilaterally (backend_1 serving), atomic-renames the
+        // post-reload EDS content (endpoint swapped `[backend_1]` → `[backend_2]`)
+        // over the watched path on BOTH sides (subject host file + upstream
+        // container file), waits — bounded, polling the discriminator, NOT a
+        // fixed sleep — for both proxies to converge on the new endpoint set,
+        // then runs `post_probes` bilaterally (backend_2 serving). The
+        // post-reload differential is NATIVE-Linux-CI-authoritative: the upstream
+        // container reload is unobservable under Docker Desktop virtiofs
+        // (bind-mount inotify does not propagate), so the in-container
+        // atomic-rename + convergence is only meaningful on native Linux CI.
+        Driver::Http1EdsReload {
+            pre_probes,
+            reload,
+            post_probes,
+        } => {
+            // M26-2 GUARD (folds the phase-26 fix the RDS arm omitted): a
+            // discriminator with NEITHER expected_status NOR expected_body would
+            // make `wait_for_reload_convergence` return Ok on the FIRST poll
+            // (`status_ok && body_ok == true` with both absent), reporting
+            // spurious instant "convergence" before the reload took effect. Bail
+            // BEFORE driving anything.
+            if !eds_reload_discriminator_is_load_bearing(&reload.discriminator) {
+                bail!(
+                    "Driver::Http1EdsReload discriminator {} carries neither \
+                     expected_status nor expected_body — it would report spurious \
+                     instant convergence (M26-2); the EDS-reload discriminator MUST \
+                     be load-bearing",
+                    reload.discriminator.name,
+                );
+            }
+
+            // An EDS-reload fixture MUST carry an `eds.yaml` (the reload swaps the
+            // file-based ClusterLoadAssignment endpoint). `subject_eds_path` is
+            // always bound, but its file only exists when the fixture is EDS-based.
+            if upstream_eds_path.is_none() {
+                bail!(
+                    "Driver::Http1EdsReload requires a file-based EDS fixture \
+                     (no {{{{EDS_PATH}}}} marker / eds.yaml found)"
+                );
+            }
+
+            // 1. pre_probes — bilateral equivalence on the ORIGINAL endpoint (backend_1).
+            for probe in pre_probes {
+                run_http1_probe_bilateral(
+                    upstream_addr,
+                    subject_addr,
+                    &expectations.equivalence,
+                    probe,
+                    "pre",
+                )
+                .await?;
+            }
+
+            // 2. Read + render the POST-reload EDS template per-side, exactly
+            //    like eds.yaml (same kv ref slices, same residual-marker guard).
+            //    The per-side `{{EDS_BACKEND_IP}}` resolves to the numeric
+            //    host-gateway IP (upstream) vs `127.0.0.1` (subject) — EDS rejects
+            //    hostnames (L1), so the two renditions carry DIFFERENT numeric
+            //    endpoint addresses.
+            let reload_tpl = std::fs::read_to_string(fixture_dir.join(&reload.reload_file))
+                .with_context(|| format!("reading EDS reload file {}", reload.reload_file))?;
+            let upstream_reload = render_yaml(&reload_tpl, &upstream_kvs_refs);
+            let subject_reload = render_yaml(&reload_tpl, &subject_kvs_refs);
+            if let Some(marker) = residual_marker(&upstream_reload) {
+                bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream reload EDS");
+            }
+            if let Some(marker) = residual_marker(&subject_reload) {
+                bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject reload EDS");
+            }
+
+            // 3. Reload BOTH sides via atomic-rename (the ONLY rewrite Envoy's
+            //    default file-watch observes — §6.2/ADR-0066). Subject = host
+            //    file; upstream = in-container file via docker exec.
+            atomic_rename_over(&subject_eds_path, &subject_reload)
+                .context("atomic-rename of reloaded subject EDS file")?;
+            upstream
+                .reload_eds_atomic(&upstream_reload)
+                .await
+                .context("atomic-rename of reloaded upstream container EDS file")?;
+
+            // 4. Wait — bounded — for BOTH sides to converge on the new endpoint
+            //    set, polling the discriminator (its expected_status/body define
+            //    "converged"). NOT a fixed sleep.
+            let budget = Duration::from_millis(reload.settle_budget_ms);
+            wait_for_reload_convergence(upstream_addr, &reload.discriminator, budget)
+                .await
+                .context("upstream Envoy never converged on reloaded EDS endpoint set")?;
+            wait_for_reload_convergence(subject_addr, &reload.discriminator, budget)
+                .await
+                .context("envoy-rust never converged on reloaded EDS endpoint set")?;
+
+            // 5. post_probes — bilateral equivalence on the SWAPPED endpoint (backend_2).
             for probe in post_probes {
                 run_http1_probe_bilateral(
                     upstream_addr,
@@ -8085,6 +8315,7 @@ driver:
 /// `admin_action_extension_tests` per the per-task placement convention.
 #[cfg(test)]
 mod eds_harness_tests {
+    use super::Driver;
     use super::discover_host_gateway_ip;
 
     /// The EDS-marker scan. A fixture template that references `{{EDS_PATH}}`
@@ -8132,6 +8363,175 @@ mod eds_harness_tests {
         ip.parse::<std::net::Ipv4Addr>().unwrap_or_else(|e| {
             panic!("discovered host-gateway IP {ip:?} must be numeric IPv4: {e}")
         });
+    }
+
+    // ---- 27 Task 6 (D6 / §6.2-LOCKED V2): EDS hot-reload step (local unit
+    // tests). The Docker-gated end-to-end reload differential is
+    // native-Linux-CI-authoritative (Task 7's fixture 0035 — under Docker
+    // Desktop virtiofs the Envoy-side reload is NOT locally observable); here we
+    // lock in the schema (mirroring `Driver::Http1RdsReload`'s round-trip), the
+    // `default_reload_file` default (`eds-reload.yaml`), the per-side render of
+    // an EDS-reload template, and the M26-2 discriminator-guard `bail!`. ----
+
+    /// A `Driver::Http1EdsReload` expectations YAML round-trips through the
+    /// snake_case-tagged serde representation. The `reload.reload_file` key is
+    /// OMITTED to exercise the `default_eds_reload_file` default
+    /// (`eds-reload.yaml`); the discriminator probe (a body marker discriminator
+    /// here — `backend_2` after the swap) parses into the expected
+    /// `EdsReloadStep`. Mirrors `driver_http1_rds_reload_round_trips_through_serde`.
+    #[test]
+    fn driver_http1_eds_reload_round_trips_through_serde() {
+        let yaml = r#"
+driver:
+  kind: http1_eds_reload
+  pre_probes:
+    - name: pre-backend-1
+      method: get
+      path: /probe
+      host: eds_backend
+      expected_status: 200
+      expected_body:
+        kind: byte_exact
+        body: "backend: backend_1\nmethod: GET\npath: /probe\nheaders:\n  ...\nbody: \n"
+  reload:
+    settle_budget_ms: 2000
+    discriminator:
+      name: discriminator
+      method: get
+      path: /probe
+      host: eds_backend
+      expected_body:
+        kind: byte_exact
+        body: "backend: backend_2\nmethod: GET\npath: /probe\nheaders:\n  ...\nbody: \n"
+  post_probes:
+    - name: post-backend-2
+      method: get
+      path: /probe
+      host: eds_backend
+      expected_status: 200
+"#;
+        let exp: crate::Expectations = serde_yaml::from_str(yaml).expect("yaml parses");
+        let Driver::Http1EdsReload {
+            pre_probes,
+            reload,
+            post_probes,
+        } = exp.driver
+        else {
+            panic!("expected Driver::Http1EdsReload");
+        };
+        // reload_file omitted ⇒ default applied.
+        assert_eq!(reload.reload_file, "eds-reload.yaml");
+        assert_eq!(reload.settle_budget_ms, 2000);
+        assert_eq!(reload.discriminator.name, "discriminator");
+        // The discriminator carries an expected_body (the post-swap marker) —
+        // so the M26-2 both-None guard does NOT trip for it.
+        assert!(reload.discriminator.expected_body.is_some());
+        assert_eq!(pre_probes.len(), 1);
+        assert_eq!(pre_probes[0].name, "pre-backend-1");
+        assert_eq!(post_probes.len(), 1);
+        assert_eq!(post_probes[0].name, "post-backend-2");
+    }
+
+    /// `#[serde(deny_unknown_fields)]` on `EdsReloadStep` rejects a stray key —
+    /// the schema is locked (mirrors the RDS step's strictness).
+    #[test]
+    fn eds_reload_step_rejects_unknown_field() {
+        let yaml = r#"
+driver:
+  kind: http1_eds_reload
+  pre_probes: []
+  reload:
+    settle_budget_ms: 2000
+    bogus_key: 1
+    discriminator:
+      name: d
+      method: get
+      path: /probe
+      host: eds_backend
+      expected_status: 200
+  post_probes: []
+"#;
+        let res: Result<crate::Expectations, _> = serde_yaml::from_str(yaml);
+        assert!(
+            res.is_err(),
+            "deny_unknown_fields must reject the stray `bogus_key`",
+        );
+    }
+
+    /// The POST-reload EDS template renders per-side exactly like `eds.yaml` —
+    /// the upstream (container-perspective) kv map resolves `{{EDS_BACKEND_IP}}`
+    /// to the numeric host-gateway IP, the subject (host-perspective) kv map to
+    /// `127.0.0.1`, and `{{HTTP1_BACKEND_2_PORT}}` swaps the endpoint to
+    /// backend_2. Mirrors `rds_reload_template_renders_per_side`.
+    #[test]
+    fn eds_reload_template_renders_per_side_and_swaps_backend() {
+        let reload_template =
+            "endpoint:\n  address: {{EDS_BACKEND_IP}}\n  port: {{HTTP1_BACKEND_2_PORT}}";
+        let upstream_reload = crate::render_yaml(
+            reload_template,
+            &[
+                ("EDS_BACKEND_IP", "172.17.0.1"),
+                ("HTTP1_BACKEND_2_PORT", "54322"),
+            ],
+        );
+        let subject_reload = crate::render_yaml(
+            reload_template,
+            &[
+                ("EDS_BACKEND_IP", "127.0.0.1"),
+                ("HTTP1_BACKEND_2_PORT", "54322"),
+            ],
+        );
+        assert!(upstream_reload.contains("address: 172.17.0.1"));
+        assert!(subject_reload.contains("address: 127.0.0.1"));
+        // Both renditions point at backend_2's port (the swapped endpoint).
+        assert!(upstream_reload.contains("port: 54322"));
+        assert!(subject_reload.contains("port: 54322"));
+        assert_ne!(upstream_reload, subject_reload);
+    }
+
+    /// The M26-2 spurious-convergence guard: a reload discriminator with NEITHER
+    /// `expected_status` NOR `expected_body` would make `wait_for_reload_convergence`
+    /// return Ok on the FIRST poll (`status_ok && body_ok == true` with both
+    /// expectations absent), reporting instant "convergence" before any reload
+    /// took effect — the phase-26 M26-2 trap. `eds_reload_discriminator_is_load_bearing`
+    /// is the guard the `Http1EdsReload` dispatch arm calls at its START to
+    /// `bail!` on such a discriminator (folding the fix the RDS arm omitted).
+    #[test]
+    fn eds_reload_discriminator_both_none_is_rejected() {
+        // both None ⇒ NOT load-bearing ⇒ the dispatch arm must bail!.
+        let both_none = crate::Http1Probe {
+            name: "d".to_string(),
+            method: crate::Http1Method::Get,
+            path: "/probe".to_string(),
+            host: "eds_backend".to_string(),
+            extra_headers: vec![],
+            body: None,
+            expected_status: None,
+            expected_body: None,
+            expected_headers: None,
+        };
+        assert!(
+            !crate::eds_reload_discriminator_is_load_bearing(&both_none),
+            "a both-None discriminator must be rejected (M26-2 spurious convergence)",
+        );
+
+        // An expected_status alone is load-bearing.
+        let status_only = crate::Http1Probe {
+            expected_status: Some(200),
+            ..both_none.clone()
+        };
+        assert!(crate::eds_reload_discriminator_is_load_bearing(
+            &status_only
+        ));
+
+        // An expected_body alone is load-bearing (the body-marker swap path).
+        let body_only = crate::Http1Probe {
+            expected_body: Some(crate::Http1BodyRule::ByteExact {
+                body: "backend: backend_2\n".to_string(),
+            }),
+            ..both_none
+        };
+        assert!(crate::eds_reload_discriminator_is_load_bearing(&body_only));
     }
 }
 

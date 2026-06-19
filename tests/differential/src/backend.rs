@@ -187,11 +187,30 @@ impl Http1EchoBackend {
     /// until the listener accepts a TCP connection. Total readiness budget:
     /// 1s (matches TcpProxyBackend's exponential backoff defaults).
     pub async fn spawn() -> Result<Self> {
+        Self::spawn_inner(None).await
+    }
+
+    /// 27 Task 6 (D6 / §6.2-LOCKED V2): spawn an echo backend with a
+    /// per-instance `--body-marker <marker>`. Two backends spawned with
+    /// DISTINCT markers (`backend_1`/`backend_2`) are distinguishable by their
+    /// response body's leading `backend: <marker>\n` line — the EDS-reload
+    /// discriminating observable (the `[backend_1]` → `[backend_2]` endpoint
+    /// swap is only a real swap if the two backends differ). `spawn()` is the
+    /// no-marker shim (the pre-27 byte-identical echo shape, unchanged for all
+    /// existing fixtures).
+    pub async fn spawn_with_marker(marker: &str) -> Result<Self> {
+        Self::spawn_inner(Some(marker)).await
+    }
+
+    async fn spawn_inner(marker: Option<&str>) -> Result<Self> {
         let port = reserve_port().context("reserving http1 backend port")?;
         let bin = locate_http1_echo_server().context("locating http1-echo-server binary")?;
-        let child = tokio::process::Command::new(&bin)
-            .arg("--port")
-            .arg(port.to_string())
+        let mut cmd = tokio::process::Command::new(&bin);
+        cmd.arg("--port").arg(port.to_string());
+        if let Some(marker) = marker {
+            cmd.arg("--body-marker").arg(marker);
+        }
+        let child = cmd
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -760,6 +779,67 @@ mod tests {
         );
 
         drop(backend);
+    }
+
+    /// 27 Task 6 (D6 / §6.2-LOCKED V2): two distinguishable single-endpoint
+    /// echo backends. The EDS-reload fixture swaps `eds_backend`'s endpoint from
+    /// `[backend_1]` to `[backend_2]`, so BOTH backends must be running AND
+    /// distinguishable by a per-backend body marker (a `GET /probe` response's
+    /// leading `backend: <marker>\n` line identifies which one served it). This
+    /// is the genuinely-new harness capability Task 7's fixture 0035 consumes;
+    /// the full Docker reload differential is native-Linux-CI-authoritative.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http1_echo_backends_are_distinguishable_by_marker() {
+        if locate_http1_echo_server().is_err() {
+            eprintln!(
+                "skipping http1_echo_backends_are_distinguishable_by_marker — http1-echo-server not built; run `cargo test --workspace`"
+            );
+            return;
+        }
+
+        let backend_1 = Http1EchoBackend::spawn_with_marker("backend_1")
+            .await
+            .expect("spawn backend_1");
+        let backend_2 = Http1EchoBackend::spawn_with_marker("backend_2")
+            .await
+            .expect("spawn backend_2");
+
+        // Distinct ports — two independent host subprocesses.
+        assert_ne!(
+            backend_1.port(),
+            backend_2.port(),
+            "the two backends must bind distinct ports"
+        );
+
+        async fn probe_marker(port: u16) -> String {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            s.write_all(b"GET /probe HTTP/1.1\r\nHost: x.test\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.expect("read");
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let r1 = probe_marker(backend_1.port()).await;
+        let r2 = probe_marker(backend_2.port()).await;
+        assert!(
+            r1.contains("backend: backend_1\n"),
+            "backend_1 must carry its marker: {r1}"
+        );
+        assert!(
+            r2.contains("backend: backend_2\n"),
+            "backend_2 must carry its marker: {r2}"
+        );
+        assert!(
+            !r1.contains("backend: backend_2"),
+            "backend_1 must NOT carry backend_2's marker: {r1}"
+        );
+
+        drop(backend_1);
+        drop(backend_2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

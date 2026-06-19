@@ -38,10 +38,16 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(5);
 /// waiting eventually" budgets, not load-bearing tuning.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Parsed argv surface. (`--port <u16>` only; no TLS keys.)
+/// Parsed argv surface. (`--port <u16>` required; `--body-marker <s>` optional.)
 #[derive(Debug, PartialEq)]
 struct Args {
     port: u16,
+    /// 27 Task 6 (D6 / §6.2-LOCKED V2): an optional per-instance body marker.
+    /// When set, the echo body carries a leading `backend: <marker>\n` line so
+    /// two otherwise-identical echo backends are distinguishable by their
+    /// response body — the EDS-reload discriminating observable. `None` for all
+    /// pre-phase-27 fixtures (the body shape is byte-identical to before).
+    body_marker: Option<String>,
 }
 
 /// argv parse failure modes.
@@ -68,6 +74,7 @@ enum ArgvError {
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
     let mut i = 0;
     let mut port: Option<u16> = None;
+    let mut body_marker: Option<String> = None;
     while i < args.len() {
         match args[i].as_str() {
             "--help" => return Err(ArgvError::HelpRequested),
@@ -77,11 +84,17 @@ fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
                 port = Some(v.parse().map_err(|_| ArgvError::InvalidPort)?);
                 i += 2;
             }
+            "--body-marker" => {
+                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
+                body_marker = Some(v.clone());
+                i += 2;
+            }
             _ => return Err(ArgvError::Trailing),
         }
     }
     Ok(Args {
         port: port.ok_or(ArgvError::MissingFlag("--port"))?,
+        body_marker,
     })
 }
 
@@ -89,7 +102,7 @@ fn print_help() {
     println!(
         "http1-echo-server: HTTP/1.1 echo server helper for the envoy-rust differential harness.\n\
          \n\
-         Usage:\n  http1-echo-server --port <u16>\n  \
+         Usage:\n  http1-echo-server --port <u16> [--body-marker <s>]\n  \
          http1-echo-server --help\n  http1-echo-server --version"
     );
 }
@@ -97,6 +110,11 @@ fn print_help() {
 async fn run(args: Args) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", args.port)).await?;
     tracing::info!("http1-echo-server listening on 0.0.0.0:{}", args.port);
+
+    // 27 Task 6: the per-instance body marker (if any). Shared with each spawned
+    // connection task so the echo body identifies which backend served the
+    // request (the EDS-reload discriminating observable).
+    let body_marker = std::sync::Arc::new(args.body_marker);
 
     let mut join_set: JoinSet<()> = JoinSet::new();
     let shutdown = tokio::signal::ctrl_c();
@@ -111,7 +129,7 @@ async fn run(args: Args) -> Result<()> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        join_set.spawn(handle_connection(stream));
+                        join_set.spawn(handle_connection(stream, body_marker.clone()));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "accept failed; continuing");
@@ -132,7 +150,10 @@ async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(mut stream: tokio::net::TcpStream) {
+async fn handle_connection(
+    mut stream: tokio::net::TcpStream,
+    body_marker: std::sync::Arc<Option<String>>,
+) {
     // Read the request bytes (single request per connection;
     // no keep-alive — see SPEC §6 signpost 9).
     let mut buf = bytes::BytesMut::with_capacity(8192);
@@ -169,7 +190,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream) {
                     body.extend_from_slice(&chunk[..n.min(need)]);
                 }
 
-                let echo = build_echo_body(&req, &body);
+                let echo = build_echo_body(&req, &body, body_marker.as_deref());
                 let resp = envoy_http1::Response {
                     status: 200,
                     reason: None,
@@ -207,8 +228,18 @@ async fn handle_connection(mut stream: tokio::net::TcpStream) {
 /// source of divergence so byte-exact body equality holds across both
 /// proxies' downstream responses (which are then proxied back to the
 /// harness verbatim per the router proxy arm in Task 9).
-fn build_echo_body(req: &envoy_http1::Request, body: &[u8]) -> Vec<u8> {
+fn build_echo_body(req: &envoy_http1::Request, body: &[u8], body_marker: Option<&str>) -> Vec<u8> {
     let mut out = String::new();
+    // 27 Task 6 (D6 / §6.2-LOCKED V2): when a per-instance marker is set, emit
+    // it as a leading `backend: <marker>\n` line so a `GET /probe` response
+    // identifies WHICH backend served it (the EDS-reload discriminating
+    // observable). `None` ⇒ no line — the body is byte-identical to the pre-27
+    // SPEC §3 D3 shape, so all existing fixtures' differential equality holds.
+    if let Some(marker) = body_marker {
+        out.push_str("backend: ");
+        out.push_str(marker);
+        out.push('\n');
+    }
     out.push_str("method: ");
     out.push_str(&req.method);
     out.push('\n');
@@ -301,6 +332,54 @@ mod tests {
     fn argv_parses_full_invocation() {
         let args = parse_argv(&argv(&["--port", "10042"])).expect("parse");
         assert_eq!(args.port, 10042);
+        // No `--body-marker` ⇒ marker is None (the default-shape echo body,
+        // unchanged for all pre-phase-27 fixtures).
+        assert_eq!(args.body_marker, None);
+    }
+
+    #[test]
+    fn argv_parses_body_marker() {
+        // 27 Task 6 (D6 / §6.2-LOCKED V2): a per-instance body marker makes two
+        // otherwise-identical echo backends distinguishable by their response
+        // body (the EDS-reload discriminating observable — `[backend_1]` →
+        // `[backend_2]` is a real endpoint swap only if the two backends differ).
+        let args =
+            parse_argv(&argv(&["--port", "10042", "--body-marker", "backend_1"])).expect("parse");
+        assert_eq!(args.port, 10042);
+        assert_eq!(args.body_marker.as_deref(), Some("backend_1"));
+    }
+
+    #[test]
+    fn body_marker_prepends_a_marker_line() {
+        // The marker is emitted as a leading `backend: <marker>\n` line so a
+        // `GET /probe` response identifies WHICH backend served it. The rest of
+        // the SPEC §3 D3 deterministic shape is preserved verbatim after it.
+        let req = envoy_http1::Request {
+            method: "GET".to_string(),
+            path: "/probe".to_string(),
+            version: envoy_http1::HttpVersion::Http11,
+            headers: vec![("host".to_string(), "x.test".to_string())],
+            bytes_consumed: 0,
+            body: None,
+        };
+        let with = build_echo_body(&req, b"", Some("backend_2"));
+        let body = String::from_utf8(with).unwrap();
+        assert!(
+            body.starts_with("backend: backend_2\n"),
+            "marker must be the leading line: {body}"
+        );
+        assert!(
+            body.contains("method: GET\npath: /probe\n"),
+            "the deterministic D3 shape follows the marker line: {body}"
+        );
+        // No marker ⇒ no `backend:` line (byte-identical to the pre-27 body).
+        let without = build_echo_body(&req, b"", None);
+        let body0 = String::from_utf8(without).unwrap();
+        assert!(
+            !body0.contains("backend:"),
+            "no `--body-marker` ⇒ no `backend:` line: {body0}"
+        );
+        assert!(body0.starts_with("method: GET\n"), "pre-27 shape: {body0}");
     }
 
     #[test]
@@ -337,7 +416,11 @@ mod tests {
 
         // Spawn the runtime in a background task.
         let server_handle = tokio::spawn(async move {
-            let _ = run(Args { port }).await;
+            let _ = run(Args {
+                port,
+                body_marker: None,
+            })
+            .await;
         });
 
         // Wait for the listener.

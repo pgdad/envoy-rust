@@ -134,6 +134,49 @@ impl UpstreamProxy {
         }
         Ok(())
     }
+
+    /// 27 Task 6 (D6 / §6.2-LOCKED V2 / ADR-0068): atomic-rename `new_content`
+    /// over the in-container EDS file (`EDS_CONTAINER_PATH`) via `docker exec` —
+    /// the EDS sibling of `reload_rds_atomic`. Base64-decode into a temp path on
+    /// the container's own filesystem, then `mv -f` over the watched path
+    /// (atomic, same fs). Must run INSIDE the container: virtiofs bind-mounts do
+    /// not propagate inotify, so a host-side rewrite would not trigger the
+    /// container Envoy's watch (§6.2/ADR-0066).
+    ///
+    /// NOT locally unit-tested (requires Docker) — exercised by the Task-7
+    /// fixture on native-Linux CI. `new_content` is base64-encoded on the host
+    /// so it survives the `sh -c` argv transit intact (arbitrary YAML bytes,
+    /// newlines, quotes).
+    pub async fn reload_eds_atomic(&self, new_content: &str) -> Result<()> {
+        use base64::Engine as _;
+        use testcontainers::core::{CmdWaitFor, ExecCommand};
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(new_content.as_bytes());
+        let tmp = format!("{EDS_CONTAINER_PATH}.reload-tmp");
+        let script = format!(
+            "set -e; printf %s '{b64}' | base64 -d > '{tmp}'; mv -f '{tmp}' '{EDS_CONTAINER_PATH}'"
+        );
+        // See reload_rds_atomic for why CmdWaitFor::exit_code(0) is load-bearing
+        // (exec returns before the in-container mv completes, so exit_code() reads
+        // None and the reload spuriously fails) and why the exit code is re-read
+        // below as a belt-and-suspenders guard.
+        let result = self
+            ._container
+            .exec(
+                ExecCommand::new(vec!["sh".to_string(), "-c".to_string(), script])
+                    .with_cmd_ready_condition(CmdWaitFor::exit_code(0)),
+            )
+            .await
+            .context("docker exec for in-container EDS atomic-rename reload")?;
+        let code = result
+            .exit_code()
+            .await
+            .context("reading exit code of in-container EDS reload exec")?;
+        if code != Some(0) {
+            anyhow::bail!("in-container EDS atomic-rename reload exited with code {code:?}");
+        }
+        Ok(())
+    }
 }
 
 /// Start upstream Envoy with `envoy_yaml_path` bind-mounted to
