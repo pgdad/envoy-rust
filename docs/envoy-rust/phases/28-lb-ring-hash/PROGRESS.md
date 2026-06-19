@@ -78,3 +78,37 @@ ADR-0071 reserved-but-unfired). The superseded state-1 top-section narrative is 
 `STATE_HISTORY.md` per ADR-0035; the `### Phase-28 state-1 brainstorm` Notes subsection STAYS (phase
 28 is still in-progress — it relocates at the state-6 close-out). Per §5.1 the state-3 execution is
 the NEXT session.
+
+## State-3 Task 2 — xxHash64
+
+**Implemented.** From-scratch xxHash64 (`pub(crate) fn xxh64(data: &[u8]) -> u64`) in
+`crates/envoy-cluster/src/xxhash.rs`, seed fixed to 0 (Envoy `RING_HASH` default — no
+arbitrary-seed generalization). Pure safe Rust per doctrine D-3.2 (no hashing crate added;
+crate root `#![forbid(unsafe_code)]`): little-endian reads via `u64::from_le_bytes` /
+`u32::from_le_bytes` plus `wrapping_*` / `rotate_left`. Covers the full algorithm — 4-lane
+32-byte stripe loop + lane merge for input >=32 bytes, the `seed + PRIME64_5` short path,
+`+= len`, the 8-byte / 4-byte / single-byte tail mixers, and the final avalanche. `xxh64`,
+`round`, `merge_round` carry a module-level `#![allow(dead_code)]` (the ring consumer lands
+in a later task; until then only the tests exercise the symbol). `mod xxhash;` added to
+`crates/envoy-cluster/src/lib.rs`.
+
+**Test vectors pinned (TDD — written + run failing before implementation):**
+- `xxh64(b"")            == 0xEF46DB3751D8E999`  — LOCKED canonical (ADR-0070), empty path
+- `xxh64(b"abc")         == 0x44BC2CF5AD770999`  — LOCKED canonical (ADR-0070), <32-byte tail
+- `xxh64(b"The quick brown fox jumps over the lazy dog") == 0x0B242D361FDA71BC` — 43 bytes, block loop + tail
+- `xxh64(b"0123456789abcdef" x4 = 64 bytes)      == 0x1AF3AC4760FE2F85` — exact multiple of 32 (two stripes, no tail)
+- `xxh64(b"172.22.0.2:5678_0")                   == 0xFB4D13869ECAFECD` — realistic ring-key shape
+
+**How the >=32-byte expected values were obtained:** the python `xxhash` library (xxhash 3.7.0,
+`pip install --break-system-packages xxhash`) was available in-environment as a reference
+*generator* (allowed — generating a test constant from an external tool is not a code
+dependency). Both LOCKED canonical vectors reproduced byte-for-byte under
+`xxhash.xxh64(..., seed=0)`, confirming seed=0 + the reference's correctness; the block-loop,
+multiple-of-32, and ring-key constants were then generated from the same reference. No
+hand-reasoned/un-justified constant was used.
+
+**cargo test:** `cargo test -p envoy-cluster xxhash` →
+`test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out`
+
+**cargo clippy:** `cargo clippy -p envoy-cluster --all-targets --all-features -- -D warnings` →
+`Finished \`dev\` profile [unoptimized + debuginfo] target(s)` (clean, no warnings).
