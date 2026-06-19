@@ -305,3 +305,64 @@ method-chain reflows), which is OUTSIDE this task's touch scope (only `ring_hash
 / `cluster.rs` / `lib.rs` / `PROGRESS.md` were touched). Per the recorded host note,
 fmt-check is native-CI-authoritative and resolved at the state-4 gate — the
 `xxhash.rs` reflow lands then (it is not Task 5's to edit).
+
+## State-3 Task 6 — request-hash plumbing
+
+**What was implemented.** Threaded the REAL per-request hash key from the HTTP
+request through to LB selection.
+
+- **envoy-cluster:** `ClusterHandle::pick_endpoint` now takes its own
+  `Option<u64>` request-hash-key and passes it to the private `Cluster::pick`
+  (Task 5). All inert (RoundRobin) call sites pass `None`
+  (behavior-preserving): the crate's own tests, `eds_reload.rs`, and the
+  `envoy-tcp` production caller (TCP proxying has no HTTP `hash_policy`). New
+  `pub fn hash_request_key(&[u8]) -> u64` is the ONLY new public hashing
+  surface — a thin wrapper over the STILL-`pub(crate)` `xxh64` (re-exported from
+  `lib.rs`).
+- **envoy-config:** re-exported `HashPolicy` / `HashPolicyHeader` from `lib.rs`
+  (Task 4 added them to `bootstrap.rs` but never re-exported) so the HCMs can
+  name them.
+- **HCMs (H1 + H2):** `BuildOutcome::Proxy` gained `request_hash_key:
+  Option<u64>`, computed ONCE in the shared `build_response` (H1) from the
+  matched route's `hash_policy` against the request headers, then threaded to
+  `run_attempt` / `run_h2_attempt` → `pick_endpoint`. H2 reuses H1's
+  `build_response`, so the single compute site covers both protocols.
+
+**The empty-vs-absent distinction (ADR-0070) + its test.** Lives in the new H1
+helper `fn request_hash_key(policies, lookup) -> Option<u64>` in
+`crates/envoy-http1/src/hcm.rs`. It is exactly
+`lookup(name).map(envoy_cluster::hash_request_key)` — NEVER
+`.filter(|v| !v.is_empty())`. The header lookup uses `find_header`, which
+returns `Some(value)` whenever the header is PRESENT (even empty) and `None`
+when ABSENT. So a present-empty `x-hash-key:` header → `Some(xxh64(b""))` (a
+deterministic point on the ring, NOT the random-host fallback), and an absent
+header → `None` (the fallback). The MUST-HAVE test (c)
+`request_hash_key_present_empty_is_some_not_none` asserts BOTH cases and
+**passes**; companions `request_hash_key_present_nonempty_is_hashed` (d) and
+`request_hash_key_empty_policy_is_none` also pass.
+
+**MVP single-header-policy choice.** When the matched route has one or more
+`HashPolicy` entries, the FIRST entry with a `header` source wins
+(`policies.iter().find_map(|p| p.header.as_ref())`). Empty `hash_policy` →
+`None` without consulting the header lookup (the common, allocation-free
+non-RING_HASH path). Multi-policy combination + non-header sources remain
+deferred non-goals (config parse already rejects non-header sources).
+
+**Struct-literal build-break sites fixed (the Task-4 `hash_policy` gap).**
+`clone_route_action` in `crates/envoy-http1/src/hcm.rs` (production, the
+documented `:320` break) now clones `hash_policy`; the 15 H1 test-fixture
+literals and the 2 H2 test-fixture literals (`crates/envoy-http2/src/hcm.rs`)
+now set `hash_policy: vec![]`. The whole workspace compiles.
+
+**Workspace regression (the round-robin no-op proof).**
+`cargo test --workspace --exclude differential` →
+`TOTAL passed: 1216  failed: 0` (every existing round-robin fixture unchanged;
+the signature change + new extraction are behavior-preserving). Per-crate:
+`cargo test -p envoy-cluster` → `test result: ok. 126 passed; 0 failed`;
+`-p envoy-http1` → `123 passed; 0 failed`; `-p envoy-http2` →
+`72 passed; 0 failed; 1 ignored`.
+
+**clippy:** `cargo clippy --workspace --all-targets --all-features -- -D
+warnings` → clean (exit 0). **fmt:** `cargo fmt --all -- --check` → clean
+(whole tree fmt-clean, including the prior `xxhash.rs` Task-2 debt resolved by
+the tree-wide `cargo fmt --all`).
