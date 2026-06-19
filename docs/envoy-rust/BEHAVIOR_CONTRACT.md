@@ -53,6 +53,90 @@ HTTP/2 already buffers and forwards request bodies (unchanged).
 
 ---
 
+## LB selection
+
+> Authored per phase 28 SPEC + **ADR-0070** (the §6.2-verified, 36/36-validated
+> ring algorithm). The cluster's `lb_policy` decides which upstream endpoint a
+> request is dispatched to from the eligible (healthy / non-ejected) set. The
+> selection is observable on the wire (the chosen backend's response-body marker),
+> so it is a first-class differential dimension.
+
+**`ROUND_ROBIN` (the default since phase 02 — unchanged this phase).** Cursor-based
+rotation over the eligible endpoints (the `pick()` fast path in
+`crates/envoy-cluster/src/cluster.rs`). The per-request hash key (below) is **inert**
+for round-robin — `pick_endpoint(Some(hash))` behaves identically to the cursor path,
+the load-bearing regression-equivalence proof that all 35 pre-phase-28 fixtures stay
+green (the policy-dispatch + the `pick()`/`pick_endpoint()` hash-key signature change
+are behavior-preserving for the round-robin arm).
+
+**`RING_HASH` (NEW, phase 28).** A ketama-style consistent-hash ring. The selection is
+**deterministic** and **byte-identical to upstream Envoy v1.33.0** (the STRONG
+differential target — cross-proxy identical selection per key), reproduced exactly by
+the ADR-0070 algorithm:
+
+- **Hash = xxHash64, seed 0**, written from scratch (D-3.2 — no hashing crate in-tree
+  or permitted; `crates/envoy-cluster/src/xxhash.rs`). Canonical vectors:
+  `xxh64("") == 0xEF46DB3751D8E999`, `xxh64("abc") == 0x44BC2CF5AD770999`.
+- **Ring build:** each host contributes `replicas = minimum_ring_size / num_hosts`
+  entries (equal weight; e.g. `1024 / 2 = 512`). Entry `i` (decimal `0..replicas-1`)
+  has ring hash `xxh64("{ip:port}_{i}")` where `{ip:port}` is the host address in IPv4
+  `SocketAddr` Display form (e.g. `172.22.0.2:5678`, matching Envoy's
+  `address()->asString()`). **The `_` separator is load-bearing** — a one-character
+  change breaks the differential. IPv6 ring hosts (bracketed `[::1]:5678` Display) are
+  an **untested non-goal** (the fixture is IPv4).
+- **Ring** = the `(hash, host_index)` pairs sorted ascending.
+- **Request hash** = `xxh64(hash_policy header value bytes)` (the same xxHash64 path as
+  the ring keys).
+- **Lookup** = the first ring entry with `entry.hash >= request_hash`; if none, **wrap
+  to index 0** (`bisect_left` / first-clockwise).
+
+**Keying.** A route-level `hash_policy` (`{ header: { header_name } }`) supplies the
+request key, extracted from the named request header in the HCM request path
+(H1 `crates/envoy-http1/src/hcm.rs`, H2 `crates/envoy-http2/src/hcm.rs`). The MVP is a
+**single header source** (cookie / connection-source-IP / query-parameter / filter-state
+sources, `terminal`, multi-policy combination, and `regex_rewrite` are deferred — SPEC §2.2).
+
+**Empty-vs-absent (the load-bearing ADR-0070 refinement).** A header that is **present
+but empty** (`x-hash-key:` empty) is **HASHED** — `xxh64("")`, deterministic — NOT the
+fallback. Only an **ABSENT key** (no `hash_policy` match, or the named header missing)
+falls back. The fallback is **Envoy's random host**, which is **non-deterministic and
+therefore NOT differentially asserted** (cross-proxy identity cannot be required of a
+random pick); it is covered by the in-process backstop only. The fixture always supplies
+the header, so the differential never exercises the fallback.
+
+**The XX_HASH-only narrowing (a documented intentional divergence).**
+`hash_function: MURMUR_HASH_2` is a valid upstream Envoy enum but is **rejected** by
+envoy-rust this phase (an all-fatal config error per ADR-0049 — `UnsupportedHashFunction`).
+A bogus `hash_function` enum → parse-reject; `minimum_ring_size > maximum_ring_size` →
+validation-reject (`RingSizeInversion`). All three are startup-fatal (no reload path this
+phase). `ring_hash_lb_config` defaults: `minimum_ring_size` 1024, `maximum_ring_size`
+8388608, `hash_function` XX_HASH.
+
+**Differential witness.** Fixture **`0036-lb-ring-hash`** — one cluster with
+`lb_policy: RING_HASH` and two distinguishable backends; the driver sweeps distinct
+`x-hash-key` values and asserts cross-proxy **identical** RING_HASH selection per key
+(by response-body marker), same-key→same-backend stability, and spread across both
+backends. This is a **normal request/response, observable LOCALLY** (no file-watch/reload
+trigger, unlike phases 26/27) — fixture 0036 runs + is authoritative on this dev host.
+
+**Deferred non-goal — HC/OD + RING_HASH composition (RECORDED here per doctrine D-3.3).**
+The ring skip-and-retry over **ineligible** (unhealthy / ejected) hosts — Envoy's
+documented behavior of advancing to the next ring entry when the selected host is not
+eligible — is a **SPEC §2.2 deferred non-goal** (Task 5 decision). The phase-28 fixture
+cluster is **PLAIN** (no active health checking, no outlier detection), so the ring
+returns a host directly and the eligibility-skip path is exercised by the **backstop
+only** — the differential does **NOT** validate it. Wiring it would couple `HashRing` to
+the cluster's health/ejection state (a `lookup_eligible(pred)` forward-with-wrap walk) for
+a path no phase-28 fixture exercises; `RING_HASH` over an HC/OD cluster is therefore **not
+yet differentially validated**. Also deferred (brief — all in SPEC §2.2): the **weighted
+ring** (`load_balancing_weight` → unequal replicas), **non-header hash sources**,
+**`maglev`**, and the non-deterministic **`least_request` / `random`** policies (which
+need a contract-relaxation ADR before they can be differential). **`RING_HASH` +
+EDS-hot-reload composition** (re-ringing on a hot endpoint-set swap) is also deferred —
+the fixture uses a static (non-EDS) RING_HASH cluster.
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**
