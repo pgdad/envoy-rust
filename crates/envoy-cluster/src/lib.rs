@@ -13,6 +13,7 @@
 
 pub mod budget;
 mod cluster;
+mod eds_reload;
 mod ejection;
 mod health;
 mod outlier;
@@ -23,6 +24,7 @@ pub use cluster::{
     Cluster, ClusterError, ClusterHandle, ClusterManager, ConnGaugeGuard, UpstreamProtocol,
     from_bootstrap,
 };
+pub use eds_reload::build_eds_watch_targets;
 pub use ejection::{DetectorType, EjectionDecision, EndpointEjection, EndpointEjectionStats};
 pub use health::EndpointHealth;
 pub use outlier::{OutlierEjectionSweeper, OutlierManager};

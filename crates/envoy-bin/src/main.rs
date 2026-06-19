@@ -516,6 +516,19 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     let rds_watcher = envoy_http1::RdsWatcher::spawn(rds_targets, token.clone());
 
+    // 27 Task 4 (D3/D4, §6.2-LOCKED / ADR-0068): spawn the EDS endpoint-file
+    // watcher beside the RDS watcher, over the SAME generic `XdsFileWatcher`
+    // core. The target list is built IN-CRATE by `build_eds_watch_targets`,
+    // which walks `cluster_mgr`, filters for PLAIN EDS clusters (EDS-with-a-
+    // file-path AND no active HC / outlier detection — Decision-5), and bundles
+    // each target's reload closure + the 5 retained `update_*` counter handles.
+    // This sidesteps the envoy-bin→envoy-cluster encapsulation wall (envoy-bin
+    // cannot reach `ClusterHandle.inner` nor the plainness fields). Inert (zero
+    // watch tasks) when no plain EDS cluster exists — the §5.2 invariant.
+    // Drained via `shutdown().await` below alongside the other primitives.
+    let eds_targets = envoy_cluster::build_eds_watch_targets(&cluster_mgr);
+    let eds_watcher = envoy_cluster::XdsFileWatcher::spawn(eds_targets, token.clone());
+
     if let Some(admin_cfg) = bootstrap.admin.as_ref() {
         let admin_config = std::sync::Arc::new(
             envoy_admin::AdminConfig::from_envoy_config(admin_cfg)
@@ -581,6 +594,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // every watch task before envoy-bin returns. Inert (immediate) when no
     // rds target was configured.
     rds_watcher.shutdown().await;
+    // 27 Task 4: drain the EDS endpoint-file watcher alongside the RDS watcher on
+    // BOTH clean-exit and error-exit paths. The signal token cancellation has
+    // already propagated through each watch loop's `tokio::select!`;
+    // `shutdown().await` cancels its token clone + joins every watch task before
+    // envoy-bin returns. Inert (immediate) when no plain EDS cluster was
+    // configured.
+    eds_watcher.shutdown().await;
     if let Some(e) = first_err {
         return Err(e);
     }

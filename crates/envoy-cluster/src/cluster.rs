@@ -71,6 +71,34 @@ impl OutlierDetectionState {
     }
 }
 
+/// 27 Task 4 (§6.2 / ADR-0068): the per-cluster EDS-reload state, retained ONLY
+/// for `type: EDS` clusters (`None` for STATIC / STRICT_DNS). Bundles everything
+/// the file-based EDS reload pipeline ([`crate::eds_reload`]) needs to reparse,
+/// select, validate, and mirror-apply (or warm-reject) a changed assignment
+/// file: the file path, the CLA selection name, and the 5 `update_*` counter
+/// handles. The in-crate `build_eds_watch_targets` reads these (they are
+/// `pub(crate)`) to bundle a watch target per PLAIN EDS cluster.
+#[derive(Debug)]
+pub(crate) struct EdsReloadState {
+    /// The EDS assignment file to stat + re-read. From the cluster's
+    /// `eds_cluster_config.eds_config.path_config_source.path`.
+    pub(crate) path: std::path::PathBuf,
+    /// The name used to select the `ClusterLoadAssignment` out of the parsed
+    /// file. MIRRORS the phase-21 initial load (`load_dynamic_resources`,
+    /// `crates/envoy-config/src/lib.rs`): `service_name` if set, else the
+    /// cluster name. The V4(b) "no CLA matches" reject fires when no CLA in the
+    /// file has `cluster_name == selection_name`.
+    pub(crate) selection_name: String,
+    /// The 5 `cluster.<name>.update_*` counter handles, ticked per the §6.2
+    /// V4 taxonomy on each reload. Captured at construction; re-registering by
+    /// name is idempotent (returns the same handle the initial load seeded).
+    pub(crate) update_attempt: Arc<envoy_stats::Counter>,
+    pub(crate) update_success: Arc<envoy_stats::Counter>,
+    pub(crate) update_failure: Arc<envoy_stats::Counter>,
+    pub(crate) update_empty: Arc<envoy_stats::Counter>,
+    pub(crate) update_rejected: Arc<envoy_stats::Counter>,
+}
+
 /// A configured upstream cluster. Owns the static endpoint list and the
 /// round-robin `AtomicUsize` cursor. Constructed by `from_bootstrap` only;
 /// external code works through `ClusterHandle`.
@@ -168,6 +196,13 @@ pub struct Cluster {
     /// inert-when-unconfigured invariant. `pick()`'s fast path bypasses entirely
     /// when this AND `endpoint_health` are both `None`.
     pub(crate) outlier_detection: Option<OutlierDetectionState>,
+    /// 27 Task 4 (§6.2 / ADR-0068): EDS-reload state, `Some` ONLY for `type: EDS`
+    /// clusters (`None` for STATIC / STRICT_DNS — the §5.2 inert-when-unconfigured
+    /// discipline). Carries the assignment-file path, the CLA selection name, and
+    /// the 5 `update_*` counter handles the [`crate::eds_reload`] pipeline ticks.
+    /// `build_eds_watch_targets` reads this in-crate to bundle a watch target per
+    /// PLAIN EDS cluster.
+    pub(crate) eds_reload: Option<EdsReloadState>,
 }
 
 impl Cluster {
@@ -526,6 +561,16 @@ impl ClusterHandle {
         self.inner.current_endpoints()
     }
 
+    /// 27 Task 4: hand out the inner `Arc<Cluster>`. `pub(crate)` so the
+    /// in-crate `eds_reload::build_eds_watch_targets` can reach the plainness
+    /// fields (`endpoint_health` / `outlier_detection`) + the retained
+    /// `eds_reload` state to filter + bundle EDS watch targets — sidestepping
+    /// the envoy-bin→envoy-cluster encapsulation wall (envoy-bin cannot reach
+    /// `inner` nor those `pub(crate)` fields).
+    pub(crate) fn into_inner(self) -> Arc<Cluster> {
+        self.inner
+    }
+
     /// 14.1 D3: delegates to `Cluster::record_response`. The 14.2 D4 response-receipt
     /// hook callers hold a `ClusterHandle`; this mirrors the accessor for ergonomic
     /// reach. See `Cluster::record_response` for the full behavior contract.
@@ -790,6 +835,32 @@ pub enum UpstreamProtocol {
     Http2,
 }
 
+/// 27 Task 4: parse one endpoint's `address`+`port_value` into a numeric
+/// `SocketAddr` (STATIC / EDS semantics — NOT DNS-resolved). Factored out of
+/// `from_bootstrap`'s endpoint loop so the EDS reload pipeline
+/// ([`crate::eds_reload`]) reuses the EXACT same parse.
+///
+/// Returns `Result` rather than `?`-propagating internally so callers choose
+/// the disposition: the startup path (`from_bootstrap`) `?`-propagates the
+/// `ClusterError::EndpointParse` (startup is all-fatal — UNCHANGED), while the
+/// reload path catches it LOCALLY and maps it to the §6.2-LOCKED V4(c) reject
+/// disposition (a bad endpoint in a hot-reloaded file must NOT kill the watch
+/// loop — the last-good set is kept).
+pub(crate) fn parse_numeric_endpoint(
+    cluster: &str,
+    address: &str,
+    port_value: u16,
+) -> Result<SocketAddr, ClusterError> {
+    let addr_str = format!("{address}:{port_value}");
+    addr_str
+        .parse()
+        .map_err(|source| ClusterError::EndpointParse {
+            cluster: cluster.to_string(),
+            addr: addr_str,
+            source,
+        })
+}
+
 /// Constructs a `ClusterManager` from a validated `Bootstrap`. The caller
 /// should have already run `envoy_config::parse_bootstrap`, but this function
 /// validates its own preconditions for library robustness.
@@ -834,16 +905,20 @@ pub async fn from_bootstrap(
                         // Failure surfaces as ClusterError::EndpointParse —
                         // regression-guarded by the I3-closing test
                         // static_cluster_constructs_with_literal_ip.
-                        let addr_str = format!("{}:{}", sa.address, sa.port_value);
-                        let parsed: SocketAddr =
-                            addr_str
-                                .parse()
-                                .map_err(|source| ClusterError::EndpointParse {
-                                    cluster: cfg.name.clone(),
-                                    addr: addr_str.clone(),
-                                    source,
-                                })?;
-                        endpoints.push(parsed);
+                        //
+                        // 27 Task 4: the numeric-IP parse is factored into
+                        // `parse_numeric_endpoint` so the EDS reload pipeline
+                        // (`eds_reload.rs`) reuses the EXACT same parse. Startup
+                        // keeps `?`-propagating (the all-fatal startup posture is
+                        // UNCHANGED); the reload path consumes the `Result`
+                        // LOCALLY (mapping a parse failure to the V4(c) reject
+                        // disposition) — it must NOT propagate `EndpointParse`,
+                        // which would kill the watch loop.
+                        endpoints.push(parse_numeric_endpoint(
+                            &cfg.name,
+                            &sa.address,
+                            sa.port_value,
+                        )?);
                     }
                     envoy_config::ClusterType::StrictDns => {
                         // 05.1 NEW per ADR-0023: each endpoint's address is a
@@ -1044,7 +1119,16 @@ pub async fn from_bootstrap(
         // register-and-set directly (no handle threading). membership_healthy is
         // health-check-gated above and membership_total does not exist in
         // envoy-rust — neither is in this family (a recorded narrowing vs Envoy).
-        if cfg.cluster_type == envoy_config::ClusterType::Eds {
+        // 27 Task 4 (§6.2-LOCKED / ADR-0068 V4): capture ALL FIVE update_* handles
+        // for `type: EDS` clusters and retain them (with the file path + CLA
+        // selection name) in `EdsReloadState`, so the file-based reload pipeline
+        // ticks the SAME series the initial load seeds. `register_counter` is
+        // idempotent by name, so re-registering in the reload path returns the
+        // same handle. `update_rejected` is ADDED here (it was NOT registered by
+        // phase 21) at INITIAL VALUE 0 — the `mk(..)?`-without-`.add(1)` form,
+        // like update_failure/update_empty; do NOT `.add(1)` it (the V4 "trio = 0
+        // on a successful initial load" witness depends on it).
+        let eds_reload = if cfg.cluster_type == envoy_config::ClusterType::Eds {
             let mk = |suffix: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
                 registry
                     .register_counter(&format!("cluster.{}.{suffix}", cfg.name))
@@ -1053,11 +1137,38 @@ pub async fn from_bootstrap(
                         message: e.to_string(),
                     })
             };
-            mk("update_attempt")?.add(1);
-            mk("update_success")?.add(1);
-            mk("update_failure")?; // registers at 0 (L4)
-            mk("update_empty")?; // registers at 0 (L4)
-        }
+            let update_attempt = mk("update_attempt")?;
+            let update_success = mk("update_success")?;
+            let update_failure = mk("update_failure")?; // registers at 0 (L4)
+            let update_empty = mk("update_empty")?; // registers at 0 (L4)
+            let update_rejected = mk("update_rejected")?; // 27 Task 4: NEW, at 0
+            update_attempt.add(1);
+            update_success.add(1);
+            // The EDS cluster's `eds_cluster_config` is validated present at parse
+            // (envoy-config rejects `type: EDS` without it); the path is the
+            // assignment file, the selection name mirrors the phase-21 initial
+            // load (`service_name` if set, else the cluster name — see
+            // `load_dynamic_resources` in `crates/envoy-config/src/lib.rs`).
+            let eds_cfg = cfg
+                .eds_cluster_config
+                .as_ref()
+                .expect("EDS cluster has eds_cluster_config — validated at parse");
+            let selection_name = eds_cfg
+                .service_name
+                .clone()
+                .unwrap_or_else(|| cfg.name.clone());
+            Some(EdsReloadState {
+                path: std::path::PathBuf::from(&eds_cfg.eds_config.path_config_source.path),
+                selection_name,
+                update_attempt,
+                update_success,
+                update_failure,
+                update_empty,
+                update_rejected,
+            })
+        } else {
+            None
+        };
         // 14.1 D5/D6 (parent-14 D3/D5/D6): if the cluster configures outlier_detection,
         // build the cluster-level state (per-endpoint EndpointEjection Vec +
         // max_ejection_percent + ejections_overflow). Envoy v3 defaults (§6.2 item-1):
@@ -1163,6 +1274,7 @@ pub async fn from_bootstrap(
             endpoint_health,
             panic_threshold,
             outlier_detection,
+            eds_reload,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
             return Err(ClusterError::DuplicateClusterName {
@@ -1274,6 +1386,7 @@ mod tests {
                 endpoint_health: None,
                 panic_threshold: 50.0,
                 outlier_detection: None,
+                eds_reload: None,
             }),
         }
     }
@@ -1679,6 +1792,7 @@ admin:
             endpoint_health: None,
             panic_threshold: 50.0,
             outlier_detection: None,
+            eds_reload: None,
         };
         assert_eq!(c.name(), "backend");
     }
@@ -2286,6 +2400,7 @@ admin:
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: None,
+                eds_reload: None,
             }),
         };
         (handle, health)
@@ -2688,6 +2803,7 @@ admin:
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: Some(od_state),
+                eds_reload: None,
             }),
         };
         (handle, health, ejection)
