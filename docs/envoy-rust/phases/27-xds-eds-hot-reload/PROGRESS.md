@@ -200,3 +200,34 @@ DOCS-ONLY (no source/test changes). Extended `docs/envoy-rust/BEHAVIOR_CONTRACT.
 **Key facts locked accurately (ADR-0068):** apply-empty MIRRORS Envoy (`update_success`+1, apply empty → 503 "no healthy upstream" 19 bytes, last-good NOT kept); empty-envelope (`resources: []`) is DISTINCT (`update_empty`+1, last-good kept); `update_rejected` promoted (post-boot `1/1/0/0/0`); fixture 0035 asserts `2/2` (data-plane flip is the differential proof, the rest backstop-only); NO config_dump `last_updated` change; EDS reload has NO behavioral divergence (only inotify-vs-mtime mechanism). Did NOT contradict the phase-21 rows — the `update_rejected` promotion is written as an explicit phase-27 CHANGE.
 
 Two commits (per-task cadence): `docs(contract): phase 27 EDS hot-reload semantics (§2.1 stat rows + §2.2 wire-state)` + this PROGRESS append.
+
+## Task 9 — state-4 verification gate (§7.5) — GREEN
+
+- **Skill:** `superpowers:verification-before-completion` (evidence before assertions — every gate command run, output confirmed, before any "complete" claim).
+- **Scope:** verification + STATE-advance only. The phase-27 code is ALREADY committed in the Task 2–8 chain (`7226c05`…`acac6d4`, pushed to `origin/main`); this state-4 step touches ONLY docs (STATE.md + PROGRESS.md). No source/test/ROADMAP/DECISIONS change.
+
+### Local gates (this Docker-Desktop dev host)
+
+- `cargo fmt --all -- --check` → **exit 0** (clean — no diff).
+- Standalone-crate builds `cargo build -p envoy-config -p envoy-cluster -p envoy-http1 -p envoy-admin -p envoy-bin` → **exit 0** (each crate compiles in isolation — the §0 standalone-buildability discipline).
+- `cargo build --workspace --all-targets` → **exit 0**.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → **exit 0** (clean — `--all-features`).
+- `cargo deny check` → **exit 0** (`advisories ok, bans ok, licenses ok, sources ok`).
+- Non-Docker `cargo test --workspace --exclude differential --no-fail-fast` → **1182 passed**. The single transient failure `envoy_http2 …send_request_maps_h2_handshake_failure_to_typed_error` is a KNOWN load-induced flake (passes 3/3 in isolation; untouched by phase 27; green on CI). The local `differential::admin_config_dump_server_info` failure is the known Docker-Desktop-virtiofs / host-gateway environmental divergence (`host-docker-desktop-virtiofs-no-inotify`) — NOT a regression; green on Linux CI.
+
+### AUTHORITATIVE Linux CI — run `27818702552` @ code HEAD `acac6d4`
+
+BOTH jobs GREEN:
+- **"build + test + lint"** (4m3s): the full `cargo test --workspace` ran on Linux with **ZERO failures**, INCLUDING the Docker-gated differential — **`test xds_eds_hot_reload_fixture … ok`** (fixture 0035's EDS-reload differential — the never-locally-observable atomic-rename reload, bilaterally equivalent to upstream Envoy v1.33.0), all 35 Docker-gated fixtures `0001`–`0035`, and **`test h2spec_pass_rate_gate … ok`** (conformance ≥95%).
+- **"fuzz (parse_bootstrap + jwt_parse, 30s each)"** (3m43s): clean.
+
+### §7.5 gate verdict — GREEN
+
+- (a) fixture 0035 (`xds_eds_hot_reload_fixture`) green ✓
+- (b) all pre-existing fixtures (`0001`–`0034`) green ✓
+- (c) h2spec pass-rate ≥95% ✓
+- (d) fuzz job clean ✓
+- (e) build / clippy (`--all-features`) / fmt / `cargo test` / `cargo deny check` clean ✓
+- (f) `REVIEW.md` ABSENT → next step is the state-5 code review ✓
+
+**Outcome:** STATE advances to **state-4 verification COMPLETE / state-5-next**; ROADMAP row `27` stays `in-progress` (flips `done` only at state-6). The next session runs `superpowers:requesting-code-review` (authors `REVIEW.md`; if issues → back to state-3 per §5.2; if approved → state-6 close-out). The superseded state-2 PLAN-write top-section narratives are relocated verbatim to `STATE_HISTORY.md` (ADR-0035 / §4.1 inv. 9); the `### Phase-27 state-2 PLAN-write` + `### Phase-27 state-1 brainstorm` Notes subsections STAY in STATE.md (phase 27 is still in-progress — they relocate at the state-6 close-out).
