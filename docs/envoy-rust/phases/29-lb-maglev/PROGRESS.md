@@ -16,13 +16,15 @@ STRONG differential target confirmed). ADR-0072 landed.
 ## Task checklist
 
 - [x] **Task 1** — Seeded xxHash64 (`xxh64_seed(data, seed)`; `xxh64 = seed 0` byte-identical). DONE (`40f4e39`).
-- [ ] **Task 2** — Config: `LbPolicy::Maglev` + `MaglevLbConfig { table_size }` + `maglev_lb_config` field.
+- [x] **Task 2** — Config: `LbPolicy::Maglev` + `MaglevLbConfig { table_size }` + `maglev_lb_config` field. DONE (`b6b4292`).
 - [ ] **Task 3** — Validation: `MaglevTableSizeNotPrime` / `MaglevTableSizeTooLarge`, MAGLEV-gated (`is_prime`). [ADR-0072]
 - [ ] **Task 4** — `maglev.rs`: `MaglevTable::build` + `lookup` (§A oracle, the correctness gate). [ADR-0072]
 - [ ] **Task 5** — M28-3 refactor: `ring: Option<HashRing>` → `hash_lb: Option<HashLb>` (`HashLb { Ring, Maglev }`).
 - [ ] **Task 6** — Fixture `0037-lb-maglev` differential (STRONG; `{{BACKEND_IP}}` shared-IP).
 - [ ] **Task 7** — Backstop tests (determinism, spread, fallback, single-host, M28-3 regression witness).
 - [ ] **Task 8** — `parse_bootstrap` maglev fuzz seed + BEHAVIOR_CONTRACT MAGLEV row + M28-1 fold.
+
+- **Task 2 (`b6b4292`)** — Added the MAGLEV config surface to `crates/envoy-config/src/bootstrap.rs`: `LbPolicy::Maglev`, `MaglevLbConfig { table_size }` (serde `deny_unknown_fields`, default 65537 via `default_maglev_table_size`), `maglev_lb_config: Option<MaglevLbConfig>` on `Cluster` — exact mirror of the `RingHashLbConfig` pattern. 5 parse tests via `parse_bootstrap` (variant / empty→65537 / absent→None / explicit / accept-and-ignore on a ROUND_ROBIN cluster). No validators, no table logic (YAGNI). No match-arm breakage (the only `LbPolicy` consumer is `cluster.rs:1379` `if == RingHash`). Spec ✅; quality APPROVED (0C/0I/3 Minor). **Carry to Task 3:** strengthen `accepts_maglev_lb_config_on_non_maglev_cluster` to feed a NON-PRIME `table_size` on a non-MAGLEV cluster (proving validation is genuinely gated, mirroring the ring precedent's teeth — Minor #1).
 
 ## Carry-forwards consumed / produced
 
