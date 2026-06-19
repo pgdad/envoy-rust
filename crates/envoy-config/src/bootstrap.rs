@@ -1360,6 +1360,83 @@ pub struct RouteAction_Route {
     /// 16.1 D1: optional per-route retry policy. Absent → no retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_policy: Option<RetryPolicy>,
+    /// 28 Task 4: route-level hash policies for RING_HASH LB. Absent → empty Vec
+    /// (the regression-equivalence default; every pre-existing route parses
+    /// unchanged). The MVP supports only the `header` specifier; unsupported
+    /// specifiers are recognized at parse and rejected as fatal by
+    /// `validate_hash_policy` (request-path wiring lands in Task 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hash_policy: Vec<HashPolicy>,
+}
+
+/// 28 Task 4: one entry of Envoy's repeated `RouteAction.hash_policy` field.
+/// Each entry is a `oneof policy_specifier`. The phase-28 MVP supports only the
+/// `header` specifier; the other known Envoy specifiers (`cookie`,
+/// `connection_properties`, `query_parameter`, `filter_state`) are RECOGNIZED at
+/// parse time (so the narrowing surfaces as a precise
+/// `ConfigError::UnsupportedHashPolicy` via `validate_hash_policy` rather than an
+/// opaque serde unknown-field error — mirroring the cluster `HashFunction`
+/// recognize-then-reject style). A truly unknown specifier key still fails at
+/// serde parse (`deny_unknown_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HashPolicy {
+    /// The `header` specifier — hash on a request header value. The only
+    /// MVP-supported source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<HashPolicyHeader>,
+    /// Recognized-but-unsupported specifier (rejected by `validate_hash_policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie: Option<serde_yaml::Value>,
+    /// Recognized-but-unsupported specifier (rejected by `validate_hash_policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_properties: Option<serde_yaml::Value>,
+    /// Recognized-but-unsupported specifier (rejected by `validate_hash_policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_parameter: Option<serde_yaml::Value>,
+    /// Recognized-but-unsupported specifier (rejected by `validate_hash_policy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_state: Option<serde_yaml::Value>,
+}
+
+/// 28 Task 4: the `header` hash-policy source. Mirrors Envoy's
+/// `RouteAction.HashPolicy.Header` — hash on the value of the named request
+/// header. Deferred sub-fields (e.g. `regex_rewrite`) are rejected by
+/// `deny_unknown_fields`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HashPolicyHeader {
+    pub header_name: String,
+}
+
+/// 28 Task 4: validate a single route `hash_policy` entry. The MVP supports only
+/// the `header` specifier; any other recognized specifier
+/// (`cookie` / `connection_properties` / `query_parameter` / `filter_state`) is
+/// rejected with a precise fatal `ConfigError::UnsupportedHashPolicy` (ADR-0049
+/// all-fatal posture). A policy carrying NO specifier at all is also rejected (an
+/// empty oneof can never produce a hash key). Header selection logic lands in
+/// Task 6; this validator owns only the config-surface narrowing.
+fn validate_hash_policy(hp: &HashPolicy) -> Result<(), crate::ConfigError> {
+    let unsupported = if hp.cookie.is_some() {
+        Some("cookie")
+    } else if hp.connection_properties.is_some() {
+        Some("connection_properties")
+    } else if hp.query_parameter.is_some() {
+        Some("query_parameter")
+    } else if hp.filter_state.is_some() {
+        Some("filter_state")
+    } else if hp.header.is_none() {
+        // No specifier set at all — an empty oneof.
+        Some("<none>")
+    } else {
+        None
+    };
+    if let Some(specifier) = unsupported {
+        return Err(crate::ConfigError::UnsupportedHashPolicy {
+            specifier: specifier.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// 16.1 D1 (phase-16 §6.2 L3): per-route retry policy shape as parsed from
@@ -2859,6 +2936,16 @@ fn validate_hcm(
 
             // 16.1 D2: validate per-route retry_policy.
             validate_retry_policy(r)?;
+
+            // 28 Task 4: validate per-route hash_policy entries — the MVP
+            // supports only the `header` specifier; unsupported specifiers are
+            // rejected as fatal (ADR-0049). Only the route-to-cluster action
+            // carries hash policies.
+            if let RouteAction::Route(route_action) = &r.action {
+                for hp in &route_action.hash_policy {
+                    validate_hash_policy(hp)?;
+                }
+            }
         }
     }
     Ok(())
@@ -12409,6 +12496,108 @@ retry_policy:
         assert!(
             msg.contains("per_try_timeout") || msg.contains("unknown field"),
             "expected unknown-field error mentioning per_try_timeout; got: {msg}"
+        );
+    }
+
+    // --- 28 Task 4: route-level hash_policy config (parse + validate) ---
+
+    /// (a) A route with a single header hash_policy parses into exactly one
+    /// HashPolicy carrying the header source and the expected header_name.
+    #[test]
+    fn route_hash_policy_parses_header_source() {
+        let yaml = r#"
+cluster: my-cluster
+hash_policy:
+  - header:
+      header_name: x-hash-key
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(ar.cluster, "my-cluster");
+        assert_eq!(ar.hash_policy.len(), 1);
+        let hp = &ar.hash_policy[0];
+        let header = hp.header.as_ref().expect("header specifier present");
+        assert_eq!(header.header_name, "x-hash-key");
+        // The validator accepts a header-only policy.
+        validate_hash_policy(hp).expect("header policy is valid");
+    }
+
+    /// (b) A route with NO hash_policy yields an empty Vec (regression-equivalence
+    /// default — every pre-existing route parses unchanged).
+    #[test]
+    fn route_hash_policy_absent_yields_empty_vec() {
+        let yaml = r#"
+cluster: my-cluster
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses");
+        assert!(ar.hash_policy.is_empty());
+    }
+
+    /// (a') Multiple header hash policies collect into a Vec of len 2 — confirms
+    /// the repeated field.
+    #[test]
+    fn route_hash_policy_collects_multiple_headers() {
+        let yaml = r#"
+cluster: my-cluster
+hash_policy:
+  - header:
+      header_name: x-a
+  - header:
+      header_name: x-b
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(ar.hash_policy.len(), 2);
+        assert_eq!(
+            ar.hash_policy[0].header.as_ref().unwrap().header_name,
+            "x-a"
+        );
+        assert_eq!(
+            ar.hash_policy[1].header.as_ref().unwrap().header_name,
+            "x-b"
+        );
+    }
+
+    /// (c) An unsupported hash-policy source (cookie) is recognized at parse but
+    /// REJECTED by the validator with the precise UnsupportedHashPolicy fatal.
+    #[test]
+    fn route_hash_policy_rejects_unsupported_cookie_source() {
+        let yaml = r#"
+cluster: my-cluster
+hash_policy:
+  - cookie:
+      name: foo
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses (recognized key)");
+        assert_eq!(ar.hash_policy.len(), 1);
+        let err =
+            validate_hash_policy(&ar.hash_policy[0]).expect_err("cookie source must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedHashPolicy { ref specifier } if specifier == "cookie"
+            ),
+            "expected UnsupportedHashPolicy(cookie); got {err:?}"
+        );
+    }
+
+    /// (c') connection_properties source is likewise rejected with the precise variant.
+    #[test]
+    fn route_hash_policy_rejects_unsupported_connection_properties_source() {
+        let yaml = r#"
+cluster: my-cluster
+hash_policy:
+  - connection_properties:
+      source_ip: true
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses (recognized key)");
+        let err = validate_hash_policy(&ar.hash_policy[0])
+            .expect_err("connection_properties source must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedHashPolicy { ref specifier }
+                    if specifier == "connection_properties"
+            ),
+            "expected UnsupportedHashPolicy(connection_properties); got {err:?}"
         );
     }
 

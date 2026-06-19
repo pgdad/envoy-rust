@@ -665,6 +665,18 @@ pub enum ConfigError {
         minimum: u64,
         maximum: u64,
     },
+
+    /// 28 Task 4 (ADR-0069): a route `hash_policy` entry names a `policy_specifier`
+    /// other than `header`. Envoy's `RouteAction.hash_policy` is a oneof
+    /// (`header` / `cookie` / `connection_properties` / `query_parameter` /
+    /// `filter_state`); the phase-28 MVP supports only `header`. An unsupported
+    /// specifier is rejected as startup-fatal (the ADR-0049 all-fatal posture)
+    /// rather than silently ignored, so the proxy never mis-routes by dropping a
+    /// hash policy. `specifier` names the offending oneof key.
+    #[error(
+        "route hash_policy specifier '{specifier}' is unsupported; envoy-rust accepts only 'header'"
+    )]
+    UnsupportedHashPolicy { specifier: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
