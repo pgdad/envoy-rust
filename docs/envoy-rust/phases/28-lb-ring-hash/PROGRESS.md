@@ -170,3 +170,48 @@ serde unknown-variant), `rejects_ring_size_inversion` (f),
 **cargo clippy:** `cargo clippy -p envoy-config --all-targets --all-features -- -D warnings` →
 `Finished \`dev\` profile [unoptimized + debuginfo] target(s)` (clean, no warnings;
 one `collapsible_if` was fixed via a `&&  let` chain, consistent with existing usage).
+
+## State-3 Task 4 — route hash_policy config
+
+Added the route-level `hash_policy` config surface (parse + validate ONLY; no
+HCM / request-path wiring — that is Task 6). `RouteAction_Route` (the
+route-to-cluster action) gains `hash_policy: Vec<HashPolicy>` with
+`#[serde(default, skip_serializing_if = "Vec::is_empty")]`, so an absent
+`hash_policy` parses to an empty Vec — the regression-equivalence default
+(every pre-existing route parses unchanged).
+
+**HashPolicy serde model (recognize-then-reject, mirroring the Task-3 cluster
+`HashFunction` style):** `HashPolicy` is a `#[serde(deny_unknown_fields)]` struct
+with one `Option` per known Envoy `policy_specifier` oneof key —
+`header: Option<HashPolicyHeader>` (the only MVP-supported source) plus
+`cookie` / `connection_properties` / `query_parameter` / `filter_state`, each an
+`Option<serde_yaml::Value>`. `HashPolicyHeader` is `{ header_name: String }`
+(also `deny_unknown_fields`). Recognizing the unsupported specifier keys at parse
+means the phase-28 narrowing surfaces as a precise fatal rather than an opaque
+serde unknown-field error; a truly unknown key still fails at serde parse.
+
+**Unsupported-source rejection:** new `validate_hash_policy(&HashPolicy)` returns
+`ConfigError::UnsupportedHashPolicy { specifier }` (new variant in `lib.rs`) for
+any non-`header` specifier (and for an empty oneof, `<none>`). It is called from
+the inline-route validation loop in `validate()` for every `RouteAction::Route`
+hash policy, so an unsupported source is startup-fatal (ADR-0049 all-fatal
+posture) — the MVP never silently mis-routes by ignoring a hash policy.
+
+**Tests added (`bootstrap::tests`):** `route_hash_policy_parses_header_source`
+(a — one header policy, `header_name == "x-hash-key"`),
+`route_hash_policy_absent_yields_empty_vec` (b — the empty-default
+regression-equivalence proof), `route_hash_policy_collects_multiple_headers`
+(a' — repeated field collects to len 2),
+`route_hash_policy_rejects_unsupported_cookie_source` and
+`route_hash_policy_rejects_unsupported_connection_properties_source` (c —
+assert the specific `UnsupportedHashPolicy` variant + specifier string).
+
+**cargo test:** `cargo test -p envoy-config` →
+`test result: ok. 444 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+(prior count 439 + 5 new = 444; 0 failures — the empty-default regression proof).
+
+**cargo clippy:** `cargo clippy -p envoy-config --all-targets --all-features -- -D warnings` →
+`Finished \`dev\` profile [unoptimized + debuginfo] target(s)` (clean, no warnings).
+
+**cargo fmt:** `cargo fmt -p envoy-config -- --check` → clean (one test line
+reflowed by `cargo fmt` before the check passed).
