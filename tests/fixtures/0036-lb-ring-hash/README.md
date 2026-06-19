@@ -89,3 +89,28 @@ with a Docker daemon (no native-Linux-CI caveat).
 
 Docker-gated by the differential harness at the cluster level (no per-test
 `cfg` gate; the harness skips when `DOCKER_HOST` is unavailable).
+
+## CI portability
+
+This fixture is the ONLY one where the upstream Envoy container reaches the host
+backends by **bridge routing to the host LAN IP** (`{{BACKEND_IP}}` via
+`discover_host_lan_ip`), NOT via the `host.docker.internal` /
+`--add-host=host-gateway` mapping the other fixtures use. This is REQUIRED
+because both proxies must build the ring from an IDENTICAL endpoint address
+string (the ring key is `xxh64("{ip:port}_{i}")`) reachable from BOTH the host
+subject process AND the upstream container, and the host LAN IP is the only
+address satisfying that on both the Docker-Desktop (local) and Linux-CI
+topologies.
+
+The local GREEN witness was Docker Desktop (VM NAT); Linux CI uses bridge
+routing — a DIFFERENT path that first executes at the state-4 CI gate (cf.
+memory "State-4 = CI's first real execution").
+
+**Failure signature if the path is blocked on a runner:** all sweep keys return
+upstream-side non-200 (503 / timeout) → surfaces as a STRONG / status assertion
+failure. **First diagnostic:** check host-LAN-IP reachability from inside the
+pinned `envoyproxy/envoy:v1.33.0` image (the container must be able to reach the
+discovered host LAN IP:port). **Remediation if blocked:** ensure the runner's
+docker bridge can route to the host LAN interface (IP forwarding + FORWARD
+policy), or fall back to sharing the host-gateway IP on both sides IF that runner
+makes it host-process-reachable.

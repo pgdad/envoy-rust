@@ -1203,6 +1203,12 @@ pub fn discover_host_gateway_ip() -> anyhow::Result<String> {
 /// Discovery is route-based and sends NO packets: a UDP socket is "connected"
 /// to a public address so the kernel selects the egress interface, and its
 /// local address is read back. The target IP need not be reachable.
+///
+/// CAVEAT: the returned IP is the **egress-to-internet** interface's address,
+/// which is ASSUMED to also be docker-bridge-reachable from the container; on a
+/// runner where the egress interface is not bridge-reachable this still returns
+/// `Ok` but defers the failure to the probe phase (the all-keys-non-200
+/// signature documented in the fixture README's "CI portability" note).
 pub fn discover_host_lan_ip() -> anyhow::Result<String> {
     use std::net::UdpSocket;
     let sock =

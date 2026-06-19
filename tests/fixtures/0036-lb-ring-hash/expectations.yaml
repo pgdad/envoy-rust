@@ -28,7 +28,7 @@
 driver:
   kind: http1_hash_sweep
   path: /
-  host: ring_cluster
+  host: localhost
   expected_status: 200
   keys:
     - key-0

@@ -429,3 +429,14 @@ witness on this dev host — NOT native-Linux-CI-only (unlike phases 26/27).
 -D warnings` → clean (exit 0). **fmt:** `cargo fmt --all -- --check` → clean.
 **lib unit tests:** `cargo test -p differential --lib` → 147 passed, 0 failed,
 2 ignored.
+
+**Task 7 review-fold: CI-portability documentation.** Folded the code-review
+Important item (resolves to DOCUMENTATION, not a mechanism change — the shared
+`{{BACKEND_IP}}` host-LAN-IP approach is CORRECT and stays): added a "CI
+portability" section to the fixture README (rationale for bridge-routing to the
+host LAN IP vs the other fixtures' `host-gateway` mapping, the local-Docker-vs-
+Linux-CI path difference, and the all-keys-non-200 failure signature + first
+diagnostic + remediation), a one-line egress-interface caveat to the
+`discover_host_lan_ip` doc comment, and a cosmetic `host: ring_cluster` →
+`host: localhost` in `expectations.yaml` (trivially safe — both vhosts are
+`domains: ["*"]`).
