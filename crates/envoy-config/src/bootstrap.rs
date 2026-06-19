@@ -246,6 +246,13 @@ pub struct Cluster {
     /// regression-equivalence).
     #[serde(default)]
     pub outlier_detection: Option<OutlierDetection>,
+    /// 28 D1 (ADR-0069/0070): OPTIONAL RING_HASH tuning. `None` when the key is
+    /// absent. Per upstream Envoy, a present `ring_hash_lb_config` on a
+    /// non-RING_HASH cluster is accepted-and-ignored (validation is gated to
+    /// RING_HASH clusters — see `validate_cluster`). Parsed-and-stored only at
+    /// phase-28 Task 3; the ring-build + pick logic lands in later tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_hash_lb_config: Option<RingHashLbConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -289,6 +296,54 @@ pub enum DnsLookupFamily {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum LbPolicy {
     RoundRobin,
+    /// 28 D1 (ADR-0069/0070): consistent-hashing ring LB. The config surface
+    /// (`ring_hash_lb_config`) lands in phase-28 Task 3; the ring-build + pick
+    /// logic lands in later tasks.
+    RingHash,
+}
+
+/// 28 D1 (ADR-0069): RING_HASH LB tuning knobs. Mirrors Envoy v1.33's
+/// `Cluster.RingHashLbConfig`. Sub-field serde defaults match Envoy's proto
+/// defaults (minimum_ring_size 1024, maximum_ring_size 8_388_608,
+/// hash_function XX_HASH), so a present-but-empty `ring_hash_lb_config: {}`
+/// yields the documented defaults. Validation (see `validate_cluster`) is
+/// gated to RING_HASH clusters and is all-fatal (ADR-0049).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RingHashLbConfig {
+    #[serde(default = "default_minimum_ring_size")]
+    pub minimum_ring_size: u64,
+    #[serde(default = "default_maximum_ring_size")]
+    pub maximum_ring_size: u64,
+    #[serde(default)]
+    pub hash_function: HashFunction,
+}
+
+fn default_minimum_ring_size() -> u64 {
+    1024
+}
+
+fn default_maximum_ring_size() -> u64 {
+    8_388_608
+}
+
+/// 28 D1 (ADR-0070): RING_HASH hash function. Both Envoy v1.33 wire values are
+/// RECOGNIZED at parse time so the phase-28 XX_HASH-only narrowing surfaces as a
+/// precise `ConfigError::UnsupportedHashFunction` (a documented divergence — see
+/// ADR-0070) rather than an opaque serde unknown-variant error. `MURMUR_HASH_2`
+/// is rejected in `validate_cluster`; a truly unknown value still fails at serde
+/// parse. Default = `XxHash` (the Envoy proto default).
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum HashFunction {
+    #[default]
+    XxHash,
+    /// Recognized (a real Envoy enum value) but REJECTED in validation — the
+    /// phase-28 XX_HASH-only narrowing (ADR-0070). Explicit rename: serde's
+    /// SCREAMING_SNAKE_CASE emits `MURMUR_HASH2` (no underscore before the
+    /// trailing digit), but the Envoy wire name is `MURMUR_HASH_2`.
+    #[serde(rename = "MURMUR_HASH_2")]
+    MurmurHash2,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -2492,6 +2547,28 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
 /// this function — they require the full cluster list and listener context, so
 /// they stay in `validate()` / `validate_hcm` / `load_dynamic_resources`.
 pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigError> {
+    // 28 D1 (ADR-0069/0070): RING_HASH sub-config validation. Gated to
+    // RING_HASH clusters — upstream Envoy accepts-and-ignores a
+    // `ring_hash_lb_config` on a non-RING_HASH cluster, so we don't validate it
+    // there. Runs BEFORE the EDS early-return below so a RING_HASH EDS cluster's
+    // sub-config is still checked at parse time. Both rejections are all-fatal
+    // (ADR-0049): MURMUR_HASH_2 is the phase-28 XX_HASH-only narrowing (ADR-0070).
+    if cluster.lb_policy == LbPolicy::RingHash
+        && let Some(cfg) = cluster.ring_hash_lb_config.as_ref()
+    {
+        if cfg.hash_function == HashFunction::MurmurHash2 {
+            return Err(crate::ConfigError::UnsupportedHashFunction {
+                cluster: cluster.name.clone(),
+            });
+        }
+        if cfg.minimum_ring_size > cfg.maximum_ring_size {
+            return Err(crate::ConfigError::RingSizeInversion {
+                cluster: cluster.name.clone(),
+                minimum: cfg.minimum_ring_size,
+                maximum: cfg.maximum_ring_size,
+            });
+        }
+    }
     // 21 D1 (§5.8; L6): exactly-one-of-and-consistent endpoint source. At PARSE
     // time an EDS cluster has `load_assignment: None` + `eds_cluster_config:
     // Some`. Post-merge the EDS cluster carries BOTH `Some` (the loaded state) —
@@ -4339,6 +4416,271 @@ static_resources:
             msg.contains("unknown variant") || msg.contains("LEAST_REQUEST"),
             "expected serde tagged-enum rejection; got {msg}",
         );
+    }
+
+    // ---- Phase 28 Task 3: RING_HASH lb_policy + ring_hash_lb_config ----
+
+    #[test]
+    fn parses_lb_policy_ring_hash() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: RING_HASH
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        assert!(
+            matches!(c.lb_policy, LbPolicy::RingHash),
+            "got {:?}",
+            c.lb_policy
+        );
+    }
+
+    #[test]
+    fn parses_ring_hash_lb_config_minimum_ring_size() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: RING_HASH
+      ring_hash_lb_config:
+        minimum_ring_size: 1024
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c
+            .ring_hash_lb_config
+            .as_ref()
+            .expect("ring_hash_lb_config present");
+        assert_eq!(cfg.minimum_ring_size, 1024);
+    }
+
+    #[test]
+    fn ring_hash_lb_config_absent_is_none() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: RING_HASH
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        assert!(c.ring_hash_lb_config.is_none());
+    }
+
+    #[test]
+    fn ring_hash_lb_config_empty_applies_defaults() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: RING_HASH
+      ring_hash_lb_config: {}
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c
+            .ring_hash_lb_config
+            .as_ref()
+            .expect("ring_hash_lb_config present");
+        assert_eq!(cfg.minimum_ring_size, 1024);
+        assert_eq!(cfg.maximum_ring_size, 8388608);
+        assert!(matches!(cfg.hash_function, HashFunction::XxHash));
+    }
+
+    #[test]
+    fn rejects_hash_function_murmur_hash_2() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: RING_HASH
+      ring_hash_lb_config:
+        hash_function: MURMUR_HASH_2
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedHashFunction { .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_hash_function_bogus_value() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: RING_HASH
+      ring_hash_lb_config:
+        hash_function: BOGUS_HASH
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = serde_yaml::from_str::<Bootstrap>(yaml).expect_err("must reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("unknown variant") || msg.contains("BOGUS_HASH"),
+            "expected serde tagged-enum rejection; got {msg}",
+        );
+    }
+
+    #[test]
+    fn rejects_ring_size_inversion() {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: RING_HASH
+      ring_hash_lb_config:
+        minimum_ring_size: 4096
+        maximum_ring_size: 1024
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::RingSizeInversion { .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn accepts_ring_hash_lb_config_on_non_ring_hash_cluster() {
+        // Upstream Envoy accepts-and-ignores ring_hash_lb_config on a
+        // non-RING_HASH cluster; envoy-rust matches that (validation gated to
+        // RING_HASH clusters). Even an otherwise-invalid sub-config (here a
+        // ring-size inversion) parses without error on a ROUND_ROBIN cluster.
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      ring_hash_lb_config:
+        minimum_ring_size: 4096
+        maximum_ring_size: 1024
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML — accept-and-ignore");
+        let c = &b.static_resources.clusters[0];
+        assert!(matches!(c.lb_policy, LbPolicy::RoundRobin));
+        assert!(c.ring_hash_lb_config.is_some());
     }
 
     #[test]

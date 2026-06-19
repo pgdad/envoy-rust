@@ -643,6 +643,28 @@ pub enum ConfigError {
         "cluster '{cluster}' outlier_detection.max_ejection_percent {value} is outside [0, 100]"
     )]
     InvalidMaxEjectionPercent { cluster: String, value: u32 },
+
+    /// 28 D1 (ADR-0070): a RING_HASH cluster's `ring_hash_lb_config.hash_function`
+    /// is `MURMUR_HASH_2`. Upstream Envoy accepts it; envoy-rust deliberately
+    /// narrows phase-28 to `XX_HASH` only (a documented divergence,
+    /// BEHAVIOR_CONTRACT) and rejects it as startup-fatal (the ADR-0049 all-fatal
+    /// posture).
+    #[error(
+        "cluster '{cluster}' ring_hash_lb_config.hash_function MURMUR_HASH_2 is unsupported; envoy-rust accepts XX_HASH only"
+    )]
+    UnsupportedHashFunction { cluster: String },
+
+    /// 28 D1 (ADR-0069): a RING_HASH cluster's `ring_hash_lb_config.minimum_ring_size`
+    /// exceeds its `maximum_ring_size`. Structurally inconsistent; rejected as
+    /// startup-fatal (the ADR-0049 all-fatal posture).
+    #[error(
+        "cluster '{cluster}' ring_hash_lb_config.minimum_ring_size {minimum} exceeds maximum_ring_size {maximum}"
+    )]
+    RingSizeInversion {
+        cluster: String,
+        minimum: u64,
+        maximum: u64,
+    },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
