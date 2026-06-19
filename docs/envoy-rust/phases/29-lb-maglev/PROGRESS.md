@@ -15,7 +15,7 @@ STRONG differential target confirmed). ADR-0072 landed.
 
 ## Task checklist
 
-- [ ] **Task 1** — Seeded xxHash64 (`xxh64_seed(data, seed)`; `xxh64 = seed 0` byte-identical).
+- [x] **Task 1** — Seeded xxHash64 (`xxh64_seed(data, seed)`; `xxh64 = seed 0` byte-identical). DONE (`40f4e39`).
 - [ ] **Task 2** — Config: `LbPolicy::Maglev` + `MaglevLbConfig { table_size }` + `maglev_lb_config` field.
 - [ ] **Task 3** — Validation: `MaglevTableSizeNotPrime` / `MaglevTableSizeTooLarge`, MAGLEV-gated (`is_prime`). [ADR-0072]
 - [ ] **Task 4** — `maglev.rs`: `MaglevTable::build` + `lookup` (§A oracle, the correctness gate). [ADR-0072]
@@ -32,4 +32,4 @@ STRONG differential target confirmed). ADR-0072 landed.
 
 ## Log
 
-_(empty — first state-3 session appends here per task.)_
+- **Task 1 (`40f4e39`)** — Generalized `crates/envoy-cluster/src/xxhash.rs` `xxh64` → seeded `xxh64_seed(data, seed)`; `xxh64(d) = xxh64_seed(d, 0)` wrapper. Seed threads into the four lane initializers + the `<32` branch (pure `SEED`→`seed` substitution; seed-0 path provably byte-identical — the 5 LOCKED phase-28 vectors unchanged + green). Added `seed1_host_key` (`xxh64_seed(b"172.31.0.2:5678", 1) == 0x57A5_6BCE_7E3A_E555`, independently generated via python xxhash 3.7.0) + `seed0_equiv` (empty/short/≥32-byte). TDD (failing test first); 7/7 green; clippy clean. Spec review ✅ (seed-1 value independently re-derived, non-circular). Quality review APPROVED (0C/0I/3 Minor — all folded: wrapper doc, reproducer-command comment, ≥32-byte equivalence assertion).
