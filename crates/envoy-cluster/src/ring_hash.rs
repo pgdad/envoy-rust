@@ -18,6 +18,12 @@
 //! `address()->asString()`. This is exact for IPv4 (the differential fixture). IPv6
 //! `SocketAddr` Display is bracketed (`[::1]:5678`); IPv6 ring hosts are an UNTESTED
 //! non-goal — the cross-proxy guarantee is scoped to IPv4.
+//!
+//! M28-1 (documented bound vs Envoy's ketama): `RingHashLbConfig.maximum_ring_size` is
+//! parse-validation-only — the ring build is governed solely by `minimum_ring_size`
+//! (`minimum_ring_size / num_hosts` replicas per host). envoy-rust does NOT scale
+//! replicas up toward `maximum_ring_size` for small host counts, validated for the
+//! 2-host/1024 oracle.
 
 use crate::xxhash::xxh64;
 

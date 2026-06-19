@@ -112,12 +112,59 @@ validation-reject (`RingSizeInversion`). All three are startup-fatal (no reload 
 phase). `ring_hash_lb_config` defaults: `minimum_ring_size` 1024, `maximum_ring_size`
 8388608, `hash_function` XX_HASH.
 
+**M28-1 — `maximum_ring_size` is parse-validation-only (a documented bound vs Envoy).**
+The ring build is governed solely by `minimum_ring_size` (`minimum_ring_size / num_hosts`
+replicas per host); envoy-rust does **NOT** scale replicas up toward `maximum_ring_size`
+for small host counts (Envoy's ketama would). `maximum_ring_size` stays parse-validated
+(`RingSizeInversion`) and stored but does not affect the ring — a documented bound,
+validated against the 2-host/1024 oracle.
+
 **Differential witness.** Fixture **`0036-lb-ring-hash`** — one cluster with
 `lb_policy: RING_HASH` and two distinguishable backends; the driver sweeps distinct
 `x-hash-key` values and asserts cross-proxy **identical** RING_HASH selection per key
 (by response-body marker), same-key→same-backend stability, and spread across both
 backends. This is a **normal request/response, observable LOCALLY** (no file-watch/reload
 trigger, unlike phases 26/27) — fixture 0036 runs + is authoritative on this dev host.
+
+**`MAGLEV` (NEW, phase 29).** A deterministic consistent-hash LB. Like `RING_HASH`, the
+selection is **byte-identical to upstream Envoy v1.33.0** (the STRONG cross-proxy
+differential — same `x-hash-key` header value → same backend on both proxies), reproduced
+exactly by the §6.2-LOCKED algorithm (**ADR-0072**):
+
+- **Hash = xxHash64** (the same from-scratch `crates/envoy-cluster/src/xxhash.rs`), but
+  with a **seeded** variant for the per-host permutation. The host key is `ip:port` with
+  **NO `_i` suffix** (the contrast with the ring's `{ip:port}_{i}` key shape is
+  load-bearing). For table size `M`: `offset = xxh64(key, seed 0) % M`;
+  `skip = xxh64(key, seed 1) % (M - 1) + 1` (**seed 1 is load-bearing**);
+  `permutation[j] = (offset + j*skip) % M`.
+- **Table build:** config-order **round-robin populate** — each host claims its next
+  unclaimed permutation slot in turn; on a collision the host advances its own cursor;
+  the **earlier host in config order wins** a contested slot. Populate continues until
+  every one of the `M` slots is filled (`crates/envoy-cluster/src/maglev.rs`).
+- **Lookup** = `table[xxh64(header_value, seed 0) % M]` — a single O(1) array index (no
+  binary search / wrap, unlike the ring).
+- **`table_size`** default **65537** (Envoy proto default); must be **prime**; max
+  **5000011**.
+
+**MAGLEV dispositions.** A **non-prime** `table_size` → startup-fatal
+(`MaglevTableSizeNotPrime`); **over-max** (`> 5000011`) → startup-fatal
+(`MaglevTableSizeTooLarge`) — both per the ADR-0049 all-fatal posture, no reload path this
+phase. A `maglev_lb_config` carried on a **non-MAGLEV** cluster is **accept-and-ignore**
+(Envoy parity — the block is only consulted when `lb_policy == MAGLEV`). There is **no
+portable LB stat** to assert (selection is observed on the wire, not via a counter).
+Header-absent → **cursor fallback** (M28-2 — not differentially asserted, mirroring the
+RING_HASH fallback rationale). An **empty-but-present** header (`x-hash-key:`) is **hashed**
+(`xxh64("", seed 0)`, deterministic), NOT the fallback — same empty-vs-absent refinement as
+the ring.
+
+**MAGLEV differential witness.** Fixture **`0037-lb-maglev`** — one `lb_policy: MAGLEV`
+cluster with two distinguishable backends; the driver sweeps distinct `x-hash-key` values
+and asserts cross-proxy **identical** MAGLEV selection per key (by response-body marker),
+same-key→same-backend stability, and spread across both backends. A normal
+request/response observable LOCALLY (no file-watch/reload trigger) — fixture 0037 runs + is
+authoritative on this dev host. Per the consistent-hash differential discipline, BOTH
+proxies build the table from one **shared** host LAN IP (identical endpoint strings), since
+the algorithm hashes the `ip:port` string.
 
 **Deferred non-goal — HC/OD + RING_HASH composition (RECORDED here per doctrine D-3.3).**
 The ring skip-and-retry over **ineligible** (unhealthy / ejected) hosts — Envoy's
@@ -129,8 +176,9 @@ only** — the differential does **NOT** validate it. Wiring it would couple `Ha
 the cluster's health/ejection state (a `lookup_eligible(pred)` forward-with-wrap walk) for
 a path no phase-28 fixture exercises; `RING_HASH` over an HC/OD cluster is therefore **not
 yet differentially validated**. Also deferred (brief — all in SPEC §2.2): the **weighted
-ring** (`load_balancing_weight` → unequal replicas), **non-header hash sources**,
-**`maglev`**, and the non-deterministic **`least_request` / `random`** policies (which
+ring** (`load_balancing_weight` → unequal replicas — applies to MAGLEV too),
+**non-header hash sources**, and the non-deterministic **`least_request` / `random`**
+policies (which
 need a contract-relaxation ADR before they can be differential). **`RING_HASH` +
 EDS-hot-reload composition** (re-ringing on a hot endpoint-set swap) is also deferred —
 the fixture uses a static (non-EDS) RING_HASH cluster.

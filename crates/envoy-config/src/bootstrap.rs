@@ -5468,6 +5468,8 @@ admin:
             "fuzz/corpus/parse_bootstrap/cluster_eds.yaml",           // 21 Task 9
             "fuzz/corpus/parse_bootstrap/route_cors_typed_per_filter_config.yaml", // 23 Task 8
             "fuzz/corpus/parse_bootstrap/route_csrf_typed_per_filter_config.yaml", // 24 Task 5
+            "fuzz/corpus/parse_bootstrap/cluster_ring_hash_lb.yaml",  // 28 Task 9
+            "fuzz/corpus/parse_bootstrap/cluster_maglev_lb.yaml",     // 29 Task 8
         ] {
             let path = format!("{root}/{fname}");
             let yaml =
