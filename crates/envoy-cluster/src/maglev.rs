@@ -8,11 +8,6 @@
 //! the round-robin claim loop in host (config) order; earlier host wins
 //! contention. Lookup = table[request_hash % M]. See the pinned-oracle test.
 
-// The maglev table is consumed by `cluster.rs` in Task 5; until then the symbol
-// is exercised only by the unit tests below, so the dead-code lint would
-// otherwise fire under the non-test build. (Mirrors xxhash.rs / ring_hash.rs.)
-#![allow(dead_code)]
-
 use crate::xxhash::xxh64_seed;
 
 #[derive(Debug)]

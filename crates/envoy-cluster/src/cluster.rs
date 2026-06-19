@@ -99,6 +99,16 @@ pub(crate) struct EdsReloadState {
     pub(crate) update_rejected: Arc<envoy_stats::Counter>,
 }
 
+/// 29 (ADR-0071/0072): the consistent-hashing LB variant a `Cluster` dispatches
+/// on. `Ring` is the phase-28 ketama ring (RING_HASH); `Maglev` is the phase-29
+/// permutation table (MAGLEV). Both expose a `lookup(key_hash) -> Option<usize>`
+/// returning a host index aligned with the cluster's endpoint Vec.
+#[derive(Debug)]
+pub(crate) enum HashLb {
+    Ring(crate::ring_hash::HashRing),
+    Maglev(crate::maglev::MaglevTable),
+}
+
 /// A configured upstream cluster. Owns the static endpoint list and the
 /// round-robin `AtomicUsize` cursor. Constructed by `from_bootstrap` only;
 /// external code works through `ClusterHandle`.
@@ -196,17 +206,11 @@ pub struct Cluster {
     /// inert-when-unconfigured invariant. `pick()`'s fast path bypasses entirely
     /// when this AND `endpoint_health` are both `None`.
     pub(crate) outlier_detection: Option<OutlierDetectionState>,
-    /// 28 Task 5 (§6.2-LOCKED / ADR-0070): the consistent-hashing ring, built at
-    /// construction for `RING_HASH` clusters from the endpoint `ip:port` Display
-    /// strings (host index `i` = `endpoints[i]` at build time — the ring's
-    /// `host_index` aligns with the `endpoints` Vec ordering). `None` for
-    /// `ROUND_ROBIN` clusters (the inert-when-unconfigured discipline) — so
-    /// `ring.is_some()` is the single source of truth for "this cluster is
-    /// RING_HASH", and `pick()` dispatches on it (no separate `lb_policy` field).
-    /// The ring is built ONCE from the bootstrap endpoint set; a later EDS
-    /// hot-reload that swaps `endpoints` does NOT rebuild it (RING_HASH +
-    /// reloadable membership is out of phase-28 scope — STATIC fixtures only).
-    pub(crate) ring: Option<crate::ring_hash::HashRing>,
+    /// 29 (ADR-0071/0072): the consistent-hash LB dispatch. `Some` iff `lb_policy`
+    /// is a hash policy (built in `from_bootstrap`); `None` for ROUND_ROBIN (the
+    /// cursor path). Replaces the phase-28 `ring: Option<HashRing>` discriminator
+    /// (M28-3): `ring.is_some()` could not distinguish a SECOND ring-building policy.
+    pub(crate) hash_lb: Option<HashLb>,
     /// 27 Task 4 (§6.2 / ADR-0068): EDS-reload state, `Some` ONLY for `type: EDS`
     /// clusters (`None` for STATIC / STRICT_DNS — the §5.2 inert-when-unconfigured
     /// discipline). Carries the assignment-file path, the CLA selection name, and
@@ -352,28 +356,35 @@ impl Cluster {
             return None;
         }
         let total = eps.len();
-        // 28 Task 5 (§6.2-LOCKED): RING_HASH dispatch. The ring's `host_index`
-        // aligns with the `eps` Vec ordering (the ring was built from the SAME
-        // endpoint slice at construction — see `from_bootstrap`). `Some(key_hash)`
-        // → ring lookup → the endpoint at that host index. `None` → fall through
-        // to the cursor path below (the no-hash fallback; the real fallback lands
-        // in Task 6). HC/OD + RING_HASH composition is a deferred non-goal (SPEC
-        // §2.2): RING_HASH clusters are plain in phase 28, so the ring host is
-        // returned directly without an eligibility filter. `ring` is `Some` iff
-        // `lb_policy == RingHash` (built together in `from_bootstrap`), so gating
-        // on `ring.as_ref()` is equivalent to dispatching on `lb_policy` — a
-        // RoundRobin cluster has `ring == None` and falls straight through, its
-        // `key_hash` inert. The ring was built from the bootstrap endpoint set;
-        // for a plain RING_HASH cluster `eps` is that same set, so `host_index`
-        // indexes `eps` directly (a reload-shrunk set is out of phase-28 scope —
-        // the `host_index < total` guard is defense-in-depth). A `None` key (or a
-        // stale index) falls through to the cursor path below — the Task-6 /
-        // backstop no-hash fallback.
-        if let (Some(ring), Some(kh)) = (self.ring.as_ref(), key_hash)
-            && let Some(host_index) = ring.lookup(kh)
-            && host_index < total
-        {
-            return Some(eps[host_index]);
+        // 29 (M28-3 / §6.2-LOCKED): consistent-hash dispatch on `hash_lb` (Ring →
+        // ketama-ring lookup, Maglev → permutation-table lookup). Both variants'
+        // `lookup` returns a `host_index` that aligns with the `eps` Vec ordering
+        // (the LB was built from the SAME endpoint slice at construction — see
+        // `from_bootstrap`). `Some(key_hash)` → lookup → the endpoint at that host
+        // index. `None` → fall through to the cursor path below (the no-hash
+        // fallback; the real fallback lands in Task 6). HC/OD + hash-LB composition
+        // is a deferred non-goal (SPEC §2.2): hash-LB clusters are plain, so the
+        // host is returned directly without an eligibility filter. `hash_lb` is
+        // `Some` iff `lb_policy` is a hash policy (built together in
+        // `from_bootstrap`), so gating on `hash_lb.as_ref()` is equivalent to
+        // dispatching on `lb_policy` — a RoundRobin cluster has `hash_lb == None`
+        // and falls straight through, its `key_hash` inert. The LB was built from
+        // the bootstrap endpoint set; for a plain hash-LB cluster `eps` is that
+        // same set, so `host_index` indexes `eps` directly (a reload-shrunk set is
+        // out of scope — the `hi < total` guard is defense-in-depth). A `None` key
+        // (or a stale index) falls through to the cursor path below — the Task-6 /
+        // backstop no-hash fallback. The RING_HASH path is byte-identical to phase
+        // 28; this is a pure dispatch refactor.
+        if let (Some(hlb), Some(kh)) = (self.hash_lb.as_ref(), key_hash) {
+            let host_index = match hlb {
+                HashLb::Ring(r) => r.lookup(kh),
+                HashLb::Maglev(t) => t.lookup(kh),
+            };
+            if let Some(hi) = host_index
+                && hi < total
+            {
+                return Some(eps[hi]);
+            }
         }
         // Fast path: nothing configured → phase-02 round-robin (byte-for-byte).
         if self.endpoint_health.is_none() && self.outlier_detection.is_none() {
@@ -1362,30 +1373,40 @@ pub async fn from_bootstrap(
         } else {
             None
         };
-        // 28 Task 5 (§6.2-LOCKED / ADR-0070): build the consistent-hashing ring
-        // for RING_HASH clusters from the endpoint `ip:port` Display strings. The
-        // ring's `host_index` aligns with the `endpoints` Vec ordering (we build
-        // the address strings by iterating `endpoints` in order, so ring index `i`
-        // == `endpoints[i]`). `SocketAddr` Display gives `ip:port` for IPv4 (e.g.
+        // 29 (M28-3 / §6.2-LOCKED / ADR-0070/0071/0072): build the consistent-hash
+        // LB per `lb_policy` from the endpoint `ip:port` Display strings. The LB's
+        // `host_index` aligns with the `endpoints` Vec ordering (we build the
+        // address strings by iterating `endpoints` in order, so LB index `i` ==
+        // `endpoints[i]`). `SocketAddr` Display gives `ip:port` for IPv4 (e.g.
         // `172.22.0.2:5678`), matching Envoy's `address()->asString()`; IPv6 is a
-        // bracketed-form UNTESTED non-goal (the differential fixture is IPv4). The
-        // ring is built ONCE here — RING_HASH + reloadable membership is out of
-        // phase-28 scope (STATIC fixtures only). `minimum_ring_size` comes from the
-        // cluster's `ring_hash_lb_config` (Envoy proto default 1024 when absent).
-        // NOTE: pick() dispatches RING_HASH via `self.ring.is_some()`. That is sound only
-        // while RingHash is the ONLY ring-building policy. If a future policy also builds a
-        // ring (e.g. MAGLEV), replace the `ring.is_some()` dispatch in pick() with an
-        // explicit lb_policy discriminant — otherwise it will be misclassified as RING_HASH.
-        let ring = if cfg.lb_policy == envoy_config::LbPolicy::RingHash {
-            let min_ring_size = cfg
-                .ring_hash_lb_config
-                .as_ref()
-                .map(|c| c.minimum_ring_size)
-                .unwrap_or(1024);
-            let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
-            Some(crate::ring_hash::HashRing::build(&addrs, min_ring_size))
-        } else {
-            None
+        // bracketed-form UNTESTED non-goal (the differential fixtures are IPv4). The
+        // LB is built ONCE here — hash-LB + reloadable membership is out of scope
+        // (STATIC fixtures only). Sizes come from the cluster's `*_lb_config` (Envoy
+        // proto defaults when absent: ring 1024, maglev 65537).
+        let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
+        let hash_lb = match cfg.lb_policy {
+            envoy_config::LbPolicy::RingHash => {
+                let min_ring_size = cfg
+                    .ring_hash_lb_config
+                    .as_ref()
+                    .map(|c| c.minimum_ring_size)
+                    .unwrap_or(1024);
+                Some(HashLb::Ring(crate::ring_hash::HashRing::build(
+                    &addrs,
+                    min_ring_size,
+                )))
+            }
+            envoy_config::LbPolicy::Maglev => {
+                let table_size = cfg
+                    .maglev_lb_config
+                    .as_ref()
+                    .map(|c| c.table_size)
+                    .unwrap_or(65537);
+                Some(HashLb::Maglev(crate::maglev::MaglevTable::build(
+                    &addrs, table_size,
+                )))
+            }
+            envoy_config::LbPolicy::RoundRobin => None,
         };
         let cluster = Arc::new(Cluster {
             name: cfg.name.clone(),
@@ -1404,7 +1425,7 @@ pub async fn from_bootstrap(
             endpoint_health,
             panic_threshold,
             outlier_detection,
-            ring,
+            hash_lb,
             eds_reload,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
@@ -1517,7 +1538,7 @@ mod tests {
                 endpoint_health: None,
                 panic_threshold: 50.0,
                 outlier_detection: None,
-                ring: None,
+                hash_lb: None,
                 eds_reload: None,
             }),
         }
@@ -1555,7 +1576,7 @@ mod tests {
             endpoint_health: None,
             panic_threshold: 50.0,
             outlier_detection: None,
-            ring: Some(ring),
+            hash_lb: Some(HashLb::Ring(ring)),
             eds_reload: None,
         };
         ClusterHandle {
@@ -2056,7 +2077,7 @@ admin:
             endpoint_health: None,
             panic_threshold: 50.0,
             outlier_detection: None,
-            ring: None,
+            hash_lb: None,
             eds_reload: None,
         };
         assert_eq!(c.name(), "backend");
@@ -2665,7 +2686,7 @@ admin:
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: None,
-                ring: None,
+                hash_lb: None,
                 eds_reload: None,
             }),
         };
@@ -3079,7 +3100,7 @@ admin:
                 endpoint_health: Some(health.clone()),
                 panic_threshold,
                 outlier_detection: Some(od_state),
-                ring: None,
+                hash_lb: None,
                 eds_reload: None,
             }),
         };
