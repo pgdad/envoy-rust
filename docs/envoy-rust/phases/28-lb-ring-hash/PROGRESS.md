@@ -215,3 +215,93 @@ assert the specific `UnsupportedHashPolicy` variant + specifier string).
 
 **cargo fmt:** `cargo fmt -p envoy-config -- --check` → clean (one test line
 reflowed by `cargo fmt` before the check passed).
+
+## State-3 Task 5 — ring build + lookup + dispatch
+
+**What landed.** The §6.2-LOCKED consistent-hashing ring core (ADR-0070):
+- `crates/envoy-cluster/src/ring_hash.rs` — `pub(crate) struct HashRing { entries:
+  Vec<(u64, usize)> }` (stores host INDEX, not address, to stay cheap). `build(
+  addresses: &[String], min_ring_size: u64)` adds `replicas = min_ring_size /
+  num_hosts` entries per host (integer division — 1024/2 = 512), each keyed
+  `xxh64(format!("{address}_{i}").as_bytes())` (the `_` separator is LOAD-BEARING;
+  `{i}` is the plain decimal index), then `sort_by_key` ascending by hash.
+  `lookup(key_hash) -> Option<usize>` uses `partition_point(|h| h < key_hash)`
+  (bisect_left → first `entry.hash >= key_hash`), wrapping to index 0 when the
+  request hash exceeds every entry. Empty ring → `lookup` returns `None`
+  (defensive — a RING_HASH cluster has ≥1 endpoint by construction; only a
+  hot-reloaded empty set could reach it, and the caller's no-host path handles it).
+- `crates/envoy-cluster/src/cluster.rs` — `Cluster` gains `ring:
+  Option<crate::ring_hash::HashRing>`. **No separate `lb_policy` field**:
+  `ring.is_some()` is the single source of truth for "this cluster is RING_HASH"
+  (a stored `lb_policy` would be a dead field — clippy `dead-code` confirmed —
+  so it was dropped). `from_bootstrap` builds the ring for `LbPolicy::RingHash`
+  clusters from the endpoint `ip:port` Display strings, `min_ring_size` from the
+  cluster's `ring_hash_lb_config.minimum_ring_size` (Envoy proto default 1024 when
+  absent). Private `pick()` now takes `key_hash: Option<u64>` and dispatches:
+  `Some(ring), Some(kh)` → `ring.lookup` → `eps[host_index]`; otherwise (None key,
+  or RoundRobin with `ring == None`) falls through to the unchanged phase-02
+  cursor/eligibility path. `ClusterHandle::pick_endpoint` passes `None` FOR NOW
+  (behavior-preserving — Task 6 changes the delegate to thread the real key + wire
+  the HCM call sites).
+- `crates/envoy-cluster/src/lib.rs` — `mod ring_hash;`.
+
+**Host-index ↔ endpoint alignment.** The ring is built by iterating the
+`endpoints: Vec<SocketAddr>` in order, so ring `host_index i` == `endpoints[i]`.
+`pick()` indexes the live `eps` snapshot directly by `host_index` (guarded by
+`host_index < total` defense-in-depth). The ring is built ONCE from the bootstrap
+endpoint set; an EDS hot-reload that swaps `endpoints` does NOT rebuild it
+(RING_HASH + reloadable membership is out of phase-28 scope — STATIC fixtures
+only).
+
+**THE PINNED ORACLE — PASS.** `ring_hash::tests::pinned_oracle_matches_live_envoy`
+builds the ring over host 0 = `172.22.0.2:5678` (ONE) / host 1 = `172.22.0.3:5678`
+(TWO), `minimum_ring_size = 1024`, and asserts `lookup(xxh64(key))` for all 8
+recorded keys — **all 8 PASS**:
+`key-0`→0, `key-2`→1, `key-10`→0, `key-11`→1, `key-14`→0, `key-19`→1,
+`user-alice`→0, `1.2.3.4`→1. The ring reproduces live Envoy v1.33.0 byte-for-byte.
+The cluster-level selection test `cluster::tests::
+pick_ring_hash_dispatch_and_round_robin_key_inert` confirms `pick(Some(xxh64(
+b"key-0")))` → the host-0 endpoint, `pick(Some(xxh64(b"key-2")))` → the host-1
+endpoint, and that a RoundRobin cluster's `pick(Some(123))` is identical to the
+cursor path (key inert; matches `pick(None)`).
+
+**HC/OD + RING_HASH composition — DEFERRED (non-goal).** Decided based on the
+actual code shape: the MVP differential fixture is a PLAIN cluster, so the ring
+returns a host directly. The skip-and-retry over ineligible ring hosts would
+require threading the cluster's eligibility predicate into the ring walk (a
+`lookup_eligible(pred)` that walks entries forward-with-wrap), coupling `HashRing`
+to `Cluster`'s health/ejection state for a path no phase-28 fixture exercises.
+Per SPEC §2.2 this composition is already a listed non-goal; gating the ring path
+to plain clusters keeps `HashRing` decoupled. RING_HASH clusters are plain in
+phase 28 — Task 9 records this in BEHAVIOR_CONTRACT.
+
+**M27-2 (FOLDED).** Added `pick()` slow-path length-coupling assertions:
+`debug_assert_eq!(eps.len(), h.len(), ...)` for `endpoint_health` and
+`debug_assert_eq!(eps.len(), e.len(), ...)` for the outlier `ejection` array,
+placed before the `is_eligible` closure that indexes them `[i]` for
+`i in 0..eps.len()`. Guards a future HC/OD-wiring regression that desyncs them.
+
+**M27-1 (FOLDED).** Tightened `Cluster::store_endpoints` `pub` → `pub(crate)`. The
+only callers are the in-crate `eds_reload` pipeline and the `#[doc(hidden)] pub`
+`ClusterHandle::store_endpoints` delegate (LEFT AS-IS — referenced cross-crate by
+an `envoy-admin` test). No external crate reaches `&Cluster`/`Arc<Cluster>`
+directly (`ClusterHandle::inner` is `pub(crate)`), so the tightening did not break
+any crate's compilation. `cargo build --workspace` confirms (the only workspace
+build error is the PRE-EXISTING `envoy-http1::hcm.rs` `hash_policy` gap — Task 6
+wiring, present on the clean tree before this task; unrelated to M27-1).
+
+**cargo test:** `cargo test -p envoy-cluster` →
+`test result: ok. 123 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+(prior 116 + 7 new = 123: 6 `ring_hash` + 1 `cluster` selection test; 0 failures).
+
+**cargo clippy:** `cargo clippy -p envoy-cluster --all-targets --all-features --
+-D warnings` → `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`
+(clean, no warnings).
+
+**cargo fmt:** `cargo fmt -p envoy-cluster -- --check` — the two TASK-5 files
+(`ring_hash.rs`, `cluster.rs`) are fmt-clean. The package-level check still reports
+3 PRE-EXISTING diffs in `xxhash.rs` (Task 2 debt: lines 42/78/86 — long
+method-chain reflows), which is OUTSIDE this task's touch scope (only `ring_hash.rs`
+/ `cluster.rs` / `lib.rs` / `PROGRESS.md` were touched). Per the recorded host note,
+fmt-check is native-CI-authoritative and resolved at the state-4 gate — the
+`xxhash.rs` reflow lands then (it is not Task 5's to edit).
