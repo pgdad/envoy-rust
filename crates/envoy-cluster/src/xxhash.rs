@@ -42,9 +42,7 @@ pub(crate) fn xxh64(data: &[u8]) -> u64 {
     let mut input = data;
 
     let mut h: u64 = if len >= 32 {
-        let mut v1 = SEED
-            .wrapping_add(PRIME64_1)
-            .wrapping_add(PRIME64_2);
+        let mut v1 = SEED.wrapping_add(PRIME64_1).wrapping_add(PRIME64_2);
         let mut v2 = SEED.wrapping_add(PRIME64_2);
         let mut v3 = SEED;
         let mut v4 = SEED.wrapping_sub(PRIME64_1);
@@ -78,7 +76,10 @@ pub(crate) fn xxh64(data: &[u8]) -> u64 {
     while input.len() >= 8 {
         let k1 = round(0, u64::from_le_bytes(input[0..8].try_into().unwrap()));
         h ^= k1;
-        h = h.rotate_left(27).wrapping_mul(PRIME64_1).wrapping_add(PRIME64_4);
+        h = h
+            .rotate_left(27)
+            .wrapping_mul(PRIME64_1)
+            .wrapping_add(PRIME64_4);
         input = &input[8..];
     }
 
@@ -86,7 +87,10 @@ pub(crate) fn xxh64(data: &[u8]) -> u64 {
     if input.len() >= 4 {
         let k1 = u32::from_le_bytes(input[0..4].try_into().unwrap()) as u64;
         h ^= k1.wrapping_mul(PRIME64_1);
-        h = h.rotate_left(23).wrapping_mul(PRIME64_2).wrapping_add(PRIME64_3);
+        h = h
+            .rotate_left(23)
+            .wrapping_mul(PRIME64_2)
+            .wrapping_add(PRIME64_3);
         input = &input[4..];
     }
 

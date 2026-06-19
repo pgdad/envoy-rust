@@ -1358,6 +1358,10 @@ pub async fn from_bootstrap(
         // ring is built ONCE here — RING_HASH + reloadable membership is out of
         // phase-28 scope (STATIC fixtures only). `minimum_ring_size` comes from the
         // cluster's `ring_hash_lb_config` (Envoy proto default 1024 when absent).
+        // NOTE: pick() dispatches RING_HASH via `self.ring.is_some()`. That is sound only
+        // while RingHash is the ONLY ring-building policy. If a future policy also builds a
+        // ring (e.g. MAGLEV), replace the `ring.is_some()` dispatch in pick() with an
+        // explicit lb_policy discriminant — otherwise it will be misclassified as RING_HASH.
         let ring = if cfg.lb_policy == envoy_config::LbPolicy::RingHash {
             let min_ring_size = cfg
                 .ring_hash_lb_config
