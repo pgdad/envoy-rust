@@ -1,0 +1,57 @@
+# 29 fixture-0037 expectations (ADR-0072): MAGLEV consistent-hashing LB
+# cross-proxy differential. The Http1HashSweep driver sweeps a list of
+# `x-hash-key` header values against BOTH proxies (upstream envoyproxy/envoy
+# v1.33.0 and the subject envoy-rust) through a STATIC `lb_policy: MAGLEV`
+# cluster `maglev_cluster` with TWO distinguishable echo backends
+# (`--body-marker backend_1`/`backend_2`). Each response body's leading
+# `backend: <marker>\n` line names which backend the table selected for the
+# request hash xxh64(header value).
+#
+# The driver asserts THREE properties over the sweep:
+#
+#   STRONG (the core differential): for EACH key the marker chosen by envoy-rust
+#       is IDENTICAL to the one chosen by upstream Envoy — cross-proxy identical
+#       MAGLEV selection (the locked Maglev table — xxHash64 permutation —
+#       reproduced end-to-end).
+#   SPREAD: over the full sweep BOTH backend_1 AND backend_2 are selected on
+#       EACH side (the table actually distributes; a one-backend sweep fails).
+#   STABILITY: each key is probed twice; a repeated key must hit the SAME
+#       backend on each proxy (same-key -> same-backend).
+#
+# The sweep keys are the same 16 used by fixture-0036 (RING_HASH). The live
+# Maglev table is built from the runtime-ephemeral `{{BACKEND_IP}}:port` keys
+# (NOT the §6.2 oracle's fixed `ip:port`), so the per-key host mapping is not
+# predictable from the oracle — but a 2-host Maglev table is ~50/50, so 16 keys
+# reliably hit both backends, and cross-proxy identity holds because BOTH
+# proxies build the table from the SAME endpoint strings.
+#
+# LOCALLY observable: a plain request/response with NO file-watch/reload
+# trigger, so the Docker test runs and is authoritative on any host with a
+# Docker daemon. Docker-gated by the differential harness at the cluster level
+# (no per-test cfg gate; the harness skips when `DOCKER_HOST` is unavailable).
+driver:
+  kind: http1_hash_sweep
+  path: /
+  host: localhost
+  expected_status: 200
+  keys:
+    - key-0
+    - key-1
+    - key-2
+    - key-3
+    - key-4
+    - key-5
+    - user-alice
+    - user-bob
+    - user-carol
+    - 1.2.3.4
+    - 10.0.0.1
+    - session-abcdef
+    - session-123456
+    - tenant-acme
+    - tenant-globex
+    - cart-99
+# `response_status: exact` adds a cross-proxy status equivalence belt over the
+# per-key driver assertions (the driver also asserts each side returns 200).
+equivalence:
+  response_status: exact
