@@ -12601,6 +12601,46 @@ hash_policy:
         );
     }
 
+    /// (c'') End-to-end wiring: an unsupported cookie hash_policy on a route in a
+    /// COMPLETE bootstrap (HCM + inline route_config) is rejected by the real
+    /// `parse_bootstrap` route loop — proving `validate_hcm` actually invokes
+    /// `validate_hash_policy` (the new wiring this task added), not merely that
+    /// the validator's logic is correct in isolation.
+    #[test]
+    fn parse_bootstrap_rejects_route_hash_policy_cookie_source() {
+        let routes = r#"- match: { prefix: "/" }
+                          route:
+                            cluster: backend
+                            hash_policy:
+                              - cookie:
+                                  name: foo"#;
+        let yaml = route_action_yaml(routes, BACKEND_CLUSTER);
+        let err = crate::parse_bootstrap(&yaml).expect_err("cookie hash_policy must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedHashPolicy { ref specifier } if specifier == "cookie"
+            ),
+            "expected UnsupportedHashPolicy(cookie) through full parse+validate; got {err:?}"
+        );
+    }
+
+    /// (c''') An empty-oneof hash_policy (no specifier set at all) is rejected
+    /// with `specifier == "<none>"` — covers the distinct empty-oneof branch of
+    /// the validator.
+    #[test]
+    fn route_hash_policy_rejects_empty_oneof() {
+        let hp = HashPolicy::default();
+        let err = validate_hash_policy(&hp).expect_err("empty oneof must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedHashPolicy { ref specifier } if specifier == "<none>"
+            ),
+            "expected UnsupportedHashPolicy(<none>); got {err:?}"
+        );
+    }
+
     /// (d) A VirtualHost YAML with include_attempt_count_in_response: true → field true;
     ///     absent → false (default).
     #[test]
