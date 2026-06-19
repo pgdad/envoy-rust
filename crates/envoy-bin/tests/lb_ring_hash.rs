@@ -178,6 +178,9 @@ async fn ring_determinism_matches_section_6_2_oracle() {
 async fn ring_spread_selects_both_hosts() {
     let rh = build_cluster(&ring_hash_two_host_block(), "ring_cluster").await;
 
+    // The 16 keys are a FIXED characterization set observed (in the §6.2 recon /
+    // locally) to cover both hosts; the runtime SPREAD assertions below are the
+    // safety net should a future distribution change shift which keys land where.
     let mut saw_host0 = false;
     let mut saw_host1 = false;
     for i in 0..16u32 {
@@ -226,10 +229,23 @@ async fn no_hash_key_falls_back_to_valid_host() {
 /// selection, NOT the random/None fallback (ADR-0070). The integration companion
 /// to Task 6's extraction-helper test (c): `Some(hash(""))` lands on the SAME
 /// host every time, and that host equals an explicit `xxh64("")` ring lookup.
+///
+/// This proves the load-bearing ADR-0070 distinction DIRECTLY by asserting BOTH
+/// paths side-by-side on the SAME freshly-built two-host ring:
+///   - `Some(hash(""))` is HASHED: it pins to ONE host, stable across repeats
+///     (the ring path — an empty-but-PRESENT header value is hashed, not random);
+///   - `None` is the ABSENT-header FALLBACK: it ROTATES host0→host1→host0… (the
+///     round-robin cursor path), so it is NOT pinned to one host.
+/// The `Some(hash(""))` picks take the ring path and do NOT touch the cursor, so
+/// the `None` rotation below starts from a clean cursor at 0 (host0 first) and the
+/// host0→host1 rotation is observable on this one cluster. Stability of the hashed
+/// pick CONTRASTED with the rotation of the fallback is what makes "hashed, not
+/// fallback" self-evident (rather than implied by stability alone).
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_header_value_is_hashed_deterministically() {
     let rh = build_cluster(&ring_hash_two_host_block(), "ring_cluster").await;
 
+    // HASHED path: Some(hash("")) pins to one host, stable across repeats.
     let empty_hash = hash_request_key(b"");
     let first = rh
         .pick_endpoint(Some(empty_hash))
@@ -245,6 +261,22 @@ async fn empty_header_value_is_hashed_deterministically() {
     assert!(
         first == host0() || first == host1(),
         "empty-value pick {first} must be one of the two members"
+    );
+
+    // FALLBACK path: None rotates across hosts — it is NOT pinned. The ring picks
+    // above did not advance the round-robin cursor, so it starts clean at 0: the
+    // first None lands host0, the second host1 (the cursor advancing), proving the
+    // absent-header fallback is the rotating cursor path, distinct from the pinned
+    // hashed selection of an empty-but-present value above (ADR-0070).
+    assert_eq!(
+        rh.pick_endpoint(None),
+        Some(host0()),
+        "None fallback (cursor 0) — absent-header path, NOT the hashed empty-value path"
+    );
+    assert_eq!(
+        rh.pick_endpoint(None),
+        Some(host1()),
+        "None fallback rotates to host1 (cursor 1) — it is NOT pinned to one host"
     );
 }
 
@@ -286,6 +318,9 @@ async fn single_host_ring_routes_everything_to_the_one_host() {
 async fn round_robin_ignores_hash_key() {
     let rr = build_cluster(&round_robin_two_host_block(), "rr_cluster").await;
 
+    // NOTE: these assertions depend on a FRESH, unshared cursor starting at 0
+    // (host0 first) — a freshly-built cluster has not advanced its round-robin
+    // cursor, so the first pick is endpoints[0].
     // The cursor advances regardless of Some/None — Some(123) is inert. Starting
     // from a fresh cursor: pick 0 → endpoints[0], pick 1 → endpoints[1], pick 2 →
     // endpoints[0] (2 % 2). A `Some(key)` call advances the cursor identically to
