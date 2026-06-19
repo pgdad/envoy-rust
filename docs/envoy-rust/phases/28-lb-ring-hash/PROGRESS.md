@@ -491,3 +491,49 @@ parse-valid bootstrap exercising the new config surface for the EXISTING
 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`. **clippy:** `cargo
 clippy -p envoy-bin --all-targets --all-features -- -D warnings` → clean (exit 0).
 **fmt:** `cargo fmt --all -- --check` → clean.
+
+## State-3 Task 9 — BEHAVIOR_CONTRACT LB selection
+
+Added a per-feature **"LB selection"** subsection to
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md` (inserted after "Request body
+forwarding (HTTP/1.1)", before "Header allow-list" — alongside the other
+data-path equivalence notes), matching the file's heading/density/tone. Docs-only;
+`git diff --stat` confirmed BEHAVIOR_CONTRACT.md as the sole change (+84 lines).
+
+Documented:
+
+- **`ROUND_ROBIN`** (default since phase 02, unchanged this phase) — cursor-based
+  rotation over eligible endpoints; the per-request hash key is **inert** for
+  round-robin (the regression-equivalence proof: all 35 pre-phase-28 fixtures stay
+  green; the `pick()`/`pick_endpoint()` hash-key signature change is
+  behavior-preserving).
+- **`RING_HASH`** (NEW, phase 28) — deterministic + byte-identical to upstream
+  Envoy v1.33.0 via the ADR-0070 algorithm: **xxHash64 seed 0** (from scratch);
+  per-host ring key `"{ip:port}_{i}"` (load-bearing `_` separator; IPv4
+  `SocketAddr` Display; IPv6 ring hosts an untested non-goal); `replicas =
+  minimum_ring_size / num_hosts`; sorted `(hash, host)` ring; request hash =
+  `xxh64(header value)`; lookup = first entry `>= request_hash` wrapping
+  (`bisect_left`).
+- **Keying** — route-level header `hash_policy` (`{ header: { header_name } }`);
+  single-header-source MVP.
+- **Empty-vs-absent** — empty-but-present header value is HASHED (`xxh64("")`,
+  deterministic), NOT the fallback; only an ABSENT key falls back. The
+  no-`hash_policy`-match / absent-header → **random-host fallback is NOT
+  differentially asserted** (non-deterministic; backstop-only).
+- **XX_HASH-only narrowing** — `MURMUR_HASH_2` rejected (all-fatal config error,
+  documented intentional divergence); bogus enum → parse-reject;
+  `minimum_ring_size > maximum_ring_size` → validation-reject.
+- **Differential witness** — fixture `0036-lb-ring-hash` (cross-proxy identical
+  RING_HASH selection per key; locally observable, no reload trigger).
+
+**Deferred HC/OD + RING_HASH non-goal — RECORDED.** The subsection explicitly
+records (per doctrine D-3.3) that the ring skip-and-retry over ineligible
+(unhealthy / ejected) hosts is a **SPEC §2.2 deferred non-goal** (the Task 5
+decision): the phase-28 fixture cluster is PLAIN, so the differential does NOT
+exercise the eligibility-skip path — `RING_HASH` over an HC/OD cluster is **not yet
+differentially validated** (backstop-only). The weighted ring, non-header hash
+sources, `maglev`, `least_request`/`random`, and `RING_HASH` + EDS-hot-reload
+composition are also noted as deferred (brief; SPEC §2.2).
+
+Docs-only task — no build/test. The two commits touch only BEHAVIOR_CONTRACT.md
+(commit 1) and this PROGRESS.md (commit 2).
