@@ -1584,6 +1584,54 @@ mod tests {
         }
     }
 
+    /// 29 Task 7: build a MAGLEV `ClusterHandle` with the given endpoints and
+    /// `table_size`, mirroring `from_bootstrap`'s table build (host index `i` =
+    /// `endpoints[i]`, address strings from `SocketAddr` Display — the SAME
+    /// derivation `from_bootstrap` uses, so the table is built through the real
+    /// path). Structurally identical to `mk_ring_hash_handle` but installs a
+    /// `HashLb::Maglev` rather than a `HashLb::Ring`.
+    fn mk_maglev_handle(name: &str, endpoints: Vec<SocketAddr>, table_size: u64) -> ClusterHandle {
+        let handle = mk_handle(name, endpoints.clone());
+        let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
+        let table = crate::maglev::MaglevTable::build(&addrs, table_size);
+        let inner = handle.inner;
+        let new_inner = Cluster {
+            name: inner.name.clone(),
+            endpoints: RwLock::new(inner.current_endpoints()),
+            cursor: AtomicUsize::new(0),
+            upstream_protocol: inner.upstream_protocol,
+            cx_total: Arc::clone(&inner.cx_total),
+            cx_active: Arc::clone(&inner.cx_active),
+            upstream_rq_total: Arc::clone(&inner.upstream_rq_total),
+            upstream_rq_5xx: Arc::clone(&inner.upstream_rq_5xx),
+            upstream_rq_retry: Arc::clone(&inner.upstream_rq_retry),
+            upstream_rq_retry_success: Arc::clone(&inner.upstream_rq_retry_success),
+            upstream_rq_retry_limit_exceeded: Arc::clone(&inner.upstream_rq_retry_limit_exceeded),
+            upstream_rq_retry_overflow: Arc::clone(&inner.upstream_rq_retry_overflow),
+            budget: None,
+            endpoint_health: None,
+            panic_threshold: 50.0,
+            outlier_detection: None,
+            hash_lb: Some(HashLb::Maglev(table)),
+            eds_reload: None,
+        };
+        ClusterHandle {
+            inner: Arc::new(new_inner),
+        }
+    }
+
+    /// 29 Task 7: build a standalone reference `MaglevTable` over the SAME
+    /// address strings the cluster derives (`SocketAddr` Display), so a test can
+    /// compute the oracle host index `MaglevTable::lookup(kh)` for the cluster's
+    /// dispatch to be checked against. Mirrors `from_bootstrap` / `mk_maglev_handle`.
+    fn reference_maglev_table(
+        endpoints: &[SocketAddr],
+        table_size: u64,
+    ) -> crate::maglev::MaglevTable {
+        let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
+        crate::maglev::MaglevTable::build(&addrs, table_size)
+    }
+
     /// 28 Task 5: a RING_HASH cluster's `pick(Some(key_hash))` routes by the ring
     /// (consistent with the §6.2 oracle), while a RoundRobin cluster IGNORES the
     /// key (the cursor path is inert to it).
@@ -1666,6 +1714,204 @@ mod tests {
         );
         assert_eq!(rr.pick_endpoint(None), Some(ep1), "cursor 1, key ignored");
         assert_eq!(rr.pick_endpoint(Some(123)), Some(ep0), "cursor 2 % 2 = 0");
+    }
+
+    // ---------------------------------------------------------------------
+    // 29 Task 7: MAGLEV cluster-level `pick()`-dispatch backstop. These
+    // complement the maglev.rs TABLE-level oracle/distribution tests (Task 4)
+    // by exercising `Cluster::pick` / `ClusterHandle::pick_endpoint` for a
+    // MAGLEV cluster — proving the `hash_lb` dispatch routes a MAGLEV cluster
+    // through the table — plus the M28-3 three-policy regression witness.
+    // The hosts use the §6.2-oracle addresses (172.31.0.2/.3:5678) so the
+    // pinned-oracle host indices line up with maglev.rs.
+    // ---------------------------------------------------------------------
+
+    /// 29 Task 7 (1): a MAGLEV cluster's `pick_endpoint(Some(kh))` returns the
+    /// endpoint at the index `MaglevTable::lookup(kh)` would return (the dispatch
+    /// routes THROUGH the table), and same-key→same-endpoint across repeated
+    /// calls (cluster-level determinism — not the round-robin cursor).
+    #[test]
+    fn pick_endpoint_maglev_routes_through_table_and_is_deterministic() {
+        let ep0: SocketAddr = "172.31.0.2:5678".parse().unwrap(); // host 0
+        let ep1: SocketAddr = "172.31.0.3:5678".parse().unwrap(); // host 1
+        let endpoints = vec![ep0, ep1];
+        let mg = mk_maglev_handle("mg", endpoints.clone(), 65537);
+        let table = reference_maglev_table(&endpoints, 65537);
+        // For a sweep of keys, the cluster dispatch must equal eps[table.lookup(kh)].
+        for key in [
+            "key-0",
+            "key-2",
+            "key-7",
+            "key-10",
+            "user-alice",
+            "user-bob",
+            "session-abc",
+        ] {
+            let kh = crate::xxhash::xxh64(key.as_bytes());
+            let expected_idx = table.lookup(kh).expect("non-empty table");
+            assert_eq!(
+                mg.pick_endpoint(Some(kh)),
+                Some(endpoints[expected_idx]),
+                "key {key:?} dispatches through the table to host {expected_idx}"
+            );
+            // Determinism at the cluster level: repeated calls are stable (the
+            // table lookup, NOT the advancing cursor).
+            assert_eq!(
+                mg.pick_endpoint(Some(kh)),
+                mg.pick_endpoint(Some(kh)),
+                "same key → same endpoint across repeated cluster picks"
+            );
+        }
+    }
+
+    /// 29 Task 7 (2): a sweep of distinct key_hashes selects BOTH endpoints at
+    /// the cluster level (the table distributes across hosts — the dispatch is
+    /// not pinned to a single host).
+    #[test]
+    fn pick_endpoint_maglev_spreads_over_endpoints() {
+        let ep0: SocketAddr = "172.31.0.2:5678".parse().unwrap();
+        let ep1: SocketAddr = "172.31.0.3:5678".parse().unwrap();
+        let mg = mk_maglev_handle("mg_spread", vec![ep0, ep1], 65537);
+        let mut saw0 = false;
+        let mut saw1 = false;
+        for i in 0..256u64 {
+            let kh = crate::xxhash::xxh64(format!("spread-key-{i}").as_bytes());
+            match mg.pick_endpoint(Some(kh)) {
+                Some(ep) if ep == ep0 => saw0 = true,
+                Some(ep) if ep == ep1 => saw1 = true,
+                other => panic!("unexpected pick {other:?}"),
+            }
+            if saw0 && saw1 {
+                break;
+            }
+        }
+        assert!(saw0 && saw1, "a key sweep must select both endpoints");
+    }
+
+    /// 29 Task 7 (3): the M28-2 no-hash-key fallback — `pick_endpoint(None)` on a
+    /// MAGLEV cluster falls through to the CURSOR / round-robin path (NOT the
+    /// table): it cycles endpoints like round-robin. This characterizes the
+    /// absent-key fallback (the cursor path) per phase-28 M28-2.
+    #[test]
+    fn pick_endpoint_maglev_no_hash_key_falls_through_to_cursor() {
+        let ep0: SocketAddr = "172.31.0.2:5678".parse().unwrap();
+        let ep1: SocketAddr = "172.31.0.3:5678".parse().unwrap();
+        let mg = mk_maglev_handle("mg_none", vec![ep0, ep1], 65537);
+        // No-hash → cursor path: cycles endpoints[0], [1], [0], [1], ... like RR.
+        assert_eq!(mg.pick_endpoint(None), Some(ep0), "cursor 0");
+        assert_eq!(mg.pick_endpoint(None), Some(ep1), "cursor 1");
+        assert_eq!(mg.pick_endpoint(None), Some(ep0), "cursor 2 % 2 = 0");
+        assert_eq!(mg.pick_endpoint(None), Some(ep1), "cursor 3 % 2 = 1");
+    }
+
+    /// 29 Task 7 (4): an EMPTY-but-PRESENT hash value hashes to `xxh64(b"")` (NOT
+    /// a fallback — ADR-0070). `pick_endpoint(Some(hash_request_key(b"")))` is
+    /// deterministic and equals the table host for `xxh64(b"")` — the present-
+    /// empty-vs-absent distinction. (The maglev.rs oracle pins `"" → host 0`.)
+    #[test]
+    fn pick_endpoint_maglev_empty_but_present_hashes_not_fallback() {
+        let ep0: SocketAddr = "172.31.0.2:5678".parse().unwrap(); // oracle: "" → host 0
+        let ep1: SocketAddr = "172.31.0.3:5678".parse().unwrap();
+        let endpoints = vec![ep0, ep1];
+        let mg = mk_maglev_handle("mg_empty", endpoints.clone(), 65537);
+        // `hash_request_key(b"")` is the HCM's request-key hash for a present-
+        // empty value; it equals `xxh64(b"")` (NOT None — not the cursor fallback).
+        let kh = super::hash_request_key(b"");
+        let table = reference_maglev_table(&endpoints, 65537);
+        let expected_idx = table.lookup(kh).expect("non-empty table");
+        // Pin the present-empty oracle host (maglev.rs: "" → host 0).
+        assert_eq!(expected_idx, 0, "empty-but-present oracle maps to host 0");
+        // Deterministic + routes through the table (NOT the cursor).
+        assert_eq!(mg.pick_endpoint(Some(kh)), Some(endpoints[expected_idx]));
+        assert_eq!(
+            mg.pick_endpoint(Some(kh)),
+            mg.pick_endpoint(Some(kh)),
+            "empty-but-present key is deterministic (table, not cursor)"
+        );
+    }
+
+    /// 29 Task 7 (5): the M28-3 regression witness (load-bearing). Asserts the
+    /// `hash_lb: Option<HashLb>` dispatch refactor sends EACH of the three
+    /// policies down the right path in ONE place:
+    ///   - ROUND_ROBIN: `pick_endpoint(Some(kh))` IGNORES the key (cursor path —
+    ///     identical to `pick_endpoint(None)`; key inert).
+    ///   - RING_HASH: `pick_endpoint(Some(kh))` routes via the ring.
+    ///   - MAGLEV: `pick_endpoint(Some(kh))` routes via the table.
+    #[test]
+    fn pick_endpoint_m28_3_three_policy_dispatch_witness() {
+        let ep0: SocketAddr = "172.31.0.2:5678".parse().unwrap(); // host 0
+        let ep1: SocketAddr = "172.31.0.3:5678".parse().unwrap(); // host 1
+        let endpoints = vec![ep0, ep1];
+        let kh = crate::xxhash::xxh64(b"key-0"); // ring oracle + table both defined
+
+        // (a) ROUND_ROBIN: key inert — Some(kh) behaves like None (cursor path).
+        let rr = mk_handle("witness_rr", endpoints.clone());
+        let rr_none = mk_handle("witness_rr2", endpoints.clone());
+        assert_eq!(
+            rr.pick_endpoint(Some(kh)),
+            rr_none.pick_endpoint(None),
+            "ROUND_ROBIN: Some(kh) == None (key inert, cursor path)"
+        );
+        // And the cursor advances regardless of the key being present.
+        assert_eq!(
+            rr.pick_endpoint(Some(kh)),
+            Some(ep1),
+            "RR cursor advances; key inert"
+        );
+
+        // (b) RING_HASH: routes via the ring (eps[ring.lookup(kh)] — computed
+        // against a reference ring built from the SAME address strings, since
+        // the ring host for a given key is address-string-dependent).
+        let rh = mk_ring_hash_handle("witness_rh", endpoints.clone(), 1024);
+        let ring_addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
+        let ref_ring = crate::ring_hash::HashRing::build(&ring_addrs, 1024);
+        let rh_idx = ref_ring.lookup(kh).expect("non-empty ring");
+        assert_eq!(
+            rh.pick_endpoint(Some(kh)),
+            Some(endpoints[rh_idx]),
+            "RING_HASH: routes via the ring"
+        );
+        assert_eq!(
+            rh.pick_endpoint(Some(kh)),
+            rh.pick_endpoint(Some(kh)),
+            "RING_HASH: same key → same host (ring, not cursor)"
+        );
+
+        // (c) MAGLEV: routes via the table (eps[table.lookup(kh)]).
+        let mg = mk_maglev_handle("witness_mg", endpoints.clone(), 65537);
+        let table = reference_maglev_table(&endpoints, 65537);
+        let mg_idx = table.lookup(kh).expect("non-empty table");
+        assert_eq!(
+            mg.pick_endpoint(Some(kh)),
+            Some(endpoints[mg_idx]),
+            "MAGLEV: routes via the table"
+        );
+        assert_eq!(
+            mg.pick_endpoint(Some(kh)),
+            mg.pick_endpoint(Some(kh)),
+            "MAGLEV: same key → same host (table, not cursor)"
+        );
+    }
+
+    /// 29 Task 7 (6): a single-host MAGLEV cluster at the CLUSTER level always
+    /// returns that endpoint — for any key, AND for the no-hash fallback (a
+    /// 1-element cursor cycle). Complements maglev.rs's TABLE-level
+    /// single-host test by exercising the dispatch.
+    #[test]
+    fn pick_endpoint_maglev_single_host_always_returns_it() {
+        let only: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let mg = mk_maglev_handle("mg_solo", vec![only], 65537);
+        for key in ["", "a", "key-0", "1.2.3.4", "anything"] {
+            let kh = crate::xxhash::xxh64(key.as_bytes());
+            assert_eq!(
+                mg.pick_endpoint(Some(kh)),
+                Some(only),
+                "key {key:?} → sole host"
+            );
+        }
+        // No-hash fallback (cursor path over a 1-element set) also yields it.
+        assert_eq!(mg.pick_endpoint(None), Some(only), "no-hash → sole host");
+        assert_eq!(mg.pick_endpoint(None), Some(only), "cursor cycle of 1");
     }
 
     // ---------------------------------------------------------------------
