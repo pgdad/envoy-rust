@@ -366,3 +366,66 @@ the signature change + new extraction are behavior-preserving). Per-crate:
 warnings` → clean (exit 0). **fmt:** `cargo fmt --all -- --check` → clean
 (whole tree fmt-clean, including the prior `xxhash.rs` Task-2 debt resolved by
 the tree-wide `cargo fmt --all`).
+
+## State-3 Task 7 — fixture 0036 differential
+
+**Fixture shape.** `tests/fixtures/0036-lb-ring-hash/` (`envoy.yaml`,
+`envoy-rust.yaml`, `expectations.yaml`, `README.md`). ONE STATIC H1 HCM listener
+(`stat_prefix: ingress_http`) routes `/` → a STATIC `lb_policy: RING_HASH`
+cluster `ring_cluster` with TWO distinguishable echo backends
+(`--body-marker backend_1`/`backend_2`); the route action carries
+`hash_policy: [{ header: { header_name: "x-hash-key" } }]`. A PLAIN cluster —
+NO health check, NO outlier detection. `ring_hash_lb_config.minimum_ring_size:
+1024` set explicitly (= default; 1024 / 2 hosts = 512 replicas/host).
+`envoy.yaml` and `envoy-rust.yaml` are IDENTICAL config except the listener bind
+address (`0.0.0.0` upstream vs `127.0.0.1` subject — standard harness per-side
+convention). NO behavioral divergence.
+
+**Load-bearing addressing fix.** The ring key is `xxh64("{ip:port}_{i}")`, so
+cross-proxy identical selection holds ONLY if both proxies build the ring from
+IDENTICAL endpoint `ip:port` strings. The EDS per-side IP split (host-gateway IP
+upstream / `127.0.0.1` subject) would defeat this. A new `{{BACKEND_IP}}` marker
+(`discover_host_lan_ip` — route-based, no packets) renders to ONE SHARED host
+LAN IPv4 on BOTH sides; the subject reaches the `0.0.0.0`-bound backends
+directly and the upstream container reaches the same host backends via the
+Docker bridge / Desktop-VM NAT (verified reachable from both). A STATIC cluster
+rejects hostnames, hence a numeric IP.
+
+**Driver.** New `Driver::Http1HashSweep` in `tests/differential/src/lib.rs`
+sweeps 16 distinct `x-hash-key` values — `key-0..key-5`, `user-alice`,
+`user-bob`, `user-carol`, `1.2.3.4`, `10.0.0.1`, `session-abcdef`,
+`session-123456`, `tenant-acme`, `tenant-globex`, `cart-99` (includes the §6.2
+oracle keys `key-0`, `key-2`, `user-alice`, `1.2.3.4`). For each key it sends
+`GET /` with the header to BOTH proxies (twice) and extracts each response
+body's leading `backend: <marker>\n` line. Assertions: **STRONG** — per-key the
+envoy-rust marker is IDENTICAL to upstream Envoy's (cross-proxy identical
+RING_HASH selection, ADR-0070); **SPREAD** — over the sweep BOTH `backend_1` and
+`backend_2` are selected on EACH side; **STABILITY** — each key probed twice
+hits the SAME backend per proxy. `tests/differential/tests/lb_ring_hash.rs` is
+the Docker-gated wrapper (`run_fixture`, no per-test cfg gate — the harness
+skips when `DOCKER_HOST` is unavailable).
+
+**Local Docker differential witness (GREEN).** `cargo test -p differential
+--test lb_ring_hash` against live `envoyproxy/envoy:v1.33.0` (image present
+locally, digest pinned in `ENVOY_TARGET.md`):
+
+```
+running 1 test
+test lb_ring_hash_fixture ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s
+```
+
+Stable across 3 consecutive runs (no ephemeral-port / ring-rebuild flake). This
+phase's differential is LOCALLY observable (a plain request/response with NO
+file-watch/reload trigger), so this Docker run is the authoritative differential
+witness on this dev host — NOT native-Linux-CI-only (unlike phases 26/27).
+
+**Schema lock-in.** New unit test
+`driver_http1_hash_sweep_round_trips_through_serde` round-trips the
+`http1_hash_sweep` expectations YAML (mirrors the RDS/EDS round-trip tests).
+
+**clippy:** `cargo clippy -p differential --all-targets --all-features --
+-D warnings` → clean (exit 0). **fmt:** `cargo fmt --all -- --check` → clean.
+**lib unit tests:** `cargo test -p differential --lib` → 147 passed, 0 failed,
+2 ignored.
