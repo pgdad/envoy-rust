@@ -1,0 +1,63 @@
+# 27 fixture-0035 expectations: file-based EDS HOT-RELOAD (ADR-0067 SPEC /
+# ADR-0068 PLAN) — the runtime continuation of phase-21's EDS *initial-load*
+# surface (fixture 0029). A STATIC-but-EDS cluster `eds_backend` (NO inline
+# `load_assignment`); its single endpoint arrives entirely from the watched EDS
+# file, and CHANGES only because each proxy re-reads the file after an
+# atomic-rename rewrite. Driver::Http1EdsReload runs a THREE-PHASE bilateral
+# sequence over TWO distinguishable single-endpoint backends:
+#
+#   pre_probes (before reload):  GET /probe -> 200, body `backend: backend_1`
+#       (the initial EDS endpoint = backend_1, spawned `--body-marker backend_1`)
+#   reload: atomic-rename eds-reload.yaml over the watched EDS path on BOTH
+#           sides (the endpoint swapped backend_1 -> backend_2), then POLL the
+#           discriminator (GET /probe) until its body's leading marker line flips
+#           to `backend: backend_2` (= "converged"), bounded by settle_budget_ms.
+#   post_probes (after convergence): GET /probe -> 200, body `backend: backend_2`
+#       (the SWAPPED EDS endpoint = backend_2).
+#
+# The SAME path (/probe) returns a DIFFERENT body (`backend_1` -> `backend_2`)
+# after the rewrite, proving the EDS endpoint set was re-read and hot-swapped —
+# identically on both sides. The echoed body is byte-exact on EACH side: the
+# Envoy side strips the proxy-injected upstream headers in its MAIN config (see
+# envoy.yaml: generate_request_id:false + a header_mutation filter +
+# suppress_envoy_headers:true), so both sides forward the SAME request to the
+# echo helper and only `host` survives in the echoed body.
+#
+# NATIVE-LINUX-CI-AUTHORITATIVE: under macOS/Docker-Desktop virtiofs the host
+# bind-mount inotify does not propagate into the container, so the upstream
+# Envoy never observes the reload locally; the cluster/counter/config_dump
+# reload proofs AND the bad-reload taxonomy (V4(a)-(e) + apply-empty -> 503 +
+# in-flight isolation + cursor-bounds) live in the in-process backstop
+# (crates/envoy-bin/tests/xds_eds_hot_reload.rs). See README.
+driver:
+  kind: http1_eds_reload
+  pre_probes:
+    - name: probe_backend_1
+      method: get
+      path: /probe
+      host: eds_backend
+      expected_status: 200
+      expected_body:
+        kind: byte_exact
+        body: "backend: backend_1\nmethod: GET\npath: /probe\nheaders:\n  host: eds_backend\nbody: \n"
+  reload:
+    # reload_file omitted -> defaults to eds-reload.yaml.
+    settle_budget_ms: 5000
+    discriminator:
+      name: converge_backend_2
+      method: get
+      path: /probe
+      host: eds_backend
+      expected_status: 200
+      expected_body:
+        kind: byte_exact
+        body: "backend: backend_2\nmethod: GET\npath: /probe\nheaders:\n  host: eds_backend\nbody: \n"
+  post_probes:
+    - name: probe_backend_2
+      method: get
+      path: /probe
+      host: eds_backend
+      expected_status: 200
+      expected_body:
+        kind: byte_exact
+        body: "backend: backend_2\nmethod: GET\npath: /probe\nheaders:\n  host: eds_backend\nbody: \n"

@@ -1,0 +1,28 @@
+# 27 fixture-0035 — the INITIAL EDS file (loaded at boot): a bare `resources:`
+# envelope with one `@type`-tagged ClusterLoadAssignment named `eds_backend`,
+# pointing the single endpoint at BACKEND_1. Like fixture 0029's eds.yaml this
+# is a SINGLE SHARED template rendered per-side through each side's kv map, so
+# it carries NO Envoy-only fields.
+#
+# NUMERIC IP, per-side (L1 / L9 — EDS REJECTS hostnames → update_rejected): the
+# backend `socket_address.address` is the `{{EDS_BACKEND_IP}}` marker — the
+# harness renders it to the runtime-discovered numeric host-gateway IP on the
+# upstream (Envoy) side and `127.0.0.1` on the subject (envoy-rust) side.
+# `{{HTTP1_BACKEND_1_PORT}}` resolves to backend_1's http1-echo-server port
+# (spawned with `--body-marker backend_1`) per side.
+#
+# Backend-spawn note (harness `backend_scan_sources`): the harness scans ONLY
+# `eds.yaml` (NOT `eds-reload.yaml`) to decide which echo backends to spawn and
+# which port keys to put in the per-side kv map. The post-reload endpoint lives
+# in eds-reload.yaml as `{{HTTP1_BACKEND_2_PORT}}`, so we MUST also reference
+# that marker HERE — otherwise backend_2 is never spawned and the reload render
+# bails on the unsubstituted token. It is referenced in this comment only (the
+# LIVE initial endpoint below is backend_1): {{HTTP1_BACKEND_2_PORT}}
+resources:
+  - "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment
+    cluster_name: eds_backend
+    endpoints:
+      - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: { address: {{EDS_BACKEND_IP}}, port_value: {{HTTP1_BACKEND_1_PORT}} }

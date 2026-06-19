@@ -1,0 +1,62 @@
+node: { id: envoy-rust-phase-27-fixture-0035, cluster: envoy-rust-phase-27 }
+# Kernel-ephemeral admin (port 0): the Http1EdsReload driver probes ONLY the
+# data listener (/probe) and never scrapes admin — so this fixture follows the
+# non-admin-scraping convention of the RDS-hot-reload sibling 0034, NOT the
+# {{ADMIN_PORT}} convention of the initial-load EDS sibling 0029. (The harness
+# `needs_admin_port` gate does not reserve/substitute {{ADMIN_PORT}} for this
+# driver, so a literal {{ADMIN_PORT}} here would leave an unsubstituted marker.
+# The counter / config_dump reload proofs live in the in-process backstop.)
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 0 } } }
+# 27 fixture-0035 (ADR-0067 SPEC / ADR-0068 PLAN): file-based EDS HOT-RELOAD —
+# the runtime continuation of phase-21's EDS *initial-load* surface (fixture
+# 0029). A STATIC-but-EDS cluster `eds_backend` (NO inline `load_assignment`):
+# its endpoint arrives from the SHARED `eds.yaml` at boot via
+# `eds_cluster_config.eds_config.path_config_source.path`, and CHANGES only
+# because each proxy re-reads the file after an atomic-rename rewrite
+# (`eds.yaml` → `eds-reload.yaml`): backend_1 → backend_2.
+#
+# NO `dynamic_resources` (the cluster is STATIC-but-EDS, NOT CDS-delivered).
+# NO active HC / NO outlier detection on `eds_backend` (§0 finding 3): only a
+# PLAIN EDS cluster gets a reload watcher.
+static_resources:
+  listeners:
+    - name: http1_listener
+      address: { socket_address: { address: 127.0.0.1, port_value: {{PORT}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                # INLINE route_config: the route table is static. `/probe` routes
+                # to the EDS-supplied cluster `eds_backend`. envoy-rust emits the
+                # proxy-injected-header stripping natively, so this side carries
+                # NONE of the Envoy-only main-config knobs (the per-side
+                # field-set divergence — see envoy.yaml / README).
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend_vh
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/probe" }
+                          route: { cluster: eds_backend }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    # The `eds_backend` cluster: STATIC cluster declaration with `type: EDS`.
+    # NO inline `load_assignment` — the endpoint arrives from the SHARED
+    # eds.yaml at boot, then is hot-reloaded from eds-reload.yaml at runtime.
+    # NO health_checks / NO outlier_detection: a PLAIN EDS cluster, the only
+    # kind that gets a reload watcher (§0 finding 3 / Decision-5).
+    - name: eds_backend
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        eds_config:
+          resource_api_version: V3
+          path_config_source:
+            path: {{EDS_PATH}}

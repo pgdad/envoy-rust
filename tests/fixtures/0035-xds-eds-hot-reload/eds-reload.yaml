@@ -1,0 +1,19 @@
+# 27 fixture-0035 — the POST-RELOAD EDS file: IDENTICAL envelope/CLA shape as
+# eds.yaml (same `eds_backend` cluster_name) but the single endpoint now points
+# at BACKEND_2 (`{{HTTP1_BACKEND_2_PORT}}`, spawned with `--body-marker
+# backend_2`). The harness atomic-renames this over the watched `{{EDS_PATH}}`
+# on BOTH sides; each proxy re-reads it and hot-swaps the endpoint set, so the
+# SAME `/probe` response body flips its leading `backend: backend_1` line to
+# `backend: backend_2` — the bilateral hot-reload proof.
+#
+# As with eds.yaml this is a SINGLE SHARED template rendered per-side (NO
+# Envoy-only fields); `{{EDS_BACKEND_IP}}` renders to the host-gateway IP on the
+# upstream side and `127.0.0.1` on the subject side.
+resources:
+  - "@type": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment
+    cluster_name: eds_backend
+    endpoints:
+      - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address: { address: {{EDS_BACKEND_IP}}, port_value: {{HTTP1_BACKEND_2_PORT}} }
