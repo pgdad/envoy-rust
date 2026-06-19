@@ -666,6 +666,21 @@ pub enum ConfigError {
         maximum: u64,
     },
 
+    /// 29 D1 (ADR-0072): a MAGLEV cluster's `maglev_lb_config.table_size` is not a
+    /// prime number. Envoy requires a prime table size ("The table size of maglev
+    /// must be prime number"); rejected as startup-fatal (the ADR-0049 all-fatal
+    /// posture).
+    #[error("cluster '{cluster}' maglev_lb_config.table_size {table_size} is not a prime number")]
+    MaglevTableSizeNotPrime { cluster: String, table_size: u64 },
+
+    /// 29 D1 (ADR-0072): a MAGLEV cluster's `maglev_lb_config.table_size` exceeds
+    /// Envoy's maximum 5000011. Rejected as startup-fatal (the ADR-0049 all-fatal
+    /// posture).
+    #[error(
+        "cluster '{cluster}' maglev_lb_config.table_size {table_size} exceeds the maximum 5000011"
+    )]
+    MaglevTableSizeTooLarge { cluster: String, table_size: u64 },
+
     /// 28 Task 4 (ADR-0069): a route `hash_policy` entry names a `policy_specifier`
     /// other than `header`. Envoy's `RouteAction.hash_policy` is a oneof
     /// (`header` / `cookie` / `connection_properties` / `query_parameter` /

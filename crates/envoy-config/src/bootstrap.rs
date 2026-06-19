@@ -2638,6 +2638,26 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
     Ok(())
 }
 
+/// 29 (ADR-0072): primality test for `MaglevLbConfig.table_size` (bounded
+/// ≤ 5000011, so trial division to sqrt(n) is cheap — sqrt(5000011) ≈ 2236).
+/// `0`/`1` are not prime.
+fn is_prime(n: u64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n.is_multiple_of(2) {
+        return n == 2;
+    }
+    let mut d = 3u64;
+    while d * d <= n {
+        if n.is_multiple_of(d) {
+            return false;
+        }
+        d += 2;
+    }
+    true
+}
+
 /// Run the per-cluster invariant gauntlet on a single cluster. Extracted from
 /// `validate()`'s static-cluster loop (Task-2 Step 3b) so that `validate()` and
 /// `cds::parse_cds_file` share ONE source of truth: dynamically-loaded (CDS)
@@ -2667,6 +2687,29 @@ pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigErr
                 cluster: cluster.name.clone(),
                 minimum: cfg.minimum_ring_size,
                 maximum: cfg.maximum_ring_size,
+            });
+        }
+    }
+    // 29 D1 (ADR-0072): MAGLEV sub-config validation. Gated to MAGLEV clusters —
+    // upstream Envoy accepts-and-ignores a `maglev_lb_config` on a non-MAGLEV
+    // cluster (the phase-28 ring precedent), so we don't validate it there. Like
+    // the RING_HASH block this runs BEFORE the EDS early-return below. Both
+    // rejections are all-fatal (ADR-0049). Over-max is checked FIRST so the
+    // bounded `is_prime` trial loop never runs on a huge value.
+    const MAGLEV_MAX_TABLE_SIZE: u64 = 5_000_011;
+    if cluster.lb_policy == LbPolicy::Maglev
+        && let Some(cfg) = cluster.maglev_lb_config.as_ref()
+    {
+        if cfg.table_size > MAGLEV_MAX_TABLE_SIZE {
+            return Err(crate::ConfigError::MaglevTableSizeTooLarge {
+                cluster: cluster.name.clone(),
+                table_size: cfg.table_size,
+            });
+        }
+        if !is_prime(cfg.table_size) {
+            return Err(crate::ConfigError::MaglevTableSizeNotPrime {
+                cluster: cluster.name.clone(),
+                table_size: cfg.table_size,
             });
         }
     }
@@ -4927,8 +4970,11 @@ static_resources:
     fn accepts_maglev_lb_config_on_non_maglev_cluster() {
         // Upstream Envoy accepts-and-ignores maglev_lb_config on a non-MAGLEV
         // cluster; envoy-rust matches that (validation gated to MAGLEV clusters,
-        // landing in Task 3). For this task the field need only parse and be
-        // accepted on a ROUND_ROBIN cluster.
+        // Task 3 — ADR-0072). Even an otherwise-invalid sub-config (here a
+        // non-prime table_size: 100, which a MAGLEV cluster would reject as
+        // startup-fatal) parses without error on a ROUND_ROBIN cluster — proving
+        // the validation is genuinely gated (mirrors
+        // accepts_ring_hash_lb_config_on_non_ring_hash_cluster).
         let yaml = r#"
 admin:
   address:
@@ -4941,7 +4987,7 @@ static_resources:
       type: STATIC
       lb_policy: ROUND_ROBIN
       maglev_lb_config:
-        table_size: 65537
+        table_size: 100
       load_assignment:
         cluster_name: backend
         endpoints:
@@ -4956,6 +5002,159 @@ static_resources:
         let c = &b.static_resources.clusters[0];
         assert!(matches!(c.lb_policy, LbPolicy::RoundRobin));
         assert!(c.maglev_lb_config.is_some());
+    }
+
+    // ---- Phase 29 Task 3: MAGLEV table_size validation (prime/over-max, gated) ----
+
+    #[test]
+    fn rejects_non_prime_maglev_table_size() {
+        // ADR-0072: a MAGLEV cluster's non-prime table_size is startup-fatal
+        // (Envoy: "The table size of maglev must be prime number").
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      maglev_lb_config:
+        table_size: 100
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::MaglevTableSizeNotPrime { .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn rejects_over_max_maglev_table_size() {
+        // ADR-0072: a MAGLEV cluster's table_size > 5000011 is startup-fatal
+        // (PGV: value must be less than or equal to 5000011).
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      maglev_lb_config:
+        table_size: 5000012
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
+        assert!(
+            matches!(err, crate::ConfigError::MaglevTableSizeTooLarge { .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn accepts_max_maglev_table_size() {
+        // ADR-0072: exactly 5000011 (prime, == the maximum) boots.
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      maglev_lb_config:
+        table_size: 5000011
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML — 5000011 is prime and == max");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c
+            .maglev_lb_config
+            .as_ref()
+            .expect("maglev_lb_config present");
+        assert_eq!(cfg.table_size, 5_000_011);
+    }
+
+    #[test]
+    fn accepts_default_prime_maglev_table_size() {
+        // ADR-0072: the default table_size (65537, applied for `maglev_lb_config: {}`)
+        // is prime and within bounds — boots.
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+      maglev_lb_config: {}
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#;
+        let b = crate::parse_bootstrap(yaml).expect("valid YAML — default 65537 is prime");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c
+            .maglev_lb_config
+            .as_ref()
+            .expect("maglev_lb_config present");
+        assert_eq!(cfg.table_size, 65537);
+    }
+
+    #[test]
+    fn is_prime_helper() {
+        // ADR-0072: primality test for MaglevLbConfig.table_size.
+        assert!(super::is_prime(65537));
+        assert!(super::is_prime(5_000_011));
+        assert!(super::is_prime(2));
+        assert!(super::is_prime(3));
+        assert!(!super::is_prime(100));
+        assert!(!super::is_prime(9));
+        assert!(!super::is_prime(0));
+        assert!(!super::is_prime(1));
     }
 
     #[test]
