@@ -368,8 +368,15 @@ pub struct LbSubsetConfig {
     pub fallback_policy: LbSubsetFallbackPolicy,
     #[serde(default)]
     pub subset_selectors: Vec<LbSubsetSelector>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_subset: Option<LbMetadata>,
+    /// Envoy `LbSubsetConfig.default_subset` is a `google.protobuf.Struct` — a FLAT
+    /// key→value map (`{ stage: prod }`), NOT a `core.v3.Metadata` (ADR-0075). Scalar
+    /// values are stringified (Envoy Struct values are `google.protobuf.Value`).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_flat_struct",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_subset: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// 28 D1 (ADR-0069): RING_HASH LB tuning knobs. Mirrors Envoy v1.33's
@@ -533,6 +540,25 @@ fn stringify_scalar(v: &serde_yaml::Value) -> Option<String> {
         serde_yaml::Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
+}
+
+/// 30 (ADR-0075): deserialize `LbSubsetConfig.default_subset` — a flat
+/// `google.protobuf.Struct` (`{ <key>: <value> }`). Scalar values are stringified
+/// (reusing `stringify_scalar`); non-scalars are dropped (permissive, never errors).
+fn deserialize_opt_flat_struct<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::collections::BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let opt: Option<std::collections::BTreeMap<String, serde_yaml::Value>> =
+        Option::deserialize(deserializer)?;
+    Ok(opt.map(|m| {
+        m.iter()
+            .filter_map(|(k, v)| stringify_scalar(v).map(|s| (k.clone(), s)))
+            .collect()
+    }))
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -13829,9 +13855,7 @@ static_resources:
             "      lb_subset_config:\n",
             "        fallback_policy: DEFAULT_SUBSET\n",
             "        default_subset:\n",
-            "          filter_metadata:\n",
-            "            envoy.lb:\n",
-            "              stage: prod\n",
+            "          stage: prod\n",
             "        subset_selectors:\n",
             "          - keys: [stage]\n",
         );
@@ -13842,7 +13866,8 @@ static_resources:
             .expect("present");
         assert_eq!(cfg.fallback_policy, LbSubsetFallbackPolicy::DefaultSubset);
         let ds = cfg.default_subset.as_ref().expect("default_subset present");
-        assert_eq!(ds.envoy_lb.get("stage"), Some(&"prod".to_string()));
+        assert_eq!(ds.get("stage").map(String::as_str), Some("prod"));
+        assert_eq!(ds.len(), 1);
     }
 
     #[test]
