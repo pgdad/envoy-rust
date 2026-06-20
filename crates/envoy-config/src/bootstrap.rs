@@ -430,6 +430,61 @@ pub struct LocalityLbEndpoints {
 #[serde(deny_unknown_fields)]
 pub struct LbEndpoint {
     pub endpoint: Endpoint,
+    /// 30 D1 (ADR-0073/0074): the endpoint's `envoy.lb` filter-metadata slice,
+    /// used by subset LB. Absent ⇒ `None`. See `LbMetadata`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<LbMetadata>,
+}
+
+/// 30 D1 (ADR-0073/0074): the `envoy.lb` filter-metadata slice used by subset LB.
+/// Mirrors Envoy `core.v3.Metadata.filter_metadata["envoy.lb"]` — a map of
+/// string key → string value. Other filter_metadata namespaces are parsed and
+/// ignored (they belong to other consumers). Ordered map for deterministic
+/// subset-key tuples (BTreeMap).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(from = "MetadataWire")]
+pub struct LbMetadata {
+    /// the `envoy.lb` namespace map (empty when absent).
+    pub envoy_lb: std::collections::BTreeMap<String, String>,
+}
+
+/// Private wire mirror of Envoy's `core.v3.Metadata`: `filter_metadata` is a map
+/// of namespace → (map of key → value). `From<MetadataWire>` pulls the
+/// `"envoy.lb"` namespace and stringifies each scalar value (§6.2: only strings
+/// are observed in practice, but non-string scalars are coerced via a permissive
+/// `to_string`; non-scalar values are skipped — parse-and-ignore, never error).
+#[derive(Deserialize)]
+struct MetadataWire {
+    #[serde(default)]
+    filter_metadata:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, serde_yaml::Value>>,
+}
+
+impl From<MetadataWire> for LbMetadata {
+    fn from(wire: MetadataWire) -> Self {
+        let envoy_lb = wire
+            .filter_metadata
+            .get("envoy.lb")
+            .map(|ns| {
+                ns.iter()
+                    .filter_map(|(k, v)| stringify_scalar(v).map(|s| (k.clone(), s)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        LbMetadata { envoy_lb }
+    }
+}
+
+/// Coerce a YAML scalar to its string form for the `envoy.lb` map. Strings pass
+/// through verbatim; other scalars (bool / number) stringify permissively;
+/// non-scalar values (sequence / mapping / null / tagged) are dropped (None).
+fn stringify_scalar(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -13582,6 +13637,56 @@ static_resources:
             msg.contains("unknown field") || msg.contains("api_config_source"),
             "expected deny_unknown_fields rejection; got {msg}",
         );
+    }
+
+    // ---- 30 Task 1 (ADR-0073/0074): LbMetadata + endpoint metadata ----
+
+    #[test]
+    fn lb_metadata_parses_envoy_lb_namespace() {
+        let yaml = r#"
+endpoint:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 8001 }
+metadata:
+  filter_metadata:
+    envoy.lb:
+      stage: prod
+      version: v2
+"#;
+        let ep: LbEndpoint = serde_yaml::from_str(yaml).expect("valid LbEndpoint");
+        let md = ep.metadata.expect("metadata present");
+        assert_eq!(md.envoy_lb.get("stage"), Some(&"prod".to_string()));
+        assert_eq!(md.envoy_lb.get("version"), Some(&"v2".to_string()));
+        assert_eq!(md.envoy_lb.len(), 2);
+    }
+
+    #[test]
+    fn lb_metadata_absent_is_none() {
+        let yaml = r#"
+endpoint:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 8001 }
+"#;
+        let ep: LbEndpoint = serde_yaml::from_str(yaml).expect("valid LbEndpoint");
+        assert!(ep.metadata.is_none(), "no metadata → None");
+    }
+
+    #[test]
+    fn lb_metadata_non_envoy_lb_namespace_ignored() {
+        // A non-`envoy.lb` namespace must parse without error and yield an empty
+        // `envoy.lb` map (parsed-and-ignored, not an error).
+        let yaml = r#"
+endpoint:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 8001 }
+metadata:
+  filter_metadata:
+    envoy.transport_socket_match:
+      foo: bar
+"#;
+        let ep: LbEndpoint = serde_yaml::from_str(yaml).expect("valid LbEndpoint");
+        let md = ep.metadata.expect("metadata struct present");
+        assert!(md.envoy_lb.is_empty(), "non-envoy.lb namespace ignored");
     }
 }
 
