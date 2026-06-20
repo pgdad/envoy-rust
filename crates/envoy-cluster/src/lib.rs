@@ -19,6 +19,7 @@ mod health;
 mod maglev;
 mod outlier;
 mod ring_hash;
+mod subset;
 pub mod xds_watch;
 mod xxhash;
 
