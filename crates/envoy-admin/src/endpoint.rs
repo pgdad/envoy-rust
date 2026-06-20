@@ -648,6 +648,7 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
                             },
                         },
                     },
+                    metadata: None, // 30 Task 1 (LbEndpoint.metadata)
                 })
                 .collect(),
         }]

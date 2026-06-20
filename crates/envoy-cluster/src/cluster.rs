@@ -2246,6 +2246,7 @@ admin:
                                 },
                             },
                         },
+                        metadata: None, // 30 Task 1 (LbEndpoint.metadata)
                     }],
                 }],
             }),
@@ -4102,6 +4103,7 @@ admin:
                                 },
                             },
                         },
+                        metadata: None, // 30 Task 1 (LbEndpoint.metadata)
                     }],
                 }],
             }),
@@ -4286,6 +4288,7 @@ admin:
                                 },
                             },
                         },
+                        metadata: None, // 30 Task 1 (LbEndpoint.metadata)
                     }],
                 }],
             }),
