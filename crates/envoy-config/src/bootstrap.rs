@@ -441,6 +441,8 @@ pub struct LbEndpoint {
 /// string key → string value. Other filter_metadata namespaces are parsed and
 /// ignored (they belong to other consumers). Ordered map for deterministic
 /// subset-key tuples (BTreeMap).
+/// NOTE: `Serialize` emits the internal flat shape (`envoy_lb`), NOT the Envoy
+/// wire shape — `LbMetadata` is not round-trip symmetric (deserialize-only `from` shim).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(from = "MetadataWire")]
 pub struct LbMetadata {
@@ -13687,6 +13689,27 @@ metadata:
         let ep: LbEndpoint = serde_yaml::from_str(yaml).expect("valid LbEndpoint");
         let md = ep.metadata.expect("metadata struct present");
         assert!(md.envoy_lb.is_empty(), "non-envoy.lb namespace ignored");
+    }
+
+    #[test]
+    fn lb_metadata_coerces_non_string_scalars() {
+        // §6.2 COERCE: non-string scalars (number / bool) stringify permissively
+        // so the `envoy_lb` map is uniformly string-valued (Task 4 subset keys).
+        let yaml = r#"
+endpoint:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 8001 }
+metadata:
+  filter_metadata:
+    envoy.lb:
+      version: 2
+      enabled: true
+"#;
+        let ep: LbEndpoint = serde_yaml::from_str(yaml).expect("valid LbEndpoint");
+        let md = ep.metadata.expect("metadata present");
+        assert_eq!(md.envoy_lb.get("version"), Some(&"2".to_string()));
+        assert_eq!(md.envoy_lb.get("enabled"), Some(&"true".to_string()));
+        assert_eq!(md.envoy_lb.len(), 2);
     }
 }
 
