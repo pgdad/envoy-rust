@@ -398,16 +398,10 @@ impl Cluster {
             // HC/OD by intersection so a subset cluster that ALSO has HC/OD never returns an
             // out-of-subset or unhealthy host (the MVP fixture is plain → this filter is a
             // vacuous pass). A stale index (reload-shrunk eps) is guarded by `i < total`.
-            let health = self.endpoint_health.as_ref();
-            let ejection = self.outlier_detection.as_ref().map(|od| &od.endpoints);
             let sub: Vec<usize> = idxs
                 .into_iter()
                 .filter(|&i| i < total)
-                .filter(|&i| {
-                    let healthy = health.is_none_or(|h| h[i].is_healthy());
-                    let not_ejected = ejection.is_none_or(|e| !e[i].is_ejected());
-                    healthy && not_ejected
-                })
+                .filter(|&i| self.endpoint_eligible(i))
                 .collect();
             if sub.is_empty() {
                 return None; // no eligible host in the subset -> 503 (NO_FALLBACK semantics)
@@ -472,17 +466,7 @@ impl Cluster {
                 "outlier ejection must align with endpoints"
             );
         }
-        let is_eligible = |i: usize| -> bool {
-            let healthy = match health {
-                None => true,
-                Some(h) => h[i].is_healthy(),
-            };
-            let not_ejected = match ejection {
-                None => true,
-                Some(e) => !e[i].is_ejected(),
-            };
-            healthy && not_ejected
-        };
+        let is_eligible = |i: usize| self.endpoint_eligible(i);
         let eligible_count = (0..total).filter(|&i| is_eligible(i)).count();
         let eligible_percent = 100.0 * (eligible_count as f64) / (total as f64);
         // Panic threshold (strictly-below): route over ALL endpoints when the
@@ -501,6 +485,23 @@ impl Cluster {
         }
         let i = self.cursor.fetch_add(1, Ordering::Relaxed);
         Some(eps[eligible_idx[i % eligible_idx.len()]])
+    }
+
+    /// 30 (Task-5 review M-1): the per-endpoint eligibility predicate shared by the
+    /// subset-narrowing path AND the slow HC/OD path — endpoint `i` is eligible iff it
+    /// is healthy (active HC; vacuously true when `endpoint_health` is None) AND not
+    /// ejected (outlier detection; vacuously true when `outlier_detection` is None).
+    /// `i` MUST be < the current endpoint count (callers guarantee this).
+    fn endpoint_eligible(&self, i: usize) -> bool {
+        let healthy = match self.endpoint_health.as_ref() {
+            None => true,
+            Some(h) => h[i].is_healthy(),
+        };
+        let not_ejected = match self.outlier_detection.as_ref().map(|od| &od.endpoints) {
+            None => true,
+            Some(e) => !e[i].is_ejected(),
+        };
+        healthy && not_ejected
     }
 
     /// 27 D1 (§5.4 read-once): snapshot the current endpoint address set as a
