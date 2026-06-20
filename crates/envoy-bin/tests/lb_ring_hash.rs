@@ -153,7 +153,7 @@ async fn ring_determinism_matches_section_6_2_oracle() {
 
     for (key, expected) in oracle {
         let hash = hash_request_key(key);
-        let got = rh.pick_endpoint(Some(hash));
+        let got = rh.pick_endpoint(Some(hash), None);
         assert_eq!(
             got,
             Some(*expected),
@@ -162,7 +162,7 @@ async fn ring_determinism_matches_section_6_2_oracle() {
         );
         // Determinism: a SECOND pick with the same key lands on the same host.
         assert_eq!(
-            rh.pick_endpoint(Some(hash)),
+            rh.pick_endpoint(Some(hash), None),
             Some(*expected),
             "ring pick is deterministic for key {:?}",
             std::str::from_utf8(key).unwrap()
@@ -186,7 +186,7 @@ async fn ring_spread_selects_both_hosts() {
     for i in 0..16u32 {
         let key = format!("spread-key-{i}");
         let pick = rh
-            .pick_endpoint(Some(hash_request_key(key.as_bytes())))
+            .pick_endpoint(Some(hash_request_key(key.as_bytes())), None)
             .expect("RING_HASH pick yields a host for a healthy cluster");
         assert!(
             pick == host0() || pick == host1(),
@@ -215,7 +215,7 @@ async fn no_hash_key_falls_back_to_valid_host() {
     let rh = build_cluster(&ring_hash_two_host_block(), "ring_cluster").await;
 
     let pick = rh
-        .pick_endpoint(None)
+        .pick_endpoint(None, None)
         .expect("RING_HASH None-key fallback must yield a valid host (cursor path)");
     assert!(
         pick == host0() || pick == host1(),
@@ -248,12 +248,12 @@ async fn empty_header_value_is_hashed_deterministically() {
     // HASHED path: Some(hash("")) pins to one host, stable across repeats.
     let empty_hash = hash_request_key(b"");
     let first = rh
-        .pick_endpoint(Some(empty_hash))
+        .pick_endpoint(Some(empty_hash), None)
         .expect("empty-value hashed pick yields a host");
     // Deterministic across repeated picks (it's a fixed key, not randomized).
     for _ in 0..8 {
         assert_eq!(
-            rh.pick_endpoint(Some(empty_hash)),
+            rh.pick_endpoint(Some(empty_hash), None),
             Some(first),
             "Some(hash(\"\")) is a deterministic hashed selection, not a random fallback"
         );
@@ -269,12 +269,12 @@ async fn empty_header_value_is_hashed_deterministically() {
     // absent-header fallback is the rotating cursor path, distinct from the pinned
     // hashed selection of an empty-but-present value above (ADR-0070).
     assert_eq!(
-        rh.pick_endpoint(None),
+        rh.pick_endpoint(None, None),
         Some(host0()),
         "None fallback (cursor 0) — absent-header path, NOT the hashed empty-value path"
     );
     assert_eq!(
-        rh.pick_endpoint(None),
+        rh.pick_endpoint(None, None),
         Some(host1()),
         "None fallback rotates to host1 (cursor 1) — it is NOT pinned to one host"
     );
@@ -291,19 +291,19 @@ async fn single_host_ring_routes_everything_to_the_one_host() {
     for i in 0..16u32 {
         let key = format!("single-key-{i}");
         assert_eq!(
-            rh.pick_endpoint(Some(hash_request_key(key.as_bytes()))),
+            rh.pick_endpoint(Some(hash_request_key(key.as_bytes())), None),
             Some(host0()),
             "single-host ring: key {key} → the one host"
         );
     }
     // The empty-value key and the None fallback also land on the one host.
     assert_eq!(
-        rh.pick_endpoint(Some(hash_request_key(b""))),
+        rh.pick_endpoint(Some(hash_request_key(b"")), None),
         Some(host0()),
         "single-host ring: empty-value key → the one host"
     );
     assert_eq!(
-        rh.pick_endpoint(None),
+        rh.pick_endpoint(None, None),
         Some(host0()),
         "single-host ring: None fallback → the one host"
     );
@@ -326,17 +326,17 @@ async fn round_robin_ignores_hash_key() {
     // endpoints[0] (2 % 2). A `Some(key)` call advances the cursor identically to
     // a `None` call.
     assert_eq!(
-        rr.pick_endpoint(Some(123)),
+        rr.pick_endpoint(Some(123), None),
         Some(host0()),
         "ROUND_ROBIN cursor 0, key ignored"
     );
     assert_eq!(
-        rr.pick_endpoint(None),
+        rr.pick_endpoint(None, None),
         Some(host1()),
         "ROUND_ROBIN cursor 1, key ignored (None advances the cursor)"
     );
     assert_eq!(
-        rr.pick_endpoint(Some(123)),
+        rr.pick_endpoint(Some(123), None),
         Some(host0()),
         "ROUND_ROBIN cursor 2 % 2 = 0, key ignored"
     );

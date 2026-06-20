@@ -3,7 +3,6 @@
 //! `metadata_match` selects the selector whose `keys` SET EQUALS the match's keys,
 //! then the value-tuple → the subset; superset match (endpoint metadata ⊇ match);
 //! fallback per `LbSubsetFallbackPolicy`. NO config is fatal (§A divergence #1).
-#![allow(dead_code)] // consumed by Task 5; remove the allow there.
 use std::collections::{BTreeMap, BTreeSet};
 
 use envoy_config::{LbSubsetConfig, LbSubsetFallbackPolicy};

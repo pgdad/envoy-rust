@@ -211,6 +211,15 @@ pub struct Cluster {
     /// cursor path). Replaces the phase-28 `ring: Option<HashRing>` discriminator
     /// (M28-3): `ring.is_some()` could not distinguish a SECOND ring-building policy.
     pub(crate) hash_lb: Option<HashLb>,
+    /// 30 (ADR-0073/0074): metadata-based subset LB index. `Some` ONLY when the
+    /// cluster's `lb_subset_config` block is present (built in `from_bootstrap`
+    /// over an `endpoint_metadata` Vec index-aligned with `endpoints`); `None`
+    /// for clusters with no subset config — the §6.2 inert-when-unconfigured
+    /// invariant. When `None`, `pick()` runs the EXISTING hash_lb/fast/slow
+    /// dispatch byte-identically (the no-op regression proof). When `Some`,
+    /// `pick()` resolves the route `metadata_match` to an eligible-endpoint set
+    /// BEFORE that dispatch and narrows to it.
+    pub(crate) subset: Option<crate::subset::SubsetIndex>,
     /// 27 Task 4 (§6.2 / ADR-0068): EDS-reload state, `Some` ONLY for `type: EDS`
     /// clusters (`None` for STATIC / STRICT_DNS — the §5.2 inert-when-unconfigured
     /// discipline). Carries the assignment-file path, the CLA selection name, and
@@ -343,7 +352,24 @@ impl Cluster {
     /// (Task 6 + the request-path backstop cover the real no-hash fallback). The
     /// PUBLIC `ClusterHandle::pick_endpoint` delegate passes `None` FOR NOW — Task
     /// 6 threads the real key through.
-    fn pick(&self, key_hash: Option<u64>) -> Option<SocketAddr> {
+    ///
+    /// 30 (ADR-0073/0074): `subset_match` carries the route's `metadata_match`
+    /// (the `envoy.lb` map). When the cluster has `subset: None` (no
+    /// `lb_subset_config`) this argument is INERT — the existing
+    /// hash_lb/fast/slow dispatch runs byte-identically (the no-op regression
+    /// proof). When `subset: Some`, the index resolves `subset_match` to an
+    /// eligible-endpoint set BEFORE the dispatch: `Eligible::All` → treated as
+    /// "all endpoints" (dispatch unchanged); `Eligible::Some(idxs)` → round-robin
+    /// within the matched subset (intersected with HC/OD eligibility, I-1);
+    /// `Eligible::None` → `None` (NO_FALLBACK no-match → 503). Subset +
+    /// consistent-hash-inner-LB and subset + panic-threshold are §2.2 deferred
+    /// non-goals (the MVP inner LB is ROUND_ROBIN). The real route-`metadata_match`
+    /// threading at the HCM sites is Task 6; every caller passes `None` for now.
+    fn pick(
+        &self,
+        key_hash: Option<u64>,
+        subset_match: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Option<SocketAddr> {
         // 27 D1 (§5.4 / M26-1): snapshot the current endpoint Arc ONCE at entry
         // and use this snapshot for the whole selection. Never re-acquire the
         // lock mid-selection — a concurrent `store_endpoints` swap then cannot
@@ -356,6 +382,39 @@ impl Cluster {
             return None;
         }
         let total = eps.len();
+        // 30: subset narrowing BEFORE the hash_lb/cursor dispatch. No lb_subset_config -> None
+        // (the no-op: the existing all-endpoints dispatch below runs UNCHANGED, byte-identical).
+        let subset_idxs: Option<Vec<usize>> = match self.subset.as_ref() {
+            None => None,
+            Some(ix) => match ix.resolve(subset_match) {
+                crate::subset::Eligible::All => None, // treat as "all endpoints"
+                crate::subset::Eligible::Some(idxs) => Some(idxs),
+                crate::subset::Eligible::None => return None, // NO_FALLBACK no-match -> 503
+            },
+        };
+        if let Some(idxs) = subset_idxs {
+            // 30 (I-1): MVP inner LB within a matched subset = ROUND_ROBIN cursor. Subset +
+            // hash-LB and subset + panic-threshold are §2.2 deferred non-goals. Compose with
+            // HC/OD by intersection so a subset cluster that ALSO has HC/OD never returns an
+            // out-of-subset or unhealthy host (the MVP fixture is plain → this filter is a
+            // vacuous pass). A stale index (reload-shrunk eps) is guarded by `i < total`.
+            let health = self.endpoint_health.as_ref();
+            let ejection = self.outlier_detection.as_ref().map(|od| &od.endpoints);
+            let sub: Vec<usize> = idxs
+                .into_iter()
+                .filter(|&i| i < total)
+                .filter(|&i| {
+                    let healthy = health.is_none_or(|h| h[i].is_healthy());
+                    let not_ejected = ejection.is_none_or(|e| !e[i].is_ejected());
+                    healthy && not_ejected
+                })
+                .collect();
+            if sub.is_empty() {
+                return None; // no eligible host in the subset -> 503 (NO_FALLBACK semantics)
+            }
+            let c = self.cursor.fetch_add(1, Ordering::Relaxed);
+            return Some(eps[sub[c % sub.len()]]);
+        }
         // 29 (M28-3 / §6.2-LOCKED): consistent-hash dispatch on `hash_lb` (Ring →
         // ketama-ring lookup, Maglev → permutation-table lookup). Both variants'
         // `lookup` returns a `host_index` that aligns with the `eps` Vec ordering
@@ -643,8 +702,16 @@ impl ClusterHandle {
     /// `Some(key_hash)`; `RoundRobin` IGNORES it (the cursor path). `None`
     /// (no `hash_policy`, or the header was ABSENT) falls back to the cursor
     /// path. Delegates straight to the private [`Cluster::pick`].
-    pub fn pick_endpoint(&self, key_hash: Option<u64>) -> Option<SocketAddr> {
-        self.inner.pick(key_hash)
+    /// 30 (ADR-0073/0074): `subset_match` carries the route's `metadata_match`
+    /// (the `envoy.lb` map) for metadata subset LB. INERT for clusters with no
+    /// `lb_subset_config` (the no-op). Every caller passes `None` FOR NOW — Task
+    /// 6 threads the real route `metadata_match` through at the HCM sites.
+    pub fn pick_endpoint(
+        &self,
+        key_hash: Option<u64>,
+        subset_match: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Option<SocketAddr> {
+        self.inner.pick(key_hash, subset_match)
     }
 
     /// 27 D1 (§5.4 / §6.2): delegates to [`Cluster::current_endpoints`] — a
@@ -1008,9 +1075,22 @@ pub async fn from_bootstrap(
             .as_ref()
             .expect("load_assignment populated post-load — §5.3 invariant");
         let mut endpoints: Vec<SocketAddr> = Vec::new();
+        // 30 (ADR-0073/0074, I-2 alignment): a Vec of each endpoint's `envoy.lb`
+        // metadata map, pushed ONCE PER RESOLVED `SocketAddr` so it stays exactly
+        // index-aligned with `endpoints` (Static/Eds: one LbEndpoint → one push;
+        // StrictDns: one LbEndpoint fans out to N resolved addrs → N pushes of the
+        // SAME map). The subset index `build` consumes this slice.
+        let mut endpoint_metadata: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
         for locality in &load_assignment.endpoints {
             for lbe in &locality.lb_endpoints {
                 let sa = &lbe.endpoint.address.socket_address;
+                // The endpoint's `envoy.lb` map (empty when no metadata), computed
+                // once per LbEndpoint and pushed once per resolved SocketAddr below.
+                let md = lbe
+                    .metadata
+                    .as_ref()
+                    .map(|m| m.envoy_lb.clone())
+                    .unwrap_or_default();
                 match cfg.cluster_type {
                     // 21 D1 (L1): EDS endpoints are resolved numeric socket
                     // addresses, parsed exactly like STATIC (NOT DNS-resolved
@@ -1035,6 +1115,8 @@ pub async fn from_bootstrap(
                             &sa.address,
                             sa.port_value,
                         )?);
+                        // 30 (I-2): one resolved addr → one metadata push.
+                        endpoint_metadata.push(md.clone());
                     }
                     envoy_config::ClusterType::StrictDns => {
                         // 05.1 NEW per ADR-0023: each endpoint's address is a
@@ -1069,16 +1151,35 @@ pub async fn from_bootstrap(
                                 ),
                             });
                         }
+                        let n = resolved.len();
                         endpoints.extend(resolved);
+                        // 30 (I-2): one LbEndpoint fans out to N resolved addrs →
+                        // push the SAME `envoy.lb` map N times so `endpoint_metadata`
+                        // stays index-aligned with `endpoints`.
+                        for _ in 0..n {
+                            endpoint_metadata.push(md.clone());
+                        }
                     }
                 }
             }
         }
+        debug_assert_eq!(
+            endpoints.len(),
+            endpoint_metadata.len(),
+            "endpoint_metadata must align 1:1 with endpoints (I-2)"
+        );
         if endpoints.is_empty() {
             return Err(ClusterError::EmptyCluster {
                 name: cfg.name.clone(),
             });
         }
+        // 30 (ADR-0073/0074): build the subset index ONLY when `lb_subset_config`
+        // is present (else `None` → `pick()` is byte-identical to before — the
+        // no-op regression proof). Built over the index-aligned `endpoint_metadata`.
+        let subset = cfg
+            .lb_subset_config
+            .as_ref()
+            .map(|sc| crate::subset::SubsetIndex::build(sc, &endpoint_metadata));
         // 05.3 NEW per SPEC §3 D3: project upstream_protocol from the parsed
         // cluster's typed_extension_protocol_options. The match arm is sync;
         // 05.1's lookup_host async branch is unaffected (the two are
@@ -1426,6 +1527,7 @@ pub async fn from_bootstrap(
             panic_threshold,
             outlier_detection,
             hash_lb,
+            subset,
             eds_reload,
         });
         if clusters.insert(cfg.name.clone(), cluster).is_some() {
@@ -1539,6 +1641,7 @@ mod tests {
                 panic_threshold: 50.0,
                 outlier_detection: None,
                 hash_lb: None,
+                subset: None,
                 eds_reload: None,
             }),
         }
@@ -1577,6 +1680,7 @@ mod tests {
             panic_threshold: 50.0,
             outlier_detection: None,
             hash_lb: Some(HashLb::Ring(ring)),
+            subset: None,
             eds_reload: None,
         };
         ClusterHandle {
@@ -1613,6 +1717,7 @@ mod tests {
             panic_threshold: 50.0,
             outlier_detection: None,
             hash_lb: Some(HashLb::Maglev(table)),
+            subset: None,
             eds_reload: None,
         };
         ClusterHandle {
@@ -1643,12 +1748,12 @@ mod tests {
         let rh = mk_ring_hash_handle("rh", vec![ep0, ep1], 1024);
         // Oracle: key-0 → host 0, key-2 → host 1.
         assert_eq!(
-            rh.inner.pick(Some(crate::xxhash::xxh64(b"key-0"))),
+            rh.inner.pick(Some(crate::xxhash::xxh64(b"key-0")), None),
             Some(ep0),
             "key-0 → host 0 (the ONE backend)"
         );
         assert_eq!(
-            rh.inner.pick(Some(crate::xxhash::xxh64(b"key-2"))),
+            rh.inner.pick(Some(crate::xxhash::xxh64(b"key-2")), None),
             Some(ep1),
             "key-2 → host 1 (the TWO backend)"
         );
@@ -1656,10 +1761,18 @@ mod tests {
         // RoundRobin: the key is inert — `pick(Some(123))` behaves like the
         // cursor path (first call → endpoints[0], second → endpoints[1]).
         let rr = mk_handle("rr", vec![ep0, ep1]);
-        assert_eq!(rr.inner.pick(Some(123)), Some(ep0), "cursor 0, key ignored");
-        assert_eq!(rr.inner.pick(Some(123)), Some(ep1), "cursor 1, key ignored");
+        assert_eq!(
+            rr.inner.pick(Some(123), None),
+            Some(ep0),
+            "cursor 0, key ignored"
+        );
+        assert_eq!(
+            rr.inner.pick(Some(123), None),
+            Some(ep1),
+            "cursor 1, key ignored"
+        );
         // And matches a `None`-key call (proving the key is truly inert).
-        assert_eq!(rr.inner.pick(None), Some(ep0), "cursor 2 % 2 = 0");
+        assert_eq!(rr.inner.pick(None, None), Some(ep0), "cursor 2 % 2 = 0");
     }
 
     /// 28 Task 6: the public `hash_request_key` helper is the ONLY public
@@ -1685,14 +1798,14 @@ mod tests {
         let rh = mk_ring_hash_handle("rh_pub", vec![ep0, ep1], 1024);
         // `Some(xxh64("key-0"))` → host 0 (the oracle).
         assert_eq!(
-            rh.pick_endpoint(Some(crate::xxhash::xxh64(b"key-0"))),
+            rh.pick_endpoint(Some(crate::xxhash::xxh64(b"key-0")), None),
             Some(ep0),
             "key-0 → host 0 through the public delegate"
         );
         // `None` (no-hash path) → a valid host (the ring is skipped; falls
         // through to the cursor path which yields endpoints[0] first).
         assert_eq!(
-            rh.pick_endpoint(None),
+            rh.pick_endpoint(None, None),
             Some(ep0),
             "None falls through to the cursor path → a valid host"
         );
@@ -1708,12 +1821,20 @@ mod tests {
         let rr = mk_handle("rr_pub", vec![ep0, ep1]);
         // The key is inert: the cursor advances regardless of Some/None.
         assert_eq!(
-            rr.pick_endpoint(Some(123)),
+            rr.pick_endpoint(Some(123), None),
             Some(ep0),
             "cursor 0, key ignored"
         );
-        assert_eq!(rr.pick_endpoint(None), Some(ep1), "cursor 1, key ignored");
-        assert_eq!(rr.pick_endpoint(Some(123)), Some(ep0), "cursor 2 % 2 = 0");
+        assert_eq!(
+            rr.pick_endpoint(None, None),
+            Some(ep1),
+            "cursor 1, key ignored"
+        );
+        assert_eq!(
+            rr.pick_endpoint(Some(123), None),
+            Some(ep0),
+            "cursor 2 % 2 = 0"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1750,15 +1871,15 @@ mod tests {
             let kh = crate::xxhash::xxh64(key.as_bytes());
             let expected_idx = table.lookup(kh).expect("non-empty table");
             assert_eq!(
-                mg.pick_endpoint(Some(kh)),
+                mg.pick_endpoint(Some(kh), None),
                 Some(endpoints[expected_idx]),
                 "key {key:?} dispatches through the table to host {expected_idx}"
             );
             // Determinism at the cluster level: repeated calls are stable (the
             // table lookup, NOT the advancing cursor).
             assert_eq!(
-                mg.pick_endpoint(Some(kh)),
-                mg.pick_endpoint(Some(kh)),
+                mg.pick_endpoint(Some(kh), None),
+                mg.pick_endpoint(Some(kh), None),
                 "same key → same endpoint across repeated cluster picks"
             );
         }
@@ -1776,7 +1897,7 @@ mod tests {
         let mut saw1 = false;
         for i in 0..256u64 {
             let kh = crate::xxhash::xxh64(format!("spread-key-{i}").as_bytes());
-            match mg.pick_endpoint(Some(kh)) {
+            match mg.pick_endpoint(Some(kh), None) {
                 Some(ep) if ep == ep0 => saw0 = true,
                 Some(ep) if ep == ep1 => saw1 = true,
                 other => panic!("unexpected pick {other:?}"),
@@ -1798,10 +1919,10 @@ mod tests {
         let ep1: SocketAddr = "172.31.0.3:5678".parse().unwrap();
         let mg = mk_maglev_handle("mg_none", vec![ep0, ep1], 65537);
         // No-hash → cursor path: cycles endpoints[0], [1], [0], [1], ... like RR.
-        assert_eq!(mg.pick_endpoint(None), Some(ep0), "cursor 0");
-        assert_eq!(mg.pick_endpoint(None), Some(ep1), "cursor 1");
-        assert_eq!(mg.pick_endpoint(None), Some(ep0), "cursor 2 % 2 = 0");
-        assert_eq!(mg.pick_endpoint(None), Some(ep1), "cursor 3 % 2 = 1");
+        assert_eq!(mg.pick_endpoint(None, None), Some(ep0), "cursor 0");
+        assert_eq!(mg.pick_endpoint(None, None), Some(ep1), "cursor 1");
+        assert_eq!(mg.pick_endpoint(None, None), Some(ep0), "cursor 2 % 2 = 0");
+        assert_eq!(mg.pick_endpoint(None, None), Some(ep1), "cursor 3 % 2 = 1");
     }
 
     /// 29 Task 7 (4): an EMPTY-but-PRESENT hash value hashes to `xxh64(b"")` (NOT
@@ -1822,10 +1943,13 @@ mod tests {
         // Pin the present-empty oracle host (maglev.rs: "" → host 0).
         assert_eq!(expected_idx, 0, "empty-but-present oracle maps to host 0");
         // Deterministic + routes through the table (NOT the cursor).
-        assert_eq!(mg.pick_endpoint(Some(kh)), Some(endpoints[expected_idx]));
         assert_eq!(
-            mg.pick_endpoint(Some(kh)),
-            mg.pick_endpoint(Some(kh)),
+            mg.pick_endpoint(Some(kh), None),
+            Some(endpoints[expected_idx])
+        );
+        assert_eq!(
+            mg.pick_endpoint(Some(kh), None),
+            mg.pick_endpoint(Some(kh), None),
             "empty-but-present key is deterministic (table, not cursor)"
         );
     }
@@ -1848,13 +1972,13 @@ mod tests {
         let rr = mk_handle("witness_rr", endpoints.clone());
         let rr_none = mk_handle("witness_rr2", endpoints.clone());
         assert_eq!(
-            rr.pick_endpoint(Some(kh)),
-            rr_none.pick_endpoint(None),
+            rr.pick_endpoint(Some(kh), None),
+            rr_none.pick_endpoint(None, None),
             "ROUND_ROBIN: Some(kh) == None (key inert, cursor path)"
         );
         // And the cursor advances regardless of the key being present.
         assert_eq!(
-            rr.pick_endpoint(Some(kh)),
+            rr.pick_endpoint(Some(kh), None),
             Some(ep1),
             "RR cursor advances; key inert"
         );
@@ -1867,13 +1991,13 @@ mod tests {
         let ref_ring = crate::ring_hash::HashRing::build(&ring_addrs, 1024);
         let rh_idx = ref_ring.lookup(kh).expect("non-empty ring");
         assert_eq!(
-            rh.pick_endpoint(Some(kh)),
+            rh.pick_endpoint(Some(kh), None),
             Some(endpoints[rh_idx]),
             "RING_HASH: routes via the ring"
         );
         assert_eq!(
-            rh.pick_endpoint(Some(kh)),
-            rh.pick_endpoint(Some(kh)),
+            rh.pick_endpoint(Some(kh), None),
+            rh.pick_endpoint(Some(kh), None),
             "RING_HASH: same key → same host (ring, not cursor)"
         );
 
@@ -1882,13 +2006,13 @@ mod tests {
         let table = reference_maglev_table(&endpoints, 65537);
         let mg_idx = table.lookup(kh).expect("non-empty table");
         assert_eq!(
-            mg.pick_endpoint(Some(kh)),
+            mg.pick_endpoint(Some(kh), None),
             Some(endpoints[mg_idx]),
             "MAGLEV: routes via the table"
         );
         assert_eq!(
-            mg.pick_endpoint(Some(kh)),
-            mg.pick_endpoint(Some(kh)),
+            mg.pick_endpoint(Some(kh), None),
+            mg.pick_endpoint(Some(kh), None),
             "MAGLEV: same key → same host (table, not cursor)"
         );
     }
@@ -1904,14 +2028,22 @@ mod tests {
         for key in ["", "a", "key-0", "1.2.3.4", "anything"] {
             let kh = crate::xxhash::xxh64(key.as_bytes());
             assert_eq!(
-                mg.pick_endpoint(Some(kh)),
+                mg.pick_endpoint(Some(kh), None),
                 Some(only),
                 "key {key:?} → sole host"
             );
         }
         // No-hash fallback (cursor path over a 1-element set) also yields it.
-        assert_eq!(mg.pick_endpoint(None), Some(only), "no-hash → sole host");
-        assert_eq!(mg.pick_endpoint(None), Some(only), "cursor cycle of 1");
+        assert_eq!(
+            mg.pick_endpoint(None, None),
+            Some(only),
+            "no-hash → sole host"
+        );
+        assert_eq!(
+            mg.pick_endpoint(None, None),
+            Some(only),
+            "cursor cycle of 1"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1928,7 +2060,7 @@ mod tests {
         let initial = mk_endpoints(2); // 127.0.0.1:10000, :10001
         let handle = mk_handle("backend", initial.clone());
         // (a) reads current set.
-        assert_eq!(handle.pick_endpoint(None).unwrap(), initial[0]); // cursor 0
+        assert_eq!(handle.pick_endpoint(None, None).unwrap(), initial[0]); // cursor 0
         // (b) swap in a brand-new, disjoint set.
         let replacement: Vec<SocketAddr> = vec![
             "127.0.0.1:20000".parse().unwrap(),
@@ -1936,9 +2068,9 @@ mod tests {
         ];
         handle.inner.store_endpoints(Arc::new(replacement.clone()));
         // The NEXT pick observes the replacement (cursor 1 → replacement[1]).
-        assert_eq!(handle.pick_endpoint(None).unwrap(), replacement[1]);
+        assert_eq!(handle.pick_endpoint(None, None).unwrap(), replacement[1]);
         assert!(
-            replacement.contains(&handle.pick_endpoint(None).unwrap()),
+            replacement.contains(&handle.pick_endpoint(None, None).unwrap()),
             "every subsequent pick reads the replacement set"
         );
     }
@@ -1971,10 +2103,10 @@ mod tests {
     #[test]
     fn endpoint_handle_store_empty_yields_none_next_pick() {
         let handle = mk_handle("backend", mk_endpoints(2));
-        assert!(handle.pick_endpoint(None).is_some());
+        assert!(handle.pick_endpoint(None, None).is_some());
         handle.inner.store_endpoints(Arc::new(Vec::new()));
         assert_eq!(
-            handle.pick_endpoint(None),
+            handle.pick_endpoint(None, None),
             None,
             "an empty endpoint set short-circuits to None before any modulo"
         );
@@ -1989,14 +2121,14 @@ mod tests {
         let handle = mk_handle("backend", initial);
         // Advance the cursor past 1 (so a stale length would index out of range).
         for _ in 0..5 {
-            assert!(handle.pick_endpoint(None).is_some());
+            assert!(handle.pick_endpoint(None, None).is_some());
         }
         // Shrink to a single endpoint.
         let one: Vec<SocketAddr> = vec!["127.0.0.1:40000".parse().unwrap()];
         handle.inner.store_endpoints(Arc::new(one.clone()));
         // Every subsequent pick must be the sole survivor — never an OOB index.
         for _ in 0..5 {
-            assert_eq!(handle.pick_endpoint(None).unwrap(), one[0]);
+            assert_eq!(handle.pick_endpoint(None, None).unwrap(), one[0]);
         }
     }
 
@@ -2005,7 +2137,7 @@ mod tests {
         let endpoints = mk_endpoints(3);
         let handle = mk_handle("backend", endpoints.clone());
         let picks: Vec<SocketAddr> = (0..7)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         let expected = vec![
             endpoints[0],
@@ -2037,7 +2169,7 @@ mod tests {
             let h = handle.clone();
             let c = Arc::clone(&counts);
             handles.push(thread::spawn(move || {
-                let ep = h.pick_endpoint(None).expect("non-empty");
+                let ep = h.pick_endpoint(None, None).expect("non-empty");
                 *c.lock().unwrap().entry(ep).or_insert(0) += 1;
             }));
         }
@@ -2068,10 +2200,10 @@ mod tests {
         // cursor, the sequence is alternating-index; with separate cursors
         // each handle would pick its own [0,1,0,1,...].
         let seq: Vec<SocketAddr> = vec![
-            a.pick_endpoint(None).unwrap(), // cursor=0 -> endpoints[0]
-            b.pick_endpoint(None).unwrap(), // cursor=1 -> endpoints[1]
-            a.pick_endpoint(None).unwrap(), // cursor=2 -> endpoints[0]
-            b.pick_endpoint(None).unwrap(), // cursor=3 -> endpoints[1]
+            a.pick_endpoint(None, None).unwrap(), // cursor=0 -> endpoints[0]
+            b.pick_endpoint(None, None).unwrap(), // cursor=1 -> endpoints[1]
+            a.pick_endpoint(None, None).unwrap(), // cursor=2 -> endpoints[0]
+            b.pick_endpoint(None, None).unwrap(), // cursor=3 -> endpoints[1]
         ];
         assert_eq!(
             seq,
@@ -2109,7 +2241,7 @@ admin:
             .await
             .expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
-        let picked = handle.pick_endpoint(None).expect("non-empty");
+        let picked = handle.pick_endpoint(None, None).expect("non-empty");
         assert_eq!(picked, "127.0.0.1:10042".parse::<SocketAddr>().unwrap());
     }
 
@@ -2154,7 +2286,7 @@ admin:
             .expect("construct");
         let handle = mgr.get("backend").expect("cluster present");
         let picks: Vec<SocketAddr> = (0..3)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert_eq!(
             picks,
@@ -2327,6 +2459,7 @@ admin:
             panic_threshold: 50.0,
             outlier_detection: None,
             hash_lb: None,
+            subset: None,
             eds_reload: None,
         };
         assert_eq!(c.name(), "backend");
@@ -2345,7 +2478,7 @@ admin:
         // an endpoint compiles cleanly.
         let h = mk_handle("primary", mk_endpoints(2));
         let name = h.name();
-        let _ep = h.pick_endpoint(None);
+        let _ep = h.pick_endpoint(None, None);
         assert_eq!(name, "primary");
     }
 
@@ -2423,7 +2556,7 @@ admin:
             .await
             .expect("Static cluster constructs cleanly");
         let handle = mgr.get("backend").expect("cluster present");
-        let picked = handle.pick_endpoint(None).expect("non-empty");
+        let picked = handle.pick_endpoint(None, None).expect("non-empty");
         assert_eq!(picked, "127.0.0.1:7000".parse::<SocketAddr>().unwrap());
     }
 
@@ -2459,7 +2592,7 @@ admin:
             .await
             .expect("STRICT_DNS cluster resolves localhost cleanly");
         let handle = mgr.get("backend").expect("cluster present");
-        let picked = handle.pick_endpoint(None).expect("non-empty");
+        let picked = handle.pick_endpoint(None, None).expect("non-empty");
         assert_eq!(
             picked.port(),
             7000,
@@ -2936,6 +3069,7 @@ admin:
                 panic_threshold,
                 outlier_detection: None,
                 hash_lb: None,
+                subset: None,
                 eds_reload: None,
             }),
         };
@@ -2950,7 +3084,7 @@ admin:
         // Make endpoint 0 healthy, endpoint 1 stays unhealthy.
         health[0].record_success();
         let picks: Vec<SocketAddr> = (0..4)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert!(
             picks.iter().all(|&p| p == eps[0]),
@@ -2968,7 +3102,7 @@ admin:
         health[0].record_success();
         health[2].record_success();
         let picks: Vec<SocketAddr> = (0..4)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert_eq!(
             picks,
@@ -2982,7 +3116,7 @@ admin:
         let eps = mk_endpoints(2);
         let (handle, _health) = mk_handle_with_health("b", eps, 1, 1, 0.0);
         // All endpoints start Unhealthy; panic disabled → None.
-        assert!(handle.pick_endpoint(None).is_none());
+        assert!(handle.pick_endpoint(None, None).is_none());
     }
 
     #[test]
@@ -2991,7 +3125,7 @@ admin:
         // default 50% panic threshold; 0 healthy → 0% < 50% → panic → round-robin ALL.
         let (handle, _health) = mk_handle_with_health("b", eps.clone(), 1, 1, 50.0);
         let picks: Vec<SocketAddr> = (0..4)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert_eq!(
             picks,
@@ -3007,7 +3141,7 @@ admin:
         let (handle, health) = mk_handle_with_health("b", eps.clone(), 1, 1, 50.0);
         health[0].record_success();
         let picks: Vec<SocketAddr> = (0..4)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert!(
             picks.iter().all(|&p| p == eps[0]),
@@ -3022,7 +3156,7 @@ admin:
         let mgr = build_cluster_mgr(THREE_ENDPOINT_YAML).await;
         let handle = mgr.get("backend").expect("cluster");
         let picks: Vec<SocketAddr> = (0..3)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert_eq!(
             picks,
@@ -3135,7 +3269,7 @@ admin:
         let mgr = build_cluster_mgr(yaml).await;
         let handle = mgr.get("hc_backend").expect("cluster");
         assert!(
-            handle.pick_endpoint(None).is_none(),
+            handle.pick_endpoint(None, None).is_none(),
             "all endpoints start unhealthy + panic disabled"
         );
     }
@@ -3203,7 +3337,7 @@ admin:
         // Simulate the call-site connect-then-increment pattern.
         let handle = mgr.get("backend_cluster").expect("cluster present");
         for _ in 0..3 {
-            let endpoint = handle.pick_endpoint(None).expect("endpoint");
+            let endpoint = handle.pick_endpoint(None, None).expect("endpoint");
             let _stream = tokio::net::TcpStream::connect(endpoint).await.unwrap();
             // 06.1 D4.b: this is the call-site increment pattern that
             // envoy-tcp / envoy_http1::Client::connect / envoy_http2::
@@ -3350,6 +3484,7 @@ admin:
                 panic_threshold,
                 outlier_detection: Some(od_state),
                 hash_lb: None,
+                subset: None,
                 eds_reload: None,
             }),
         };
@@ -3363,7 +3498,7 @@ admin:
         let endpoints = mk_endpoints(3);
         let handle = mk_handle("backend", endpoints.clone()); // unchanged 12.1 helper
         let picks: Vec<SocketAddr> = (0..6)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert_eq!(
             picks,
@@ -3391,7 +3526,7 @@ admin:
         ejection[0].eject(crate::DetectorType::Consecutive5xx);
         // pick() should now only return endpoint 1.
         for _ in 0..5 {
-            assert_eq!(handle.pick_endpoint(None).unwrap(), eps[1]);
+            assert_eq!(handle.pick_endpoint(None, None).unwrap(), eps[1]);
         }
     }
 
@@ -3405,7 +3540,7 @@ admin:
         ejection[0].eject(crate::DetectorType::Consecutive5xx);
         ejection[1].eject(crate::DetectorType::Consecutive5xx);
         assert!(
-            handle.pick_endpoint(None).is_none(),
+            handle.pick_endpoint(None, None).is_none(),
             "all ejected + panic=0 → None"
         );
     }
@@ -3421,7 +3556,7 @@ admin:
         ejection[0].eject(crate::DetectorType::Consecutive5xx);
         // 1 of 2 eligible (50.0 < 60.0) → panic → round-robin over ALL.
         let picks: Vec<SocketAddr> = (0..4)
-            .map(|_| handle.pick_endpoint(None).unwrap())
+            .map(|_| handle.pick_endpoint(None, None).unwrap())
             .collect();
         assert_eq!(picks, vec![eps[0], eps[1], eps[0], eps[1]]);
     }
@@ -3441,7 +3576,7 @@ admin:
         ejection[2].eject(crate::DetectorType::Consecutive5xx);
         // Eligible: only endpoint 3.
         for _ in 0..5 {
-            assert_eq!(handle.pick_endpoint(None).unwrap(), eps[3]);
+            assert_eq!(handle.pick_endpoint(None, None).unwrap(), eps[3]);
         }
     }
 
@@ -3641,7 +3776,7 @@ admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
             .expect("construct");
         let handle = mgr.get("c1").expect("cluster c1");
         let ep = handle
-            .pick_endpoint(None)
+            .pick_endpoint(None, None)
             .expect("endpoint pickable pre-ejection");
         // One 500 crosses consecutive_5xx=1 → ejects the sole endpoint.
         handle.record_response(ep, 500);
@@ -3653,7 +3788,7 @@ admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
         // yield None (→ the 12.2 no-healthy-upstream synth-503). The bug made this
         // return Some(ep) because panic_threshold wrongly defaulted to 50.0.
         assert!(
-            handle.pick_endpoint(None).is_none(),
+            handle.pick_endpoint(None, None).is_none(),
             "panic_threshold=0 + sole endpoint ejected ⇒ pick() == None",
         );
     }
@@ -4388,6 +4523,129 @@ admin:
                 .iter()
                 .any(|n| n == "cluster.eds_backend.membership_healthy"),
             "membership_healthy is HC-gated and must not register for a non-HC EDS cluster; got {names:?}"
+        );
+    }
+
+    // ---- 30 Task 5 (ADR-0073/0074): pick() subset narrowing ----
+
+    /// 30 Task 5 (no-op regression witness): a ROUND_ROBIN cluster with NO
+    /// `lb_subset_config` (so `subset: None`) MUST ignore `subset_match` entirely —
+    /// `pick_endpoint(None, Some(&map))` round-robins EXACTLY like
+    /// `pick_endpoint(None, None)`. This is the byte-identical no-op proof at the
+    /// cluster level: the new `subset_match` argument is inert when the cluster has
+    /// no subset config.
+    #[test]
+    fn subset_match_is_inert_when_no_lb_subset_config() {
+        let ep0: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let ep1: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        // A non-empty subset_match that would matter IF a subset index existed.
+        let some_map: std::collections::BTreeMap<String, String> =
+            [("stage".to_string(), "prod".to_string())]
+                .into_iter()
+                .collect();
+
+        // Cluster A: drive with Some(subset_match). Cluster B: drive with None.
+        // Both have subset == None (built by mk_handle), so the cursor sequence
+        // must be identical, proving the match is inert.
+        let a = mk_handle("noop_a", vec![ep0, ep1]);
+        let b = mk_handle("noop_b", vec![ep0, ep1]);
+        for _ in 0..4 {
+            assert_eq!(
+                a.pick_endpoint(None, Some(&some_map)),
+                b.pick_endpoint(None, None),
+                "subset_match must be inert when subset is None (no-op proof)"
+            );
+        }
+        // Spot-check the exact cursor order is the phase-02 round-robin.
+        let c = mk_handle("noop_c", vec![ep0, ep1]);
+        assert_eq!(c.pick_endpoint(None, Some(&some_map)), Some(ep0));
+        assert_eq!(c.pick_endpoint(None, Some(&some_map)), Some(ep1));
+        assert_eq!(c.pick_endpoint(None, Some(&some_map)), Some(ep0));
+    }
+
+    const SUBSET_TWO_ENDPOINT_YAML: &str = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: subset_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      lb_subset_config:
+        fallback_policy: NO_FALLBACK
+        subset_selectors:
+          - keys: [stage]
+      load_assignment:
+        cluster_name: subset_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: prod
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10002
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: canary
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+
+    /// 30 Task 5 (subset narrowing, §A oracle at the cluster level): a cluster with
+    /// `lb_subset_config` (selector `keys:[stage]`, NO_FALLBACK) and two endpoints
+    /// carrying `envoy.lb` metadata routes deterministically within the matched
+    /// subset: `{stage:prod}` → the prod host, `{stage:canary}` → the canary host,
+    /// `{stage:nonexistent}` → None (NO_FALLBACK no-match → 503).
+    #[tokio::test]
+    async fn subset_narrows_to_matched_endpoint() {
+        let prod: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let canary: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let bootstrap = envoy_config::parse_bootstrap(SUBSET_TWO_ENDPOINT_YAML).expect("valid");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("construct");
+        let handle = mgr.get("subset_backend").expect("cluster present");
+
+        let mk = |k: &str, v: &str| -> std::collections::BTreeMap<String, String> {
+            [(k.to_string(), v.to_string())].into_iter().collect()
+        };
+
+        // {stage:prod} narrows to the single prod endpoint, deterministically.
+        let prod_match = mk("stage", "prod");
+        for _ in 0..3 {
+            assert_eq!(
+                handle.pick_endpoint(None, Some(&prod_match)),
+                Some(prod),
+                "stage:prod must route to the prod endpoint"
+            );
+        }
+        // {stage:canary} narrows to the single canary endpoint, deterministically.
+        let canary_match = mk("stage", "canary");
+        for _ in 0..3 {
+            assert_eq!(
+                handle.pick_endpoint(None, Some(&canary_match)),
+                Some(canary),
+                "stage:canary must route to the canary endpoint"
+            );
+        }
+        // {stage:nonexistent} under NO_FALLBACK -> None (503).
+        let none_match = mk("stage", "nonexistent");
+        assert_eq!(
+            handle.pick_endpoint(None, Some(&none_match)),
+            None,
+            "no matching subset under NO_FALLBACK must return None (503)"
         );
     }
 }

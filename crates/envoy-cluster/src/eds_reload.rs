@@ -534,7 +534,7 @@ static_resources:
         assert!(
             mgr.get("eds_cluster")
                 .unwrap()
-                .pick_endpoint(None)
+                .pick_endpoint(None, None)
                 .is_none(),
             "pick() returns None on the empty set (503 path)"
         );

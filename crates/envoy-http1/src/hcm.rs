@@ -418,7 +418,7 @@ async fn run_attempt(
     // When `pick() -> None`, no endpoint is attributable: emit the 19-byte
     // no-healthy synth-503 and return (not retriable; no record_response,
     // lock-in #8).
-    let Some(endpoint) = cluster.pick_endpoint(request_hash_key) else {
+    let Some(endpoint) = cluster.pick_endpoint(request_hash_key, None) else {
         tracing::warn!(
             cluster = %cluster.name(),
             "no healthy endpoint for cluster — returning 503",

@@ -182,7 +182,7 @@ async fn run_h2_attempt(
     // On `pick() -> None`, no endpoint is attributable: emit the H2 synth-502
     // (preserving the pre-phase-16 H2 pick-none shape) and return (not
     // retriable; no record_response).
-    let Some(endpoint) = cluster.pick_endpoint(request_hash_key) else {
+    let Some(endpoint) = cluster.pick_endpoint(request_hash_key, None) else {
         tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
         return H2AttemptResult {
             response: synth_h2_502(),
