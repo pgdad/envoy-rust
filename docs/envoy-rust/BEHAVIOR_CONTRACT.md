@@ -207,9 +207,11 @@ no-op clause below).
   a missing `default_subset` (the consequences are request-time), so envoy-rust **accepts**
   all of these (no fatal validator), per **ADR-0049** (fatal only where Envoy itself
   rejects).
-- **Stats (ADR-0074 correction #2).** `lb_subsets_active`/`lb_subsets_created` read a
-  **non-portable** 66 → envoy-rust emits **no `lb_subsets_*` stat** this phase (deferred
-  non-goal); fixture 0038 **ignore-lists** them.
+- **Stats (ADR-0074 correction #2).** Envoy's `lb_subsets_active`/`lb_subsets_created` read
+  an **opaque, non-portable** value (an observed **66** for a minimal 2-endpoint / single-
+  `[stage]`-selector cluster — NOT the naive "1 per distinct value"; the derivation is
+  opaque) → envoy-rust emits **no `lb_subsets_*` stat** this phase (deferred non-goal);
+  fixture 0038 **ignore-lists** them.
 - **No-op regression.** A cluster with **no** `lb_subset_config` is **byte-identical** to
   before (the subset layer is inert) — all pre-existing fixtures plus the
   RING_HASH/MAGLEV/round-robin selection paths are unchanged.
