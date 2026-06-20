@@ -177,12 +177,13 @@ async fn run_h2_attempt(
     envoy_req: &Request,
     host_header: &str,
     request_hash_key: Option<u64>,
+    subset_match: Option<&std::collections::BTreeMap<String, String>>,
 ) -> H2AttemptResult {
     // Re-pick the endpoint each attempt — Envoy re-runs LB on every retry.
     // On `pick() -> None`, no endpoint is attributable: emit the H2 synth-502
     // (preserving the pre-phase-16 H2 pick-none shape) and return (not
     // retriable; no record_response).
-    let Some(endpoint) = cluster.pick_endpoint(request_hash_key, None) else {
+    let Some(endpoint) = cluster.pick_endpoint(request_hash_key, subset_match) else {
         tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
         return H2AttemptResult {
             response: synth_h2_502(),
@@ -530,6 +531,10 @@ async fn handle_one_stream(
                 // 28 Task 6: the per-request hash key resolved in `build_response`
                 // (shared with the H1 path) — threaded to `run_h2_attempt`'s pick.
                 request_hash_key,
+                // 30 Task 6: the matched route's `metadata_match` envoy.lb map
+                // (static route config) — threaded to `run_h2_attempt`'s pick for
+                // metadata subset LB. `None` when the route has no `metadata_match`.
+                subset_match,
             } => {
                 // SPEC §3 D4 H2-side: symmetric H1-or-H2 dispatch keyed on
                 // cluster.upstream_protocol() (the fork now lives inside
@@ -645,6 +650,7 @@ async fn handle_one_stream(
                             &envoy_req,
                             &host_header,
                             request_hash_key,
+                            subset_match.as_ref(),
                         )
                         .await;
 

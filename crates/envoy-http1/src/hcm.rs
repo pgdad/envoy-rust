@@ -404,6 +404,11 @@ struct AttemptResult {
 ///
 /// `out_headers`/body framing is rebuilt per attempt by the caller's loop, so
 /// the request bits are passed in fresh.
+// 30 Task 6: threading `subset_match` alongside the phase-28 `request_hash_key`
+// pushes the per-attempt arg count to 8 (the pick inputs are all distinct
+// request/route facts; bundling them into a struct would obscure the
+// `request_hash_key`-mirror parallel this task is required to preserve).
+#[allow(clippy::too_many_arguments)]
 async fn run_attempt(
     config: &HCMConfig,
     cluster: &envoy_cluster::ClusterHandle,
@@ -412,13 +417,14 @@ async fn run_attempt(
     host_header: &str,
     close: bool,
     request_hash_key: Option<u64>,
+    subset_match: Option<&std::collections::BTreeMap<String, String>>,
 ) -> AttemptResult {
     // Re-pick the endpoint each attempt — Envoy re-runs LB on every retry (a
     // healthy host may have been ejected, or a round-robin cluster rotates).
     // When `pick() -> None`, no endpoint is attributable: emit the 19-byte
     // no-healthy synth-503 and return (not retriable; no record_response,
     // lock-in #8).
-    let Some(endpoint) = cluster.pick_endpoint(request_hash_key, None) else {
+    let Some(endpoint) = cluster.pick_endpoint(request_hash_key, subset_match) else {
         tracing::warn!(
             cluster = %cluster.name(),
             "no healthy endpoint for cluster — returning 503",
@@ -844,6 +850,7 @@ async fn serve_connection(
                     retry_config,
                     include_attempt_count_in_response,
                     request_hash_key,
+                    subset_match,
                 } => {
                     // The validator (envoy-config Task 2) ensures every cluster
                     // name referenced from a RouteAction::Route exists in the
@@ -950,6 +957,7 @@ async fn serve_connection(
                                 &host_header,
                                 close,
                                 request_hash_key,
+                                subset_match.as_ref(),
                             )
                             .await;
 
@@ -1289,6 +1297,10 @@ pub enum BuildOutcome {
         /// `hash_policy` or the header is ABSENT. Threaded to
         /// `ClusterHandle::pick_endpoint`; `RoundRobin` clusters ignore it.
         request_hash_key: Option<u64>,
+        /// 30 Task 6: the matched route's `metadata_match` envoy.lb map (subset LB).
+        /// `None` when the route has no `metadata_match` (the no-subset no-op). Static
+        /// route config — resolved at route-match, threaded to `pick_endpoint`.
+        subset_match: Option<std::collections::BTreeMap<String, String>>,
     },
 }
 
@@ -1439,6 +1451,10 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
             request_hash_key: request_hash_key(&ar.hash_policy, |name| {
                 find_header(&req.headers, name).map(str::as_bytes)
             }),
+            // 30 Task 6: the matched route's `metadata_match` envoy.lb map travels
+            // to the dispatch seam for metadata subset LB. STATIC route config (no
+            // request data) — `None` when the route has no `metadata_match`.
+            subset_match: ar.metadata_match.as_ref().map(|m| m.envoy_lb.clone()),
         },
     }
 }
@@ -1682,7 +1698,7 @@ fn synth_501(close: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use envoy_config::HashPolicyHeader;
+    use envoy_config::{HashPolicyHeader, LbMetadata};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -5711,6 +5727,83 @@ static_resources:
             },
             bytes_consumed: 0,
             body: None,
+        }
+    }
+
+    /// 30 Task 6: a config with a `RouteAction::Route` whose `action` carries an
+    /// optional `metadata_match`. Used to assert `build_response` surfaces the
+    /// route's `envoy.lb` map into `BuildOutcome::Proxy.subset_match`.
+    async fn subset_match_test_config(metadata_match: Option<LbMetadata>) -> HCMConfig {
+        HCMConfig {
+            stat_prefix: "test".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("test"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".into(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_response_subset_match_populated_from_metadata_match() {
+        // Route WITH metadata_match → BuildOutcome::Proxy.subset_match == Some(map).
+        let mut envoy_lb = std::collections::BTreeMap::new();
+        envoy_lb.insert("stage".to_string(), "canary".to_string());
+        envoy_lb.insert("version".to_string(), "v2".to_string());
+        let config = subset_match_test_config(Some(LbMetadata {
+            envoy_lb: envoy_lb.clone(),
+        }))
+        .await;
+        let req = make_req("/foo", "localhost");
+        match build_response(&config, &req, true) {
+            BuildOutcome::Proxy { subset_match, .. } => {
+                assert_eq!(
+                    subset_match,
+                    Some(envoy_lb),
+                    "subset_match must mirror the route's metadata_match envoy.lb map"
+                );
+            }
+            _other => panic!("expected BuildOutcome::Proxy"),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_response_subset_match_none_without_metadata_match() {
+        // Route WITHOUT metadata_match → subset_match == None (the no-subset no-op).
+        let config = subset_match_test_config(None).await;
+        let req = make_req("/foo", "localhost");
+        match build_response(&config, &req, true) {
+            BuildOutcome::Proxy { subset_match, .. } => {
+                assert_eq!(
+                    subset_match, None,
+                    "no metadata_match must yield subset_match == None"
+                );
+            }
+            _other => panic!("expected BuildOutcome::Proxy"),
         }
     }
 
