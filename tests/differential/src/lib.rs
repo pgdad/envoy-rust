@@ -338,6 +338,51 @@ pub enum Driver {
         /// Expected status for every probe on both sides (e.g. 200).
         expected_status: u16,
     },
+    /// 30 Task 7 (ADR-0074): route-selection differential for subset LB. Drives
+    /// a list of distinct PATHS (each route carries a `metadata_match`) against
+    /// BOTH proxies; asserts cross-proxy identical backend selection by the
+    /// `backend: <marker>` body line (STRONG), plus the NO_FALLBACK 503 probe.
+    ///
+    /// Unlike `Http1HashSweep` the discriminator is the ROUTE (path), not an
+    /// `x-hash-key` header: each path's route carries a `metadata_match` that
+    /// narrows the STATIC `subset_cluster`'s eligible endpoint set to the subset
+    /// whose endpoint `metadata` matches. Per 200 probe: STRONG — the marker
+    /// chosen by envoy-rust is IDENTICAL to upstream Envoy's AND equals the §A
+    /// oracle marker. The 503 probe (a `metadata_match` resolving to NO subset
+    /// under `NO_FALLBACK`) asserts each side returns 503 with the fixed
+    /// 19-byte `no healthy upstream` local-reply body (byte-equal cross-proxy).
+    ///
+    /// LOCALLY observable (a plain request/response with NO file-watch/reload
+    /// trigger), so the Docker test runs and is authoritative on any host with a
+    /// Docker daemon.
+    Http1RouteSelect {
+        /// The distinct paths to drive. Each is sent (GET, Host: localhost) to
+        /// both proxies; the response status + body marker are compared
+        /// cross-proxy per probe.
+        probes: Vec<RouteSelectProbe>,
+    },
+}
+
+/// 30 Task 7 (ADR-0074): one probe of `Driver::Http1RouteSelect`. A path whose
+/// route carries a `metadata_match`, the status both proxies must return, and —
+/// for a 200 probe — the `backend: <marker>` body line the §A oracle expects.
+/// A `None` `expected_marker` marks the NO_FALLBACK 503 probe (whose body is
+/// asserted to be the fixed `no healthy upstream` local reply instead).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSelectProbe {
+    /// Human-readable probe name (for assertion messages), e.g. `prod-route`.
+    pub name: String,
+    /// Request path, e.g. `/prod`. Routed (by prefix) to `subset_cluster` with
+    /// a route-carried `metadata_match`.
+    pub path: String,
+    /// Status both proxies must return for this path (200 for a resolved
+    /// subset; 503 for the NO_FALLBACK no-subset probe).
+    pub expected_status: u16,
+    /// The §A oracle `backend: <marker>` body line for a 200 probe; `None` for
+    /// the 503 probe (whose body is the fixed `no healthy upstream` local reply).
+    #[serde(default)]
+    pub expected_marker: Option<String>,
 }
 
 /// 26 Task 7: the reload directive inside `Driver::Http1RdsReload`. Carries the
@@ -2704,6 +2749,9 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // 28 Task 7 (ADR-0070): RING_HASH sweep uses the same {{PORT}}
         // data-listener convention as the other HCM-shaped drivers.
         | Driver::Http1HashSweep { .. }
+        // 30 Task 7 (ADR-0074): the subset route-selection driver runs over the
+        // same {{PORT}} data-listener convention as the other HCM-shaped drivers.
+        | Driver::Http1RouteSelect { .. }
         | Driver::Http1RdsReload { .. }
         // 27 Task 6 (D6): the EDS-hot-reload driver runs over an HCM `{{PORT}}`
         // listener like the other HTTP drivers; the reload swaps the file-based
@@ -4394,6 +4442,136 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                     keys.len(),
                     subject_markers,
                 );
+            }
+
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+        }
+        // 30 Task 7 (ADR-0074): subset LB route-selection cross-proxy
+        // differential. For each probe: GET <path> against BOTH proxies, assert
+        // both return `expected_status`. 200 probes — extract each body's leading
+        // `backend: <marker>` line; assert cross-proxy marker agreement (STRONG)
+        // AND that it equals the §A oracle marker. The 503 probe — assert each
+        // side's body is the fixed `no healthy upstream` NO_FALLBACK local reply.
+        // Locally observable — a plain request/response with no reload trigger.
+        Driver::Http1RouteSelect { probes } => {
+            if probes.is_empty() {
+                bail!("Driver::Http1RouteSelect requires a non-empty `probes:` list");
+            }
+
+            // Extract the selected-backend marker from an echo response body's
+            // leading `backend: <marker>\n` line. The two backends are spawned
+            // `--body-marker backend_1`/`backend_2`, so this line names WHICH
+            // backend the subset selected.
+            fn extract_marker(body: &[u8], side: &str, name: &str) -> Result<String> {
+                let text = std::str::from_utf8(body).with_context(|| {
+                    format!("{side} response body for probe `{name}` is not utf8")
+                })?;
+                let first = text.lines().next().unwrap_or("");
+                let marker = first.strip_prefix("backend: ").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{side} response body for probe `{name}` does not begin with \
+                         `backend: <marker>`; got first line `{first}`"
+                    )
+                })?;
+                Ok(marker.trim().to_string())
+            }
+
+            // Drive one probe on one proxy; return the full response (status +
+            // body) after asserting the status matches.
+            async fn drive_probe(
+                addr: SocketAddr,
+                path: &str,
+                expected_status: u16,
+                side: &str,
+                name: &str,
+            ) -> Result<DriveHttp1Result> {
+                let resp = drive_http1(addr, &Http1Method::Get, path, "localhost", &[], None)
+                    .await
+                    .with_context(|| {
+                        format!("{side} http1 drive (probe `{name}` path `{path}`)")
+                    })?;
+                if resp.status != expected_status {
+                    bail!(
+                        "{side} status {} != expected {} (probe `{name}` path `{path}`)",
+                        resp.status,
+                        expected_status,
+                    );
+                }
+                Ok(resp)
+            }
+
+            for probe in probes {
+                let up = drive_probe(
+                    upstream_addr,
+                    &probe.path,
+                    probe.expected_status,
+                    "upstream",
+                    &probe.name,
+                )
+                .await?;
+                let su = drive_probe(
+                    subject_addr,
+                    &probe.path,
+                    probe.expected_status,
+                    "subject",
+                    &probe.name,
+                )
+                .await?;
+
+                match &probe.expected_marker {
+                    // 200 probe: STRONG cross-proxy identical subset selection,
+                    // AND agreement with the §A oracle marker.
+                    Some(expected) => {
+                        let up_marker = extract_marker(&up.body, "upstream", &probe.name)?;
+                        let su_marker = extract_marker(&su.body, "subject", &probe.name)?;
+                        if up_marker != su_marker {
+                            bail!(
+                                "subset LB cross-proxy selection mismatch for probe `{}` (path `{}`):\n  \
+                                 upstream Envoy -> `{up_marker}`\n  envoy-rust      -> `{su_marker}`\n\
+                                 (the §6.2-LOCKED subset resolution — ADR-0074 — must select the SAME backend)",
+                                probe.name,
+                                probe.path,
+                            );
+                        }
+                        if &up_marker != expected {
+                            bail!(
+                                "subset LB §A oracle mismatch for probe `{}` (path `{}`): \
+                                 selected `{up_marker}` but oracle expects `{expected}`",
+                                probe.name,
+                                probe.path,
+                            );
+                        }
+                    }
+                    // 503 (NO_FALLBACK) probe: each side's body is the fixed
+                    // 19-byte `no healthy upstream` local reply (byte-equal
+                    // cross-proxy).
+                    None => {
+                        const NO_HEALTHY: &str = "no healthy upstream";
+                        let up_body = std::str::from_utf8(&up.body).with_context(|| {
+                            format!("upstream body for probe `{}` is not utf8", probe.name)
+                        })?;
+                        let su_body = std::str::from_utf8(&su.body).with_context(|| {
+                            format!("subject body for probe `{}` is not utf8", probe.name)
+                        })?;
+                        if up_body != NO_HEALTHY {
+                            bail!(
+                                "upstream Envoy NO_FALLBACK body mismatch for probe `{}` (path `{}`): \
+                                 expected `{NO_HEALTHY}`, got `{up_body}`",
+                                probe.name,
+                                probe.path,
+                            );
+                        }
+                        if su_body != NO_HEALTHY {
+                            bail!(
+                                "envoy-rust NO_FALLBACK body mismatch for probe `{}` (path `{}`): \
+                                 expected `{NO_HEALTHY}`, got `{su_body}`",
+                                probe.name,
+                                probe.path,
+                            );
+                        }
+                    }
+                }
             }
 
             subject.shutdown(Duration::from_secs(5)).await.ok();

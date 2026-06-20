@@ -1,0 +1,46 @@
+# 30 fixture-0038 expectations (ADR-0074): subset LB cross-proxy ROUTE-SELECTION
+# differential. The Http1RouteSelect driver drives THREE distinct PATHS (each
+# route carries a `metadata_match`) against BOTH proxies (upstream
+# envoyproxy/envoy v1.33.0 and the subject envoy-rust) through a STATIC cluster
+# `subset_cluster` carrying an `lb_subset_config` (single selector keys:[stage],
+# fallback_policy: NO_FALLBACK) over TWO distinguishable echo backends
+# (`--body-marker backend_1`/`backend_2`). The endpoint metadata is
+# backend_1 = {stage:prod, version:v2}, backend_2 = {stage:canary, version:v1}.
+#
+# The §A regression oracle (live-Envoy confirmed):
+#   /prod   (metadata_match {stage:prod})        -> backend_1 (marker backend_1)
+#   /canary (metadata_match {stage:canary})      -> backend_2 (marker backend_2)
+#   /nope   (metadata_match {stage:nonexistent}) -> HTTP 503, body
+#                                                   `no healthy upstream`
+#                                                   (NO_FALLBACK — no subset).
+#
+# The driver asserts, per 200 probe: STRONG (the core differential) — the marker
+# chosen by envoy-rust is IDENTICAL to upstream Envoy's (cross-proxy identical
+# subset selection) AND equals the §A oracle marker; and per the 503 probe —
+# BOTH sides return 503 with the fixed 19-byte `no healthy upstream` local-reply
+# body (byte-equal cross-proxy).
+#
+# The subset LB selects on METADATA (not ip:port), so the runtime-ephemeral
+# backend ports are not the discriminator (unlike maglev/ring_hash) — the body
+# marker is. The shared `{{BACKEND_IP}}` keeps both proxies' endpoint sets
+# byte-identical cross-proxy.
+#
+# ADR-0074 deferral: envoy-rust emits no `cluster.subset_cluster.lb_subsets_*`
+# stats (§A divergence #2 — subset stats deferred). This driver does NO admin
+# stat scrape, so there is nothing to ignore-list here; the divergence is inert
+# for this fixture and recorded for the record only.
+#
+# LOCALLY observable: a plain request/response with NO file-watch/reload
+# trigger, so the Docker test runs and is authoritative on any host with a
+# Docker daemon. Docker-gated by the differential harness at the cluster level
+# (no per-test cfg gate; the harness skips when `DOCKER_HOST` is unavailable).
+driver:
+  kind: http1_route_select
+  probes:
+    - { name: prod-route,   path: /prod,   expected_status: 200, expected_marker: backend_1 }
+    - { name: canary-route, path: /canary, expected_status: 200, expected_marker: backend_2 }
+    - { name: nofallback,   path: /nope,   expected_status: 503 }
+# `response_status: exact` adds a cross-proxy status equivalence belt over the
+# per-probe driver assertions (the driver also asserts each side's status).
+equivalence:
+  response_status: exact

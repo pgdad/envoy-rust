@@ -1,0 +1,90 @@
+node: { id: envoy-rust-phase-30-fixture-0038, cluster: envoy-rust-phase-30 }
+# Kernel-ephemeral admin (port 0): the Http1RouteSelect driver probes ONLY the
+# data listener (GET <path>) and never scrapes admin.
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 0 } } }
+# 30 fixture-0038 (ADR-0074): subset LB cross-proxy ROUTE-SELECTION
+# differential. ONE STATIC H1 HCM listener routes THREE distinct prefixes to a
+# STATIC cluster `subset_cluster` (explicit ROUND_ROBIN — the within-subset balancer)
+# carrying an `lb_subset_config` (single selector `keys: [stage]`,
+# `fallback_policy: NO_FALLBACK`) over TWO distinguishable echo backends. Each
+# endpoint carries `metadata.filter_metadata.envoy.lb`; each route carries a
+# `metadata_match` that narrows the eligible set to the matching subset.
+# IDENTICAL config to envoy.yaml except the listener bind address (127.0.0.1
+# here vs 0.0.0.0 upstream) — the standard harness per-side convention. The
+# STATIC endpoint address is the `{{BACKEND_IP}}` marker, rendered to the SAME
+# shared host LAN IPv4 as envoy.yaml (NOT loopback) so both proxies build
+# IDENTICAL endpoints. No behavioral divergence.
+static_resources:
+  listeners:
+    - name: http1_listener
+      address: { socket_address: { address: 127.0.0.1, port_value: {{PORT}} } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: subset_vh
+                      domains: ["*"]
+                      # ADR-0074: most-specific prefixes first. Each route's
+                      # `metadata_match` narrows the cluster's eligible endpoint
+                      # set to the subset whose endpoint metadata matches.
+                      routes:
+                        - match: { prefix: "/prod" }
+                          route:
+                            cluster: subset_cluster
+                            metadata_match: { filter_metadata: { envoy.lb: { stage: prod } } }
+                        - match: { prefix: "/canary" }
+                          route:
+                            cluster: subset_cluster
+                            metadata_match: { filter_metadata: { envoy.lb: { stage: canary } } }
+                        - match: { prefix: "/nope" }
+                          route:
+                            cluster: subset_cluster
+                            metadata_match: { filter_metadata: { envoy.lb: { stage: nonexistent } } }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    # `subset_cluster`: a PLAIN STATIC ROUND_ROBIN cluster (the
+    # within-subset balancer) carrying an `lb_subset_config`. NO health check, NO
+    # outlier detection. Two distinguishable echo backends (`--body-marker
+    # backend_1`/`backend_2`); each response body's leading `backend: <marker>\n`
+    # line names which backend the subset selected. backend_1 = {stage:prod},
+    # backend_2 = {stage:canary} — the {{HTTP1_BACKEND_1_PORT}} backend is
+    # spawned `--body-marker backend_1` by the harness, so the {stage:prod}
+    # endpoint MUST point at {{HTTP1_BACKEND_1_PORT}}.
+    - name: subset_cluster
+      type: STATIC
+      # Explicit ROUND_ROBIN: upstream Envoy defaults to it when omitted, but the
+      # envoy-rust parser requires `lb_policy` (no serde default). Stating it
+      # keeps BOTH configs identical AND valid; ROUND_ROBIN is the subset MVP's
+      # within-subset balancer, so this is semantically the default.
+      lb_policy: ROUND_ROBIN
+      # ADR-0074: single selector keys:[stage]; NO_FALLBACK so a metadata_match
+      # that resolves to NO subset yields HTTP 503 `no healthy upstream`.
+      lb_subset_config:
+        fallback_policy: NO_FALLBACK
+        subset_selectors:
+          - keys: [stage]
+      load_assignment:
+        cluster_name: subset_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: {{BACKEND_IP}}, port_value: {{HTTP1_BACKEND_1_PORT}} }
+                metadata:
+                  filter_metadata:
+                    envoy.lb: { stage: prod, version: v2 }
+              - endpoint:
+                  address:
+                    socket_address: { address: {{BACKEND_IP}}, port_value: {{HTTP1_BACKEND_2_PORT}} }
+                metadata:
+                  filter_metadata:
+                    envoy.lb: { stage: canary, version: v1 }
