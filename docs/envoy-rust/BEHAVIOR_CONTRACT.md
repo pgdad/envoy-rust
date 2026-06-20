@@ -183,6 +183,45 @@ need a contract-relaxation ADR before they can be differential). **`RING_HASH` +
 EDS-hot-reload composition** (re-ringing on a hot endpoint-set swap) is also deferred —
 the fixture uses a static (non-EDS) RING_HASH cluster.
 
+**`subset LB` (NEW, phase 30).** An **orthogonal pre-dispatch layer** (NOT an `LbPolicy`
+value) that **narrows** the candidate endpoint set BEFORE the inner `lb_policy` (MVP
+**ROUND_ROBIN**) picks within the subset. It is configured by a cluster's
+`lb_subset_config` (selectors + fallback) plus per-endpoint `metadata` and a route's
+`metadata_match`; when no `lb_subset_config` is present the layer is **inert** (see the
+no-op clause below).
+
+- **Match semantics (ADR-0074).** An endpoint is a candidate iff its `envoy.lb` metadata is
+  a **superset** of the route `metadata_match`. The `subset_selectors` entry **used** is the
+  one whose `keys` **set equals** the `metadata_match` key set; the index build groups
+  endpoints per selector by the **value-tuple** of that selector's keys, and an endpoint
+  **missing** a selector key is **excluded** from that selector's groups.
+- **Fallback (ADR-0074, §6.2-VERIFIED).** On no-match: **`NO_FALLBACK`** → `503 no healthy
+  upstream`; **`ANY_ENDPOINT`** → round-robin over **all** endpoints; **`DEFAULT_SUBSET`** →
+  the subset named by `default_subset` (an empty/absent `default_subset` → matches all →
+  round-robin all).
+- **Wire shapes.** Endpoint `metadata` and route `metadata_match` are `core.v3.Metadata`
+  (nested `filter_metadata."envoy.lb"`); `lb_subset_config.default_subset` is a **flat**
+  `google.protobuf.Struct` (`{ stage: prod }`, NOT nested) per **ADR-0075**.
+- **Config validity (ADR-0074 correction #1).** Subset config is **NOT startup-fatal** —
+  upstream Envoy boots for empty `subset_selectors`, empty `keys`, an uncovered selector, or
+  a missing `default_subset` (the consequences are request-time), so envoy-rust **accepts**
+  all of these (no fatal validator), per **ADR-0049** (fatal only where Envoy itself
+  rejects).
+- **Stats (ADR-0074 correction #2).** `lb_subsets_active`/`lb_subsets_created` read a
+  **non-portable** 66 → envoy-rust emits **no `lb_subsets_*` stat** this phase (deferred
+  non-goal); fixture 0038 **ignore-lists** them.
+- **No-op regression.** A cluster with **no** `lb_subset_config` is **byte-identical** to
+  before (the subset layer is inert) — all pre-existing fixtures plus the
+  RING_HASH/MAGLEV/round-robin selection paths are unchanged.
+- **Differential witness.** Fixture **`0038-lb-subset`** — two metadata'd backends
+  (`{stage:prod}` / `{stage:canary}`) and three `metadata_match` routes; a **new
+  route-select driver** asserts cross-proxy **identical** selection (`/prod`→prod,
+  `/canary`→canary) plus the `NO_FALLBACK` `/nope`→**503** probe. Observable **LOCALLY** (no
+  file-watch/reload trigger). **H1-only** (an H2 pick-none → 502 case is **not** asserted).
+- **Inner LB within a subset = ROUND_ROBIN** (MVP). Deferred §2.2 non-goals:
+  subset + consistent-hash inner-LB, subset + HC/OD differential, multiple-overlapping
+  selectors, per-selector fallback, and `single_host_per_subset`.
+
 ---
 
 ## Header allow-list
