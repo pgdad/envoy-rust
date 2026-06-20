@@ -19,7 +19,7 @@ pub(crate) struct SubsetIndex {
 #[derive(Debug)]
 struct SelectorIndex {
     keys: BTreeSet<String>,
-    subsets: BTreeMap<Vec<String>, Vec<usize>>, // value-tuple (in `keys` order) -> indices
+    subsets: BTreeMap<Vec<String>, Vec<usize>>, // value-tuple (in sorted `keys` order) -> indices
 }
 
 /// The resolved eligible set for one request.
@@ -38,19 +38,21 @@ impl SubsetIndex {
     ) -> SubsetIndex {
         let mut selectors: Vec<SelectorIndex> = Vec::with_capacity(cfg.subset_selectors.len());
         for selector in &cfg.subset_selectors {
+            // Canonical (sorted) key order, used for BOTH the value-tuple here and
+            // lookup's rebuild, so build/lookup agree regardless of declaration order.
+            let keyset: BTreeSet<String> = selector.keys.iter().cloned().collect();
             let mut subsets: BTreeMap<Vec<String>, Vec<usize>> = BTreeMap::new();
             for (i, meta) in endpoint_metadata.iter().enumerate() {
                 // Endpoint is placed under this selector iff it has a value for
                 // EVERY key in the selector (Envoy parity); endpoints missing any
                 // selector key are EXCLUDED from that selector's subsets.
-                if selector.keys.iter().all(|k| meta.contains_key(k)) {
-                    let tuple: Vec<String> =
-                        selector.keys.iter().map(|k| meta[k].clone()).collect();
+                if keyset.iter().all(|k| meta.contains_key(k)) {
+                    let tuple: Vec<String> = keyset.iter().map(|k| meta[k].clone()).collect();
                     subsets.entry(tuple).or_default().push(i);
                 }
             }
             selectors.push(SelectorIndex {
-                keys: selector.keys.iter().cloned().collect(),
+                keys: keyset,
                 subsets,
             });
         }
@@ -72,7 +74,9 @@ impl SubsetIndex {
             .selectors
             .iter()
             .find(|s| s.keys.iter().collect::<BTreeSet<&String>>() == want)?;
-        // Build the value-tuple in the selector's `keys` order (BTreeSet iterates sorted).
+        // Rebuild the value-tuple in sorted key order (BTreeSet iterates sorted) —
+        // the SAME ordering `build` used, so the tuples match regardless of the
+        // selector's config declaration order.
         let tuple: Vec<String> = selector.keys.iter().map(|k| m[k].clone()).collect();
         selector.subsets.get(&tuple).cloned()
     }
@@ -264,6 +268,31 @@ mod tests {
             Eligible::All
         );
         assert_eq!(idx.resolve(None), Eligible::All);
+    }
+
+    #[test]
+    fn multi_key_selector_tuple_order_independent() {
+        // Regression: a multi-key selector whose declaration order differs from
+        // sorted order must still resolve. keys = [version, stage] (declared),
+        // sorted = [stage, version]. build and lookup must use the SAME ordering.
+        let cfg = LbSubsetConfig {
+            fallback_policy: LbSubsetFallbackPolicy::NoFallback,
+            subset_selectors: vec![LbSubsetSelector {
+                keys: vec!["version".into(), "stage".into()],
+            }],
+            default_subset: None,
+        };
+        let idx = SubsetIndex::build(&cfg, &ab_endpoints());
+        // A = {stage:prod, version:v2} (idx 0)
+        assert_eq!(
+            idx.resolve(Some(&meta(&[("version", "v2"), ("stage", "prod")]))),
+            Eligible::Some(vec![0])
+        );
+        // B = {stage:canary, version:v1} (idx 1)
+        assert_eq!(
+            idx.resolve(Some(&meta(&[("version", "v1"), ("stage", "canary")]))),
+            Eligible::Some(vec![1])
+        );
     }
 
     #[test]
