@@ -4649,6 +4649,289 @@ admin:
             "no matching subset under NO_FALLBACK must return None (503)"
         );
     }
+
+    // ---- 30 Task 8 backstop GAPS (pick() level) ----
+
+    /// Build a STATIC subset cluster YAML: two endpoints (prod @10001, canary
+    /// @10002), selector `keys:[stage]`, the given `fallback_policy`, optional
+    /// `default_subset: {stage: <ds>}`.
+    fn subset_yaml(fallback_policy: &str, default_subset_stage: Option<&str>) -> String {
+        let ds = match default_subset_stage {
+            Some(v) => format!("        default_subset:\n          stage: {v}\n"),
+            None => String::new(),
+        };
+        format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: subset_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      lb_subset_config:
+        fallback_policy: {fallback_policy}
+{ds}        subset_selectors:
+          - keys: [stage]
+      load_assignment:
+        cluster_name: subset_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: prod
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10002
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: canary
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#
+        )
+    }
+
+    async fn build_subset_handle(yaml: &str) -> ClusterHandle {
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("valid");
+        let mgr = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+            .await
+            .expect("construct");
+        mgr.get("subset_backend").expect("cluster present")
+    }
+
+    fn stage_match(v: &str) -> std::collections::BTreeMap<String, String> {
+        [("stage".to_string(), v.to_string())].into_iter().collect()
+    }
+
+    /// GAP 4 (ANY_ENDPOINT fallback): a no-match `metadata_match` under
+    /// ANY_ENDPOINT round-robins over ALL endpoints — never None, and over
+    /// repeated calls it hits BOTH the prod and canary hosts.
+    #[tokio::test]
+    async fn subset_any_endpoint_fallback_round_robins_all() {
+        let prod: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let canary: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let handle = build_subset_handle(&subset_yaml("ANY_ENDPOINT", None)).await;
+
+        let none_match = stage_match("nonexistent");
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let got = handle
+                .pick_endpoint(None, Some(&none_match))
+                .expect("ANY_ENDPOINT no-match must return a host, never None");
+            seen.insert(got);
+        }
+        assert_eq!(
+            seen,
+            [prod, canary].into_iter().collect(),
+            "ANY_ENDPOINT must round-robin over ALL endpoints"
+        );
+
+        // The no-metadata_match request (None) under ANY_ENDPOINT also returns a host.
+        let mut seen_none = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            seen_none.insert(
+                handle
+                    .pick_endpoint(None, None)
+                    .expect("ANY_ENDPOINT with no match must return a host"),
+            );
+        }
+        assert_eq!(seen_none, [prod, canary].into_iter().collect());
+    }
+
+    /// GAP 4 (DEFAULT_SUBSET fallback): a no-match `metadata_match` (and the
+    /// no-`metadata_match` request) under DEFAULT_SUBSET `{stage:prod}` returns
+    /// the prod host deterministically.
+    #[tokio::test]
+    async fn subset_default_subset_fallback_routes_to_default() {
+        let prod: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let handle = build_subset_handle(&subset_yaml("DEFAULT_SUBSET", Some("prod"))).await;
+
+        let none_match = stage_match("nonexistent");
+        for _ in 0..3 {
+            assert_eq!(
+                handle.pick_endpoint(None, Some(&none_match)),
+                Some(prod),
+                "DEFAULT_SUBSET no-match must route to the default subset (prod)"
+            );
+        }
+        // The no-metadata_match request also falls back to the default subset.
+        for _ in 0..3 {
+            assert_eq!(
+                handle.pick_endpoint(None, None),
+                Some(prod),
+                "DEFAULT_SUBSET with no match must route to the default subset (prod)"
+            );
+        }
+    }
+
+    /// GAP 4 (NO_FALLBACK, no-`metadata_match` request): a subset cluster under
+    /// NO_FALLBACK with a `None` `metadata_match` returns None (503). (The
+    /// no-match `{stage:nonexistent}` case is already in
+    /// `subset_narrows_to_matched_endpoint`.)
+    #[tokio::test]
+    async fn subset_no_fallback_no_metadata_match_returns_none() {
+        let handle = build_subset_handle(&subset_yaml("NO_FALLBACK", None)).await;
+        assert_eq!(
+            handle.pick_endpoint(None, None),
+            None,
+            "NO_FALLBACK with no metadata_match must return None (503)"
+        );
+    }
+
+    /// GAP 5 (M-2): a `metadata_match` selecting a subset of TWO endpoints
+    /// round-robins over the two subset members across repeated calls — pinning
+    /// the MVP inner-LB-within-subset = ROUND_ROBIN cursor rotation that the
+    /// single-host fixture can't exercise.
+    #[tokio::test]
+    async fn subset_multi_member_round_robins_within_subset() {
+        // Two endpoints SHARE stage:prod; a third is stage:canary (excluded).
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: subset_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      lb_subset_config:
+        fallback_policy: NO_FALLBACK
+        subset_selectors:
+          - keys: [stage]
+      load_assignment:
+        cluster_name: subset_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: prod
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10002
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: prod
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10003
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: canary
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let prod0: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let prod1: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let canary: SocketAddr = "127.0.0.1:10003".parse().unwrap();
+        let handle = build_subset_handle(yaml).await;
+
+        let prod_match = stage_match("prod");
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            let got = handle
+                .pick_endpoint(None, Some(&prod_match))
+                .expect("a 2-member subset must return a host");
+            assert_ne!(
+                got, canary,
+                "the canary host is OUTSIDE the {{stage:prod}} subset"
+            );
+            seen.insert(got);
+        }
+        assert_eq!(
+            seen,
+            [prod0, prod1].into_iter().collect(),
+            "the cursor must round-robin over BOTH members of the {{stage:prod}} subset"
+        );
+    }
+
+    /// GAP 6 (empty subset_selectors no-op at pick level): a cluster with an
+    /// `lb_subset_config` whose `subset_selectors` is empty disables the layer —
+    /// `pick_endpoint(None, Some(&{stage:prod}))` round-robins ALL hosts even
+    /// under NO_FALLBACK (never None).
+    #[tokio::test]
+    async fn subset_empty_selectors_round_robins_all_at_pick_level() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: subset_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      lb_subset_config:
+        fallback_policy: NO_FALLBACK
+        subset_selectors: []
+      load_assignment:
+        cluster_name: subset_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: prod
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10002
+                metadata:
+                  filter_metadata:
+                    envoy.lb:
+                      stage: canary
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#;
+        let prod: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let canary: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+        let handle = build_subset_handle(yaml).await;
+
+        let prod_match = stage_match("prod");
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..6 {
+            seen.insert(
+                handle
+                    .pick_endpoint(None, Some(&prod_match))
+                    .expect("empty selectors disable the layer -> always a host"),
+            );
+        }
+        assert_eq!(
+            seen,
+            [prod, canary].into_iter().collect(),
+            "empty subset_selectors must round-robin ALL hosts even under NO_FALLBACK"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -306,4 +306,75 @@ mod tests {
             Eligible::All
         );
     }
+
+    // ----- 30 Task 8 backstop GAPS (resolve/build level) -----
+
+    #[test]
+    fn build_is_deterministic_across_a_query_battery() {
+        // GAP 1: building a SubsetIndex twice from the same config + endpoint
+        // metadata yields identical resolve outputs over a battery of queries.
+        // SubsetIndex isn't PartialEq, so we pin determinism via `resolve` results.
+        let config = cfg(
+            LbSubsetFallbackPolicy::DefaultSubset,
+            Some(meta(&[("stage", "prod")])),
+        );
+        let a = SubsetIndex::build(&config, &ab_endpoints());
+        let b = SubsetIndex::build(&config, &ab_endpoints());
+        let queries: Vec<Option<BTreeMap<String, String>>> = vec![
+            Some(meta(&[("stage", "prod")])),
+            Some(meta(&[("stage", "canary")])),
+            Some(meta(&[("stage", "nonexistent")])),
+            // wrong key-set (no selector matches) -> falls back to default subset
+            Some(meta(&[("version", "v2")])),
+            None,
+        ];
+        for q in &queries {
+            assert_eq!(
+                a.resolve(q.as_ref()),
+                b.resolve(q.as_ref()),
+                "build must be deterministic for query {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_selector_key_endpoints_are_excluded() {
+        // GAP 2 (I-3): endpoints missing the selector's key are EXCLUDED from its
+        // subsets. A = {stage:prod} (idx 0), B = {} (idx 1, no keys),
+        // C = {version:v1} (idx 2, missing `stage`). Selector keys = [stage].
+        let endpoints = vec![
+            meta(&[("stage", "prod")]),
+            BTreeMap::new(),
+            meta(&[("version", "v1")]),
+        ];
+        let idx = SubsetIndex::build(&cfg(LbSubsetFallbackPolicy::NoFallback, None), &endpoints);
+        // {stage:prod} -> ONLY A (idx 0); B and C are excluded for lacking `stage`.
+        assert_eq!(
+            idx.resolve(Some(&meta(&[("stage", "prod")]))),
+            Eligible::Some(vec![0])
+        );
+        // B/C carry no `stage` value, so NO {stage:...} query can ever reach them.
+        for v in ["v1", "", "anything", "prod"] {
+            let r = idx.resolve(Some(&meta(&[("stage", v)])));
+            if let Eligible::Some(idxs) = r {
+                assert!(
+                    !idxs.contains(&1) && !idxs.contains(&2),
+                    "missing-key endpoints B(1)/C(2) must never be selected by stage:{v}, got {idxs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn value_tuple_maps_to_multiple_indices() {
+        // GAP 3 (SPREAD): two endpoints SHARING a selector value both land in the
+        // same subset. A = {stage:prod} (idx 0), B = {stage:prod} (idx 1).
+        let endpoints = vec![meta(&[("stage", "prod")]), meta(&[("stage", "prod")])];
+        let idx = SubsetIndex::build(&cfg(LbSubsetFallbackPolicy::NoFallback, None), &endpoints);
+        assert_eq!(
+            idx.resolve(Some(&meta(&[("stage", "prod")]))),
+            Eligible::Some(vec![0, 1]),
+            "a value-tuple must map to ALL endpoints sharing it"
+        );
+    }
 }
