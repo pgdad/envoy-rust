@@ -323,6 +323,8 @@ fn clone_route_action(a: &RouteAction) -> RouteAction {
             retry_policy: ar.retry_policy.clone(),
             // 28 Task 6: carry the route-level hash policies through the clone.
             hash_policy: ar.hash_policy.clone(),
+            // 30 Task 3: carry the route-level metadata_match through the clone.
+            metadata_match: ar.metadata_match.clone(),
         }),
     }
 }
@@ -2708,6 +2710,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -2767,6 +2770,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -2802,6 +2806,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -2827,6 +2832,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -2929,6 +2935,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -2966,6 +2973,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -3005,6 +3013,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -3037,6 +3046,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -3062,6 +3072,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -3097,6 +3108,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -3229,6 +3241,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -3254,6 +3267,7 @@ static_resources:
                 cluster: "backend".into(),
                 retry_policy: None,
                 hash_policy: vec![],
+                metadata_match: None,
             }),
             cluster_mgr,
         );
@@ -4590,6 +4604,7 @@ static_resources:
                             cluster: "backend".to_string(),
                             retry_policy: None,
                             hash_policy: vec![],
+                            metadata_match: None,
                         }),
                         typed_per_filter_config: Default::default(),
                     }],
@@ -4777,6 +4792,7 @@ static_resources:
                             cluster: "backend".to_string(),
                             retry_policy: None,
                             hash_policy: vec![],
+                            metadata_match: None,
                         }),
                         typed_per_filter_config: Default::default(),
                     }],
@@ -4901,6 +4917,7 @@ static_resources:
                             cluster: cluster.to_string(),
                             retry_policy,
                             hash_policy: vec![],
+                            metadata_match: None,
                         }),
                         typed_per_filter_config: Default::default(),
                     }],

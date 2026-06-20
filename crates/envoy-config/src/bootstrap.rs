@@ -1520,6 +1520,12 @@ pub struct RouteAction_Route {
     /// `validate_hash_policy` (request-path wiring lands in Task 6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hash_policy: Vec<HashPolicy>,
+    /// 30 Task 3 (ADR-0074): optional route-level `metadata_match` — Envoy's
+    /// `core.v3.Metadata` (same nested `filter_metadata."envoy.lb"` wire shape as
+    /// endpoint `metadata`). Used by subset LB to narrow the eligible endpoint
+    /// set. Absent ⇒ `None` (no narrowing). See `LbMetadata`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_match: Option<LbMetadata>,
 }
 
 /// 28 Task 4: one entry of Envoy's repeated `RouteAction.hash_policy` field.
@@ -13157,6 +13163,35 @@ hash_policy:
             ),
             "expected UnsupportedHashPolicy(<none>); got {err:?}"
         );
+    }
+
+    /// 30 Task 3: a route `metadata_match` with the Envoy `core.v3.Metadata`
+    /// nested `filter_metadata."envoy.lb"` wire shape parses into `Some(LbMetadata)`
+    /// carrying the namespace map; an absent `metadata_match` yields `None`.
+    #[test]
+    fn route_metadata_match_parses_envoy_lb_namespace() {
+        let yaml = r#"
+cluster: backend
+metadata_match:
+  filter_metadata:
+    envoy.lb:
+      stage: prod
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses");
+        assert_eq!(ar.cluster, "backend");
+        let md = ar.metadata_match.as_ref().expect("metadata_match present");
+        assert_eq!(md.envoy_lb.get("stage").map(String::as_str), Some("prod"));
+    }
+
+    /// 30 Task 3: a route with NO `metadata_match` yields `None` (regression-
+    /// equivalence default — every pre-existing route parses unchanged).
+    #[test]
+    fn route_metadata_match_absent_yields_none() {
+        let yaml = r#"
+cluster: backend
+"#;
+        let ar: RouteAction_Route = serde_yaml::from_str(yaml).expect("parses");
+        assert!(ar.metadata_match.is_none());
     }
 
     /// (d) A VirtualHost YAML with include_attempt_count_in_response: true → field true;
