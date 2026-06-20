@@ -7,15 +7,32 @@
 
 ## Status
 
-**Lifecycle state:** **state-3 implementation COMPLETE / state-4-next** (`superpowers:verification-before-completion`).
-All 9 `PLAN.md` tasks implemented TDD-per-task, each dispatched to a fresh implementer subagent
+**Lifecycle state:** **state-4 verification COMPLETE → state-5-next** (code review). The §7.5 phase-done
+gate (a)-(e) is **GREEN at the AUTHORITATIVE Linux CI run [`27881837635`](https://github.com/pgdad/envoy-rust/actions/runs/27881837635)
+@ HEAD `1acf78c`** (both jobs ✓; see the §7.5 evidence block below). `REVIEW.md` ABSENT → the next step
+is the state-5 `superpowers:requesting-code-review`.
+All 9 `PLAN.md` tasks were implemented TDD-per-task, each dispatched to a fresh implementer subagent
 (SERIAL), two-stage-reviewed (spec-compliance THEN code-quality via fresh `superpowers:code-reviewer`
 subagents), each committed separately on `main`. **The fixture-0038 differential RAN LOCALLY → GREEN**
-(subset LB is locally observable; Docker `envoyproxy/envoy:v1.33.0`). `cargo fmt --all -- --check`
-clean locally at the state-3 close (the `envoy-rust-state4-ci-first-execution` discipline — pre-empts
-the mid-phase fmt red). The authoritative §7.5 verification gate (full
-`cargo build/clippy/fmt/test --workspace` + `cargo deny` + the full Docker differential suite + the
-short-budget fuzz) is the state-4 Linux-CI run, NOT state-3.
+(subset LB is locally observable; Docker `envoyproxy/envoy:v1.33.0`) and re-confirmed on Linux/Docker in CI.
+`cargo fmt --all -- --check` was clean locally at the state-3 close (the `envoy-rust-state4-ci-first-execution`
+discipline — pre-empted the mid-phase fmt red), and the run was green on the first push.
+
+## §7.5 verification gate (state-4 — CI's first full execution; AUTHORITATIVE = Linux CI)
+
+**CI run [`27881837635`](https://github.com/pgdad/envoy-rust/actions/runs/27881837635) (push, `main` @ `1acf78c`) — both jobs ✓ success:**
+- **`build + test + lint`** (4m2s, job `82510649488`) ran, per `.github/workflows/ci.yml`: `cargo fmt --all -- --check` → clean; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean; `cargo build --workspace --all-targets` → `Finished` ok; h2spec (conformance; unchanged — no H2 codec change this phase); `cargo test --workspace` (**includes the Docker differential harness**, pre-pulling upstream `envoyproxy/envoy:v1.33.0`) → **0 failed workspace-wide**; `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+- **`fuzz`** (2m10s, job `82510649489`) ran `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30` (corpus now incl. the new `cluster_lb_subset.yaml` seed) + `jwt_parse` → clean (no crash).
+
+**§7.5 (a)-(e) mapping (evidence quoted from the CI test-job log):**
+- **(a) new differential fixture green** — `test lb_subset_fixture ... ok` (fixture `0038-lb-subset` cross-proxy route-selection STRONG witness — `/prod`→prod, `/canary`→canary, `/nope`→503 NO_FALLBACK; on Linux/Docker vs live Envoy v1.33.0; node `envoy-rust-phase-30-fixture-0038`).
+- **(b) pre-existing differential fixtures green** — all other fixture binaries `... ok`, incl. `lb_maglev_fixture` (0037) + `lb_ring_hash_fixture` (0036) + the `0001`–`0035` family (40 fixture/fixture-expectation tests total, `0 failed`); NO `FAILED`/`panicked`/`error[` anywhere in the run. The no-`lb_subset_config` no-op is a verified pass-through (ROUND_ROBIN + the consistent-hash fixtures behavior-identical).
+- **(c) conformance** — `test h2spec_pass_rate_gate ... ok` (the ≥95% gate asserted green in the `build + test + lint` job); unchanged — no HTTP/2 codec change this phase.
+- **(d) fuzz clean** — the `fuzz` job ✓; `parse_bootstrap` `Done 195277 runs in 31 second(s)` (cov 11048, corpus incl. the new `cluster_lb_subset.yaml` seed); `jwt_parse` `Done 4461621 runs in 31 second(s)`. NO new fuzz target.
+- **(e) build/clippy/fmt/test/deny** — all clean in the green `build + test + lint` job (representative workspace counts: envoy lib 146 passed / 0 failed / 2 ignored; the differential lib + per-fixture integration binaries all `0 failed`; the differential summary binary `16 passed; 0 failed`).
+- (f) `REVIEW.md` approved is the state-5 step (not part of state-4).
+
+No CI iteration was needed — the run was green on the first (state-3) push (`cargo fmt --all -- --check` had already been run clean locally at the state-3 close, pre-empting the usual mid-phase fmt red). The known pre-existing flake `differential::tests::drive_http2_round_trip_against_in_process_listener` did NOT fire. Open carry-forwards (M29-1/M29-2 + M30-1 differential-driver wording/`extract_marker` fold; M30-2 `lb_policy` serde-default divergence) are cosmetic/future and do NOT affect any gate.
 
 **ADRs this phase:** ADR-0073 (scope, state-1), ADR-0074 (§6.2 lock, state-2), **ADR-0075 (state-3 Task-2
 correction — `default_subset` is a flat `google.protobuf.Struct`, not nested `core.v3.Metadata`;
