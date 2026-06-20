@@ -258,6 +258,13 @@ pub struct Cluster {
     /// gated to MAGLEV clusters — see `validate_cluster`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maglev_lb_config: Option<MaglevLbConfig>,
+    /// 30 D1 (ADR-0073/0074): OPTIONAL subset-LB tuning. `None` when absent. Per
+    /// §A divergence #1 / ADR-0074, NOTHING about this config is startup-fatal
+    /// (Envoy boots for empty selectors / empty keys / uncovered default_subset /
+    /// DEFAULT_SUBSET-without-default — consequences are request-time). No
+    /// `validate_cluster` block; accept-all. See `LbSubsetConfig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lb_subset_config: Option<LbSubsetConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -324,6 +331,45 @@ pub struct MaglevLbConfig {
 
 fn default_maglev_table_size() -> u64 {
     65537
+}
+
+/// 30 D1 (ADR-0073/0074): subset-LB fallback policy when a request's
+/// metadata_match selects no subset. Mirrors Envoy v1.33's
+/// `Cluster.LbSubsetConfig.LbSubsetFallbackPolicy` (the 3 cluster-level
+/// variants). Defaults to `NO_FALLBACK` (Envoy proto default).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LbSubsetFallbackPolicy {
+    #[default]
+    NoFallback,
+    AnyEndpoint,
+    DefaultSubset,
+}
+
+/// 30 D1 (ADR-0073/0074): one subset selector — a set of metadata keys whose
+/// distinct value-tuples across endpoints define the cluster's subsets. Mirrors
+/// Envoy v1.33's `Cluster.LbSubsetConfig.LbSubsetSelector` (keys only; the
+/// per-selector fallback fields are out of scope for phase-30). An empty
+/// `keys: []` is accepted (NOT fatal — ADR-0074 §A divergence #1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LbSubsetSelector {
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+/// 30 D1 (ADR-0073/0074): MAGLEV-style optional subset-LB tuning. NO validator is
+/// fatal (§6.2/ADR-0074: Envoy boots for empty selectors / empty keys / uncovered
+/// default_subset / DEFAULT_SUBSET-without-default — consequences are request-time).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LbSubsetConfig {
+    #[serde(default)]
+    pub fallback_policy: LbSubsetFallbackPolicy,
+    #[serde(default)]
+    pub subset_selectors: Vec<LbSubsetSelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_subset: Option<LbMetadata>,
 }
 
 /// 28 D1 (ADR-0069): RING_HASH LB tuning knobs. Mirrors Envoy v1.33's
@@ -13710,6 +13756,123 @@ metadata:
         assert_eq!(md.envoy_lb.get("version"), Some(&"2".to_string()));
         assert_eq!(md.envoy_lb.get("enabled"), Some(&"true".to_string()));
         assert_eq!(md.envoy_lb.len(), 2);
+    }
+
+    // ---- 30 Task 2 (ADR-0073/0074): Cluster.lb_subset_config (accept-all) ----
+
+    fn cluster_yaml(lb_subset_block: &str) -> String {
+        format!(
+            r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: MAGLEV
+{lb_subset_block}      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 10001
+"#
+        )
+    }
+
+    #[test]
+    fn lb_subset_config_absent_is_none() {
+        let b = crate::parse_bootstrap(&cluster_yaml("")).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        assert!(c.lb_subset_config.is_none(), "no lb_subset_config → None");
+    }
+
+    #[test]
+    fn lb_subset_config_default_fallback_policy_is_no_fallback() {
+        // fallback_policy omitted ⇒ NO_FALLBACK (serde default).
+        let block =
+            "      lb_subset_config:\n        subset_selectors:\n          - keys: [stage]\n";
+        let b = crate::parse_bootstrap(&cluster_yaml(block)).expect("valid YAML");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c.lb_subset_config.as_ref().expect("present");
+        assert_eq!(cfg.fallback_policy, LbSubsetFallbackPolicy::NoFallback);
+        assert_eq!(cfg.subset_selectors.len(), 1);
+        assert_eq!(cfg.subset_selectors[0].keys, vec!["stage".to_string()]);
+        assert!(cfg.default_subset.is_none());
+    }
+
+    #[test]
+    fn lb_subset_config_any_endpoint_fallback() {
+        let block = concat!(
+            "      lb_subset_config:\n",
+            "        fallback_policy: ANY_ENDPOINT\n",
+            "        subset_selectors:\n",
+            "          - keys: [stage]\n",
+        );
+        let b = crate::parse_bootstrap(&cluster_yaml(block)).expect("valid YAML");
+        let cfg = b.static_resources.clusters[0]
+            .lb_subset_config
+            .as_ref()
+            .expect("present");
+        assert_eq!(cfg.fallback_policy, LbSubsetFallbackPolicy::AnyEndpoint);
+    }
+
+    #[test]
+    fn lb_subset_config_default_subset_fallback_with_default_subset() {
+        let block = concat!(
+            "      lb_subset_config:\n",
+            "        fallback_policy: DEFAULT_SUBSET\n",
+            "        default_subset:\n",
+            "          filter_metadata:\n",
+            "            envoy.lb:\n",
+            "              stage: prod\n",
+            "        subset_selectors:\n",
+            "          - keys: [stage]\n",
+        );
+        let b = crate::parse_bootstrap(&cluster_yaml(block)).expect("valid YAML");
+        let cfg = b.static_resources.clusters[0]
+            .lb_subset_config
+            .as_ref()
+            .expect("present");
+        assert_eq!(cfg.fallback_policy, LbSubsetFallbackPolicy::DefaultSubset);
+        let ds = cfg.default_subset.as_ref().expect("default_subset present");
+        assert_eq!(ds.envoy_lb.get("stage"), Some(&"prod".to_string()));
+    }
+
+    #[test]
+    fn lb_subset_config_empty_selectors_parse_ok() {
+        // §A divergence #1 (ADR-0074): empty subset_selectors is NOT fatal.
+        let block = "      lb_subset_config:\n        subset_selectors: []\n";
+        let b = crate::parse_bootstrap(&cluster_yaml(block))
+            .expect("valid YAML — empty selectors accepted (not fatal)");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c.lb_subset_config.as_ref().expect("present");
+        assert!(cfg.subset_selectors.is_empty());
+        // The validator must return Ok for empty selectors.
+        assert!(super::validate_cluster(c).is_ok(), "empty selectors → Ok");
+    }
+
+    #[test]
+    fn lb_subset_config_empty_keys_parse_ok() {
+        // §A divergence #1 (ADR-0074): a selector with keys: [] is NOT fatal.
+        let block = concat!(
+            "      lb_subset_config:\n",
+            "        subset_selectors:\n",
+            "          - keys: []\n",
+        );
+        let b = crate::parse_bootstrap(&cluster_yaml(block))
+            .expect("valid YAML — empty keys accepted (not fatal)");
+        let c = &b.static_resources.clusters[0];
+        let cfg = c.lb_subset_config.as_ref().expect("present");
+        assert_eq!(cfg.subset_selectors.len(), 1);
+        assert!(cfg.subset_selectors[0].keys.is_empty());
+        assert!(super::validate_cluster(c).is_ok(), "empty keys → Ok");
     }
 }
 

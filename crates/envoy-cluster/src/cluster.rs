@@ -2205,6 +2205,7 @@ admin:
                     outlier_detection: None,   // 14.1 D1
                     ring_hash_lb_config: None, // 28 Task 3
                     maglev_lb_config: None,    // 29 Task 2
+                    lb_subset_config: None,    // 30 Task 2
                 }],
             },
             dynamic_resources: None,
@@ -2258,6 +2259,7 @@ admin:
             outlier_detection: None,   // 14.1 D1
             ring_hash_lb_config: None, // 28 Task 3
             maglev_lb_config: None,    // 29 Task 2
+            lb_subset_config: None,    // 30 Task 2
         };
         let bootstrap = Bootstrap {
             node: None,
@@ -4113,6 +4115,7 @@ admin:
             outlier_detection: None,
             ring_hash_lb_config: None, // 28 Task 3
             maglev_lb_config: None,    // 29 Task 2
+            lb_subset_config: None,    // 30 Task 2
         }
     }
 
@@ -4304,6 +4307,7 @@ admin:
             outlier_detection: None,
             ring_hash_lb_config: None, // 28 Task 3
             maglev_lb_config: None,    // 29 Task 2
+            lb_subset_config: None,    // 30 Task 2
         }
     }
 
