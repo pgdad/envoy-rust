@@ -25,6 +25,7 @@ members = [
 ]
 exclude = [
     "crates/envoy-config/fuzz",
+    "crates/envoy-filter/fuzz",
     "crates/envoy-jwt/fuzz",
 ]
 

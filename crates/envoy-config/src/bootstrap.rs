@@ -5677,6 +5677,7 @@ admin:
             "fuzz/corpus/parse_bootstrap/cluster_ring_hash_lb.yaml",  // 28 Task 9
             "fuzz/corpus/parse_bootstrap/cluster_maglev_lb.yaml",     // 29 Task 8
             "fuzz/corpus/parse_bootstrap/cluster_lb_subset.yaml",     // 30 Task 9
+            "fuzz/corpus/parse_bootstrap/http_filter_cdn_loop.yaml",  // 31 Task 6
         ] {
             let path = format!("{root}/{fname}");
             let yaml =

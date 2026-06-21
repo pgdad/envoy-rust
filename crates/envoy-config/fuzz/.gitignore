@@ -37,6 +37,7 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/cluster_ring_hash_lb.yaml
 !corpus/parse_bootstrap/cluster_maglev_lb.yaml
 !corpus/parse_bootstrap/cluster_lb_subset.yaml
+!corpus/parse_bootstrap/http_filter_cdn_loop.yaml
 !corpus/parse_bootstrap/seed-buffer.yaml
 artifacts/
 target/
