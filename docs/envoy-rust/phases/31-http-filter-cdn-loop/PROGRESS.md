@@ -100,3 +100,42 @@
 
 **Next session (state-4, per §5.1 — do NOT run this session):** `superpowers:verification-before-completion` — the §7.5 phase-done gate (39-fixture differential green on the AUTHORITATIVE Linux CI + h2spec ≥95% + both fuzzers clean + build/clippy/fmt/test/deny clean), quoting all outputs into this PROGRESS.md.
 
+
+---
+
+## State-4 verification (`superpowers:verification-before-completion`)
+
+> Authored at the phase-31 state-4 §7.5 verification gate. **AUTHORITATIVE Linux CI run `27915239054`
+> @ `a2051b2`** (the HEAD after the CI fuzz-wiring fix). All six §7.5 gates GREEN; quoted evidence below.
+
+**One verification-driven fix landed:** the Task-6 `cdn_loop_parse` fuzz target was scaffolded but NOT
+invoked by CI (the CI `fuzz` job ran only `parse_bootstrap` + `jwt_parse`). §7.4 requires every new
+fuzzer to run short-budget in CI. Commit `a2051b2` (`phase 31: state-4 — wire cdn_loop_parse fuzz
+target into CI (§7.4)`) adds the 30s `cdn_loop_parse` step + the `crates/envoy-filter/fuzz` cache
+workspace + the job-name update (mirroring the jwt_parse precedent). CI-config only; no code change.
+
+**§7.5 six-part gate — all GREEN (CI run `27915239054` @ `a2051b2`):**
+- **(a) fixture `0039-http-filter-cdn-loop` green** — `test http_filter_cdn_loop_fixture ... ok` (build job).
+- **(b) all `0001`–`0038` green SIMULTANEOUSLY** — the full `cargo test --workspace` ran all 39 differential
+  fixture binaries; **0 non-zero-fail test results** across the entire build job (every `test result:`
+  line carried `0 failed`).
+- **(c) h2spec ≥95%** — `test h2spec_pass_rate_gate ... ok` (the h2spec-conformance ≥95% gate assertion).
+- **(d) fuzz clean** — CI `fuzz` job ✓ (6m31s): `parse_bootstrap` + `jwt_parse` + the NEW `cdn_loop_parse`
+  (`cargo +nightly fuzz run cdn_loop_parse -- -max_total_time=30`, no crash). LOCAL corroboration:
+  `cdn_loop_parse` ran **6,756,700 runs in 31s, exit 0** (no panic on adversarial bytes).
+- **(e) build/clippy/fmt/test/deny clean** — build job steps all ✓ (fmt, clippy, build, test, cargo deny
+  check). LOCAL corroboration: `cargo build --workspace --all-targets` exit 0; `cargo fmt --all -- --check`
+  clean (at the state-3 close).
+- **(f) `REVIEW.md`** — the state-5 step (`superpowers:requesting-code-review`); NOT this session.
+
+**CI flake encountered + cleared (NOT a phase-31 issue):** the first run of `27915239054` failed the build
+job's `test` step at `happy_reload_flips_route_and_ticks_counters` (`crates/envoy-bin/tests/xds_rds_hot_reload.rs:476`)
+with `ConnectionRefused` on envoy-bin admin-ready — a phase-26 RDS-hot-reload admin-readiness startup-race
+flake, unrelated to cdn_loop (my commit touched ONLY `ci.yml`; the identical `cargo test --workspace`
+passed on `583e7c2` 30 min earlier). Re-running the failed build job → GREEN, confirming the transient flake.
+(Aligns with the `host-docker-desktop-virtiofs-no-inotify` / `envoy-rust-state4-ci-first-execution`
+discipline: the hot-reload tests are timing-sensitive and CI-authoritative.)
+
+**`#![forbid(unsafe_code)]` holds. STATE advanced → `31` state-4-complete/state-5-next** (next skill
+`superpowers:requesting-code-review`); the superseded state-3 top-section blocks relocated verbatim to
+STATE_HISTORY.md per ADR-0035.
