@@ -75,7 +75,7 @@ jobs:
         run: cargo deny check
 
   fuzz:
-    name: fuzz (parse_bootstrap + jwt_parse, 30s each)
+    name: fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse, 30s each)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -92,6 +92,7 @@ jobs:
           workspaces: |
             crates/envoy-config/fuzz -> target
             crates/envoy-jwt/fuzz -> target
+            crates/envoy-filter/fuzz -> target
 
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -108,3 +109,10 @@ jobs:
         # Phase-22 §7.4 fuzz target over the JWKS/JWT parse + RS256-verify
         # surface (the envoy-jwt crate). Same `+nightly` rationale as above.
         run: cargo +nightly fuzz run jwt_parse -- -max_total_time=30
+
+      - name: fuzz cdn_loop_parse
+        working-directory: crates/envoy-filter
+        # Phase-31 §7.4 fuzz target over the RFC 8586 CDN-Loop header parser
+        # (`parse_cdn_loop` in the envoy-filter crate; the multi-header
+        # coalescing surface). Same `+nightly` rationale as above.
+        run: cargo +nightly fuzz run cdn_loop_parse -- -max_total_time=30
