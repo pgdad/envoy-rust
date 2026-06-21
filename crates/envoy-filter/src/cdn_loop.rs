@@ -1,5 +1,8 @@
-//! RFC 8586 `CDN-Loop` header parser — the correctness engine for the
-//! `envoy.filters.http.cdn_loop` filter (phase 31; ADR-0077).
+//! RFC 8586 `CDN-Loop` header parser + the `envoy.filters.http.cdn_loop`
+//! runtime filter (phase 31; ADR-0077). The parser (`parse_cdn_loop` /
+//! `count_cdn_id`) is the correctness engine; `CdnLoopFilter` is the
+//! decode-side filter that drives it (count/append/reject) — see the
+//! `CdnLoopFilter` section below.
 //!
 //! §6.2-LOCKED against envoyproxy/envoy:v1.33.0.
 //!
