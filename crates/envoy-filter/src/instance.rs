@@ -18,6 +18,7 @@ use std::sync::Arc;
 use envoy_stats::StatsRegistry;
 
 use crate::buffer::BufferFilter;
+use crate::cdn_loop::CdnLoopFilter;
 use crate::cors::CorsFilter;
 use crate::csrf::CsrfFilter;
 use crate::error::FilterError;
@@ -72,6 +73,13 @@ pub enum HttpFilterInstance {
     /// through `apply_route_config`; over-limit → 413 `Payload Too Large`. NO
     /// stats — ADR-0063 finding 4).
     Buffer(BufferFilter),
+    /// Phase-31 Task 3: the `envoy.filters.http.cdn_loop` filter (decode-side
+    /// RFC 8586 loop detection; coalesces all `cdn-loop` request headers, parses
+    /// them, rejects malformed values with a 400 and `count(cdn_id) >
+    /// max_allowed_occurrences` with a 502, else appends this proxy's `cdn_id`
+    /// (comma-only) and forwards ONE coalesced header. No per-route config, no
+    /// stats — ADR-0077).
+    CdnLoop(CdnLoopFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -142,6 +150,9 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::Buffer(cfg) => {
                 Ok(HttpFilterInstance::Buffer(BufferFilter::new(cfg)))
             }
+            envoy_config::HttpFilterTypedConfig::CdnLoop(cfg) => {
+                Ok(HttpFilterInstance::CdnLoop(CdnLoopFilter::new(cfg)))
+            }
         }
     }
 
@@ -156,6 +167,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Cors(f) => f.decode_headers(req),
             HttpFilterInstance::Csrf(f) => f.decode_headers(req),
             HttpFilterInstance::Buffer(f) => f.decode_headers(req),
+            HttpFilterInstance::CdnLoop(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -176,6 +188,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Cors(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Csrf(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::Buffer(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::CdnLoop(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
@@ -194,8 +207,8 @@ impl HttpFilterInstance {
             HttpFilterInstance::Cors(f) => f.apply_route_config(route),
             HttpFilterInstance::Csrf(f) => f.apply_route_config(route),
             HttpFilterInstance::Buffer(f) => f.apply_route_config(route),
-            // Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn (and the
-            // test-only variants) consume no per-route config; only
+            // Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn/CdnLoop
+            // (and the test-only variants) consume no per-route config; only
             // Cors/Csrf/Buffer override. A future route-config-consuming filter
             // must add an arm above rather than silently fall through here.
             _ => {}
@@ -402,6 +415,58 @@ mod tests {
         }
 
         // encode_headers is a no-op for Csrf — must return Continue.
+        let mut resp = FilterResponse {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
+    }
+
+    #[test]
+    fn builds_cdn_loop_instance_and_dispatches() {
+        let registry = test_registry();
+        let hf = envoy_config::HttpFilter {
+            name: "envoy.filters.http.cdn_loop".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::CdnLoop(
+                envoy_config::CdnLoopConfig {
+                    cdn_id: "mycdn.example".to_string(),
+                    max_allowed_occurrences: 0,
+                },
+            ),
+        };
+        let mut inst = HttpFilterInstance::build(&hf, &registry, "ingress_http")
+            .expect("CdnLoop build succeeds");
+        assert!(matches!(inst, HttpFilterInstance::CdnLoop(_)));
+
+        // Self id already present at limit 0 → 502 loop rejection (decode-side).
+        let mut req = FilterRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![("cdn-loop".into(), "mycdn.example".into())],
+            body: None,
+        };
+        match inst.decode_headers(&mut req) {
+            Decision::StopAndSend(r) => assert_eq!(r.status, 502),
+            Decision::Continue => panic!("expected StopAndSend(502) for self-loop"),
+        }
+
+        // No header → append + Continue.
+        let mut req2 = FilterRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![],
+            body: None,
+        };
+        assert!(matches!(inst.decode_headers(&mut req2), Decision::Continue));
+        assert!(
+            req2.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("cdn-loop") && v == "mycdn.example")
+        );
+
+        // encode_headers is a no-op for CdnLoop — must return Continue.
         let mut resp = FilterResponse {
             status: 200,
             reason: None,

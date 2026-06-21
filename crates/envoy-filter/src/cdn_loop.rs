@@ -28,7 +28,17 @@
 //! Pure function over bytes: no I/O, no `unsafe`, no allocation beyond the
 //! returned `Vec`.
 
+use bytes::Bytes;
 use thiserror::Error;
+
+use crate::pipeline::Decision;
+use crate::types::{FilterRequest, FilterResponse};
+
+const CDN_LOOP_HEADER: &str = "cdn-loop";
+/// ADR-0077 §6.2-LOCKED: the 502 loop-detected body — 44 bytes, NO newline.
+const LOOP_BODY: &[u8] = b"The server has detected a loop between CDNs.";
+/// ADR-0077 §6.2-LOCKED: the 400 malformed body — 35 bytes, NO newline.
+const MALFORMED_BODY: &[u8] = b"Invalid CDN-Loop header in request.";
 
 /// One parsed `cdn-info` list entry.
 ///
@@ -241,6 +251,308 @@ fn trim_ows(mut s: &[u8]) -> &[u8] {
         }
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// CdnLoopFilter — the runtime decode-side filter (phase 31 Task 3; ADR-0077)
+// ---------------------------------------------------------------------------
+
+/// The `envoy.filters.http.cdn_loop` runtime filter (RFC 8586 loop detection).
+///
+/// Built once per filter-chain from a `CdnLoopConfig`. On the decode side it
+/// coalesces all `cdn-loop` request-header values, parses them, and:
+/// - malformed → 400 `Invalid CDN-Loop header in request.`;
+/// - `count(cdn_id) > max_allowed_occurrences` → 502
+///   `The server has detected a loop between CDNs.`;
+/// - else appends this proxy's `cdn_id` (comma-only, on the RAW coalesced bytes
+///   to preserve empty entries) and `Continue`s.
+///
+/// Encode-side is inert. No per-route config this phase. No stats (ADR-0077).
+#[derive(Debug, Clone)]
+pub struct CdnLoopFilter {
+    cdn_id: String,
+    max_allowed_occurrences: u32,
+}
+
+impl CdnLoopFilter {
+    /// Build from the chain-level `CdnLoopConfig`. Infallible — the `cdn_id`
+    /// token validity is enforced at config-load time by
+    /// `envoy_config::validate_cdn_loop_config` (boot-fatal), not here.
+    pub(crate) fn new(cfg: &envoy_config::CdnLoopConfig) -> Self {
+        Self {
+            cdn_id: cfg.cdn_id.clone(),
+            max_allowed_occurrences: cfg.max_allowed_occurrences,
+        }
+    }
+
+    /// Decode-side entry point (ADR-0077 §6.2-LOCKED).
+    pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
+        // Coalesce all cdn-loop values in arrival order (RFC 8586 / RFC 7230).
+        let raw_values: Vec<Vec<u8>> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(CDN_LOOP_HEADER))
+            .map(|(_, v)| v.as_bytes().to_vec())
+            .collect();
+        let value_refs: Vec<&[u8]> = raw_values.iter().map(Vec::as_slice).collect();
+
+        // Parse → malformed → 400.
+        let parsed = match parse_cdn_loop(&value_refs) {
+            Ok(p) => p,
+            Err(_) => return Decision::StopAndSend(malformed_response()),
+        };
+
+        // Loop detection: count > max → 502.
+        let count = count_cdn_id(self.cdn_id.as_bytes(), &parsed);
+        if count > self.max_allowed_occurrences as usize {
+            return Decision::StopAndSend(loop_response());
+        }
+
+        // Within limit → append `cdn_id` (comma-only join on the RAW coalesced
+        // bytes, preserving empty entries) and forward ONE coalesced header.
+        if raw_values.is_empty() {
+            // No existing cdn-loop header → add the bare cdn_id (lowercase key).
+            req.headers
+                .push((CDN_LOOP_HEADER.to_string(), self.cdn_id.clone()));
+        } else {
+            // Coalesce existing values with a comma (RFC 7230 §3.2.2), then append
+            // `,{cdn_id}`. Operate on raw bytes so empty entries survive.
+            let mut appended = raw_values.join(&b","[..]);
+            appended.push(b',');
+            appended.extend_from_slice(self.cdn_id.as_bytes());
+            let new_value = String::from_utf8_lossy(&appended).into_owned();
+
+            // Preserve the FIRST existing entry's key string; set its value to the
+            // appended bytes; drop the redundant cdn-loop entries.
+            let mut first_done = false;
+            req.headers.retain_mut(|(k, v)| {
+                if k.eq_ignore_ascii_case(CDN_LOOP_HEADER) {
+                    if first_done {
+                        return false; // drop redundant entries
+                    }
+                    first_done = true;
+                    *v = new_value.clone();
+                }
+                true
+            });
+        }
+        Decision::Continue
+    }
+
+    /// CDN-Loop is decode-side only; encode is the trivial `Continue` arm (the
+    /// exhaustive-match arm for the `HttpFilterInstance` wiring).
+    pub(crate) fn encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision {
+        Decision::Continue
+    }
+}
+
+/// The 502 loop-detected local reply (ADR-0077 §6.2). `content-type`,
+/// `content-length`, `server`(, `connection`) are stamped by the H1/H2 synth
+/// decorators downstream (the csrf/buffer/rbac precedent).
+fn loop_response() -> FilterResponse {
+    FilterResponse {
+        status: 502,
+        reason: Some("Bad Gateway"),
+        headers: Vec::new(),
+        body: Bytes::from_static(LOOP_BODY),
+    }
+}
+
+/// The 400 malformed-header local reply (ADR-0077 §6.2).
+fn malformed_response() -> FilterResponse {
+    FilterResponse {
+        status: 400,
+        reason: Some("Bad Request"),
+        headers: Vec::new(),
+        body: Bytes::from_static(MALFORMED_BODY),
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::pipeline::Decision;
+    use crate::types::FilterRequest;
+
+    fn filter(cdn_id: &str, max: u32) -> CdnLoopFilter {
+        CdnLoopFilter::new(&envoy_config::CdnLoopConfig {
+            cdn_id: cdn_id.to_string(),
+            max_allowed_occurrences: max,
+        })
+    }
+
+    fn req(headers: &[(&str, &str)]) -> FilterRequest {
+        FilterRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: None,
+        }
+    }
+
+    // Extract the (single) cdn-loop header value (case-insensitively) post-decode.
+    fn cdn_loop_value(r: &FilterRequest) -> Option<String> {
+        let mut found: Vec<&str> = r
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("cdn-loop"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        match found.len() {
+            0 => None,
+            1 => Some(found.remove(0).to_string()),
+            _ => panic!("expected exactly one cdn-loop header after decode, got {found:?}"),
+        }
+    }
+
+    // §A probe: no header → Continue AND the request now carries `cdn-loop: mycdn.example`.
+    #[test]
+    fn no_header_appends_bare_cdn_id_and_continues() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(cdn_loop_value(&r).as_deref(), Some("mycdn.example"));
+    }
+
+    // §A probe: foreign id → Continue + `cdn-loop: othercdn.example,mycdn.example` (comma-only).
+    #[test]
+    fn foreign_id_appends_comma_only_and_continues() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "othercdn.example")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(
+            cdn_loop_value(&r).as_deref(),
+            Some("othercdn.example,mycdn.example")
+        );
+    }
+
+    // §A probe: self id at limit 0 → 502 loop body.
+    #[test]
+    fn self_id_over_limit_rejects_502() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "mycdn.example")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 502);
+                assert_eq!(resp.reason, Some("Bad Gateway"));
+                assert_eq!(
+                    &resp.body[..],
+                    b"The server has detected a loop between CDNs."
+                );
+                assert_eq!(resp.body.len(), 44);
+                assert!(resp.headers.is_empty());
+            }
+            Decision::Continue => panic!("expected 502 loop rejection"),
+        }
+    }
+
+    // §A probe: malformed → 400 invalid body.
+    #[test]
+    fn malformed_header_rejects_400() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "a@b")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 400);
+                assert_eq!(resp.reason, Some("Bad Request"));
+                assert_eq!(&resp.body[..], b"Invalid CDN-Loop header in request.");
+                assert_eq!(resp.body.len(), 35);
+                assert!(resp.headers.is_empty());
+            }
+            Decision::Continue => panic!("expected 400 malformed rejection"),
+        }
+    }
+
+    // §A probe: max_allowed_occurrences: 1 boundary — one self entry → Continue+append.
+    #[test]
+    fn boundary_one_self_entry_within_limit_appends() {
+        let mut f = filter("mycdn.example", 1);
+        let mut r = req(&[("cdn-loop", "mycdn.example")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(
+            cdn_loop_value(&r).as_deref(),
+            Some("mycdn.example,mycdn.example")
+        );
+    }
+
+    // §A probe: max_allowed_occurrences: 1 boundary — two self entries → 502.
+    #[test]
+    fn boundary_two_self_entries_over_limit_rejects_502() {
+        let mut f = filter("mycdn.example", 1);
+        let mut r = req(&[("cdn-loop", "mycdn.example,mycdn.example")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => assert_eq!(resp.status, 502),
+            Decision::Continue => panic!("expected 502 at count=2 > max=1"),
+        }
+    }
+
+    // Empty entries preserved on the RAW bytes: `othercdn.example,` → `othercdn.example,,mycdn.example`.
+    #[test]
+    fn empty_entries_preserved_on_append() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "othercdn.example,")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(
+            cdn_loop_value(&r).as_deref(),
+            Some("othercdn.example,,mycdn.example")
+        );
+    }
+
+    // Multiple cdn-loop request headers are coalesced (arrival order) before count
+    // AND before append; after append ONE header is emitted.
+    #[test]
+    fn multiple_headers_coalesced_then_appended_to_one() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "a"), ("cdn-loop", "b")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(cdn_loop_value(&r).as_deref(), Some("a,b,mycdn.example"));
+    }
+
+    // Append-to-existing preserves the FIRST existing entry's key casing.
+    #[test]
+    fn append_preserves_first_existing_key_casing() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("CDN-Loop", "othercdn.example")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        let key = r
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cdn-loop"))
+            .map(|(k, _)| k.as_str());
+        assert_eq!(key, Some("CDN-Loop"));
+        assert_eq!(
+            cdn_loop_value(&r).as_deref(),
+            Some("othercdn.example,mycdn.example")
+        );
+    }
+
+    // Coalescing a malformed-in-any-value multi-header → 400.
+    #[test]
+    fn multi_header_malformed_in_any_value_rejects_400() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "ok"), ("cdn-loop", "a@b")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => assert_eq!(resp.status, 400),
+            Decision::Continue => panic!("expected 400 for malformed coalesced value"),
+        }
+    }
+
+    // Encode is inert.
+    #[test]
+    fn encode_is_inert() {
+        use crate::types::FilterResponse;
+        let mut f = filter("mycdn.example", 0);
+        let mut resp = FilterResponse {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
+    }
 }
 
 #[cfg(test)]
