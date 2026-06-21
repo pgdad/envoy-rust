@@ -7,6 +7,7 @@
 //! already-buffered request/response shape established by 04.1 + 05.2.
 
 pub mod buffer;
+pub mod cdn_loop;
 pub mod cors;
 pub mod csrf;
 pub mod error;
