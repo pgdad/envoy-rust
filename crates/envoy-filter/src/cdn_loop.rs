@@ -540,6 +540,136 @@ mod filter_tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Phase-31 Task 5 — §A.4 edge matrix at the FILTER level (gaps not already
+    // pinned by Task 1's parser oracle nor Task 3's filter probes).
+    // -----------------------------------------------------------------------
+
+    // Case-sensitivity OBSERVED THROUGH THE FILTER: a capitalised variant of the
+    // configured id is a FOREIGN id (no 502) → Continue + comma-only append.
+    // (Task 1 pins case-sensitivity at the parser; Task 3 did not exercise it at
+    // the filter disposition level.)
+    #[test]
+    fn case_variant_of_self_is_foreign_appends_not_502() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "MYCDN.EXAMPLE")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(
+            cdn_loop_value(&r).as_deref(),
+            Some("MYCDN.EXAMPLE,mycdn.example")
+        );
+    }
+
+    // Parameter-IGNORING match + parameter-PRESERVING append: a foreign id that
+    // carries a `;`-parameter is matched ignoring the param (so no 502 for a
+    // DIFFERENT configured id), and the param survives byte-verbatim on the
+    // forwarded (raw-appended) header.
+    #[test]
+    fn foreign_id_with_parameter_preserves_param_on_append() {
+        let mut f = filter("othercdn.example", 0);
+        let mut r = req(&[("cdn-loop", "mycdn.example; foo=bar")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(
+            cdn_loop_value(&r).as_deref(),
+            Some("mycdn.example; foo=bar,othercdn.example")
+        );
+    }
+
+    // Parameter-ignoring match THROUGH THE FILTER also covers the loop case: a
+    // self id carrying a parameter still counts as the self id → 502 at limit 0.
+    #[test]
+    fn self_id_with_parameter_still_loops_502() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "mycdn.example; trace=\"abc\"")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => assert_eq!(resp.status, 502),
+            Decision::Continue => panic!("param-bearing self id must still loop → 502"),
+        }
+    }
+
+    // Multi-header COALESCE → 502: two cdn-loop headers each carrying one self id
+    // coalesce to count=2 > max=0 → loop rejection. (Task 3 pinned coalesce →
+    // append and coalesce → 400; this fills the coalesce → 502 disposition.)
+    #[test]
+    fn multi_header_coalesced_self_count_over_limit_rejects_502() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "mycdn.example"), ("cdn-loop", "mycdn.example")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 502);
+                assert_eq!(resp.body.len(), 44);
+            }
+            Decision::Continue => panic!("coalesced self count=2 > max=0 must be 502"),
+        }
+    }
+
+    // Empty-entry / malformed-id BOUNDARY at the filter: an all-empty list
+    // (`,,,`) is NOT malformed → Continue + append (empties preserved on raw
+    // bytes); a malformed id (unterminated quote) → 400. Pins both sides of the
+    // boundary at the disposition level.
+    #[test]
+    fn only_commas_not_malformed_appends_at_filter() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", ",,,")]);
+        assert!(matches!(f.decode_headers(&mut r), Decision::Continue));
+        assert_eq!(cdn_loop_value(&r).as_deref(), Some(",,,,mycdn.example"));
+    }
+
+    #[test]
+    fn unterminated_quote_id_rejects_400_at_filter() {
+        let mut f = filter("mycdn.example", 0);
+        let mut r = req(&[("cdn-loop", "\"abc")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => assert_eq!(resp.status, 400),
+            Decision::Continue => panic!("unterminated-quote id must be 400 malformed"),
+        }
+    }
+
+    // OWS around a list entry is TRIMMED for matching/counting, but the filter
+    // appends on the RAW coalesced bytes — so the original OWS survives verbatim
+    // on the forwarded header (it does not re-serialize the trimmed parse).
+    #[test]
+    fn ows_trimmed_for_count_but_raw_bytes_preserved_on_append() {
+        let mut f = filter("mycdn.example", 0);
+        // `  mycdn.example  ` trims to the self id → would loop at limit 0.
+        let mut r = req(&[("cdn-loop", "  mycdn.example  ")]);
+        match f.decode_headers(&mut r) {
+            Decision::StopAndSend(resp) => assert_eq!(resp.status, 502),
+            Decision::Continue => panic!("OWS-trimmed self id must be counted → 502"),
+        }
+        // A foreign OWS-padded id continues, and the OWS survives on the raw append.
+        let mut f2 = filter("mycdn.example", 0);
+        let mut r2 = req(&[("cdn-loop", "  othercdn.example  ")]);
+        assert!(matches!(f2.decode_headers(&mut r2), Decision::Continue));
+        assert_eq!(
+            cdn_loop_value(&r2).as_deref(),
+            Some("  othercdn.example  ,mycdn.example")
+        );
+    }
+
+    // `max_allowed_occurrences > 0` general boundary (Task 3 pinned max=1; this
+    // pins max=2): count==max → Continue+append; count==max+1 → 502.
+    #[test]
+    fn boundary_max_two_at_limit_continues_over_limit_502() {
+        let mut f = filter("mycdn.example", 2);
+        let mut r = req(&[("cdn-loop", "mycdn.example,mycdn.example")]);
+        assert!(
+            matches!(f.decode_headers(&mut r), Decision::Continue),
+            "count=2 == max=2 must Continue"
+        );
+        assert_eq!(
+            cdn_loop_value(&r).as_deref(),
+            Some("mycdn.example,mycdn.example,mycdn.example")
+        );
+
+        let mut f2 = filter("mycdn.example", 2);
+        let mut r2 = req(&[("cdn-loop", "mycdn.example,mycdn.example,mycdn.example")]);
+        match f2.decode_headers(&mut r2) {
+            Decision::StopAndSend(resp) => assert_eq!(resp.status, 502),
+            Decision::Continue => panic!("count=3 > max=2 must be 502"),
+        }
+    }
+
     // Encode is inert.
     #[test]
     fn encode_is_inert() {

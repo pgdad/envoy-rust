@@ -476,6 +476,108 @@ mod tests {
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
     }
 
+    /// Phase-31 Task 5 — the inert no-op witness (the headline backstop).
+    ///
+    /// A filter chain that does NOT contain `cdn_loop` (here a LIVE
+    /// header_mutation + router pipeline) must leave any `CDN-Loop` request
+    /// header completely UNTOUCHED — never appended-to, never mutated, and
+    /// never short-circuited with a 400/502 — even when the carried value would
+    /// be a self-loop or a malformed token IF cdn_loop were present. This is the
+    /// in-process proof of the load-bearing invariant that the filter is inert
+    /// when absent from the chain (→ all 38 pre-existing fixtures stay green).
+    ///
+    /// The header_mutation arm is deliberately LIVE (it adds `x-witness`) so the
+    /// pipeline is provably active; if cdn_loop logic ever leaked into a
+    /// non-cdn_loop chain, the `cdn-loop` assertions below would catch it.
+    #[test]
+    fn no_cdn_loop_in_chain_leaves_cdn_loop_header_untouched() {
+        use crate::FilterPipeline;
+        use envoy_config::{
+            AppendAction, HeaderMutationConfig, HeaderMutationEntry, HeaderValue,
+            HeaderValueOption, HttpFilter, HttpFilterTypedConfig, Mutations, RouterConfig,
+        };
+
+        // `HttpFilter` is not `Clone`, so rebuild the chain per case via a
+        // closure (`HeaderMutationConfig` etc. are cheap to reconstruct).
+        let registry = test_registry();
+        let build_chain = || {
+            let header_mutation_hf = HttpFilter {
+                name: "envoy.filters.http.header_mutation".to_string(),
+                typed_config: HttpFilterTypedConfig::HeaderMutation(HeaderMutationConfig {
+                    mutations: Mutations {
+                        request_mutations: vec![HeaderMutationEntry {
+                            append: HeaderValueOption {
+                                header: HeaderValue {
+                                    key: "x-witness".to_string(),
+                                    value: "1".to_string(),
+                                },
+                                append_action: AppendAction::OverwriteIfExistsOrAdd,
+                            },
+                        }],
+                        response_mutations: vec![],
+                    },
+                }),
+            };
+            let router_hf = HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            };
+            FilterPipeline::build_from_config(
+                &[header_mutation_hf, router_hf],
+                &registry,
+                "ingress_http",
+            )
+            .expect("header_mutation + router pipeline builds")
+        };
+
+        // Each case carries a `cdn-loop` value that WOULD trip cdn_loop if it
+        // were in the chain: a benign foreign id, a would-be self-loop, and a
+        // malformed (unterminated-quote / non-token) value.
+        for cdn_loop_value in ["mycdn.example", "othercdn.example", "\"abc", "a@b"] {
+            let mut pipe = build_chain();
+
+            let mut req = FilterRequest {
+                method: "GET".to_string(),
+                path: "/".to_string(),
+                headers: vec![("cdn-loop".to_string(), cdn_loop_value.to_string())],
+                body: None,
+            };
+            pipe.apply_route_config(None);
+
+            // Never 400/502 (never any StopAndSend) — the chain Continues.
+            assert!(
+                matches!(pipe.decode_headers(&mut req), Decision::Continue),
+                "inert chain must Continue for cdn-loop value {cdn_loop_value:?}"
+            );
+
+            // The cdn-loop header is passed through UNTOUCHED: exactly one entry,
+            // verbatim key + value, no append of any proxy id.
+            let cdn_loop_headers: Vec<&(String, String)> = req
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("cdn-loop"))
+                .collect();
+            assert_eq!(
+                cdn_loop_headers.len(),
+                1,
+                "exactly one cdn-loop header must survive for {cdn_loop_value:?}"
+            );
+            assert_eq!(cdn_loop_headers[0].0, "cdn-loop");
+            assert_eq!(
+                cdn_loop_headers[0].1, cdn_loop_value,
+                "cdn-loop value must be byte-identical (no append/mutation) for {cdn_loop_value:?}"
+            );
+
+            // And the chain is provably LIVE — header_mutation added its witness.
+            assert!(
+                req.headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("x-witness") && v == "1"),
+                "header_mutation must have run (proves the chain is active)"
+            );
+        }
+    }
+
     #[test]
     fn buffer_pipeline_backstop_all_dispositions() {
         use crate::FilterPipeline;
