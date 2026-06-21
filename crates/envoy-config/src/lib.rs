@@ -13,24 +13,25 @@ pub mod rds;
 
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, AttemptOutcome,
-    Bootstrap, Buffer, BufferPerRoute, CertificateValidationContext, CircuitBreakers, Cluster,
-    ClusterType, CodecType, CommonLbConfig, CommonTlsContext, ConfigSource, CorsConfig, CorsPolicy,
-    CsrfPolicy, DataSource, DenominatorType, DirectResponse, DnsLookupFamily, DownstreamTlsContext,
-    DynamicResources, EdsClusterConfig, Endpoint, ExplicitHttpConfig, FaultAbort, FaultConfig,
-    FileAccessLog, FilterChain, FilterChainMatch, FractionalPercent, HashPolicy, HashPolicyHeader,
-    HeaderMatcher, HeaderMatcherMode, HeaderMutationConfig, HeaderMutationEntry, HeaderValue,
-    HeaderValueOption, HealthCheck, Http1ProtocolOptions, Http2ProtocolOptions,
-    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpHealthCheck,
-    HttpProtocolOptions, HttpStatus, Int64Range, JwtAuthnConfig, JwtProvider, JwtRequirement,
-    LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig, LbSubsetFallbackPolicy, LbSubsetSelector,
-    Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter,
-    Node, OutlierDetection, PathConfigSource, PerFilterConfig, Percent, Permission, PermissionSet,
-    Policy, Principal, PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn,
-    RetryPolicy, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch,
-    RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent, SafeRegex, SocketAddress,
-    StaticResources, StringMatcher, StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate,
-    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
-    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
+    Bootstrap, Buffer, BufferPerRoute, CdnLoopConfig, CertificateValidationContext,
+    CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig, CommonTlsContext,
+    ConfigSource, CorsConfig, CorsPolicy, CsrfPolicy, DataSource, DenominatorType, DirectResponse,
+    DnsLookupFamily, DownstreamTlsContext, DynamicResources, EdsClusterConfig, Endpoint,
+    ExplicitHttpConfig, FaultAbort, FaultConfig, FileAccessLog, FilterChain, FilterChainMatch,
+    FractionalPercent, HashPolicy, HashPolicyHeader, HeaderMatcher, HeaderMatcherMode,
+    HeaderMutationConfig, HeaderMutationEntry, HeaderValue, HeaderValueOption, HealthCheck,
+    Http1ProtocolOptions, Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter,
+    HttpFilterTypedConfig, HttpHealthCheck, HttpProtocolOptions, HttpStatus, Int64Range,
+    JwtAuthnConfig, JwtProvider, JwtRequirement, LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig,
+    LbSubsetFallbackPolicy, LbSubsetSelector, Listener, LoadAssignment, LocalRateLimitConfig,
+    LocalityLbEndpoints, Mutations, NetworkFilter, Node, OutlierDetection, PathConfigSource,
+    PerFilterConfig, Percent, Permission, PermissionSet, Policy, Principal, PrincipalSet,
+    RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction,
+    RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules,
+    RuntimeFractionalPercent, SafeRegex, SocketAddress, StaticResources, StringMatcher,
+    StringMatcherMode, TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket, TransportSocket,
+    TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext,
+    VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;
 pub use eds::parse_eds_file;
@@ -693,6 +694,25 @@ pub enum ConfigError {
         "route hash_policy specifier '{specifier}' is unsupported; envoy-rust accepts only 'header'"
     )]
     UnsupportedHashPolicy { specifier: String },
+
+    /// 31 Task 2 (ADR-0077 §6.2-LOCKED): a `cdn_loop` filter's `cdn_id` is the
+    /// empty string. `cdn_id` is REQUIRED to be a non-empty RFC-7230 token;
+    /// rejected as startup-fatal (the ADR-0049 all-fatal posture — Envoy itself
+    /// rejects an empty cdn_id at boot). `listener` names the offending HCM.
+    #[error(
+        "cdn_loop filter on listener `{listener}` has an empty cdn_id; a non-empty token is required"
+    )]
+    CdnLoopEmptyCdnId { listener: String },
+
+    /// 31 Task 2 (ADR-0077 §6.2-LOCKED): a `cdn_loop` filter's `cdn_id` is
+    /// non-empty but is not a bare RFC-7230 token — it carries a comma, a space,
+    /// or some other non-`tchar` byte. Rejected as startup-fatal (the ADR-0049
+    /// all-fatal posture). `listener` names the offending HCM; `cdn_id` echoes
+    /// the rejected value.
+    #[error(
+        "cdn_loop filter on listener `{listener}` has an invalid cdn_id {cdn_id:?}; it must be a bare RFC-7230 token (no comma, space, or other non-tchar)"
+    )]
+    CdnLoopInvalidCdnId { listener: String, cdn_id: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

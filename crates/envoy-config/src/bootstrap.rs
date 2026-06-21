@@ -979,6 +979,9 @@ pub enum HttpFilterTypedConfig {
 
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.buffer.v3.Buffer")]
     Buffer(Buffer),
+
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig")]
+    CdnLoop(CdnLoopConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -1045,6 +1048,25 @@ pub struct CsrfPolicy {
 #[serde(deny_unknown_fields)]
 pub struct Buffer {
     pub max_request_bytes: u32,
+}
+
+/// `envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig` (phase 31,
+/// ADR-0077 §6.2). The CDN-Loop filter appends this proxy's `cdn_id` to the
+/// `CDN-Loop` request header and rejects requests whose count of this `cdn_id`
+/// already exceeds `max_allowed_occurrences` (RFC 8586 loop detection).
+///
+/// `cdn_id` is REQUIRED and must be a non-empty bare RFC-7230 token (validated
+/// at startup by `validate_cdn_loop_config` — empty → `CdnLoopEmptyCdnId`, any
+/// non-tchar → `CdnLoopInvalidCdnId`; all boot-fatal per ADR-0049, matching
+/// Envoy's own boot rejection). `max_allowed_occurrences` is a proto `uint32`
+/// accepted as a plain integer; absent → 0 (`#[serde(default)]`), meaning the
+/// request is rejected the moment this `cdn_id` appears at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdnLoopConfig {
+    pub cdn_id: String,
+    #[serde(default)]
+    pub max_allowed_occurrences: u32,
 }
 
 /// `envoy.extensions.filters.http.buffer.v3.BufferPerRoute` — the per-route
@@ -3316,6 +3338,14 @@ pub(crate) fn validate_http_filters(
                 // absent/malformed → fatal parse error); `0` is a valid limit.
                 // No further validation (ADR-0063 — NO stats, NO new ConfigError).
             }
+            crate::HttpFilterTypedConfig::CdnLoop(cfg) => {
+                if f.name != "envoy.filters.http.cdn_loop" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_cdn_loop_config(cfg, listener_name)?;
+            }
         }
     }
 
@@ -3596,6 +3626,47 @@ fn validate_csrf_config(
                 listener: listener_name.to_string(),
             },
         );
+    }
+    Ok(())
+}
+
+/// RFC 7230 §3.2.6 `tchar` (ADR-0077 §A.4):
+///   "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+///   "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+///
+/// Duplicated here (not imported) so envoy-config does NOT take a dependency on
+/// envoy-filter, which carries its own private `is_tchar` for the runtime
+/// CDN-Loop header parser. The two sets are intentionally identical — both
+/// trace to RFC 7230 + ADR-0077 §A.4. Comma (`,`) and space (` `) are NOT
+/// tchars, so a comma-joined or space-containing `cdn_id` is rejected here.
+const fn is_cdn_id_tchar(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+'
+        | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+}
+
+/// phase 31 Task 2 (ADR-0077 §6.2-LOCKED): validate a `cdn_loop` filter config.
+/// A valid `cdn_id` is a non-empty bare RFC-7230 token (1+ tchars). Both checks
+/// are boot-fatal (ADR-0049 — Envoy itself rejects these at boot):
+///
+/// - empty `cdn_id` → `CdnLoopEmptyCdnId`
+/// - `cdn_id` carrying any non-RFC-7230-tchar (comma, space, `@`, …) →
+///   `CdnLoopInvalidCdnId`
+fn validate_cdn_loop_config(
+    cfg: &crate::CdnLoopConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if cfg.cdn_id.is_empty() {
+        return Err(crate::ConfigError::CdnLoopEmptyCdnId {
+            listener: listener_name.to_string(),
+        });
+    }
+    if !cfg.cdn_id.bytes().all(is_cdn_id_tchar) {
+        return Err(crate::ConfigError::CdnLoopInvalidCdnId {
+            listener: listener_name.to_string(),
+            cdn_id: cfg.cdn_id.clone(),
+        });
     }
     Ok(())
 }
@@ -15007,6 +15078,161 @@ admin:
                 crate::ConfigError::UnsupportedRuntimeKeyedCsrfFilterEnabled { .. }
             ),
             "expected UnsupportedRuntimeKeyedCsrfFilterEnabled (route override), got {err:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// phase 31 Task 2: cdn_loop filter config schema + cdn_id validation tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod cdn_loop_config_tests {
+    /// A standalone `cdn_loop` filter typed_config (chain-level), parsed in
+    /// isolation as `HttpFilterTypedConfig`. `cdn_id` is required; the optional
+    /// `max_allowed_occurrences` defaults to 0.
+    fn cdn_loop_typed_config(cdn_id: &str, max_line: &str) -> String {
+        format!(
+            r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig
+cdn_id: "{cdn_id}"{max_line}
+"#
+        )
+    }
+
+    #[test]
+    fn cdn_loop_config_parses_and_selects_variant() {
+        let yaml = cdn_loop_typed_config("mycdn.example", "");
+        let cfg: crate::HttpFilterTypedConfig = serde_yaml::from_str(&yaml).unwrap();
+        match cfg {
+            crate::HttpFilterTypedConfig::CdnLoop(c) => {
+                assert_eq!(c.cdn_id, "mycdn.example");
+                assert_eq!(c.max_allowed_occurrences, 0);
+            }
+            other => panic!("expected CdnLoop variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cdn_loop_config_max_allowed_occurrences_parses() {
+        let yaml = cdn_loop_typed_config("mycdn.example", "\nmax_allowed_occurrences: 3");
+        let cfg: crate::HttpFilterTypedConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(matches!(
+            cfg,
+            crate::HttpFilterTypedConfig::CdnLoop(c)
+                if c.cdn_id == "mycdn.example" && c.max_allowed_occurrences == 3
+        ));
+    }
+
+    #[test]
+    fn cdn_loop_config_absent_max_defaults_zero() {
+        let yaml = cdn_loop_typed_config("mycdn.example", "");
+        let cfg: crate::HttpFilterTypedConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(matches!(
+            cfg,
+            crate::HttpFilterTypedConfig::CdnLoop(c) if c.max_allowed_occurrences == 0
+        ));
+    }
+
+    #[test]
+    fn cdn_loop_config_rejects_unknown_field() {
+        let yaml = r#"
+"@type": type.googleapis.com/envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig
+cdn_id: "mycdn.example"
+bogus: 1
+"#;
+        let r: Result<crate::HttpFilterTypedConfig, _> = serde_yaml::from_str(yaml);
+        assert!(r.is_err(), "deny_unknown_fields must reject unknown field");
+    }
+
+    /// A full bootstrap with a `cdn_loop` filter chain entry (+ router terminus),
+    /// parameterized on `cdn_id`. Exercises `parse_bootstrap`'s validation path.
+    fn bootstrap_with_cdn_loop(cdn_id: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok\n" }}
+                http_filters:
+                  - name: envoy.filters.http.cdn_loop
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig
+                      cdn_id: "{cdn_id}"
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 9901 }}
+"#
+        )
+    }
+
+    #[test]
+    fn hcm_accepts_cdn_loop_filter_chain_entry() {
+        let yaml = bootstrap_with_cdn_loop("mycdn.example");
+        assert!(
+            crate::parse_bootstrap(&yaml).is_ok(),
+            "valid cdn_id token + router terminus must parse + validate clean"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_cdn_id() {
+        let yaml = bootstrap_with_cdn_loop("");
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::CdnLoopEmptyCdnId { .. }),
+            "expected CdnLoopEmptyCdnId, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_comma_in_cdn_id() {
+        let yaml = bootstrap_with_cdn_loop("a,b");
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::CdnLoopInvalidCdnId { .. }),
+            "expected CdnLoopInvalidCdnId for comma token, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_space_in_cdn_id() {
+        let yaml = bootstrap_with_cdn_loop("a b");
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::CdnLoopInvalidCdnId { .. }),
+            "expected CdnLoopInvalidCdnId for space token, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_at_sign_in_cdn_id() {
+        let yaml = bootstrap_with_cdn_loop("a@b");
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::CdnLoopInvalidCdnId { .. }),
+            "expected CdnLoopInvalidCdnId for '@' token, got {err:?}"
         );
     }
 }
