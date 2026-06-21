@@ -814,6 +814,74 @@ lock-in — chain-base/route-replace, scheme-stripped origin, 403 body).
 - Verified byte-exact at BOTH the chain level AND a `BufferPerRoute`-lowered
   per-route limit against `envoyproxy/envoy:v1.33.0` (ADR-0063 finding 1).
 
+**cdn_loop filter (ADR-0076 SPEC / ADR-0077 §6.2-LOCKED).**
+
+> The HTTP-filter-family ninth phase. `envoy.filters.http.cdn_loop` is Envoy's
+> RFC 8586 `CDN-Loop` request-header filter (decode-side, header-only, fully
+> self-contained — no upstream state, no per-route config, no stat). For each
+> request the filter coalesces all `CDN-Loop` request headers into one
+> comma-joined RFC-8586 `cdn-info` list, parses it (strict RFC-7230 token
+> grammar), counts how many entries equal the configured `cdn_id` (CASE-SENSITIVE,
+> parameters IGNORED), and: malformed → 400 reject; `count > max_allowed_occurrences`
+> (default 0) → 502 loop reject; else appends `cdn_id` (COMMA-ONLY) and forwards.
+> Inert when not in the chain (no existing filter reads `CDN-Loop` → all 38
+> pre-existing fixtures 0001-0038 stay green — the 07.1 foundation-slice
+> regression-equivalence property, proven in-process by the Task-5 no-op witness).
+> Differentially proven by fixture `0039-http-filter-cdn-loop` (5 probes, STRONG
+> cross-proxy byte-exact) against `envoyproxy/envoy:v1.33.0`.
+
+**cdn_loop reject local-reply wire shapes (ADR-0077 §6.2-LOCKED).**
+
+- **Loop** (`count(cdn_id) > max_allowed_occurrences`): status **502** (`Bad Gateway`);
+  body **`The server has detected a loop between CDNs.`** — exactly **44 bytes**, NO
+  trailing newline. Envoy emits `%RESPONSE_CODE_DETAILS% = cdn_loop_detected`; envoy-rust
+  does NOT model response-code-details (the csrf precedent) and the fixture does not assert it.
+- **Malformed** (`parse_cdn_loop` → `Err`): status **400** (`Bad Request`); body
+  **`Invalid CDN-Loop header in request.`** — exactly **35 bytes**, NO trailing newline.
+  Envoy emits `%RESPONSE_CODE_DETAILS% = invalid_cdn_loop_header` (not modeled / not asserted).
+- Both bodies are set verbatim via `Bytes::from_static`; `content-type: text/plain` +
+  `content-length` + `server` + `connection` are stamped by the H1/phase-11-H2 synth
+  decorators (`decorate_filter_synth_response{,_h2}`). Under the differential close-driver
+  BOTH reject probes carry `connection: close` on BOTH proxies (value-compared — `connection`
+  is not in the header allow-list — the 0032-csrf-403 reject precedent).
+
+**cdn_loop append byte-shape (ADR-0077 §6.2-LOCKED, validated by fixture 0039).**
+
+- **COMMA-ONLY, no space.** No `CDN-Loop` present → the forwarded request carries the bare
+  `CDN-Loop: {cdn_id}`. A foreign entry present → `{existing},{cdn_id}` (e.g.
+  `othercdn.example` → `othercdn.example,mycdn.example`). (⚠ the SPEC §1.3 example wrote the
+  comma-SPACE form; ADR-0077 corrects it to comma-only.)
+- **Empty list entries are PRESERVED verbatim** on append (the append concatenates the RAW
+  coalesced header bytes, not a parsed reserialization): `othercdn.example,` →
+  `othercdn.example,,mycdn.example`. Empty entries (`a,,b`, leading/trailing comma, `,,,`)
+  are NOT malformed; OWS around entries is trimmed for COUNTING but the raw bytes flow on append.
+- The egress header-NAME casing is NOT differentially pinned by fixture 0039 (the
+  `http1-echo-server` lowercases reflected header names → only the appended VALUE byte-shape is
+  cross-proxy-proven). envoy-rust preserves the first existing entry's key casing on append and
+  adds `cdn-loop` (lowercase) when absent.
+
+**cdn_loop parser grammar (strict RFC-7230 + RFC-8586; the §A oracle, ADR-0077).**
+
+- A `cdn-id` MUST be a bare RFC-7230 `token` (tchars). A quoted-string id (even a well-formed
+  `"mycdn.example"`) or a non-tchar id (space/`/`/`@`/tab) → MALFORMED (400). A `parameter` is
+  `name=value`; a bare param without `=value` → 400; an unterminated quoted-string → 400.
+- Multiple `CDN-Loop` request headers are coalesced into one comma-joined list before counting;
+  matching is CASE-SENSITIVE and IGNORES parameters (`mycdn.example; foo=bar` counts as a
+  `mycdn.example` match → 502 at default `max_allowed_occurrences: 0`).
+
+**cdn_loop config validity (ALL BOOT-FATAL — ADR-0049 / ADR-0077).**
+
+- A valid `cdn_id` is a non-empty bare RFC-7230 token. Empty `cdn_id` → `ConfigError::CdnLoopEmptyCdnId`;
+  a comma-containing or otherwise non-tchar `cdn_id` → `ConfigError::CdnLoopInvalidCdnId`. Both fail
+  config-load (the container never serves). `@type` =
+  `type.googleapis.com/envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig`; fields `cdn_id`
+  (string) + `max_allowed_occurrences` (uint32, default 0).
+
+**cdn_loop stats — NONE** (the phase-21/24/28/29/30 no-stat discipline; effects surface only in the
+generic HCM `downstream_rq_{2xx,4xx,5xx}`). **Deferred non-goals (ADR-0076):** per-route
+`typed_per_filter_config` for cdn_loop; RFC 8586 `cdn-info` parameter semantics beyond counting;
+encode-side behavior (cdn_loop is request-only).
+
 **H1 upstream connection-pool `Connection: close` single-use (ADR-0059).**
 
 > When an upstream H1 response carries `Connection: close`, the H1 connection
