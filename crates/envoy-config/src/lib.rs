@@ -357,6 +357,11 @@ pub enum ConfigError {
     #[error("access log path must be non-empty")]
     InvalidAccessLogPath,
 
+    /// Phase 32 (ADR-0079): a `FileAccessLog.log_format.text_format_source.inline_string`
+    /// failed to compile (unknown/malformed command operator). Boot-fatal per ADR-0049.
+    #[error("invalid access-log format string: {detail}")]
+    InvalidAccessLogFormat { detail: String },
+
     /// 06.3 D14.3: listener with codec_type HTTP1 or AUTO routes to a cluster
     /// whose typed_extension_protocol_options.HttpProtocolOptions.
     /// explicit_http_config.http2_protocol_options is set. Closes

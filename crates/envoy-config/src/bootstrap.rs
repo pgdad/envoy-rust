@@ -670,15 +670,43 @@ pub enum AccessLogTypedConfig {
     FileAccessLog(FileAccessLog),
 }
 
-/// FileAccessLog — typed_config payload for the file access logger. 06.2
-/// consumes only `path`; format-string customization (`log_format`,
-/// `json_format`, …) is OUT of scope per parent-06 SPEC §4 + 06.2 SPEC §4
-/// (the emitter uses the default Envoy v3 format string). Empty paths
-/// are rejected by the validator (`ConfigError::InvalidAccessLogPath`).
+/// FileAccessLog — typed_config payload for the file access logger. `path`
+/// names the sink; empty paths are rejected by the validator
+/// (`ConfigError::InvalidAccessLogPath`).
+///
+/// Phase 32 (ADR-0079) adds the modern format-customization path
+/// `log_format.text_format_source.inline_string`: an Envoy command-operator
+/// format string that is compiled (`envoy_accesslog::parse_format`) at
+/// config-load time and rejected boot-fatally
+/// (`ConfigError::InvalidAccessLogFormat`) when malformed. The deprecated
+/// `text_format` / top-level `format` paths and `json_format` remain OUT of
+/// scope (deferred); when `log_format` is absent the emitter uses the default
+/// Envoy v3 format string.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileAccessLog {
     pub path: String,
+    #[serde(default)]
+    pub log_format: Option<SubstitutionFormatString>,
+}
+
+/// Models `envoy.config.core.v3.SubstitutionFormatString` — only the
+/// `text_format_source` (inline `DataSource`) variant is supported in phase 32
+/// (ADR-0079). `json_format` and the deprecated `text_format` scalar are
+/// deferred.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstitutionFormatString {
+    pub text_format_source: DataSourceInline,
+}
+
+/// Models the `inline_string` arm of an `envoy.config.core.v3.DataSource`. The
+/// file/environment-variable DataSource arms are out of scope; only an inline
+/// command-operator format string is accepted.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DataSourceInline {
+    pub inline_string: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -4017,6 +4045,13 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
             AccessLogTypedConfig::FileAccessLog(cfg) => {
                 if cfg.path.is_empty() {
                     return Err(crate::ConfigError::InvalidAccessLogPath);
+                }
+                if let Some(fmt) = &cfg.log_format {
+                    envoy_accesslog::parse_format(&fmt.text_format_source.inline_string).map_err(
+                        |e| crate::ConfigError::InvalidAccessLogFormat {
+                            detail: e.to_string(),
+                        },
+                    )?;
                 }
             }
         }
@@ -10550,6 +10585,121 @@ static_resources:
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
         assert!(matches!(err, crate::ConfigError::InvalidAccessLogPath));
+    }
+
+    // --- phase 32 t4: FileAccessLog.log_format boot-fatal format validation ---
+
+    #[test]
+    fn accepts_hcm_with_valid_access_log_format() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        text_format_source:
+                          inline_string: "%RESPONSE_CODE%"
+"#,
+        );
+        let bootstrap = crate::parse_bootstrap(&yaml).expect("parse + validate");
+        let hcm = match &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0]
+            .typed_config
+        {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        match &hcm.access_log[0].typed_config {
+            AccessLogTypedConfig::FileAccessLog(cfg) => {
+                let fmt = cfg.log_format.as_ref().expect("log_format present");
+                assert_eq!(fmt.text_format_source.inline_string, "%RESPONSE_CODE%");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_hcm_with_unknown_access_log_format_operator() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        text_format_source:
+                          inline_string: "%NOPE%"
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InvalidAccessLogFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_hcm_with_malformed_access_log_format() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        text_format_source:
+                          inline_string: "%REQ("
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InvalidAccessLogFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn accepts_hcm_with_absent_access_log_format() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+"#,
+        );
+        let bootstrap = crate::parse_bootstrap(&yaml).expect("parse + validate");
+        let hcm = match &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0]
+            .typed_config
+        {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        match &hcm.access_log[0].typed_config {
+            AccessLogTypedConfig::FileAccessLog(cfg) => {
+                assert!(cfg.log_format.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_hcm_with_unknown_nested_log_format_key() {
+        // A misspelled nested key (`inline_strings` instead of `inline_string`)
+        // must be caught by `#[serde(deny_unknown_fields)]` at YAML
+        // deserialization — surfacing as `ConfigError::Yaml(_)`, NOT the later
+        // `InvalidAccessLogFormat` validation error.
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        text_format_source:
+                          inline_strings: "%RESPONSE_CODE%"
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(err, crate::ConfigError::Yaml(_)));
     }
 
     // --- 06.3 Task 2: D14.3 H1-listener × H2-cluster parse-time validator gate ---
