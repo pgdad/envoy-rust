@@ -74,6 +74,20 @@ pub enum Http1Error {
     #[error("failed to open access log sink: {message}")]
     AccessLogOpen { message: String },
 
+    /// Phase 32 Task 5 (ADR-0079): compiling the configured
+    /// `FileAccessLog.log_format.text_format_source.inline_string` into a
+    /// `CompiledFormat` failed at `HCMConfig::from_config` time. Semantically
+    /// distinct from [`Http1Error::AccessLogOpen`] (a filesystem failure) — this
+    /// is a format-string parse failure. The `envoy-config` validator (Task 4)
+    /// already compiled the same string at config-load, so this re-parse cannot
+    /// fail in practice; the variant exists so the HCM build maps the defensive
+    /// re-parse error rather than panicking. Wraps the
+    /// `envoy_accesslog::FormatParseError` `Display` rendering (`message: String`
+    /// for the same thiserror `source`-field reason documented on
+    /// [`Http1Error::AccessLogOpen`]).
+    #[error("failed to compile access log format: {message}")]
+    AccessLogFormat { message: String },
+
     /// 07.1 Task 6: `FilterPipeline::build_from_config` rejected the
     /// http_filters list at `HCMConfig::from_config` time (most likely
     /// empty list — but the validator at

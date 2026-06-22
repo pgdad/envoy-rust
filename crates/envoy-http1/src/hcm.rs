@@ -202,10 +202,10 @@ impl HCMConfig {
         for entry in &cfg.access_log {
             match &entry.typed_config {
                 envoy_config::AccessLogTypedConfig::FileAccessLog(file_cfg) => {
-                    // Task 5 replaces the default with the config-derived CompiledFormat.
+                    let format = compiled_log_format(file_cfg)?;
                     let sink = envoy_accesslog::FileSink::new(
                         std::path::PathBuf::from(&file_cfg.path),
-                        envoy_accesslog::CompiledFormat::default(),
+                        format,
                     )
                     .await
                     .map_err(|err| Http1Error::AccessLogOpen {
@@ -1237,6 +1237,27 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Erro
     }
 }
 
+/// Phase 32 Task 5 (ADR-0079) — build the access-log `CompiledFormat` for a
+/// file sink: the config-supplied
+/// `log_format.text_format_source.inline_string` if present, else the Envoy
+/// default format. The config validator (`envoy-config` Task 4) already compiled
+/// the string at config-load, so `from_inline` here re-parses an already-validated
+/// string and cannot fail in practice — but we map any error defensively rather
+/// than panic (the HCM build is `Result`-returning).
+fn compiled_log_format(
+    file_cfg: &envoy_config::FileAccessLog,
+) -> Result<envoy_accesslog::CompiledFormat, Http1Error> {
+    match &file_cfg.log_format {
+        Some(s) => {
+            envoy_accesslog::CompiledFormat::from_inline(&s.text_format_source.inline_string)
+                .map_err(|err| Http1Error::AccessLogFormat {
+                    message: err.to_string(),
+                })
+        }
+        None => Ok(envoy_accesslog::CompiledFormat::default()),
+    }
+}
+
 // 06.2 Task 6 — access-log dispatch helpers. Used by the factored
 // dispatch site at the end of `serve_connection`'s per-request loop
 // iteration. Mirrors the field-population shape expected by
@@ -1705,6 +1726,63 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Phase 32 Task 5 — synthetic `AccessLogRecord` for the
+    /// `compiled_log_format` wiring tests: method=GET, response_code=200,
+    /// start_time=UNIX_EPOCH (renders as the fixed `1970-01-01T00:00:00.000Z`
+    /// bracket), all optional fields `None` so `%UPSTREAM_HOST%` (and the other
+    /// `%REQ/RESP%` optionals) render as the `-` sentinel.
+    fn record_get_200() -> envoy_accesslog::AccessLogRecord {
+        envoy_accesslog::AccessLogRecord {
+            start_time: std::time::UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            protocol: "HTTP/1.1".into(),
+            response_code: 200,
+            response_flags: "-".into(),
+            bytes_received: 0,
+            bytes_sent: 0,
+            duration: Duration::from_millis(0),
+            upstream_service_time: None,
+            forwarded_for: None,
+            user_agent: None,
+            request_id: None,
+            authority: None,
+            upstream_host: None,
+        }
+    }
+
+    #[test]
+    fn compiled_log_format_uses_config_string_when_present() {
+        let file_cfg = envoy_config::FileAccessLog {
+            path: "/tmp/x".into(),
+            log_format: Some(envoy_config::SubstitutionFormatString {
+                text_format_source: envoy_config::DataSourceInline {
+                    inline_string: "%REQ(:METHOD)% %RESPONSE_CODE%".into(),
+                },
+            }),
+        };
+        let fmt = compiled_log_format(&file_cfg).expect("valid");
+        assert_eq!(fmt.render(&record_get_200()), "GET 200");
+    }
+
+    #[test]
+    fn compiled_log_format_falls_back_to_default_when_absent() {
+        let file_cfg = envoy_config::FileAccessLog {
+            path: "/tmp/x".into(),
+            log_format: None,
+        };
+        let fmt = compiled_log_format(&file_cfg).expect("default");
+        let line = fmt.render(&record_get_200());
+        assert!(
+            line.starts_with("[1970-01-01T00:00:00.000Z] "),
+            "line: {line}"
+        );
+        assert!(
+            line.ends_with("\"-\"\n"),
+            "default render ends with the last token + newline: {line}"
+        );
+    }
 
     /// 28 Task 6 (c) — THE load-bearing empty-vs-absent distinction (ADR-0070).
     /// A header that is PRESENT but EMPTY hashes to `xxh64(b"")` (deterministic,
