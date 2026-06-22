@@ -1028,14 +1028,115 @@ surrounding quotes).
 | `%REQ(:AUTHORITY)%` | `AccessLogRecord.authority: Option<String>`, populated from the `Host:` header on the H1 path (envoy_http1::codec produces this from the request-line) or the `:authority` pseudo-header on the H2 path (translated by 05.2 D3's adapter). | value-exact | Both proxies see the same wire-level request authority; both render the same value. |
 | `%UPSTREAM_HOST%` | `AccessLogRecord.upstream_host: Option<String>`, populated at HCM record-build time from the router-arm's resolved upstream `SocketAddr` (formatted via `SocketAddr` Display). `None` on direct_response paths. | value-exact `-` (direct_response, fixture 0012); value-exact for STRICT_DNS single-A-record resolution; name-required, value-may-differ for multi-A non-deterministic resolution | Fixture 0012's direct_response path produces `-`; both proxies emit `-`. Future router-proxy fixtures use STRICT_DNS with single-A resolution (matches the 04.3 fixture 0008 / 05.3 fixture 0010 posture). |
 
-Format-string customization is OUT of scope in 06.2. The `envoy-config`
-validator at `validate_access_logs` rejects non-`envoy.access_loggers.file`
-access-log names and fixtures that supply format strings on the FileAccessLog
-typed_config (the `format` / `log_format` / `json_format` / `typed_json_format`
-fields on the upstream proto are not in envoy-rust's `FileAccessLog` struct;
-serde `deny_unknown_fields` rejects them). Future observability-family phases
-extend this section with new tokens (`%FILTER_STATE%`, `%DYNAMIC_METADATA%`,
-`%RESPONSE_CODE_DETAILS%`, etc.) when the corresponding machinery lands.
+> **NOTE (06.2-era posture, NOW PARTIALLY SUPERSEDED by phase 32).** The
+> paragraph below records the original 06.2 stance that format-string
+> customization was wholly out of scope. Phase 32 (ADR-0079) SUPERSEDES it for
+> the modern `log_format.text_format_source.inline_string` path, which is now
+> a supported configurable command-operator format engine — see the
+> [Phase 32 (ADR-0079)](#phase-32-adr-0079-configurable-command-operator-format-engine)
+> subsection below. The remaining out-of-scope claims (the `json_format` /
+> `typed_json_format` fields, the DEPRECATED inline `text_format` field, and
+> the top-level `format` field) STILL HOLD and are still rejected.
+
+Format-string customization via `json_format` / `typed_json_format`, the
+DEPRECATED inline `text_format` field, and the top-level `format` field is OUT
+of scope. The `envoy-config` validator at `validate_access_logs` rejects
+non-`envoy.access_loggers.file` access-log names; those format fields are not
+modeled on envoy-rust's `FileAccessLog` struct and serde `deny_unknown_fields`
+rejects them. (The modern `log_format.text_format_source.inline_string` path is
+the EXCEPTION — it IS modeled and IS supported per phase 32 below.) Future
+observability-family phases extend this section with new tokens
+(`%FILTER_STATE%`, `%DYNAMIC_METADATA%`, `%RESPONSE_CODE_DETAILS%`, etc.) when
+the corresponding machinery lands.
+
+### Phase 32 (ADR-0079): configurable command-operator format engine
+
+> Phase 32 lands a configurable access-log format engine in the
+> `envoy-accesslog` crate. A `log_format.text_format_source.inline_string`
+> supplied on the `FileAccessLog` typed_config is compiled at config-load into
+> a sequence of literals + command operators and rendered per record. The
+> default format (the 14-token string above) is now re-expressed THROUGH this
+> engine but remains byte-identical to the legacy 06.2 concatenator output.
+
+**Grammar.** A `log_format` string is a sequence of literal text and command
+operators. The operator forms are:
+
+| Form | Meaning |
+|---|---|
+| `%OP%` | The operator `OP` with no argument. |
+| `%OP(ARG)%` | The operator `OP` with argument `ARG` (e.g. a header name). |
+| `%OP(ARG):N%` | As above, then BYTE-count truncate the resolved value to at most `N` bytes. |
+| `%%` | A single literal `%`. This is the ONLY way to emit a literal `%`. |
+
+`:N` truncation is a BYTE count, rounded DOWN to the nearest UTF-8 character
+boundary (it never splits a multi-byte char and never panics; for ASCII values
+`:N` = the first `N` bytes). The `?`-alternate form `%REQ(PRIMARY?ALT)%` (and
+`%RESP(PRIMARY?ALT)%`) resolves to `ALT` when `PRIMARY` is absent; when combined
+with `:N`, truncation applies to the RESOLVED value (whichever branch was used).
+
+**Absent value renders `-`.** A resolved value that is absent renders as a
+single dash `-` (never the empty string). A missing `%REQ(NAME)%` / `%RESP(NAME)%`
+header, a `%UPSTREAM_HOST%` with no upstream (direct_response), and a
+`%RESPONSE_FLAGS%` with no flags set (Envoy's no-flags sentinel) all render `-`.
+
+**Boot-fatal config validity (ADR-0049 posture).** The format string is compiled
+at config-load by `envoy-config`'s `validate_access_logs`, which calls
+`envoy_accesslog::parse_format`. The following are ALL config-load errors that
+abort boot (`ConfigError::InvalidAccessLogFormat`):
+
+- an unknown operator keyword;
+- a malformed / unterminated operator (e.g. `%REQ(` with no closing `)%`);
+- an empty operator `%()%`;
+- a stray / lone / trailing single `%` (the only literal `%` is `%%`);
+- a `%REQ` / `%RESP` header name outside the §B support matrix below.
+
+**§B operator support matrix (name → field allow-list).** The `AccessLogRecord`
+struct has 15 named fields and NO generic header map, so `%REQ` / `%RESP`
+operators resolve via a FIXED allow-list — any other header name is a config
+error. Header-name matching is case-insensitive (ASCII). A `%REQ` / `%RESP`
+operator is valid iff at least one of its branches (the primary name OR the `?`
+alternate) maps to a backed field.
+
+| Operator | Argument (header name) | → `AccessLogRecord` field |
+|---|---|---|
+| `%REQ(…)%` | `:method` | `method` |
+| `%REQ(…)%` | `:authority` | `authority` |
+| `%REQ(…)%` | `:path` | `path` |
+| `%REQ(…)%` | `x-envoy-original-path` | `path` |
+| `%REQ(…)%` | `x-forwarded-for` | `forwarded_for` |
+| `%REQ(…)%` | `user-agent` | `user_agent` |
+| `%REQ(…)%` | `x-request-id` | `request_id` |
+| `%RESP(…)%` | `x-envoy-upstream-service-time` | `upstream_service_time` (ms) |
+
+Standalone operators (no argument): `%PROTOCOL%`, `%RESPONSE_CODE%`,
+`%RESPONSE_FLAGS%`, `%BYTES_RECEIVED%`, `%BYTES_SENT%`, `%UPSTREAM_HOST%`,
+`%START_TIME%`, `%DURATION%`. Their internal sources and equivalence
+dispositions are exactly as documented in the 06.2 token→source table above.
+
+**Trailing-newline rule (Fact 7).** Upstream Envoy emits a custom
+`inline_string` VERBATIM with NO auto-appended `\n`; the DEFAULT format string
+carries its own trailing `\n`. envoy-rust matches this exactly: the engine
+renders the format string verbatim and `FileSink::emit` appends NOTHING.
+Consequently the default-format render is byte-identical to the legacy 06.2
+concatenator output plus its trailing `\n` (proven by the
+`compiled_default_matches_legacy_concatenator` unit test). ⇒ **fixture 0012
+stays byte-identical, UNCHANGED.**
+
+**Deterministic vs non-deterministic classification.** Operators split by
+whether their resolved value is byte-stable across the two proxies:
+
+| Class | Operators | Cross-proxy disposition |
+|---|---|---|
+| DETERMINISTIC | `%REQ(:METHOD)%`, `%REQ(:PATH)%`, `%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%` (both branches resolve to the deterministic `path` field), `%REQ(:AUTHORITY)%`, `%REQ(X-FORWARDED-FOR)%`, `%REQ(USER-AGENT)%`, `%PROTOCOL%`, `%RESPONSE_CODE%`, `%RESPONSE_FLAGS%`, `%BYTES_RECEIVED%`, `%BYTES_SENT%`, `%UPSTREAM_HOST%` | Whole-line byte-exact cross-proxy. Proven by **fixture 0040** (`0040-accesslog-command-operators`). `%UPSTREAM_HOST%` renders `-` on the direct_response path (byte-identical); its real `ip:port` render is proven in the in-process backstop. |
+| NON-DETERMINISTIC | `%START_TIME%`, `%DURATION%`, `%REQ(X-REQUEST-ID)%`, `%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%` | NEVER placed in a cross-proxy byte-exact fixture. Proven ONLY in the in-process backstop (the `envoy-accesslog` evaluator unit tests). Where surfaced cross-proxy, equivalence is asserted via the existing `AccessLogLineRule::Iso8601Format` / `DurationMs` allow-list rules. |
+
+**Witness fixtures.** The cross-proxy byte-exact differential witness is
+**fixture 0040** (`0040-accesslog-command-operators`), which exercises the
+deterministic operators end-to-end. The in-process backstop — the
+`envoy-accesslog` `command_operator` / `default_format` / `file_sink` unit
+tests plus the H1 `compiled_log_format` wiring test — covers the
+non-deterministic operators, the real-`ip:port` `%UPSTREAM_HOST%` render, and
+the boot-fatal parse errors.
 
 ---
 
