@@ -20,6 +20,7 @@ pub mod file_sink;
 pub mod record;
 mod sink;
 
+pub use command_operator::{CompiledFormat, FormatParseError, parse_format};
 pub use error::AccessLogError;
 pub use file_sink::FileSink;
 pub use record::AccessLogRecord;

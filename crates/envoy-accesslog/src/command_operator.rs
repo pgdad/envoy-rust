@@ -12,7 +12,11 @@
 //! the default-format re-expression, the config field, and the HCM wiring are
 //! later tasks in this phase. Do NOT add `render`/`CompiledFormat` here.
 
+use std::fmt::Write as _;
+
 use thiserror::Error;
+
+use crate::record::AccessLogRecord;
 
 /// One piece of a parsed format string: either a literal run of text or a
 /// typed substitution operator.
@@ -296,9 +300,182 @@ fn parse_header_op(
     })
 }
 
+/// A parsed-and-validated access-log format ready for evaluation against an
+/// [`AccessLogRecord`]. Wraps the `Vec<Segment>` produced by [`parse_format`];
+/// every operator is already known to have a backing field (the parser rejected
+/// unbacked names), so `render` is total and never fails.
+///
+/// The inner field is PRIVATE on purpose: external crates construct a
+/// `CompiledFormat` via the `Default`/`from_inline` constructors added in a
+/// later task (the default-format re-expression). Same-crate code (and these
+/// tests) may use the tuple constructor directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledFormat(pub(crate) Vec<Segment>);
+
+impl CompiledFormat {
+    /// Evaluate every segment against `record` and concatenate into one line.
+    ///
+    /// `Literal` segments are emitted verbatim. `Op` segments resolve to their
+    /// backing field per §B; absent `Option` fields render as the Envoy
+    /// no-value sentinel `-`. `Req`/`Resp` apply `?`-alt fallback then `:N`
+    /// byte-truncation to the resolved value.
+    pub fn render(&self, record: &AccessLogRecord) -> String {
+        let mut out = String::with_capacity(256);
+        for seg in &self.0 {
+            match seg {
+                Segment::Literal(s) => out.push_str(s),
+                Segment::Op(op) => render_op(&mut out, op, record),
+            }
+        }
+        out
+    }
+}
+
+/// Render a single operator into `out`.
+fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord) {
+    match op {
+        Op::Protocol => out.push_str(&record.protocol),
+        Op::ResponseCode => {
+            let _ = write!(out, "{}", record.response_code);
+        }
+        Op::ResponseFlags => out.push_str(&record.response_flags),
+        Op::BytesReceived => {
+            let _ = write!(out, "{}", record.bytes_received);
+        }
+        Op::BytesSent => {
+            let _ = write!(out, "{}", record.bytes_sent);
+        }
+        Op::Duration => {
+            let _ = write!(out, "{}", record.duration.as_millis());
+        }
+        Op::StartTime => out.push_str(&crate::format_iso8601(record.start_time)),
+        Op::UpstreamHost => out.push_str(record.upstream_host.as_deref().unwrap_or("-")),
+        Op::Req {
+            name,
+            alt,
+            truncate,
+        } => {
+            // REQ values are all borrowed `&str` from the record.
+            let value = resolve_req(name, record)
+                .or_else(|| alt.as_deref().and_then(|a| resolve_req(a, record)))
+                .unwrap_or("-");
+            out.push_str(truncate_bytes(value, *truncate));
+        }
+        Op::Resp {
+            name,
+            alt,
+            truncate,
+        } => {
+            // RESP values are owned `String` (the only RESP field is rendered
+            // from a `Duration` → decimal-ms string).
+            let value = resolve_resp(name, record)
+                .or_else(|| alt.as_deref().and_then(|a| resolve_resp(a, record)));
+            let value = value.as_deref().unwrap_or("-");
+            out.push_str(truncate_bytes(value, *truncate));
+        }
+    }
+}
+
+/// Resolve a REQ header `name` (already lowercased) to its backing field value.
+/// Returns `None` for an absent `Option` field. Names not in `REQ_ALLOW_LIST`
+/// also return `None`, but the parser already rejected those at parse time.
+fn resolve_req<'a>(name: &str, record: &'a AccessLogRecord) -> Option<&'a str> {
+    match name {
+        ":method" => Some(&record.method),
+        // `:path` and `x-envoy-original-path` both map to the already-resolved
+        // `path` field (the record build site folds the original-path override
+        // into `path` before record construction).
+        ":path" | "x-envoy-original-path" => Some(&record.path),
+        ":authority" => record.authority.as_deref(),
+        "x-forwarded-for" => record.forwarded_for.as_deref(),
+        "user-agent" => record.user_agent.as_deref(),
+        "x-request-id" => record.request_id.as_deref(),
+        _ => None,
+    }
+}
+
+/// Resolve a RESP header `name` (already lowercased) to its backing field
+/// value as an owned `String`. The only backed RESP header is
+/// `x-envoy-upstream-service-time`, rendered as decimal milliseconds.
+fn resolve_resp(name: &str, record: &AccessLogRecord) -> Option<String> {
+    match name {
+        "x-envoy-upstream-service-time" => record
+            .upstream_service_time
+            .map(|d| d.as_millis().to_string()),
+        _ => None,
+    }
+}
+
+/// Truncate `value` to AT MOST `n` BYTES (Envoy truncates by byte count, not
+/// char count). To avoid panicking on a multi-byte UTF-8 boundary, we round
+/// DOWN to the nearest char boundary at or below `n` bytes via
+/// `str::floor_char_boundary` (stable since Rust 1.82; the pinned toolchain is
+/// 1.95). For ASCII values — the common access-log case — this is exactly the
+/// first `n` bytes. `None` means no truncation.
+fn truncate_bytes(value: &str, truncate: Option<usize>) -> &str {
+    match truncate {
+        None => value,
+        Some(n) => &value[..value.floor_char_boundary(n)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::AccessLogRecord;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // A fully-populated, deterministic record for evaluator tests. The record
+    // intentionally has no `Default` impl, so every field is set explicitly.
+    fn rec() -> AccessLogRecord {
+        AccessLogRecord {
+            start_time: UNIX_EPOCH,
+            method: "POST".into(),
+            path: "/p".into(),
+            protocol: "HTTP/1.1".into(),
+            response_code: 200,
+            response_flags: "-".into(),
+            bytes_received: 16,
+            bytes_sent: 433,
+            duration: Duration::from_millis(0),
+            upstream_service_time: None,
+            forwarded_for: None,
+            user_agent: Some("curl/8.20.0".into()),
+            request_id: None,
+            authority: Some("h:1".into()),
+            upstream_host: Some("1.2.3.4:80".into()),
+        }
+    }
+
+    #[test]
+    fn renders_deterministic_line() {
+        let f = parse_format(
+            "m=%REQ(:METHOD)% code=%RESPONSE_CODE% ua=%REQ(USER-AGENT)% up=%UPSTREAM_HOST%",
+        )
+        .unwrap();
+        assert_eq!(
+            CompiledFormat(f).render(&rec()),
+            "m=POST code=200 ua=curl/8.20.0 up=1.2.3.4:80"
+        );
+    }
+
+    #[test]
+    fn absent_header_renders_dash() {
+        let f = parse_format("xff=%REQ(X-FORWARDED-FOR)%").unwrap(); // forwarded_for=None
+        assert_eq!(CompiledFormat(f).render(&rec()), "xff=-");
+    }
+
+    #[test]
+    fn truncate_is_byte_count() {
+        let f = parse_format("%REQ(USER-AGENT):5%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&rec()), "curl/"); // first 5 bytes
+    }
+
+    #[test]
+    fn alt_used_when_primary_absent() {
+        let f = parse_format("%REQ(X-FORWARDED-FOR?USER-AGENT)%").unwrap(); // xff absent → ua
+        assert_eq!(CompiledFormat(f).render(&rec()), "curl/8.20.0");
+    }
 
     // Literals + a simple operator.
     #[test]
@@ -393,5 +570,47 @@ mod tests {
             parse_format("a€%%b").unwrap(),
             vec![Segment::Literal("a€%b".into())]
         );
+    }
+
+    // RESP present: `x-envoy-upstream-service-time` renders the upstream
+    // service time as decimal milliseconds via `as_millis()`.
+    #[test]
+    fn resp_upstream_service_time_present() {
+        let mut r = rec();
+        r.upstream_service_time = Some(Duration::from_millis(7));
+        let f = parse_format("%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "7");
+    }
+
+    // RESP absent: an unset `upstream_service_time` (the base `rec()`) renders
+    // the Envoy no-value sentinel `-`.
+    #[test]
+    fn resp_upstream_service_time_absent() {
+        let f = parse_format("%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&rec()), "-"); // upstream_service_time=None
+    }
+
+    // Multi-byte truncation rounds DOWN to a char boundary. "café" is 5 bytes
+    // ("caf" = 3 bytes, "é" = bytes 3..5). Truncating to 4 bytes lands mid-"é",
+    // so `floor_char_boundary(4)` = 3 → "caf" (no panic, no partial "é").
+    #[test]
+    fn truncate_multibyte_rounds_down_to_char_boundary() {
+        let mut r = rec();
+        r.user_agent = Some("café".into());
+        let f = parse_format("%REQ(USER-AGENT):4%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "caf"); // byte 4 is mid-"é" → floor to 3
+
+        // Truncating to the full 5 bytes is a char boundary → the whole "café".
+        let f = parse_format("%REQ(USER-AGENT):5%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "café");
+    }
+
+    // alt + `:N`: the primary header is absent, so the alt resolves; the `:N`
+    // truncation then applies to the alt-resolved value, not the primary.
+    #[test]
+    fn alt_resolved_value_is_truncated() {
+        // xff absent → alt user-agent "curl/8.20.0" → truncate to 4 bytes.
+        let f = parse_format("%REQ(X-FORWARDED-FOR?USER-AGENT):4%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&rec()), "curl");
     }
 }
