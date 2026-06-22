@@ -131,3 +131,60 @@
 | 8 BEHAVIOR_CONTRACT + close | `be82cbae1bcdd6a962890b38201cb1f272b7aaf1` | spec ✅ (every claim code-verified) / quality ✅ (+clarity) |
 
 **Phase outcome:** the hardcoded Envoy-v3 default-format emitter is now a configurable command-operator substitution engine driven by a per-`FileAccessLog` `log_format`; the cross-proxy byte-exact custom-format differential (fixture 0040) is GREEN; fixture 0012 is byte-preserved; all 8 tasks TDD + two-stage-reviewed + committed separately. **STATE stays `32` state-3 / state-4-next** — the §7.5 verification gate (`cargo build/clippy/fmt/test/deny` workspace-wide + `cargo fuzz` short-budget + the full Docker differential suite incl. all `0001`–`0040` + h2spec + `REVIEW.md`) is the NEXT session per §5.1.
+
+---
+
+## Phase-32 state-4 VERIFICATION record (`superpowers:verification-before-completion`) — §7.5 phase-done gate GREEN
+
+> Ran `superpowers:verification-before-completion`. The 9 state-3 commits (`7917c8a`…`ecb62d3`) were COMMITTED-but-UNPUSHED at session start (`HEAD` 9 ahead of `origin/main` `783d29f`; STEP-0 expected `HEAD == origin/main`). Pushed `783d29f..ecb62d3` → triggered the AUTHORITATIVE Linux CI run. Gate verdict: **(a)-(e) GREEN; (f) REVIEW.md is the NEXT session (state-5).**
+
+### AUTHORITATIVE CI run — `27941931062` (commit `ecb62d3`, push to `main`) → **conclusion: success**
+
+URL: https://github.com/pgdad/envoy-rust/actions/runs/27941931062 — every step `success` in both jobs:
+
+```
+success :: build + test + lint
+    success  fmt          # cargo fmt --all -- --check                                    [gate (e)]
+    success  clippy       # cargo clippy --workspace --all-targets --all-features -D warns [gate (e)]
+    success  build        # cargo build --workspace --all-targets                          [gate (e)]
+    success  test (includes differential harness → Docker)  # cargo test --workspace   [gates (a)(b)(c)(e)]
+    success  cargo deny check                                                              [gate (e)]
+success :: fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)
+    success  fuzz parse_bootstrap / jwt_parse / cdn_loop_parse / accesslog_format_parse    [gate (d)]
+```
+
+**(a) new fixture 0040 GREEN on CI:** `test access_log_command_operators ... ok` (the cross-proxy byte-exact custom-format line).
+**(b) pre-existing fixtures GREEN on CI (simultaneously):** `test admin_config_dump_server_info ... ok` + `test admin_config_dump_server_info_in_process ... ok`; ZERO `test result: FAILED` / `... FAILED` / `panicked at` anywhere in the 27 638-line CI log → all `0001`–`0039` (incl. `0012` byte-identical regression-equivalence witness) green alongside `0040`.
+**(c) h2spec ≥95% (unchanged surface):** `test h2spec_pass_rate_gate ... ok`.
+**(d) fuzz short-budget, 0 crashes (incl. the NEW target):** all 4 CI fuzz steps `success`; the `accesslog_format_parse` step confirms the hand-wired ci.yml gate (d) is live (memory `new-fuzz-target-needs-a-ci-yml-step`).
+**(e) build/clippy/fmt/test/deny clean:** all 5 CI steps `success`; `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+
+### LOCAL gate runs on this host (Docker Desktop, virtiofs) — corroborating, with one documented host-only divergence
+
+| (e) command | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 (clean) |
+| `cargo deny check` | exit 0 — `advisories ok, bans ok, licenses ok, sources ok` (only benign `license-not-encountered` allowance warnings) |
+| `cargo build --workspace --all-targets` | exit 0 (clean) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | exit 0 (clean) |
+| `cargo test --workspace` | **all GREEN except fixture `0014` differential** (host-only — root-caused below); `access_log_command_operators` (0040) **1 passed**; envoy-config 482 / differential-lib 151 / envoy-http1 / envoy-http2 (72+1 ign) all ok |
+
+(d) local fuzz short-budget — **all 0 crashes**:
+```
+accesslog_format_parse : Done 4 739 696 runs in 31s   (exit 0)
+parse_bootstrap        : Done   444 122 runs in 31s   (exit 0)  [corpus now reaches FormatParseError — Task-7 seed live]
+jwt_parse              : Done 9 482 935 runs in 31s   (exit 0)
+cdn_loop_parse         : Done10 716 419 runs in 31s   (exit 0)
+```
+
+### Root-cause: local fixture `0014` RED is a host-networking allow-list gap, NOT a phase-32 regression (`superpowers:systematic-debugging`)
+
+`cargo test --workspace` failed ONLY `admin_config_dump_server_info` (fixture 0014, `/clusters` text_lines) on this host. Root cause (deterministic across re-runs):
+- Envoy emits per-endpoint backend counter lines addressed `backend::192.168.65.2:<ephemeral>::…` (hostname `host.docker.internal`); envoy-rust emits none (documented phase-08 lock-in #10: minimal 2-line `/clusters` rendering).
+- Fixture 0014's `allowlist_envoy_only_line_prefixes` absorbs these via `backend::192.168.65.254:` (macOS Docker Desktop gvisor bridge) **and** `backend::172.17.0.1:` (Linux CI docker0) — but THIS host routes the backend via `192.168.65.2` (host.docker.internal host-gateway), a THIRD bridge address in neither prefix → the lines escape the allow-list → divergence.
+- **Not a phase-32 regression, proven deductively:** `git diff --stat origin/main..HEAD` touches ZERO cluster/admin/listener code and does NOT modify fixture 0014's files; the `lib.rs` harness diff grep for `text_lines|allow|admin|clusters|backend::` is EMPTY (comparator/allow-list path byte-identical to base); fixture 0014 has NO access-log content (phase-32 config/runtime inert for it). ⇒ 0014's behavior at `ecb62d3` ≡ base.
+- **Confirmed green on the AUTHORITATIVE environment:** CI (Linux, `172.17.0.1` docker0) → `admin_config_dump_server_info ... ok`. This dev host is differential-non-authoritative (memory `host-docker-desktop-virtiofs-no-inotify`; `envoy-rust-state4-ci-first-execution`). NO source/fixture change made (state-4 = verify; the authoritative gate did not fail).
+
+### Gate disposition
+
+§7.5 (a)-(e) **GREEN** on the authoritative Linux CI (run `27941931062`). (f) `REVIEW.md` is the state-5 session (`superpowers:requesting-code-review`). STATE advances `32` state-4-complete / **state-5-next**. `#![forbid(unsafe_code)]` holds. Ledger head ADR-0079 unchanged (no ADR this session — verification only).
