@@ -13,6 +13,7 @@
 //! When N≥2 sink types exist (gRPC ALS sink, stdout sink, etc.), a
 //! future phase will ship the trait + multi-sink dispatch in this crate.
 
+pub mod command_operator;
 pub mod default_format;
 mod error;
 pub mod file_sink;
