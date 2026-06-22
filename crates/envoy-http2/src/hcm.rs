@@ -1911,9 +1911,12 @@ static_resources:
         let mut sinks: Vec<Arc<envoy_accesslog::FileSink>> = Vec::new();
         for p in paths {
             sinks.push(Arc::new(
-                envoy_accesslog::FileSink::new(p.clone())
-                    .await
-                    .expect("open sink"),
+                envoy_accesslog::FileSink::new(
+                    p.clone(),
+                    envoy_accesslog::CompiledFormat::default(),
+                )
+                .await
+                .expect("open sink"),
             ));
         }
         let config = h2_hcm_config_with_access_log(sinks).await;

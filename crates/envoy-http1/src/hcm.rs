@@ -202,12 +202,15 @@ impl HCMConfig {
         for entry in &cfg.access_log {
             match &entry.typed_config {
                 envoy_config::AccessLogTypedConfig::FileAccessLog(file_cfg) => {
-                    let sink =
-                        envoy_accesslog::FileSink::new(std::path::PathBuf::from(&file_cfg.path))
-                            .await
-                            .map_err(|err| Http1Error::AccessLogOpen {
-                                message: err.to_string(),
-                            })?;
+                    // Task 5 replaces the default with the config-derived CompiledFormat.
+                    let sink = envoy_accesslog::FileSink::new(
+                        std::path::PathBuf::from(&file_cfg.path),
+                        envoy_accesslog::CompiledFormat::default(),
+                    )
+                    .await
+                    .map_err(|err| Http1Error::AccessLogOpen {
+                        message: err.to_string(),
+                    })?;
                     access_log_sinks.push(Arc::new(sink));
                 }
             }
@@ -3577,9 +3580,12 @@ static_resources:
         let dir = tempdir().expect("tempdir");
         let path: PathBuf = dir.path().join("access.log");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(path.clone())
-                .await
-                .expect("open sink"),
+            envoy_accesslog::FileSink::new(
+                path.clone(),
+                envoy_accesslog::CompiledFormat::default(),
+            )
+            .await
+            .expect("open sink"),
         );
         // Build config with a 200 direct-response route (synth arm) and
         // an access-log sink so the factored dispatch site is exercised.
@@ -3702,9 +3708,12 @@ static_resources:
         let mut sinks: Vec<Arc<envoy_accesslog::FileSink>> = Vec::new();
         for p in paths {
             sinks.push(Arc::new(
-                envoy_accesslog::FileSink::new(p.clone())
-                    .await
-                    .expect("open sink"),
+                envoy_accesslog::FileSink::new(
+                    p.clone(),
+                    envoy_accesslog::CompiledFormat::default(),
+                )
+                .await
+                .expect("open sink"),
             ));
         }
         let config = hcm_config_with_access_log(sinks).await;
@@ -3822,6 +3831,7 @@ static_resources:
         let sink = Arc::new(envoy_accesslog::FileSink::from_file_for_test(
             path.clone(),
             ro_file,
+            envoy_accesslog::CompiledFormat::default(),
         ));
         let result = serve_one_request_with_pre_constructed_sinks(&[sink]).await;
         assert!(
@@ -3905,9 +3915,12 @@ static_resources:
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(path.clone())
-                .await
-                .expect("open sink"),
+            envoy_accesslog::FileSink::new(
+                path.clone(),
+                envoy_accesslog::CompiledFormat::default(),
+            )
+            .await
+            .expect("open sink"),
         );
         let (config, _registry) = hcm_config_with_access_log_and_registry(vec![sink]).await;
 
@@ -3976,6 +3989,7 @@ static_resources:
         let sink = Arc::new(envoy_accesslog::FileSink::from_file_for_test(
             path.clone(),
             ro_file,
+            envoy_accesslog::CompiledFormat::default(),
         ));
         let (config, _registry) = hcm_config_with_access_log_and_registry(vec![sink]).await;
 
@@ -4278,9 +4292,12 @@ static_resources:
         log_path: &std::path::Path,
     ) -> Arc<HCMConfig> {
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.to_path_buf())
-                .await
-                .expect("open FileSink"),
+            envoy_accesslog::FileSink::new(
+                log_path.to_path_buf(),
+                envoy_accesslog::CompiledFormat::default(),
+            )
+            .await
+            .expect("open FileSink"),
         );
         Arc::new(HCMConfig {
             stat_prefix: "ingress_http".to_string(),

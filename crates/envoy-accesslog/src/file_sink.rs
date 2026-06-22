@@ -17,7 +17,7 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::default_format::format;
+use crate::command_operator::CompiledFormat;
 use crate::error::AccessLogError;
 use crate::record::AccessLogRecord;
 
@@ -26,11 +26,15 @@ use crate::record::AccessLogRecord;
 /// Owns an `Arc<tokio::sync::Mutex<File>>` so concurrent emissions
 /// on the same `Arc<FileSink>` serialize at the mutex boundary
 /// rather than racing at the kernel append boundary. The path is
-/// retained for error reporting via `AccessLogError::Write`.
+/// retained for error reporting via `AccessLogError::Write`. The
+/// `format` is the compiled access-log format the sink renders each
+/// record through (the Envoy default via `CompiledFormat::default()`,
+/// or a config-derived custom format).
 #[derive(Debug)]
 pub struct FileSink {
     path: PathBuf,
     handle: Arc<Mutex<File>>,
+    format: CompiledFormat,
 }
 
 impl FileSink {
@@ -40,7 +44,7 @@ impl FileSink {
     /// directory, etc.). Per 06.2 SPEC §6 signpost 6 + signpost 7,
     /// the constructor does NOT mkdir -p, does NOT pre-validate
     /// path shape, and does NOT truncate existing files.
-    pub async fn new(path: PathBuf) -> Result<Self, AccessLogError> {
+    pub async fn new(path: PathBuf, format: CompiledFormat) -> Result<Self, AccessLogError> {
         let file = tokio::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -53,6 +57,7 @@ impl FileSink {
         Ok(Self {
             path,
             handle: Arc::new(Mutex::new(file)),
+            format,
         })
     }
 
@@ -68,26 +73,29 @@ impl FileSink {
     /// — production code uses `FileSink::new` exclusively.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-util"))]
-    pub fn from_file_for_test(path: PathBuf, file: File) -> Self {
+    pub fn from_file_for_test(path: PathBuf, file: File, format: CompiledFormat) -> Self {
         Self {
             path,
             handle: Arc::new(Mutex::new(file)),
+            format,
         }
     }
 
-    /// Format `record` per the Envoy default format and append the
-    /// result + a trailing `\n` to the underlying file. Returns
-    /// `AccessLogError::Write` on filesystem failure. The HCM
-    /// dispatch site at `envoy-http1::hcm` does NOT propagate this
-    /// error — emission failures are logged via `tracing::warn!`
-    /// and discarded per parent-06 SPEC §6 architectural Rule 4
-    /// (fire-and-forget).
+    /// Render `record` through the sink's compiled `format` and append
+    /// the result VERBATIM to the underlying file. The sink does NOT
+    /// append a trailing `\n` of its own — the newline (if any) is part
+    /// of the format string itself (the Envoy default carries a trailing
+    /// `\n`; a custom format controls its own line terminator). Returns
+    /// `AccessLogError::Write` on filesystem failure. The HCM dispatch
+    /// site at `envoy-http1::hcm` does NOT propagate this error —
+    /// emission failures are logged via `tracing::warn!` and discarded
+    /// per parent-06 SPEC §6 architectural Rule 4 (fire-and-forget).
     ///
     /// Concurrent emissions on the same `Arc<FileSink>` serialize
     /// at the per-sink `Mutex<File>` — no two records will
     /// interleave in the file.
     pub async fn emit(&self, record: &AccessLogRecord) -> Result<(), AccessLogError> {
-        let line = format(record);
+        let line = self.format.render(record);
         let mut file = self.handle.lock().await;
         file.write_all(line.as_bytes())
             .await
@@ -95,22 +103,28 @@ impl FileSink {
                 path: self.path.clone(),
                 source,
             })?;
-        file.write_all(b"\n")
-            .await
-            .map_err(|source| AccessLogError::Write {
-                path: self.path.clone(),
-                source,
-            })?;
-        // No explicit flush — the kernel will flush on file close.
-        // Tests drop the FileSink (and let the runtime finalize the
-        // drop chain via the test-internal tokio::time::sleep) to
-        // force flush before reading.
+        // Flush the single write. `tokio::fs::File` buffers writes on a
+        // blocking-pool thread and can return `Ok` from the first
+        // `write_all` even when the underlying `write(2)` will fail
+        // (e.g. an `O_RDONLY` FD); the OS error then only surfaces on a
+        // later op. When `emit` did TWO writes (line + `\n`) the second
+        // write forced that surfacing; now that the format string carries
+        // its own newline there is a SINGLE write, so we `flush()` here to
+        // observe the write error in the same `emit` call (preserving the
+        // fire-and-forget error-reporting contract at the HCM dispatch
+        // site). This is a buffer flush, not an fsync — durability still
+        // rides on file close.
+        file.flush().await.map_err(|source| AccessLogError::Write {
+            path: self.path.clone(),
+            source,
+        })?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // `CompiledFormat` is in scope via `super::*` (imported at module top).
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::tempdir;
@@ -151,7 +165,9 @@ mod tests {
     async fn file_sink_writes_one_record() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
-        let sink = FileSink::new(path.clone()).await.expect("open");
+        let sink = FileSink::new(path.clone(), CompiledFormat::default())
+            .await
+            .expect("open");
         let record = make_record();
         sink.emit(&record).await.expect("emit");
         drop(sink); // force OS-level flush via file close
@@ -186,7 +202,9 @@ mod tests {
     async fn file_sink_appends_multiple_records() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
-        let sink = FileSink::new(path.clone()).await.expect("open");
+        let sink = FileSink::new(path.clone(), CompiledFormat::default())
+            .await
+            .expect("open");
         for i in 0..3 {
             let mut record = make_record();
             record.response_code = 200 + i;
@@ -206,7 +224,11 @@ mod tests {
     async fn file_sink_serializes_concurrent_emissions() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
-        let sink = Arc::new(FileSink::new(path.clone()).await.expect("open"));
+        let sink = Arc::new(
+            FileSink::new(path.clone(), CompiledFormat::default())
+                .await
+                .expect("open"),
+        );
         let mut handles = Vec::new();
         for _ in 0..10 {
             let sink = Arc::clone(&sink);
@@ -258,7 +280,7 @@ mod tests {
         // FileSink::new does NOT mkdir -p; the OS-level open() will
         // return ENOENT and FileSink::new maps to AccessLogError::Open.
         let path = PathBuf::from("/nonexistent-parent-directory-06-2-fixture/access.log");
-        let err = FileSink::new(path.clone())
+        let err = FileSink::new(path.clone(), CompiledFormat::default())
             .await
             .expect_err("expected open error");
         match err {
@@ -270,5 +292,17 @@ mod tests {
             }
             other => panic!("expected AccessLogError::Open; got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn file_sink_writes_custom_format_verbatim() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let fmt = CompiledFormat::from_inline("%RESPONSE_CODE%").expect("valid");
+        let sink = FileSink::new(path.clone(), fmt).await.expect("open");
+        sink.emit(&make_record()).await.expect("emit");
+        drop(sink);
+        let contents = read_to_string(&path).await;
+        assert_eq!(contents, "200"); // verbatim, NO trailing newline
     }
 }

@@ -1,31 +1,50 @@
 //! Envoy default-format access-log line emitter.
 //!
-//! Renders an `AccessLogRecord` as the fixed 14-token Envoy default
-//! format (verifiable against upstream Envoy v1.33's documentation
-//! at the canonical access-log usage page). The output is a single
-//! line WITHOUT trailing newline — `FileSink::emit` writes the
-//! `\n` separately.
+//! The default format is now re-expressed THROUGH the command-operator
+//! engine: [`DEFAULT_FORMAT`] is the canonical Envoy default-format
+//! STRING (verifiable against upstream Envoy v1.33's documentation at
+//! the canonical access-log usage page), and `CompiledFormat::default()`
+//! parses it once. Unlike the old hand-rolled concatenator, the default
+//! STRING carries its OWN trailing `\n` — Envoy emits an `inline_string`
+//! VERBATIM with no auto-appended newline, so `FileSink::emit` renders
+//! the format verbatim and no longer appends a `\n` of its own.
 //!
 //! Token sequence (literal separators preserved):
 //! `[%START_TIME%] "%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%"
 //!  %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION%
 //!  %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% "%REQ(X-FORWARDED-FOR)%"
-//!  "%REQ(USER-AGENT)%" "%REQ(X-REQUEST-ID)%" "%REQ(:AUTHORITY)%" "%UPSTREAM_HOST%"`
+//!  "%REQ(USER-AGENT)%" "%REQ(X-REQUEST-ID)%" "%REQ(:AUTHORITY)%" "%UPSTREAM_HOST%"\n`
 //!
 //! Tokens whose backing fields are `None` (or whose values are not
 //! emitted by envoy-rust) render as a literal `-` per Envoy's
 //! substitution rule. Quoted positions render as `"-"`.
+//!
+//! [`legacy_format`] (the old hand-rolled concatenator) is retained
+//! ONLY as a `#[cfg(test)]` equivalence oracle: a test asserts that the
+//! engine's rendering of [`DEFAULT_FORMAT`] equals `legacy_format(...)`
+//! plus a trailing `\n`, proving the default-format re-expression stays
+//! byte-identical to the prior output.
 
 use std::fmt::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// `AccessLogRecord` is only referenced by the `#[cfg(test)]` `legacy_format`
+// oracle (and the test module); production code here is timestamp-only.
+#[cfg(test)]
 use crate::record::AccessLogRecord;
 
-/// Format an AccessLogRecord as a single Envoy default-format
-/// access-log line. No trailing newline — `FileSink::emit` writes
-/// the `\n` separately so callers that build multi-record buffers
-/// can control the newline placement.
-pub fn format(record: &AccessLogRecord) -> String {
+/// The canonical Envoy default-format access-log STRING, byte-for-byte
+/// matching upstream Envoy v1.33. Note the trailing `\n`: Envoy's
+/// default format carries its own newline, and the engine renders it
+/// verbatim (no auto-appended `\n` at the sink).
+pub const DEFAULT_FORMAT: &str = "[%START_TIME%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" %RESPONSE_CODE% %RESPONSE_FLAGS% %BYTES_RECEIVED% %BYTES_SENT% %DURATION% %RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)% \"%REQ(X-FORWARDED-FOR)%\" \"%REQ(USER-AGENT)%\" \"%REQ(X-REQUEST-ID)%\" \"%REQ(:AUTHORITY)%\" \"%UPSTREAM_HOST%\"\n";
+
+/// Hand-rolled Envoy default-format concatenator — retained ONLY as a
+/// `#[cfg(test)]` equivalence oracle for the engine-based default-format
+/// re-expression. Emits a single line WITHOUT a trailing newline (the
+/// engine path adds the `\n` via [`DEFAULT_FORMAT`]).
+#[cfg(test)]
+fn legacy_format(record: &AccessLogRecord) -> String {
     let mut s = String::with_capacity(256);
     s.push('[');
     format_iso8601(&mut s, record.start_time);
@@ -66,6 +85,7 @@ pub fn format(record: &AccessLogRecord) -> String {
     s
 }
 
+#[cfg(test)]
 fn push_or_dash(s: &mut String, opt: &Option<String>) {
     match opt {
         Some(v) => s.push_str(v),
@@ -201,9 +221,17 @@ mod tests {
     }
 
     #[test]
+    fn compiled_default_matches_legacy_concatenator() {
+        let record = make_baseline_record();
+        let legacy = legacy_format(&record);
+        let engine = crate::command_operator::CompiledFormat::default().render(&record);
+        assert_eq!(engine, format!("{legacy}\n"));
+    }
+
+    #[test]
     fn format_happy_path_direct_response() {
         let record = make_baseline_record();
-        let line = format(&record);
+        let line = legacy_format(&record);
         // The leading [...] is the ISO-8601 timestamp (golden-tested
         // separately in format_iso8601_epoch_zero). After the
         // closing `] `, the rest of the line is deterministic per
@@ -230,7 +258,7 @@ mod tests {
         record.upstream_service_time = Some(Duration::from_millis(2));
         record.upstream_host = Some("127.0.0.1:8080".into());
         record.response_code = 201;
-        let line = format(&record);
+        let line = legacy_format(&record);
         let expected_suffix = "\"GET / HTTP/1.1\" 201 - 0 3 5 2 \"-\" \"-\" \"-\" \"envoy-rust.test\" \"127.0.0.1:8080\"";
         assert!(
             line.ends_with(expected_suffix),
@@ -248,7 +276,7 @@ mod tests {
         let mut record = make_baseline_record();
         record.response_code = 503;
         record.response_flags = "UH".into();
-        let line = format(&record);
+        let line = legacy_format(&record);
         let expected_suffix =
             "\"GET / HTTP/1.1\" 503 UH 0 3 5 - \"-\" \"-\" \"-\" \"envoy-rust.test\" \"-\"";
         assert!(line.ends_with(expected_suffix), "line: {}", line);
@@ -318,7 +346,7 @@ mod tests {
         // values; envoy-rust matches.
         let mut record = make_baseline_record();
         record.user_agent = Some("Mozilla/5.0 (X11; Linux 中文)".into());
-        let line = format(&record);
+        let line = legacy_format(&record);
         assert!(
             line.contains("\"Mozilla/5.0 (X11; Linux 中文)\""),
             "line: {}",

@@ -313,6 +313,13 @@ fn parse_header_op(
 pub struct CompiledFormat(pub(crate) Vec<Segment>);
 
 impl CompiledFormat {
+    /// Parse and compile an inline format STRING into a `CompiledFormat`.
+    /// Returns a [`FormatParseError`] (later surfaced as a config-load
+    /// failure) if any operator is unknown, malformed, or unbacked.
+    pub fn from_inline(s: &str) -> Result<Self, FormatParseError> {
+        parse_format(s).map(CompiledFormat)
+    }
+
     /// Evaluate every segment against `record` and concatenate into one line.
     ///
     /// `Literal` segments are emitted verbatim. `Op` segments resolve to their
@@ -328,6 +335,18 @@ impl CompiledFormat {
             }
         }
         out
+    }
+}
+
+impl Default for CompiledFormat {
+    /// The Envoy default format, re-expressed through the engine by
+    /// parsing [`crate::default_format::DEFAULT_FORMAT`] (which carries
+    /// its own trailing `\n`). The constant is a compile-time-fixed,
+    /// always-valid format string, so the parse cannot fail.
+    fn default() -> Self {
+        parse_format(crate::default_format::DEFAULT_FORMAT)
+            .map(CompiledFormat)
+            .expect("default format is valid")
     }
 }
 
@@ -445,6 +464,13 @@ mod tests {
             authority: Some("h:1".into()),
             upstream_host: Some("1.2.3.4:80".into()),
         }
+    }
+
+    #[test]
+    fn default_format_parses_successfully() {
+        // Guards the `.expect(...)` in `impl Default for CompiledFormat`:
+        // the canonical default-format string must always parse.
+        assert!(parse_format(crate::default_format::DEFAULT_FORMAT).is_ok());
     }
 
     #[test]
