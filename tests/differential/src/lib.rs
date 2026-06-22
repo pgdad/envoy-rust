@@ -107,6 +107,24 @@ pub enum Driver {
         expected_access_log_paths: AccessLogPaths,
         expected_access_log_lines: Vec<Vec<crate::access_log::AccessLogLineRule>>,
     },
+    /// Phase 32 Task 6 (ADR-0079): whole-line byte-exact access-log
+    /// differential. Drives a SEQUENCE of H1 probes (via the same
+    /// `drive_http1` machinery `Http1WithAccessLog` uses) against a
+    /// `direct_response` listener whose file access-logger carries a
+    /// CUSTOM `log_format` of DETERMINISTIC command operators. After all
+    /// probes complete, scrapes BOTH proxies' access-log files and asserts
+    /// every emitted line is byte-identical via
+    /// `access_log::assert_access_log_lines_byte_identical` (NOT the
+    /// per-token default-format comparison). The fixture uses a
+    /// `direct_response` route so `%UPSTREAM_HOST%` renders `-` on both
+    /// sides — byte-identical with zero `{{BACKEND_IP}}` complexity.
+    Http1AccessLogByteExact {
+        // No Box needed: the `probes` `Vec` is already heap-indirected, so
+        // this variant stays under clippy's `large_enum_variant` threshold
+        // (unlike `Http1WithAccessLog`, which boxes its inline body rule).
+        probes: Vec<AccessLogByteExactProbe>,
+        expected_access_log_paths: AccessLogPaths,
+    },
     /// 05.2 NEW: drive an HTTP/2 cleartext (H2C prior-knowledge) request and
     /// assert the response shape. Mirrors `Http1`'s shape; the `host` field
     /// becomes `:authority` on the H2 wire. Per SPEC §3 D5.
@@ -985,6 +1003,31 @@ pub struct AccessLogPaths {
     pub envoy_rust: String,
 }
 
+/// Phase 32 Task 6 (ADR-0079): one probe inside
+/// `Driver::Http1AccessLogByteExact`. Each probe drives one H1 request
+/// through both proxies (via `drive_http1`); the emitted access-log line
+/// is later compared whole-line byte-exact. `extra_headers` lets a probe
+/// exercise request-header command operators (e.g. `%REQ(USER-AGENT)%`,
+/// `%REQ(X-FORWARDED-FOR)%`) deterministically. `expected_status` defaults
+/// to 200 (the `direct_response` status used by fixture 0040).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AccessLogByteExactProbe {
+    pub method: Http1Method,
+    pub path: String,
+    pub host: String,
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default = "default_byte_exact_status")]
+    pub expected_status: u16,
+}
+
+fn default_byte_exact_status() -> u16 {
+    200
+}
+
 /// 04.2 NEW: one probe entry inside `Driver::Http1ProbeList`. Each probe drives
 /// one HTTP/1.1 request through both upstream Envoy and envoy-rust, applying
 /// the same 5-axis equivalence cascade the single-probe `Driver::Http1` does.
@@ -1511,6 +1554,31 @@ async fn wait_file_nonempty(path: &std::path::Path, budget: Duration) -> bool {
     let deadline = std::time::Instant::now() + budget;
     loop {
         if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Budget for the byte-exact access-log scrape to see all N lines before the
+/// container is SIGKILLed. Sized to outlast Envoy's ~10s FileAccessLog flush timer.
+const ACCESS_LOG_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Poll `path` until it contains at least `want` lines or `budget` elapses.
+/// Returns true if the line count was reached. Mirrors `wait_file_nonempty`'s
+/// deadline/100ms-sleep skeleton, generalized from non-empty to a line-count
+/// predicate (used by the byte-exact access-log driver, which must scrape N
+/// lines from a still-alive container before SIGKILL drops Envoy's buffered lines).
+async fn wait_file_lines(path: &std::path::Path, want: usize, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let have = std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if have >= want {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -2728,6 +2796,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::Http1 { .. }
         | Driver::Http1ProbeList { .. }
         | Driver::Http1WithAccessLog { .. }
+        // Phase 32 Task 6 (ADR-0079): the byte-exact access-log driver runs
+        // over the same {{PORT}} H1 listener convention as the other
+        // HCM-shaped drivers.
+        | Driver::Http1AccessLogByteExact { .. }
         | Driver::Http1AfterSettle { .. }
         // 13.1 D10: Http1KeepAlive's HCM listener uses {{PORT}} like
         // the other HCM-shaped drivers; the admin listener is wired via
@@ -3553,7 +3625,13 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // of ownership. The envoy-rust side runs as a subprocess and writes
     // directly to the host path; only the upstream Envoy needs the mount.
     let upstream_access_log_mounts: Vec<(String, String)> = match &expectations.driver {
+        // Phase 32 Task 6 (ADR-0079): the byte-exact access-log driver mounts
+        // both log dirs identically to `Http1WithAccessLog`.
         Driver::Http1WithAccessLog {
+            expected_access_log_paths,
+            ..
+        }
+        | Driver::Http1AccessLogByteExact {
             expected_access_log_paths,
             ..
         } => {
@@ -5003,6 +5081,149 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             .map_err(|e| {
                 anyhow::anyhow!(
                     "access log mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
+                    e,
+                    envoy_lines,
+                    envoy_rust_lines,
+                )
+            })?;
+        }
+        // Phase 32 Task 6 (ADR-0079): whole-line byte-exact access-log
+        // differential. Drives a SEQUENCE of H1 probes (reusing `drive_http1`
+        // exactly as the `Http1WithAccessLog` arm does), then scrapes BOTH
+        // proxies' access-log files and asserts every emitted line is
+        // byte-identical (NOT the per-token default-format comparison). The
+        // fixture's custom `log_format` is deterministic-operators-only, so a
+        // whole-line `==` is the strongest possible assertion.
+        Driver::Http1AccessLogByteExact {
+            probes,
+            expected_access_log_paths,
+        } => {
+            let expected_lines = probes.len();
+
+            // Drive each probe in order against BOTH proxies. Reuse the exact
+            // request build (`drive_http1`) the `Http1WithAccessLog` arm uses;
+            // assert each side's status matches the probe's `expected_status`.
+            for (idx, probe) in probes.iter().enumerate() {
+                let body: Option<&[u8]> = probe.body.as_deref().map(|s| s.as_bytes());
+                let upstream_resp = drive_http1(
+                    upstream_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                    body,
+                )
+                .await
+                .with_context(|| {
+                    format!("upstream envoy http1 drive (Http1AccessLogByteExact probe {idx})")
+                })?;
+                let subject_resp = drive_http1(
+                    subject_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                    body,
+                )
+                .await
+                .with_context(|| {
+                    format!("envoy-rust http1 drive (Http1AccessLogByteExact probe {idx})")
+                })?;
+                if upstream_resp.status != probe.expected_status {
+                    bail!(
+                        "probe {idx}: upstream status {} != expected {}",
+                        upstream_resp.status,
+                        probe.expected_status,
+                    );
+                }
+                if subject_resp.status != probe.expected_status {
+                    bail!(
+                        "probe {idx}: subject status {} != expected {}",
+                        subject_resp.status,
+                        probe.expected_status,
+                    );
+                }
+            }
+
+            // envoy-rust's access-log emit is fire-and-forget; wait for all N
+            // lines to land BEFORE shutdown (SIGKILL) — mirrors the
+            // `Http1WithAccessLog` pre-shutdown wait, generalised to N lines.
+            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+            // Budget generously: Envoy's FileAccessLog flushes on a periodic
+            // timer (~10s default) rather than per-record, so a multi-probe
+            // scrape must outlast one flush cycle (a 5s budget saw only the
+            // first, already-flushed line — CI/local observed).
+            if !wait_file_lines(&envoy_rust_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+                tracing::warn!(
+                    "differential: envoy-rust access-log file {} still has < {} lines after {:?} (pre-shutdown wait)",
+                    envoy_rust_path.display(),
+                    expected_lines,
+                    ACCESS_LOG_FLUSH_WAIT,
+                );
+            }
+
+            // Wait for the upstream-Envoy file to reach all N lines BEFORE
+            // stopping the container. Envoy's FileAccessLog buffers and flushes
+            // on a periodic timer; testcontainers tears the container down with
+            // `docker rm -f` (SIGKILL, no graceful drain), so any line still
+            // buffered at stop is LOST. Polling while the container is alive
+            // lets the flush timer fire and land all N lines (CI-observed: a
+            // post-stop wait saw only the first, already-flushed line).
+            let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
+            if !wait_file_lines(&envoy_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+                tracing::warn!(
+                    "differential: envoy access-log file {} still has < {} lines after {:?} (pre-stop wait)",
+                    envoy_path.display(),
+                    expected_lines,
+                    ACCESS_LOG_FLUSH_WAIT,
+                );
+            }
+
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+
+            // One final yield to let the OS flush any in-flight bytes.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
+                format!("read envoy access-log file at {}", envoy_path.display())
+            })?;
+            let envoy_rust_contents =
+                std::fs::read_to_string(&envoy_rust_path).with_context(|| {
+                    format!(
+                        "read envoy-rust access-log file at {}",
+                        envoy_rust_path.display()
+                    )
+                })?;
+            let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
+            let envoy_rust_lines: Vec<String> =
+                envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
+
+            // Each probe emits exactly one access-log line.
+            if envoy_lines.len() != expected_lines {
+                bail!(
+                    "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
+                    envoy_lines.len(),
+                    expected_lines,
+                    envoy_lines,
+                );
+            }
+            if envoy_rust_lines.len() != expected_lines {
+                bail!(
+                    "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
+                    envoy_rust_lines.len(),
+                    expected_lines,
+                    envoy_rust_lines,
+                );
+            }
+
+            crate::access_log::assert_access_log_lines_byte_identical(
+                &envoy_lines,
+                &envoy_rust_lines,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "access log byte-exact mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
                     e,
                     envoy_lines,
                     envoy_rust_lines,
@@ -6790,6 +7011,22 @@ driver:
         let p = dir.path().join("log");
         std::fs::write(&p, "").unwrap();
         assert!(!wait_file_nonempty(&p, Duration::from_millis(200)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_file_lines_true_when_count_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        assert!(wait_file_lines(&p, 3, Duration::from_millis(300)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_file_lines_false_when_count_unreached() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        assert!(!wait_file_lines(&p, 4, Duration::from_millis(200)).await);
     }
 
     #[tokio::test]

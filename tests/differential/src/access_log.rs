@@ -290,6 +290,40 @@ pub fn assert_access_log_lines_equivalent(
     Ok(())
 }
 
+/// Phase 32 Task 6 (ADR-0079): whole-line byte-exact access-log
+/// comparator. Unlike `assert_access_log_lines_equivalent` (which
+/// tokenizes the Envoy default format and applies per-token rules), this
+/// asserts each emitted line is byte-identical between upstream Envoy and
+/// envoy-rust. It is the comparator for fixture 0040's custom
+/// `log_format` of DETERMINISTIC command operators — every operator in
+/// that format renders the same bytes on both proxies, so a whole-line
+/// `==` is the strongest possible assertion.
+///
+/// Returns `Err` with a descriptive message on the first divergence:
+/// a length mismatch (naming both counts) or a line mismatch (naming the
+/// line index plus both values).
+pub fn assert_access_log_lines_byte_identical(
+    envoy: &[String],
+    envoy_rust: &[String],
+) -> Result<(), String> {
+    if envoy.len() != envoy_rust.len() {
+        return Err(format!(
+            "line count mismatch: envoy={} envoy-rust={}",
+            envoy.len(),
+            envoy_rust.len()
+        ));
+    }
+    for (idx, (envoy_line, envoy_rust_line)) in envoy.iter().zip(envoy_rust.iter()).enumerate() {
+        if envoy_line != envoy_rust_line {
+            return Err(format!(
+                "line {} not byte-identical: envoy={:?} envoy-rust={:?}",
+                idx, envoy_line, envoy_rust_line
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +428,45 @@ mod tests {
         let err = assert_access_log_lines_equivalent(&envoy, &envoy_rust_diff, &rules)
             .expect_err("expected mismatch");
         assert!(err.contains("envoy-rust token"), "err: {}", err);
+    }
+
+    // ---- assert_access_log_lines_byte_identical (Phase 32 Task 6) ----
+
+    #[test]
+    fn byte_identical_accepts_identical_sequences() {
+        let envoy = vec![
+            "m=GET p=/ proto=HTTP/1.1 code=200 flags=- rx=0 tx=3 ua=- xff=- auth=envoy-rust.test up=-"
+                .to_owned(),
+            "m=GET p=/ proto=HTTP/1.1 code=200 flags=- rx=0 tx=3 ua=curl/8.0 xff=203.0.113.7 auth=envoy-rust.test up=-"
+                .to_owned(),
+        ];
+        let envoy_rust = envoy.clone();
+        assert_access_log_lines_byte_identical(&envoy, &envoy_rust).expect("ok");
+    }
+
+    #[test]
+    fn byte_identical_rejects_mutated_line() {
+        let envoy = vec![
+            "m=GET p=/ proto=HTTP/1.1 code=200 flags=- rx=0 tx=3 ua=- xff=- auth=envoy-rust.test up=-"
+                .to_owned(),
+        ];
+        // envoy-rust diverges on a single byte (code=200 -> code=201).
+        let envoy_rust = vec![
+            "m=GET p=/ proto=HTTP/1.1 code=201 flags=- rx=0 tx=3 ua=- xff=- auth=envoy-rust.test up=-"
+                .to_owned(),
+        ];
+        let err = assert_access_log_lines_byte_identical(&envoy, &envoy_rust)
+            .expect_err("expected mismatch");
+        assert!(err.contains("line 0"), "err: {}", err);
+        assert!(err.contains("not byte-identical"), "err: {}", err);
+    }
+
+    #[test]
+    fn byte_identical_rejects_length_mismatch() {
+        let envoy = vec!["a".to_owned(), "b".to_owned()];
+        let envoy_rust = vec!["a".to_owned()];
+        let err = assert_access_log_lines_byte_identical(&envoy, &envoy_rust)
+            .expect_err("expected mismatch");
+        assert!(err.contains("line count mismatch"), "err: {}", err);
     }
 }

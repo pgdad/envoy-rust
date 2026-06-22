@@ -1,0 +1,26 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0040-envoy-mount/access.log
+    envoy_rust: /tmp/0040-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / with no extra request headers. The absent
+    # USER-AGENT and X-FORWARDED-FOR command operators render the
+    # canonical absent-value sentinel `-` on both proxies; on a
+    # direct_response route %UPSTREAM_HOST% also renders `-` (no upstream).
+    # Expected line (byte-identical on both sides):
+    #   m=GET p=/ proto=HTTP/1.1 code=200 flags=- rx=0 tx=3 ua=- xff=- auth=envoy-rust.test up=-
+    - method: get
+      path: /
+      host: envoy-rust.test
+    # Probe 2: GET / carrying USER-AGENT and X-FORWARDED-FOR so the
+    # %REQ(USER-AGENT)% / %REQ(X-FORWARDED-FOR)% operators render their
+    # literal header values (deterministic — no timing / id operators).
+    # Expected line (byte-identical on both sides):
+    #   m=GET p=/ proto=HTTP/1.1 code=200 flags=- rx=0 tx=3 ua=curl/8.0 xff=203.0.113.7 auth=envoy-rust.test up=-
+    - method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - ["user-agent", "curl/8.0"]
+        - ["x-forwarded-for", "203.0.113.7"]
