@@ -24,6 +24,7 @@ members = [
     "tests/helpers/tls-echo-server",
 ]
 exclude = [
+    "crates/envoy-accesslog/fuzz",
     "crates/envoy-config/fuzz",
     "crates/envoy-filter/fuzz",
     "crates/envoy-jwt/fuzz",

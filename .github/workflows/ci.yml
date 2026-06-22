@@ -75,7 +75,7 @@ jobs:
         run: cargo deny check
 
   fuzz:
-    name: fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse, 30s each)
+    name: fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -93,6 +93,7 @@ jobs:
             crates/envoy-config/fuzz -> target
             crates/envoy-jwt/fuzz -> target
             crates/envoy-filter/fuzz -> target
+            crates/envoy-accesslog/fuzz -> target
 
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -116,3 +117,10 @@ jobs:
         # (`parse_cdn_loop` in the envoy-filter crate; the multi-header
         # coalescing surface). Same `+nightly` rationale as above.
         run: cargo +nightly fuzz run cdn_loop_parse -- -max_total_time=30
+
+      - name: fuzz accesslog_format_parse
+        working-directory: crates/envoy-accesslog
+        # Phase-32 §7.4 fuzz target over the access-log command-operator
+        # format-string parser (`parse_format` in the envoy-accesslog crate).
+        # Same `+nightly` rationale as above.
+        run: cargo +nightly fuzz run accesslog_format_parse -- -max_total_time=30

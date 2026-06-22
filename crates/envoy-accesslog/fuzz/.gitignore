@@ -1,0 +1,11 @@
+target/
+artifacts/
+Cargo.lock
+corpus/accesslog_format_parse/*
+!corpus/accesslog_format_parse/default.txt
+!corpus/accesslog_format_parse/simple.txt
+!corpus/accesslog_format_parse/truncate_alt.txt
+!corpus/accesslog_format_parse/escape.txt
+!corpus/accesslog_format_parse/malformed.txt
+!corpus/accesslog_format_parse/empty.txt
+!corpus/accesslog_format_parse/multibyte.txt
