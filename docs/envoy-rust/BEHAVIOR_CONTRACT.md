@@ -1138,6 +1138,91 @@ tests plus the H1 `compiled_log_format` wiring test — covers the
 non-deterministic operators, the real-`ip:port` `%UPSTREAM_HOST%` render, and
 the boot-fatal parse errors.
 
+### Phase 33 (ADR-0081): the `%DYNAMIC_METADATA%` operator + `set_metadata`
+
+> Phase 33 lands the smallest end-to-end dynamic-metadata loop: a per-request
+> string-only dynamic-metadata store (namespace → key → value), the
+> `envoy.filters.http.set_metadata` HTTP filter (a static-value metadata
+> emitter), and the `%DYNAMIC_METADATA(namespace:key)%` access-log command
+> operator. The §A facts below are LOCKED by ADR-0081 against
+> `envoyproxy/envoy:v1.33.0`; the cross-proxy witness is **fixture 0041**
+> (`0041-http-set-metadata-dynamic-metadata`).
+
+**The `%DYNAMIC_METADATA(namespace:key)%` operator.** A new command operator in
+the phase-32 engine. Its argument is a SINGLE-LEVEL, TWO-SEGMENT,
+`:`-separated `namespace:key` path. Both segments are matched
+CASE-SENSITIVELY (unlike `%REQ` / `%RESP` header names, which are
+case-insensitive — dynamic-metadata namespaces and keys are exact-match map
+keys). The operator carries NO `truncate` field.
+
+- **Resolution.** The operator resolves
+  `record.dynamic_metadata.get(namespace)?.get(key)` — the per-request store
+  copied from `FilterRequest.dynamic_metadata` at the HCM record-build site.
+- **Present value → RAW, UNQUOTED scalar string (§A3).** A scalar string leaf
+  (`prod`) renders the bytes `prod` verbatim — NO surrounding quotes
+  (`od -c` → `[ p r o d ]`, never `[ " p r o d " ]`). The value is emitted
+  verbatim and is NOT re-parsed (a `%` inside a stored value is a literal `%`,
+  never an operator).
+- **Absent → `-` (§A4).** An absent KEY (`%DYNAMIC_METADATA(envoy.test:missing)%`)
+  AND an absent NAMESPACE (`%DYNAMIC_METADATA(envoy.absent:k)%`) BOTH render a
+  single dash `-` — never empty, never `{}`, never `null`. This reuses the
+  engine's existing absent sentinel.
+
+**Boot-fatal grammar (§A2, ADR-0049 posture).** The operator is compiled at
+config-load by `parse_format` / `validate_access_logs`; the following are ALL
+boot-fatal (`ConfigError::InvalidAccessLogFormat`, via
+`FormatParseError::MalformedArgument { keyword: "DYNAMIC_METADATA", .. }`):
+
+- **No argument** — `%DYNAMIC_METADATA%` with no `(…)` (Envoy:
+  `DYNAMIC_METADATA requires parameters`).
+- **A `:N` length suffix** — `%DYNAMIC_METADATA(envoy.test:tier):2%` (Envoy:
+  `DYNAMIC_METADATA does not allow length to be specified.`, exit 1). The
+  operator does NOT compose with `:N` truncation, unlike `%REQ`/`%RESP`.
+- **A 1-segment (whole-namespace) arg** — `%DYNAMIC_METADATA(envoy.test)%`.
+- **A 3+-segment (nested-path) arg** — `%DYNAMIC_METADATA(a:b:c)%`. (Envoy
+  ACCEPTS nested struct traversal; the string-only single-level MVP rejects it
+  — stricter than Envoy; the §2.2 nested-path deferral; NOT differentially
+  exercised — fixture 0041 uses only `ns:key`.)
+
+**Deterministic classification (cross-proxy).** A `%DYNAMIC_METADATA%` render of
+a STATIC-config value is a pure function of static config (no host-address /
+clock term), so both proxies emit a byte-identical line. The operator is
+therefore DETERMINISTIC and is placed in the cross-proxy whole-line byte-exact
+fixture **0041** (`Driver::Http1AccessLogByteExact` +
+`assert_access_log_lines_byte_identical`, reused verbatim from phase 32). The
+fixture's present + absent probe PAIR (`tier=prod missk=- missns=-`) guards
+against an echo-the-config-literal implementation: the absent probe must
+resolve `-` through the SAME store path.
+
+**The `set_metadata` filter config shape (§A1).** The HTTP filter
+`envoy.filters.http.set_metadata` writes static metadata into the per-request
+store on the decode side (`Continue`-only; encode inert).
+
+- **`@type`** is `type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config`
+  — the proto message is named `Config`, NOT `SetMetadata` (the SPEC-projected
+  `…v3.SetMetadata` DOES NOT EXIST; Envoy boot-fatal on it).
+- **Modern repeated form only:** `metadata: [{ metadata_namespace, value,
+  allow_overwrite }]`. Each entry merges its flat string→string `value` map
+  into the request store under `metadata_namespace`, honoring `allow_overwrite`
+  (Envoy default `false`).
+- **String-only `value`.** `value` is a `BTreeMap<String, String>`; a non-string
+  YAML scalar (`value: { tier: 7 }`) fails serde deserialization → boot-fatal
+  in envoy-rust (the §2.2 non-string-Value deferral boundary; the fixture uses
+  string values only).
+- **Empty namespace → boot-fatal.** An empty `metadata_namespace` →
+  `ConfigError::SetMetadataEmptyNamespace` (Envoy: PGV length ≥ 1; envoy-rust
+  matches under ADR-0049 all-fatal). A name mismatch → `UnsupportedHttpFilter`.
+
+**§2.2 deferrals (documented, NOT differentially exercised).** The following are
+out of the string-only single-level-leaf MVP scope: non-string `Value`s (a
+struct/object leaf renders as JSON WITH literal quotes in Envoy —
+`{"sub":"deepval"}` — and a whole-namespace read renders a sorted JSON object;
+the MVP resolves only scalar-string leaves → raw unquoted); nested paths
+(`ns:a:b`); whole-namespace reads (`ns` alone); the DEPRECATED top-level
+`set_metadata` form (`metadata_namespace` + `value` at `Config` top level — warn
+in Envoy, but `deny_unknown_fields` rejects it boot-fatal in envoy-rust); and
+the `:N` length suffix on `%DYNAMIC_METADATA%`.
+
 ---
 
 ## xDS wire state machine

@@ -40,5 +40,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/http_filter_cdn_loop.yaml
 !corpus/parse_bootstrap/seed-buffer.yaml
 !corpus/parse_bootstrap/accesslog_log_format.yaml
+!corpus/parse_bootstrap/hcm_set_metadata_dynamic_metadata.yaml
 artifacts/
 target/

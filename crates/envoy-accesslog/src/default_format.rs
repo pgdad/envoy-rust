@@ -223,10 +223,31 @@ mod tests {
 
     #[test]
     fn compiled_default_matches_legacy_concatenator() {
-        let record = make_baseline_record();
-        let legacy = legacy_format(&record);
-        let engine = crate::command_operator::CompiledFormat::default().render(&record);
-        assert_eq!(engine, format!("{legacy}\n"));
+        // M32-4: loop the default-equivalence oracle over ≥3 records. The
+        // default format does NOT reference %DYNAMIC_METADATA%, so the
+        // engine ≡ legacy equivalence holding for EACH record PROVES the
+        // phase-33 operator did not perturb the default format. Each record
+        // carries an (empty) `dynamic_metadata` field via make_baseline_record.
+
+        // (1) the baseline direct_response record (mirrors fixture 0012).
+        let baseline = make_baseline_record();
+
+        // (2) a 5xx / router-proxy record (upstream host + service time).
+        let mut router_5xx = make_baseline_record();
+        router_5xx.response_code = 503;
+        router_5xx.upstream_host = Some("127.0.0.1:8080".into());
+        router_5xx.upstream_service_time = Some(Duration::from_millis(2));
+
+        // (3) a UTF-8 record (multi-byte user_agent + authority).
+        let mut utf8 = make_baseline_record();
+        utf8.user_agent = Some("Mözillá/5.0 — café".into());
+        utf8.authority = Some("héllo.example".into());
+
+        for record in [baseline, router_5xx, utf8] {
+            let legacy = legacy_format(&record);
+            let engine = crate::command_operator::CompiledFormat::default().render(&record);
+            assert_eq!(engine, format!("{legacy}\n"));
+        }
     }
 
     #[test]

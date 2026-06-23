@@ -305,3 +305,56 @@ an echo-the-configured-literal.
   `unknown access-log operator keyword 'DYNAMIC_METADATA'`); after `cargo build -p envoy-bin` the run is green — the
   source `command_operator.rs` carries the `DYNAMIC_METADATA` arm (T8). Test-started v1.33.0 container auto-cleaned by
   the harness.
+
+---
+
+## Task 12 — BEHAVIOR_CONTRACT + fuzz seeds + M32-4/M32-5
+
+Documents the new operator; folds the two M32 carry-forwards; seeds the EXISTING fuzz targets (NO new target — §A
+§3.8, no ci.yml change needed).
+
+**(A) M32-4 — looped the default-equivalence oracle.** `crates/envoy-accesslog/src/default_format.rs`: replaced the
+single-record `compiled_default_matches_legacy_concatenator` with a loop over THREE records — (1) the baseline
+`make_baseline_record()` direct_response record (fixture-0012 surface), (2) a 5xx/router-proxy record
+(`response_code: 503`, `upstream_host: Some("127.0.0.1:8080")`, `upstream_service_time: Some(2ms)`), (3) a UTF-8
+record (`user_agent: "Mözillá/5.0 — café"`, `authority: "héllo.example"`). Each asserts
+`engine == format!("{legacy}\n")`. Every record carries an (empty) `dynamic_metadata` field via
+`make_baseline_record`; since the DEFAULT format does NOT reference `%DYNAMIC_METADATA%`, the engine≡legacy
+equivalence holding for every record PROVES the phase-33 operator did not perturb the default format. Coverage-widening
+of an existing passing test — stayed GREEN.
+
+**(B) M32-5 — deleted the vestigial 0-byte `payload.bin`.** `git rm
+tests/fixtures/0040-accesslog-command-operators/inputs/payload.bin` (it was 0 bytes; the `Http1AccessLogByteExact`
+driver drives probes, NOT an input file). Confirmed nothing references it: a `grep -rn payload.bin` over `tests/` +
+`crates/` hits ONLY the unrelated tcp_echo fixtures 0001/0005/0006 and the `tcp_echo` driver in
+`tests/differential/src/lib.rs` — never 0040.
+
+**(C) Fuzz seeds (existing targets, NO new target).**
+- `crates/envoy-accesslog/fuzz/corpus/accesslog_format_parse/dynamic_metadata.txt` — a format string exercising the
+  new operator: `m=%REQ(:METHOD)% tier=%DYNAMIC_METADATA(envoy.test:tier)% miss=%DYNAMIC_METADATA(envoy.absent:k)%\n`
+  (present + absent-namespace reads).
+- `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_set_metadata_dynamic_metadata.yaml` — a minimal valid bootstrap
+  (concrete `port_value: 10000`, no `{{PORT}}`) with a `set_metadata` filter (`@type …v3.Config`, modern
+  `metadata: [{ metadata_namespace: envoy.test, value: { tier: prod } }]`) + a router + a file access logger whose
+  `log_format` uses `%DYNAMIC_METADATA(envoy.test:tier)%`. Modeled on fixture 0041's `envoy-rust.yaml`.
+- **Both seeds parse** via the targets' entry points (throwaway integration tests used + removed; NOT committed):
+  `envoy_accesslog::parse_format(seed)` → `Ok`; `envoy_config::parse_bootstrap(seed)` → `Ok`. No full
+  `cargo +nightly fuzz` build run here — that is the state-4 §7.5 gate (d).
+
+**(D) BEHAVIOR_CONTRACT.md extension.** Added a `### Phase 33 (ADR-0081): the %DYNAMIC_METADATA% operator +
+set_metadata` subsection AFTER the phase-32 subsection in the "Access log field mapping" section. Documents: the
+`%DYNAMIC_METADATA(namespace:key)%` operator (single-level, two-segment, `:`-separated, CASE-SENSITIVE, NO `:N`
+truncation — boot-fatal; no-arg boot-fatal; 1-seg/3+-seg boot-fatal); the resolution
+`record.dynamic_metadata.get(ns)?.get(key)`; the RAW UNQUOTED scalar-string byte form (§A3) + absent `-` (§A4); the
+deterministic cross-proxy classification (witness fixture 0041, present+absent probe pair guards against
+echo-the-literal); the §2.2 deferrals (non-string Values → JSON-quoted; nested paths; whole-namespace; deprecated
+top-level form; `:N`); and the `set_metadata` config-shape note (`@type …v3.Config`, modern repeated form, string-only
+`value`, empty-namespace boot-fatal `ConfigError::SetMetadataEmptyNamespace`).
+
+**Verification:**
+- `cargo fmt -p envoy-accesslog` → clean (only `default_format.rs` changed in code).
+- `cargo test -p envoy-accesslog` → `test result: ok. 48 passed; 0 failed; 0 ignored` (incl. the looped
+  `compiled_default_matches_legacy_concatenator`).
+- `cargo test -p differential access_log_command_operators -- --include-ignored` → `test result: ok. 1 passed`
+  (10.63s) — fixture 0040 stays GREEN after the `payload.bin` removal (Docker + `envoyproxy/envoy:v1.33.0` present;
+  locally authoritative per memory `host-docker-desktop-virtiofs-no-inotify`).

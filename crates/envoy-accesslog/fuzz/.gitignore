@@ -9,3 +9,4 @@ corpus/accesslog_format_parse/*
 !corpus/accesslog_format_parse/malformed.txt
 !corpus/accesslog_format_parse/empty.txt
 !corpus/accesslog_format_parse/multibyte.txt
+!corpus/accesslog_format_parse/dynamic_metadata.txt
