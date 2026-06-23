@@ -297,7 +297,7 @@ fn parse_header_op(keyword: &str, rest: Option<&str>, side: Side) -> Result<Op, 
     // Split ARG on the first '?' into name / alt; lowercase both. An empty
     // alternate (a `?` with nothing after it) is MALFORMED — not `alt: Some("")`.
     let (name, alt) = match arg.split_once('?') {
-        Some((_, a)) if a.is_empty() => {
+        Some((_, "")) => {
             return Err(FormatParseError::MalformedArgument {
                 keyword: keyword.to_string(),
                 detail: "empty alternate after '?'".to_string(),
