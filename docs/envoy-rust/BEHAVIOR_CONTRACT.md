@@ -1223,6 +1223,124 @@ the MVP resolves only scalar-string leaves → raw unquoted); nested paths
 in Envoy, but `deny_unknown_fields` rejects it boot-fatal in envoy-rust); and
 the `:N` length suffix on `%DYNAMIC_METADATA%`.
 
+### Phase 34 (ADR-0084): the `header_to_metadata` HTTP filter
+
+> Phase 34 lands the `envoy.filters.http.header_to_metadata` HTTP filter — a
+> request-side, header-driven dynamic-metadata emitter. Unlike `set_metadata`
+> (which writes static config values), `header_to_metadata` inspects incoming
+> request headers and writes the result into the per-request dynamic-metadata
+> store. The §A facts below are LOCKED by ADR-0084 against
+> `envoyproxy/envoy:v1.33.0`; the cross-proxy witness is **fixture 0042**
+> (`0042-http-header-to-metadata`). Scope defined by ADR-0083.
+
+**A1 — Wire shape (config-load, §A1-LOCKED by ADR-0084).**
+
+- **`@type`** is
+  `type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config`
+  — the proto message is `Config` (NOT `HeaderToMetadata`).
+- **`request_rules`** is the sole config field used at phase-34 scope: a
+  repeated list of `Rule` objects, one per header source.
+- Each `Rule` has three fields: `header` (string, the request header name to
+  inspect), `on_header_present` (a `KeyValuePair` action applied when the header
+  is present and non-empty), and `on_header_missing` (a `KeyValuePair` action
+  applied ONLY when the header is FULLY ABSENT — not present at any value,
+  including empty; a present-but-empty header is a distinct third disposition
+  that writes NOTHING and does NOT trigger `on_header_missing` — see A4).
+- A `KeyValuePair` action has three fields: `metadata_namespace` (string,
+  defaults to the filter canonical name when omitted — see A2), `key` (string,
+  the metadata key to write), and `value` (string, a static override — see A3).
+  The `type` field is **string-only at phase-34 scope** (see §2.2 deferrals).
+
+**A2 — Default `metadata_namespace` (§A2-LOCKED by ADR-0084).** When
+`metadata_namespace` is **omitted** from a `KeyValuePair`, it defaults to
+`envoy.filters.http.header_to_metadata` — the filter's canonical name — **NOT**
+`envoy.lb`. This is the Envoy proto default (the field carries no proto default
+override). The fixture always supplies `metadata_namespace` explicitly; the
+default is exercised by the in-process backstop only. When the namespace is
+provided (as in fixture 0042: `envoy.lb`), that value is used verbatim.
+
+**A3 — Static `value` WINS over header value (§A3-LOCKED by ADR-0084).**
+On a present, non-empty header:
+
+- If `on_header_present.value` is **set** (non-empty string), that **static
+  value** is written to the metadata store — the actual header value is IGNORED.
+- If `on_header_present.value` is **absent** (not set), the **header value
+  verbatim** is written to the metadata store.
+
+The stored scalar is rendered by the `%DYNAMIC_METADATA(ns:key)%` operator as a
+**RAW, UNQUOTED byte string** — the same phase-33 scalar render (a stored value
+`prod` emits `prod`, never `"prod"`). The header value flow (no static `value`)
+is proven by the in-process backstop; fixture 0042 exercises both paths.
+
+**A4 — Absent and empty-header behavior (§A4-LOCKED by ADR-0084).**
+
+- **Present but EMPTY header** (the header line exists but the value is the
+  empty string): the `on_header_present` action does NOT fire. The key is left
+  **UNSET** in the store; `%DYNAMIC_METADATA(ns:key)%` renders `-`.
+- **Absent header** (no header line at all) with `on_header_missing` configured:
+  the `on_header_missing` action fires — writing `on_header_missing.value` (the
+  static value; see A-missing below) to the store.
+- **Absent header** with NO `on_header_missing` configured: the key is left
+  **UNSET**; `%DYNAMIC_METADATA(ns:key)%` renders `-`.
+
+The **present-but-empty → UNSET** behavior is the load-bearing refinement: an
+empty-valued header does NOT trigger `on_header_present` (it is neither
+present-with-value nor absent-triggering-missing — it is a third disposition,
+"present-but-empty", which results in no write). Fixture 0042 asserts the
+absent-with-missing-action path; the empty-header-→-UNSET path is backstop-only.
+
+**A-missing — `on_header_missing` REQUIRES a `value` (§A4-LOCKED by ADR-0084).**
+An `on_header_missing` action without a `value` field set is **boot-fatal**
+(`ConfigError::HeaderToMetadataInvalidRule` — see A5). A config that sets
+`on_header_missing` without a value is rejected at config-load (Envoy rejects it
+with `Filter: on_header_missing must have a value`). The `on_header_missing.key`
+is likewise required to be non-empty.
+
+**A5 — Malformed config is boot-fatal (§A5-LOCKED by ADR-0084, ADR-0049 posture).**
+All of the following are startup-fatal (`ConfigError::HeaderToMetadataInvalidRule`
+— the listener name and a human-readable `detail` string are included in the
+error); the process exits before construction completes:
+
+| Violation | Detail |
+|---|---|
+| Empty `header` field (the request header name is the empty string) | `"header name must not be empty"` |
+| A rule with NEITHER `on_header_present` NOR `on_header_missing` set (a no-op rule) | `"rule must have at least one action (on_header_present or on_header_missing)"` |
+| An `on_header_present.key` or `on_header_missing.key` that is the empty string | `"action key must not be empty"` |
+| An `on_header_missing` action whose `value` is absent / empty | `"on_header_missing must have a non-empty value"` |
+| An unknown field in the `Config` / `Rule` / `KeyValuePair` structs | `deny_unknown_fields` serde reject → `ConfigError::YamlError` |
+
+**Deterministic classification (cross-proxy).** A `header_to_metadata` extraction
+is a pure function of the (fixed) request headers and static filter config — no
+host-address term, no clock term. Both upstream Envoy and envoy-rust therefore
+produce a byte-identical access-log line for fixture 0042
+(`Driver::Http1AccessLogByteExact` + `assert_access_log_lines_byte_identical`).
+The fixture's present + absent probe pair guards against trivial implementations:
+the absent probe must traverse the same store path and render `-` via
+`%DYNAMIC_METADATA(ns:key)%`. The extraction is therefore DETERMINISTIC and the
+whole-line byte-exact assertion is authoritative (§A6, ADR-0084).
+
+**§2.2 deferrals (phase 34; documented, NOT differentially exercised).**
+
+The following are out of the request-side string-only MVP scope (ADR-0083 / ADR-0084):
+
+- **`response_rules`** — response-side header extraction. The `response_rules`
+  field is present on the upstream Envoy `Config` proto but is **unmodeled in
+  envoy-rust** at phase-34 scope; a config supplying `response_rules` is rejected
+  boot-fatal by `deny_unknown_fields`.
+- **Typed (non-string) values** — `type` field values other than the default
+  `STRING` (e.g. `NUMBER`, `PROTOBUF_VALUE`). The `type` field is not modeled;
+  a non-string type in a config is rejected boot-fatal.
+- **`encode: BASE64`** — base64-encoding of the stored value. Not modeled;
+  boot-fatal if supplied.
+- **`regex_value_rewrite`** — regex-based value transformation. Not modeled;
+  boot-fatal if supplied.
+- **`remove`** — remove the source header after extraction. Not modeled;
+  boot-fatal if supplied.
+- **`cookie`** — extract from a cookie rather than a plain header. Not modeled;
+  boot-fatal if supplied (stricter than Envoy, which accepts it).
+- **Per-route config** (`typed_per_filter_config`) — per-route override of the
+  filter config. Not modeled at phase-34 scope.
+
 ---
 
 ## xDS wire state machine
