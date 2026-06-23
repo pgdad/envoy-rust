@@ -32,6 +32,13 @@ pub struct FilterRequest {
     /// Outgoing body bytes. `None` is treated as `Bytes::new()`
     /// (Content-Length: 0) — same convention as `envoy_http1::Request`.
     pub body: Option<Bytes>,
+    /// Per-request dynamic-metadata store (namespace → key → string value),
+    /// written by `envoy.filters.http.set_metadata` (phase 33) and read by the
+    /// HCM record-build into `AccessLogRecord.dynamic_metadata`. Default-empty;
+    /// string-only (a non-string Value enum is the §2.2 deferral). A plain
+    /// `std::collections::BTreeMap` — NO new crate, NO shared Value type.
+    pub dynamic_metadata:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 /// Filter-visible response.
@@ -45,4 +52,27 @@ pub struct FilterResponse {
     pub reason: Option<&'static str>,
     pub headers: Vec<(String, String)>,
     pub body: Bytes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_request_dynamic_metadata_defaults_empty_and_is_writable() {
+        use std::collections::BTreeMap;
+        let mut r = FilterRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![],
+            body: None,
+            dynamic_metadata: BTreeMap::new(),
+        };
+        assert!(r.dynamic_metadata.is_empty());
+        r.dynamic_metadata
+            .entry("ns".into())
+            .or_default()
+            .insert("k".into(), "v".into());
+        assert_eq!(r.dynamic_metadata["ns"]["k"], "v");
+    }
 }

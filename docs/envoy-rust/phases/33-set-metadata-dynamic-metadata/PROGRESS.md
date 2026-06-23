@@ -50,3 +50,40 @@ all tests green (the plan explicitly permits it as an acceptable fallback).
 
 None. M32-6 took the plan-sanctioned tuple-on-the-fly fallback rather than a precomputed named field, to
 keep the in-crate `CompiledFormat(f)` test constructors unchanged.
+
+---
+
+## Task 2 — FilterRequest.dynamic_metadata field + sweep
+
+### Field added
+
+- `crates/envoy-filter/src/types.rs`: added the additive, default-empty field to `FilterRequest`:
+  ```rust
+  pub dynamic_metadata: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+  ```
+  Per-request dynamic-metadata store (namespace → key → string value). String-only (non-string Value enum is
+  the §2.2 deferral); plain `BTreeMap`, NO new crate, NO shared Value type. `PartialEq, Eq` derives still hold
+  (the new `BTreeMap` field supports both). No logic reads it yet — behavior is unchanged.
+
+### Construction-site sweep (compiler-driven)
+
+- Updated **22** `FilterRequest { … }` literal construction sites by adding
+  `dynamic_metadata: std::collections::BTreeMap::new()` (the types.rs test site uses the imported `BTreeMap::new()`):
+  - 2 production: `crates/envoy-http1/src/hcm.rs` (775), `crates/envoy-http2/src/hcm.rs` (475).
+  - 20 test sites across `crates/envoy-filter/src/{types(1), pipeline(3), router(1), rbac(1), cdn_loop(1),
+    header_mutation(1), jwt_authn(1), csrf(1), instance(6), local_rate_limit(1), fault(1), cors(1), buffer(1)}.rs`.
+- **Count note:** the PLAN's "33 sites" figure counted all lines containing the `FilterRequest {` token,
+  which includes 11 non-literal `fn … -> FilterRequest {` return-type/signature lines that need no field. The
+  actual literal-construction-site count is **22**. The compiler is authoritative: `cargo build --all-targets`
+  is clean for all three crates, proving every literal that needs the field has it.
+
+### Verification
+
+- `cargo test -p envoy-filter` → `test result: ok. 171 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+  (includes the new `types::tests::filter_request_dynamic_metadata_defaults_empty_and_is_writable ... ok`).
+- `cargo build -p envoy-http1 -p envoy-http2 --all-targets` → clean (`Finished dev profile`).
+
+### Deviations from the plan
+
+None on substance. The field and the mechanical sweep are exactly as specified; only the site count differs
+(22 actual literals vs. the PLAN's 33 token-occurrence estimate, as noted above).

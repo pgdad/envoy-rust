@@ -777,6 +777,7 @@ async fn serve_connection(
             path: std::mem::take(&mut req.path),
             headers: std::mem::take(&mut req.headers),
             body: req.body.take(),
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
         let decode_decision = pipeline.decode_headers(&mut filter_req);
         // Write back the (possibly mutated) fields.

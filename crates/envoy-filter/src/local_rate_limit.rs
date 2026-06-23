@@ -392,6 +392,7 @@ mod tests {
             path: "/".to_string(),
             headers: vec![("host".to_string(), "envoy-rust.test".to_string())],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 

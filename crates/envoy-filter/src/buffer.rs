@@ -127,6 +127,7 @@ mod tests {
             } else {
                 Some(Bytes::copy_from_slice(body))
             },
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 

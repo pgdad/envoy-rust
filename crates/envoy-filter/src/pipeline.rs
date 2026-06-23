@@ -196,6 +196,7 @@ mod tests {
             path: "/".to_string(),
             headers: vec![],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
         match pipeline.decode_headers(&mut req) {
             Decision::StopAndSend(resp) => assert_eq!(resp.status, 503),
@@ -209,6 +210,7 @@ mod tests {
             path: "/".to_string(),
             headers: vec![("host".to_string(), "localhost".to_string())],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 
@@ -272,6 +274,7 @@ typed_per_filter_config:
                 ),
             ],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 

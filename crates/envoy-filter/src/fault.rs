@@ -119,6 +119,7 @@ mod tests {
             path: "/".to_string(),
             headers,
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 

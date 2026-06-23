@@ -355,6 +355,7 @@ mod tests {
             path: "/".into(),
             headers: vec![("host".into(), "envoy.test".into())],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
         match inst.decode_headers(&mut req) {
             Decision::StopAndSend(r) => assert_eq!(r.status, 401),
@@ -408,6 +409,7 @@ mod tests {
                 ("origin".into(), "http://evil.example.com".into()),
             ],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
         match inst.decode_headers(&mut req) {
             Decision::StopAndSend(r) => assert_eq!(r.status, 403),
@@ -446,6 +448,7 @@ mod tests {
             path: "/".into(),
             headers: vec![("cdn-loop".into(), "mycdn.example".into())],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
         match inst.decode_headers(&mut req) {
             Decision::StopAndSend(r) => assert_eq!(r.status, 502),
@@ -458,6 +461,7 @@ mod tests {
             path: "/".into(),
             headers: vec![],
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
         assert!(matches!(inst.decode_headers(&mut req2), Decision::Continue));
         assert!(
@@ -541,6 +545,7 @@ mod tests {
                 path: "/".to_string(),
                 headers: vec![("cdn-loop".to_string(), cdn_loop_value.to_string())],
                 body: None,
+                dynamic_metadata: std::collections::BTreeMap::new(),
             };
             pipe.apply_route_config(None);
 
@@ -611,6 +616,7 @@ mod tests {
             } else {
                 Some(bytes::Bytes::copy_from_slice(body))
             },
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
 
         fn route_with_buffer_pr(pr: BufferPerRoute) -> Route {

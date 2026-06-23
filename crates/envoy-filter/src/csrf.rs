@@ -245,6 +245,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
     fn cval(r: &Arc<StatsRegistry>, s: &str) -> u64 {

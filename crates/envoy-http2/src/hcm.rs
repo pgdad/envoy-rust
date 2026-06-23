@@ -477,6 +477,7 @@ async fn handle_one_stream(
         path: std::mem::take(&mut envoy_req.path),
         headers: std::mem::take(&mut envoy_req.headers),
         body: envoy_req.body.take(),
+        dynamic_metadata: std::collections::BTreeMap::new(),
     };
     let decode_decision = pipeline.decode_headers(&mut filter_req);
     // Write back the (possibly mutated) fields. Codec-state fields

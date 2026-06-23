@@ -47,6 +47,7 @@ mod tests {
             path: "/".to_string(),
             headers: vec![("host".to_string(), "example.com".to_string())],
             body: Some(Bytes::from_static(b"hello")),
+            dynamic_metadata: std::collections::BTreeMap::new(),
         };
         let before = req.clone();
         let decision = router.decode_headers(&mut req);

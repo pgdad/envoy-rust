@@ -255,6 +255,7 @@ mod tests {
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .collect(),
             body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 
