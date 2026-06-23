@@ -1,0 +1,19 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0041-envoy-mount/access.log
+    envoy_rust: /tmp/0041-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET /a. The set_metadata filter writes envoy.test→{tier:prod}
+    # into the per-request dynamic-metadata store; %DYNAMIC_METADATA(envoy.test:tier)%
+    # resolves the RAW, UNQUOTED scalar `prod` (§A3). The two absent operators —
+    # an absent KEY (envoy.test:missing) and an absent NAMESPACE (envoy.absent:k) —
+    # both render the canonical absent sentinel `-` (§A4) on BOTH proxies.
+    # Expected line (byte-identical on both sides):
+    #   m=GET code=200 tier=prod missk=- missns=-
+    - { method: get, path: /a, host: envoy-rust.test }
+    # Probe 2: POST /b with a body. Proves the static metadata is request-method /
+    # request-body independent (the store value is a pure function of static config).
+    # Expected line (byte-identical on both sides):
+    #   m=POST code=200 tier=prod missk=- missns=-
+    - { method: post, path: /b, host: envoy-rust.test, body: "x" }

@@ -262,3 +262,46 @@ the operator render too):
   (incl. the new H2 backstop).
 - `cargo fmt --all -- --check` clean. `#![forbid(unsafe_code)]` holds. Only `crates/envoy-http1/src/hcm.rs` and
   `crates/envoy-http2/src/hcm.rs` touched.
+
+---
+
+## Task 11 — fixture 0041 differential
+
+**Files created:**
+- `tests/fixtures/0041-http-set-metadata-dynamic-metadata/envoy.yaml` — H1 `direct_response` 200 `ok\n` listener;
+  filter chain `[set_metadata, router]` where `set_metadata` writes `envoy.test`→`{tier: prod}` via the modern
+  repeated form `metadata: [{ metadata_namespace: envoy.test, value: { tier: prod } }]` under
+  `@type …set_metadata.v3.Config` (§A1); a `file` access-logger whose `log_format.text_format_source.inline_string`
+  is `"m=%REQ(:METHOD)% code=%RESPONSE_CODE% tier=%DYNAMIC_METADATA(envoy.test:tier)% missk=%DYNAMIC_METADATA(envoy.test:missing)% missns=%DYNAMIC_METADATA(envoy.absent:k)%\n"`; mount `/tmp/0041-envoy-mount/access.log`;
+  `0.0.0.0` bind + admin (port 0) + `generate_request_id: false`. `{{PORT}}` substituted as in 0040.
+- `tests/fixtures/0041-http-set-metadata-dynamic-metadata/envoy-rust.yaml` — identical EXCEPT the 0040 per-side
+  convention: `127.0.0.1` bind, no admin block, no `generate_request_id`, mount `/tmp/0041-envoy-rust-mount/access.log`.
+- `tests/fixtures/0041-http-set-metadata-dynamic-metadata/expectations.yaml` — `kind: http1_access_log_byte_exact`;
+  `expected_access_log_paths` for both proxies; 2 probes: probe 1 `{ method: get, path: /a, host: envoy-rust.test }`
+  (expected `m=GET code=200 tier=prod missk=- missns=-`), probe 2
+  `{ method: post, path: /b, host: envoy-rust.test, body: "x" }` (expected `m=POST code=200 tier=prod missk=- missns=-`).
+- `tests/fixtures/0041-http-set-metadata-dynamic-metadata/README.md` — pins §A1 (`@type …v3.Config`, modern repeated
+  form, no `:N`), §A3 (raw unquoted `prod`), §A4 (absent `-`), §A6 determinism; documents the present+absent probe
+  pair as the anti-echo (echo-the-config-literal) guard.
+- `tests/differential/tests/set_metadata_dynamic_metadata.rs` — mirrors `access_log_command_operators.rs`; test fn
+  `set_metadata_dynamic_metadata` calls `differential::run_fixture` on the `0041-…` dir (Docker-availability is
+  guarded inside `run_fixture`, NOT `#[ignore]`-gated — same as 0040).
+
+**The present + absent probe pair:** each line carries ONE present read (`tier=prod`) and TWO absent reads
+(`missk=-`, `missns=-`); the absent KEY (`envoy.test:missing`) + absent NAMESPACE (`envoy.absent:k`) both resolve `-`
+through the SAME store path that yields `prod` for the present key — proving the implementation is store-backed, not
+an echo-the-configured-literal.
+
+**Verification:**
+- **Compile:** `cargo build -p differential --tests` → clean (the new test file compiles).
+- **Config-parse smoke (envoy-rust ACCEPTS):** `envoy_config::parse_bootstrap` on `envoy-rust.yaml` (with `{{PORT}}`
+  substituted) → `Ok` ("envoy-rust ACCEPTS fixture 0041 envoy-rust.yaml"). Throwaway example used + removed; not
+  committed.
+- **Local differential — RAN BYTE-IDENTICAL:** `cargo test -p differential set_metadata_dynamic_metadata --
+  --include-ignored` → `test result: ok. 1 passed`. Docker present + `envoyproxy/envoy:v1.33.0` image present; the
+  access-log file-scrape differential is locally authoritative on this host (memory
+  `host-docker-desktop-virtiofs-no-inotify`). Cross-proxy whole-line byte-exact assertion GREEN for both probes
+  (present `tier=prod` + absent `missk=- missns=-`). NOTE: the first run hit a STALE `envoy-bin` (pre-T8 binary →
+  `unknown access-log operator keyword 'DYNAMIC_METADATA'`); after `cargo build -p envoy-bin` the run is green — the
+  source `command_operator.rs` carries the `DYNAMIC_METADATA` arm (T8). Test-started v1.33.0 container auto-cleaned by
+  the harness.
