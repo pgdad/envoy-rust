@@ -121,3 +121,39 @@ needing the field — the rest were `fn … -> AccessLogRecord {` signature line
 - `cargo build -p envoy-http1 -p envoy-http2 --all-targets` → clean (no errors/warnings)
 - `cargo fmt -p envoy-accesslog -p envoy-http1 -p envoy-http2 --check` → clean
 - Behavior unchanged (default-empty); fixture 0012 stays byte-identical (no operator reads the field).
+
+---
+
+## Tasks 4+5 — SetMetadataConfig + variant + validator + ConfigError
+
+**Task 4 — config schema + enum variant (`crates/envoy-config/src/bootstrap.rs`, `…/src/lib.rs`):**
+- Added `SetMetadataConfig { metadata: Vec<MetadataEntry> }` and
+  `MetadataEntry { metadata_namespace: String, value: BTreeMap<String, String>, allow_overwrite: bool }`
+  near `CdnLoopConfig`. Both `#[serde(deny_unknown_fields)]`; `value` is string→string (a non-string YAML
+  scalar fails serde deserialization — the §A1/§A5 string-only MVP boundary). `allow_overwrite` is
+  `#[serde(default)]` (Envoy default false).
+- Appended the `HttpFilterTypedConfig::SetMetadata(SetMetadataConfig)` variant after `CdnLoop`, tagged
+  `@type = type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config` (§A1-LOCKED — the
+  proto message is `Config`, NOT `SetMetadata`).
+- Re-exported `MetadataEntry`, `SetMetadataConfig` from `lib.rs` (alphabetical `pub use bootstrap::{…}` list;
+  cargo fmt re-wrapped the list).
+- Tests (`bootstrap::set_metadata_config_tests`): `parses_set_metadata_filter_modern_form` (modern repeated
+  form → variant + field asserts) and `set_metadata_non_string_value_is_rejected` (`value: { tier: 7 }` → `Err`).
+
+**Task 5 — validator + ConfigError (`…/src/lib.rs`, `…/src/bootstrap.rs`):**
+- Added `ConfigError::SetMetadataEmptyNamespace { listener: String }` (§A5-LOCKED, boot-fatal,
+  ADR-0049 all-fatal) after the cdn_loop variants.
+- Added the `validate_http_filters` `SetMetadata` arm (name-mismatch → `UnsupportedHttpFilter`, else
+  `validate_set_metadata_config`) and the `validate_set_metadata_config` helper (empty
+  `metadata_namespace` → `SetMetadataEmptyNamespace`), modeled on the `CdnLoop` arm / `validate_cdn_loop_config`.
+- Tests (same module): `set_metadata_empty_namespace_is_fatal` and `set_metadata_name_mismatch_is_unsupported`,
+  both driven through the full `parse_bootstrap(&yaml)` validation entry-point (the same entry-point the
+  existing cdn_loop validator tests use).
+
+**Verification:**
+- `cargo test -p envoy-config` → `test result: ok. 486 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+  (the 4 new + every pre-existing).
+- `cargo fmt -p envoy-config` → clean.
+- NOTE: `envoy-filter` is intentionally RED (`HttpFilterInstance::build` non-exhaustive match on the new
+  `SetMetadata` variant) until the instance-wiring task (Task 7). Per the PLAN sequencing rule, the gate for
+  Tasks 4+5 is `cargo test -p envoy-config` only — NOT a workspace build.

@@ -24,14 +24,15 @@ pub use bootstrap::{
     HttpFilter, HttpFilterTypedConfig, HttpHealthCheck, HttpProtocolOptions, HttpStatus,
     Int64Range, JwtAuthnConfig, JwtProvider, JwtRequirement, LbEndpoint, LbMetadata, LbPolicy,
     LbSubsetConfig, LbSubsetFallbackPolicy, LbSubsetSelector, Listener, LoadAssignment,
-    LocalRateLimitConfig, LocalityLbEndpoints, Mutations, NetworkFilter, Node, OutlierDetection,
-    PathConfigSource, PerFilterConfig, Percent, Permission, PermissionSet, Policy, Principal,
-    PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route,
-    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority,
-    Rules, RuntimeFractionalPercent, SafeRegex, SocketAddress, StaticResources, StringMatcher,
-    StringMatcherMode, SubstitutionFormatString, TcpProxyConfig, Thresholds, TlsCertificate,
-    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
-    TypedExtensionProtocolOptions, UpstreamTlsContext, VirtualHost, parse_duration,
+    LocalRateLimitConfig, LocalityLbEndpoints, MetadataEntry, Mutations, NetworkFilter, Node,
+    OutlierDetection, PathConfigSource, PerFilterConfig, Percent, Permission, PermissionSet,
+    Policy, Principal, PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn,
+    RetryPolicy, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch,
+    RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent, SafeRegex, SetMetadataConfig,
+    SocketAddress, StaticResources, StringMatcher, StringMatcherMode, SubstitutionFormatString,
+    TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket, TransportSocket,
+    TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext,
+    VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;
 pub use eds::parse_eds_file;
@@ -718,6 +719,14 @@ pub enum ConfigError {
         "cdn_loop filter on listener `{listener}` has an invalid cdn_id {cdn_id:?}; it must be a bare RFC-7230 token (no comma, space, or other non-tchar)"
     )]
     CdnLoopInvalidCdnId { listener: String, cdn_id: String },
+
+    /// Phase 33 (§A5-LOCKED): a `set_metadata` filter entry has an empty
+    /// `metadata_namespace`. Envoy rejects this boot-fatally (PGV: length ≥ 1);
+    /// envoy-rust matches (ADR-0049 all-fatal). `listener` names the offending HCM.
+    #[error(
+        "set_metadata filter on listener `{listener}` has an empty metadata_namespace; a non-empty namespace is required"
+    )]
+    SetMetadataEmptyNamespace { listener: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {

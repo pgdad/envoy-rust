@@ -1010,6 +1010,9 @@ pub enum HttpFilterTypedConfig {
 
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.cdn_loop.v3.CdnLoopConfig")]
     CdnLoop(CdnLoopConfig),
+
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config")]
+    SetMetadata(SetMetadataConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -1095,6 +1098,27 @@ pub struct CdnLoopConfig {
     pub cdn_id: String,
     #[serde(default)]
     pub max_allowed_occurrences: u32,
+}
+
+/// `envoy.extensions.filters.http.set_metadata.v3.Config` (phase 33,
+/// §A1-LOCKED). The modern repeated `metadata` form. Each entry merges a flat
+/// string→string `value` map into the request's dynamic metadata under
+/// `metadata_namespace`. String-only MVP (non-string values rejected by serde
+/// — the §2.2 deferral). `allow_overwrite` (Envoy default false) governs
+/// whether existing keys in the namespace are overwritten.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetMetadataConfig {
+    pub metadata: Vec<MetadataEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataEntry {
+    pub metadata_namespace: String,
+    pub value: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub allow_overwrite: bool,
 }
 
 /// `envoy.extensions.filters.http.buffer.v3.BufferPerRoute` — the per-route
@@ -3374,6 +3398,14 @@ pub(crate) fn validate_http_filters(
                 }
                 validate_cdn_loop_config(cfg, listener_name)?;
             }
+            crate::HttpFilterTypedConfig::SetMetadata(cfg) => {
+                if f.name != "envoy.filters.http.set_metadata" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                validate_set_metadata_config(cfg, listener_name)?;
+            }
         }
     }
 
@@ -3695,6 +3727,20 @@ fn validate_cdn_loop_config(
             listener: listener_name.to_string(),
             cdn_id: cfg.cdn_id.clone(),
         });
+    }
+    Ok(())
+}
+
+fn validate_set_metadata_config(
+    cfg: &crate::SetMetadataConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    for entry in &cfg.metadata {
+        if entry.metadata_namespace.is_empty() {
+            return Err(crate::ConfigError::SetMetadataEmptyNamespace {
+                listener: listener_name.to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -15384,6 +15430,118 @@ admin:
         assert!(
             matches!(err, crate::ConfigError::CdnLoopInvalidCdnId { .. }),
             "expected CdnLoopInvalidCdnId for '@' token, got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_metadata_config_tests {
+    use super::*;
+
+    #[test]
+    fn parses_set_metadata_filter_modern_form() {
+        let yaml = r#"
+name: envoy.filters.http.set_metadata
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config
+  metadata:
+  - metadata_namespace: envoy.test
+    value:
+      tier: prod
+"#;
+        let hf: HttpFilter = serde_yaml::from_str(yaml).expect("parses");
+        match hf.typed_config {
+            HttpFilterTypedConfig::SetMetadata(cfg) => {
+                assert_eq!(cfg.metadata.len(), 1);
+                assert_eq!(cfg.metadata[0].metadata_namespace, "envoy.test");
+                assert_eq!(cfg.metadata[0].value["tier"], "prod");
+                assert!(!cfg.metadata[0].allow_overwrite); // serde default false
+            }
+            other => panic!("expected SetMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_metadata_non_string_value_is_rejected() {
+        // A non-string YAML scalar value (a number) must FAIL serde
+        // deserialization — the string-only MVP boundary (§A5).
+        let yaml = r#"
+name: envoy.filters.http.set_metadata
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config
+  metadata:
+  - metadata_namespace: envoy.test
+    value:
+      tier: 7
+"#;
+        let r: Result<HttpFilter, _> = serde_yaml::from_str(yaml);
+        assert!(r.is_err(), "non-string value must be rejected by serde");
+    }
+
+    /// A full bootstrap with a `set_metadata` filter chain entry (+ router
+    /// terminus), parameterized on the filter `name` and the `metadata_namespace`.
+    /// Exercises `parse_bootstrap`'s validation path (the same entry-point the
+    /// cdn_loop validator tests use).
+    fn bootstrap_with_set_metadata(filter_name: &str, namespace: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok\n" }}
+                http_filters:
+                  - name: {filter_name}
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config
+                      metadata:
+                      - metadata_namespace: "{namespace}"
+                        value: {{ tier: prod }}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 9901 }}
+"#
+        )
+    }
+
+    #[test]
+    fn set_metadata_empty_namespace_is_fatal() {
+        let yaml = bootstrap_with_set_metadata("envoy.filters.http.set_metadata", "");
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::SetMetadataEmptyNamespace { .. }),
+            "expected SetMetadataEmptyNamespace, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn set_metadata_name_mismatch_is_unsupported() {
+        let yaml = bootstrap_with_set_metadata("envoy.filters.http.wrong_name", "envoy.test");
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedHttpFilter { .. }),
+            "expected UnsupportedHttpFilter for name mismatch, got {err:?}"
         );
     }
 }
