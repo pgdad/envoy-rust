@@ -24,6 +24,7 @@ use crate::csrf::CsrfFilter;
 use crate::error::FilterError;
 use crate::fault::FaultFilter;
 use crate::header_mutation::HeaderMutationFilter;
+use crate::header_to_metadata::HeaderToMetadataFilter;
 use crate::jwt_authn::JwtAuthnFilter;
 use crate::local_rate_limit::LocalRateLimitFilter;
 use crate::pipeline::Decision;
@@ -87,6 +88,14 @@ pub enum HttpFilterInstance {
     /// `req.dynamic_metadata` under the entry's `metadata_namespace`, honoring
     /// `allow_overwrite`. No per-route config, no stats — ADR-0080/ADR-0081.
     SetMetadata(SetMetadataFilter),
+    /// Phase-34 Tasks 3+4: the `envoy.filters.http.header_to_metadata` filter
+    /// (decode-side, Continue-only; request-driven dynamic-metadata emitter —
+    /// NEVER short-circuits). For each request_rule, extracts the matched request
+    /// header's value (or the rule's static `value` override — §A3 precedence)
+    /// into `req.dynamic_metadata[namespace][key]`; an absent header applies
+    /// `on_header_missing`'s static `value`; a present-but-empty header writes
+    /// nothing (§A4). No per-route config, no stats — ADR-0083/ADR-0084.
+    HeaderToMetadata(HeaderToMetadataFilter),
     /// Test-only: a filter that always returns `Decision::StopAndSend` on the
     /// DECODE side, carrying the given `FilterResponse`. Used by the H1/H2 HCM
     /// integration tests to exercise the decode-side short-circuit.
@@ -163,6 +172,9 @@ impl HttpFilterInstance {
             envoy_config::HttpFilterTypedConfig::SetMetadata(cfg) => {
                 Ok(HttpFilterInstance::SetMetadata(SetMetadataFilter::new(cfg)))
             }
+            envoy_config::HttpFilterTypedConfig::HeaderToMetadata(cfg) => Ok(
+                HttpFilterInstance::HeaderToMetadata(HeaderToMetadataFilter::new(cfg)),
+            ),
         }
     }
 
@@ -179,6 +191,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Buffer(f) => f.decode_headers(req),
             HttpFilterInstance::CdnLoop(f) => f.decode_headers(req),
             HttpFilterInstance::SetMetadata(f) => f.decode_headers(req),
+            HttpFilterInstance::HeaderToMetadata(f) => f.decode_headers(req),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(resp) => {
                 Decision::StopAndSend(resp.clone())
@@ -201,6 +214,7 @@ impl HttpFilterInstance {
             HttpFilterInstance::Buffer(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::CdnLoop(f) => f.encode_headers(resp_arg),
             HttpFilterInstance::SetMetadata(f) => f.encode_headers(resp_arg),
+            HttpFilterInstance::HeaderToMetadata(f) => f.encode_headers(resp_arg),
             #[cfg(feature = "test-util")]
             HttpFilterInstance::TestStopAndSendOnDecode(_) => Decision::Continue,
             #[cfg(feature = "test-util")]
@@ -220,8 +234,8 @@ impl HttpFilterInstance {
             HttpFilterInstance::Csrf(f) => f.apply_route_config(route),
             HttpFilterInstance::Buffer(f) => f.apply_route_config(route),
             // Router/HeaderMutation/LocalRateLimit/Rbac/Fault/JwtAuthn/CdnLoop/
-            // SetMetadata (and the test-only variants) consume no per-route
-            // config; only Cors/Csrf/Buffer override. A future
+            // SetMetadata/HeaderToMetadata (and the test-only variants) consume no
+            // per-route config; only Cors/Csrf/Buffer override. A future
             // route-config-consuming filter must add an arm above rather than
             // silently fall through here.
             _ => {}
@@ -529,6 +543,51 @@ mod tests {
         assert_eq!(req.dynamic_metadata["envoy.test"]["tier"], "prod");
 
         // encode_headers is inert for SetMetadata — must return Continue.
+        let mut resp = FilterResponse {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
+    }
+
+    #[test]
+    fn builds_header_to_metadata_instance_and_writes() {
+        let registry = test_registry();
+        let hf = envoy_config::HttpFilter {
+            name: "envoy.filters.http.header_to_metadata".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::HeaderToMetadata(
+                envoy_config::HeaderToMetadataConfig {
+                    request_rules: vec![envoy_config::HeaderToMetadataRule {
+                        header: "x-tier".to_string(),
+                        on_header_present: Some(envoy_config::HeaderToMetadataKeyValue {
+                            metadata_namespace: "envoy.lb".to_string(),
+                            key: "tier".to_string(),
+                            value: None,
+                            r#type: envoy_config::HeaderToMetadataType::String,
+                        }),
+                        on_header_missing: None,
+                    }],
+                },
+            ),
+        };
+        let mut inst = HttpFilterInstance::build(&hf, &registry, "ingress_http")
+            .expect("HeaderToMetadata build succeeds");
+        assert!(matches!(inst, HttpFilterInstance::HeaderToMetadata(_)));
+
+        // decode with x-tier: prod → Continue AND the value lands under envoy.lb.tier.
+        let mut req = FilterRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            headers: vec![("x-tier".into(), "prod".into())],
+            body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
+        };
+        assert!(matches!(inst.decode_headers(&mut req), Decision::Continue));
+        assert_eq!(req.dynamic_metadata["envoy.lb"]["tier"], "prod");
+
+        // encode_headers is inert for HeaderToMetadata — must return Continue.
         let mut resp = FilterResponse {
             status: 200,
             reason: None,
