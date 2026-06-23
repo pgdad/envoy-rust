@@ -188,3 +188,31 @@ needing the field — the rest were `fn … -> AccessLogRecord {` signature line
 - `cargo build -p envoy-bin` → clean (binary compiles with the new variant).
 - `cargo fmt -p envoy-filter --check` → clean. `#![forbid(unsafe_code)]` holds.
 - Continue-only honored: no `StopAndSend` anywhere in `set_metadata.rs`.
+
+## Task 8 — `Op::DynamicMetadata` (`crates/envoy-accesslog/src/command_operator.rs`)
+
+- Added the `Op::DynamicMetadata { namespace: String, key: String }` variant — **NO `truncate` field**
+  (§A2-LOCKED: a `:N` length suffix is boot-fatal in Envoy, so the operator carries no length).
+- `parse_operator`: new `"DYNAMIC_METADATA"` arm → `parse_dynamic_metadata_op(rest)`, mirroring
+  `parse_header_op`'s paren/`)`-suffix handling but rejecting `:N` and NOT lowercasing. Parse rejections
+  (all `FormatParseError::MalformedArgument { keyword: "DYNAMIC_METADATA", .. }`):
+  - no `(...)` argument (no-arg `%DYNAMIC_METADATA%`) → "requires a (namespace:key) argument";
+  - any non-empty suffix after `)` (a trailing `:N`) → "does not accept a ':N' length suffix";
+  - not exactly two non-empty `:`-separated segments (1-segment whole-namespace `(ns)` or 3+-segment
+    nested `(a:b:c)`) → "requires exactly 'namespace:key'".
+  namespace/key are CASE-SENSITIVE (stored verbatim, not lowercased — unlike REQ/RESP header names).
+- `render_op`: `record.dynamic_metadata.get(namespace).and_then(|m| m.get(key)).map(String::as_str)
+  .unwrap_or("-")` — a present scalar string renders RAW, UNQUOTED (§A3, e.g. `prod` not `"prod"`);
+  an absent namespace OR an absent key renders the single dash `-` (§A4).
+
+**Tests (`command_operator::tests`):** `parses_dynamic_metadata`, `renders_present_metadata_raw_unquoted`,
+`renders_absent_key_and_namespace_dash`, `dynamic_metadata_rejects_truncation`, `dynamic_metadata_requires_arg`,
+`dynamic_metadata_rejects_single_and_nested_segments`, `dynamic_metadata_is_case_sensitive`.
+
+**Verification:**
+- `cargo test -p envoy-accesslog` → `test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+  (the new operator tests + every pre-existing command_operator/default_format/record/file_sink test).
+- `cargo build -p envoy-config` → clean (`validate_access_logs` reuses `parse_format`; the new operator now
+  parses through it without error).
+- `cargo fmt -p envoy-accesslog` applied. `#![forbid(unsafe_code)]` holds. No `truncate` field on the variant;
+  `:N` / no-arg / non-two-segment args are all rejected.

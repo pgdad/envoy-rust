@@ -62,6 +62,14 @@ pub enum Op {
     Duration,
     /// `%UPSTREAM_HOST%`
     UpstreamHost,
+    /// `%DYNAMIC_METADATA(namespace:key)%` — a single-level two-segment lookup
+    /// into the per-request dynamic-metadata store (§A2-LOCKED). namespace/key
+    /// are CASE-SENSITIVE (NOT lowercased). Carries NO `:N` truncation field —
+    /// a trailing `:N` is boot-fatal in Envoy (`DYNAMIC_METADATA does not allow
+    /// length to be specified.`), so the parser rejects it. A present scalar
+    /// string value renders RAW, UNQUOTED (§A3); an absent namespace or key
+    /// renders `-` (§A4).
+    DynamicMetadata { namespace: String, key: String },
 }
 
 /// REQ-side header names (lowercased) that have a backing field on
@@ -222,6 +230,7 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
     match keyword {
         "REQ" => parse_header_op(keyword, rest, Side::Req),
         "RESP" => parse_header_op(keyword, rest, Side::Resp),
+        "DYNAMIC_METADATA" => parse_dynamic_metadata_op(rest),
         // Non-arg keywords: must NOT carry parens.
         "PROTOCOL" | "RESPONSE_CODE" | "RESPONSE_FLAGS" | "BYTES_RECEIVED" | "BYTES_SENT"
         | "UPSTREAM_HOST" | "START_TIME" | "DURATION" => {
@@ -328,6 +337,59 @@ fn parse_header_op(keyword: &str, rest: Option<&str>, side: Side) -> Result<Op, 
     })
 }
 
+/// Parse a `%DYNAMIC_METADATA(namespace:key)%` operator (§A2-LOCKED). `rest` is
+/// the body slice starting at the opening `(` (or `None` if absent). Unlike
+/// `parse_header_op`, this operator:
+/// - REQUIRES a `(...)` argument (a no-arg `%DYNAMIC_METADATA%` is boot-fatal);
+/// - REJECTS any trailing `:N` length suffix (boot-fatal in Envoy);
+/// - requires EXACTLY two non-empty `:`-separated segments (the single-level MVP
+///   — a 1-segment whole-namespace or a 3+-segment nested path is rejected);
+/// - does NOT lowercase namespace/key (metadata keys are case-sensitive).
+fn parse_dynamic_metadata_op(rest: Option<&str>) -> Result<Op, FormatParseError> {
+    const KEYWORD: &str = "DYNAMIC_METADATA";
+
+    let rest = rest.ok_or_else(|| FormatParseError::MalformedArgument {
+        keyword: KEYWORD.to_string(),
+        detail: "requires a (namespace:key) argument".to_string(),
+    })?;
+    debug_assert!(rest.starts_with('('));
+
+    let close = rest
+        .find(')')
+        .ok_or_else(|| FormatParseError::MalformedArgument {
+            keyword: KEYWORD.to_string(),
+            detail: "missing closing ')' on the (namespace:key) argument".to_string(),
+        })?;
+
+    let arg = &rest[1..close];
+    let after = &rest[close + 1..];
+
+    // §A2: a trailing `:N` length suffix is boot-fatal — nothing may follow ')'.
+    if !after.is_empty() {
+        return Err(FormatParseError::MalformedArgument {
+            keyword: KEYWORD.to_string(),
+            detail: "does not accept a ':N' length suffix".to_string(),
+        });
+    }
+
+    // Exactly two non-empty `:`-separated segments (single-level MVP).
+    let mut parts = arg.split(':');
+    let (namespace, key) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(ns), Some(k), None) if !ns.is_empty() && !k.is_empty() => (ns, k),
+        _ => {
+            return Err(FormatParseError::MalformedArgument {
+                keyword: KEYWORD.to_string(),
+                detail: "requires exactly 'namespace:key'".to_string(),
+            });
+        }
+    };
+
+    Ok(Op::DynamicMetadata {
+        namespace: namespace.to_string(),
+        key: key.to_string(),
+    })
+}
+
 /// A parsed-and-validated access-log format ready for evaluation against an
 /// [`AccessLogRecord`]. Wraps the `Vec<Segment>` produced by [`parse_format`];
 /// every operator is already known to have a backing field (the parser rejected
@@ -410,6 +472,14 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord) {
         }
         Op::StartTime => out.push_str(&crate::format_iso8601(record.start_time)),
         Op::UpstreamHost => out.push_str(record.upstream_host.as_deref().unwrap_or("-")),
+        Op::DynamicMetadata { namespace, key } => out.push_str(
+            record
+                .dynamic_metadata
+                .get(namespace)
+                .and_then(|m| m.get(key))
+                .map(String::as_str)
+                .unwrap_or("-"),
+        ),
         Op::Req {
             name,
             alt,
@@ -698,5 +768,96 @@ mod tests {
     fn truncate_zero_is_valid_and_empty() {
         let f = parse_format("%REQ(USER-AGENT):0%").expect("`:0` is a valid truncation");
         assert_eq!(CompiledFormat(f).render(&rec()), ""); // user_agent present, truncated to 0 bytes
+    }
+
+    // ── Task 8: %DYNAMIC_METADATA(namespace:key)% ───────────────────────────
+    // §A2/A3/A4-LOCKED against envoyproxy/envoy:v1.33.0.
+
+    // Parses to the two-segment variant WITHOUT lowercasing (case-sensitive).
+    #[test]
+    fn parses_dynamic_metadata() {
+        let segs = parse_format("%DYNAMIC_METADATA(envoy.test:tier)%").unwrap();
+        assert_eq!(
+            segs,
+            vec![Segment::Op(Op::DynamicMetadata {
+                namespace: "envoy.test".into(),
+                key: "tier".into(),
+            })]
+        );
+    }
+
+    // §A3: a present scalar string value renders RAW, UNQUOTED (`prod`, not `"prod"`).
+    #[test]
+    fn renders_present_metadata_raw_unquoted() {
+        let mut r = rec();
+        r.dynamic_metadata
+            .entry("envoy.test".into())
+            .or_default()
+            .insert("tier".into(), "prod".into());
+        let f = parse_format("%DYNAMIC_METADATA(envoy.test:tier)%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "prod"); // no quotes
+    }
+
+    // §A4: an absent key OR an absent namespace renders the single dash `-`.
+    #[test]
+    fn renders_absent_key_and_namespace_dash() {
+        let mut r = rec();
+        r.dynamic_metadata
+            .entry("envoy.test".into())
+            .or_default()
+            .insert("tier".into(), "prod".into());
+        // Absent KEY in a present namespace → `-`.
+        let f = parse_format("%DYNAMIC_METADATA(envoy.test:missing)%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "-");
+        // Absent NAMESPACE → `-`.
+        let f = parse_format("%DYNAMIC_METADATA(envoy.absent:tier)%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "-");
+    }
+
+    // §A2: a trailing `:N` length suffix is BOOT-FATAL on this operator.
+    #[test]
+    fn dynamic_metadata_rejects_truncation() {
+        assert!(matches!(
+            parse_format("%DYNAMIC_METADATA(envoy.test:tier):2%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+    }
+
+    // §A2: a no-arg `%DYNAMIC_METADATA%` (no `(...)`) is rejected.
+    #[test]
+    fn dynamic_metadata_requires_arg() {
+        assert!(matches!(
+            parse_format("%DYNAMIC_METADATA%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+    }
+
+    // §A2: a 1-segment (whole-namespace) or 3+-segment (nested) arg is rejected.
+    #[test]
+    fn dynamic_metadata_rejects_single_and_nested_segments() {
+        assert!(matches!(
+            parse_format("%DYNAMIC_METADATA(envoy.test)%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+        assert!(matches!(
+            parse_format("%DYNAMIC_METADATA(a:b:c)%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+    }
+
+    // §A2: namespace/key are CASE-SENSITIVE — they are NOT lowercased.
+    #[test]
+    fn dynamic_metadata_is_case_sensitive() {
+        let mut r = rec();
+        r.dynamic_metadata
+            .entry("envoy.test".into())
+            .or_default()
+            .insert("Tier".into(), "prod".into());
+        // lowercase `tier` does NOT match the stored `Tier` → `-`.
+        let f = parse_format("%DYNAMIC_METADATA(envoy.test:tier)%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "-");
+        // exact-case `Tier` matches → `prod`.
+        let f = parse_format("%DYNAMIC_METADATA(envoy.test:Tier)%").unwrap();
+        assert_eq!(CompiledFormat(f).render(&r), "prod");
     }
 }
