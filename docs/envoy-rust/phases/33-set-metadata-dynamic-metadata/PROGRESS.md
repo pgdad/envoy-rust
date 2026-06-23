@@ -216,3 +216,49 @@ needing the field — the rest were `fn … -> AccessLogRecord {` signature line
   parses through it without error).
 - `cargo fmt -p envoy-accesslog` applied. `#![forbid(unsafe_code)]` holds. No `truncate` field on the variant;
   `:N` / no-arg / non-two-segment args are all rejected.
+
+## Tasks 9+10 — H1+H2 dynamic-metadata threading + backstops
+
+**Goal:** thread the per-request dynamic-metadata store from the filter pipeline into the access-log record at the
+TWO independent HCM record-build sites, so `%DYNAMIC_METADATA(ns:key)%` renders the `set_metadata`-written value
+instead of `-`. Each site needs a symmetric capture-before-drop: both HCMs build a `FilterRequest` (`filter_req`),
+run `pipeline.decode_headers`, write back ONLY `method`/`path`/`headers`/`body` to the codec-native request, then
+drop the rest of `filter_req` — so `filter_req.dynamic_metadata` would be LOST without an explicit capture.
+
+**Dual capture-before-drop sites:**
+- **H1 (`crates/envoy-http1/src/hcm.rs`):** right after the 4-field write-back (`req.body = filter_req.body;`) and
+  BEFORE the `match decode_decision`, `let dynamic_metadata = filter_req.dynamic_metadata;` (a full move of the
+  remaining field — `filter_req` is already partially moved by the four write-backs, so this compiles cleanly).
+  The record build inside `if !config.access_log.is_empty()` sets `dynamic_metadata: dynamic_metadata.clone()`
+  (clone because the local is captured unconditionally but consumed inside the `if`).
+- **H2 (`crates/envoy-http2/src/hcm.rs`):** the H2 record build lives in a SEPARATE function
+  (`finalize_h2_stream`), not inline. So the capture `let dynamic_metadata = filter_req.dynamic_metadata;` (same
+  partial-move pattern, after the 4-field write-back, before `match decode_decision`) is threaded as a NEW owned
+  parameter `dynamic_metadata: BTreeMap<String, BTreeMap<String, String>>` to `finalize_h2_stream` (single call
+  site updated). The record build moves it in directly (`dynamic_metadata,` shorthand — single-use). H2 builds its
+  OWN record and does NOT inherit from H1 (spec C-1), so this is the SOLE proof of the H2 path (fixture 0041 is
+  H1-only).
+
+Both partial-move captures compile — confirmed. Chains WITHOUT `set_metadata` are unchanged (empty metadata →
+their formats don't use `%DYNAMIC_METADATA%`); every pre-existing H1/H2 test stays green.
+
+**Backstop approach — END-TO-END log-scrape for BOTH crates** (preferred over the record-field assertion; exercises
+the operator render too):
+- **H1 (`h1_dynamic_metadata_threads_into_access_log`):** builds a `[set_metadata, router]` pipeline
+  (`set_metadata_router_pipeline()` helper writes `envoy.test`→`{tier: prod}`), an `HCMConfig` with a `FileSink`
+  whose `log_format` is `%DYNAMIC_METADATA(envoy.test:tier)% / %DYNAMIC_METADATA(envoy.test:missing)%` against a
+  `direct_response` 200 route; drives one H1 GET via the existing `drive` helper; scrapes the written line and
+  asserts it equals `prod / -\n` (present key `prod`, absent key `-`).
+- **H2 (`h2_dynamic_metadata_threads_into_access_log`):** builds the inner `Http1HCMConfig` via `from_config` from
+  a `HttpConnectionManagerConfig` carrying the same `[set_metadata, router]` filter chain + a FileAccessLog with the
+  same `log_format`; drives one real H2 GET via the `h2::client` + `spawn_h2_hcm` harness; scrapes the line and
+  asserts `prod / -\n`. Both watched FAIL first (line `- / -\n` — present key renders `-` because the threading
+  isn't wired), then PASS after the capture.
+
+**Verification:**
+- `cargo test -p envoy-http1` → `test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+  (incl. the new H1 backstop).
+- `cargo test -p envoy-http2` → `test result: ok. 73 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out`
+  (incl. the new H2 backstop).
+- `cargo fmt --all -- --check` clean. `#![forbid(unsafe_code)]` holds. Only `crates/envoy-http1/src/hcm.rs` and
+  `crates/envoy-http2/src/hcm.rs` touched.

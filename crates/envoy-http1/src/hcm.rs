@@ -785,6 +785,11 @@ async fn serve_connection(
         req.path = filter_req.path;
         req.headers = filter_req.headers;
         req.body = filter_req.body;
+        // Phase 33 T9: capture the pipeline's dynamic metadata before
+        // `filter_req` is dropped, so the access-log record build below can
+        // render %DYNAMIC_METADATA% (a full move of the remaining field —
+        // `filter_req` is already partially moved by the four write-backs).
+        let dynamic_metadata = filter_req.dynamic_metadata;
 
         // 5. Build response (handles 400 / 404 / 501 / 200 internally) or
         //    decide to proxy upstream. 07.1 Task 6: dispatch through
@@ -1203,7 +1208,7 @@ async fn serve_connection(
                 request_id: access_log_header_value(&req.headers, "x-request-id"),
                 authority: access_log_header_value(&req.headers, "host"),
                 upstream_host: upstream_host_for_log,
-                dynamic_metadata: std::collections::BTreeMap::new(),
+                dynamic_metadata: dynamic_metadata.clone(),
             };
             // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
             // time (BEFORE the per-sink await), per parent SPEC §6 Rule 4 —
@@ -4611,6 +4616,102 @@ static_resources:
         assert!(
             logged.contains(" 200 "),
             "access log captured post-encode status: {logged:?}"
+        );
+    }
+
+    /// Phase 33 T9 backstop: build a `[set_metadata, router]` pipeline whose
+    /// `set_metadata` filter writes `envoy.test`→`{tier: prod}`.
+    fn set_metadata_router_pipeline() -> Arc<envoy_filter::FilterPipeline> {
+        let filters = vec![
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.set_metadata".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::SetMetadata(
+                    envoy_config::SetMetadataConfig {
+                        metadata: vec![envoy_config::MetadataEntry {
+                            metadata_namespace: "envoy.test".to_string(),
+                            value: [("tier".to_string(), "prod".to_string())]
+                                .into_iter()
+                                .collect(),
+                            allow_overwrite: false,
+                        }],
+                    },
+                ),
+            },
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            },
+        ];
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        Arc::new(
+            envoy_filter::FilterPipeline::build_from_config(&filters, &registry, "test_prefix")
+                .expect("set_metadata+router pipeline builds"),
+        )
+    }
+
+    /// Phase 33 T9 backstop: prove the per-request dynamic-metadata store
+    /// threads end-to-end through the H1 HCM into the access-log record and is
+    /// rendered by `%DYNAMIC_METADATA%`. Drives one request through a
+    /// `[set_metadata, router]` chain + a file logger whose `log_format`
+    /// reads a present key (`tier`→`prod`) and an absent key (`missing`→`-`),
+    /// then scrapes the written line. This is the sole proof that the
+    /// capture-before-drop at the H1 4-field write-back populates the record.
+    #[tokio::test]
+    async fn h1_dynamic_metadata_threads_into_access_log() {
+        let pipeline = set_metadata_router_pipeline();
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let format = envoy_accesslog::CompiledFormat::from_inline(
+            "%DYNAMIC_METADATA(envoy.test:tier)% / %DYNAMIC_METADATA(envoy.test:missing)%\n",
+        )
+        .expect("valid log_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), format)
+                .await
+                .expect("open FileSink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: pipeline,
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "prod / -\n",
+            "access log renders present key `prod` and absent key `-`: {logged:?}"
         );
     }
 

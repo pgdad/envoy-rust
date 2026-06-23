@@ -487,6 +487,11 @@ async fn handle_one_stream(
     envoy_req.path = filter_req.path;
     envoy_req.headers = filter_req.headers;
     envoy_req.body = filter_req.body;
+    // Phase 33 T10: capture dynamic metadata before `filter_req` is dropped
+    // (H2 builds its OWN record at ~888 and does NOT inherit from H1 —
+    // spec C-1). A full move of the remaining field; `filter_req` is already
+    // partially moved by the four write-backs above.
+    let dynamic_metadata = filter_req.dynamic_metadata;
 
     // Hand to the existing 04.x route-walk. close=false because H2 has its
     // own connection lifecycle; the close flag is only meaningful for H1.
@@ -795,6 +800,7 @@ async fn handle_one_stream(
         &envoy_req,
         request_body_len,
         upstream_host_for_log_h2,
+        dynamic_metadata,
     )
     .await
 }
@@ -820,6 +826,13 @@ async fn finalize_h2_stream(
     envoy_req: &Request,
     request_body_len: u64,
     upstream_host_for_log_h2: Option<String>,
+    // Phase 33 T10: the pipeline's dynamic metadata, captured before
+    // `filter_req` was dropped at the decode site, threaded here so the H2
+    // record build can render %DYNAMIC_METADATA%.
+    dynamic_metadata: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    >,
 ) -> Result<(), Http2Error> {
     // 07.1 Task 7: encode-side filter invocation. Boundary conversion
     // `envoy_http1::codec::Response` ↔ `envoy_filter::FilterResponse`
@@ -902,7 +915,7 @@ async fn finalize_h2_stream(
             request_id: access_log_header_value(&envoy_req.headers, "x-request-id"),
             authority: access_log_header_value(&envoy_req.headers, "host"),
             upstream_host: upstream_host_for_log_h2,
-            dynamic_metadata: std::collections::BTreeMap::new(),
+            dynamic_metadata,
         };
         // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
         // Counter::add(N) per 06.1 REVIEW §7 R-8; fires BEFORE the per-sink
@@ -1308,6 +1321,116 @@ static_resources:
             bytes.extend_from_slice(&chunk);
         }
         assert_eq!(&bytes[..], b"ok\n");
+    }
+
+    /// Phase 33 T10 backstop: prove the per-request dynamic-metadata store
+    /// threads end-to-end through the H2 HCM into its OWN access-log record
+    /// (the H2 record build does NOT inherit from H1 — spec C-1), and is
+    /// rendered by `%DYNAMIC_METADATA%`. This is the SOLE proof of the H2
+    /// path (fixture 0041 is H1-only). Drives one H2 request through a
+    /// `[set_metadata, router]` chain + a file logger whose `log_format`
+    /// reads a present key (`tier`→`prod`) and an absent key (`missing`→`-`),
+    /// then scrapes the written line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_dynamic_metadata_threads_into_access_log() {
+        use envoy_config::{
+            AccessLog, AccessLogTypedConfig, DataSourceInline, FileAccessLog, MetadataEntry,
+            SetMetadataConfig, SubstitutionFormatString,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![AccessLog {
+                name: "envoy.access_loggers.file".to_string(),
+                typed_config: AccessLogTypedConfig::FileAccessLog(FileAccessLog {
+                    path: log_path.to_str().unwrap().to_string(),
+                    log_format: Some(SubstitutionFormatString {
+                        text_format_source: DataSourceInline {
+                            inline_string:
+                                "%DYNAMIC_METADATA(envoy.test:tier)% / %DYNAMIC_METADATA(envoy.test:missing)%\n"
+                                    .to_string(),
+                        },
+                    }),
+                }),
+            }],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![
+                HttpFilter {
+                    name: "envoy.filters.http.set_metadata".to_string(),
+                    typed_config: HttpFilterTypedConfig::SetMetadata(SetMetadataConfig {
+                        metadata: vec![MetadataEntry {
+                            metadata_namespace: "envoy.test".to_string(),
+                            value: [("tier".to_string(), "prod".to_string())]
+                                .into_iter()
+                                .collect(),
+                            allow_overwrite: false,
+                        }],
+                    }),
+                },
+                HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+                },
+            ],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let config = Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+                .await
+                .expect("build HCM config"),
+        );
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let _ = chunk.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "prod / -\n",
+            "H2 access log renders present key `prod` and absent key `-`: {logged:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
