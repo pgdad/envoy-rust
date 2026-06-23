@@ -1433,6 +1433,122 @@ static_resources:
         );
     }
 
+    /// Phase 34 T5 backstop: prove that the `header_to_metadata` filter's
+    /// output threads end-to-end through the H2 HCM into its access-log record.
+    /// Mirrors `h2_dynamic_metadata_threads_into_access_log` verbatim, swapping
+    /// the filter chain to `[header_to_metadata, router]` with a rule that
+    /// extracts request header `x-tier` → `envoy.lb:tier` on presence.
+    /// Drives one H2 GET with `x-tier: prod`; asserts the rendered log line
+    /// shows `prod` for the written key and `-` for the absent sentinel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_header_to_metadata_threads_into_access_log() {
+        use envoy_config::{
+            AccessLog, AccessLogTypedConfig, DataSourceInline, FileAccessLog,
+            HeaderToMetadataConfig, HeaderToMetadataKeyValue, HeaderToMetadataRule,
+            HeaderToMetadataType, SubstitutionFormatString,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![AccessLog {
+                name: "envoy.access_loggers.file".to_string(),
+                typed_config: AccessLogTypedConfig::FileAccessLog(FileAccessLog {
+                    path: log_path.to_str().unwrap().to_string(),
+                    log_format: Some(SubstitutionFormatString {
+                        text_format_source: DataSourceInline {
+                            inline_string:
+                                "%DYNAMIC_METADATA(envoy.lb:tier)% / %DYNAMIC_METADATA(envoy.lb:missing)%\n"
+                                    .to_string(),
+                        },
+                    }),
+                }),
+            }],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![
+                HttpFilter {
+                    name: "envoy.filters.http.header_to_metadata".to_string(),
+                    typed_config: HttpFilterTypedConfig::HeaderToMetadata(
+                        HeaderToMetadataConfig {
+                            request_rules: vec![HeaderToMetadataRule {
+                                header: "x-tier".to_string(),
+                                on_header_present: Some(HeaderToMetadataKeyValue {
+                                    metadata_namespace: "envoy.lb".to_string(),
+                                    key: "tier".to_string(),
+                                    value: None,
+                                    r#type: HeaderToMetadataType::String,
+                                }),
+                                on_header_missing: None,
+                            }],
+                        },
+                    ),
+                },
+                HttpFilter {
+                    name: "envoy.filters.http.router".to_string(),
+                    typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+                },
+            ],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let config = Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+                .await
+                .expect("build HCM config"),
+        );
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .header("x-tier", "prod")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let _ = chunk.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "prod / -\n",
+            "H2 access log renders header-derived `prod` and absent key `-`: {logged:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_authority_header_synthesizes_host_for_route_walk() {
         // Build an HCM config with TWO virtual hosts: one matching "test.example"

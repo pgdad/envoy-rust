@@ -4715,6 +4715,100 @@ static_resources:
         );
     }
 
+    /// Phase 34 T5 backstop: prove that the `header_to_metadata` filter's
+    /// output threads end-to-end through the H1 HCM into the access-log record.
+    /// Mirrors `h1_dynamic_metadata_threads_into_access_log` verbatim, swapping
+    /// the filter chain to `[header_to_metadata, router]` with a rule that
+    /// extracts request header `x-tier` → `envoy.lb:tier` on presence.
+    /// Drives one H1 GET with `x-tier: prod`; asserts the rendered log line
+    /// shows `prod` for the written key and `-` for the absent sentinel.
+    #[tokio::test]
+    async fn h1_header_to_metadata_threads_into_access_log() {
+        use tempfile::tempdir;
+        let filters = vec![
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.header_to_metadata".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::HeaderToMetadata(
+                    envoy_config::HeaderToMetadataConfig {
+                        request_rules: vec![envoy_config::HeaderToMetadataRule {
+                            header: "x-tier".to_string(),
+                            on_header_present: Some(envoy_config::HeaderToMetadataKeyValue {
+                                metadata_namespace: "envoy.lb".to_string(),
+                                key: "tier".to_string(),
+                                value: None,
+                                r#type: envoy_config::HeaderToMetadataType::String,
+                            }),
+                            on_header_missing: None,
+                        }],
+                    },
+                ),
+            },
+            envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            },
+        ];
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let pipeline = Arc::new(
+            envoy_filter::FilterPipeline::build_from_config(&filters, &registry, "test_prefix")
+                .expect("header_to_metadata+router pipeline builds"),
+        );
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let format = envoy_accesslog::CompiledFormat::from_inline(
+            "%DYNAMIC_METADATA(envoy.lb:tier)% / %DYNAMIC_METADATA(envoy.lb:missing)%\n",
+        )
+        .expect("valid log_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), format)
+                .await
+                .expect("open FileSink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: pipeline,
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nx-tier: prod\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "prod / -\n",
+            "access log renders header-derived `prod` and absent key `-`: {logged:?}"
+        );
+    }
+
     // ── 13.1 Task 4: H1Pool dispatch integration ──────────────────────────
 
     /// 13.1 Task 4 (D4): regression-equivalence proof that the H1 proxy arm
