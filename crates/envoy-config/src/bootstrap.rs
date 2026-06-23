@@ -1013,6 +1013,11 @@ pub enum HttpFilterTypedConfig {
 
     #[serde(rename = "type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config")]
     SetMetadata(SetMetadataConfig),
+
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config"
+    )]
+    HeaderToMetadata(HeaderToMetadataConfig),
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -1119,6 +1124,51 @@ pub struct MetadataEntry {
     pub value: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub allow_overwrite: bool,
+}
+
+/// `envoy.extensions.filters.http.header_to_metadata.v3.Config` (phase 34, §A1-LOCKED).
+/// Request-side, string-only subset: each rule extracts a request header into dynamic
+/// metadata. `cookie`/`remove`/`encode`/non-STRING `type` are §2.2-deferred → rejected
+/// by `deny_unknown_fields` / the `HeaderToMetadataType` enum (boot-fatal, stricter than Envoy).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderToMetadataConfig {
+    pub request_rules: Vec<HeaderToMetadataRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderToMetadataRule {
+    pub header: String,
+    #[serde(default)]
+    pub on_header_present: Option<HeaderToMetadataKeyValue>,
+    #[serde(default)]
+    pub on_header_missing: Option<HeaderToMetadataKeyValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderToMetadataKeyValue {
+    #[serde(default = "default_h2m_namespace")]
+    pub metadata_namespace: String,
+    pub key: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub r#type: HeaderToMetadataType,
+}
+
+fn default_h2m_namespace() -> String {
+    "envoy.filters.http.header_to_metadata".to_string()
+}
+
+/// §A3: MVP models only STRING. A `type: NUMBER | PROTOBUF_VALUE` (the §2.2 non-string-Value
+/// deferral) fails deserialization → boot-fatal (stricter than Envoy).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HeaderToMetadataType {
+    #[default]
+    String,
 }
 
 /// `envoy.extensions.filters.http.buffer.v3.BufferPerRoute` — the per-route
@@ -3405,6 +3455,15 @@ pub(crate) fn validate_http_filters(
                     });
                 }
                 validate_set_metadata_config(cfg, listener_name)?;
+            }
+            crate::HttpFilterTypedConfig::HeaderToMetadata(_cfg) => {
+                if f.name != "envoy.filters.http.header_to_metadata" {
+                    return Err(crate::ConfigError::UnsupportedHttpFilter {
+                        name: f.name.clone(),
+                    });
+                }
+                // Phase 34 T1: name/typed_config consistency is the sole gate at this task;
+                // per-rule validation (empty key, etc.) is added in a later task.
             }
         }
     }
@@ -15542,6 +15601,95 @@ admin:
         assert!(
             matches!(err, crate::ConfigError::UnsupportedHttpFilter { .. }),
             "expected UnsupportedHttpFilter for name mismatch, got {err:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 34 Task 1: HeaderToMetadataConfig schema tests
+// ---------------------------------------------------------------------------
+mod header_to_metadata_config_tests {
+    use super::*;
+
+    #[test]
+    fn parses_header_to_metadata_filter() {
+        let yaml = r#"
+name: envoy.filters.http.header_to_metadata
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config
+  request_rules:
+  - header: x-tier
+    on_header_present:
+      metadata_namespace: envoy.lb
+      key: tier
+    on_header_missing:
+      metadata_namespace: envoy.lb
+      key: tier
+      value: default-tier
+"#;
+        let hf: HttpFilter = serde_yaml::from_str(yaml).expect("parses");
+        match hf.typed_config {
+            HttpFilterTypedConfig::HeaderToMetadata(cfg) => {
+                assert_eq!(cfg.request_rules.len(), 1);
+                let r = &cfg.request_rules[0];
+                assert_eq!(r.header, "x-tier");
+                let p = r.on_header_present.as_ref().unwrap();
+                assert_eq!(p.metadata_namespace, "envoy.lb");
+                assert_eq!(p.key, "tier");
+                assert!(p.value.is_none());
+                assert_eq!(
+                    r.on_header_missing.as_ref().unwrap().value.as_deref(),
+                    Some("default-tier")
+                );
+            }
+            other => panic!("expected HeaderToMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_to_metadata_default_namespace_is_filter_name() {
+        // When metadata_namespace is omitted, the default must be the filter's
+        // canonical name "envoy.filters.http.header_to_metadata" (A2-LOCKED).
+        let yaml = r#"
+name: envoy.filters.http.header_to_metadata
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config
+  request_rules:
+  - header: x-env
+    on_header_present:
+      key: env
+"#;
+        let hf: HttpFilter = serde_yaml::from_str(yaml).expect("parses");
+        match hf.typed_config {
+            HttpFilterTypedConfig::HeaderToMetadata(cfg) => {
+                let p = cfg.request_rules[0].on_header_present.as_ref().unwrap();
+                assert_eq!(
+                    p.metadata_namespace,
+                    "envoy.filters.http.header_to_metadata"
+                );
+            }
+            other => panic!("expected HeaderToMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_to_metadata_rejects_unknown_rule_field() {
+        // A rule with `remove: true` (a deferred field) must FAIL serde
+        // deserialization — rejected by deny_unknown_fields (boot-fatal, §A1).
+        let yaml = r#"
+name: envoy.filters.http.header_to_metadata
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config
+  request_rules:
+  - header: x-tier
+    remove: true
+    on_header_present:
+      key: tier
+"#;
+        let r: Result<HttpFilter, _> = serde_yaml::from_str(yaml);
+        assert!(
+            r.is_err(),
+            "deferred `remove` field must be rejected by deny_unknown_fields"
         );
     }
 }
