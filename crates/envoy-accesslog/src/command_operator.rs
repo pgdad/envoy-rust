@@ -81,6 +81,33 @@ pub const REQ_ALLOW_LIST: &[&str] = &[
 /// [`crate::record::AccessLogRecord`].
 pub const RESP_ALLOW_LIST: &[&str] = &["x-envoy-upstream-service-time"];
 
+/// Which header side a `%REQ(...)%` / `%RESP(...)%` operator addresses. Threaded
+/// through `parse_header_op` and surfaced in [`FormatParseError::UnsupportedHeader`]
+/// so diagnostics name the correct side without a stray `&'static str`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Side {
+    /// The request side (`%REQ(...)%`).
+    Req,
+    /// The response side (`%RESP(...)%`).
+    Resp,
+}
+
+impl Side {
+    /// The uppercase keyword form (`"REQ"` / `"RESP"`) used in diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Side::Req => "REQ",
+            Side::Resp => "RESP",
+        }
+    }
+}
+
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A failure parsing an access-log format string. The detail strings are
 /// human-readable because they will later feed a config-load error message.
 #[derive(Debug, Error, PartialEq)]
@@ -99,8 +126,8 @@ pub enum FormatParseError {
 
     /// `REQ`/`RESP` used without the required parenthesized header arg, or a
     /// non-`REQ`/`RESP` keyword given an argument it does not take.
-    #[error("operator '{0}' has a malformed argument: {1}")]
-    MalformedArgument(String, String),
+    #[error("operator '{keyword}' has a malformed argument: {detail}")]
+    MalformedArgument { keyword: String, detail: String },
 
     /// A `REQ`/`RESP` header name (and its alt, if any) has no backing field.
     #[error(
@@ -108,7 +135,7 @@ pub enum FormatParseError {
          {side} headers: {supported})"
     )]
     UnsupportedHeader {
-        side: &'static str,
+        side: Side,
         name: String,
         supported: String,
     },
@@ -193,16 +220,16 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
     }
 
     match keyword {
-        "REQ" => parse_header_op(keyword, rest, "REQ"),
-        "RESP" => parse_header_op(keyword, rest, "RESP"),
+        "REQ" => parse_header_op(keyword, rest, Side::Req),
+        "RESP" => parse_header_op(keyword, rest, Side::Resp),
         // Non-arg keywords: must NOT carry parens.
         "PROTOCOL" | "RESPONSE_CODE" | "RESPONSE_FLAGS" | "BYTES_RECEIVED" | "BYTES_SENT"
         | "UPSTREAM_HOST" | "START_TIME" | "DURATION" => {
             if rest.is_some() {
-                return Err(FormatParseError::MalformedArgument(
-                    keyword.to_string(),
-                    "this operator takes no '(...)' argument".to_string(),
-                ));
+                return Err(FormatParseError::MalformedArgument {
+                    keyword: keyword.to_string(),
+                    detail: "this operator takes no '(...)' argument".to_string(),
+                });
             }
             Ok(match keyword {
                 "PROTOCOL" => Op::Protocol,
@@ -222,25 +249,17 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
 
 /// Parse a `REQ`/`RESP` operator: `KEYWORD(ARG)` optionally followed by `:N`.
 /// `rest` is the body slice starting at the opening `(` (or `None` if absent).
-fn parse_header_op(
-    keyword: &str,
-    rest: Option<&str>,
-    side: &'static str,
-) -> Result<Op, FormatParseError> {
-    let rest = rest.ok_or_else(|| {
-        FormatParseError::MalformedArgument(
-            keyword.to_string(),
-            "requires a parenthesized header argument, e.g. REQ(:path)".to_string(),
-        )
+fn parse_header_op(keyword: &str, rest: Option<&str>, side: Side) -> Result<Op, FormatParseError> {
+    let rest = rest.ok_or_else(|| FormatParseError::MalformedArgument {
+        keyword: keyword.to_string(),
+        detail: "requires a parenthesized header argument, e.g. REQ(:path)".to_string(),
     })?;
     debug_assert!(rest.starts_with('('));
 
     // Find the closing ')'.
-    let close = rest.find(')').ok_or_else(|| {
-        FormatParseError::MalformedArgument(
-            keyword.to_string(),
-            "missing closing ')' on the header argument".to_string(),
-        )
+    let close = rest.find(')').ok_or_else(|| FormatParseError::MalformedArgument {
+        keyword: keyword.to_string(),
+        detail: "missing closing ')' on the header argument".to_string(),
     })?;
 
     let arg = &rest[1..close];
@@ -258,21 +277,28 @@ fn parse_header_op(
                 .map_err(|_| FormatParseError::BadTruncate(num.to_string()))?,
         )
     } else {
-        return Err(FormatParseError::MalformedArgument(
-            keyword.to_string(),
-            format!("unexpected trailing text '{after}' after ')'"),
-        ));
+        return Err(FormatParseError::MalformedArgument {
+            keyword: keyword.to_string(),
+            detail: format!("unexpected trailing text '{after}' after ')'"),
+        });
     };
 
-    // Split ARG on the first '?' into name / alt; lowercase both.
+    // Split ARG on the first '?' into name / alt; lowercase both. An empty
+    // alternate (a `?` with nothing after it) is MALFORMED — not `alt: Some("")`.
     let (name, alt) = match arg.split_once('?') {
+        Some((_, a)) if a.is_empty() => {
+            return Err(FormatParseError::MalformedArgument {
+                keyword: keyword.to_string(),
+                detail: "empty alternate after '?'".to_string(),
+            });
+        }
         Some((n, a)) => (n.to_ascii_lowercase(), Some(a.to_ascii_lowercase())),
         None => (arg.to_ascii_lowercase(), None),
     };
 
     let allow_list = match side {
-        "REQ" => REQ_ALLOW_LIST,
-        _ => RESP_ALLOW_LIST,
+        Side::Req => REQ_ALLOW_LIST,
+        Side::Resp => RESP_ALLOW_LIST,
     };
 
     // Valid iff at least one resolvable branch (name, else alt) is backed.
@@ -287,12 +313,12 @@ fn parse_header_op(
     }
 
     Ok(match side {
-        "REQ" => Op::Req {
+        Side::Req => Op::Req {
             name,
             alt,
             truncate,
         },
-        _ => Op::Resp {
+        Side::Resp => Op::Resp {
             name,
             alt,
             truncate,
@@ -327,7 +353,20 @@ impl CompiledFormat {
     /// no-value sentinel `-`. `Req`/`Resp` apply `?`-alt fallback then `:N`
     /// byte-truncation to the resolved value.
     pub fn render(&self, record: &AccessLogRecord) -> String {
-        let mut out = String::with_capacity(256);
+        // Data-driven pre-allocation (M32-6): size the buffer to the sum of the
+        // literal segments' byte lengths (an exact lower bound) plus a small
+        // operator allowance, instead of a fixed 256. The tuple shape is kept
+        // (in-crate tests construct `CompiledFormat(vec)` directly), so the
+        // literal length is summed on the fly here rather than precomputed.
+        let literal_len: usize = self
+            .0
+            .iter()
+            .map(|seg| match seg {
+                Segment::Literal(s) => s.len(),
+                Segment::Op(_) => 0,
+            })
+            .sum();
+        let mut out = String::with_capacity(literal_len + 64);
         for seg in &self.0 {
             match seg {
                 Segment::Literal(s) => out.push_str(s),
@@ -638,5 +677,23 @@ mod tests {
         // xff absent → alt user-agent "curl/8.20.0" → truncate to 4 bytes.
         let f = parse_format("%REQ(X-FORWARDED-FOR?USER-AGENT):4%").unwrap();
         assert_eq!(CompiledFormat(f).render(&rec()), "curl");
+    }
+
+    // M32-2: an empty alternate after '?' (a '?' with nothing after) is
+    // MALFORMED, not `alt: Some("")`.
+    #[test]
+    fn empty_alternate_is_error() {
+        assert!(matches!(
+            parse_format("%REQ(:PATH?)%").unwrap_err(),
+            FormatParseError::MalformedArgument { .. }
+        ));
+    }
+
+    // M32-2: pin `:0` semantics — a `:0` truncation is VALID and renders the
+    // empty string for a present value (floor_char_boundary(0) = 0, total).
+    #[test]
+    fn truncate_zero_is_valid_and_empty() {
+        let f = parse_format("%REQ(USER-AGENT):0%").expect("`:0` is a valid truncation");
+        assert_eq!(CompiledFormat(f).render(&rec()), ""); // user_agent present, truncated to 0 bytes
     }
 }
