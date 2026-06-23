@@ -257,10 +257,12 @@ fn parse_header_op(keyword: &str, rest: Option<&str>, side: Side) -> Result<Op, 
     debug_assert!(rest.starts_with('('));
 
     // Find the closing ')'.
-    let close = rest.find(')').ok_or_else(|| FormatParseError::MalformedArgument {
-        keyword: keyword.to_string(),
-        detail: "missing closing ')' on the header argument".to_string(),
-    })?;
+    let close = rest
+        .find(')')
+        .ok_or_else(|| FormatParseError::MalformedArgument {
+            keyword: keyword.to_string(),
+            detail: "missing closing ')' on the header argument".to_string(),
+        })?;
 
     let arg = &rest[1..close];
     let after = &rest[close + 1..];
@@ -502,6 +504,7 @@ mod tests {
             request_id: None,
             authority: Some("h:1".into()),
             upstream_host: Some("1.2.3.4:80".into()),
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 

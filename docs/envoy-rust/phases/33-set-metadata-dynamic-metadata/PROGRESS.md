@@ -87,3 +87,37 @@ keep the in-crate `CompiledFormat(f)` test constructors unchanged.
 
 None on substance. The field and the mechanical sweep are exactly as specified; only the site count differs
 (22 actual literals vs. the PLAN's 33 token-occurrence estimate, as noted above).
+
+## Task 3 — AccessLogRecord.dynamic_metadata field + sweep
+
+Added the additive, default-empty field to `AccessLogRecord` (`crates/envoy-accesslog/src/record.rs`):
+
+```rust
+pub dynamic_metadata: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+```
+
+Per-request dynamic metadata (namespace → key → string value), copied from `FilterRequest.dynamic_metadata`
+at the HCM record-build site. Rendered by the future `%DYNAMIC_METADATA(namespace:key)%` operator. The struct
+still has NO `Default` impl — every construction site sets the field explicitly.
+
+**TDD:** new test `record_dynamic_metadata_defaults_empty_and_carries_values` in `record.rs` — constructs an
+empty-metadata record (asserts `dynamic_metadata.is_empty()`) and a populated one
+(`{"envoy.test": {"tier": "prod"}}`, asserts `record.dynamic_metadata["envoy.test"]["tier"] == "prod"`).
+Verified RED (no field `dynamic_metadata`, E0560/E0609) before adding the field.
+
+**Construction-site sweep (compiler-driven) — 8 literal sites updated:**
+- Production (3): `crates/envoy-http1/src/hcm.rs` (H1 record build ~1190 + the `make_test_record` literal ~1752),
+  `crates/envoy-http2/src/hcm.rs` (H2 record build ~889). Each set to `std::collections::BTreeMap::new()`
+  (default-empty; no operator reads it yet — wiring of `filter_req.dynamic_metadata` is Task 8).
+- In-crate (5): `command_operator.rs` `rec()`, `default_format.rs` `make_baseline_record()`, `file_sink.rs`
+  `make_record()`, and the two pre-existing `record.rs` test literals (`record_construction_full`,
+  `record_clone_is_deep_for_strings`).
+
+(The PLAN's "~13 literal sites" was a token-occurrence estimate; the compiler worklist found 8 true literals
+needing the field — the rest were `fn … -> AccessLogRecord {` signature lines.)
+
+**Verification:**
+- `cargo test -p envoy-accesslog` → `test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+- `cargo build -p envoy-http1 -p envoy-http2 --all-targets` → clean (no errors/warnings)
+- `cargo fmt -p envoy-accesslog -p envoy-http1 -p envoy-http2 --check` → clean
+- Behavior unchanged (default-empty); fixture 0012 stays byte-identical (no operator reads the field).

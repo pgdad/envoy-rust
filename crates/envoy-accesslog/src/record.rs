@@ -81,12 +81,53 @@ pub struct AccessLogRecord {
     /// impl (e.g., `127.0.0.1:8080` for IPv4, `[::1]:8080` for
     /// IPv6). `None` on direct_response paths.
     pub upstream_host: Option<String>,
+
+    /// Per-request dynamic metadata (namespace → key → string value), copied
+    /// from the pipeline's `FilterRequest.dynamic_metadata` at the HCM
+    /// record-build site (H1 hcm.rs ~1189, H2 hcm.rs ~888). Rendered by the
+    /// `%DYNAMIC_METADATA(namespace:key)%` command-operator (phase 33).
+    pub dynamic_metadata:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn record_dynamic_metadata_defaults_empty_and_carries_values() {
+        let empty = AccessLogRecord {
+            start_time: UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            protocol: "HTTP/1.1".into(),
+            response_code: 200,
+            response_flags: "-".into(),
+            bytes_received: 0,
+            bytes_sent: 3,
+            duration: Duration::from_millis(5),
+            upstream_service_time: None,
+            forwarded_for: None,
+            user_agent: None,
+            request_id: None,
+            authority: None,
+            upstream_host: None,
+            dynamic_metadata: BTreeMap::new(),
+        };
+        assert!(empty.dynamic_metadata.is_empty());
+
+        let mut dm: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        dm.entry("envoy.test".into())
+            .or_default()
+            .insert("tier".into(), "prod".into());
+        let populated = AccessLogRecord {
+            dynamic_metadata: dm,
+            ..empty
+        };
+        assert_eq!(populated.dynamic_metadata["envoy.test"]["tier"], "prod");
+    }
 
     #[test]
     fn record_construction_full() {
@@ -106,6 +147,7 @@ mod tests {
             request_id: None,
             authority: Some("envoy-rust.test".into()),
             upstream_host: None,
+            dynamic_metadata: BTreeMap::new(),
         };
         let dbg = format!("{:?}", record);
         assert!(dbg.contains("method: \"GET\""), "debug output: {}", dbg);
@@ -134,6 +176,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            dynamic_metadata: BTreeMap::new(),
         };
         let mut clone = original.clone();
         clone.method = "POST".into();

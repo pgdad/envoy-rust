@@ -1203,6 +1203,7 @@ async fn serve_connection(
                 request_id: access_log_header_value(&req.headers, "x-request-id"),
                 authority: access_log_header_value(&req.headers, "host"),
                 upstream_host: upstream_host_for_log,
+                dynamic_metadata: std::collections::BTreeMap::new(),
             };
             // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
             // time (BEFORE the per-sink await), per parent SPEC §6 Rule 4 —
@@ -1750,6 +1751,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }
 
