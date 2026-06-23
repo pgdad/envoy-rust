@@ -358,3 +358,106 @@ top-level form; `:N`); and the `set_metadata` config-shape note (`@type …v3.Co
 - `cargo test -p differential access_log_command_operators -- --include-ignored` → `test result: ok. 1 passed`
   (10.63s) — fixture 0040 stays GREEN after the `payload.bin` removal (Docker + `envoyproxy/envoy:v1.33.0` present;
   locally authoritative per memory `host-docker-desktop-virtiofs-no-inotify`).
+
+---
+
+## State-4 verification (`superpowers:verification-before-completion`)
+
+The §7.5 phase-done gate, re-run as one coherent pass at HEAD `dd9d80d` (state-3 docs commit).
+Gate (e) first (cheapest, catches the most); then (a)/(b) the differential suite, (c) h2spec, (d) fuzz.
+**Outcome: GREEN** — modulo two documented host-sensitive backend-routing differential false-REDs that CI
+covers (both confirmed `... ok` on CI run `27985371447`), and one host-environment h2spec artifact (the gate is
+`ok` on CI). One verification-only code fix landed (the clippy nit, commit `883cf8a`) BEFORE this docs commit.
+
+### Gate (e) — build / clippy / fmt / test / deny
+
+- **`cargo build --workspace --all-targets`** → exit 0: `Finished \`dev\` profile [unoptimized + debuginfo]
+  target(s) in 0.09s`.
+- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** → FIRST workspace-wide clippy over
+  the whole tree (per memory `envoy-rust-state4-ci-first-execution`; the per-task subagents ran per-crate
+  `cargo fmt` but NOT workspace `clippy -D warnings`). **Surfaced one nit** (as the memory predicted):
+  ```
+  error: redundant guard
+     --> crates/envoy-accesslog/src/command_operator.rs:300:25
+  300 |         Some((_, a)) if a.is_empty() => {
+      = note: `-D clippy::redundant-guards` implied by `-D warnings`
+  ```
+  Fixed in-place (`Some((_, a)) if a.is_empty()` → `Some((_, "")`; semantically identical, covered by the
+  existing `empty_alternate_is_error` test) — committed as `883cf8a` BEFORE this docs commit. **Re-run clean:**
+  `Finished \`dev\` profile … in 3.08s`, **exit 0, 0 errors / 0 warnings**.
+- **`cargo fmt --all -- --check`** → exit 0 (clean; no fmt drift).
+- **`cargo test --workspace`** initially halted (`exit 101`) on the FIRST test binary that failed — the
+  host-sensitive `differential` crate (cargo stops at the first failing binary), BEFORE running the per-crate
+  unit tests. Split to isolate signal:
+  - **`cargo test --workspace --exclude differential`** → **exit 0, 1396 passed; 0 failed** across all bins,
+    including the phase-33 crates: `envoy-accesslog` **48 passed**, `envoy-config` **486 passed**,
+    `envoy-filter` **177 passed**, `envoy-http1` **128 passed**, `envoy-http2` **73 passed; 1 ignored** (all
+    matching the state-3 per-crate counts).
+  - the `differential` crate is gated separately under (a)/(b) below.
+- **`cargo deny check`** → exit 0: `advisories ok, bans ok, licenses ok, sources ok` (the 4
+  `license-not-encountered` lines are benign unmatched allow-list entries, not failures).
+
+### Gates (a) + (b) — the differential suite
+
+Ran `cargo test -p differential --no-fail-fast -- --include-ignored` to enumerate (not halt on) every fixture.
+**Result: 192 `... ok`, 2 `... FAILED`.**
+
+- **(a) fixture `0041` GREEN:** `test set_metadata_dynamic_metadata ... ok` — cross-proxy byte-identical
+  against live `envoyproxy/envoy:v1.33.0` (both probes: present `tier=prod`, absent `missk=- missns=-`). This
+  re-confirms the state-3 headline; access-log file-scrape → locally authoritative (memory
+  `host-docker-desktop-virtiofs-no-inotify`).
+- **(b) `0001`–`0040` + the non-backend-routing set GREEN:** `access_log_command_operators ... ok` (fixture
+  0040, incl. the `0012` byte-identical default-format surface), plus every `http_filter_*`, `lb_*` (ring_hash /
+  maglev / subset), `tls_*`, `xds_*` / `eds` / `rds`, `http1/http2_direct_response`, `http1_router_upstream`,
+  `http2_router_upstream`, `tcp_proxy`, `echo`, and the `upstream_*` pooling/circuit-breaker/outlier/health
+  fixtures — all `... ok`.
+- **The 2 FAILED are documented host-sensitive backend-routing false-REDs, NOT phase-33 regressions:**
+  1. `admin_config_dump_server_info` — divergence is entirely `backend::192.168.65.2:32949::…` (this host routes
+     the Docker backend via `192.168.65.2`, not CI's allow-listed `172.17.0.1` — memory
+     `differential-host-bridge-ip-192-168-65-2`).
+  2. `upstream_retry_on_5xx_fixture` — `upstream admin listener never became accept-ready` / `127.0.0.1:… not
+     accept-ready within 10s: Connection refused (os error 111)` (the upstream Docker container's admin port did
+     not bind/route on this Docker-Desktop host — same backend-routing host-sensitivity family).
+  **Both confirmed `... ok` on CI** (Linux, `172.17.0.1`): CI run `27985371447` (latest `main`, all jobs
+  `success`) shows `test admin_config_dump_server_info ... ok` and `test upstream_retry_on_5xx_fixture ... ok`.
+  Phase 33 is additive + inert outside a `set_metadata` chain → zero content-divergence risk to these fixtures.
+
+### Gate (c) — h2spec ≥95%
+
+Locally the gate normally SKIPS (no `h2spec` binary → `eprintln!`-skip). To obtain real local evidence the
+`h2spec` 2.6.0 binary (CI's pinned version) was downloaded and put on PATH, then `cargo test -p
+h2spec-conformance`:
+- **Pass rate `1.0000` — `146 tests, 145 passed, 1 skipped, 0 failed`** (well above the 0.95 gate).
+- BUT the runner's lockstep secondary assertion tripped (deterministic, 3/3 re-runs):
+  `known-failures.txt has stale entries (now passing): ["3.5/2"]`. Local h2spec scores http2 §3.5/2 ("Sends
+  invalid connection preface") as ✔ pass on this host.
+- **This is a host-environment artifact, NOT a phase-33 issue, and the entry must NOT be trimmed:**
+  - Phase 33 touched ZERO HTTP/2 codec / preface / handshake code and ZERO dependencies (`h2` crate is
+    UNCHANGED at `0.4.13` since the known-failure landed at phase 05.2 `dac3f8b`) → the gate's state is
+    byte-identical with or without phase 33.
+  - **On CI the gate is GREEN:** CI run `27985371447` shows `test h2spec_pass_rate_gate ... ok` — i.e. on CI's
+    environment §3.5/2 still FAILS, so the known-failure is correct there (it was landed via a phase-05.2
+    post-CI fixup and has survived 28 phases of green CI runs). Trimming based on this host's pass would BREAK
+    CI (the runner would then see §3.5/2 fail without it being listed → regression panic).
+  - Gate (c) is therefore SATISFIED on the authoritative platform (CI). The local stale-entry result is a
+    host-sensitive false-RED analogous to the Docker-bridge-IP cases.
+
+### Gate (d) — fuzz (existing targets, short CI budget; NO new target, NO ci.yml change)
+
+Confirmed by inspection: exactly two targets exist (`crates/envoy-accesslog/fuzz/fuzz_targets/accesslog_format_parse.rs`,
+`crates/envoy-config/fuzz/fuzz_targets/parse_bootstrap.rs`); both already have ci.yml steps (lines 106 / 126);
+T12 added only corpus SEEDS — so memory `new-fuzz-target-needs-a-ci-yml-step` is satisfied (no new target).
+
+- **`cargo +nightly fuzz run accesslog_format_parse -- -max_total_time=30`** → `Done 4363443 runs in 31
+  second(s)` — **0 crashes** (`cov: 405` stable; no `crash-`/`leak`/`ERROR`/`panic`).
+- **`cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`** → `Done 453797 runs in 31 second(s)` —
+  **0 crashes**.
+
+### State-4 conclusion
+
+§7.5 gate **GREEN** (green modulo the two documented host-sensitive backend-routing differential false-REDs and
+the one h2spec host-environment artifact — all three confirmed `... ok` on CI run `27985371447`). One
+verification-only fix landed (`883cf8a`, the clippy `redundant_guards` nit). No state-3 re-entry warranted (no
+genuine defect surfaced). `#![forbid(unsafe_code)]` holds; NO new crate / dependency / fuzz-target / ci.yml
+change. Advancing STATE → `33` state-4-complete / state-5-next; the state-5 code-review (`REVIEW.md` via
+`superpowers:requesting-code-review`) is the SEPARATE next session.
