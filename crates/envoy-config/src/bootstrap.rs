@@ -3456,14 +3456,13 @@ pub(crate) fn validate_http_filters(
                 }
                 validate_set_metadata_config(cfg, listener_name)?;
             }
-            crate::HttpFilterTypedConfig::HeaderToMetadata(_cfg) => {
+            crate::HttpFilterTypedConfig::HeaderToMetadata(cfg) => {
                 if f.name != "envoy.filters.http.header_to_metadata" {
                     return Err(crate::ConfigError::UnsupportedHttpFilter {
                         name: f.name.clone(),
                     });
                 }
-                // Phase 34 T1: name/typed_config consistency is the sole gate at this task;
-                // per-rule validation (empty key, etc.) is added in a later task.
+                validate_header_to_metadata_config(cfg, listener_name)?;
             }
         }
     }
@@ -3799,6 +3798,52 @@ fn validate_set_metadata_config(
             return Err(crate::ConfigError::SetMetadataEmptyNamespace {
                 listener: listener_name.to_string(),
             });
+        }
+    }
+    Ok(())
+}
+
+fn validate_header_to_metadata_config(
+    cfg: &crate::HeaderToMetadataConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    let bad = |detail: String| crate::ConfigError::HeaderToMetadataInvalidRule {
+        listener: listener_name.to_string(),
+        detail,
+    };
+    for rule in &cfg.request_rules {
+        if rule.header.is_empty() {
+            return Err(bad("a rule has an empty `header`".into()));
+        }
+        if rule.on_header_present.is_none() && rule.on_header_missing.is_none() {
+            return Err(bad(format!(
+                "rule for header `{}` has neither on_header_present nor on_header_missing",
+                rule.header
+            )));
+        }
+        for kv in [
+            rule.on_header_present.as_ref(),
+            rule.on_header_missing.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if kv.key.is_empty() {
+                return Err(bad(format!(
+                    "rule for header `{}` has an empty `key`",
+                    rule.header
+                )));
+            }
+        }
+        if rule
+            .on_header_missing
+            .as_ref()
+            .is_some_and(|miss| miss.value.is_none())
+        {
+            return Err(bad(format!(
+                "on_header_missing for header `{}` requires a `value`",
+                rule.header
+            )));
         }
     }
     Ok(())
@@ -15608,6 +15653,7 @@ admin:
 // ---------------------------------------------------------------------------
 // Phase 34 Task 1: HeaderToMetadataConfig schema tests
 // ---------------------------------------------------------------------------
+#[cfg(test)]
 mod header_to_metadata_config_tests {
     use super::*;
 
@@ -15690,6 +15736,138 @@ typed_config:
         assert!(
             r.is_err(),
             "deferred `remove` field must be rejected by deny_unknown_fields"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 34 Task 2: header_to_metadata validator tests (via parse_bootstrap)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod header_to_metadata_validator_tests {
+    /// Full bootstrap YAML with one HCM containing a `header_to_metadata` filter,
+    /// parameterized on filter `name` and raw YAML for the `request_rules` block.
+    fn bootstrap_with_header_to_metadata(filter_name: &str, request_rules_yaml: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address: {{ address: 0.0.0.0, port_value: 8080 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: local
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok\n" }}
+                http_filters:
+                  - name: {filter_name}
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config
+                      request_rules:
+{request_rules_yaml}
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+admin:
+  address:
+    socket_address: {{ address: 0.0.0.0, port_value: 9901 }}
+"#
+        )
+    }
+
+    #[test]
+    fn header_to_metadata_empty_header_is_fatal() {
+        let rules = r#"                      - header: ""
+                        on_header_present:
+                          key: tier"#;
+        let yaml =
+            bootstrap_with_header_to_metadata("envoy.filters.http.header_to_metadata", rules);
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::HeaderToMetadataInvalidRule { .. }),
+            "expected HeaderToMetadataInvalidRule, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_to_metadata_no_action_is_fatal() {
+        let rules = r#"                      - header: x-tier"#;
+        let yaml =
+            bootstrap_with_header_to_metadata("envoy.filters.http.header_to_metadata", rules);
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::HeaderToMetadataInvalidRule { .. }),
+            "expected HeaderToMetadataInvalidRule, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_to_metadata_empty_key_is_fatal() {
+        let rules = r#"                      - header: x-tier
+                        on_header_present:
+                          key: """#;
+        let yaml =
+            bootstrap_with_header_to_metadata("envoy.filters.http.header_to_metadata", rules);
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::HeaderToMetadataInvalidRule { .. }),
+            "expected HeaderToMetadataInvalidRule, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_to_metadata_empty_key_on_missing_is_fatal() {
+        let rules = r#"                      - header: x-tier
+                        on_header_missing:
+                          key: ""
+                          value: default"#;
+        let yaml =
+            bootstrap_with_header_to_metadata("envoy.filters.http.header_to_metadata", rules);
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::HeaderToMetadataInvalidRule { .. }),
+            "expected HeaderToMetadataInvalidRule, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_to_metadata_missing_without_value_is_fatal() {
+        let rules = r#"                      - header: x-tier
+                        on_header_missing:
+                          key: tier"#;
+        let yaml =
+            bootstrap_with_header_to_metadata("envoy.filters.http.header_to_metadata", rules);
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::HeaderToMetadataInvalidRule { .. }),
+            "expected HeaderToMetadataInvalidRule, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_to_metadata_name_mismatch_is_unsupported() {
+        let rules = r#"                      - header: x-tier
+                        on_header_present:
+                          key: tier"#;
+        let yaml = bootstrap_with_header_to_metadata("envoy.filters.http.wrong_name", rules);
+        let err = crate::parse_bootstrap(&yaml).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedHttpFilter { .. }),
+            "expected UnsupportedHttpFilter for name mismatch, got {err:?}"
         );
     }
 }

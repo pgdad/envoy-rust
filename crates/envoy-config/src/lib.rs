@@ -728,6 +728,12 @@ pub enum ConfigError {
         "set_metadata filter on listener `{listener}` has an empty metadata_namespace; a non-empty namespace is required"
     )]
     SetMetadataEmptyNamespace { listener: String },
+
+    /// Phase 34 (§A5-LOCKED): a `header_to_metadata` rule is malformed (empty header, no action,
+    /// empty key, or an on_header_missing with no value). Envoy rejects these boot-fatally; envoy-rust
+    /// matches (ADR-0049). `listener` names the offending HCM; `detail` the specific violation.
+    #[error("header_to_metadata filter on listener `{listener}` has an invalid rule: {detail}")]
+    HeaderToMetadataInvalidRule { listener: String, detail: String },
 }
 
 pub fn parse_bootstrap(yaml: &str) -> Result<Bootstrap, ConfigError> {
