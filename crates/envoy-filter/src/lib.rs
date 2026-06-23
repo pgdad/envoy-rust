@@ -19,6 +19,7 @@ pub mod local_rate_limit;
 pub mod pipeline;
 pub mod rbac;
 pub mod router;
+pub mod set_metadata;
 pub mod types;
 
 pub use buffer::BufferFilter;
@@ -33,4 +34,5 @@ pub use local_rate_limit::LocalRateLimitFilter;
 pub use pipeline::{Decision, FilterPipeline};
 pub use rbac::RbacFilter;
 pub use router::RouterTerminus;
+pub use set_metadata::SetMetadataFilter;
 pub use types::{FilterRequest, FilterResponse};

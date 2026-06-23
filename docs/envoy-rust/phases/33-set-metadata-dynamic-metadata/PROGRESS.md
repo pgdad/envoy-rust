@@ -157,3 +157,34 @@ needing the field — the rest were `fn … -> AccessLogRecord {` signature line
 - NOTE: `envoy-filter` is intentionally RED (`HttpFilterInstance::build` non-exhaustive match on the new
   `SetMetadata` variant) until the instance-wiring task (Task 7). Per the PLAN sequencing rule, the gate for
   Tasks 4+5 is `cargo test -p envoy-config` only — NOT a workspace build.
+
+## Tasks 6+7 — SetMetadataFilter + HttpFilterInstance wiring
+
+**Task 6 — the filter (`crates/envoy-filter/src/set_metadata.rs`, new):**
+- Added `SetMetadataFilter { metadata: Vec<MetadataEntry> }` with `new(&SetMetadataConfig)`,
+  `decode_headers` (merges each entry's `value` into `req.dynamic_metadata[ns]`, honoring
+  `allow_overwrite`), and an inert `encode_headers`. Decode-side, **Continue-ONLY** — NEVER
+  `StopAndSend` (observability plumbing; §A-LOCKED). Follows the `cdn_loop.rs` add-a-decode-side-filter
+  precedent.
+- Wired `pub mod set_metadata;` + `pub use set_metadata::SetMetadataFilter;` into `lib.rs` (sibling pattern).
+- Tests (`set_metadata::tests`): `writes_value_under_namespace_and_continues`, `multi_namespace_multi_entry`,
+  `allow_overwrite_false_keeps_existing`, `allow_overwrite_true_overwrites`, `encode_is_inert`.
+
+**Task 7 — instance wiring (`crates/envoy-filter/src/instance.rs`):**
+- Added `use crate::set_metadata::SetMetadataFilter;`, the `SetMetadata(SetMetadataFilter)` enum variant
+  (doc comment mirroring `CdnLoop`), the `build` arm (`SetMetadata(cfg) => …SetMetadataFilter::new(cfg)`),
+  and the `decode_headers` / `encode_headers` dispatch arms. `apply_route_config` uses the existing
+  `_ => {}` fall-through (no per-route config); updated the no-per-route-config comment to list `SetMetadata`.
+- Test (`instance::tests`): `builds_set_metadata_instance_and_writes` — builds via `HttpFilterInstance::build`,
+  matches `SetMetadata(_)`, decode → `Continue` + `dynamic_metadata["envoy.test"]["tier"]=="prod"`, encode → `Continue`.
+
+**RED WINDOW CLOSED:** the `HttpFilterInstance::build` non-exhaustive match opened by Task 4's
+`HttpFilterTypedConfig::SetMetadata` variant is now exhaustive.
+
+**Verification:**
+- `cargo test -p envoy-filter` → `test result: ok. 177 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out`
+  (the new set_metadata + instance tests + every pre-existing).
+- `cargo build -p envoy-http1 -p envoy-http2 --all-targets` → clean.
+- `cargo build -p envoy-bin` → clean (binary compiles with the new variant).
+- `cargo fmt -p envoy-filter --check` → clean. `#![forbid(unsafe_code)]` holds.
+- Continue-only honored: no `StopAndSend` anywhere in `set_metadata.rs`.
