@@ -481,6 +481,20 @@ pub enum ConfigError {
         depth: u32,
     },
 
+    /// Phase 35: an RBAC `metadata` matcher is malformed — an empty `filter`
+    /// (Envoy: PGV min_len 1) or a `path` whose length is not exactly 1 (Envoy accepts a
+    /// multi-segment path; envoy-rust's flat string store cannot resolve it → stricter boot-fatal).
+    /// Both are config-load-time fatal (ADR-0049).
+    #[error(
+        "HCM listener {listener:?}: RBAC policy {policy_name:?} metadata matcher at {path} is invalid: {detail}"
+    )]
+    RbacMetadataMatcherInvalid {
+        listener: String,
+        policy_name: String,
+        path: String,
+        detail: String,
+    },
+
     /// Phase 11: fault filter `abort.http_status` outside the syntactic HTTP
     /// status band (100..=599).
     #[error(
