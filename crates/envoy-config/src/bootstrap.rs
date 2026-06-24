@@ -1323,16 +1323,6 @@ pub struct Policy {
     pub principals: Vec<Principal>,
 }
 
-/// RBAC Permission. Only header-based + combinators land at phase 10;
-/// `url_path`, `destination_ip`, `destination_port[_range]`, `metadata`,
-/// `requested_server_name[_matcher]`, `uri_template` defer per phase-10 SPEC §4.
-///
-/// Deserialize is hand-rolled because `serde_yaml` 0.9 does not support
-/// externally-tagged enums via plain YAML maps (`{any: true}`) — it expects
-/// YAML `!Tag` syntax. The hand-rolled impl mirrors the 04.2 `HeaderMatcher`
-/// pattern: visit a map with exactly one key, dispatch to the matching variant.
-/// Serialize derive is retained (produces `{"any":true}` for JSON, which the
-/// 08.1 roundtrip path uses).
 /// RBAC `metadata` matcher (phase 35). Reads a single-segment dynamic-metadata
 /// path. `filter` is the namespace (the producer's `metadata_namespace`). The MVP models
 /// a single `path` segment + a string-only `value` (multi-segment path + non-string_match
@@ -1400,6 +1390,16 @@ impl<'de> serde::Deserialize<'de> for ValueMatcher {
     }
 }
 
+/// RBAC Permission. Only header-based + combinators land at phase 10;
+/// `url_path`, `destination_ip`, `destination_port[_range]`, `metadata`,
+/// `requested_server_name[_matcher]`, `uri_template` defer per phase-10 SPEC §4.
+///
+/// Deserialize is hand-rolled because `serde_yaml` 0.9 does not support
+/// externally-tagged enums via plain YAML maps (`{any: true}`) — it expects
+/// YAML `!Tag` syntax. The hand-rolled impl mirrors the 04.2 `HeaderMatcher`
+/// pattern: visit a map with exactly one key, dispatch to the matching variant.
+/// Serialize derive is retained (produces `{"any":true}` for JSON, which the
+/// 08.1 roundtrip path uses).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Permission {
     #[serde(rename = "any")]
@@ -12122,6 +12122,33 @@ rules:
                 }
                 other => panic!("expected Metadata, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn rbac_metadata_permission_json_round_trips() {
+            // BEHAVIOR_CONTRACT A1: the metadata matcher field names round-trip verbatim
+            // (snake_case) through /config_dump. /config_dump is a JSON surface (mirrors the
+            // 08.1 JSON roundtrip test at bootstrap.rs:14771), so JSON is the correct
+            // serializer here. (YAML serialize would emit `!Tag` syntax for these
+            // externally-tagged enums — the exact serde_yaml 0.9 limitation the hand-rolled
+            // Permission/ValueMatcher Deserialize impls exist to work around — so the JSON
+            // round-trip, not a YAML one, is what backs the A1 config_dump claim.)
+            let yaml = r#"
+metadata:
+  filter: envoy.filters.http.header_to_metadata
+  path:
+    - key: tier
+  value:
+    string_match: { exact: "prod" }
+"#;
+            let p1: Permission = serde_yaml::from_str(yaml).expect("parses");
+            let json = serde_json::to_string(&p1).expect("serializes to JSON");
+            let p2: Permission = serde_json::from_str(&json).expect("JSON re-parses");
+            assert_eq!(p1, p2);
+            // and assert the JSON uses the verbatim snake_case keys, not Rust variant names
+            assert!(json.contains("\"metadata\""));
+            assert!(json.contains("\"filter\""));
+            assert!(json.contains("\"string_match\""));
         }
 
         #[test]
