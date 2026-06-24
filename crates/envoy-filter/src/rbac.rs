@@ -37,6 +37,10 @@ pub(crate) enum RuntimePermission {
     OrRules(Vec<RuntimePermission>),
     /// Negation of a single inner rule.
     NotRule(Box<RuntimePermission>),
+    /// Phase 35: dynamic-metadata condition. Holds the config matcher directly
+    /// (the `Header(HeaderMatcher)` precedent). Reads a single-segment metadata
+    /// path; absent namespace/key → no match.
+    Metadata(envoy_config::MetadataMatcher),
 }
 
 /// Build-time-lowered runtime representation of an Envoy RBAC `Principal`.
@@ -57,6 +61,10 @@ pub(crate) enum RuntimePrincipal {
     OrIds(Vec<RuntimePrincipal>),
     /// Negation of a single inner id.
     NotId(Box<RuntimePrincipal>),
+    /// Phase 35: dynamic-metadata condition. Holds the config matcher directly
+    /// (the `Header(HeaderMatcher)` precedent). Reads a single-segment metadata
+    /// path; absent namespace/key → no match.
+    Metadata(envoy_config::MetadataMatcher),
 }
 
 /// Recursive tree-walk evaluator for `RuntimePermission`. Synchronous,
@@ -70,7 +78,18 @@ pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> boo
         RuntimePermission::AndRules(set) => set.iter().all(|p| eval_permission(p, req)),
         RuntimePermission::OrRules(set) => set.iter().any(|p| eval_permission(p, req)),
         RuntimePermission::NotRule(inner) => !eval_permission(inner, req),
+        RuntimePermission::Metadata(m) => eval_metadata(m, req),
     }
+}
+
+/// Phase 35: resolve the single-segment metadata path and apply the ValueMatcher.
+/// Absent namespace OR absent key → no match (false). The config validator
+/// guarantees `path.len() == 1` (boot-fatal otherwise), so `path[0]` is safe.
+fn eval_metadata(m: &envoy_config::MetadataMatcher, req: &FilterRequest) -> bool {
+    req.dynamic_metadata
+        .get(&m.filter)
+        .and_then(|ns| ns.get(&m.path[0].key))
+        .is_some_and(|v| m.value.matches(v))
 }
 
 /// Recursive tree-walk evaluator for `RuntimePrincipal`. Structurally
@@ -83,6 +102,7 @@ pub(crate) fn eval_principal(p: &RuntimePrincipal, req: &FilterRequest) -> bool 
         RuntimePrincipal::AndIds(set) => set.iter().all(|p| eval_principal(p, req)),
         RuntimePrincipal::OrIds(set) => set.iter().any(|p| eval_principal(p, req)),
         RuntimePrincipal::NotId(inner) => !eval_principal(inner, req),
+        RuntimePrincipal::Metadata(m) => eval_metadata(m, req),
     }
 }
 
@@ -219,6 +239,7 @@ fn lower_permission(p: &envoy_config::Permission) -> RuntimePermission {
         envoy_config::Permission::NotRule(inner) => {
             RuntimePermission::NotRule(Box::new(lower_permission(inner)))
         }
+        envoy_config::Permission::Metadata(m) => RuntimePermission::Metadata(m.clone()),
     }
 }
 
@@ -238,13 +259,17 @@ fn lower_principal(p: &envoy_config::Principal) -> RuntimePrincipal {
         envoy_config::Principal::NotId(inner) => {
             RuntimePrincipal::NotId(Box::new(lower_principal(inner)))
         }
+        envoy_config::Principal::Metadata(m) => RuntimePrincipal::Metadata(m.clone()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use envoy_config::{HeaderMatcher, HeaderMatcherMode, StringMatcher, StringMatcherMode};
+    use envoy_config::{
+        HeaderMatcher, HeaderMatcherMode, MetadataMatcher, MetadataPathSegment, StringMatcher,
+        StringMatcherMode, ValueMatcher,
+    };
 
     fn req_with(headers: Vec<(&'static str, &'static str)>) -> FilterRequest {
         FilterRequest {
@@ -365,6 +390,87 @@ mod tests {
             )))),
         ]);
         assert!(eval_permission(&perm, &req));
+    }
+
+    fn metadata_matcher(filter: &str, key: &str, exact: &str) -> MetadataMatcher {
+        MetadataMatcher {
+            filter: filter.to_string(),
+            path: vec![MetadataPathSegment {
+                key: key.to_string(),
+            }],
+            value: ValueMatcher::StringMatch(StringMatcher {
+                mode: StringMatcherMode::Exact(exact.to_string()),
+                ignore_case: false,
+            }),
+        }
+    }
+
+    // a req carrying dynamic_metadata[ns][key] = val
+    fn req_with_md(ns: &str, key: &str, val: &str) -> FilterRequest {
+        let mut req = req_with(vec![]);
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(key.to_string(), val.to_string());
+        req.dynamic_metadata.insert(ns.to_string(), inner);
+        req
+    }
+
+    #[test]
+    fn metadata_permission_matches_present_value() {
+        let req = req_with_md("envoy.filters.http.header_to_metadata", "tier", "prod");
+        let perm = RuntimePermission::Metadata(metadata_matcher(
+            "envoy.filters.http.header_to_metadata",
+            "tier",
+            "prod",
+        ));
+        assert!(eval_permission(&perm, &req));
+    }
+
+    #[test]
+    fn metadata_permission_no_match_on_value_mismatch() {
+        // tier=dev present but matcher wants exact "prod" → false
+        let req = req_with_md("envoy.filters.http.header_to_metadata", "tier", "dev");
+        let perm = RuntimePermission::Metadata(metadata_matcher(
+            "envoy.filters.http.header_to_metadata",
+            "tier",
+            "prod",
+        ));
+        assert!(!eval_permission(&perm, &req));
+    }
+
+    #[test]
+    fn metadata_permission_no_match_on_absent_namespace() {
+        // req has a DIFFERENT namespace → false
+        let req = req_with_md("some.other.ns", "tier", "prod");
+        let perm = RuntimePermission::Metadata(metadata_matcher(
+            "envoy.filters.http.header_to_metadata",
+            "tier",
+            "prod",
+        ));
+        assert!(!eval_permission(&perm, &req));
+    }
+
+    #[test]
+    fn metadata_permission_no_match_on_absent_key() {
+        // namespace present, but a different key → false
+        let req = req_with_md("envoy.filters.http.header_to_metadata", "other_key", "prod");
+        let perm = RuntimePermission::Metadata(metadata_matcher(
+            "envoy.filters.http.header_to_metadata",
+            "tier",
+            "prod",
+        ));
+        assert!(!eval_permission(&perm, &req));
+    }
+
+    #[test]
+    fn metadata_principal_mirrors_permission() {
+        // RuntimePrincipal::Metadata, same present-value match
+        let req = req_with_md("envoy.filters.http.header_to_metadata", "tier", "prod");
+        let prin = RuntimePrincipal::Metadata(metadata_matcher(
+            "envoy.filters.http.header_to_metadata",
+            "tier",
+            "prod",
+        ));
+        assert!(eval_principal(&prin, &req));
     }
 
     #[test]
