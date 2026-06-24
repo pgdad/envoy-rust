@@ -702,4 +702,203 @@ mod tests {
             crate::pipeline::Decision::Continue
         ));
     }
+
+    // --- Task 4: in-process producer→consumer backstop ----------------------
+    //
+    // These prove, IN-PROCESS through the real (non-test-util) pipeline, the
+    // load-bearing mechanism that the cross-proxy fixture (Task 5) cannot show
+    // deterministically: a real `header_to_metadata` PRODUCER writes
+    // `dynamic_metadata` that the real `rbac` CONSUMER reads in the SAME decode
+    // pass. Built via the non-gated `build_from_config` paths so they run under
+    // plain `cargo test --workspace` (NOT behind `test-util`).
+
+    // (A) mid-chain: [header_to_metadata, rbac] driven by the real FilterPipeline.
+    fn h2m_then_rbac_pipeline(action: envoy_config::Action) -> crate::pipeline::FilterPipeline {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        // producer: x-tier -> envoy.filters.http.header_to_metadata:tier
+        let hf_h2m = envoy_config::HttpFilter {
+            name: "envoy.filters.http.header_to_metadata".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::HeaderToMetadata(
+                envoy_config::HeaderToMetadataConfig {
+                    request_rules: vec![envoy_config::HeaderToMetadataRule {
+                        header: "x-tier".to_string(),
+                        on_header_present: Some(envoy_config::HeaderToMetadataKeyValue {
+                            metadata_namespace: "envoy.filters.http.header_to_metadata".to_string(),
+                            key: "tier".to_string(),
+                            value: None,
+                            r#type: envoy_config::HeaderToMetadataType::String,
+                        }),
+                        on_header_missing: None,
+                    }],
+                },
+            ),
+        };
+        // consumer: ALLOW/DENY policy whose Permission is metadata tier==prod.
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "tier_prod".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Metadata(metadata_matcher(
+                    "envoy.filters.http.header_to_metadata",
+                    "tier",
+                    "prod",
+                ))],
+                principals: vec![envoy_config::Principal::Any(true)],
+            },
+        );
+        let hf_rbac = envoy_config::HttpFilter {
+            name: "envoy.filters.http.rbac".to_string(),
+            typed_config: envoy_config::HttpFilterTypedConfig::Rbac(envoy_config::RbacConfig {
+                rules: envoy_config::Rules { action, policies },
+            }),
+        };
+        crate::pipeline::FilterPipeline::build_from_config(
+            &[hf_h2m, hf_rbac],
+            &registry,
+            "ingress_http",
+        )
+        .expect("pipeline builds")
+    }
+
+    #[test]
+    fn mid_chain_producer_then_consumer_allows_prod() {
+        // The consumer reads the producer's mid-pass write: x-tier:prod →
+        // metadata tier==prod → ALLOW policy matches → Continue.
+        let mut pipeline = h2m_then_rbac_pipeline(envoy_config::Action::Allow);
+        let mut req = req_with(vec![("x-tier", "prod")]);
+        assert!(matches!(
+            pipeline.decode_headers(&mut req),
+            crate::pipeline::Decision::Continue
+        ));
+    }
+
+    #[test]
+    fn mid_chain_producer_then_consumer_denies_dev() {
+        // x-tier:dev → metadata tier==dev → ALLOW policy (wants prod) no match → 403.
+        let mut pipeline = h2m_then_rbac_pipeline(envoy_config::Action::Allow);
+        let mut req = req_with(vec![("x-tier", "dev")]);
+        match pipeline.decode_headers(&mut req) {
+            crate::pipeline::Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 403);
+                assert_eq!(&resp.body[..], b"RBAC: access denied");
+            }
+            other => panic!("expected StopAndSend(403), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mid_chain_absent_header_denies() {
+        // No x-tier → header_to_metadata writes nothing → key unset → no match → 403.
+        let mut pipeline = h2m_then_rbac_pipeline(envoy_config::Action::Allow);
+        let mut req = req_with(vec![]);
+        match pipeline.decode_headers(&mut req) {
+            crate::pipeline::Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 403);
+                assert_eq!(&resp.body[..], b"RBAC: access denied");
+            }
+            other => panic!("expected StopAndSend(403), got {other:?}"),
+        }
+    }
+
+    // (B) composition / Principal / DENY-inversion — standalone RbacFilter with
+    // metadata injected directly (no producer needed).
+
+    #[test]
+    fn metadata_composes_in_and_rules() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let ns = "envoy.filters.http.header_to_metadata";
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "p".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::AndRules(
+                    envoy_config::PermissionSet {
+                        rules: vec![
+                            envoy_config::Permission::Metadata(metadata_matcher(
+                                ns, "tier", "prod",
+                            )),
+                            envoy_config::Permission::Any(true),
+                        ],
+                    },
+                )],
+                principals: vec![envoy_config::Principal::Any(true)],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let mut filter = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").unwrap();
+
+        // tier==prod → and_rules all-true → ALLOW → Continue.
+        let mut req_prod = req_with_md(ns, "tier", "prod");
+        assert!(matches!(
+            filter.decode_headers(&mut req_prod),
+            crate::pipeline::Decision::Continue
+        ));
+
+        // tier==dev → metadata child fails → and_rules fails → no match → 403.
+        let mut req_dev = req_with_md(ns, "tier", "dev");
+        match filter.decode_headers(&mut req_dev) {
+            crate::pipeline::Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 403);
+                assert_eq!(&resp.body[..], b"RBAC: access denied");
+            }
+            other => panic!("expected StopAndSend(403), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_principal_and_deny_inversion() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let ns = "envoy.filters.http.header_to_metadata";
+        let registry = Arc::new(StatsRegistry::new());
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "deny_prod".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::Metadata(metadata_matcher(
+                    ns, "tier", "prod",
+                ))],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Deny,
+                policies,
+            },
+        };
+        let mut filter = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").unwrap();
+
+        // tier==prod → Principal::Metadata matches → DENY action match → 403.
+        let mut req_prod = req_with_md(ns, "tier", "prod");
+        match filter.decode_headers(&mut req_prod) {
+            crate::pipeline::Decision::StopAndSend(resp) => {
+                assert_eq!(resp.status, 403);
+                assert_eq!(&resp.body[..], b"RBAC: access denied");
+            }
+            other => panic!("expected StopAndSend(403), got {other:?}"),
+        }
+
+        // tier==dev → Principal::Metadata no match → DENY action no_match → Continue.
+        let mut req_dev = req_with_md(ns, "tier", "dev");
+        assert!(matches!(
+            filter.decode_headers(&mut req_dev),
+            crate::pipeline::Decision::Continue
+        ));
+    }
 }
