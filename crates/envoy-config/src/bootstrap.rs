@@ -1333,6 +1333,73 @@ pub struct Policy {
 /// pattern: visit a map with exactly one key, dispatch to the matching variant.
 /// Serialize derive is retained (produces `{"any":true}` for JSON, which the
 /// 08.1 roundtrip path uses).
+/// RBAC `metadata` matcher (phase 35). Reads a single-segment dynamic-metadata
+/// path. `filter` is the namespace (the producer's `metadata_namespace`). The MVP models
+/// a single `path` segment + a string-only `value` (multi-segment path + non-string_match
+/// value are stricter-than-Envoy boot-fatal). `value` is REQUIRED.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataMatcher {
+    pub filter: String,
+    pub path: Vec<MetadataPathSegment>,
+    pub value: ValueMatcher,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataPathSegment {
+    pub key: String,
+}
+
+/// Envoy `type.matcher.v3.ValueMatcher` (string-only MVP). The hand-rolled "exactly one
+/// key" Deserialize accepts ONLY `string_match`; any other oneof key (`present_match`, …) →
+/// `unknown_field` → boot-fatal (stricter than Envoy, which accepts them). Mirrors the
+/// `Permission`/`StringMatcher` visitor template.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum ValueMatcher {
+    #[serde(rename = "string_match")]
+    StringMatch(StringMatcher),
+}
+
+impl<'de> serde::Deserialize<'de> for ValueMatcher {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        use std::fmt;
+
+        const KEYS: &[&str] = &["string_match"];
+
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ValueMatcher;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a ValueMatcher map with exactly one of {KEYS:?} as key")
+            }
+            fn visit_map<M>(self, mut map: M) -> Result<ValueMatcher, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    M::Error::custom("ValueMatcher: expected one map key, got none")
+                })?;
+                let value = match key.as_str() {
+                    "string_match" => ValueMatcher::StringMatch(map.next_value::<StringMatcher>()?),
+                    other => return Err(M::Error::unknown_field(other, KEYS)),
+                };
+                if map.next_key::<String>()?.is_some() {
+                    return Err(M::Error::custom(
+                        "ValueMatcher: expected exactly one map key, got more",
+                    ));
+                }
+                Ok(value)
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum Permission {
     #[serde(rename = "any")]
@@ -1345,6 +1412,8 @@ pub enum Permission {
     OrRules(PermissionSet),
     #[serde(rename = "not_rule")]
     NotRule(Box<Permission>),
+    #[serde(rename = "metadata")]
+    Metadata(MetadataMatcher),
 }
 
 impl<'de> serde::Deserialize<'de> for Permission {
@@ -1355,7 +1424,14 @@ impl<'de> serde::Deserialize<'de> for Permission {
         use serde::de::{Error, MapAccess, Visitor};
         use std::fmt;
 
-        const KEYS: &[&str] = &["any", "header", "and_rules", "or_rules", "not_rule"];
+        const KEYS: &[&str] = &[
+            "any",
+            "header",
+            "and_rules",
+            "or_rules",
+            "not_rule",
+            "metadata",
+        ];
 
         struct V;
         impl<'de> Visitor<'de> for V {
@@ -1379,6 +1455,7 @@ impl<'de> serde::Deserialize<'de> for Permission {
                     "and_rules" => Permission::AndRules(map.next_value::<PermissionSet>()?),
                     "or_rules" => Permission::OrRules(map.next_value::<PermissionSet>()?),
                     "not_rule" => Permission::NotRule(Box::new(map.next_value::<Permission>()?)),
+                    "metadata" => Permission::Metadata(map.next_value::<MetadataMatcher>()?),
                     other => return Err(M::Error::unknown_field(other, KEYS)),
                 };
                 if map.next_key::<String>()?.is_some() {
@@ -1417,6 +1494,8 @@ pub enum Principal {
     OrIds(PrincipalSet),
     #[serde(rename = "not_id")]
     NotId(Box<Principal>),
+    #[serde(rename = "metadata")]
+    Metadata(MetadataMatcher),
 }
 
 impl<'de> serde::Deserialize<'de> for Principal {
@@ -1427,7 +1506,7 @@ impl<'de> serde::Deserialize<'de> for Principal {
         use serde::de::{Error, MapAccess, Visitor};
         use std::fmt;
 
-        const KEYS: &[&str] = &["any", "header", "and_ids", "or_ids", "not_id"];
+        const KEYS: &[&str] = &["any", "header", "and_ids", "or_ids", "not_id", "metadata"];
 
         struct V;
         impl<'de> Visitor<'de> for V {
@@ -1451,6 +1530,7 @@ impl<'de> serde::Deserialize<'de> for Principal {
                     "and_ids" => Principal::AndIds(map.next_value::<PrincipalSet>()?),
                     "or_ids" => Principal::OrIds(map.next_value::<PrincipalSet>()?),
                     "not_id" => Principal::NotId(Box::new(map.next_value::<Principal>()?)),
+                    "metadata" => Principal::Metadata(map.next_value::<MetadataMatcher>()?),
                     other => return Err(M::Error::unknown_field(other, KEYS)),
                 };
                 if map.next_key::<String>()?.is_some() {
@@ -3892,6 +3972,10 @@ fn validate_permission_tree(
             &format!("{path}.not_rule"),
             depth + 1,
         ),
+        // phase 35: real `metadata` matcher validation (single-segment path +
+        // string-only value enforcement) lands in T2 (`RbacMetadataMatcherInvalid`).
+        // T1 leaf accepts so the schema-only crate compiles.
+        crate::Permission::Metadata(_) => Ok(()),
     }
 }
 
@@ -3938,6 +4022,8 @@ fn validate_principal_tree(
             &format!("{path}.not_id"),
             depth + 1,
         ),
+        // phase 35: see `validate_permission_tree` — T2 owns the real check.
+        crate::Principal::Metadata(_) => Ok(()),
     }
 }
 
@@ -11963,6 +12049,114 @@ rules:
                 Principal::AndIds(set) => assert_eq!(set.ids.len(), 2),
                 other => panic!("expected AndIds, got {other:?}"),
             }
+        }
+
+        // -------------------------------------------------------------------
+        // phase 35 T1: RBAC `metadata` Permission/Principal matcher.
+        // -------------------------------------------------------------------
+        #[test]
+        fn parses_rbac_metadata_permission() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    tier_prod:
+      permissions:
+        - metadata:
+            filter: envoy.filters.http.header_to_metadata
+            path:
+              - key: tier
+            value:
+              string_match: { exact: "prod" }
+      principals:
+        - any: true
+"#;
+            let cfg: RbacConfig = serde_yaml::from_str(yaml).expect("parses");
+            let policy = &cfg.rules.policies["tier_prod"];
+            match &policy.permissions[0] {
+                Permission::Metadata(m) => {
+                    assert_eq!(m.filter, "envoy.filters.http.header_to_metadata");
+                    assert_eq!(m.path.len(), 1);
+                    assert_eq!(m.path[0].key, "tier");
+                    assert!(m.value.matches("prod"));
+                    assert!(!m.value.matches("dev"));
+                }
+                other => panic!("expected Metadata, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parses_rbac_metadata_principal() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    tier_prod:
+      permissions:
+        - any: true
+      principals:
+        - metadata:
+            filter: envoy.filters.http.header_to_metadata
+            path:
+              - key: tier
+            value:
+              string_match: { exact: "prod" }
+"#;
+            let cfg: RbacConfig = serde_yaml::from_str(yaml).expect("parses");
+            let policy = &cfg.rules.policies["tier_prod"];
+            match &policy.principals[0] {
+                Principal::Metadata(m) => {
+                    assert_eq!(m.filter, "envoy.filters.http.header_to_metadata");
+                    assert_eq!(m.path.len(), 1);
+                    assert_eq!(m.path[0].key, "tier");
+                    assert!(m.value.matches("prod"));
+                    assert!(!m.value.matches("dev"));
+                }
+                other => panic!("expected Metadata, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn rbac_metadata_rejects_present_match_value() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    tier_prod:
+      permissions:
+        - metadata:
+            filter: envoy.filters.http.header_to_metadata
+            path:
+              - key: tier
+            value:
+              present_match: true
+      principals:
+        - any: true
+"#;
+            serde_yaml::from_str::<RbacConfig>(yaml)
+                .expect_err("present_match value rejected (string-only ValueMatcher)");
+        }
+
+        #[test]
+        fn rbac_metadata_rejects_unknown_field() {
+            let yaml = r#"
+rules:
+  action: ALLOW
+  policies:
+    tier_prod:
+      permissions:
+        - metadata:
+            filter: envoy.filters.http.header_to_metadata
+            path:
+              - key: tier
+            value:
+              string_match: { exact: "prod" }
+            invert: true
+      principals:
+        - any: true
+"#;
+            serde_yaml::from_str::<RbacConfig>(yaml)
+                .expect_err("unknown `invert` field rejected (deny_unknown_fields)");
         }
 
         fn ok_cfg() -> RbacConfig {

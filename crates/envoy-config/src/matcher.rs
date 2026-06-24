@@ -6,7 +6,9 @@
 //!
 //! Phase 04.2.
 
-use crate::bootstrap::{HeaderMatcher, HeaderMatcherMode, StringMatcher, StringMatcherMode};
+use crate::bootstrap::{
+    HeaderMatcher, HeaderMatcherMode, StringMatcher, StringMatcherMode, ValueMatcher,
+};
 
 impl HeaderMatcher {
     /// Returns true iff this matcher matches the given header set.
@@ -96,6 +98,16 @@ impl StringMatcher {
                     value.contains(lit.as_str())
                 }
             }
+        }
+    }
+}
+
+impl ValueMatcher {
+    /// Returns true iff the resolved metadata value matches. String-only MVP: delegates to the
+    /// inner `StringMatcher::matches` (phase 35).
+    pub fn matches(&self, value: &str) -> bool {
+        match self {
+            ValueMatcher::StringMatch(sm) => sm.matches(value),
         }
     }
 }
