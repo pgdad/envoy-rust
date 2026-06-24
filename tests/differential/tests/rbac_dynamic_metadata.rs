@@ -13,6 +13,7 @@
 //!   - probe 1: `x-tier: prod` -> metadata `tier=prod` -> ALLOW match -> 200 + `"ok\n"`
 //!   - probe 2: `x-tier: dev`  -> metadata `tier=dev`  -> no match     -> 403 + `"RBAC: access denied"`
 //!   - probe 3: (no `x-tier`)  -> key unset           -> no match     -> 403 + `"RBAC: access denied"`
+//!
 //! The two deny probes reach the SAME metadata-lookup path and FAIL the match
 //! (this is not an allow-all). The 403 body is `"RBAC: access denied"`
 //! (19 bytes, NO trailing newline) per phase-10 ADR-0034.
