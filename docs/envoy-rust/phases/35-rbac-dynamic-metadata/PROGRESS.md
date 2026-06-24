@@ -168,3 +168,108 @@ To avoid pushing a red tree (the full differential suite + conformance + `cargo 
 variant (D-3.2). The full §7.5 phase-done gate (a)–(f) — the complete differential + conformance +
 deny + fuzz short-budget CI run + `REVIEW.md` approval — is the state-4 verification session, which
 is CI-authoritative.
+
+---
+
+## State-4 verification — §7.5 phase-done gate (`superpowers:verification-before-completion`)
+
+> This is the §5 state-4 session. The §7.5 gate (a)–(e) was RUN and is QUOTED below ((f) `REVIEW.md`
+> is the SEPARATE state-5 session). **CI run `28125206968` (push of the state-3 stack `d1cf8a3`) went
+> GREEN** — it is the authoritative first real execution of the full Docker differential suite +
+> conformance + `cargo deny` + the fuzz short-budget run (memory `envoy-rust-state4-ci-first-execution`):
+>
+> ```
+> ✓ main ci · 28125206968   (triggered via push)
+> ✓ build + test + lint   in 4m35s   (job 83287136008)
+> ✓ fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)   in 4m3s   (job 83287136031)
+> ```
+> The build+test+lint job emitted **114 `test result: ok` lines and ZERO `FAILED`/`error[` lines**.
+
+### (a) fixture `0043` green — cross-proxy byte-identical
+
+CI (job 83287136008), authoritative live Docker differential vs `envoyproxy/envoy:v1.33.0`:
+```
+Running tests/rbac_dynamic_metadata.rs
+test rbac_dynamic_metadata ... ok
+```
+Local re-confirmation (isolation, Docker up, `envoyproxy/envoy:v1.33.0` present):
+```
+$ cargo test -p differential --test rbac_dynamic_metadata
+test rbac_dynamic_metadata ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+The fixture probes `X-Tier: prod`→`200`+`ok\n` / `dev`,absent→`403`+`RBAC: access denied` (19B),
+byte-identical both proxies. LOCALLY observable (no reload trigger — NOT Linux-CI-only). **GREEN.**
+
+### (b) all `0001`–`0042` still green (43 fixtures present `0001`–`0043`)
+
+CI (job 83287136008) — the `0017` rbac header-only regression-equivalence witness + the in-process
+backstop, both green; 114 `test result: ok`, 0 FAILED on the whole job:
+```
+Running tests/http_filter_rbac.rs
+test http_filter_rbac_fixture ... ok
+test http_filter_rbac_in_process_backstop ... ok
+```
+The `metadata` matcher is an ADDITIVE `Permission`/`Principal` enum variant that no existing config
+uses (the store/producers/operator/decode-threading are byte-preserved), so `0012`/`0041`/`0042` +
+the rest carry unchanged — confirmed by the 0-FAILED CI job.
+
+**Local Docker-differential host-flakiness (CI-authoritative; NOT regressions):** under the full
+parallel `cargo test --workspace --no-fail-fast` two fixtures false-RED — `admin_config_dump_server_info`
+(the documented Docker-bridge-IP `192.168.65.2` divergence, memory
+`differential-host-bridge-ip-192-168-65-2`) and `http_filter_fault_fixture` (HTTP/2 "connection closed
+before reading preface" parallel-load timing). **Both pass when run in isolation** —
+`cargo test -p differential --test http_filter_fault` → `ok. 1 passed`;
+`cargo test -p differential --test http_filter_rbac` → `ok. 1 passed` on retry. Phase-35's cumulative
+diff touches ZERO fault/admin/http2 files (only `envoy-config/src/{bootstrap,lib,matcher}.rs` +
+`envoy-filter/src/rbac.rs` + docs + fixture `0043` + the fuzz seed), and CI ran all of them green.
+**GREEN (CI).**
+
+### (c) h2spec ≥95% (unchanged — no HTTP/2 codec change)
+
+CI (job 83287136008), h2spec `2.6.0` pinned:
+```
+Running tests/h2spec_runner.rs
+test tests::parse_h2spec_output_extracts_section_failure_ids ... ok
+test h2spec_pass_rate_gate ... ok
+```
+Local: `h2spec_runner` → `test result: ok. 3 passed`. Phase 35 touches ZERO `envoy-http2`/HTTP/2-codec
+files (the `§3.5/2` local false-RED of memory `h2spec-3-5-2-preface-host-sensitive` does not apply —
+the CI gate is authoritative and NEVER trim `known-failures.txt` from local evidence). **GREEN.**
+
+### (d) fuzz targets clean for the short-budget CI run — NO new fuzz target
+
+CI fuzz job 83287136031 GREEN (4m3s): `parse_bootstrap + jwt_parse + cdn_loop_parse +
+accesslog_format_parse`, 30s each. The new `parse_bootstrap` corpus seed `hcm_rbac_metadata.yaml`
+exercises the existing target (NO new target). The phase-35 diff confirms NO `ci.yml` change — only
+`crates/envoy-config/fuzz/.gitignore` (+1 un-ignore line) + the corpus seed (memory
+`new-fuzz-target-needs-a-ci-yml-step` does not apply; memory `fuzz-corpus-seed-gitignored-by-default`
+honored — the seed is git-tracked via the explicit `!`-un-ignore line). **GREEN.**
+
+### (e) workspace gate — build / clippy / fmt / test / deny
+
+Run locally this session (all on `d1cf8a3`, clean tree):
+```
+$ cargo fmt --all -- --check                                                  → exit 0
+$ cargo build --workspace --all-targets                                       → Finished, exit 0
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings        → Finished, exit 0
+$ cargo deny check                                                            → advisories ok, bans ok, licenses ok, sources ok (exit 0)
+$ cargo test --workspace                                                      → green modulo the (b) documented host-only Docker-differential false-REDs; CI job 83287136008 ran the full suite GREEN (114 ok / 0 FAILED)
+```
+Per-crate phase-35 surfaces: `cargo test -p envoy-config` → **506 passed**; `cargo test -p envoy-filter`
+→ **195 passed** (both 0 failed). `cargo deny check` warnings are benign `license-not-encountered`
+allowances (no advisory/ban/source failure). **GREEN.**
+
+### Gate verdict
+
+(a) ✅ / (b) ✅ / (c) ✅ / (d) ✅ / (e) ✅ — all five state-4 gates PASS (CI run `28125206968` green +
+local re-confirmation). The only local REDs are the documented host-only Docker-differential false-REDs
+in code UNTOUCHED by phase 35 (CI-authoritative). (f) `REVIEW.md` is the SEPARATE state-5 session.
+
+**Carry-forward Minors (NONE blocks; for state-5 `REVIEW.md`):** M34-1/M34-2/M34-3 + M33-1/M33-2 +
+the empty-`metadata_match`→fallback doc-comment + M29-1/M29-2 + M30-1/M30-2 + the phase-31 M-2/M-3 +
+the HTTP-filters-family (1)-(4) buffer carry-forwards. **NEW (phase-35):** the
+pre-existing-SafeRegex-in-RBAC-values limitation — a `safe_regex` in an RBAC `metadata`/`header` matcher
+value is accepted at config-load but not compiled → would panic at runtime; clean fix home = compile
+RBAC SafeRegex at `rbac.rs` lowering time (covering both `header` and `metadata`) in a future phase.
+None applies to the verification surface this session.
