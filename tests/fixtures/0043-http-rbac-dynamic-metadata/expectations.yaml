@@ -1,0 +1,35 @@
+# Phase 35: 3-probe sequential burst proving the header-driven dynamic-metadata
+# RBAC verdict is byte-identical cross-proxy. The present-match + mismatch +
+# absent probe TRIO is the anti-trivial guard: the two deny probes reach the
+# SAME metadata-lookup path and fail the match (not an allow-all). 403 body is
+# "RBAC: access denied" (19 bytes, NO trailing newline, ADR-0034). Reuses the
+# fixture-0017 http1_probe_list driver + extra_headers probe capability.
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-allow-tier-prod
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-tier, "prod"]
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-deny-tier-dev
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers:
+        - [x-tier, "dev"]
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "RBAC: access denied" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-deny-header-absent
+      method: get
+      path: /
+      host: envoy-rust.test
+      extra_headers: []
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "RBAC: access denied" }
+      expected_headers: set_equal_modulo_allow_list
