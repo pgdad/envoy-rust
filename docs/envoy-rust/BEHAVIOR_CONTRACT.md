@@ -1341,6 +1341,90 @@ The following are out of the request-side string-only MVP scope (ADR-0083 / ADR-
 - **Per-route config** (`typed_per_filter_config`) — per-route override of the
   filter config. Not modeled at phase-34 scope.
 
+### Phase 35 (ADR-0086): the RBAC `metadata` Permission/Principal condition
+
+> Phase 35 lands the RBAC `metadata` Permission/Principal condition — the FIRST
+> dynamic-metadata CONSUMER in envoy-rust (the phase-34 `header_to_metadata`
+> filter is its producer). An RBAC policy entry can now gate access on a value
+> previously written into the per-request dynamic-metadata store. The §A facts
+> below are LOCKED by ADR-0086 against `envoyproxy/envoy:v1.33.0`; the
+> cross-proxy witness is **fixture 0043** (`0043-http-rbac-dynamic-metadata`).
+> Scope defined by ADR-0085.
+
+**A1 — Wire shape (config-load, §A1-LOCKED by ADR-0086).** A `metadata`
+Permission/Principal entry is
+`{ metadata: { filter: <string>, path: [{ key: <string> }, …], value: { string_match: <StringMatcher> } } }`.
+The field names `filter` / `path` / `key` / `value` / `string_match` round-trip
+**verbatim (snake_case)** through `/config_dump`. The entry is accepted under
+**BOTH** `permissions[]` and `principals[]` with an identical shape. `value` is
+**REQUIRED** — Envoy rejects an omitted `value` boot-fatal with
+`MetadataMatcherValidationError.Value: value is required`; envoy-rust models a
+string-only `ValueMatcher` (only `string_match` is accepted — see A6).
+
+**A2 — `filter`→namespace correspondence (§A2-LOCKED by ADR-0086).**
+`MetadataMatcher.filter` is matched against the dynamic-metadata **namespace**
+(the producer's `metadata_namespace`). The phase-34 default producer namespace
+`envoy.filters.http.header_to_metadata` (ADR-0084) is matchable; a custom
+namespace is matchable by an equal `filter`. **Producer-before-consumer chain
+order is REQUIRED** — a reversed `[rbac, header_to_metadata, …]` chain evaluates
+RBAC against EMPTY metadata (so `X-Tier: prod` is wrongly `403`'d under an ALLOW
+policy). Fixture 0043 orders the chain `[header_to_metadata, rbac, router]`.
+
+**A3 — Match semantics + byte-exact verdicts (§A3-LOCKED by ADR-0086).** Runtime
+eval is
+`req.dynamic_metadata.get(&filter).and_then(|ns| ns.get(&path[0].key)).is_some_and(|v| value.matches(v))`
+— an absent namespace OR an absent key → no match. The FULL 04.x StringMatcher
+set flows through (`exact` AND `prefix` both confirmed live — do NOT restrict to
+`exact`). `X-Tier: prod` → `tier=prod` → match → ALLOW → `200` + `ok\n` (3 bytes);
+`X-Tier: dev` / absent → no match → DENY → `403` + `RBAC: access denied` (19
+bytes, no trailing newline — the phase-10 / ADR-0034 deny body).
+
+**A4 — Config-validity is boot-fatal (§A4-LOCKED by ADR-0086, ADR-0049 posture).**
+An empty `filter` → boot-fatal (Envoy PGV `min_len 1`; envoy-rust
+`ConfigError::RbacMetadataMatcherInvalid`); an empty `path: []` → boot-fatal
+(Envoy PGV `min_items 1`; envoy-rust via the path-len≠1 check — see A5); a
+missing `value` → boot-fatal (serde — a required non-`Option` field). The
+structs carry `deny_unknown_fields`.
+
+**A5 — MATERIAL DIVERGENCE: multi-segment `path`.** Envoy ACCEPTS a multi-segment
+`path: [{key}, {key}]` (a nested-struct descent). envoy-rust's flat string-only
+metadata store cannot resolve a nested path, so it is **STRICTER**:
+`path.len() != 1` is boot-fatal (`ConfigError::RbacMetadataMatcherInvalid`,
+detail "metadata matcher path must have exactly one segment …"). The nested path
+is the deferred §2.2 work (it rides the future structured-`Value`
+generalization).
+
+**A6 — MATERIAL DIVERGENCE: non-`string_match` value.** Envoy ACCEPTS the full
+`ValueMatcher` oneof (`present_match` / `null_match` / `double_match` /
+`bool_match` / `list_match` / `or_match`); the string-only MVP rejects any
+non-`string_match` key **BOOT-FATAL** via its hand-rolled "exactly one key"
+visitor (an `unknown_field` serde error). `present_match` is the cheapest
+deferred follow-up.
+
+**A7 — MATERIAL DIVERGENCE: deprecation (NON-DIFFERENTIAL).** Both
+`rbac.v3.Permission.metadata` AND `.Principal.metadata` are **DEPRECATED** in
+v1.33.0 — Envoy boots with a stderr `warning` ("Using deprecated option … will
+be removed from Envoy soon"), but the fields are FULLY FUNCTIONAL and accepted
+at the pin (both verdicts are correct). The warning is stderr-only and therefore
+**NON-DIFFERENTIAL** (no response / access-log / stats impact; envoy-rust does
+not emit it). The future pin-refresh phase (D-3.7) inherits the flag that a
+later Envoy may remove the field outright.
+
+**§2.2 deferrals (phase 35; documented, NOT differentially exercised).** Out of
+the string-only single-segment MVP scope (ADR-0085 / ADR-0086): non-string
+`Value`s (the other `ValueMatcher` oneof arms — see A6); nested / multi-segment
+`path` (see A5); `MetadataMatcher.invert` (negate the match); `shadow_rules`
+(observe-only RBAC eval); per-route `typed_per_filter_config` overrides; and
+other metadata producers / consumers (e.g. `jwt_authn` `payload_in_metadata`,
+`ext_authz`, `ext_proc`). One honest limitation: a `SafeRegex` supplied in a
+metadata `value`'s `string_match` is accepted at config-load but — matching the
+pre-existing RBAC `header` matcher path — is NOT compiled by the RBAC validator,
+so a runtime `matches` on a `SafeRegex` value would panic (a pre-existing
+limitation, not exercised by fixture 0043, which uses `exact`). The
+`parse_bootstrap` fuzz corpus seed (`hcm_rbac_metadata.yaml`) mirrors fixture
+0043's `[header_to_metadata, rbac, router]` chain but is a separate corpus
+artifact, NOT the differential fixture itself.
+
 ---
 
 ## xDS wire state machine
