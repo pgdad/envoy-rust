@@ -15,3 +15,10 @@
 - TDD: tests written first, watched fail (no variant/method), implemented, watched pass.
 - Gate: `cargo test -p envoy-config` green.
 
+## Task 2 — F1 runtime: presence-aware `eval_metadata` (`present && want`) ✅
+
+- Restructured `eval_metadata` (`crates/envoy-filter/src/rbac.rs`) to resolve the metadata path to `Option<&str>` and call `m.value.matches_resolved(resolved)` — so `present_match` observes KEY PRESENCE (§A1 `present && want`); `string_match` unchanged (present AND value-matches).
+- Added `present_matcher` helper + tests `metadata_present_match_true_matches_present_key`, `metadata_present_match_true_no_match_when_absent`, `metadata_present_match_false_never_matches`.
+- TDD: tests written first (Step-2: all 3 already passed with old `eval_metadata` via Task 1's exhaustive `matches` arm — recorded honestly per PLAN); restructured to `matches_resolved`, watched pass.
+- Gate: `cargo test -p envoy-filter rbac` green (32/32 passed).
+

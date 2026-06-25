@@ -82,14 +82,17 @@ pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> boo
     }
 }
 
-/// Phase 35: resolve the single-segment metadata path and apply the ValueMatcher.
-/// Absent namespace OR absent key → no match (false). The config validator
-/// guarantees `path.len() == 1` (boot-fatal otherwise), so `path[0]` is safe.
+/// Phase 35/36: resolve the single-segment metadata path and apply the ValueMatcher.
+/// §A1: routed through `matches_resolved` so `present_match` observes KEY PRESENCE
+/// (`match = present && want`); `string_match` keeps present-AND-value-matches.
+/// The validator guarantees `path.len() == 1`, so `path[0]` is safe.
 fn eval_metadata(m: &envoy_config::MetadataMatcher, req: &FilterRequest) -> bool {
-    req.dynamic_metadata
+    let resolved = req
+        .dynamic_metadata
         .get(&m.filter)
         .and_then(|ns| ns.get(&m.path[0].key))
-        .is_some_and(|v| m.value.matches(v))
+        .map(String::as_str);
+    m.value.matches_resolved(resolved)
 }
 
 /// Recursive tree-walk evaluator for `RuntimePrincipal`. Structurally
@@ -471,6 +474,50 @@ mod tests {
             "prod",
         ));
         assert!(eval_principal(&prin, &req));
+    }
+
+    fn present_matcher(filter: &str, key: &str, want: bool) -> MetadataMatcher {
+        MetadataMatcher {
+            filter: filter.into(),
+            path: vec![MetadataPathSegment { key: key.into() }],
+            value: ValueMatcher::PresentMatch(want),
+        }
+    }
+
+    #[test]
+    fn metadata_present_match_true_matches_present_key() {
+        let ns = "envoy.filters.http.header_to_metadata";
+        let req = req_with_md(ns, "tier", "staging"); // any value
+        assert!(eval_permission(
+            &RuntimePermission::Metadata(present_matcher(ns, "tier", true)),
+            &req
+        ));
+    }
+
+    #[test]
+    fn metadata_present_match_true_no_match_when_absent() {
+        let ns = "envoy.filters.http.header_to_metadata";
+        let req = req_with_md(ns, "other", "x"); // key tier absent
+        assert!(!eval_permission(
+            &RuntimePermission::Metadata(present_matcher(ns, "tier", true)),
+            &req
+        ));
+    }
+
+    #[test]
+    fn metadata_present_match_false_never_matches() {
+        // §A1: present_match:false → present && false → never matches, even when present.
+        let ns = "envoy.filters.http.header_to_metadata";
+        let present = req_with_md(ns, "tier", "staging");
+        let absent = req_with(vec![]);
+        assert!(!eval_permission(
+            &RuntimePermission::Metadata(present_matcher(ns, "tier", false)),
+            &present
+        ));
+        assert!(!eval_permission(
+            &RuntimePermission::Metadata(present_matcher(ns, "tier", false)),
+            &absent
+        ));
     }
 
     #[test]
