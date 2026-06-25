@@ -22,3 +22,11 @@
 - TDD: tests written first (Step-2: all 3 already passed with old `eval_metadata` via Task 1's exhaustive `matches` arm — recorded honestly per PLAN); restructured to `matches_resolved`, watched pass.
 - Gate: `cargo test -p envoy-filter rbac` green (32/32 passed).
 
+## Task 3 — F2 config: public SafeRegex compile helpers ✅
+
+- Added public `HeaderMatcher::compile_safe_regexes`, `StringMatcher::compile_safe_regex`, `ValueMatcher::compile_safe_regexes` (`bootstrap.rs`), all reusing the private `compile_safe_regex` free fn + `ConfigError::InvalidRegex`. `present_match` → no-op. Route-config `validate_header_matcher` UNCHANGED.
+- Repurposed `rbac_metadata_value_safe_regex_is_parse_accepted` → `rbac_metadata_value_safe_regex_parse_accepted_and_compilable` (M35-1 limitation note removed; now asserts the parsed value compiles via the helper, anchored `^(prod|staging)$`).
+- Added `header_matcher_compile_safe_regexes_compiles_and_rejects` + `value_matcher_compile_safe_regexes_compiles_string_and_noops_present`.
+- TDD: tests first, watched fail (no methods), implemented, watched pass.
+- Gate: `cargo test -p envoy-config` green.
+

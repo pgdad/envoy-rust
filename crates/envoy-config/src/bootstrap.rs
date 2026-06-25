@@ -4501,6 +4501,40 @@ fn compile_safe_regex(sr: &mut SafeRegex) -> Result<(), crate::ConfigError> {
     }
 }
 
+impl HeaderMatcher {
+    /// Compile any SafeRegex reachable from this matcher (top-level `safe_regex_match` or a
+    /// nested `string_match.safe_regex`) into `SafeRegex::compiled`. §A4 (phase 36) — the
+    /// RBAC lowering path calls this on its owned clone (the route-config walk uses
+    /// `validate_header_matcher`, UNCHANGED). Boot-fatal `InvalidRegex` on a bad pattern.
+    pub fn compile_safe_regexes(&mut self) -> Result<(), crate::ConfigError> {
+        match &mut self.mode {
+            HeaderMatcherMode::SafeRegexMatch(sr) => compile_safe_regex(sr),
+            HeaderMatcherMode::StringMatch(sm) => sm.compile_safe_regex(),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl StringMatcher {
+    /// Compile the SafeRegex mode (if any) into `SafeRegex::compiled`. §A4.
+    pub fn compile_safe_regex(&mut self) -> Result<(), crate::ConfigError> {
+        if let StringMatcherMode::SafeRegex(sr) = &mut self.mode {
+            compile_safe_regex(sr)?;
+        }
+        Ok(())
+    }
+}
+
+impl ValueMatcher {
+    /// Compile any SafeRegex reachable from this value matcher. §A4. `present_match` → no-op.
+    pub fn compile_safe_regexes(&mut self) -> Result<(), crate::ConfigError> {
+        match self {
+            ValueMatcher::StringMatch(sm) => sm.compile_safe_regex(),
+            ValueMatcher::PresentMatch(_) => Ok(()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7886,6 +7920,53 @@ prefix_match: "b"
             panic!("not SafeRegex");
         };
         assert!(sr.compiled.is_some(), "nested regex should be compiled");
+    }
+
+    // --- phase 36 Task 3: public SafeRegex compile helpers ---
+
+    #[test]
+    fn header_matcher_compile_safe_regexes_compiles_and_rejects() {
+        let mut ok = HeaderMatcher {
+            name: "x".into(),
+            mode: HeaderMatcherMode::SafeRegexMatch(SafeRegex {
+                regex: "^(prod|staging)$".into(),
+                compiled: None,
+            }),
+            invert_match: false,
+        };
+        ok.compile_safe_regexes().expect("valid regex compiles");
+        assert!(matches!(&ok.mode, HeaderMatcherMode::SafeRegexMatch(sr) if sr.compiled.is_some()));
+        let mut bad = HeaderMatcher {
+            name: "x".into(),
+            mode: HeaderMatcherMode::SafeRegexMatch(SafeRegex {
+                regex: "(".into(),
+                compiled: None,
+            }),
+            invert_match: false,
+        };
+        assert!(matches!(
+            bad.compile_safe_regexes(),
+            Err(crate::ConfigError::InvalidRegex { .. })
+        ));
+    }
+
+    #[test]
+    fn value_matcher_compile_safe_regexes_compiles_string_and_noops_present() {
+        let mut v = ValueMatcher::StringMatch(StringMatcher {
+            mode: StringMatcherMode::SafeRegex(SafeRegex {
+                regex: "^(prod|staging)$".into(),
+                compiled: None,
+            }),
+            ignore_case: false,
+        });
+        v.compile_safe_regexes().expect("compiles");
+        if let ValueMatcher::StringMatch(sm) = &v {
+            assert!(matches!(&sm.mode, StringMatcherMode::SafeRegex(sr) if sr.compiled.is_some()));
+        }
+        // present_match has nothing to compile → Ok.
+        ValueMatcher::PresentMatch(true)
+            .compile_safe_regexes()
+            .expect("noop ok");
     }
 
     #[test]
@@ -12550,16 +12631,11 @@ admin:
         }
 
         #[test]
-        fn rbac_metadata_value_safe_regex_is_parse_accepted() {
-            // A single-segment matcher whose `value` carries a SafeRegex is ACCEPTED
-            // at config-load (the full StringMatcher reuse parses `safe_regex`).
-            // But — matching the pre-existing RBAC `Permission::Header` path — the
-            // validator does NOT compile it (the RBAC validation borrow is
-            // immutable; see the `validate_metadata_matcher` NOTE), so a runtime
-            // `ValueMatcher::matches` on a SafeRegex value would panic. This is a
-            // documented pre-existing limitation, not exercised by phase-35
-            // fixtures/tests (which use `exact`/`prefix`). This test asserts only
-            // that config-load accepts the shape.
+        fn rbac_metadata_value_safe_regex_parse_accepted_and_compilable() {
+            // F2 (phase 36, §A4): a SafeRegex value on an RBAC `metadata` matcher is
+            // parse-accepted AND now compilable via the public `ValueMatcher::compile_safe_regexes`
+            // helper (the RBAC lowering path, Task 4, calls this at startup so a runtime match
+            // no longer panics — the M35-1 limitation is closed). Anchored pattern per §A3b.
             let rule = r#"                            permissions:
                               - metadata:
                                   filter: envoy.filters.http.header_to_metadata
@@ -12567,11 +12643,22 @@ admin:
                                     - key: tier
                                   value:
                                     string_match:
-                                      safe_regex: { regex: "pro.*" }
+                                      safe_regex: { regex: "^(prod|staging)$" }
                             principals:
                               - any: true"#;
             crate::parse_bootstrap(&rbac_metadata_bootstrap(rule))
                 .expect("single-segment SafeRegex-value metadata matcher is parse-accepted");
+            // Also verify: parsing a ValueMatcher directly and compiling it via the new helper.
+            let value_yaml = r#"string_match:
+  safe_regex: { regex: "^(prod|staging)$" }"#;
+            let mut value: ValueMatcher =
+                serde_yaml::from_str(value_yaml).expect("ValueMatcher parses");
+            value.compile_safe_regexes().expect("compiles");
+            assert!(
+                matches!(&value, ValueMatcher::StringMatch(sm)
+                    if matches!(&sm.mode, StringMatcherMode::SafeRegex(sr) if sr.compiled.is_some())),
+                "compiled SafeRegex should be Some after compile_safe_regexes"
+            );
         }
     }
 
