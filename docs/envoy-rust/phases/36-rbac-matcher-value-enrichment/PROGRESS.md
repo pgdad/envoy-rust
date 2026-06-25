@@ -38,3 +38,10 @@
 - TDD: tests first, watched panic/fail (Step 2 recorded), implemented, watched pass.
 - Gate: `cargo test -p envoy-filter` green (201/201 passed).
 
+## Task 5 — Differential fixture `0044` (F1 present/absent + F2 safe_regex match/miss) ✅
+
+- Created `tests/fixtures/0044-http-rbac-matcher-value-enrichment/` (envoy.yaml, envoy-rust.yaml, expectations.yaml, README.md): H1 direct_response + `[header_to_metadata (x-tier->tier, x-present->present_probe), rbac (two OR'd ALLOW policies f2_regex + f1_present), router]`. 4 probes: a F2 staging->200, b F2 dev->403, c F1 x-present->200, d F1 absent->403. ANCHORED `^(prod|staging)$` (§A3b); 19-byte 403 body (ADR-0034).
+- Created `tests/differential/tests/rbac_matcher_value_enrichment.rs` (mirrors 0043 entry).
+- Rebuilt `envoy-bin` (both `--release` and debug) before the differential (stale-binary guard: the debug binary dated Jun 24 was missing Tasks 1-4; rebuilt to Jun 25).
+- Differential result: pass — `cargo test -p differential rbac_matcher_value_enrichment` green (1/1 passed, 7.60s). Both proxies byte-identical on all 4 probes (Docker available locally).
+
