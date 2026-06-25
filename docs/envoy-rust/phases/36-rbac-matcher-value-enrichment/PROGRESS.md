@@ -64,3 +64,29 @@
   - `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
 - The full §7.5 phase-done gate (cargo-fmt-check + Docker differential + h2spec, all authoritatively quoted) is the SEPARATE state-4 verification session.
 
+
+## State-4 verification (§5 state-4 / §7.5 gate (a)-(e); `superpowers:verification-before-completion`)
+
+Run on 2026-06-25 against `HEAD` = `19c3fe9` (clean tree). The state-3 sweep is here RE-RUN and quoted authoritatively.
+
+### Local §7.5 gate (e) — build / clippy / fmt / test / deny
+
+- `cargo build --workspace --all-targets` → `Finished dev profile` — **exit 0** (clean).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished dev profile` — **exit 0** (clean, zero warnings).
+- `cargo fmt --all -- --check` → no diff — **exit 0** (clean).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` — **exit 0** (the only output is pre-existing cosmetic `license-not-encountered` warnings for unmatched allowances `Unicode-DFS-2016`/`Zlib`, not failures).
+- `cargo test --workspace --no-fail-fast` → **exit 101 with exactly 3 failures, ALL documented host-only false-REDs in UNTOUCHED code, NOT phase-36 regressions:**
+  1. `admin_config_dump_server_info` (`-p differential`) — bridge-IP `192.168.65.2` routing (memory `differential-host-bridge-ip-192-168-65-2`).
+  2. `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` (`-p envoy-http2 --lib`) — `73 passed; 1 failed; 1 ignored`; handshake host-flake (memory `envoyrust-h2-handshake-test-host-flake`).
+  3. `upstream_active_health_check_fixture` (`-p differential`) — parallel-load differential flake (memory `differential-fixtures-flake-under-parallel-load`, which explicitly generalizes beyond the bridge-IP set). **Confirmed a flake, not a regression:** re-run in ISOLATION → `cargo test -p differential --test upstream_active_health_check` → `test upstream_active_health_check_fixture ... ok` / `1 passed; 0 failed` / **exit 0**. Phase 36 never touched the health-check path (F1/F2 are RBAC-matcher only).
+- Changed-crate isolation confirmation: `cargo test -p envoy-config -p envoy-filter` → `511 passed; 0 failed` (envoy-config) + `201 passed; 0 failed` (envoy-filter) — **exit 0**.
+
+### AUTHORITATIVE Linux CI (§7.5 gate (a)-(d) + (e)) — green
+
+- `gh run list --branch main`: HEAD `19c3fe9` triggered run **`28199106154`** — `completed / success` (4m52s).
+- `gh run view 28199106154`: `headSha` = `19c3fe9db2dacad4da855df2254372e55cd75612`, `conclusion: success`. BOTH jobs `success`:
+  - `build + test + lint` (job id `83533644207`) — **success** → covers gate (a) fixture `0044`, (b) all `0001`-`0043`, (c) h2spec ≥95%, (e) build/clippy/fmt/test/deny.
+  - `fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)` (job id `83533644384`) — **success** → covers gate (d) fuzz (incl. the Task-6 `parse_bootstrap` RBAC seeds).
+- Predecessor cumulative-code commit `e8f618e` run **`28198774939`** (4m47s) is also `success` (both jobs) — corroborating evidence.
+
+**Gate (a)-(e) verdict: ALL GREEN on the authoritative Linux CI; local sweep clean modulo 3 documented host-only false-REDs (each re-confirmed a flake / pre-existing, not a phase-36 regression).** The local Docker differential is NOT re-run as the gate (host bridge-IP / parallel-load unreliability; fixture `0044` already PASSED at T5 and on CI). **State-4 verification COMPLETE.** Next: state-5 code-review (`superpowers:requesting-code-review`) — SEPARATE session (§5.1 one state per session).
