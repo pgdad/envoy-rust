@@ -12296,8 +12296,7 @@ rules:
             let yaml = r#"
 rules: { action: ALLOW, policies: { p: { permissions: [ { metadata: { filter: f, path: [ { key: tier } ], value: { present_match: false } } } ], principals: [ { any: true } ] } } }
 "#;
-            let cfg: RbacConfig =
-                serde_yaml::from_str(yaml).expect("present_match:false accepted");
+            let cfg: RbacConfig = serde_yaml::from_str(yaml).expect("present_match:false accepted");
             assert_eq!(
                 cfg.rules.policies["p"].permissions[0],
                 Permission::Metadata(MetadataMatcher {
@@ -12311,7 +12310,11 @@ rules: { action: ALLOW, policies: { p: { permissions: [ { metadata: { filter: f,
         #[test]
         fn rbac_metadata_rejects_other_value_matcher_keys() {
             // §A5: null_match/bool_match/etc. stay boot-fatal (stricter than Envoy).
-            for key in ["null_match: {}", "bool_match: true", "double_match: { exact: 1.0 }"] {
+            for key in [
+                "null_match: {}",
+                "bool_match: true",
+                "double_match: { exact: 1.0 }",
+            ] {
                 let yaml = format!(
                     r#"
 rules: {{ action: ALLOW, policies: {{ p: {{ permissions: [ {{ metadata: {{ filter: f, path: [ {{ key: tier }} ], value: {{ {key} }} }} }} ], principals: [ {{ any: true }} ] }} }} }}

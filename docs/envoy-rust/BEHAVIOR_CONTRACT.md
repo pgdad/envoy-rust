@@ -1425,6 +1425,82 @@ limitation, not exercised by fixture 0043, which uses `exact`). The
 0043's `[header_to_metadata, rbac, router]` chain but is a separate corpus
 artifact, NOT the differential fixture itself.
 
+### Phase 36 (ADR-0088): RBAC matcher-VALUE enrichment — `present_match` + RBAC `safe_regex`
+
+> Phase 36 enriches the phase-35 RBAC `metadata` matcher-VALUE surface with two
+> features, both LOCKED by ADR-0088 against `envoyproxy/envoy:v1.33.0`: **F1** a
+> `present_match` `ValueMatcher` variant (gate on KEY PRESENCE), and **F2**
+> `safe_regex` `StringMatcher` compilation on the RBAC path (header + metadata
+> values) — closing carry-forward M35-1. The cross-proxy witness is **fixture
+> 0044** (`0044-http-rbac-matcher-value-enrichment`). Scope defined by ADR-0087.
+
+**A1 — F1 `present_match` presence semantics (§A1-LOCKED by ADR-0088).** A
+`metadata` value of `{ present_match: <bool> }` is accepted under BOTH
+`permissions[]` and `principals[]` and round-trips **verbatim (snake_case)**
+through `/config_dump`. Runtime semantics are **`match = present && want`** where
+`present` is whether the metadata `filter:key` resolves to a stored value:
+`present_match: true` matches IFF the key is present (any value); **`present_match:
+false` NEVER matches** (even when the key is present). This is a MATERIAL
+DIVERGENCE from the existing `HeaderMatcherMode::PresentMatch` (`want ? present :
+true`) — the RBAC `ValueMatcher::PresentMatch` does NOT use that precedent.
+A present-but-empty header → the `header_to_metadata` producer writes nothing
+(ADR-0084) → key UNSET → `present=false` → `present_match: true` DENIES. Verdicts
+are byte-exact: present → `200` + `ok\n` (3 bytes); absent → `403` + `RBAC:
+access denied` (19 bytes, no trailing newline, ADR-0034). This supersedes the
+phase-35 A6 note that `present_match` is "the cheapest deferred follow-up" — it
+is now landed.
+
+**A2 — F2 RBAC `safe_regex` is now compiled (§A3/A4-LOCKED by ADR-0088 — closes
+M35-1).** A `safe_regex` `StringMatcher` supplied in an RBAC `metadata` value's
+`string_match` OR in a `Permission`/`Principal` `header` `safe_regex_match` is now
+**compiled at `rbac.rs` lowering time** (`lower_permission`/`lower_principal` are
+fallible; the compiled `regex::Regex` is stored in `SafeRegex::compiled`). This
+**SUPERSEDES the phase-35 §2.2 limitation note** that a `SafeRegex` RBAC value "is
+accepted at config-load but NOT compiled … so a runtime `matches` would panic":
+that latent panic (carry-forward M35-1) is **CLOSED**. A malformed RBAC
+`safe_regex` is **BOOT-FATAL** (a returned `Err` from `build_from_config` fails
+the listener build — pre-traffic startup, differentially equivalent to Envoy's
+`--mode validate` reject), NOT a first-request panic. No new `ConfigError` /
+`FilterError` variant (reuses `ConfigError::InvalidRegex` → `FilterError::InvalidConfig`).
+The `metadata`-value and `header` `safe_regex` paths behave byte-identically.
+
+**A3 — F2 anchoring (MATERIAL DIVERGENCE; carry-forward M36-1).** Envoy
+`safe_regex` is **RE2 FULL match (anchored)**: with `prod|staging`,
+`staging-2`/`xstaging`/`production` → `403` (the WHOLE string must match).
+envoy-rust's `StringMatcher::matches` SafeRegex uses `regex::Regex::is_match` =
+**PARTIAL** (substring), so an UNANCHORED pattern diverges (`is_match("prod|staging",
+"staging-2") == true`). This is PRE-EXISTING (phase 04.2) and cross-cutting (the
+route-config header `safe_regex` shares the path), masked because every existing
+fixture uses an anchored pattern. **Disposition:** fixture 0044 + every phase-36
+backstop LOCK an ANCHORED pattern (`^(prod|staging)$`) so partial==full and the
+differential is byte-identical WITHOUT a SafeRegex-semantics change. The
+unanchored partial-vs-full gap is **carry-forward M36-1 — OUT of phase-36 scope**
+(a proper full-match fix touches the shared route-config SafeRegex; its own
+future phase). DISTINCT from M35-1 (the latent panic), which F2 DOES close.
+
+**A4 — Config-validity for non-`string_match`/`present_match` keys (§A5-LOCKED by
+ADR-0088 — unchanged stricter posture).** envoy-rust ADDS ONLY `present_match` to
+the hand-rolled "exactly one key" `ValueMatcher` visitor (`KEYS = ["string_match",
+"present_match"]`). Envoy ACCEPTS the full oneof (`null_match` / `bool_match` /
+`double_match` / `or_match` / `list_match`); envoy-rust STRICTER-rejects every
+other oneof key **BOOT-FATAL** (`unknown_field`), preserving the phase-35 A6
+posture for the remaining arms. The phase-35 A5 (multi-segment `path`) and A7
+(deprecation) divergences are unchanged.
+
+**Fixture 0044 probe matrix.** Chain `[header_to_metadata (x-tier→tier,
+x-present→present_probe), rbac (action ALLOW; OR'd policies f2_regex + f1_present),
+router]`; route `direct_response 200 "ok\n"`. probe a `x-tier: staging` → f2_regex
+match → `200`; probe b `x-tier: dev` → no match → `403`+19B; probe c `x-present: 1,
+x-tier: dev` → f1_present match → `200`; probe d `x-tier: dev` (no `x-present`) →
+no match → `403`+19B.
+
+**§2.2 deferrals carried (phase 36).** Unanchored SafeRegex full-vs-partial
+(M36-1, above); plus the phase-35 carries that remain (nested/multi-segment
+`path`; `MetadataMatcher.invert`; `shadow_rules`; per-route
+`typed_per_filter_config`; other metadata producers/consumers; the remaining
+non-string `ValueMatcher` oneof arms). The `parse_bootstrap` fuzz corpus gains two
+seeds (`rbac_present_match.yaml`, `rbac_safe_regex.yaml`) — NO new fuzz target.
+
 ---
 
 ## xDS wire state machine

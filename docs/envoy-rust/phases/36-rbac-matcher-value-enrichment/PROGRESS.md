@@ -52,3 +52,15 @@
 - NO new fuzz target (memory `new-fuzz-target-needs-a-ci-yml-step`): the existing `parse_bootstrap` ci.yml step picks up the new seeds, so no ci.yml change.
 - Validity check: `cargo +nightly fuzz run --fuzz-dir crates/envoy-config/fuzz parse_bootstrap <both seeds>` executed each seed once cleanly (2 ms / 0 ms, no crash/panic). Full short-budget fuzz run is the state-4 §7.5 gate (d) concern.
 
+## Task 7 — BEHAVIOR_CONTRACT phase-36 subsection + regression sweep ✅
+
+- Added a "Phase 36 (ADR-0088): RBAC matcher-VALUE enrichment" subsection to `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (after the phase-35 RBAC subsection): A1 `present_match` presence semantics (`present && want`; `false` never matches; present-empty→absent); A2 the now-compiled RBAC SafeRegex (header + metadata) — explicitly SUPERSEDES the phase-35 M35-1 limitation note + boot-fatal malformed regex; A3 the ANCHORED-pattern rationale + carry-forward M36-1; A4 config-validity (present_match accepted; other oneof keys stay boot-fatal); the fixture-0044 probe matrix; the §2.2 carries.
+- Applied `cargo fmt --all` (the Task 1/3/4 implementer code had rustfmt drift — the documented mid-phase red-at-fmt pattern); re-verified `cargo fmt --all -- --check` clean.
+- Full verification sweep (the §7.5 gate (a)-(e) preview — authoritative quote is the state-4 session):
+  - `cargo build --workspace --all-targets` → clean.
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean.
+  - `cargo fmt --all -- --check` → clean.
+  - `cargo test --workspace --no-fail-fast` → **changed crates fully green** (envoy_config 511/511, envoy_filter 201/201, new fixture `rbac_matcher_value_enrichment` 1/1, differential lib 151/151). The ONLY two failures are documented PRE-EXISTING host-only false-REDs, NOT phase-36 regressions: `admin_config_dump_server_info` (memory `differential-host-bridge-ip-192-168-65-2`, bridge-IP routing) and `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` (memory `envoyrust-h2-handshake-test-host-flake`). CI is authoritative.
+  - `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+- The full §7.5 phase-done gate (cargo-fmt-check + Docker differential + h2spec, all authoritatively quoted) is the SEPARATE state-4 verification session.
+

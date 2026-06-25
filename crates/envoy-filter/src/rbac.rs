@@ -250,14 +250,22 @@ fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, F
         envoy_config::Permission::Header(m) => {
             let mut m = m.clone();
             m.compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+                .map_err(|e| FilterError::InvalidConfig {
+                    message: e.to_string(),
+                })?;
             RuntimePermission::Header(m)
         }
         envoy_config::Permission::AndRules(set) => RuntimePermission::AndRules(
-            set.rules.iter().map(lower_permission).collect::<Result<_, _>>()?,
+            set.rules
+                .iter()
+                .map(lower_permission)
+                .collect::<Result<_, _>>()?,
         ),
         envoy_config::Permission::OrRules(set) => RuntimePermission::OrRules(
-            set.rules.iter().map(lower_permission).collect::<Result<_, _>>()?,
+            set.rules
+                .iter()
+                .map(lower_permission)
+                .collect::<Result<_, _>>()?,
         ),
         envoy_config::Permission::NotRule(inner) => {
             RuntimePermission::NotRule(Box::new(lower_permission(inner)?))
@@ -266,7 +274,9 @@ fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, F
             let mut m = m.clone();
             m.value
                 .compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+                .map_err(|e| FilterError::InvalidConfig {
+                    message: e.to_string(),
+                })?;
             RuntimePermission::Metadata(m)
         }
     })
@@ -283,14 +293,22 @@ fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimePrincipal, Filt
         envoy_config::Principal::Header(m) => {
             let mut m = m.clone();
             m.compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+                .map_err(|e| FilterError::InvalidConfig {
+                    message: e.to_string(),
+                })?;
             RuntimePrincipal::Header(m)
         }
         envoy_config::Principal::AndIds(set) => RuntimePrincipal::AndIds(
-            set.ids.iter().map(lower_principal).collect::<Result<_, _>>()?,
+            set.ids
+                .iter()
+                .map(lower_principal)
+                .collect::<Result<_, _>>()?,
         ),
         envoy_config::Principal::OrIds(set) => RuntimePrincipal::OrIds(
-            set.ids.iter().map(lower_principal).collect::<Result<_, _>>()?,
+            set.ids
+                .iter()
+                .map(lower_principal)
+                .collect::<Result<_, _>>()?,
         ),
         envoy_config::Principal::NotId(inner) => {
             RuntimePrincipal::NotId(Box::new(lower_principal(inner)?))
@@ -299,7 +317,9 @@ fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimePrincipal, Filt
             let mut m = m.clone();
             m.value
                 .compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+                .map_err(|e| FilterError::InvalidConfig {
+                    message: e.to_string(),
+                })?;
             RuntimePrincipal::Metadata(m)
         }
     })
@@ -824,8 +844,7 @@ mod tests {
                 policies,
             },
         };
-        let mut f =
-            RbacFilter::build_from_config(&cfg, &registry, "ingress_http").expect("builds");
+        let mut f = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").expect("builds");
         let mut ok = req_with_md(ns, "tier", "staging");
         assert!(matches!(
             f.decode_headers(&mut ok),
@@ -863,8 +882,7 @@ mod tests {
                 policies,
             },
         };
-        let mut f =
-            RbacFilter::build_from_config(&cfg, &registry, "ingress_http").expect("builds");
+        let mut f = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").expect("builds");
         let mut ok = req_with(vec![("x-tier", "staging")]);
         assert!(matches!(
             f.decode_headers(&mut ok),
