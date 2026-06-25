@@ -43,5 +43,7 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/hcm_set_metadata_dynamic_metadata.yaml
 !corpus/parse_bootstrap/hcm_header_to_metadata.yaml
 !corpus/parse_bootstrap/hcm_rbac_metadata.yaml
+!corpus/parse_bootstrap/rbac_present_match.yaml
+!corpus/parse_bootstrap/rbac_safe_regex.yaml
 artifacts/
 target/

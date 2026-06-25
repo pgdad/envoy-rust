@@ -45,3 +45,10 @@
 - Rebuilt `envoy-bin` (both `--release` and debug) before the differential (stale-binary guard: the debug binary dated Jun 24 was missing Tasks 1-4; rebuilt to Jun 25).
 - Differential result: pass — `cargo test -p differential rbac_matcher_value_enrichment` green (1/1 passed, 7.60s). Both proxies byte-identical on all 4 probes (Docker available locally).
 
+## Task 6 — Fuzz seeds (existing `parse_bootstrap`, NO new target) ✅
+
+- Added two corpus seeds under `crates/envoy-config/fuzz/corpus/parse_bootstrap/`: `rbac_present_match.yaml` (a `[header_to_metadata, rbac]` chain whose RBAC `metadata` value is `present_match: true`) and `rbac_safe_regex.yaml` (same with `value: { string_match: { safe_regex: { regex: "^(prod|staging)$" } } }`, anchored §A3b).
+- Per memory `fuzz-corpus-seed-gitignored-by-default`: added `!rbac_present_match.yaml` + `!rbac_safe_regex.yaml` un-ignore lines to `crates/envoy-config/fuzz/.gitignore`. Verified both tracked via `git ls-files`; `git check-ignore` reports neither ignored.
+- NO new fuzz target (memory `new-fuzz-target-needs-a-ci-yml-step`): the existing `parse_bootstrap` ci.yml step picks up the new seeds, so no ci.yml change.
+- Validity check: `cargo +nightly fuzz run --fuzz-dir crates/envoy-config/fuzz parse_bootstrap <both seeds>` executed each seed once cleanly (2 ms / 0 ms, no crash/panic). Full short-budget fuzz run is the state-4 §7.5 gate (d) concern.
+
