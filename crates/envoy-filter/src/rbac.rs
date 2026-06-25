@@ -147,6 +147,10 @@ impl RbacFilter {
     /// `http.{hcm_stat_prefix}.rbac.{allowed,denied}`. Returns
     /// `FilterError::InvalidConfig` if the registry rejects a counter name
     /// (defense-in-depth; the envoy-config validator is the primary gate).
+    /// Also returns `FilterError::InvalidConfig` if any `safe_regex` pattern
+    /// in an RBAC `header`/`metadata` matcher is malformed — compiled here at
+    /// lowering time so a bad pattern is boot-fatal rather than a
+    /// first-request panic (closes carry-forward M35-1).
     pub(crate) fn build_from_config(
         cfg: &envoy_config::RbacConfig,
         registry: &Arc<StatsRegistry>,
@@ -160,12 +164,22 @@ impl RbacFilter {
             .rules
             .policies
             .iter()
-            .map(|(name, policy)| RuntimePolicy {
-                name: name.clone(),
-                permissions: policy.permissions.iter().map(lower_permission).collect(),
-                principals: policy.principals.iter().map(lower_principal).collect(),
+            .map(|(name, policy)| -> Result<RuntimePolicy, FilterError> {
+                Ok(RuntimePolicy {
+                    name: name.clone(),
+                    permissions: policy
+                        .permissions
+                        .iter()
+                        .map(lower_permission)
+                        .collect::<Result<_, _>>()?,
+                    principals: policy
+                        .principals
+                        .iter()
+                        .map(lower_principal)
+                        .collect::<Result<_, _>>()?,
+                })
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         // Reuse FilterError::InvalidConfig per local_rate_limit.rs precedent.
         let allowed_counter = registry
             .register_counter(&format!("http.{hcm_stat_prefix}.rbac.allowed"))
@@ -228,42 +242,67 @@ impl RbacFilter {
 /// Recursive lowering of wire-form `envoy_config::Permission` → runtime
 /// `RuntimePermission`. Flattens the `PermissionSet { rules }` wrapper on
 /// `AndRules`/`OrRules` into the runtime enum's direct `Vec<RuntimePermission>`
-/// payload per PLAN lock-in #6.
-fn lower_permission(p: &envoy_config::Permission) -> RuntimePermission {
-    match p {
+/// payload per PLAN lock-in #6. Now fallible: `Header` and `Metadata` arms
+/// compile any `SafeRegex` on the owned clone (phase 36 M35-1 fix, §A4).
+fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, FilterError> {
+    Ok(match p {
         envoy_config::Permission::Any(b) => RuntimePermission::Any(*b),
-        envoy_config::Permission::Header(m) => RuntimePermission::Header(m.clone()),
-        envoy_config::Permission::AndRules(set) => {
-            RuntimePermission::AndRules(set.rules.iter().map(lower_permission).collect())
+        envoy_config::Permission::Header(m) => {
+            let mut m = m.clone();
+            m.compile_safe_regexes()
+                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+            RuntimePermission::Header(m)
         }
-        envoy_config::Permission::OrRules(set) => {
-            RuntimePermission::OrRules(set.rules.iter().map(lower_permission).collect())
-        }
+        envoy_config::Permission::AndRules(set) => RuntimePermission::AndRules(
+            set.rules.iter().map(lower_permission).collect::<Result<_, _>>()?,
+        ),
+        envoy_config::Permission::OrRules(set) => RuntimePermission::OrRules(
+            set.rules.iter().map(lower_permission).collect::<Result<_, _>>()?,
+        ),
         envoy_config::Permission::NotRule(inner) => {
-            RuntimePermission::NotRule(Box::new(lower_permission(inner)))
+            RuntimePermission::NotRule(Box::new(lower_permission(inner)?))
         }
-        envoy_config::Permission::Metadata(m) => RuntimePermission::Metadata(m.clone()),
-    }
+        envoy_config::Permission::Metadata(m) => {
+            let mut m = m.clone();
+            m.value
+                .compile_safe_regexes()
+                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+            RuntimePermission::Metadata(m)
+        }
+    })
 }
 
 /// Recursive lowering of wire-form `envoy_config::Principal` → runtime
 /// `RuntimePrincipal`. Symmetric to `lower_permission` per PLAN lock-in #7;
-/// `PrincipalSet { ids }` wrapper flattened on `AndIds`/`OrIds`.
-fn lower_principal(p: &envoy_config::Principal) -> RuntimePrincipal {
-    match p {
+/// `PrincipalSet { ids }` wrapper flattened on `AndIds`/`OrIds`. Now fallible:
+/// `Header` and `Metadata` arms compile any `SafeRegex` on the owned clone
+/// (phase 36 M35-1 fix, §A4).
+fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimePrincipal, FilterError> {
+    Ok(match p {
         envoy_config::Principal::Any(b) => RuntimePrincipal::Any(*b),
-        envoy_config::Principal::Header(m) => RuntimePrincipal::Header(m.clone()),
-        envoy_config::Principal::AndIds(set) => {
-            RuntimePrincipal::AndIds(set.ids.iter().map(lower_principal).collect())
+        envoy_config::Principal::Header(m) => {
+            let mut m = m.clone();
+            m.compile_safe_regexes()
+                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+            RuntimePrincipal::Header(m)
         }
-        envoy_config::Principal::OrIds(set) => {
-            RuntimePrincipal::OrIds(set.ids.iter().map(lower_principal).collect())
-        }
+        envoy_config::Principal::AndIds(set) => RuntimePrincipal::AndIds(
+            set.ids.iter().map(lower_principal).collect::<Result<_, _>>()?,
+        ),
+        envoy_config::Principal::OrIds(set) => RuntimePrincipal::OrIds(
+            set.ids.iter().map(lower_principal).collect::<Result<_, _>>()?,
+        ),
         envoy_config::Principal::NotId(inner) => {
-            RuntimePrincipal::NotId(Box::new(lower_principal(inner)))
+            RuntimePrincipal::NotId(Box::new(lower_principal(inner)?))
         }
-        envoy_config::Principal::Metadata(m) => RuntimePrincipal::Metadata(m.clone()),
-    }
+        envoy_config::Principal::Metadata(m) => {
+            let mut m = m.clone();
+            m.value
+                .compile_safe_regexes()
+                .map_err(|e| FilterError::InvalidConfig { message: e.to_string() })?;
+            RuntimePrincipal::Metadata(m)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -748,6 +787,121 @@ mod tests {
             filter.encode_headers(&mut resp),
             crate::pipeline::Decision::Continue
         ));
+    }
+
+    // --- Task 4 (T4): safe_regex compile-at-lower regression guard (M35-1) ---
+
+    fn safe_regex_string_matcher(pattern: &str) -> StringMatcher {
+        StringMatcher {
+            mode: StringMatcherMode::SafeRegex(envoy_config::SafeRegex {
+                regex: pattern.into(),
+                compiled: None,
+            }),
+            ignore_case: false,
+        }
+    }
+
+    #[test]
+    fn metadata_safe_regex_value_matches_without_panic() {
+        // §A3: ANCHORED ^(prod|staging)$ → staging matches, dev misses. No panic (M35-1 closed).
+        let ns = "envoy.filters.http.header_to_metadata";
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let mut policies = std::collections::BTreeMap::new();
+        policies.insert(
+            "p".into(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Metadata(MetadataMatcher {
+                    filter: ns.into(),
+                    path: vec![MetadataPathSegment { key: "tier".into() }],
+                    value: ValueMatcher::StringMatch(safe_regex_string_matcher("^(prod|staging)$")),
+                })],
+                principals: vec![envoy_config::Principal::Any(true)],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let mut f =
+            RbacFilter::build_from_config(&cfg, &registry, "ingress_http").expect("builds");
+        let mut ok = req_with_md(ns, "tier", "staging");
+        assert!(matches!(
+            f.decode_headers(&mut ok),
+            crate::pipeline::Decision::Continue
+        ));
+        let mut miss = req_with_md(ns, "tier", "dev");
+        match f.decode_headers(&mut miss) {
+            crate::pipeline::Decision::StopAndSend(r) => assert_eq!(r.status, 403),
+            other => panic!("expected 403, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_safe_regex_matches_without_panic() {
+        // PANIC-REGRESSION GUARD (M35-1)
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let mut policies = std::collections::BTreeMap::new();
+        policies.insert(
+            "p".into(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Header(HeaderMatcher {
+                    name: "x-tier".into(),
+                    mode: HeaderMatcherMode::SafeRegexMatch(envoy_config::SafeRegex {
+                        regex: "^(prod|staging)$".into(),
+                        compiled: None,
+                    }),
+                    invert_match: false,
+                })],
+                principals: vec![envoy_config::Principal::Any(true)],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        let mut f =
+            RbacFilter::build_from_config(&cfg, &registry, "ingress_http").expect("builds");
+        let mut ok = req_with(vec![("x-tier", "staging")]);
+        assert!(matches!(
+            f.decode_headers(&mut ok),
+            crate::pipeline::Decision::Continue
+        ));
+        let mut miss = req_with(vec![("x-tier", "dev")]);
+        assert!(matches!(
+            f.decode_headers(&mut miss),
+            crate::pipeline::Decision::StopAndSend(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_rbac_safe_regex_is_boot_fatal_not_panic() {
+        let registry = std::sync::Arc::new(envoy_stats::StatsRegistry::new());
+        let mut policies = std::collections::BTreeMap::new();
+        policies.insert(
+            "p".into(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Header(HeaderMatcher {
+                    name: "x".into(),
+                    mode: HeaderMatcherMode::SafeRegexMatch(envoy_config::SafeRegex {
+                        regex: "(".into(),
+                        compiled: None,
+                    }),
+                    invert_match: false,
+                })],
+                principals: vec![envoy_config::Principal::Any(true)],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        assert!(RbacFilter::build_from_config(&cfg, &registry, "ingress_http").is_err());
     }
 
     // --- Task 4: in-process producer→consumer backstop ----------------------

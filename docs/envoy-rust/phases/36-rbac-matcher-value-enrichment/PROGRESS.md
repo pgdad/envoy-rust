@@ -30,3 +30,11 @@
 - TDD: tests first, watched fail (no methods), implemented, watched pass.
 - Gate: `cargo test -p envoy-config` green.
 
+## Task 4 — F2 runtime: fallible RBAC lowering compiles SafeRegex (closes M35-1) ✅
+
+- Made `lower_permission`/`lower_principal` fallible (`-> Result<_, FilterError>`); the `Header`/`Metadata` arms clone the matcher, call `compile_safe_regexes()` (header) / `value.compile_safe_regexes()` (metadata), map `ConfigError::InvalidRegex → FilterError::InvalidConfig`; combinator arms thread `?`. `build_from_config`'s policies closure now fallible + `collect::<Result<_,_>>()?`.
+- A malformed RBAC `safe_regex` is now BOOT-fatal (not a first-request panic) — M35-1 CONSUMED.
+- Tests: `metadata_safe_regex_value_matches_without_panic`, `header_safe_regex_matches_without_panic` (the panic-regression GUARD — PANICKED on the pre-fix tree per Step 2), `malformed_rbac_safe_regex_is_boot_fatal_not_panic`. All anchored `^(prod|staging)$` (§A3b).
+- TDD: tests first, watched panic/fail (Step 2 recorded), implemented, watched pass.
+- Gate: `cargo test -p envoy-filter` green (201/201 passed).
+
