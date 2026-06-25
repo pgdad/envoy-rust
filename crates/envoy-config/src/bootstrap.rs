@@ -1341,14 +1341,18 @@ pub struct MetadataPathSegment {
     pub key: String,
 }
 
-/// Envoy `type.matcher.v3.ValueMatcher` (string-only MVP). The hand-rolled "exactly one
-/// key" Deserialize accepts ONLY `string_match`; any other oneof key (`present_match`, …) →
-/// `unknown_field` → boot-fatal (stricter than Envoy, which accepts them). Mirrors the
-/// `Permission`/`StringMatcher` visitor template.
+/// Envoy `type.matcher.v3.ValueMatcher`. The hand-rolled "exactly one key" Deserialize
+/// accepts `string_match` and `present_match`; any other oneof key (`null_match`,
+/// `bool_match`, …) → `unknown_field` → boot-fatal (stricter than Envoy, which accepts
+/// them). Mirrors the `Permission`/`StringMatcher` visitor template.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ValueMatcher {
     #[serde(rename = "string_match")]
     StringMatch(StringMatcher),
+    /// §A1 (phase 36): match on KEY PRESENCE. Semantics `match = present && want`
+    /// (`present_match: false` NEVER matches — NOT the HeaderMatcher `present_match` precedent).
+    #[serde(rename = "present_match")]
+    PresentMatch(bool),
 }
 
 impl<'de> serde::Deserialize<'de> for ValueMatcher {
@@ -1359,7 +1363,7 @@ impl<'de> serde::Deserialize<'de> for ValueMatcher {
         use serde::de::{Error, MapAccess, Visitor};
         use std::fmt;
 
-        const KEYS: &[&str] = &["string_match"];
+        const KEYS: &[&str] = &["string_match", "present_match"];
 
         struct V;
         impl<'de> Visitor<'de> for V {
@@ -1376,6 +1380,7 @@ impl<'de> serde::Deserialize<'de> for ValueMatcher {
                 })?;
                 let value = match key.as_str() {
                     "string_match" => ValueMatcher::StringMatch(map.next_value::<StringMatcher>()?),
+                    "present_match" => ValueMatcher::PresentMatch(map.next_value::<bool>()?),
                     other => return Err(M::Error::unknown_field(other, KEYS)),
                 };
                 if map.next_key::<String>()?.is_some() {
@@ -12183,24 +12188,57 @@ rules:
         }
 
         #[test]
-        fn rbac_metadata_rejects_present_match_value() {
+        fn rbac_metadata_accepts_present_match_value() {
+            // F1 §A5: present_match is now an ACCEPTED ValueMatcher variant.
             let yaml = r#"
 rules:
   action: ALLOW
   policies:
-    tier_prod:
+    p:
       permissions:
         - metadata:
             filter: envoy.filters.http.header_to_metadata
-            path:
-              - key: tier
-            value:
-              present_match: true
+            path: [ { key: tier } ]
+            value: { present_match: true }
       principals:
         - any: true
 "#;
-            serde_yaml::from_str::<RbacConfig>(yaml)
-                .expect_err("present_match value rejected (string-only ValueMatcher)");
+            let cfg: RbacConfig = serde_yaml::from_str(yaml).expect("present_match accepted");
+            match &cfg.rules.policies["p"].permissions[0] {
+                Permission::Metadata(m) => assert_eq!(m.value, ValueMatcher::PresentMatch(true)),
+                other => panic!("expected Metadata, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn rbac_metadata_present_match_false_parses() {
+            let yaml = r#"
+rules: { action: ALLOW, policies: { p: { permissions: [ { metadata: { filter: f, path: [ { key: tier } ], value: { present_match: false } } } ], principals: [ { any: true } ] } } }
+"#;
+            let cfg: RbacConfig =
+                serde_yaml::from_str(yaml).expect("present_match:false accepted");
+            assert_eq!(
+                cfg.rules.policies["p"].permissions[0],
+                Permission::Metadata(MetadataMatcher {
+                    filter: "f".into(),
+                    path: vec![MetadataPathSegment { key: "tier".into() }],
+                    value: ValueMatcher::PresentMatch(false)
+                })
+            );
+        }
+
+        #[test]
+        fn rbac_metadata_rejects_other_value_matcher_keys() {
+            // §A5: null_match/bool_match/etc. stay boot-fatal (stricter than Envoy).
+            for key in ["null_match: {}", "bool_match: true", "double_match: { exact: 1.0 }"] {
+                let yaml = format!(
+                    r#"
+rules: {{ action: ALLOW, policies: {{ p: {{ permissions: [ {{ metadata: {{ filter: f, path: [ {{ key: tier }} ], value: {{ {key} }} }} }} ], principals: [ {{ any: true }} ] }} }} }}
+"#
+                );
+                serde_yaml::from_str::<RbacConfig>(&yaml)
+                    .expect_err("non-string/present value rejected");
+            }
         }
 
         #[test]

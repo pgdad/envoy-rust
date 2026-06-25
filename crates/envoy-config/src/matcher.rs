@@ -103,11 +103,21 @@ impl StringMatcher {
 }
 
 impl ValueMatcher {
-    /// Returns true iff the resolved metadata value matches. String-only MVP: delegates to the
-    /// inner `StringMatcher::matches` (phase 35).
+    /// Match against a PRESENT value. `present_match` returns its bool (the value is present,
+    /// so `present && want == want`). Kept for the value-present call sites.
     pub fn matches(&self, value: &str) -> bool {
         match self {
             ValueMatcher::StringMatch(sm) => sm.matches(value),
+            ValueMatcher::PresentMatch(want) => *want,
+        }
+    }
+
+    /// Presence-aware entry (§A1). `resolved` is `Some(v)` iff the metadata key resolved.
+    /// `present_match`: `match = resolved.is_some() && want`. `string_match`: value present AND matches.
+    pub fn matches_resolved(&self, resolved: Option<&str>) -> bool {
+        match self {
+            ValueMatcher::StringMatch(sm) => resolved.is_some_and(|v| sm.matches(v)),
+            ValueMatcher::PresentMatch(want) => resolved.is_some() && *want,
         }
     }
 }
@@ -364,5 +374,24 @@ mod tests {
         let m = hm_inverted("authorization", HeaderMatcherMode::PresentMatch(true));
         assert!(m.matches(&[]));
         assert!(!m.matches(&[h("authorization", "x")]));
+    }
+
+    #[test]
+    fn value_matcher_present_match_resolved_semantics() {
+        // §A1: match = present && want.  present_match:false NEVER matches.
+        let t = ValueMatcher::PresentMatch(true);
+        assert!(t.matches_resolved(Some("anything"))); // present && true
+        assert!(!t.matches_resolved(None)); // absent
+        let f = ValueMatcher::PresentMatch(false);
+        assert!(!f.matches_resolved(Some("anything"))); // present && false → false
+        assert!(!f.matches_resolved(None)); // absent
+        // StringMatch via matches_resolved:
+        let sm = ValueMatcher::StringMatch(StringMatcher {
+            mode: StringMatcherMode::Exact("prod".into()),
+            ignore_case: false,
+        });
+        assert!(sm.matches_resolved(Some("prod")));
+        assert!(!sm.matches_resolved(Some("dev")));
+        assert!(!sm.matches_resolved(None));
     }
 }
