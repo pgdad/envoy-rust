@@ -12347,6 +12347,16 @@ metadata:
             assert!(matches!(p, crate::Principal::UrlPath(_)));
         }
 
+        // ---- Phase 37: url_path config-validity boot-fatal §D 1-3 (Task 5) ----
+        // The SAME rejections as the bare-PathMatcher tests, but THROUGH a full
+        // RBAC `Permission` (the real boot path).
+        #[test]
+        fn rbac_url_path_empty_and_unknown_are_boot_fatal() {
+            assert!(serde_yaml::from_str::<crate::Permission>("url_path: {}").is_err()); // §D1
+            assert!(serde_yaml::from_str::<crate::Permission>("url_path: { path: {} }").is_err()); // §D2
+            assert!(serde_yaml::from_str::<crate::Permission>("url_path: { foo: bar }").is_err()); // §D3
+        }
+
         #[test]
         fn parses_rbac_metadata_principal() {
             let yaml = r#"

@@ -97,3 +97,21 @@ Task-2 `url_path_permission_exact_matches_and_strips_query` + Task-3
 `url_path_principal_matches_query_stripped`).
 
 **Commit:** `phase 37: url_path backstop — modes, composition, DENY-inversion, anchored safe_regex [ADR-0090]`
+
+---
+
+## Task 5 — config-validity boot-fatal backstop (ADR-0090 §D) — DONE
+
+**TDD:** pure guard tests (§D maps to existing error paths — NO new `ConfigError`
+variant per ADR-0090 §D); ran after writing — both GREEN with NO new implementation.
+- `bootstrap.rs` `rbac_url_path_empty_and_unknown_are_boot_fatal` — §D 1-3 THROUGH
+  a full `Permission`: `url_path: {}` (missing `path`), `url_path: { path: {} }`
+  (missing mode key), `url_path: { foo: bar }` (`deny_unknown_fields`) all `is_err()`.
+- `rbac.rs` `url_path_malformed_safe_regex_is_build_error` — §D 4: a `safe_regex: "["`
+  url_path is rejected at `build_from_config` (the lowering `compile_safe_regex()`)
+  as `Err(FilterError::InvalidConfig { .. })` — boot-fatal, NOT a first-request panic.
+
+**Evidence:** `cargo test -p envoy-config rbac_url_path_empty` → `1 passed`;
+`cargo test -p envoy-filter url_path_malformed` → `1 passed`.
+
+**Commit:** `phase 37: url_path config-validity boot-fatal backstop (ADR-0090 §D) [ADR-0090]`

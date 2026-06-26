@@ -544,6 +544,38 @@ mod tests {
         )); // full-anchor
     }
 
+    // ---- Phase 37: url_path §D case 4 — malformed safe_regex is boot-fatal (Task 5) ----
+    #[test]
+    fn url_path_malformed_safe_regex_is_build_error() {
+        use envoy_config::*;
+        let bad = StringMatcher {
+            mode: StringMatcherMode::SafeRegex(SafeRegex {
+                regex: "[".into(),
+                compiled: None,
+            }),
+            ignore_case: false,
+        };
+        let cfg = RbacConfig {
+            rules: Rules {
+                action: Action::Allow,
+                policies: [(
+                    "p0".to_string(),
+                    Policy {
+                        permissions: vec![Permission::UrlPath(PathMatcher { path: bad })],
+                        principals: vec![Principal::Any(true)],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        };
+        let registry = std::sync::Arc::new(StatsRegistry::new());
+        assert!(matches!(
+            RbacFilter::build_from_config(&cfg, &registry, "ingress_http"),
+            Err(FilterError::InvalidConfig { .. })
+        ));
+    }
+
     fn header_matcher_exact(name: &str, exact: &str) -> HeaderMatcher {
         HeaderMatcher {
             name: name.to_string(),
