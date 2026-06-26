@@ -115,3 +115,34 @@ variant per ADR-0090 §D); ran after writing — both GREEN with NO new implemen
 `cargo test -p envoy-filter url_path_malformed` → `1 passed`.
 
 **Commit:** `phase 37: url_path config-validity boot-fatal backstop (ADR-0090 §D) [ADR-0090]`
+
+---
+
+## Task 6 — differential fixture `0045-http-rbac-url-path` + wrapper — DONE
+
+**Created:** `tests/fixtures/0045-http-rbac-url-path/{envoy.yaml,envoy-rust.yaml,
+expectations.yaml,README.md}` (templated off `0043`, `header_to_metadata` producer
+REMOVED — `url_path` is self-contained; `metadata` permission replaced by
+`url_path: { path: { exact: "/allowed" } }`; route is `direct_response{200,"ok\n"}`,
+chain `[rbac, router]`, `clusters: []`) + the per-fixture wrapper
+`tests/differential/tests/rbac_url_path.rs` (`#[tokio::test] async fn rbac_url_path`
+— REQUIRED; there is no manifest/glob, so without it fixture 0045 never runs).
+3 path-varying probes: `/allowed`→200+`ok\n`, `/denied`→403+`RBAC: access denied`,
+`/allowed?x=1`→200+`ok\n` (the query-strip discriminator).
+
+**Rebuilt the DEBUG binary first** (`cargo build -p envoy-bin` → `Finished`) so the
+differential subprocess understands the new `url_path` config key (the
+differential-harness-uses-debug-binary discipline — else stale `unknown field`).
+
+**Evidence:** `cargo test -p differential rbac_url_path` →
+```
+running 1 test
+test rbac_url_path ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.06s
+```
+Genuinely ran Envoy `v1.33.0` (image cached locally; `run_fixture` has no Docker-skip
+early-return — it would `Err` if Docker were unavailable) vs the envoy-rust subprocess;
+all 3 probes byte-identical. Filtered by test NAME `rbac_url_path` (NOT `0045` — test
+names are non-numeric → `0045` would be a false green).
+
+**Commit:** `phase 37: fixture 0045-http-rbac-url-path + differential wrapper (match/miss/query-strip) [ADR-0090]`

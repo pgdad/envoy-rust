@@ -1,0 +1,30 @@
+# Phase 37: url_path RBAC condition. 3 path-varying probes prove the
+# query-stripped path match is byte-identical cross-proxy. Probe (c) /allowed?x=1
+# is the load-bearing discriminator: Envoy strips the query (ADR-0090 §B), so it
+# matches url_path:{exact:/allowed} and returns 200 — a naive whole-:path compare
+# would 403 it. 403 body is "RBAC: access denied" (19 bytes, no newline, ADR-0034).
+# Reuses the fixture-0043 http1_probe_list driver (per-probe path; NO extra_headers).
+driver:
+  kind: http1_probe_list
+  probes:
+    - name: probe-1-allow-exact
+      method: get
+      path: /allowed
+      host: envoy-rust.test
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-2-deny-miss
+      method: get
+      path: /denied
+      host: envoy-rust.test
+      expected_status: 403
+      expected_body: { kind: byte_exact, body: "RBAC: access denied" }
+      expected_headers: set_equal_modulo_allow_list
+    - name: probe-3-allow-query-strip
+      method: get
+      path: /allowed?x=1
+      host: envoy-rust.test
+      expected_status: 200
+      expected_body: { kind: byte_exact, body: "ok\n" }
+      expected_headers: set_equal_modulo_allow_list

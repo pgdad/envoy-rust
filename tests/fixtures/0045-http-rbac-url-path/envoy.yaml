@@ -1,0 +1,68 @@
+# Phase 37 differential acceptance fixture: the RBAC `url_path` condition.
+# Drive 3 path-varying GET probes through an HCM whose http_filters chain is
+#   [envoy.filters.http.rbac, envoy.filters.http.router]
+# (NO header_to_metadata producer — `url_path` is self-contained: it reads the
+# request path directly). The rbac filter (action: ALLOW, one policy `allow_path`)
+# matches `url_path: { path: { exact: "/allowed" } }` as a Permission.
+#   probe 1: GET /allowed     -> exact match                       -> 200 + "ok\n"
+#   probe 2: GET /denied      -> no match                          -> 403 + "RBAC: access denied"
+#   probe 3: GET /allowed?x=1 -> query (?x=1) STRIPPED (ADR-0090 §B) -> matches /allowed -> 200 + "ok\n"
+# Probe 3 is the load-bearing discriminator: a naive whole-:path compare sees
+# `/allowed?x=1 != /allowed` and would 403 it. 403 body is "RBAC: access denied"
+# (19 bytes, NO trailing newline) per phase-10 ADR-0034.
+# `#fragment` / percent-decode / dot-segment / slash-merge / case normalization
+# are OUT of scope (ADR-0090 §B/R1, carry-forward M37-1) — the probes are
+# already-normalized, query-strip-only, so the cross-proxy verdict is byte-portable.
+# Per-side YAML asymmetry follows the fixture-0017/0043 precedent (admin/bind/
+# generate_request_id on the upstream side; none on the envoy-rust side).
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 0
+node:
+  cluster: phase-37-cluster
+  id: phase-37-envoy
+static_resources:
+  listeners:
+    - name: ingress_http
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: {{PORT}}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                generate_request_id: false
+                route_config:
+                  name: default
+                  virtual_hosts:
+                    - name: default
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          direct_response:
+                            status: 200
+                            body: { inline_string: "ok\n" }
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: ALLOW
+                        policies:
+                          "allow_path":
+                            permissions:
+                              - url_path:
+                                  path:
+                                    exact: "/allowed"
+                            principals:
+                              - any: true
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
