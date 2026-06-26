@@ -1341,6 +1341,18 @@ pub struct MetadataPathSegment {
     pub key: String,
 }
 
+/// Envoy `type.matcher.v3.PathMatcher` (phase 37). The only in-scope rule is
+/// `path` (a `StringMatcher`); RBAC `url_path` matches the request path with the
+/// `?query` stripped (ADR-0090 §B). A thin derived struct — the required `path`
+/// field + `deny_unknown_fields` + the inner StringMatcher's "missing mode key"
+/// error make an empty/path-less/unknown-subkey `PathMatcher` boot-fatal,
+/// matching Envoy (ADR-0090 §D); no hand-rolled visitor needed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathMatcher {
+    pub path: StringMatcher,
+}
+
 /// Envoy `type.matcher.v3.ValueMatcher`. The hand-rolled "exactly one key" Deserialize
 /// accepts `string_match` and `present_match`; any other oneof key (`null_match`,
 /// `bool_match`, …) → `unknown_field` → boot-fatal (stricter than Envoy, which accepts
@@ -12235,6 +12247,54 @@ metadata:
             assert!(json.contains("\"metadata\""));
             assert!(json.contains("\"filter\""));
             assert!(json.contains("\"string_match\""));
+        }
+
+        // ---- Phase 37: PathMatcher (RBAC url_path) config struct (Task 1) ----
+
+        #[test]
+        fn path_matcher_parses_exact_and_round_trips() {
+            let pm: crate::PathMatcher = serde_yaml::from_str("path: { exact: \"/allowed\" }").unwrap();
+            assert_eq!(
+                pm.path,
+                StringMatcher {
+                    mode: StringMatcherMode::Exact("/allowed".into()),
+                    ignore_case: false
+                }
+            );
+            // round-trips through serde_yaml
+            let s = serde_yaml::to_string(&pm).unwrap();
+            let pm2: crate::PathMatcher = serde_yaml::from_str(&s).unwrap();
+            assert_eq!(pm, pm2);
+        }
+
+        #[test]
+        fn path_matcher_empty_is_missing_path_error() {
+            // §D case 1: `url_path: {}` → empty PathMatcher → missing `path`.
+            let err = serde_yaml::from_str::<crate::PathMatcher>("{}")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("path"), "want missing-path error, got: {err}");
+        }
+
+        #[test]
+        fn path_matcher_empty_string_matcher_is_missing_mode_error() {
+            // §D case 2: `url_path: { path: {} }` → StringMatcher with no mode key.
+            let err = serde_yaml::from_str::<crate::PathMatcher>("path: {}")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("mode key"), "want missing-mode error, got: {err}");
+        }
+
+        #[test]
+        fn path_matcher_unknown_subkey_is_denied() {
+            // §D case 3: `url_path: { foo: bar }` → deny_unknown_fields.
+            let err = serde_yaml::from_str::<crate::PathMatcher>("foo: bar")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("foo") || err.contains("unknown"),
+                "want unknown-field error, got: {err}"
+            );
         }
 
         #[test]
