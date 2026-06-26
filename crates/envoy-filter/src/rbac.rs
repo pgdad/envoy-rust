@@ -41,6 +41,9 @@ pub(crate) enum RuntimePermission {
     /// (the `Header(HeaderMatcher)` precedent). Reads a single-segment metadata
     /// path; absent namespace/key → no match.
     Metadata(envoy_config::MetadataMatcher),
+    /// Phase 37: `url_path` condition. Holds the inner `StringMatcher` directly
+    /// (the `PathMatcher` wrapper is trivial). Matches the query-stripped req.path.
+    UrlPath(envoy_config::StringMatcher),
 }
 
 /// Build-time-lowered runtime representation of an Envoy RBAC `Principal`.
@@ -79,7 +82,16 @@ pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> boo
         RuntimePermission::OrRules(set) => set.iter().any(|p| eval_permission(p, req)),
         RuntimePermission::NotRule(inner) => !eval_permission(inner, req),
         RuntimePermission::Metadata(m) => eval_metadata(m, req),
+        RuntimePermission::UrlPath(sm) => sm.matches(strip_query(&req.path)),
     }
+}
+
+/// Phase 37: extract the path Envoy matches `url_path` against — the request
+/// target with everything from the first `?` removed (ADR-0090 §B: query-strip
+/// ONLY; no percent-decode / dot-segment / slash / case normalization). Envoy's
+/// `#fragment` is rejected at the H1 codec (400) before it reaches here (R1/M37-1).
+fn strip_query(path: &str) -> &str {
+    path.split('?').next().unwrap_or(path)
 }
 
 /// Phase 35/36: resolve the single-segment metadata path and apply the ValueMatcher.
@@ -279,6 +291,16 @@ fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, F
                 })?;
             RuntimePermission::Metadata(m)
         }
+        envoy_config::Permission::UrlPath(pm) => {
+            // Phase 37: reuse the phase-36 fallible SafeRegex compile so a malformed
+            // `safe_regex` url_path pattern is boot-fatal, not a first-request panic.
+            let mut sm = pm.path.clone();
+            sm.compile_safe_regex()
+                .map_err(|e| FilterError::InvalidConfig {
+                    message: e.to_string(),
+                })?;
+            RuntimePermission::UrlPath(sm)
+        }
     })
 }
 
@@ -344,6 +366,31 @@ mod tests {
             body: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
         }
+    }
+
+    // Phase 37: a request whose only varying axis is the request-target `path`.
+    fn req_with_path(path: &str) -> FilterRequest {
+        FilterRequest {
+            method: "GET".into(),
+            path: path.into(),
+            headers: vec![],
+            body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn url_path_permission_exact_matches_and_strips_query() {
+        let sm = StringMatcher {
+            mode: StringMatcherMode::Exact("/allowed".into()),
+            ignore_case: false,
+        };
+        let p = RuntimePermission::UrlPath(sm);
+        assert!(eval_permission(&p, &req_with_path("/allowed"))); // match
+        assert!(eval_permission(&p, &req_with_path("/allowed?x=1"))); // query stripped (ADR-0090 §B)
+        assert!(eval_permission(&p, &req_with_path("/allowed?"))); // empty query stripped
+        assert!(!eval_permission(&p, &req_with_path("/denied"))); // miss
+        assert!(!eval_permission(&p, &req_with_path("/allowed/"))); // trailing slash significant
     }
 
     fn header_matcher_exact(name: &str, exact: &str) -> HeaderMatcher {

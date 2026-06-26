@@ -1431,6 +1431,10 @@ pub enum Permission {
     NotRule(Box<Permission>),
     #[serde(rename = "metadata")]
     Metadata(MetadataMatcher),
+    /// Phase 37: `url_path` condition (Envoy `type.matcher.v3.PathMatcher`).
+    /// Matches the request path with the `?query` stripped (ADR-0090 §B).
+    #[serde(rename = "url_path")]
+    UrlPath(PathMatcher),
 }
 
 impl<'de> serde::Deserialize<'de> for Permission {
@@ -1448,6 +1452,7 @@ impl<'de> serde::Deserialize<'de> for Permission {
             "or_rules",
             "not_rule",
             "metadata",
+            "url_path",
         ];
 
         struct V;
@@ -1473,6 +1478,7 @@ impl<'de> serde::Deserialize<'de> for Permission {
                     "or_rules" => Permission::OrRules(map.next_value::<PermissionSet>()?),
                     "not_rule" => Permission::NotRule(Box::new(map.next_value::<Permission>()?)),
                     "metadata" => Permission::Metadata(map.next_value::<MetadataMatcher>()?),
+                    "url_path" => Permission::UrlPath(map.next_value::<PathMatcher>()?),
                     other => return Err(M::Error::unknown_field(other, KEYS)),
                 };
                 if map.next_key::<String>()?.is_some() {
@@ -3994,6 +4000,11 @@ fn validate_permission_tree(
         crate::Permission::Metadata(m) => {
             validate_metadata_matcher(m, listener_name, policy_name, path)
         }
+        // phase 37: `url_path` is a leaf (no semantic check beyond serde, mirroring
+        // the `Header(_)` arm). The inner StringMatcher's SafeRegex compiles at RBAC
+        // lowering (`lower_permission`), not here — this path is an immutable borrow
+        // (ADR-0090 §D; the validate_metadata_matcher note above).
+        crate::Permission::UrlPath(_) => Ok(()),
     }
 }
 
@@ -12295,6 +12306,26 @@ metadata:
                 err.contains("foo") || err.contains("unknown"),
                 "want unknown-field error, got: {err}"
             );
+        }
+
+        // ---- Phase 37: Permission::UrlPath (Task 2) ----
+
+        #[test]
+        fn permission_parses_url_path_and_json_round_trips() {
+            // Parse from YAML (the config-load surface).
+            let p: crate::Permission =
+                serde_yaml::from_str("url_path: { path: { exact: \"/allowed\" } }").unwrap();
+            assert!(matches!(&p, crate::Permission::UrlPath(pm)
+                if pm.path == StringMatcher { mode: StringMatcherMode::Exact("/allowed".into()), ignore_case: false }));
+            // Round-trip through JSON — NOT YAML. `serde_yaml` 0.9 serializes these
+            // externally-tagged hand-rolled enums as `!url_path` TAG syntax, which the
+            // hand-rolled Deserialize visitor does NOT accept on reparse (it expects a
+            // map). /config_dump is a JSON surface anyway. Precedent + rationale:
+            // `rbac_metadata_permission_json_round_trips` above.
+            let s = serde_json::to_string(&p).unwrap();
+            assert!(s.contains("url_path"));
+            let p2: crate::Permission = serde_json::from_str(&s).unwrap();
+            assert_eq!(p, p2);
         }
 
         #[test]
