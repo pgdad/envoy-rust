@@ -12274,7 +12274,8 @@ metadata:
 
         #[test]
         fn path_matcher_parses_exact_and_round_trips() {
-            let pm: crate::PathMatcher = serde_yaml::from_str("path: { exact: \"/allowed\" }").unwrap();
+            let pm: crate::PathMatcher =
+                serde_yaml::from_str("path: { exact: \"/allowed\" }").unwrap();
             assert_eq!(
                 pm.path,
                 StringMatcher {
@@ -12303,7 +12304,10 @@ metadata:
             let err = serde_yaml::from_str::<crate::PathMatcher>("path: {}")
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("mode key"), "want missing-mode error, got: {err}");
+            assert!(
+                err.contains("mode key"),
+                "want missing-mode error, got: {err}"
+            );
         }
 
         #[test]

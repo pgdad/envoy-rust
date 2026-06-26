@@ -28,13 +28,13 @@ pub use bootstrap::{
     Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints, MetadataEntry,
     MetadataMatcher, MetadataPathSegment, Mutations, NetworkFilter, Node, OutlierDetection,
     PathConfigSource, PathMatcher, PerFilterConfig, Percent, Permission, PermissionSet, Policy,
-    Principal,
-    PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route,
-    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority,
-    Rules, RuntimeFractionalPercent, SafeRegex, SetMetadataConfig, SocketAddress, StaticResources,
-    StringMatcher, StringMatcherMode, SubstitutionFormatString, TcpProxyConfig, Thresholds,
-    TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
-    TypedExtensionProtocolOptions, UpstreamTlsContext, ValueMatcher, VirtualHost, parse_duration,
+    Principal, PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn, RetryPolicy,
+    Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
+    RoutingPriority, Rules, RuntimeFractionalPercent, SafeRegex, SetMetadataConfig, SocketAddress,
+    StaticResources, StringMatcher, StringMatcherMode, SubstitutionFormatString, TcpProxyConfig,
+    Thresholds, TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig,
+    TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext, ValueMatcher, VirtualHost,
+    parse_duration,
 };
 pub use cds::parse_cds_file;
 pub use eds::parse_eds_file;

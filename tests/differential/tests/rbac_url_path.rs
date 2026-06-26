@@ -4,6 +4,7 @@
 //!   - probe 1: GET /allowed     -> match              -> 200 + "ok\n"
 //!   - probe 2: GET /denied      -> no match           -> 403 + "RBAC: access denied"
 //!   - probe 3: GET /allowed?x=1 -> query stripped (ADR-0090 §B) -> match -> 200 + "ok\n"
+//!
 //! Probe 3 is the load-bearing discriminator: a naive whole-:path compare would 403 it.
 //! 403 body is "RBAC: access denied" (19 bytes, no newline, ADR-0034). LOCALLY
 //! authoritative (no reload trigger). Docker-gated by the harness at the cluster level.
@@ -16,5 +17,7 @@ async fn rbac_url_path() {
         .join("..")
         .join("..")
         .join("tests/fixtures/0045-http-rbac-url-path");
-    differential::run_fixture(&dir).await.expect("fixture passes");
+    differential::run_fixture(&dir)
+        .await
+        .expect("fixture passes");
 }

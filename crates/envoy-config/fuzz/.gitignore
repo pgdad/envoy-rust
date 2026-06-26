@@ -45,5 +45,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/hcm_rbac_metadata.yaml
 !corpus/parse_bootstrap/rbac_present_match.yaml
 !corpus/parse_bootstrap/rbac_safe_regex.yaml
+!corpus/parse_bootstrap/hcm_rbac_url_path.yaml
 artifacts/
 target/

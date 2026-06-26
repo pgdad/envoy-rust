@@ -435,7 +435,11 @@ mod tests {
                 mode,
                 ignore_case: false,
             });
-            assert_eq!(eval_permission(&p, &req_with_path(path)), want, "path={path}");
+            assert_eq!(
+                eval_permission(&p, &req_with_path(path)),
+                want,
+                "path={path}"
+            );
         }
     }
 

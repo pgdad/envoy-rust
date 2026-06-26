@@ -1501,6 +1501,21 @@ no match → `403`+19B.
 non-string `ValueMatcher` oneof arms). The `parse_bootstrap` fuzz corpus gains two
 seeds (`rbac_present_match.yaml`, `rbac_safe_regex.yaml`) — NO new fuzz target.
 
+### Phase 37 (ADR-0089/0090): the RBAC `url_path` Permission/Principal condition
+
+> Phase 37 adds the `url_path` condition type (Envoy `type.matcher.v3.PathMatcher`,
+> `url_path: { path: { <StringMatcher> } }`) to BOTH the RBAC `Permission` and
+> `Principal` enums on the existing phase-10 filter. `url_path` matches the request
+> path with the `?query` STRIPPED (ADR-0090 §B: query-strip ONLY — Envoy applies NO
+> percent-decode / dot-segment / slash-merge / case normalization by default at
+> v1.33.0). The cross-proxy witness is **fixture 0045** (`0045-http-rbac-url-path`):
+> `/allowed`→200, `/denied`→403+`RBAC: access denied` (19B), `/allowed?x=1`→200 (the
+> query-strip discriminator). `safe_regex` is RE2 FULL-match against the stripped path
+> (anchored patterns are portable; M36-1). Config-validity (empty/path-less PathMatcher,
+> unknown sub-key, malformed regex) is boot-fatal on BOTH proxies (ADR-0090 §D).
+> CARRY-FORWARD M37-1: `#fragment` in the request-target is rejected at the H1 codec
+> (400) before url_path matching — a separate codec surface, OUT of phase-37 scope.
+
 ---
 
 ## xDS wire state machine

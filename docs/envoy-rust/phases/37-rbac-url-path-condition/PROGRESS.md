@@ -146,3 +146,46 @@ all 3 probes byte-identical. Filtered by test NAME `rbac_url_path` (NOT `0045` �
 names are non-numeric → `0045` would be a false green).
 
 **Commit:** `phase 37: fixture 0045-http-rbac-url-path + differential wrapper (match/miss/query-strip) [ADR-0090]`
+
+---
+
+## Task 7 — fuzz seed + BEHAVIOR_CONTRACT + state-3 gate confirmation — DONE
+
+**Fuzz seed:** created `crates/envoy-config/fuzz/corpus/parse_bootstrap/hcm_rbac_url_path.yaml`
+(a full bootstrap with a `[rbac, router]` chain whose policy carries a `safe_regex`
+`url_path` Permission `^/allowed/[0-9]+$` AND an `exact` `url_path` Principal — exercises
+the `regex` compile path + both enums) + the un-ignore line
+`!corpus/parse_bootstrap/hcm_rbac_url_path.yaml` in `crates/envoy-config/fuzz/.gitignore`.
+Verified tracked: `git ls-files ...hcm_rbac_url_path.yaml` → prints the path. NO new
+fuzz target; NO `ci.yml` change (reuses `parse_bootstrap`).
+
+**Short-budget fuzz (§7.5 gate (d)):**
+`cargo fuzz run parse_bootstrap -- -runs=200000 -max_total_time=60` →
+`Done 200000 runs in 13 second(s)` — no crash; the new seed exercised.
+
+**BEHAVIOR_CONTRACT:** added the `### Phase 37 (ADR-0089/0090): the RBAC url_path
+Permission/Principal condition` subsection (query-strip semantic, fixture-0045 witness,
+RE2 full-match, §D boot-fatal, M37-1 `#fragment` carry-forward) after the phase-35/36
+RBAC metadata subsections.
+
+**§7.5 gate (state-3 confirmation — full formal gate is the state-4 concern per §5.1):**
+- `cargo build --workspace --all-targets` → `Finished` (clean).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → `Finished`
+  (clean; fixed one `doc list item without indentation` in the wrapper by adding a
+  blank `//!` line before the trailing paragraph).
+- `cargo fmt --all -- --check` → clean (after `cargo fmt --all` reflow).
+- `cargo test --workspace` → all GREEN **except** the single pre-existing host flake
+  `admin_config_dump_server_info` (a backend-cluster fixture whose stats set is keyed on
+  this host's Docker bridge IP `192.168.65.2` — the documented "Differential host bridge
+  IP" false-RED; CI-authoritative; ZERO connection to RBAC/url_path — fixture 0045 has no
+  backend). Library crates: `envoy-config` 518 passed / 0 failed; `envoy-filter` 208
+  passed / 0 failed.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+- `cargo test -p differential rbac_url_path` → `1 passed` (fixture 0045 green vs live
+  Envoy v1.33.0).
+
+`#![forbid(unsafe_code)]` holds; NO new crate/dependency/`HttpFilterInstance` variant/
+`ConfigError` variant/fuzz-target. M36-1 anchored-locked (NOT consumed). New carry-forward
+**M37-1** (codec `#`-handling, ADR-0090 R1).
+
+**Commit:** `phase 37: url_path parse_bootstrap seed + BEHAVIOR_CONTRACT subsection [ADR-0090]`
