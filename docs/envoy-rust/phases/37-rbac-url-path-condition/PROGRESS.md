@@ -73,3 +73,27 @@ matches in BOTH crates):**
 → `Finished` (clean).
 
 **Commit:** `phase 37: Principal::UrlPath variant (symmetric) [ADR-0090]`
+
+---
+
+## Task 4 — backstop (modes, composition, DENY-inversion, anchored safe_regex) — DONE
+
+**TDD:** these are pure backstop tests over behavior already built in Tasks 2/3;
+ran them after writing — all GREEN with NO new implementation (the correct TDD
+outcome for a backstop confirming an existing surface). Added to `rbac.rs` tests:
+- `url_path_all_string_modes` — exact/prefix/suffix/contains match+miss matrix.
+- `url_path_composes_and_inverts_under_deny` — `not_rule { url_path }` under
+  `action: DENY` through `build_from_config` + `decode_headers` (the decision matrix):
+  `/allowed`→Continue, `/other`→StopAndSend.
+- `url_path_composes_in_and_or_rules` — `and_rules` (both prefixes) / `or_rules`
+  (either prefix).
+- `url_path_anchored_safe_regex_matches_without_panic` — ADR-0090 §C anchored
+  `^/allowed/[0-9]+$` through the full filter: `/allowed/42`→Continue,
+  `/allowed/42?q=1`→Continue (query-strip), `/allowed/xx`→StopAndSend,
+  `/allowed`→StopAndSend (full-anchor; no first-request panic — compiled at lowering).
+
+**Evidence:** `cargo test -p envoy-filter url_path` → `6 passed` (the 4 backstop +
+Task-2 `url_path_permission_exact_matches_and_strips_query` + Task-3
+`url_path_principal_matches_query_stripped`).
+
+**Commit:** `phase 37: url_path backstop — modes, composition, DENY-inversion, anchored safe_regex [ADR-0090]`

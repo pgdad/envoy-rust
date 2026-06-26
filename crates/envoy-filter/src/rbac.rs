@@ -417,6 +417,133 @@ mod tests {
         assert!(!eval_principal(&p, &req_with_path("/denied")));
     }
 
+    // ---- Phase 37: url_path backstop (Task 4) ----
+    // ADR-0090 §C: LOCK anchored `^…$` safe_regex (M36-1 — partial==full).
+
+    #[test]
+    fn url_path_all_string_modes() {
+        use StringMatcherMode::*;
+        for (mode, path, want) in [
+            (Prefix("/api".into()), "/api/users", true),
+            (Prefix("/api".into()), "/v2/users", false),
+            (Suffix("/health".into()), "/svc/health", true),
+            (Suffix("/health".into()), "/svc/ready", false),
+            (Contains("admin".into()), "/x/admin/y", true),
+            (Contains("admin".into()), "/x/user/y", false),
+        ] {
+            let p = RuntimePermission::UrlPath(StringMatcher {
+                mode,
+                ignore_case: false,
+            });
+            assert_eq!(eval_permission(&p, &req_with_path(path)), want, "path={path}");
+        }
+    }
+
+    #[test]
+    fn url_path_composes_and_inverts_under_deny() {
+        // DENY policy whose permission is `not_rule { url_path exact /allowed }`,
+        // principal any:true. DENY + match(of not) inverts:
+        //   /allowed → matched-by-inner → not_rule false → policy no-match →
+        //              DENY-action no-match → ALLOW (Continue);
+        //   /other   → inner false → not_rule true → policy match → DENY (StopAndSend).
+        use envoy_config::*;
+        let url = Permission::UrlPath(PathMatcher {
+            path: StringMatcher {
+                mode: StringMatcherMode::Exact("/allowed".into()),
+                ignore_case: false,
+            },
+        });
+        let cfg = RbacConfig {
+            rules: Rules {
+                action: Action::Deny,
+                policies: [(
+                    "p0".to_string(),
+                    Policy {
+                        permissions: vec![Permission::NotRule(Box::new(url))],
+                        principals: vec![Principal::Any(true)],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        };
+        let registry = std::sync::Arc::new(StatsRegistry::new());
+        let mut f = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").unwrap();
+        assert!(matches!(
+            f.decode_headers(&mut req_with_path("/allowed")),
+            Decision::Continue
+        ));
+        assert!(matches!(
+            f.decode_headers(&mut req_with_path("/other")),
+            Decision::StopAndSend(_)
+        ));
+    }
+
+    #[test]
+    fn url_path_composes_in_and_or_rules() {
+        // SPEC §2.1.5: url_path composes inside and_rules / or_rules.
+        let url = |p: &str| {
+            RuntimePermission::UrlPath(StringMatcher {
+                mode: StringMatcherMode::Prefix(p.into()),
+                ignore_case: false,
+            })
+        };
+        // and_rules: BOTH prefixes must match.
+        let and = RuntimePermission::AndRules(vec![url("/api"), url("/api/v2")]);
+        assert!(eval_permission(&and, &req_with_path("/api/v2/users")));
+        assert!(!eval_permission(&and, &req_with_path("/api/v1/users")));
+        // or_rules: EITHER prefix matches.
+        let or = RuntimePermission::OrRules(vec![url("/api"), url("/admin")]);
+        assert!(eval_permission(&or, &req_with_path("/admin/x")));
+        assert!(!eval_permission(&or, &req_with_path("/public/x")));
+    }
+
+    #[test]
+    fn url_path_anchored_safe_regex_matches_without_panic() {
+        // ADR-0090 §C: anchored ^/allowed/[0-9]+$ ; compiles at lowering, no
+        // first-request panic.
+        use envoy_config::*;
+        let sr = StringMatcher {
+            mode: StringMatcherMode::SafeRegex(SafeRegex {
+                regex: "^/allowed/[0-9]+$".into(),
+                compiled: None,
+            }),
+            ignore_case: false,
+        };
+        let cfg = RbacConfig {
+            rules: Rules {
+                action: Action::Allow,
+                policies: [(
+                    "p0".to_string(),
+                    Policy {
+                        permissions: vec![Permission::UrlPath(PathMatcher { path: sr })],
+                        principals: vec![Principal::Any(true)],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        };
+        let registry = std::sync::Arc::new(StatsRegistry::new());
+        let mut f = RbacFilter::build_from_config(&cfg, &registry, "ingress_http").unwrap();
+        assert!(matches!(
+            f.decode_headers(&mut req_with_path("/allowed/42")),
+            Decision::Continue
+        ));
+        assert!(matches!(
+            f.decode_headers(&mut req_with_path("/allowed/42?q=1")),
+            Decision::Continue
+        )); // query-strip
+        assert!(matches!(
+            f.decode_headers(&mut req_with_path("/allowed/xx")),
+            Decision::StopAndSend(_)
+        ));
+        assert!(matches!(
+            f.decode_headers(&mut req_with_path("/allowed")),
+            Decision::StopAndSend(_)
+        )); // full-anchor
+    }
+
     fn header_matcher_exact(name: &str, exact: &str) -> HeaderMatcher {
         HeaderMatcher {
             name: name.to_string(),
