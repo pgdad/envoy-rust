@@ -68,6 +68,9 @@ pub(crate) enum RuntimePrincipal {
     /// (the `Header(HeaderMatcher)` precedent). Reads a single-segment metadata
     /// path; absent namespace/key → no match.
     Metadata(envoy_config::MetadataMatcher),
+    /// Phase 37: `url_path` condition. Symmetric to `RuntimePermission::UrlPath`;
+    /// holds the inner `StringMatcher`, matches the query-stripped req.path.
+    UrlPath(envoy_config::StringMatcher),
 }
 
 /// Recursive tree-walk evaluator for `RuntimePermission`. Synchronous,
@@ -118,6 +121,7 @@ pub(crate) fn eval_principal(p: &RuntimePrincipal, req: &FilterRequest) -> bool 
         RuntimePrincipal::OrIds(set) => set.iter().any(|p| eval_principal(p, req)),
         RuntimePrincipal::NotId(inner) => !eval_principal(inner, req),
         RuntimePrincipal::Metadata(m) => eval_metadata(m, req),
+        RuntimePrincipal::UrlPath(sm) => sm.matches(strip_query(&req.path)),
     }
 }
 
@@ -344,6 +348,15 @@ fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimePrincipal, Filt
                 })?;
             RuntimePrincipal::Metadata(m)
         }
+        envoy_config::Principal::UrlPath(pm) => {
+            // Phase 37: symmetric to `lower_permission`'s url_path arm.
+            let mut sm = pm.path.clone();
+            sm.compile_safe_regex()
+                .map_err(|e| FilterError::InvalidConfig {
+                    message: e.to_string(),
+                })?;
+            RuntimePrincipal::UrlPath(sm)
+        }
     })
 }
 
@@ -391,6 +404,17 @@ mod tests {
         assert!(eval_permission(&p, &req_with_path("/allowed?"))); // empty query stripped
         assert!(!eval_permission(&p, &req_with_path("/denied"))); // miss
         assert!(!eval_permission(&p, &req_with_path("/allowed/"))); // trailing slash significant
+    }
+
+    #[test]
+    fn url_path_principal_matches_query_stripped() {
+        let sm = StringMatcher {
+            mode: StringMatcherMode::Exact("/allowed".into()),
+            ignore_case: false,
+        };
+        let p = RuntimePrincipal::UrlPath(sm);
+        assert!(eval_principal(&p, &req_with_path("/allowed?x=1")));
+        assert!(!eval_principal(&p, &req_with_path("/denied")));
     }
 
     fn header_matcher_exact(name: &str, exact: &str) -> HeaderMatcher {

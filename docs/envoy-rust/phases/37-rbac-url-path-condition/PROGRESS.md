@@ -52,3 +52,24 @@ matches in BOTH crates):**
 → `Finished` (clean — both crates' exhaustive matches updated, workspace-green).
 
 **Commit:** `phase 37: Permission::UrlPath variant + query-stripped eval + fallible lowering [ADR-0090]`
+
+---
+
+## Task 3 — `Principal::UrlPath` end-to-end (symmetric) — DONE
+
+**TDD:** wrote `principal_parses_url_path` (bootstrap.rs) and
+`url_path_principal_matches_query_stripped` (rbac.rs) FIRST; confirmed RED
+(`no variant ... UrlPath ... for enum Principal` / `... RuntimePrincipal`).
+
+**Implemented (mirror of Task 2 for `Principal`):**
+- `bootstrap.rs`: `Principal::UrlPath(PathMatcher)` variant + `#[serde(rename = "url_path")]`,
+  `"url_path"` in `KEYS`, visitor arm, `validate_principal_tree` leaf `Principal::UrlPath(_) => Ok(())`.
+- `rbac.rs`: `RuntimePrincipal::UrlPath(StringMatcher)` variant; `eval_principal`
+  arm `sm.matches(strip_query(&req.path))`; `lower_principal` arm (clone +
+  `compile_safe_regex()?`).
+
+**Evidence:** `cargo test -p envoy-config principal_parses_url_path` → `1 passed`;
+`cargo test -p envoy-filter url_path_principal` → `1 passed`; `cargo build --workspace`
+→ `Finished` (clean).
+
+**Commit:** `phase 37: Principal::UrlPath variant (symmetric) [ADR-0090]`

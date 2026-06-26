@@ -1519,6 +1519,11 @@ pub enum Principal {
     NotId(Box<Principal>),
     #[serde(rename = "metadata")]
     Metadata(MetadataMatcher),
+    /// Phase 37: `url_path` condition (Envoy `type.matcher.v3.PathMatcher`).
+    /// Matches the request path with the `?query` stripped (ADR-0090 §A/§B —
+    /// Envoy's `Principal` carries `url_path` too).
+    #[serde(rename = "url_path")]
+    UrlPath(PathMatcher),
 }
 
 impl<'de> serde::Deserialize<'de> for Principal {
@@ -1529,7 +1534,9 @@ impl<'de> serde::Deserialize<'de> for Principal {
         use serde::de::{Error, MapAccess, Visitor};
         use std::fmt;
 
-        const KEYS: &[&str] = &["any", "header", "and_ids", "or_ids", "not_id", "metadata"];
+        const KEYS: &[&str] = &[
+            "any", "header", "and_ids", "or_ids", "not_id", "metadata", "url_path",
+        ];
 
         struct V;
         impl<'de> Visitor<'de> for V {
@@ -1554,6 +1561,7 @@ impl<'de> serde::Deserialize<'de> for Principal {
                     "or_ids" => Principal::OrIds(map.next_value::<PrincipalSet>()?),
                     "not_id" => Principal::NotId(Box::new(map.next_value::<Principal>()?)),
                     "metadata" => Principal::Metadata(map.next_value::<MetadataMatcher>()?),
+                    "url_path" => Principal::UrlPath(map.next_value::<PathMatcher>()?),
                     other => return Err(M::Error::unknown_field(other, KEYS)),
                 };
                 if map.next_key::<String>()?.is_some() {
@@ -4055,6 +4063,8 @@ fn validate_principal_tree(
         crate::Principal::Metadata(m) => {
             validate_metadata_matcher(m, listener_name, policy_name, path)
         }
+        // phase 37: see `validate_permission_tree` — symmetric `url_path` leaf.
+        crate::Principal::UrlPath(_) => Ok(()),
     }
 }
 
@@ -12326,6 +12336,15 @@ metadata:
             assert!(s.contains("url_path"));
             let p2: crate::Permission = serde_json::from_str(&s).unwrap();
             assert_eq!(p, p2);
+        }
+
+        // ---- Phase 37: Principal::UrlPath (Task 3) ----
+
+        #[test]
+        fn principal_parses_url_path() {
+            let p: crate::Principal =
+                serde_yaml::from_str("url_path: { path: { prefix: \"/api\" } }").unwrap();
+            assert!(matches!(p, crate::Principal::UrlPath(_)));
         }
 
         #[test]
