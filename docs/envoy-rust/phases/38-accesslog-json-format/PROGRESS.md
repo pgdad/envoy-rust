@@ -218,3 +218,126 @@ the PLAN's `0046_*` filter guess does not match; the descriptive name is filtera
 prints the path; `git check-ignore` → not-ignored (tracked).
 
 **Commit:** `phase 38 task 9: BEHAVIOR_CONTRACT json_format subsection + parse_bootstrap seed [ADR-0092]`
+
+---
+
+## State-4 Verification Gate (§7.5) — `superpowers:verification-before-completion`
+
+Run on this dev host (`HEAD` = `44f177a`, working tree clean) on 2026-06-27. Each
+command below was executed fresh this session; the quoted lines are the actual
+terminal output, not assertions. Toolchain: `cargo 1.98.0-nightly (598ab48ec
+2026-06-17)`, Docker server `28.1.1`. Rebuilt the debug binary
+(`cargo build -p envoy-bin` → `Finished … in 2.16s`, exit 0) BEFORE the differential
+per the stale-debug-binary lesson.
+
+**Result: every §7.5 gate that is locally verifiable is GREEN.** The only RED test
+results are 5 PRE-DOCUMENTED host false-REDs/flakes (none touch the `json_format` /
+access-log surface; CI is authoritative) — itemised under gate (b)/(e) below.
+
+### (e) build / clippy / fmt / test / deny
+
+```
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.43s
+BUILD_EXIT=0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.09s   (no warnings)
+CLIPPY_EXIT=0
+
+$ cargo fmt --all -- --check
+FMT_EXIT=0   (no diff)
+
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
+DENY_EXIT=0
+```
+(`cargo deny` also emits 5 non-fatal `license-not-encountered` allowance warnings for
+unused allow-list entries `0BSD`/`BSD-2-Clause`/`MPL-2.0`/`Unicode-DFS-2016`/`Zlib`;
+the summary line + exit 0 are clean.)
+
+**`cargo test --workspace` (full, incl. Docker differential):** exits 101 — but ONLY on
+documented host false-REDs, never on a real test:
+
+- Full run aborts (cargo fail-fast) at `admin_config_dump_server_info` →
+  `text_lines diverged after allow-lists: envoy-only: ["backend::192.168.65.2:34543::…"]
+  envoy-rust-only: []` — the documented bridge-IP `192.168.65.2` backend-stats false-RED
+  (this host routes the backend via 192.168.65.2, not the allow-listed IP). Re-run in
+  isolation → STILL `FAILED` (deterministic host issue, NOT parallel-load, NOT a
+  regression; CI-authoritative). Unrelated to `json_format` (it is the admin `/clusters`
+  backend-stats scrape).
+- Non-differential workspace (`cargo test --workspace --exclude differential`) exits 101
+  on EXACTLY ONE lib test:
+  `test result: FAILED. 73 passed; 1 failed; 1 ignored` in `envoy-http2 --lib`. The
+  failing test is `client::tests::send_request_maps_h2_handshake_failure_to_typed_error`
+  — the documented host flake (handshake unexpectedly succeeds under parallel load).
+  Re-run in isolation:
+  `test client::tests::send_request_maps_h2_handshake_failure_to_typed_error ... ok`
+  (`1 passed; 0 failed`). Every other non-differential crate is green (sample tallies:
+  `525 passed`, `208 passed`, `131 passed`, `97 passed`, `58 passed`, … all `0 failed`).
+
+### (a)+(b) differential surface — `cargo test -p differential --no-fail-fast`
+
+Full sweep enumerated every fixture. New + witness fixtures GREEN:
+
+```
+test access_log_json_format ... ok        # 0046 — byte-exact JSON line (gate (a)) ✓
+test access_log_command_operators ... ok  # 0040 witness ✓
+test header_to_metadata ... ok            # 0042 witness ✓
+```
+0012 (`access_log_file_sink`) and 0041 (`set_metadata_dynamic_metadata`) — see flake note.
+
+Of all 0001–0046 fixtures, 4 targets RED in the parallel sweep. Re-run EACH in isolation
+(`--test-threads=1`):
+
+```
+ISOLATED access_log_file_sink (0012)                            -> test result: ok. 1 passed  (witness ✓)
+ISOLATED set_metadata_dynamic_metadata (0041)                   -> test result: ok. 1 passed  (witness ✓)
+ISOLATED upstream_connection_pooling_and_per_class_counters     -> test result: ok. 1 passed
+ISOLATED admin_config_dump_server_info (0014)                   -> test result: FAILED  (documented bridge-IP false-RED)
+```
+→ 3 of the 4 are the documented parallel-load flakes (GREEN in isolation); the 4th is the
+documented bridge-IP host false-RED (RED in isolation too, CI-authoritative). Therefore
+gate (a) `0046` GREEN (byte-exact JSON) and gate (b) `0001–0045` GREEN both hold, with all
+four regression witnesses (0012/0040/0041/0042) byte-identical/green. The authoritative
+0046 line (ADR-0092 §F) rendered byte-identical cross-proxy:
+`{"bytes_rcvd":0,"bytes_sent":3,"flags":"-","method":"GET","mixed":"code-200","path":"/","protocol":"HTTP/1.1","status":200,"upstream":null}`
+
+### (c) conformance — h2spec ≥95%
+
+`cargo test -p h2spec-conformance` → `test h2spec_pass_rate_gate ... ok` (exit 0), but the
+gate eprintln!-SKIPS locally because the `h2spec` binary is absent on this host
+(`which h2spec` → exit 1; runner prints `h2spec_runner: h2spec not found — skipping
+locally`). h2spec is therefore CI-authoritative; `json_format` does not touch the H2 codec,
+so the conformance surface is unchanged this phase. NOT claimed as a local pass.
+
+### (d) fuzz — existing targets, short-budget, with new seed; NO new target
+
+Confirmed exactly two pre-existing relevant targets (no new fuzz target this phase, per
+ADR-0092): `crates/envoy-config/fuzz/fuzz_targets/parse_bootstrap.rs` +
+`crates/envoy-accesslog/fuzz/fuzz_targets/accesslog_format_parse.rs`. The new seed
+`crates/envoy-config/fuzz/corpus/parse_bootstrap/json_format_logger.yaml` is git-tracked.
+
+```
+$ cargo +nightly fuzz run --fuzz-dir crates/envoy-config/fuzz parse_bootstrap -- -max_total_time=60 -runs=100000
+#100000	DONE   cov: 14444 ft: 29267 corp: 2582/1692Kb lim: 2577 exec/s: 14285 rss: 360Mb
+Done 100000 runs in 7 second(s)
+FUZZ_PB_EXIT=0   (no crash)
+
+$ cargo +nightly fuzz run --fuzz-dir crates/envoy-accesslog/fuzz accesslog_format_parse -- -max_total_time=60 -runs=100000
+#100000	DONE   cov: 405 ft: 1909 corp: 417/189Kb lim: 4096 exec/s: 0 rss: 358Mb
+Done 100000 runs in 0 second(s)
+FUZZ_AFP_EXIT=0   (no crash)
+```
+
+### (f) REVIEW.md — NOT this session
+
+Gate (f) (`REVIEW.md` approved) is state-5 (`superpowers:requesting-code-review`), the
+NEXT session. Per §5.1 (one state per session) this session stops after the gate evidence
+is quoted and STATE advances state-4-complete/state-5-next.
+
+**Verification verdict:** §7.5 (a) GREEN, (b) GREEN, (c) CI-authoritative (local skip,
+unchanged surface), (d) GREEN, (e) GREEN — the sole local REDs are the 5 documented
+host false-REDs/flakes, none on the `json_format`/access-log surface. `#![forbid(unsafe_code)]`
+holds; no new crate/dependency/fuzz-target; one new `ConfigError` variant
+(`AmbiguousLogFormat`). Gate (f) deferred to state-5.
