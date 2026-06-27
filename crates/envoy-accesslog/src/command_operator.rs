@@ -241,8 +241,16 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
         "RESP" => parse_header_op(keyword, rest, Side::Resp),
         "DYNAMIC_METADATA" => parse_dynamic_metadata_op(rest),
         // Non-arg keywords: must NOT carry parens.
-        "PROTOCOL" | "RESPONSE_CODE" | "RESPONSE_FLAGS" | "BYTES_RECEIVED" | "BYTES_SENT"
-        | "UPSTREAM_HOST" | "ROUTE_NAME" | "RESPONSE_CODE_DETAILS" | "START_TIME" | "DURATION" => {
+        "PROTOCOL"
+        | "RESPONSE_CODE"
+        | "RESPONSE_FLAGS"
+        | "BYTES_RECEIVED"
+        | "BYTES_SENT"
+        | "UPSTREAM_HOST"
+        | "ROUTE_NAME"
+        | "RESPONSE_CODE_DETAILS"
+        | "START_TIME"
+        | "DURATION" => {
             if rest.is_some() {
                 return Err(FormatParseError::MalformedArgument {
                     keyword: keyword.to_string(),
