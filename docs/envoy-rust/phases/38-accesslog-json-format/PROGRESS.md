@@ -168,3 +168,29 @@ The sink-build loop (`:205`) is unchanged (`format` is now `LogFormat`, accepted
 `Finished`.
 
 **Commit:** `phase 38 task 7: HCM wires LogFormat (Text|Json) from log_format config [ADR-0092]`
+
+---
+
+## Task 8 — differential fixture `0046-accesslog-json-format` (byte-exact JSON line) — DONE
+
+**Rebuilt** `cargo build -p envoy-bin` FIRST (the differential runs
+`target/debug/envoy-bin`; a new config key needs a fresh debug binary).
+
+**Authored** `tests/fixtures/0046-accesslog-json-format/{envoy.yaml, envoy-rust.yaml,
+expectations.yaml, README.md}` (template = `0040`): both proxy configs carry the same
+`json_format` map (9 keys, config order arbitrary — both sort); `direct_response`
+`{status:200, body:"ok\n"}`; per-side divergences = bind addr / admin block /
+`generate_request_id` / mount path (`/tmp/0046-envoy-mount/`, `/tmp/0046-envoy-rust-mount/`).
+Added the Docker-gated test `tests/differential/tests/access_log_json_format.rs`
+(`kind: http1_access_log_byte_exact`, one bare `GET /` probe, Host `envoy-rust.test`).
+(Test fn named `access_log_json_format` per the existing per-fixture convention —
+the PLAN's `0046_*` filter guess does not match; the descriptive name is filterable.)
+
+**Evidence (Docker differential, this host):**
+- `cargo test -p differential access_log_json_format` → `test access_log_json_format
+  ... ok` (`1 passed`) — the JSON object is byte-identical cross-proxy (ADR-0092 §F).
+- regression-equivalence witnesses all byte-identical: `access_log_file_sink` (0012),
+  `access_log_command_operators` (0040), `set_metadata_dynamic_metadata` (0041),
+  `header_to_metadata` (0042) → each `1 passed; 0 failed`.
+
+**Commit:** `phase 38 task 8: fixture 0046 byte-exact json_format access-log line [ADR-0092]`

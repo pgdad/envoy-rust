@@ -1,0 +1,18 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0046-envoy-mount/access.log
+    envoy_rust: /tmp/0046-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / with no extra request headers. The single
+    # `json_format` object is emitted once per request; keys SORT by UTF-8
+    # bytes (ADR-0092 §A), single-operator values are TYPE-INFERRED
+    # (numeric → unquoted number, string → quoted, absent → null; §B), with
+    # compact separators + a trailing `\n` (§D). On a direct_response route
+    # %UPSTREAM_HOST% is absent → `null`; the `mixed: "code-%RESPONSE_CODE%"`
+    # value has a literal prefix → a quoted string `"code-200"`.
+    # Expected line (byte-identical on both sides, ADR-0092 §F):
+    #   {"bytes_rcvd":0,"bytes_sent":3,"flags":"-","method":"GET","mixed":"code-200","path":"/","protocol":"HTTP/1.1","status":200,"upstream":null}
+    - method: get
+      path: /
+      host: envoy-rust.test
