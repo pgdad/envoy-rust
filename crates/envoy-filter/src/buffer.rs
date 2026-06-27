@@ -138,6 +138,7 @@ mod tests {
             envoy_config::PerFilterConfig::Buffer(pr),
         );
         envoy_config::Route {
+            name: String::new(),
             r#match: envoy_config::RouteMatch {
                 prefix: Some("/".to_string()),
                 path: None,

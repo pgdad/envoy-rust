@@ -298,6 +298,7 @@ fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
                     .routes
                     .iter()
                     .map(|r| Route {
+                        name: r.name.clone(),
                         r#match: RouteMatch {
                             prefix: r.r#match.prefix.clone(),
                             path: r.r#match.path.clone(),
@@ -2212,6 +2213,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
                             path: None,
@@ -2361,6 +2363,7 @@ static_resources:
                     domains: vec!["foo.example.com".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -2407,6 +2410,7 @@ static_resources:
                     include_attempt_count_in_response: false,
                     routes: vec![
                         Route {
+                            name: String::new(),
                             r#match: RouteMatch {
                                 prefix: Some("/healthz".to_string()),
                                 path: None,
@@ -2422,6 +2426,7 @@ static_resources:
                             typed_per_filter_config: Default::default(),
                         },
                         Route {
+                            name: String::new(),
                             r#match: RouteMatch {
                                 prefix: Some("/".to_string()),
                                 path: None,
@@ -2480,6 +2485,7 @@ static_resources:
                     domains: vec!["only.example.com".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -2681,6 +2687,7 @@ static_resources:
     async fn route_with_no_headers_matches_unchanged() {
         // Regression: a route with empty headers Vec still matches on path only.
         let cfg = build_test_config(vec![Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".into()),
                 path: None,
@@ -2704,6 +2711,7 @@ static_resources:
     #[tokio::test]
     async fn single_header_matcher_route_selected_when_match() {
         let matcher_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/api/".into()),
                 path: None,
@@ -2723,6 +2731,7 @@ static_resources:
             typed_per_filter_config: Default::default(),
         };
         let default_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".into()),
                 path: None,
@@ -2749,6 +2758,7 @@ static_resources:
     #[tokio::test]
     async fn single_header_matcher_route_skipped_when_no_match() {
         let matcher_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/api/".into()),
                 path: None,
@@ -2768,6 +2778,7 @@ static_resources:
             typed_per_filter_config: Default::default(),
         };
         let default_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".into()),
                 path: None,
@@ -2793,6 +2804,7 @@ static_resources:
     #[tokio::test]
     async fn multi_header_matcher_and_combination_all_match() {
         let matcher_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".into()),
                 path: None,
@@ -2828,6 +2840,7 @@ static_resources:
     #[tokio::test]
     async fn multi_header_matcher_and_combination_one_fails() {
         let matcher_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/api/".into()),
                 path: None,
@@ -2854,6 +2867,7 @@ static_resources:
             typed_per_filter_config: Default::default(),
         };
         let default_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".into()),
                 path: None,
@@ -2913,6 +2927,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
                             path: None,
@@ -3616,6 +3631,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -3687,6 +3703,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -3965,6 +3982,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -4167,6 +4185,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -4340,6 +4359,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -4452,6 +4472,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
                             path: None,
@@ -4527,6 +4548,7 @@ static_resources:
         pipeline: Arc<envoy_filter::FilterPipeline>,
     ) -> Arc<HCMConfig> {
         let matcher_route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".to_string()),
                 path: None,
@@ -4599,6 +4621,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -4886,6 +4909,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -4980,6 +5004,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -5102,6 +5127,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -5290,6 +5316,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -5415,6 +5442,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: include_attempt_count,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some(prefix.to_string()),
                             path: None,
@@ -6185,6 +6213,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -6241,6 +6270,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -6340,6 +6370,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: None,
                             path: Some("/exact".to_string()),
@@ -6383,6 +6414,7 @@ static_resources:
                     domains: vec!["myhost".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -6435,6 +6467,7 @@ static_resources:
         );
 
         let route = Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".to_string()),
                 path: None,
@@ -6498,6 +6531,7 @@ static_resources:
                 domains: vec!["*".to_string()],
                 include_attempt_count_in_response: false,
                 routes: vec![Route {
+                    name: String::new(),
                     r#match: RouteMatch {
                         prefix: Some("/".to_string()),
                         path: None,
@@ -6520,6 +6554,7 @@ static_resources:
     async fn route_table_handle_swap_is_read_once() {
         // Build an HCMConfig whose route table starts as "v1".
         let config = build_test_config(vec![Route {
+            name: String::new(),
             r#match: RouteMatch {
                 prefix: Some("/".to_string()),
                 path: None,

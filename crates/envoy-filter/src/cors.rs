@@ -597,6 +597,7 @@ mod tests {
         let mut pfc_map = BTreeMap::new();
         pfc_map.insert(CORS_FILTER_NAME.to_string(), pfc);
         let route = envoy_config::Route {
+            name: String::new(),
             r#match: envoy_config::RouteMatch {
                 prefix: Some("/".to_string()),
                 path: None,
@@ -659,6 +660,7 @@ mod tests {
 
         // Route with no typed_per_filter_config entries at all.
         let route = envoy_config::Route {
+            name: String::new(),
             r#match: envoy_config::RouteMatch {
                 prefix: Some("/".to_string()),
                 path: None,

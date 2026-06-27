@@ -260,6 +260,7 @@ mod tests {
             envoy_config::PerFilterConfig::Csrf(p),
         );
         envoy_config::Route {
+            name: String::new(),
             r#match: envoy_config::RouteMatch {
                 prefix: Some("/".to_string()),
                 path: None,

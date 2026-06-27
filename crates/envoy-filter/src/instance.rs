@@ -743,6 +743,7 @@ mod tests {
                 PerFilterConfig::Buffer(pr),
             );
             Route {
+                name: String::new(),
                 r#match: RouteMatch {
                     prefix: Some("/".to_string()),
                     path: None,

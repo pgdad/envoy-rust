@@ -1752,6 +1752,11 @@ pub struct VirtualHost {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
+    /// 41 NEW: the route's optional config `name`. Empty (`""`) = unnamed.
+    /// Rendered by the `%ROUTE_NAME%` access-log operator (NAMED → the name,
+    /// unnamed → absent). Hand-wired into the Deserialize/Serialize below.
+    pub name: String,
+
     /// The match predicate (path + headers; populated by 04.1 + 04.2).
     pub r#match: RouteMatch,
 
@@ -2031,6 +2036,7 @@ impl<'de> serde::Deserialize<'de> for Route {
             where
                 M: MapAccess<'de>,
             {
+                let mut name: Option<String> = None;
                 let mut r#match: Option<RouteMatch> = None;
                 let mut direct_response: Option<DirectResponse> = None;
                 let mut route_action: Option<RouteAction_Route> = None;
@@ -2040,6 +2046,12 @@ impl<'de> serde::Deserialize<'de> for Route {
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
+                        "name" => {
+                            if name.is_some() {
+                                return Err(M::Error::duplicate_field("name"));
+                            }
+                            name = Some(map.next_value::<String>()?);
+                        }
                         "match" => {
                             if r#match.is_some() {
                                 return Err(M::Error::duplicate_field("match"));
@@ -2073,6 +2085,7 @@ impl<'de> serde::Deserialize<'de> for Route {
                             return Err(M::Error::unknown_field(
                                 other,
                                 &[
+                                    "name",
                                     "match",
                                     "direct_response",
                                     "route",
@@ -2102,6 +2115,7 @@ impl<'de> serde::Deserialize<'de> for Route {
                 };
 
                 Ok(Route {
+                    name: name.unwrap_or_default(),
                     r#match,
                     action,
                     typed_per_filter_config: typed_per_filter_config.unwrap_or_default(),
@@ -2119,8 +2133,13 @@ impl serde::Serialize for Route {
         S: serde::Serializer,
     {
         use serde::ser::SerializeMap;
-        let len = 2 + usize::from(!self.typed_per_filter_config.is_empty());
+        let len = 2
+            + usize::from(!self.name.is_empty())
+            + usize::from(!self.typed_per_filter_config.is_empty());
         let mut map = serializer.serialize_map(Some(len))?;
+        if !self.name.is_empty() {
+            map.serialize_entry("name", &self.name)?;
+        }
         map.serialize_entry("match", &self.r#match)?;
         match &self.action {
             RouteAction::DirectResponse(dr) => map.serialize_entry("direct_response", dr)?,
@@ -15704,6 +15723,26 @@ typed_per_filter_config:
         assert_eq!(p.expose_headers.as_deref(), Some("x-exposed-header"));
         assert_eq!(p.max_age.as_deref(), Some("3600"));
         assert_eq!(p.allow_credentials, Some(true));
+    }
+
+    #[test]
+    fn route_parses_name_when_present_and_defaults_empty_when_absent() {
+        // phase 41: a NAMED route round-trips its config `name`.
+        let named = r#"
+name: myroute
+match: { prefix: "/" }
+route: { cluster: backend }
+"#;
+        let route: Route = serde_yaml::from_str(named).expect("named route parses");
+        assert_eq!(route.name, "myroute");
+
+        // An UNNAMED (name-less) route still parses; `name` defaults empty.
+        let unnamed = r#"
+match: { prefix: "/" }
+route: { cluster: backend }
+"#;
+        let route: Route = serde_yaml::from_str(unnamed).expect("name-less route parses");
+        assert_eq!(route.name, "");
     }
 
     #[test]

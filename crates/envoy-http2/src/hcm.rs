@@ -1065,6 +1065,7 @@ mod tests {
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -1218,6 +1219,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -1367,6 +1369,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -1479,6 +1482,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -1576,6 +1580,7 @@ static_resources:
                         domains: vec!["test.example".to_string()],
                         include_attempt_count_in_response: false,
                         routes: vec![Route {
+                            name: String::new(),
                             r#match: RouteMatch {
                                 prefix: Some("/".to_string()),
                                 path: None,
@@ -1596,6 +1601,7 @@ static_resources:
                         domains: vec!["*".to_string()],
                         include_attempt_count_in_response: false,
                         routes: vec![Route {
+                            name: String::new(),
                             r#match: RouteMatch {
                                 prefix: Some("/".to_string()),
                                 path: None,
@@ -2031,6 +2037,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -2116,6 +2123,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -2553,6 +2561,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -2619,6 +2628,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -2701,6 +2711,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -2907,6 +2918,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: include_attempt_count,
                     routes: vec![Route {
+                        name: String::new(),
                         r#match: RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -3826,6 +3838,7 @@ static_resources:
                     domains: vec!["test.example".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![envoy_config::Route {
+                        name: String::new(),
                         r#match: envoy_config::RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
@@ -3949,6 +3962,7 @@ static_resources:
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
                     routes: vec![envoy_config::Route {
+                        name: String::new(),
                         r#match: envoy_config::RouteMatch {
                             prefix: Some("/".to_string()),
                             path: None,
