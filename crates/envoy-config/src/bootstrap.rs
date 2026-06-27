@@ -698,7 +698,8 @@ pub struct FileAccessLog {
 /// emit in sorted (UTF-8-byte) order, matching v1.33.0's `json_format` wire
 /// order (ADR-0092 §A); each value is a command-operator format string compiled
 /// per-value via `envoy_accesslog::parse_format`. The deprecated `text_format`
-/// scalar + `json_format_options`/`omit_empty_values`/`content_type` are deferred.
+/// scalar + `json_format_options`/`content_type` are deferred; `omit_empty_values`
+/// is supported (ADR-0096 — the absent-operator sentinel swap).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstitutionFormatString {
@@ -706,6 +707,14 @@ pub struct SubstitutionFormatString {
     pub text_format_source: Option<DataSourceInline>,
     #[serde(default)]
     pub json_format: Option<std::collections::BTreeMap<String, JsonFormatValue>>,
+    /// `omit_empty_values` (ADR-0096): when `true`, the command-operator engine
+    /// renders an absent operator as the EMPTY STRING `""` instead of the `-`
+    /// sentinel in MULTI-SEGMENT values, for BOTH `text_format` and `json_format`,
+    /// recursively. It does NOT drop keys/entries (§A), and the single-operator
+    /// json-typed path (`encode_single_op` → `null`) is UNAFFECTED (§C). A plain
+    /// `bool` that composes with either arm; `deny_unknown_fields` rejects typos.
+    #[serde(default)]
+    pub omit_empty_values: bool,
 }
 
 /// A `json_format` value — a single `google.protobuf.Struct` value (ADR-0094
@@ -11211,6 +11220,19 @@ json_format:
             "%RESPONSE_CODE%"
         );
         assert!(sfs.json_format.is_none());
+    }
+
+    // --- phase 40 t1 (ADR-0096 §E): omit_empty_values bool field ---
+
+    #[test]
+    fn omit_empty_values_round_trips_and_defaults_false() {
+        let s: SubstitutionFormatString =
+            serde_yaml::from_str("omit_empty_values: true\njson_format:\n  a: \"%PROTOCOL%\"\n")
+                .unwrap();
+        assert!(s.omit_empty_values);
+        let d: SubstitutionFormatString =
+            serde_yaml::from_str("json_format:\n  a: \"x\"\n").unwrap();
+        assert!(!d.omit_empty_values); // default false
     }
 
     // --- phase 38 t2: exactly-one-of log_format cardinality + per-value parse ---

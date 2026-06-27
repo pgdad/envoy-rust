@@ -1814,6 +1814,7 @@ mod tests {
                     inline_string: "%REQ(:METHOD)% %RESPONSE_CODE%".into(),
                 }),
                 json_format: None,
+                omit_empty_values: false,
             }),
         };
         let fmt = compiled_log_format(&file_cfg).expect("valid");
@@ -1832,6 +1833,7 @@ mod tests {
             log_format: Some(envoy_config::SubstitutionFormatString {
                 text_format_source: None,
                 json_format: Some(map),
+                omit_empty_values: false,
             }),
         };
         let fmt = compiled_log_format(&file_cfg).unwrap();
@@ -1870,6 +1872,7 @@ mod tests {
             log_format: Some(envoy_config::SubstitutionFormatString {
                 text_format_source: None,
                 json_format: Some(map),
+                omit_empty_values: false,
             }),
         };
         let fmt = compiled_log_format(&file_cfg).unwrap();
@@ -1888,6 +1891,7 @@ mod tests {
                     inline_string: "%RESPONSE_CODE%".into(),
                 }),
                 json_format: None,
+                omit_empty_values: false,
             }),
         };
         assert!(matches!(
