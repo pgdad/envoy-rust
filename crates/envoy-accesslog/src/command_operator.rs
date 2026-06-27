@@ -62,6 +62,10 @@ pub enum Op {
     Duration,
     /// `%UPSTREAM_HOST%`
     UpstreamHost,
+    /// `%ROUTE_NAME%` — the matched route's config `name` (phase 41). An
+    /// `Option<String>` mirroring `UpstreamHost`: present → the name, absent
+    /// (unnamed route) → the `-` sentinel / json `null`.
+    RouteName,
     /// `%DYNAMIC_METADATA(namespace:key)%` — a single-level two-segment lookup
     /// into the per-request dynamic-metadata store (§A2-LOCKED). namespace/key
     /// are CASE-SENSITIVE (NOT lowercased). Carries NO `:N` truncation field —
@@ -233,7 +237,7 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
         "DYNAMIC_METADATA" => parse_dynamic_metadata_op(rest),
         // Non-arg keywords: must NOT carry parens.
         "PROTOCOL" | "RESPONSE_CODE" | "RESPONSE_FLAGS" | "BYTES_RECEIVED" | "BYTES_SENT"
-        | "UPSTREAM_HOST" | "START_TIME" | "DURATION" => {
+        | "UPSTREAM_HOST" | "ROUTE_NAME" | "START_TIME" | "DURATION" => {
             if rest.is_some() {
                 return Err(FormatParseError::MalformedArgument {
                     keyword: keyword.to_string(),
@@ -247,6 +251,7 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
                 "BYTES_RECEIVED" => Op::BytesReceived,
                 "BYTES_SENT" => Op::BytesSent,
                 "UPSTREAM_HOST" => Op::UpstreamHost,
+                "ROUTE_NAME" => Op::RouteName,
                 "START_TIME" => Op::StartTime,
                 "DURATION" => Op::Duration,
                 _ => unreachable!("matched above"),
@@ -509,6 +514,7 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord, omit_empty: bo
         }
         Op::StartTime => out.push_str(&crate::format_iso8601(record.start_time)),
         Op::UpstreamHost => out.push_str(record.upstream_host.as_deref().unwrap_or(empty_or_dash)),
+        Op::RouteName => out.push_str(record.route_name.as_deref().unwrap_or(empty_or_dash)),
         Op::DynamicMetadata { namespace, key } => out.push_str(
             record
                 .dynamic_metadata
@@ -639,6 +645,37 @@ mod tests {
     fn absent_header_renders_dash() {
         let f = parse_format("xff=%REQ(X-FORWARDED-FOR)%").unwrap(); // forwarded_for=None
         assert_eq!(CompiledFormat::new(f).render(&rec()), "xff=-");
+    }
+
+    // --- phase 41 (ADR-0098 §C): %ROUTE_NAME% — parse + text render ---
+
+    #[test]
+    fn route_name_parses_as_no_arg_op() {
+        assert_eq!(parse_format("%ROUTE_NAME%").unwrap(), vec![Segment::Op(Op::RouteName)]);
+    }
+
+    #[test]
+    fn route_name_rejects_paren_argument() {
+        assert!(parse_format("%ROUTE_NAME(x)%").is_err());
+    }
+
+    #[test]
+    fn route_name_text_renders_name_or_dash() {
+        let mut named = rec();
+        named.route_name = Some("myroute".into());
+        assert_eq!(CompiledFormat::new(parse_format("%ROUTE_NAME%").unwrap()).render(&named), "myroute");
+        assert_eq!(
+            CompiledFormat::new(parse_format("r=%ROUTE_NAME%").unwrap()).render(&named),
+            "r=myroute"
+        );
+
+        let mut absent = rec();
+        absent.route_name = None;
+        assert_eq!(CompiledFormat::new(parse_format("%ROUTE_NAME%").unwrap()).render(&absent), "-");
+        assert_eq!(
+            CompiledFormat::new(parse_format("r=%ROUTE_NAME%").unwrap()).render(&absent),
+            "r=-"
+        );
     }
 
     // --- phase 40 t2 (ADR-0096 §B): omit_empty sentinel swap on the TEXT path ---
