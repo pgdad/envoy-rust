@@ -1,0 +1,29 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0048-envoy-mount/access.log
+    envoy_rust: /tmp/0048-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / on a direct_response 200 route (no upstream host), with
+    # `omit_empty_values: true` on the `json_format`. This is the phase-40
+    # SENTINEL SWAP (ADR-0096 §B/§C): an absent operator inside a MULTI-SEGMENT
+    # leaf renders as the EMPTY STRING `""` instead of the `-` sentinel —
+    #   up:  "up=%UPSTREAM_HOST%"          → "up="   (swap; was "up=-")
+    #   xff: "x=%REQ(X-FORWARDED-FOR)%"    → "x="    (swap; was "x=-")
+    # while a SINGLE-operator-typed absent value is UNAFFECTED (§C carve-out) —
+    #   single_up: "%UPSTREAM_HOST%"       → null    (NOT "", NOT dropped)
+    # and present operators are normal (proto/method). NO key is dropped (§A);
+    # keys sort by UTF-8 byte order (ADR-0094 §A). Compact separators + ONE
+    # trailing `\n` (§E).
+    #
+    # Expected line (byte-identical on both sides; LIVE-CAPTURED from
+    # `envoyproxy/envoy:v1.33.0`, phase-40 T5 recon):
+    #   {"method":"GET","proto":"HTTP/1.1","single_up":null,"up":"up=","xff":"x="}
+    #
+    # Flag-off control witness: fixture 0047-accesslog-json-nested (same shape,
+    # NO `omit_empty_values`) keeps the `-` sentinel ("up=-"/"x=-") and stays
+    # byte-exact — the default-off regression proof. (Live-captured control line:
+    #   {"method":"GET","proto":"HTTP/1.1","single_up":null,"up":"up=-","xff":"x=-"})
+    - method: get
+      path: /
+      host: envoy-rust.test
