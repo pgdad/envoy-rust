@@ -145,3 +145,26 @@ existing `file_sink` tests). `cargo build --workspace --all-targets` → `Finish
 via `Into`).
 
 **Commit:** `phase 38 task 6: LogFormat enum (Text|Json) on FileSink via Into [ADR-0092]`
+
+---
+
+## Task 7 — HCM wires `LogFormat` (Text|Json) from `log_format` config — DONE
+
+**TDD:** wrote 2 new failing tests in `envoy-http1/src/hcm.rs`
+(`compiled_log_format_picks_json_arm`, `compiled_log_format_picks_text_arm`); confirmed
+RED (`expected CompiledFormat, found LogFormat` — the fn still returned `CompiledFormat`).
+
+**Implemented:** rewrote H1 `compiled_log_format` (`hcm.rs:1254`) to return
+`Result<envoy_accesslog::LogFormat, Http1Error>` — `match (&text_format_source,
+&json_format)`: text arm → `CompiledFormat::from_inline(...).into()`; json arm →
+`CompiledJsonFormat::from_map(...).into()`; neither/absent → `CompiledFormat::default().into()`.
+The sink-build loop (`:205`) is unchanged (`format` is now `LogFormat`, accepted by
+`FileSink::new` directly). H2 default site (`:2159`) already passes
+`CompiledFormat::default()` and coerces via `Into` — no change. The two pre-existing
+`compiled_log_format_*` tests survive unchanged (`LogFormat::render` provides `.render`).
+
+**Evidence:** `cargo test -p envoy-http1 -p envoy-http2` → `131 passed` / `74 passed`
+(`0 failed`; 1 pre-existing H2 ignore). `cargo build --workspace --all-targets` →
+`Finished`.
+
+**Commit:** `phase 38 task 7: HCM wires LogFormat (Text|Json) from log_format config [ADR-0092]`

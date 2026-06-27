@@ -1253,18 +1253,25 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Erro
 /// than panic (the HCM build is `Result`-returning).
 fn compiled_log_format(
     file_cfg: &envoy_config::FileAccessLog,
-) -> Result<envoy_accesslog::CompiledFormat, Http1Error> {
+) -> Result<envoy_accesslog::LogFormat, Http1Error> {
+    let map_err = |err: envoy_accesslog::FormatParseError| Http1Error::AccessLogFormat {
+        message: err.to_string(),
+    };
     match &file_cfg.log_format {
-        // Task-1 temporary form (text arm only); Task 7 returns `LogFormat`.
-        Some(s) => match &s.text_format_source {
-            Some(ds) => envoy_accesslog::CompiledFormat::from_inline(&ds.inline_string).map_err(
-                |err| Http1Error::AccessLogFormat {
-                    message: err.to_string(),
-                },
-            ),
-            None => Ok(envoy_accesslog::CompiledFormat::default()),
+        // exactly-one-of already enforced by the envoy-config validator (Task 2);
+        // this build is defense-in-depth — prefer the set arm, default if neither.
+        Some(s) => match (&s.text_format_source, &s.json_format) {
+            (Some(ds), _) => Ok(envoy_accesslog::CompiledFormat::from_inline(&ds.inline_string)
+                .map_err(map_err)?
+                .into()),
+            (None, Some(map)) => {
+                Ok(envoy_accesslog::CompiledJsonFormat::from_map(map)
+                    .map_err(map_err)?
+                    .into())
+            }
+            (None, None) => Ok(envoy_accesslog::CompiledFormat::default().into()),
         },
-        None => Ok(envoy_accesslog::CompiledFormat::default()),
+        None => Ok(envoy_accesslog::CompiledFormat::default().into()),
     }
 }
 
@@ -1776,6 +1783,40 @@ mod tests {
         };
         let fmt = compiled_log_format(&file_cfg).expect("valid");
         assert_eq!(fmt.render(&record_get_200()), "GET 200");
+    }
+
+    #[test]
+    fn compiled_log_format_picks_json_arm() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("c".to_string(), "%RESPONSE_CODE%".to_string());
+        let file_cfg = envoy_config::FileAccessLog {
+            path: "/tmp/x".into(),
+            log_format: Some(envoy_config::SubstitutionFormatString {
+                text_format_source: None,
+                json_format: Some(map),
+            }),
+        };
+        assert!(matches!(
+            compiled_log_format(&file_cfg).unwrap(),
+            envoy_accesslog::LogFormat::Json(_)
+        ));
+    }
+
+    #[test]
+    fn compiled_log_format_picks_text_arm() {
+        let file_cfg = envoy_config::FileAccessLog {
+            path: "/tmp/x".into(),
+            log_format: Some(envoy_config::SubstitutionFormatString {
+                text_format_source: Some(envoy_config::DataSourceInline {
+                    inline_string: "%RESPONSE_CODE%".into(),
+                }),
+                json_format: None,
+            }),
+        };
+        assert!(matches!(
+            compiled_log_format(&file_cfg).unwrap(),
+            envoy_accesslog::LogFormat::Text(_)
+        ));
     }
 
     #[test]
