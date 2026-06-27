@@ -417,28 +417,33 @@ impl CompiledFormat {
     /// no-value sentinel `-`. `Req`/`Resp` apply `?`-alt fallback then `:N`
     /// byte-truncation to the resolved value.
     pub fn render(&self, record: &AccessLogRecord) -> String {
-        // Data-driven pre-allocation (M32-6): size the buffer to the sum of the
-        // literal segments' byte lengths (an exact lower bound) plus a small
-        // operator allowance, instead of a fixed 256. The tuple shape is kept
-        // (in-crate tests construct `CompiledFormat(vec)` directly), so the
-        // literal length is summed on the fly here rather than precomputed.
-        let literal_len: usize = self
-            .0
-            .iter()
-            .map(|seg| match seg {
-                Segment::Literal(s) => s.len(),
-                Segment::Op(_) => 0,
-            })
-            .sum();
-        let mut out = String::with_capacity(literal_len + 64);
-        for seg in &self.0 {
-            match seg {
-                Segment::Literal(s) => out.push_str(s),
-                Segment::Op(op) => render_op(&mut out, op, record),
-            }
-        }
-        out
+        render_value_segments(&self.0, record)
     }
+}
+
+/// Render an arbitrary `&[Segment]` slice against `record` into one owned
+/// `String` (the engine's shared text-render path). `CompiledFormat::render`
+/// delegates here; the phase-38 `json_format` mixed/literal-value encoder reuses
+/// it so the text semantics (absent `Option` → the `-` sentinel) stay identical.
+///
+/// Data-driven pre-allocation (M32-6): size the buffer to the sum of the literal
+/// segments' byte lengths (an exact lower bound) plus a small operator allowance.
+pub(crate) fn render_value_segments(segments: &[Segment], record: &AccessLogRecord) -> String {
+    let literal_len: usize = segments
+        .iter()
+        .map(|seg| match seg {
+            Segment::Literal(s) => s.len(),
+            Segment::Op(_) => 0,
+        })
+        .sum();
+    let mut out = String::with_capacity(literal_len + 64);
+    for seg in segments {
+        match seg {
+            Segment::Literal(s) => out.push_str(s),
+            Segment::Op(op) => render_op(&mut out, op, record),
+        }
+    }
+    out
 }
 
 impl Default for CompiledFormat {
@@ -509,7 +514,7 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord) {
 /// Resolve a REQ header `name` (already lowercased) to its backing field value.
 /// Returns `None` for an absent `Option` field. Names not in `REQ_ALLOW_LIST`
 /// also return `None`, but the parser already rejected those at parse time.
-fn resolve_req<'a>(name: &str, record: &'a AccessLogRecord) -> Option<&'a str> {
+pub(crate) fn resolve_req<'a>(name: &str, record: &'a AccessLogRecord) -> Option<&'a str> {
     match name {
         ":method" => Some(&record.method),
         // `:path` and `x-envoy-original-path` both map to the already-resolved
@@ -527,7 +532,7 @@ fn resolve_req<'a>(name: &str, record: &'a AccessLogRecord) -> Option<&'a str> {
 /// Resolve a RESP header `name` (already lowercased) to its backing field
 /// value as an owned `String`. The only backed RESP header is
 /// `x-envoy-upstream-service-time`, rendered as decimal milliseconds.
-fn resolve_resp(name: &str, record: &AccessLogRecord) -> Option<String> {
+pub(crate) fn resolve_resp(name: &str, record: &AccessLogRecord) -> Option<String> {
     match name {
         "x-envoy-upstream-service-time" => record
             .upstream_service_time
@@ -542,7 +547,7 @@ fn resolve_resp(name: &str, record: &AccessLogRecord) -> Option<String> {
 /// `str::floor_char_boundary` (stable since Rust 1.82; the pinned toolchain is
 /// 1.95). For ASCII values — the common access-log case — this is exactly the
 /// first `n` bytes. `None` means no truncation.
-fn truncate_bytes(value: &str, truncate: Option<usize>) -> &str {
+pub(crate) fn truncate_bytes(value: &str, truncate: Option<usize>) -> &str {
     match truncate {
         None => value,
         Some(n) => &value[..value.floor_char_boundary(n)],

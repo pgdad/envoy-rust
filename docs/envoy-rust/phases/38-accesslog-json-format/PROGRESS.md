@@ -76,3 +76,28 @@ UTF-8; `/` NOT escaped — byte-identical to serde_json defaults (no new dep). W
 **Evidence:** `cargo test -p envoy-accesslog escapes_per_json_rules` → `1 passed`.
 
 **Commit:** `phase 38 task 3: hand-rolled JSON string escaper [ADR-0092]`
+
+---
+
+## Task 4 — per-operator typed JSON value encoder (number/string/null) — DONE
+
+**TDD:** wrote 4 failing tests first in `json_format.rs` (`single_numeric_operator_emits_unquoted_number`,
+`single_string_operator_emits_quoted_string`, `single_absent_operator_emits_null`,
+`mixed_or_literal_emits_quoted_string_with_dash_sentinel`) + a `rec()`/`enc()` helper.
+Confirmed RED (`cannot find function encode_json_value`).
+
+**Implemented:**
+- FIRST factored `pub(crate) fn render_value_segments(&[Segment], &AccessLogRecord) -> String`
+  out of `CompiledFormat::render` (carrying the M32-6 `literal_len + 64` pre-alloc);
+  `render` now delegates → the text path stays byte-identical.
+- made `resolve_req`/`resolve_resp`/`truncate_bytes` `pub(crate)`.
+- added `encode_json_value` + `encode_single_op` (+ `quote`/`quote_opt` helpers) to
+  `json_format.rs`: single numeric op → unquoted number; single string op → quoted;
+  single absent Option-op → `null`; mixed/literal → quoted string via the engine with
+  the `-` sentinel (ADR-0092 §B). `Op::DynamicMetadata` follows §B's general rule
+  (quoted-when-present / `null`-when-absent; not separately recon'd — backstop only).
+
+**Evidence:** `cargo test -p envoy-accesslog` → `53 passed; 0 failed` (4 new + the
+escaper + ALL pre-existing `command_operator`/`file_sink` tests — text path byte-frozen).
+
+**Commit:** `phase 38 task 4: per-operator typed JSON value encoder (number/string/null) [ADR-0092]`
