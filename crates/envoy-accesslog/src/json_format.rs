@@ -68,18 +68,24 @@ impl CompiledJsonValue {
     /// Render this value as a JSON token into `out` (ADR-0094 §C/§D/§E/§F). The
     /// recursion is purely structural; `Leaf` defers to the phase-38
     /// `encode_json_value` helper VERBATIM. No inter-element/inter-level `\n`.
-    fn render_into(&self, out: &mut String, record: &AccessLogRecord) {
+    ///
+    /// `omit_empty` (ADR-0096 §B/§D) threads recursively to every `Leaf`: a
+    /// multi-segment leaf's absent operator renders as `""` (not `-`). The
+    /// single-operator-typed path (`encode_single_op` → `null`) is UNAFFECTED (§C).
+    fn render_into(&self, out: &mut String, record: &AccessLogRecord, omit_empty: bool) {
         match self {
             CompiledJsonValue::Null => out.push_str("null"),
             CompiledJsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            CompiledJsonValue::Leaf(segments) => encode_json_value(out, segments, record),
+            CompiledJsonValue::Leaf(segments) => {
+                encode_json_value(out, segments, record, omit_empty)
+            }
             CompiledJsonValue::Array(items) => {
                 out.push('[');
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
-                    item.render_into(out, record);
+                    item.render_into(out, record, omit_empty);
                 }
                 out.push(']');
             }
@@ -92,7 +98,7 @@ impl CompiledJsonValue {
                     out.push('"');
                     json_escape_into(out, key);
                     out.push_str("\":");
-                    value.render_into(out, record);
+                    value.render_into(out, record, omit_empty);
                 }
                 out.push('}');
             }
@@ -104,12 +110,19 @@ impl CompiledJsonValue {
 /// `CompiledJsonValue` (ADR-0094 §A). `render` assembles ONE sorted JSON object
 /// per record (the top level is always an object, as Envoy's `Struct` is).
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompiledJsonFormat(std::collections::BTreeMap<String, CompiledJsonValue>);
+pub struct CompiledJsonFormat {
+    map: std::collections::BTreeMap<String, CompiledJsonValue>,
+    /// `omit_empty_values` (ADR-0096 §B/§D): threaded recursively into every
+    /// `Leaf`'s multi-segment render. Default `false`. The single-op `null` path
+    /// (`encode_single_op`) is UNAFFECTED (§C).
+    omit_empty: bool,
+}
 
 impl CompiledJsonFormat {
     /// Compile each value via `CompiledJsonValue::compile` (recursing nested
     /// objects/lists, compiling each `Format` leaf). Returns the first
     /// `FormatParseError` (surfaced at config-load as `InvalidAccessLogFormat`).
+    /// The resulting format has `omit_empty=false`; use [`Self::with_omit_empty`].
     pub fn from_map(
         map: &std::collections::BTreeMap<String, JsonValueInput>,
     ) -> Result<Self, FormatParseError> {
@@ -117,23 +130,33 @@ impl CompiledJsonFormat {
         for (k, v) in map {
             compiled.insert(k.clone(), CompiledJsonValue::compile(v)?);
         }
-        Ok(Self(compiled))
+        Ok(Self {
+            map: compiled,
+            omit_empty: false,
+        })
+    }
+
+    /// Builder setter for the `omit_empty_values` flag (ADR-0096 §B); the HCM
+    /// bridge calls this from the config `SubstitutionFormatString`.
+    pub fn with_omit_empty(mut self, omit_empty: bool) -> Self {
+        self.omit_empty = omit_empty;
+        self
     }
 
     /// Render ONE sorted JSON object + trailing `\n` (ADR-0094 §A/§E). The
     /// nested structure is emitted inline; only this top-level render appends
     /// the single `\n`.
     pub fn render(&self, record: &AccessLogRecord) -> String {
-        let mut out = String::with_capacity(64 + self.0.len() * 16);
+        let mut out = String::with_capacity(64 + self.map.len() * 16);
         out.push('{');
-        for (i, (key, value)) in self.0.iter().enumerate() {
+        for (i, (key, value)) in self.map.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push('"');
             json_escape_into(&mut out, key);
             out.push_str("\":");
-            value.render_into(&mut out, record);
+            value.render_into(&mut out, record, self.omit_empty);
         }
         out.push_str("}\n");
         out
@@ -167,13 +190,20 @@ pub(crate) fn json_escape_into(out: &mut String, s: &str) {
 /// unquoted number; string present → quoted+escaped; absent → `null`).
 /// Otherwise (literals / multi-segment / literal-only) → a quoted+escaped string
 /// rendered through the existing engine (absent operator → the `-` sentinel).
-pub(crate) fn encode_json_value(out: &mut String, segments: &[Segment], r: &AccessLogRecord) {
+pub(crate) fn encode_json_value(
+    out: &mut String,
+    segments: &[Segment],
+    r: &AccessLogRecord,
+    omit_empty: bool,
+) {
     if let [Segment::Op(op)] = segments {
+        // §C carve-out: the single-operator-typed path is UNAFFECTED by omit_empty
+        // (an absent single op stays `null`, NOT `""`).
         encode_single_op(out, op, r);
     } else {
-        // M40-B placeholder: T3 threads the real `omit_empty` flag here. For now
-        // `false` keeps the json path byte-unchanged (the `-` sentinel) + the crate green.
-        let s = render_value_segments(segments, r, false); // existing render semantics, `-` for absent
+        // §B: a multi-segment / literal leaf renders an absent op as `""` when
+        // omit_empty (else the `-` sentinel).
+        let s = render_value_segments(segments, r, omit_empty);
         quote(out, &s);
     }
 }
@@ -273,7 +303,7 @@ mod tests {
 
     fn enc(value_fmt: &str, r: &AccessLogRecord) -> String {
         let mut out = String::new();
-        encode_json_value(&mut out, &parse_format(value_fmt).unwrap(), r);
+        encode_json_value(&mut out, &parse_format(value_fmt).unwrap(), r, false);
         out
     }
 
@@ -380,10 +410,10 @@ mod tests {
         map.insert("missing".to_string(), JsonValueInput::Null);
         let cjf = CompiledJsonFormat::from_map(&map).expect("recursive compile Ok");
         // Bool/Null carried verbatim; Format compiled to Leaf.
-        assert_eq!(cjf.0["flag"], CompiledJsonValue::Bool(false));
-        assert_eq!(cjf.0["missing"], CompiledJsonValue::Null);
-        assert!(matches!(cjf.0["obj"], CompiledJsonValue::Object(_)));
-        assert!(matches!(cjf.0["list"], CompiledJsonValue::Array(_)));
+        assert_eq!(cjf.map["flag"], CompiledJsonValue::Bool(false));
+        assert_eq!(cjf.map["missing"], CompiledJsonValue::Null);
+        assert!(matches!(cjf.map["obj"], CompiledJsonValue::Object(_)));
+        assert!(matches!(cjf.map["list"], CompiledJsonValue::Array(_)));
     }
 
     #[test]
@@ -641,6 +671,104 @@ mod tests {
         // and nested:
         let cjf2 = top(&[("o", obj(&[("e", fmt(""))]))]);
         assert_eq!(cjf2.render(&r), "{\"o\":{\"e\":\"\"}}\n");
+    }
+
+    // --- phase 40 t3 (ADR-0096 §B/§C/§D): omit_empty in the json render ---
+
+    fn top_omit(pairs: &[(&str, JsonValueInput)], omit_empty: bool) -> CompiledJsonFormat {
+        let mut m = std::collections::BTreeMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        CompiledJsonFormat::from_map(&m)
+            .unwrap()
+            .with_omit_empty(omit_empty)
+    }
+
+    #[test]
+    fn omit_empty_swaps_dash_in_multi_segment_json_leaf() {
+        // §B — a multi-segment leaf with an absent op: omit=false "pre--", omit=true "pre-".
+        let mut r = fixture_record();
+        r.forwarded_for = None;
+        let off = top_omit(&[("e", fmt("pre-%REQ(X-FORWARDED-FOR)%"))], false);
+        assert_eq!(off.render(&r), "{\"e\":\"pre--\"}\n");
+        let on = top_omit(&[("e", fmt("pre-%REQ(X-FORWARDED-FOR)%"))], true);
+        assert_eq!(on.render(&r), "{\"e\":\"pre-\"}\n");
+    }
+
+    #[test]
+    fn omit_empty_leaves_single_op_null_unchanged() {
+        // §C — a single absent op routes through encode_single_op → null under BOTH.
+        let mut r = fixture_record();
+        r.upstream_host = None;
+        let off = top_omit(&[("u", fmt("%UPSTREAM_HOST%"))], false);
+        assert_eq!(off.render(&r), "{\"u\":null}\n");
+        let on = top_omit(&[("u", fmt("%UPSTREAM_HOST%"))], true);
+        assert_eq!(on.render(&r), "{\"u\":null}\n"); // NOT "" — §C carve-out
+    }
+
+    #[test]
+    fn omit_empty_applies_recursively_single_op_null_at_depth() {
+        // §D / CASE-4 — nested objects + lists: mixed leaves get the swap, single-op
+        // leaves stay null at depth.
+        let mut r = fixture_record();
+        r.forwarded_for = None;
+        let cjf = top_omit(
+            &[
+                (
+                    "nested",
+                    obj(&[
+                        ("mixed", fmt("v=%REQ(X-FORWARDED-FOR)%")),
+                        ("single", fmt("%REQ(X-FORWARDED-FOR)%")),
+                    ]),
+                ),
+                (
+                    "arr",
+                    JsonValueInput::Array(vec![
+                        fmt("a=%REQ(X-FORWARDED-FOR)%"),
+                        fmt("%REQ(X-FORWARDED-FOR)%"),
+                    ]),
+                ),
+            ],
+            true,
+        );
+        assert_eq!(
+            cjf.render(&r),
+            "{\"arr\":[\"a=\",null],\"nested\":{\"mixed\":\"v=\",\"single\":null}}\n"
+        );
+    }
+
+    #[test]
+    fn omit_empty_default_off_round_trip_byte_unchanged() {
+        // The phase-39 nested fixture line must be byte-identical with omit=false.
+        let r = fixture_record();
+        let cjf = top_omit(
+            &[
+                ("zouter", fmt("%PROTOCOL%")),
+                (
+                    "arequest",
+                    obj(&[
+                        ("method", fmt("%REQ(:METHOD)%")),
+                        ("zpath", fmt("%REQ(:PATH)%")),
+                        ("aaa", fmt("%RESPONSE_CODE%")),
+                    ]),
+                ),
+                (
+                    "blist",
+                    JsonValueInput::Array(vec![
+                        fmt("%REQ(:METHOD)%"),
+                        fmt("%RESPONSE_CODE%"),
+                        fmt("%UPSTREAM_HOST%"),
+                    ]),
+                ),
+                ("mtop", fmt("code-%RESPONSE_CODE%")),
+            ],
+            false,
+        );
+        assert_eq!(
+            cjf.render(&r),
+            "{\"arequest\":{\"aaa\":200,\"method\":\"GET\",\"zpath\":\"/\"},\"blist\":[\"GET\",200,null],\"mtop\":\"code-200\",\"zouter\":\"HTTP/1.1\"}\n"
+        );
     }
 
     #[test]
