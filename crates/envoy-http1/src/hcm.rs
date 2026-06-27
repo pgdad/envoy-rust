@@ -1945,16 +1945,17 @@ mod tests {
             "single".to_string(),
             envoy_config::JsonFormatValue::Format("%UPSTREAM_HOST%".to_string()),
         );
-        let mk = |omit: bool, map: std::collections::BTreeMap<String, envoy_config::JsonFormatValue>| {
-            envoy_config::FileAccessLog {
-                path: "/tmp/x".into(),
-                log_format: Some(envoy_config::SubstitutionFormatString {
-                    text_format_source: None,
-                    json_format: Some(map),
-                    omit_empty_values: omit,
-                }),
-            }
-        };
+        let mk =
+            |omit: bool, map: std::collections::BTreeMap<String, envoy_config::JsonFormatValue>| {
+                envoy_config::FileAccessLog {
+                    path: "/tmp/x".into(),
+                    log_format: Some(envoy_config::SubstitutionFormatString {
+                        text_format_source: None,
+                        json_format: Some(map),
+                        omit_empty_values: omit,
+                    }),
+                }
+            };
         assert_eq!(
             compiled_log_format(&mk(false, map.clone()))
                 .unwrap()

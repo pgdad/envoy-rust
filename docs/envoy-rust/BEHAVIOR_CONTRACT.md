@@ -1649,6 +1649,67 @@ acceptance (`{}\n`) are UNCHANGED from phase 38. **NO new `ConfigError` variant.
 
 ---
 
+### Phase 40 (ADR-0096): `omit_empty_values` — the absent-operator sentinel swap
+
+> Phase 40 adds `SubstitutionFormatString.omit_empty_values` (a plain
+> `#[serde(default)]` `bool`, default `false`). The SPEC's original "drop empty
+> KEYS" framing is **VOID** — ADR-0096's empirical recon against live
+> `envoyproxy/envoy:v1.33.0` overturned it. `omit_empty_values` is a **sentinel
+> SWAP, NOT a key filter**: when `true`, the command-operator engine renders an
+> absent operator as the EMPTY STRING `""` instead of the `-` sentinel, in the
+> MULTI-SEGMENT render path. It threads as an `omit_empty: bool` into the EXISTING
+> `render_value_segments` (the four `.unwrap_or("-")` sites become
+> `.unwrap_or(if omit_empty {""} else {"-"})`), carried on the compiled
+> `CompiledFormat` / `CompiledJsonFormat`. The cross-proxy witness is **fixture
+> 0048** (`0048-accesslog-omit-empty`); fixture 0047 + all `0001`-`0047` (no flag)
+> are the default-off byte-preservation witnesses. Facts §A–§E are empirically
+> locked against live v1.33.0 (ADR-0096).
+
+**§A — NO key/entry drop.** Every `json_format` key (and list entry) ALWAYS
+emits. `omit_empty_values` does NOT omit JSON keys — the "omit" names the
+absent-operator value rendering, not the key set. Typed-`null` keys survive as
+`null`; an empty-literal value (`""`) survives as `""`.
+
+**§B — the swap on the MULTI-SEGMENT render (BOTH formats).** An absent operator
+inside a multi-segment / literal-prefixed value renders as `""` (not `-`) for
+BOTH `text_format` and `json_format`:
+`up=%UPSTREAM_HOST%` → `up=` (was `up=-`); `x=%REQ(X-FORWARDED-FOR)%` → `x=`
+(was `x=-`); text `m=%REQ(:METHOD)% up=%UPSTREAM_HOST%` → `m=GET up=` (was
+`m=GET up=-`). It is a render-engine-level behavior shared by both format arms.
+
+**§C — single-operator-typed json values are UNAFFECTED (the carve-out).** A
+`json_format` value that is EXACTLY one operator routes through the typed encoder
+(`encode_single_op`: numeric→number, string→quoted, **absent→`null`**), NOT
+through `render_value_segments`. A single absent op stays `null` under BOTH
+`omit_empty_values` and the default — NOT `""`, NOT dropped. `encode_single_op`
+is UNCHANGED by this phase.
+
+**§D — recursive.** The swap threads through the recursive `render_into` to
+EVERY leaf (nested objects + lists): a mixed value at depth gets the `-`→`""`
+swap; a single-op value at depth stays `null`.
+
+**§E — all-absent / config-validity.** A `json_format` of only single-absent ops
+→ the keys survive as `null` (NOT dropped, NOT `{}`). `omit_empty_values: true`
+composes with either arm (`text_format_source` or `json_format`);
+`deny_unknown_fields` rejects typos; the exactly-one-of validator + empty-top-map
+acceptance are UNCHANGED. **NO new `ConfigError` variant.**
+
+**Authoritative fixture-0048 line** (bare `GET /`, `direct_response`
+`{status:200, body:"ok\n"}`; `json_format` + `omit_empty_values: true`;
+live-captured from `envoyproxy/envoy:v1.33.0`):
+
+```
+{"method":"GET","proto":"HTTP/1.1","single_up":null,"up":"up=","xff":"x="}
+```
+
+The flag-off control over the SAME map (live-captured) keeps the `-` sentinel:
+
+```
+{"method":"GET","proto":"HTTP/1.1","single_up":null,"up":"up=-","xff":"x=-"}
+```
+
+---
+
 ## xDS wire state machine
 
 > **To be filled per-phase as needed.**
