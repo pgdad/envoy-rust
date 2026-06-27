@@ -928,6 +928,9 @@ async fn finalize_h2_stream(
             authority: access_log_header_value(&envoy_req.headers, "host"),
             upstream_host: upstream_host_for_log_h2,
             route_name: route_name_for_log_h2,
+            // phase 42: %RESPONSE_CODE_DETAILS% backing field — the HCM that SETS
+            // the detail string is a later task; left `None` for now.
+            response_code_details: None,
             dynamic_metadata,
         };
         // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.

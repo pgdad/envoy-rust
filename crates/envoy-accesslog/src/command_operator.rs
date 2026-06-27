@@ -618,6 +618,7 @@ mod tests {
             authority: Some("h:1".into()),
             upstream_host: Some("1.2.3.4:80".into()),
             route_name: None,
+            response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }

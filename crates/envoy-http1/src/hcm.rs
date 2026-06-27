@@ -1217,6 +1217,9 @@ async fn serve_connection(
                     .map(|r| r.route().name.as_str())
                     .filter(|n| !n.is_empty())
                     .map(str::to_owned),
+                // phase 42: %RESPONSE_CODE_DETAILS% backing field — the HCM that
+                // SETS the detail string is a later task; left `None` for now.
+                response_code_details: None,
                 dynamic_metadata: dynamic_metadata.clone(),
             };
             // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
@@ -1814,6 +1817,7 @@ mod tests {
             authority: None,
             upstream_host: None,
             route_name: None,
+            response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }

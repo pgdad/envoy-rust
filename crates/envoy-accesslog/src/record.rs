@@ -88,6 +88,13 @@ pub struct AccessLogRecord {
     /// (`Some`→the name, `None`→absent → `-` sentinel / json `null`).
     pub route_name: Option<String>,
 
+    /// Envoy's response-code-details string for the reply (e.g.
+    /// `direct_response` / `via_upstream`), set by the HCM per response-path; an
+    /// `Option<String>` mirroring `route_name` — present → quoted/rendered,
+    /// absent → `-` sentinel / json `null`. Rendered by `%RESPONSE_CODE_DETAILS%`
+    /// (phase 42).
+    pub response_code_details: Option<String>,
+
     /// Per-request dynamic metadata (namespace → key → string value), copied
     /// from the pipeline's `FilterRequest.dynamic_metadata` at the HCM
     /// record-build site (H1 hcm.rs ~1189, H2 hcm.rs ~888). Rendered by the
@@ -121,6 +128,7 @@ mod tests {
             authority: None,
             upstream_host: None,
             route_name: None,
+            response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
         };
         assert!(empty.dynamic_metadata.is_empty());
@@ -155,6 +163,7 @@ mod tests {
             authority: None,
             upstream_host: None,
             route_name: None,
+            response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
         };
         assert!(absent.route_name.is_none());
@@ -164,6 +173,40 @@ mod tests {
             ..absent
         };
         assert_eq!(named.route_name.as_deref(), Some("myroute"));
+    }
+
+    #[test]
+    fn record_response_code_details_defaults_and_carries_value() {
+        let absent = AccessLogRecord {
+            start_time: UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            protocol: "HTTP/1.1".into(),
+            response_code: 200,
+            response_flags: "-".into(),
+            bytes_received: 0,
+            bytes_sent: 3,
+            duration: Duration::from_millis(5),
+            upstream_service_time: None,
+            forwarded_for: None,
+            user_agent: None,
+            request_id: None,
+            authority: None,
+            upstream_host: None,
+            route_name: None,
+            response_code_details: None,
+            dynamic_metadata: BTreeMap::new(),
+        };
+        assert!(absent.response_code_details.is_none());
+
+        let detailed = AccessLogRecord {
+            response_code_details: Some("direct_response".into()),
+            ..absent
+        };
+        assert_eq!(
+            detailed.response_code_details.as_deref(),
+            Some("direct_response")
+        );
     }
 
     #[test]
@@ -185,6 +228,7 @@ mod tests {
             authority: Some("envoy-rust.test".into()),
             upstream_host: None,
             route_name: None,
+            response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
         };
         let dbg = format!("{:?}", record);
@@ -215,6 +259,7 @@ mod tests {
             authority: None,
             upstream_host: None,
             route_name: None,
+            response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
         };
         let mut clone = original.clone();
