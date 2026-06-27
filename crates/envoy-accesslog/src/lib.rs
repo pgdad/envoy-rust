@@ -18,6 +18,7 @@ pub mod default_format;
 mod error;
 pub mod file_sink;
 mod json_format;
+mod log_format;
 pub mod record;
 mod sink;
 
@@ -25,6 +26,7 @@ pub use command_operator::{CompiledFormat, FormatParseError, parse_format};
 pub use error::AccessLogError;
 pub use file_sink::FileSink;
 pub use json_format::CompiledJsonFormat;
+pub use log_format::LogFormat;
 pub use record::AccessLogRecord;
 
 use std::time::SystemTime;

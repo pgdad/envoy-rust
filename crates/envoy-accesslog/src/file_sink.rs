@@ -17,8 +17,8 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::command_operator::CompiledFormat;
 use crate::error::AccessLogError;
+use crate::log_format::LogFormat;
 use crate::record::AccessLogRecord;
 
 /// FileSink — concrete on-disk access-log sink.
@@ -34,7 +34,7 @@ use crate::record::AccessLogRecord;
 pub struct FileSink {
     path: PathBuf,
     handle: Arc<Mutex<File>>,
-    format: CompiledFormat,
+    format: LogFormat,
 }
 
 impl FileSink {
@@ -44,7 +44,10 @@ impl FileSink {
     /// directory, etc.). Per 06.2 SPEC §6 signpost 6 + signpost 7,
     /// the constructor does NOT mkdir -p, does NOT pre-validate
     /// path shape, and does NOT truncate existing files.
-    pub async fn new(path: PathBuf, format: CompiledFormat) -> Result<Self, AccessLogError> {
+    pub async fn new(
+        path: PathBuf,
+        format: impl Into<LogFormat>,
+    ) -> Result<Self, AccessLogError> {
         let file = tokio::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -57,7 +60,7 @@ impl FileSink {
         Ok(Self {
             path,
             handle: Arc::new(Mutex::new(file)),
-            format,
+            format: format.into(),
         })
     }
 
@@ -73,11 +76,11 @@ impl FileSink {
     /// — production code uses `FileSink::new` exclusively.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-util"))]
-    pub fn from_file_for_test(path: PathBuf, file: File, format: CompiledFormat) -> Self {
+    pub fn from_file_for_test(path: PathBuf, file: File, format: impl Into<LogFormat>) -> Self {
         Self {
             path,
             handle: Arc::new(Mutex::new(file)),
-            format,
+            format: format.into(),
         }
     }
 
@@ -124,8 +127,8 @@ impl FileSink {
 
 #[cfg(test)]
 mod tests {
-    // `CompiledFormat` is in scope via `super::*` (imported at module top).
     use super::*;
+    use crate::command_operator::CompiledFormat;
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::tempdir;
     use tokio::io::AsyncReadExt;
@@ -293,6 +296,19 @@ mod tests {
             }
             other => panic!("expected AccessLogError::Open; got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn file_sink_emits_json_object() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("status".to_string(), "%RESPONSE_CODE%".to_string());
+        let fmt = crate::CompiledJsonFormat::from_map(&map).unwrap();
+        let sink = FileSink::new(path.clone(), fmt).await.unwrap(); // CompiledJsonFormat: Into<LogFormat>
+        sink.emit(&make_record()).await.unwrap();
+        drop(sink);
+        assert_eq!(read_to_string(&path).await, "{\"status\":200}\n");
     }
 
     #[tokio::test]

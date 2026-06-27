@@ -122,3 +122,26 @@ sorted JSON object — `{`, comma-separated `"key":value` via `json_escape_into`
 `{"bytes_rcvd":0,"bytes_sent":3,"flags":"-","method":"GET","mixed":"code-200","path":"/","protocol":"HTTP/1.1","status":200,"upstream":null}\n`.
 
 **Commit:** `phase 38 task 5: CompiledJsonFormat compile + sorted-object render [ADR-0092]`
+
+---
+
+## Task 6 — `LogFormat` enum (Text|Json) on `FileSink` via `Into` — DONE
+
+**TDD:** wrote `file_sink_emits_json_object` first (build a `FileSink` from a
+`CompiledJsonFormat`, emit, assert `{"status":200}\n`). Confirmed RED (`FileSink::new`
+mismatched type — expected `CompiledFormat`).
+
+**Implemented:** new `crates/envoy-accesslog/src/log_format.rs` —
+`pub enum LogFormat { Text(CompiledFormat), Json(CompiledJsonFormat) }` with `render`
+delegating to each arm + `From<CompiledFormat>`/`From<CompiledJsonFormat>` impls.
+`FileSink.format: CompiledFormat → LogFormat`; `new`/`from_file_for_test` take
+`impl Into<LogFormat>` (store `.into()`). `emit` UNCHANGED. Re-exported `LogFormat`
+from `lib.rs`. Existing `CompiledFormat::default()`/`from_inline(...)` call sites coerce
+via `Into` — text path byte-frozen.
+
+**Evidence:** `cargo test -p envoy-accesslog` → `58 passed; 0 failed` (1 new + all
+existing `file_sink` tests). `cargo build --workspace --all-targets` → `Finished`
+(the `from_file_for_test` signature change leaves envoy-http1's call sites compiling
+via `Into`).
+
+**Commit:** `phase 38 task 6: LogFormat enum (Text|Json) on FileSink via Into [ADR-0092]`
