@@ -1262,8 +1262,10 @@ fn compiled_log_format(
         // this build is defense-in-depth — prefer the set arm, default if neither.
         Some(s) => match (&s.text_format_source, &s.json_format) {
             (Some(ds), _) => Ok(
+                // ADR-0096 §B — thread `omit_empty_values` onto the compiled format.
                 envoy_accesslog::CompiledFormat::from_inline(&ds.inline_string)
                     .map_err(map_err)?
+                    .with_omit_empty(s.omit_empty_values)
                     .into(),
             ),
             (None, Some(map)) => {
@@ -1277,6 +1279,7 @@ fn compiled_log_format(
                         .collect();
                 Ok(envoy_accesslog::CompiledJsonFormat::from_map(&input)
                     .map_err(map_err)?
+                    .with_omit_empty(s.omit_empty_values) // ADR-0096 §B/§D
                     .into())
             }
             (None, None) => Ok(envoy_accesslog::CompiledFormat::default().into()),
@@ -1898,6 +1901,72 @@ mod tests {
             compiled_log_format(&file_cfg).unwrap(),
             envoy_accesslog::LogFormat::Text(_)
         ));
+    }
+
+    #[test]
+    fn compiled_log_format_threads_omit_empty_values_text() {
+        // ADR-0096 §B / phase40 T4 — `omit_empty_values: true` on the text arm
+        // makes an absent op render `""` (swap), not the `-` sentinel.
+        let mk = |omit: bool| envoy_config::FileAccessLog {
+            path: "/tmp/x".into(),
+            log_format: Some(envoy_config::SubstitutionFormatString {
+                text_format_source: Some(envoy_config::DataSourceInline {
+                    inline_string: "up=%UPSTREAM_HOST%".into(),
+                }),
+                json_format: None,
+                omit_empty_values: omit,
+            }),
+        };
+        // record_get_200 has upstream_host = None.
+        assert_eq!(
+            compiled_log_format(&mk(false))
+                .unwrap()
+                .render(&record_get_200()),
+            "up=-"
+        );
+        assert_eq!(
+            compiled_log_format(&mk(true))
+                .unwrap()
+                .render(&record_get_200()),
+            "up="
+        );
+    }
+
+    #[test]
+    fn compiled_log_format_threads_omit_empty_values_json() {
+        // ADR-0096 §B/§C — `omit_empty_values: true` on the json arm: the
+        // multi-segment leaf gets the swap; a single absent op stays `null`.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "mixed".to_string(),
+            envoy_config::JsonFormatValue::Format("up=%UPSTREAM_HOST%".to_string()),
+        );
+        map.insert(
+            "single".to_string(),
+            envoy_config::JsonFormatValue::Format("%UPSTREAM_HOST%".to_string()),
+        );
+        let mk = |omit: bool, map: std::collections::BTreeMap<String, envoy_config::JsonFormatValue>| {
+            envoy_config::FileAccessLog {
+                path: "/tmp/x".into(),
+                log_format: Some(envoy_config::SubstitutionFormatString {
+                    text_format_source: None,
+                    json_format: Some(map),
+                    omit_empty_values: omit,
+                }),
+            }
+        };
+        assert_eq!(
+            compiled_log_format(&mk(false, map.clone()))
+                .unwrap()
+                .render(&record_get_200()),
+            "{\"mixed\":\"up=-\",\"single\":null}\n"
+        );
+        assert_eq!(
+            compiled_log_format(&mk(true, map))
+                .unwrap()
+                .render(&record_get_200()),
+            "{\"mixed\":\"up=\",\"single\":null}\n" // §C: single stays null
+        );
     }
 
     #[test]
