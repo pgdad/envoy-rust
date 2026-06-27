@@ -243,6 +243,7 @@ fn encode_single_op(out: &mut String, op: &Op, r: &AccessLogRecord) {
         Op::StartTime => quote(out, &crate::format_iso8601(r.start_time)),
         // Option-backed → null when absent, else quoted
         Op::UpstreamHost => quote_opt(out, r.upstream_host.as_deref()),
+        Op::UpstreamCluster => quote_opt(out, r.upstream_cluster.as_deref()),
         Op::RouteName => quote_opt(out, r.route_name.as_deref()),
         Op::ResponseCodeDetails => quote_opt(out, r.response_code_details.as_deref()),
         Op::DynamicMetadata { namespace, key } => quote_opt(

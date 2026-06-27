@@ -62,6 +62,11 @@ pub enum Op {
     Duration,
     /// `%UPSTREAM_HOST%`
     UpstreamHost,
+    /// `%UPSTREAM_CLUSTER%` — the config `name` of the cluster the request was
+    /// routed to (phase 43). An `Option<String>` mirroring `UpstreamHost`:
+    /// present → the cluster name, absent (non-proxy / direct_response path) →
+    /// the `-` sentinel / json `null`.
+    UpstreamCluster,
     /// `%ROUTE_NAME%` — the matched route's config `name` (phase 41). An
     /// `Option<String>` mirroring `UpstreamHost`: present → the name, absent
     /// (unnamed route) → the `-` sentinel / json `null`.
@@ -247,6 +252,7 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
         | "BYTES_RECEIVED"
         | "BYTES_SENT"
         | "UPSTREAM_HOST"
+        | "UPSTREAM_CLUSTER"
         | "ROUTE_NAME"
         | "RESPONSE_CODE_DETAILS"
         | "START_TIME"
@@ -264,6 +270,7 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
                 "BYTES_RECEIVED" => Op::BytesReceived,
                 "BYTES_SENT" => Op::BytesSent,
                 "UPSTREAM_HOST" => Op::UpstreamHost,
+                "UPSTREAM_CLUSTER" => Op::UpstreamCluster,
                 "ROUTE_NAME" => Op::RouteName,
                 "RESPONSE_CODE_DETAILS" => Op::ResponseCodeDetails,
                 "START_TIME" => Op::StartTime,
@@ -528,6 +535,9 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord, omit_empty: bo
         }
         Op::StartTime => out.push_str(&crate::format_iso8601(record.start_time)),
         Op::UpstreamHost => out.push_str(record.upstream_host.as_deref().unwrap_or(empty_or_dash)),
+        Op::UpstreamCluster => {
+            out.push_str(record.upstream_cluster.as_deref().unwrap_or(empty_or_dash))
+        }
         Op::RouteName => out.push_str(record.route_name.as_deref().unwrap_or(empty_or_dash)),
         Op::ResponseCodeDetails => out.push_str(
             record
@@ -706,6 +716,47 @@ mod tests {
         assert_eq!(
             CompiledFormat::new(parse_format("r=%ROUTE_NAME%").unwrap()).render(&absent),
             "r=-"
+        );
+    }
+
+    // --- phase 43 (ADR-0100): %UPSTREAM_CLUSTER% — parse + text render ---
+
+    #[test]
+    fn upstream_cluster_parses_as_no_arg_op() {
+        assert_eq!(
+            parse_format("%UPSTREAM_CLUSTER%").unwrap(),
+            vec![Segment::Op(Op::UpstreamCluster)]
+        );
+    }
+
+    #[test]
+    fn upstream_cluster_rejects_arg() {
+        assert!(parse_format("%UPSTREAM_CLUSTER(x)%").is_err());
+        assert!(parse_format("%UPSTREAM_CLUSTER:3%").is_err());
+    }
+
+    #[test]
+    fn upstream_cluster_text_renders_value_or_dash() {
+        let mut clustered = rec();
+        clustered.upstream_cluster = Some("my_backend_cluster".into());
+        assert_eq!(
+            CompiledFormat::new(parse_format("%UPSTREAM_CLUSTER%").unwrap()).render(&clustered),
+            "my_backend_cluster"
+        );
+        assert_eq!(
+            CompiledFormat::new(parse_format("c=%UPSTREAM_CLUSTER%").unwrap()).render(&clustered),
+            "c=my_backend_cluster"
+        );
+
+        let mut absent = rec();
+        absent.upstream_cluster = None;
+        assert_eq!(
+            CompiledFormat::new(parse_format("%UPSTREAM_CLUSTER%").unwrap()).render(&absent),
+            "-"
+        );
+        assert_eq!(
+            CompiledFormat::new(parse_format("c=%UPSTREAM_CLUSTER%").unwrap()).render(&absent),
+            "c=-"
         );
     }
 
