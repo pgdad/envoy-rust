@@ -344,7 +344,10 @@ mod tests {
     #[test]
     fn from_map_rejects_malformed_operator() {
         let mut map = std::collections::BTreeMap::new();
-        map.insert("a".to_string(), JsonValueInput::Format("%NOPE%".to_string()));
+        map.insert(
+            "a".to_string(),
+            JsonValueInput::Format("%NOPE%".to_string()),
+        );
         assert!(CompiledJsonFormat::from_map(&map).is_err());
     }
 
@@ -573,7 +576,10 @@ mod tests {
         // §F — empty {} → {}, empty [] → [].
         let r = fixture_record();
         let cjf = top(&[
-            ("e", JsonValueInput::Object(std::collections::BTreeMap::new())),
+            (
+                "e",
+                JsonValueInput::Object(std::collections::BTreeMap::new()),
+            ),
             ("l", JsonValueInput::Array(vec![])),
         ]);
         assert_eq!(cjf.render(&r), "{\"e\":{},\"l\":[]}\n");
@@ -595,10 +601,7 @@ mod tests {
     fn depth_three_nesting() {
         // Deep nesting (depth-3), at-depth numeric inference still applies.
         let r = fixture_record();
-        let cjf = top(&[(
-            "d1",
-            obj(&[("d2", obj(&[("d3", fmt("%RESPONSE_CODE%"))]))]),
-        )]);
+        let cjf = top(&[("d1", obj(&[("d2", obj(&[("d3", fmt("%RESPONSE_CODE%"))]))]))]);
         assert_eq!(cjf.render(&r), "{\"d1\":{\"d2\":{\"d3\":200}}}\n");
     }
 
@@ -623,10 +626,7 @@ mod tests {
     fn nested_key_and_value_escaping() {
         // Reuse the phase-38 escaping at depth: a nested key + value both escaped.
         let r = fixture_record();
-        let cjf = top(&[(
-            "o",
-            obj(&[("a\"b", fmt("x\ty"))]),
-        )]);
+        let cjf = top(&[("o", obj(&[("a\"b", fmt("x\ty"))]))]);
         assert_eq!(cjf.render(&r), "{\"o\":{\"a\\\"b\":\"x\\ty\"}}\n");
     }
 
@@ -654,10 +654,10 @@ mod tests {
         let cjf = top(&[(
             "o",
             obj(&[
-                ("trunc", fmt("%REQ(:METHOD):2%")), // "POST" → "PO"
+                ("trunc", fmt("%REQ(:METHOD):2%")),       // "POST" → "PO"
                 ("alt", fmt("%REQ(X-MISSING?:METHOD)%")), // absent → :METHOD → "POST"
-                ("dur", fmt("%DURATION%")),         // 42 (unquoted)
-                ("ctrl", fmt("%REQ(USER-AGENT)%")), // "ab" escaped
+                ("dur", fmt("%DURATION%")),               // 42 (unquoted)
+                ("ctrl", fmt("%REQ(USER-AGENT)%")),       // "ab" escaped
             ]),
         )]);
         assert_eq!(

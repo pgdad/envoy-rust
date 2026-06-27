@@ -1037,6 +1037,10 @@ surrounding quotes).
 > subsection below. **Phase 38 (ADR-0092) FURTHER SUPERSEDES it for `json_format`**,
 > which is now the supported v1.33.0 oneof sibling of `text_format_source` — see the
 > [Phase 38 (ADR-0092)](#phase-38-adr-0092-the-json_format-access-log-encoder)
+> subsection below; **Phase 39 (ADR-0094) EXTENDS `json_format` to the full
+> recursive `google.protobuf.Struct`** (nested objects + lists + `bool`/`null`
+> literal leaves) — see the
+> [Phase 39 (ADR-0094)](#phase-39-adr-0094-the-recursive-nested-json_format-encoder)
 > subsection below. The remaining out-of-scope claims (`typed_json_format` — NOT a
 > v1.33.0 field, ADR-0092 §C; the DEPRECATED inline `text_format` scalar; and the
 > top-level `format` field) STILL HOLD and are still rejected.
@@ -1578,6 +1582,69 @@ phase-32 per-value `parse_format`).
 
 ```
 {"bytes_rcvd":0,"bytes_sent":3,"flags":"-","method":"GET","mixed":"code-200","path":"/","protocol":"HTTP/1.1","status":200,"upstream":null}
+```
+
+### Phase 39 (ADR-0094): the RECURSIVE (nested) `json_format` encoder
+
+> Phase 39 makes the phase-38 `json_format` encoder RECURSIVE — a `json_format`
+> value may itself be a nested OBJECT (key → value map, to arbitrary depth), a
+> LIST (sequence of values), or a `bool`/`null` literal, matching Envoy's
+> `google.protobuf.Struct`. The config model becomes
+> `json_format: Option<BTreeMap<String, JsonFormatValue>>` where
+> `JsonFormatValue` is a `#[serde(untagged)]` enum
+> `{ Null, Bool(bool), Format(String), Array(Vec<…>), Object(BTreeMap<String,…>) }`;
+> the encoder becomes a recursive `CompiledJsonValue`. The phase-38 LEAF helpers
+> (`encode_json_value`/`encode_single_op`/`json_escape_into`) are REUSED VERBATIM
+> at every recursion leaf — the only new behavior is the `{…}`/`[…]` structural
+> envelope + the `bool`/`null` literal arms. The text/default/flat-JSON render
+> paths are BYTE-FROZEN (fixture 0046 stays byte-identical — the depth-1 instance
+> of the recursive model is the regression witness). The cross-proxy witness is
+> **fixture 0047** (`0047-accesslog-json-nested`). All facts below are
+> empirically locked against live `envoyproxy/envoy:v1.33.0` (ADR-0094 §A–§H).
+
+**§A — per-level key sorting.** Keys are SORTED by UTF-8 bytes at EVERY object
+level independently (top level AND each nested object), exactly `BTreeMap`
+iteration order. Phase-38 §A applied recursively, with zero extra work.
+
+**§B — list order = config order.** A LIST emits its elements in CONFIG order
+(NOT sorted) — lists are `Vec`, only objects sort.
+
+**§C — at-depth type inference.** The SAME phase-38 per-leaf rule (§B above)
+applies at every depth: a nested single numeric op → unquoted number; a nested
+string op → quoted; a nested/in-list absent op → `null`; mixed/literal → quoted
+string with the `-` sentinel. `encode_json_value` is reused verbatim.
+
+**§D — non-string scalar leaves are NATIVE-TYPED.** A `bool` literal → `true` /
+`false` (unquoted); a `null`/`~` literal → `null` (unquoted) — byte-exact and IN
+this phase. **NUMERIC literal leaves are DEFERRED (CF-39-1):** a literal YAML
+number in a `json_format` value routes through Envoy's protobuf-`double` JSON
+serialization, a non-portable formatting rabbit hole (`1000000`→`1e+06`
+scientific notation; `1.5`→`"1.5"` a YAML→Struct quirk). envoy-rust **boot-rejects
+a numeric-literal `json_format` value** (a YAML number matches NO `#[serde(untagged)]`
+arm → parse error) — a documented, narrow divergence (Envoy accepts it; operators
+are strings and `bool`/`null` cover the realistic constant-field cases).
+
+**§E — separators / terminator / nesting whitespace.** Compact separators
+(`{"k":v,"k2":v2}` / `[a,b,c]`, NO spaces) at every level; exactly ONE trailing
+`\n` on the WHOLE top-level object; NO inter-element / inter-level `\n` (nested
+objects/lists are inline). The single `\n` is appended only by the top-level
+render.
+
+**§F — degenerate nesting.** Empty nested object `{}` → `{}`; empty list `[]` →
+`[]`; a list containing an absent-operator leaf → `null` in place. All valid.
+
+**§G — validity (all boot-fatal, ADR-0049).** A malformed operator in a NESTED
+leaf at ANY depth is boot-fatal via the EXISTING `InvalidAccessLogFormat`
+(the per-leaf `parse_format` validator now recurses the tree). The exactly-one-of
+`{text_format_source, json_format}` (`AmbiguousLogFormat`) and the empty-top-map
+acceptance (`{}\n`) are UNCHANGED from phase 38. **NO new `ConfigError` variant.**
+
+**§H — authoritative fixture-0047 line** (bare `GET /`, Host `envoy-rust.test`,
+`direct_response` `{status:200, body:"ok\n"}`; nested `arequest` object +
+`blist` list + top scalars):
+
+```
+{"arequest":{"aaa":200,"method":"GET","zpath":"/"},"blist":["GET",200,null],"mtop":"code-200","zouter":"HTTP/1.1"}
 ```
 
 ---
