@@ -534,7 +534,7 @@ async fn handle_one_stream(
 
     let resp: Response = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
-            BuildOutcome::Synth(r) => r,
+            BuildOutcome::Synth(r, _) => r,
             BuildOutcome::Proxy {
                 cluster: cluster_name,
                 // 16 Task 5: consume the retry policy + attempt-count flag that

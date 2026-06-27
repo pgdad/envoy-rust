@@ -806,7 +806,7 @@ async fn serve_connection(
                         path = %req.path,
                         "request rejected: Transfer-Encoding: chunked not supported (501)"
                     );
-                    BuildOutcome::Synth(synth_501(close))
+                    BuildOutcome::Synth(synth_501(close), None)
                 } else {
                     build_response(&config, &req, close)
                 };
@@ -833,6 +833,10 @@ async fn serve_connection(
         // once below the writer-arm match from the unified `outgoing:
         // Response` value (see comment at the unified factored site).
         let mut upstream_host_for_log: Option<String> = None; // stays mut — only proxy arm populates
+        // phase 42 (ADR-0099): per-request %RESPONSE_CODE_DETAILS%. Set by the
+        // synth writer-arm (carries the BuildOutcome detail) and the
+        // proxy-success arm (`via_upstream`); error/filter synths leave it None.
+        let mut response_code_details_for_log: Option<String> = None;
 
         // 07.1 Task 5: per-arm-populated response value, written to the wire
         // once below the match (factored unified-site). 07.1 Task 6 flipped
@@ -852,8 +856,9 @@ async fn serve_connection(
         // structurally for 07.2 HeaderMutation forward-compat).
         match request_path {
             RequestPath::Match(outcome) => match outcome {
-                BuildOutcome::Synth(resp) => {
+                BuildOutcome::Synth(resp, details) => {
                     outgoing = resp;
+                    response_code_details_for_log = details.map(str::to_owned);
                 }
                 BuildOutcome::Proxy {
                     cluster: cluster_name,
@@ -976,6 +981,7 @@ async fn serve_connection(
                                 // for the access-log `%UPSTREAM_HOST%` token (last
                                 // attempt's endpoint wins). Skipped on pick()->None.
                                 upstream_host_for_log = Some(endpoint.to_string());
+                                response_code_details_for_log = Some("via_upstream".to_owned());
                             }
 
                             // L5: per-attempt upstream_rq_total — only for received
@@ -1217,9 +1223,9 @@ async fn serve_connection(
                     .map(|r| r.route().name.as_str())
                     .filter(|n| !n.is_empty())
                     .map(str::to_owned),
-                // phase 42: %RESPONSE_CODE_DETAILS% backing field — the HCM that
-                // SETS the detail string is a later task; left `None` for now.
-                response_code_details: None,
+                // phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% backing field,
+                // set per response-path (direct_response / via_upstream).
+                response_code_details: response_code_details_for_log,
                 dynamic_metadata: dynamic_metadata.clone(),
             };
             // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
@@ -1369,7 +1375,11 @@ fn extract_upstream_service_time(headers: &[(String, String)]) -> Option<std::ti
 /// Synth via `Http1Response::write_to` and dispatches Proxy via
 /// `cluster_mgr` → `pick_endpoint` → `Client::connect` → `send_request`.
 pub enum BuildOutcome {
-    Synth(Response),
+    /// phase 42 (ADR-0099): the second field carries the
+    /// `%RESPONSE_CODE_DETAILS%` access-log detail string for this synth path
+    /// (`Some("direct_response")` for a DirectResponse route; `None` for error
+    /// synths 400/404/501 — deferred).
+    Synth(Response, Option<&'static str>),
     Proxy {
         cluster: String,
         /// 16 Task 4: resolved per-route retry policy (`None` → no retries).
@@ -1476,7 +1486,7 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
                 path = %req.path,
                 "request rejected: missing or empty Host header"
             );
-            return BuildOutcome::Synth(synth_400(close));
+            return BuildOutcome::Synth(synth_400(close), None);
         }
     };
     let host = strip_port(host_raw);
@@ -1501,7 +1511,7 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
                 path = %req.path,
                 "request rejected: no matching virtual_host"
             );
-            return BuildOutcome::Synth(synth_404(close));
+            return BuildOutcome::Synth(synth_404(close), None);
         }
     };
 
@@ -1519,13 +1529,15 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
                 path = %req.path,
                 "request rejected: no matching route"
             );
-            return BuildOutcome::Synth(synth_404(close));
+            return BuildOutcome::Synth(synth_404(close), None);
         }
     };
 
     // Hardcoded router-filter call site.
     match &route.action {
-        RouteAction::DirectResponse(dr) => BuildOutcome::Synth(synth_direct_response(dr, close)),
+        RouteAction::DirectResponse(dr) => {
+            BuildOutcome::Synth(synth_direct_response(dr, close), Some("direct_response"))
+        }
         RouteAction::Route(ar) => BuildOutcome::Proxy {
             cluster: ar.cluster.clone(),
             // 16 Task 4: resolve the per-route retry policy. `None` → no retries.
@@ -3988,6 +4000,70 @@ static_resources:
             unnamed.contains("r=-"),
             "UNNAMED route → %ROUTE_NAME% renders the `-` sentinel; got: {}",
             unnamed.trim()
+        );
+    }
+
+    /// phase 42 (ADR-0099): the H1 HCM sets `response_code_details` on the
+    /// access-log record per response-path. A `direct_response` route →
+    /// `%RESPONSE_CODE_DETAILS%` renders `direct_response`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h1_sets_response_code_details_from_response_path() {
+        use std::path::PathBuf;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path: PathBuf = dir.path().join("access.log");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(
+                path.clone(),
+                envoy_accesslog::CompiledFormat::from_inline("d=%RESPONSE_CODE_DETAILS%")
+                    .expect("format parses"),
+            )
+            .await
+            .expect("open sink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "dr".to_string(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let contents = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        assert!(
+            contents.contains("d=direct_response"),
+            "direct_response route → %RESPONSE_CODE_DETAILS% renders `direct_response`; got: {}",
+            contents.trim()
         );
     }
 
