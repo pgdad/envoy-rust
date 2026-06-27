@@ -5,7 +5,7 @@
 //! v1.33.0 wire behavior. Hand-rolled JSON escaping (no new dependency, D-3.2).
 use std::fmt::Write as _;
 
-use crate::command_operator::{parse_format, render_value_segments, FormatParseError, Op, Segment};
+use crate::command_operator::{FormatParseError, Op, Segment, parse_format, render_value_segments};
 use crate::record::AccessLogRecord;
 
 /// A compiled `json_format`: sorted (BTreeMap) key → compiled value segments
@@ -285,14 +285,14 @@ mod tests {
     #[test]
     fn escapes_per_json_rules() {
         let cases = [
-            ("ab", "ab"),                 // plain
-            ("a\"b", "a\\\"b"),           // quote
-            ("a\\b", "a\\\\b"),           // backslash
-            ("a\nb", "a\\nb"),            // newline short escape
-            ("a\tb", "a\\tb"),            // tab short escape
-            ("a\u{0001}b", "a\\u0001b"),  // other C0 control → \u00XX
-            ("a/b", "a/b"),               // forward slash NOT escaped
-            ("café", "café"),             // non-ASCII verbatim UTF-8
+            ("ab", "ab"),                // plain
+            ("a\"b", "a\\\"b"),          // quote
+            ("a\\b", "a\\\\b"),          // backslash
+            ("a\nb", "a\\nb"),           // newline short escape
+            ("a\tb", "a\\tb"),           // tab short escape
+            ("a\u{0001}b", "a\\u0001b"), // other C0 control → \u00XX
+            ("a/b", "a/b"),              // forward slash NOT escaped
+            ("café", "café"),            // non-ASCII verbatim UTF-8
         ];
         for (input, want) in cases {
             let mut out = String::new();

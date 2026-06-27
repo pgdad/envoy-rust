@@ -1261,14 +1261,14 @@ fn compiled_log_format(
         // exactly-one-of already enforced by the envoy-config validator (Task 2);
         // this build is defense-in-depth — prefer the set arm, default if neither.
         Some(s) => match (&s.text_format_source, &s.json_format) {
-            (Some(ds), _) => Ok(envoy_accesslog::CompiledFormat::from_inline(&ds.inline_string)
+            (Some(ds), _) => Ok(
+                envoy_accesslog::CompiledFormat::from_inline(&ds.inline_string)
+                    .map_err(map_err)?
+                    .into(),
+            ),
+            (None, Some(map)) => Ok(envoy_accesslog::CompiledJsonFormat::from_map(map)
                 .map_err(map_err)?
                 .into()),
-            (None, Some(map)) => {
-                Ok(envoy_accesslog::CompiledJsonFormat::from_map(map)
-                    .map_err(map_err)?
-                    .into())
-            }
             (None, None) => Ok(envoy_accesslog::CompiledFormat::default().into()),
         },
         None => Ok(envoy_accesslog::CompiledFormat::default().into()),

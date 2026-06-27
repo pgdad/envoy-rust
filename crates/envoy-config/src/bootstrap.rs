@@ -4390,12 +4390,12 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                         (Some(_), Some(_)) => {
                             return Err(crate::ConfigError::AmbiguousLogFormat {
                                 detail: "both text_format_source and json_format are set".into(),
-                            })
+                            });
                         }
                         (None, None) => {
                             return Err(crate::ConfigError::AmbiguousLogFormat {
                                 detail: "neither text_format_source nor json_format is set".into(),
-                            })
+                            });
                         }
                     }
                 }
@@ -11179,10 +11179,7 @@ json_format:
 "#,
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
-        assert!(matches!(
-            err,
-            crate::ConfigError::AmbiguousLogFormat { .. }
-        ));
+        assert!(matches!(err, crate::ConfigError::AmbiguousLogFormat { .. }));
     }
 
     #[test]
@@ -11197,10 +11194,7 @@ json_format:
 "#,
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
-        assert!(matches!(
-            err,
-            crate::ConfigError::AmbiguousLogFormat { .. }
-        ));
+        assert!(matches!(err, crate::ConfigError::AmbiguousLogFormat { .. }));
     }
 
     #[test]

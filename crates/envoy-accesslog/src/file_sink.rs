@@ -44,10 +44,7 @@ impl FileSink {
     /// directory, etc.). Per 06.2 SPEC §6 signpost 6 + signpost 7,
     /// the constructor does NOT mkdir -p, does NOT pre-validate
     /// path shape, and does NOT truncate existing files.
-    pub async fn new(
-        path: PathBuf,
-        format: impl Into<LogFormat>,
-    ) -> Result<Self, AccessLogError> {
+    pub async fn new(path: PathBuf, format: impl Into<LogFormat>) -> Result<Self, AccessLogError> {
         let file = tokio::fs::OpenOptions::new()
             .append(true)
             .create(true)
