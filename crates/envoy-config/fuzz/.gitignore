@@ -50,5 +50,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/json_format_nested.yaml
 !corpus/parse_bootstrap/omit_empty_values.yaml
 !corpus/parse_bootstrap/route_name.yaml
+!corpus/parse_bootstrap/response_code_details.yaml
 artifacts/
 target/

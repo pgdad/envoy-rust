@@ -1,0 +1,24 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0050-envoy-mount/access.log
+    envoy_rust: /tmp/0050-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / on a `direct_response` 200 route, with a `json_format`
+    # carrying `%RESPONSE_CODE_DETAILS%` in a single-operator leaf and in a
+    # multi-segment leaf. Phase 42 (ADR-0099): `%RESPONSE_CODE_DETAILS%` renders
+    # Envoy's response-code-details string — for a `direct_response` route this is
+    # the literal `direct_response`. An `Option<String>` shaped exactly like
+    # `%ROUTE_NAME%`/`%UPSTREAM_HOST%` (present → the string; absent → `-`
+    # sentinel / json null).
+    #   single_rcd: "%RESPONSE_CODE_DETAILS%"    → "direct_response" (json single-op → quoted)
+    #   rcd:        "d=%RESPONSE_CODE_DETAILS%"  → "d=direct_response" (mixed leaf → string)
+    # Keys sort by UTF-8 byte order (ADR-0094 §A); compact separators + ONE
+    # trailing `\n` (ADR-0092 §E).
+    #
+    # Expected line (byte-identical on both sides; LIVE-CAPTURED from
+    # `envoyproxy/envoy:v1.33.0`, phase-42 T6 recon):
+    #   {"method":"GET","proto":"HTTP/1.1","rcd":"d=direct_response","single_rcd":"direct_response"}
+    - method: get
+      path: /
+      host: envoy-rust.test
