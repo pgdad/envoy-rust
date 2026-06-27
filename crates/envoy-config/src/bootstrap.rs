@@ -4368,14 +4368,35 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                     return Err(crate::ConfigError::InvalidAccessLogPath);
                 }
                 if let Some(fmt) = &cfg.log_format {
-                    // Task-1 temporary guard (the text arm only); Task 2 replaces
-                    // this with the exactly-one-of cardinality + json_format validation.
-                    if let Some(ds) = &fmt.text_format_source {
-                        envoy_accesslog::parse_format(&ds.inline_string).map_err(|e| {
-                            crate::ConfigError::InvalidAccessLogFormat {
-                                detail: e.to_string(),
+                    match (&fmt.text_format_source, &fmt.json_format) {
+                        (Some(ds), None) => {
+                            envoy_accesslog::parse_format(&ds.inline_string).map_err(|e| {
+                                crate::ConfigError::InvalidAccessLogFormat {
+                                    detail: e.to_string(),
+                                }
+                            })?;
+                        }
+                        (None, Some(map)) => {
+                            // Empty map is VALID (ADR-0092 §E → emits `{}\n`);
+                            // validate each value-operator.
+                            for value in map.values() {
+                                envoy_accesslog::parse_format(value).map_err(|e| {
+                                    crate::ConfigError::InvalidAccessLogFormat {
+                                        detail: e.to_string(),
+                                    }
+                                })?;
                             }
-                        })?;
+                        }
+                        (Some(_), Some(_)) => {
+                            return Err(crate::ConfigError::AmbiguousLogFormat {
+                                detail: "both text_format_source and json_format are set".into(),
+                            })
+                        }
+                        (None, None) => {
+                            return Err(crate::ConfigError::AmbiguousLogFormat {
+                                detail: "neither text_format_source nor json_format is set".into(),
+                            })
+                        }
                     }
                 }
             }
@@ -11138,6 +11159,100 @@ json_format:
             "%RESPONSE_CODE%"
         );
         assert!(sfs.json_format.is_none());
+    }
+
+    // --- phase 38 t2: exactly-one-of log_format cardinality + per-value parse ---
+
+    #[test]
+    fn both_arms_set_is_ambiguous() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        text_format_source:
+                          inline_string: "%RESPONSE_CODE%"
+                        json_format:
+                          code: "%RESPONSE_CODE%"
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AmbiguousLogFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn neither_arm_set_is_ambiguous() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format: {}
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AmbiguousLogFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_json_format_map_is_valid() {
+        // ADR-0092 §E: empty json_format: {} → Envoy boots, emits `{}\n`.
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        json_format: {}
+"#,
+        );
+        crate::parse_bootstrap(&yaml).expect("empty json_format is valid");
+    }
+
+    #[test]
+    fn malformed_json_format_value_is_invalid_format() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        json_format:
+                          a: "%NOPE%"
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InvalidAccessLogFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn valid_json_format_passes() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        json_format:
+                          code: "%RESPONSE_CODE%"
+"#,
+        );
+        crate::parse_bootstrap(&yaml).expect("valid json_format passes");
     }
 
     // --- 06.3 Task 2: D14.3 H1-listener × H2-cluster parse-time validator gate ---

@@ -365,6 +365,12 @@ pub enum ConfigError {
     #[error("invalid access-log format string: {detail}")]
     InvalidAccessLogFormat { detail: String },
 
+    /// Phase 38 (ADR-0092 §E): a `log_format` (`SubstitutionFormatString`) set
+    /// NEITHER or BOTH of `{text_format_source, json_format}`. Exactly one arm is
+    /// required (the v1.33.0 oneof — both-set and neither-set are both boot-fatal).
+    #[error("log_format must set exactly one of text_format_source or json_format: {detail}")]
+    AmbiguousLogFormat { detail: String },
+
     /// 06.3 D14.3: listener with codec_type HTTP1 or AUTO routes to a cluster
     /// whose typed_extension_protocol_options.HttpProtocolOptions.
     /// explicit_http_config.http2_protocol_options is set. Closes

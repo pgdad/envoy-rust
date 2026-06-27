@@ -34,3 +34,27 @@ compile (behavior unchanged until Tasks 2/7):
 struct widening leaves a workspace-green tree).
 
 **Commit:** `phase 38 task 1: SubstitutionFormatString {text_format_source|json_format} oneof (BTreeMap, sorted) [ADR-0092]`
+
+---
+
+## Task 2 — exactly-one-of `log_format` validator + `ConfigError::AmbiguousLogFormat` — DONE
+
+**TDD:** wrote 5 failing tests first in `bootstrap.rs` `#[cfg(test)]` (the §E
+dispositions): `both_arms_set_is_ambiguous`, `neither_arm_set_is_ambiguous`,
+`empty_json_format_map_is_valid`, `malformed_json_format_value_is_invalid_format`,
+`valid_json_format_passes` — each drives a full `parse_bootstrap` via the existing
+`hcm_with_access_log_yaml` helper. Confirmed RED (`variant AmbiguousLogFormat not
+found in ConfigError`).
+
+**Implemented:**
+- new `ConfigError::AmbiguousLogFormat { detail: String }` (`lib.rs`, after
+  `InvalidAccessLogFormat`) — the ONE new variant (ADR-0092 §E).
+- replaced the Task-1 temporary guard in `validate_access_logs` (`:4362`) with the
+  exactly-one-of `match (&text_format_source, &json_format)`: `(Some,None)` → parse
+  text; `(None,Some(map))` → empty map VALID, else per-value `parse_format`;
+  `(Some,Some)` and `(None,None)` → `AmbiguousLogFormat` (both boot-fatal, ADR-0049).
+
+**Evidence:** `cargo test -p envoy-config` → `525 passed; 0 failed` (5 new + all
+pre-existing).
+
+**Commit:** `phase 38 task 2: exactly-one-of log_format validator + per-value parse + ConfigError::AmbiguousLogFormat [ADR-0092]`
