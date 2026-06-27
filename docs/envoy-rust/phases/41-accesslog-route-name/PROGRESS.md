@@ -110,3 +110,24 @@ default-absent preservation) ✔ · (c) h2spec — re-run at state-4 gate (CI) �
 fuzz clean with the `%ROUTE_NAME%` seed, NO new target ✔ · (e)
 build/clippy/fmt/test/deny clean (test: 1 documented host false-RED only) ✔ ·
 (f) `REVIEW.md` — state-5.
+
+---
+
+## State-4 — Verification gate (§7.5 (a)-(e)) — COMPLETE
+
+Routed via `superpowers:verification-before-completion`. All outputs FRESH (run at state-4 against `HEAD` = `2c8b04a`). The AUTHORITATIVE full-suite pass is the Linux CI run on the state-3 commit.
+
+**AUTHORITATIVE — Linux CI run `28299106385` @ `2c8b04a` (state-3 implementation commit) = `completed/success`.** The full §7.5 gate on CI: the entire differential fixture suite (`0001`-`0049`, incl. the new `0049-accesslog-route-name` + the `0046`/`0048` regression witnesses), h2spec, `cargo build`/`test`/`clippy`/`fmt`/`deny`, and the `parse_bootstrap` + `accesslog_format_parse` fuzz short-budget runs (with the new `route_name.yaml` seed). All green.
+
+**Local gate (fresh, this state-4 session):**
+- **(e) `cargo fmt --all -- --check`** → CLEAN (exit 0).
+- **(e) `cargo build --workspace --all-targets`** → `Finished`.
+- **(e) `cargo clippy --workspace --all-targets --all-features -- -D warnings`** → `Finished` (no warnings).
+- **(e) `cargo deny check`** → `advisories ok, bans ok, licenses ok, sources ok`. NO new dependency.
+- **(e) `cargo test --workspace --exclude differential`** → 69 suites `ok`, 0 FAILED. (The differential crate false-REDs under full-workspace parallel load on this host — `admin_config_dump_server_info` bridge-IP `192.168.65.2` — so it is run in isolation below and is CI-authoritative.)
+- **(a) fixture `0049-accesslog-route-name`** (isolation, debug `envoy-bin` rebuilt) → `cargo test -p differential --test access_log_route_name -- --test-threads=1` → `test result: ok. 1 passed`. Cross-proxy byte-identical line `{"method":"GET","proto":"HTTP/1.1","rn":"r=myroute","single_rn":"myroute"}` vs live `envoyproxy/envoy:v1.33.0` (ADR-0098 §C — `single_rn` quoted single-op, `rn` mixed leaf).
+- **(b) fixtures `0046`/`0048`** (default-absent regression witnesses) → `cargo test -p differential --test access_log_json_format` / `--test access_log_omit_empty` (isolation) → `test result: ok. 1 passed` each. Byte-identical — the new `route_name` field defaults `None` + the operator is new. The remaining `0001`-`0045`+`0047` are CI-authoritative (the full suite ran green on `2c8b04a`).
+- **(c) h2spec** → unchanged (no HTTP/2 codec change); CI-confirmed green on `2c8b04a` (≥95%).
+- **(d) fuzz** → the EXISTING `parse_bootstrap` + `accesslog_format_parse` targets cover the new operator + the `Route.name` config surface (the new `route_name.yaml` seed is tracked — verified `git ls-files`); NO new fuzz target, `ci.yml` unchanged; short-budget runs green on `2c8b04a`.
+
+**Gate verdict:** §7.5 (a)-(e) GREEN (authoritative CI `28299106385` @ `2c8b04a` `completed/success`; local gate green modulo the documented host false-RED run in isolation). `#![forbid(unsafe_code)]` holds; NO new crate/dependency/fuzz-target; NO new `ConfigError` variant; ONE new `AccessLogRecord` field. (f) `REVIEW.md` is the state-5 code-review (next session). Phase 41 advances to state-5.
