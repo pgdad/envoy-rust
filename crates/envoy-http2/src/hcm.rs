@@ -531,10 +531,17 @@ async fn handle_one_stream(
     // paths and is set to the resolved endpoint on the successful proxy
     // path before any upstream IO is attempted.
     let mut upstream_host_for_log_h2: Option<String> = None;
+    // phase 42 (ADR-0099): per-stream %RESPONSE_CODE_DETAILS%. Set by the synth
+    // match arm (carries the BuildOutcome detail) and the proxy-success arm
+    // (`via_upstream`); error/filter synths leave it None.
+    let mut response_code_details_for_log_h2: Option<String> = None;
 
     let resp: Response = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
-            BuildOutcome::Synth(r, _) => r,
+            BuildOutcome::Synth(r, details) => {
+                response_code_details_for_log_h2 = details.map(str::to_owned);
+                r
+            }
             BuildOutcome::Proxy {
                 cluster: cluster_name,
                 // 16 Task 5: consume the retry policy + attempt-count flag that
@@ -673,6 +680,7 @@ async fn handle_one_stream(
                             // the access-log `%UPSTREAM_HOST%` token (last attempt's
                             // endpoint wins). Skipped on pick()->None.
                             upstream_host_for_log_h2 = Some(endpoint.to_string());
+                            response_code_details_for_log_h2 = Some("via_upstream".to_owned());
                         }
 
                         // L5: per-attempt upstream_rq_total — only for received
@@ -809,6 +817,7 @@ async fn handle_one_stream(
         request_body_len,
         upstream_host_for_log_h2,
         route_name_for_log_h2,
+        response_code_details_for_log_h2,
         dynamic_metadata,
     )
     .await
@@ -838,6 +847,10 @@ async fn finalize_h2_stream(
     // Phase 41: the matched route's config `name` (None = unnamed), computed at
     // the `handle_one_stream` match site and threaded here for %ROUTE_NAME%.
     route_name_for_log_h2: Option<String>,
+    // Phase 42 (ADR-0099): the per-response-path %RESPONSE_CODE_DETAILS% detail
+    // (direct_response / via_upstream / None), computed at the
+    // `handle_one_stream` dispatch site and threaded here.
+    response_code_details_for_log_h2: Option<String>,
     // Phase 33 T10: the pipeline's dynamic metadata, captured before
     // `filter_req` was dropped at the decode site, threaded here so the H2
     // record build can render %DYNAMIC_METADATA%.
@@ -928,9 +941,9 @@ async fn finalize_h2_stream(
             authority: access_log_header_value(&envoy_req.headers, "host"),
             upstream_host: upstream_host_for_log_h2,
             route_name: route_name_for_log_h2,
-            // phase 42: %RESPONSE_CODE_DETAILS% backing field — the HCM that SETS
-            // the detail string is a later task; left `None` for now.
-            response_code_details: None,
+            // phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% backing field, set per
+            // response-path (direct_response / via_upstream).
+            response_code_details: response_code_details_for_log_h2,
             dynamic_metadata,
         };
         // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
@@ -2334,6 +2347,98 @@ static_resources:
             unnamed.contains("r=-"),
             "UNNAMED route → %ROUTE_NAME% renders the `-` sentinel; got: {}",
             unnamed.trim()
+        );
+    }
+
+    /// phase 42 (ADR-0099): the H2 HCM sets `response_code_details` on the
+    /// access-log record per response-path, threaded from `handle_one_stream`
+    /// into `finalize_h2_stream`. A `direct_response` route over H2 →
+    /// `%RESPONSE_CODE_DETAILS%` renders `direct_response`.
+    async fn h2_response_code_details_line() -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(
+                path.clone(),
+                envoy_accesslog::CompiledFormat::from_inline("d=%RESPONSE_CODE_DETAILS%")
+                    .expect("format parses"),
+            )
+            .await
+            .expect("open sink"),
+        );
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "dr".to_string(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::fs::read_to_string(&path).await.unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h2_sets_response_code_details_from_response_path() {
+        let line = h2_response_code_details_line().await;
+        assert!(
+            line.contains("d=direct_response"),
+            "direct_response route → %RESPONSE_CODE_DETAILS% renders `direct_response`; got: {}",
+            line.trim()
         );
     }
 
