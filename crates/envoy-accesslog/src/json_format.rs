@@ -467,6 +467,33 @@ mod tests {
         assert_eq!(enc("1", &r), "\"1\""); // literal-only → quoted string
     }
 
+    // --- phase 41 (ADR-0098 §C): %ROUTE_NAME% json typed render ---
+
+    #[test]
+    fn route_name_single_op_present_emits_quoted_string() {
+        let mut r = rec();
+        r.route_name = Some("myroute".into());
+        assert_eq!(enc("%ROUTE_NAME%", &r), "\"myroute\"");
+    }
+
+    #[test]
+    fn route_name_single_op_absent_emits_null() {
+        let mut r = rec();
+        r.route_name = None;
+        assert_eq!(enc("%ROUTE_NAME%", &r), "null");
+    }
+
+    #[test]
+    fn route_name_mixed_emits_quoted_string_with_dash_sentinel() {
+        let mut named = rec();
+        named.route_name = Some("myroute".into());
+        assert_eq!(enc("r=%ROUTE_NAME%", &named), "\"r=myroute\"");
+
+        let mut absent = rec();
+        absent.route_name = None;
+        assert_eq!(enc("r=%ROUTE_NAME%", &absent), "\"r=-\"");
+    }
+
     #[test]
     fn escapes_per_json_rules() {
         let cases = [
