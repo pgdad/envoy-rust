@@ -66,6 +66,11 @@ pub enum Op {
     /// `Option<String>` mirroring `UpstreamHost`: present → the name, absent
     /// (unnamed route) → the `-` sentinel / json `null`.
     RouteName,
+    /// `%RESPONSE_CODE_DETAILS%` — Envoy's response-code-details string for the
+    /// reply (e.g. `direct_response` / `via_upstream`) (phase 42). An
+    /// `Option<String>` mirroring `RouteName`: present → the detail string,
+    /// absent → the `-` sentinel / json `null`.
+    ResponseCodeDetails,
     /// `%DYNAMIC_METADATA(namespace:key)%` — a single-level two-segment lookup
     /// into the per-request dynamic-metadata store (§A2-LOCKED). namespace/key
     /// are CASE-SENSITIVE (NOT lowercased). Carries NO `:N` truncation field —
@@ -237,7 +242,7 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
         "DYNAMIC_METADATA" => parse_dynamic_metadata_op(rest),
         // Non-arg keywords: must NOT carry parens.
         "PROTOCOL" | "RESPONSE_CODE" | "RESPONSE_FLAGS" | "BYTES_RECEIVED" | "BYTES_SENT"
-        | "UPSTREAM_HOST" | "ROUTE_NAME" | "START_TIME" | "DURATION" => {
+        | "UPSTREAM_HOST" | "ROUTE_NAME" | "RESPONSE_CODE_DETAILS" | "START_TIME" | "DURATION" => {
             if rest.is_some() {
                 return Err(FormatParseError::MalformedArgument {
                     keyword: keyword.to_string(),
@@ -252,6 +257,7 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
                 "BYTES_SENT" => Op::BytesSent,
                 "UPSTREAM_HOST" => Op::UpstreamHost,
                 "ROUTE_NAME" => Op::RouteName,
+                "RESPONSE_CODE_DETAILS" => Op::ResponseCodeDetails,
                 "START_TIME" => Op::StartTime,
                 "DURATION" => Op::Duration,
                 _ => unreachable!("matched above"),
@@ -515,6 +521,12 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord, omit_empty: bo
         Op::StartTime => out.push_str(&crate::format_iso8601(record.start_time)),
         Op::UpstreamHost => out.push_str(record.upstream_host.as_deref().unwrap_or(empty_or_dash)),
         Op::RouteName => out.push_str(record.route_name.as_deref().unwrap_or(empty_or_dash)),
+        Op::ResponseCodeDetails => out.push_str(
+            record
+                .response_code_details
+                .as_deref()
+                .unwrap_or(empty_or_dash),
+        ),
         Op::DynamicMetadata { namespace, key } => out.push_str(
             record
                 .dynamic_metadata
@@ -685,6 +697,48 @@ mod tests {
         assert_eq!(
             CompiledFormat::new(parse_format("r=%ROUTE_NAME%").unwrap()).render(&absent),
             "r=-"
+        );
+    }
+
+    // --- phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% — parse + text render ---
+
+    #[test]
+    fn response_code_details_parses_as_no_arg_op() {
+        assert_eq!(
+            parse_format("%RESPONSE_CODE_DETAILS%").unwrap(),
+            vec![Segment::Op(Op::ResponseCodeDetails)]
+        );
+    }
+
+    #[test]
+    fn response_code_details_rejects_paren_argument() {
+        assert!(parse_format("%RESPONSE_CODE_DETAILS(x)%").is_err());
+        assert!(parse_format("%RESPONSE_CODE_DETAILS:3%").is_err());
+    }
+
+    #[test]
+    fn response_code_details_text_renders_value_or_dash() {
+        let mut detailed = rec();
+        detailed.response_code_details = Some("direct_response".into());
+        assert_eq!(
+            CompiledFormat::new(parse_format("%RESPONSE_CODE_DETAILS%").unwrap()).render(&detailed),
+            "direct_response"
+        );
+        assert_eq!(
+            CompiledFormat::new(parse_format("d=%RESPONSE_CODE_DETAILS%").unwrap())
+                .render(&detailed),
+            "d=direct_response"
+        );
+
+        let mut absent = rec();
+        absent.response_code_details = None;
+        assert_eq!(
+            CompiledFormat::new(parse_format("%RESPONSE_CODE_DETAILS%").unwrap()).render(&absent),
+            "-"
+        );
+        assert_eq!(
+            CompiledFormat::new(parse_format("d=%RESPONSE_CODE_DETAILS%").unwrap()).render(&absent),
+            "d=-"
         );
     }
 
