@@ -497,6 +497,36 @@ mod tests {
         assert_eq!(enc("r=%ROUTE_NAME%", &absent), "\"r=-\"");
     }
 
+    // --- phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% json typed render ---
+
+    #[test]
+    fn response_code_details_single_op_present_emits_quoted_string() {
+        let mut r = rec();
+        r.response_code_details = Some("direct_response".into());
+        assert_eq!(enc("%RESPONSE_CODE_DETAILS%", &r), "\"direct_response\"");
+    }
+
+    #[test]
+    fn response_code_details_single_op_absent_emits_null() {
+        let mut r = rec();
+        r.response_code_details = None;
+        assert_eq!(enc("%RESPONSE_CODE_DETAILS%", &r), "null");
+    }
+
+    #[test]
+    fn response_code_details_mixed_emits_quoted_string_with_dash_sentinel() {
+        let mut detailed = rec();
+        detailed.response_code_details = Some("direct_response".into());
+        assert_eq!(
+            enc("d=%RESPONSE_CODE_DETAILS%", &detailed),
+            "\"d=direct_response\""
+        );
+
+        let mut absent = rec();
+        absent.response_code_details = None;
+        assert_eq!(enc("d=%RESPONSE_CODE_DETAILS%", &absent), "\"d=-\"");
+    }
+
     #[test]
     fn escapes_per_json_rules() {
         let cases = [
