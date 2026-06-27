@@ -1266,12 +1266,47 @@ fn compiled_log_format(
                     .map_err(map_err)?
                     .into(),
             ),
-            (None, Some(map)) => Ok(envoy_accesslog::CompiledJsonFormat::from_map(map)
-                .map_err(map_err)?
-                .into()),
+            (None, Some(map)) => {
+                // Bridge: map the config-side recursive `JsonFormatValue` into the
+                // accesslog-side `JsonValueInput` mirror (the crate dependency runs
+                // envoy-config → envoy-accesslog; the reverse would be a cycle, so
+                // the caller owns this mapping — ADR-0094 / phase 39 T5).
+                let input: std::collections::BTreeMap<String, envoy_accesslog::JsonValueInput> =
+                    map.iter()
+                        .map(|(k, v)| (k.clone(), json_format_value_to_input(v)))
+                        .collect();
+                Ok(envoy_accesslog::CompiledJsonFormat::from_map(&input)
+                    .map_err(map_err)?
+                    .into())
+            }
             (None, None) => Ok(envoy_accesslog::CompiledFormat::default().into()),
         },
         None => Ok(envoy_accesslog::CompiledFormat::default().into()),
+    }
+}
+
+/// Phase 39 T5 (ADR-0094) — map the config-side recursive `JsonFormatValue` into
+/// the accesslog-side `JsonValueInput` mirror. This lives on the caller (HCM)
+/// side because the crate dependency direction is `envoy-config` →
+/// `envoy-accesslog` (a reverse edge would be a cycle); `envoy-accesslog` cannot
+/// see `JsonFormatValue`. The mapping is a structural 1:1 (no behavior).
+fn json_format_value_to_input(
+    value: &envoy_config::JsonFormatValue,
+) -> envoy_accesslog::JsonValueInput {
+    use envoy_accesslog::JsonValueInput;
+    use envoy_config::JsonFormatValue;
+    match value {
+        JsonFormatValue::Null => JsonValueInput::Null,
+        JsonFormatValue::Bool(b) => JsonValueInput::Bool(*b),
+        JsonFormatValue::Format(s) => JsonValueInput::Format(s.clone()),
+        JsonFormatValue::Array(items) => {
+            JsonValueInput::Array(items.iter().map(json_format_value_to_input).collect())
+        }
+        JsonFormatValue::Object(map) => JsonValueInput::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_format_value_to_input(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -1788,7 +1823,10 @@ mod tests {
     #[test]
     fn compiled_log_format_picks_json_arm() {
         let mut map = std::collections::BTreeMap::new();
-        map.insert("c".to_string(), "%RESPONSE_CODE%".to_string());
+        map.insert(
+            "c".to_string(),
+            envoy_config::JsonFormatValue::Format("%RESPONSE_CODE%".to_string()),
+        );
         let file_cfg = envoy_config::FileAccessLog {
             path: "/tmp/x".into(),
             log_format: Some(envoy_config::SubstitutionFormatString {
@@ -1796,10 +1834,49 @@ mod tests {
                 json_format: Some(map),
             }),
         };
-        assert!(matches!(
-            compiled_log_format(&file_cfg).unwrap(),
-            envoy_accesslog::LogFormat::Json(_)
-        ));
+        let fmt = compiled_log_format(&file_cfg).unwrap();
+        assert!(matches!(fmt, envoy_accesslog::LogFormat::Json(_)));
+        assert_eq!(fmt.render(&record_get_200()), "{\"c\":200}\n");
+    }
+
+    #[test]
+    fn compiled_log_format_picks_json_arm_nested() {
+        // Phase 39 T5 (ADR-0094) — a NESTED json_format map threads through the
+        // JsonFormatValue → JsonValueInput bridge to a recursive Json LogFormat.
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(
+            "code".to_string(),
+            envoy_config::JsonFormatValue::Format("%RESPONSE_CODE%".to_string()),
+        );
+        inner.insert(
+            "method".to_string(),
+            envoy_config::JsonFormatValue::Format("%REQ(:METHOD)%".to_string()),
+        );
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "obj".to_string(),
+            envoy_config::JsonFormatValue::Object(inner),
+        );
+        map.insert(
+            "list".to_string(),
+            envoy_config::JsonFormatValue::Array(vec![
+                envoy_config::JsonFormatValue::Format("%PROTOCOL%".to_string()),
+                envoy_config::JsonFormatValue::Bool(true),
+                envoy_config::JsonFormatValue::Null,
+            ]),
+        );
+        let file_cfg = envoy_config::FileAccessLog {
+            path: "/tmp/x".into(),
+            log_format: Some(envoy_config::SubstitutionFormatString {
+                text_format_source: None,
+                json_format: Some(map),
+            }),
+        };
+        let fmt = compiled_log_format(&file_cfg).unwrap();
+        assert_eq!(
+            fmt.render(&record_get_200()),
+            "{\"list\":[\"HTTP/1.1\",true,null],\"obj\":{\"code\":200,\"method\":\"GET\"}}\n"
+        );
     }
 
     #[test]
