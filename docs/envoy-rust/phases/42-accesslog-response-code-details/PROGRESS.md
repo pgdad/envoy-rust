@@ -48,9 +48,33 @@ simultaneously, h2spec, and the fuzz run are the state-4 gate (a)-(e) — NOT ru
 `0050` differential pass + the green per-crate tests are state-3 evidence only; the AUTHORITATIVE evidence is
 the Linux CI run quoted at state-4.
 
+## §7.5 Verification gate (state-4) — GREEN on AUTHORITATIVE Linux CI
+
+**AUTHORITATIVE run: `28301067467` @ `344dbd6` — `completed/success`**
+(https://github.com/pgdad/envoy-rust/actions/runs/28301067467). Both CI jobs green:
+- **`build + test + lint`** → success — covers gates **(a)** fixture `0050-accesslog-response-code-details`
+  green (the byte-exact `direct_response` line) + **(b)** all `0001`-`0049` green SIMULTANEOUSLY
+  (default-absent byte-preservation — the new `response_code_details` field defaults `None` + the operator is
+  new) + **(c)** h2spec ≥95% (NO HTTP/2 codec change) + **(e)** `cargo build`/`clippy`/`fmt --check`/`test`/
+  `deny` clean.
+- **`fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)`** → success —
+  covers gate **(d)** the fuzz targets are clean WITH the new `response_code_details.yaml` `parse_bootstrap`
+  seed; NO new fuzz target.
+
+**State-4 gate-fix commit:** `344dbd6` (`style: cargo fmt the %RESPONSE_CODE_DETAILS% no-arg keyword list`) —
+the state-3 implementer added `"RESPONSE_CODE_DETAILS"` to the no-arg keyword match arm, widening it past the
+line limit; `cargo fmt` reformats the list one keyword per line (pure formatting, NO behavior change). This is
+the documented "State-4 = CI's first real execution" red-at-fmt — caught + fixed at THIS gate per project
+discipline (cargo-fmt-check first runs at state-4). The superseded implementation-HEAD run (`5decdbe`) was
+auto-cancelled by the `344dbd6` push.
+
+**§7.5 (a)-(e) = GREEN.** (f) `REVIEW.md` is the state-5 code-review (the SESSION AFTER). The
+`client::tests::…h2_handshake…` host-flake that false-REDs locally is GREEN on this Linux CI run (it is
+CI-authoritative — not a regression; phase 42 does not touch the H2 client handshake path).
+
 ## Carry-forwards (NONE blocks)
 M39-1/M39-2 + M38-1/M38-2 (adjacent — the encoder surface was touched but they were NOT folded this phase;
 they stay live) + CF-39-1 + M40-1 + M37-*/M36-*/M34-*/M33-* + older. Phase 42 does not touch `rbac.rs`.
 
-_State-3 implementation COMPLETE. The next session is the state-4 §7.5 verification gate
-(`superpowers:verification-before-completion`)._
+_State-3 implementation COMPLETE; state-4 §7.5 (a)-(e) gate GREEN on AUTHORITATIVE CI `28301067467` @ `344dbd6`.
+The next session is the state-5 code-review (`superpowers:requesting-code-review`)._
