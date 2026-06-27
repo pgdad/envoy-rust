@@ -651,7 +651,10 @@ mod tests {
 
     #[test]
     fn route_name_parses_as_no_arg_op() {
-        assert_eq!(parse_format("%ROUTE_NAME%").unwrap(), vec![Segment::Op(Op::RouteName)]);
+        assert_eq!(
+            parse_format("%ROUTE_NAME%").unwrap(),
+            vec![Segment::Op(Op::RouteName)]
+        );
     }
 
     #[test]
@@ -663,7 +666,10 @@ mod tests {
     fn route_name_text_renders_name_or_dash() {
         let mut named = rec();
         named.route_name = Some("myroute".into());
-        assert_eq!(CompiledFormat::new(parse_format("%ROUTE_NAME%").unwrap()).render(&named), "myroute");
+        assert_eq!(
+            CompiledFormat::new(parse_format("%ROUTE_NAME%").unwrap()).render(&named),
+            "myroute"
+        );
         assert_eq!(
             CompiledFormat::new(parse_format("r=%ROUTE_NAME%").unwrap()).render(&named),
             "r=myroute"
@@ -671,7 +677,10 @@ mod tests {
 
         let mut absent = rec();
         absent.route_name = None;
-        assert_eq!(CompiledFormat::new(parse_format("%ROUTE_NAME%").unwrap()).render(&absent), "-");
+        assert_eq!(
+            CompiledFormat::new(parse_format("%ROUTE_NAME%").unwrap()).render(&absent),
+            "-"
+        );
         assert_eq!(
             CompiledFormat::new(parse_format("r=%ROUTE_NAME%").unwrap()).render(&absent),
             "r=-"
