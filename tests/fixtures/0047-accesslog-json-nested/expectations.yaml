@@ -1,0 +1,20 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0047-envoy-mount/access.log
+    envoy_rust: /tmp/0047-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / on a direct_response 200 route. The RECURSIVE
+    # `json_format` (a nested `arequest` object + a `blist` list + top-level
+    # scalars) is emitted once per request. Keys SORT by UTF-8 bytes at EVERY
+    # object level (ADR-0094 §A): top `arequest < blist < mtop < zouter`, and
+    # nested `aaa < method < zpath`. The list preserves CONFIG order (§B). Each
+    # leaf is TYPE-INFERRED at depth (§C): nested numeric `%RESPONSE_CODE%` →
+    # `200`; `%REQ(:METHOD)%` → `"GET"`; `%UPSTREAM_HOST%` absent (direct_response)
+    # → `null` in the list; `mtop: "code-%RESPONSE_CODE%"` literal prefix →
+    # `"code-200"`. Compact separators + ONE trailing `\n` (§E).
+    # Expected line (byte-identical on both sides, ADR-0094 §H):
+    #   {"arequest":{"aaa":200,"method":"GET","zpath":"/"},"blist":["GET",200,null],"mtop":"code-200","zouter":"HTTP/1.1"}
+    - method: get
+      path: /
+      host: envoy-rust.test
