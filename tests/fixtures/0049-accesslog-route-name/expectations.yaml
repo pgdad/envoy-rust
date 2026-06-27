@@ -1,0 +1,22 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0049-envoy-mount/access.log
+    envoy_rust: /tmp/0049-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / on a NAMED direct_response 200 route (name: myroute),
+    # with a `json_format` carrying `%ROUTE_NAME%` in a single-operator leaf and
+    # in a multi-segment leaf. Phase 41 (ADR-0098 §C): `%ROUTE_NAME%` renders the
+    # matched route's config `name` — IDENTICAL to `%UPSTREAM_HOST%`'s
+    # Option<String> shape (present → the name; absent → `-` sentinel / json null).
+    #   single_rn: "%ROUTE_NAME%"      → "myroute"   (json single-op → quoted)
+    #   rn:        "r=%ROUTE_NAME%"    → "r=myroute"  (mixed leaf → string)
+    # Keys sort by UTF-8 byte order (ADR-0094 §A); compact separators + ONE
+    # trailing `\n` (ADR-0092 §E).
+    #
+    # Expected line (byte-identical on both sides; LIVE-CAPTURED from
+    # `envoyproxy/envoy:v1.33.0`, phase-41 T6 recon):
+    #   {"method":"GET","proto":"HTTP/1.1","rn":"r=myroute","single_rn":"myroute"}
+    - method: get
+      path: /
+      host: envoy-rust.test
