@@ -447,4 +447,222 @@ mod tests {
             assert_eq!(out, want, "input {input:?}");
         }
     }
+
+    // --- Phase 39 T4 (ADR-0094 §A–§H): recursive byte-exact render ---
+
+    fn fmt(s: &str) -> JsonValueInput {
+        JsonValueInput::Format(s.to_string())
+    }
+    fn obj(pairs: &[(&str, JsonValueInput)]) -> JsonValueInput {
+        let mut m = std::collections::BTreeMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        JsonValueInput::Object(m)
+    }
+    fn top(pairs: &[(&str, JsonValueInput)]) -> CompiledJsonFormat {
+        let mut m = std::collections::BTreeMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        CompiledJsonFormat::from_map(&m).unwrap()
+    }
+
+    #[test]
+    fn renders_authoritative_nested_fixture_line() {
+        // ADR-0094 §H — the live-captured CASE-1 byte-exact line. Keys sorted at
+        // BOTH levels (§A); list order preserved (§B); at-depth type inference
+        // (§C: nested %RESPONSE_CODE%→200, %UPSTREAM_HOST% absent in list→null,
+        // mixed→"code-200"); compact separators + ONE trailing \n (§E).
+        let r = fixture_record();
+        let cjf = top(&[
+            ("zouter", fmt("%PROTOCOL%")),
+            (
+                "arequest",
+                obj(&[
+                    ("method", fmt("%REQ(:METHOD)%")),
+                    ("zpath", fmt("%REQ(:PATH)%")),
+                    ("aaa", fmt("%RESPONSE_CODE%")),
+                ]),
+            ),
+            (
+                "blist",
+                JsonValueInput::Array(vec![
+                    fmt("%REQ(:METHOD)%"),
+                    fmt("%RESPONSE_CODE%"),
+                    fmt("%UPSTREAM_HOST%"),
+                ]),
+            ),
+            ("mtop", fmt("code-%RESPONSE_CODE%")),
+        ]);
+        assert_eq!(
+            cjf.render(&r),
+            "{\"arequest\":{\"aaa\":200,\"method\":\"GET\",\"zpath\":\"/\"},\"blist\":[\"GET\",200,null],\"mtop\":\"code-200\",\"zouter\":\"HTTP/1.1\"}\n"
+        );
+    }
+
+    #[test]
+    fn flat_round_trip_byte_unchanged_through_recursive_encoder() {
+        // The phase-38 flat line (fixture 0046) must render BYTE-IDENTICAL through
+        // the recursive encoder — depth-1 == flat (the regression witness).
+        let r = fixture_record();
+        let cjf = top(&[
+            ("method", fmt("%REQ(:METHOD)%")),
+            ("path", fmt("%REQ(:PATH)%")),
+            ("protocol", fmt("%PROTOCOL%")),
+            ("status", fmt("%RESPONSE_CODE%")),
+            ("flags", fmt("%RESPONSE_FLAGS%")),
+            ("bytes_rcvd", fmt("%BYTES_RECEIVED%")),
+            ("bytes_sent", fmt("%BYTES_SENT%")),
+            ("upstream", fmt("%UPSTREAM_HOST%")),
+            ("mixed", fmt("code-%RESPONSE_CODE%")),
+        ]);
+        assert_eq!(
+            cjf.render(&r),
+            "{\"bytes_rcvd\":0,\"bytes_sent\":3,\"flags\":\"-\",\"method\":\"GET\",\"mixed\":\"code-200\",\"path\":\"/\",\"protocol\":\"HTTP/1.1\",\"status\":200,\"upstream\":null}\n"
+        );
+    }
+
+    #[test]
+    fn per_level_keys_sorted_independently() {
+        // §A — each object level sorts by UTF-8 byte order independently.
+        let r = fixture_record();
+        let cjf = top(&[(
+            "outer",
+            obj(&[
+                ("zzz", fmt("%PROTOCOL%")),
+                ("aaa", fmt("%RESPONSE_CODE%")),
+                ("mmm", fmt("%REQ(:METHOD)%")),
+            ]),
+        )]);
+        assert_eq!(
+            cjf.render(&r),
+            "{\"outer\":{\"aaa\":200,\"mmm\":\"GET\",\"zzz\":\"HTTP/1.1\"}}\n"
+        );
+    }
+
+    #[test]
+    fn list_order_preserved_not_sorted() {
+        // §B — list order = config order (NOT sorted).
+        let r = fixture_record();
+        let cjf = top(&[(
+            "l",
+            JsonValueInput::Array(vec![
+                fmt("%PROTOCOL%"),
+                fmt("%REQ(:METHOD)%"),
+                fmt("%RESPONSE_CODE%"),
+            ]),
+        )]);
+        assert_eq!(cjf.render(&r), "{\"l\":[\"HTTP/1.1\",\"GET\",200]}\n");
+    }
+
+    #[test]
+    fn bool_and_null_literal_leaves_native_typed() {
+        // §D — bool/null literal leaves emit native-typed (unquoted).
+        let r = fixture_record();
+        let cjf = top(&[
+            ("f", JsonValueInput::Bool(false)),
+            ("n", JsonValueInput::Null),
+            ("t", JsonValueInput::Bool(true)),
+        ]);
+        assert_eq!(cjf.render(&r), "{\"f\":false,\"n\":null,\"t\":true}\n");
+    }
+
+    #[test]
+    fn empty_nested_object_and_list() {
+        // §F — empty {} → {}, empty [] → [].
+        let r = fixture_record();
+        let cjf = top(&[
+            ("e", JsonValueInput::Object(std::collections::BTreeMap::new())),
+            ("l", JsonValueInput::Array(vec![])),
+        ]);
+        assert_eq!(cjf.render(&r), "{\"e\":{},\"l\":[]}\n");
+    }
+
+    #[test]
+    fn absent_operator_leaf_in_list_is_null() {
+        // §F — an absent-operator leaf in a list → null in place.
+        let mut r = fixture_record();
+        r.upstream_host = None;
+        let cjf = top(&[(
+            "l",
+            JsonValueInput::Array(vec![fmt("%UPSTREAM_HOST%"), fmt("%RESPONSE_CODE%")]),
+        )]);
+        assert_eq!(cjf.render(&r), "{\"l\":[null,200]}\n");
+    }
+
+    #[test]
+    fn depth_three_nesting() {
+        // Deep nesting (depth-3), at-depth numeric inference still applies.
+        let r = fixture_record();
+        let cjf = top(&[(
+            "d1",
+            obj(&[("d2", obj(&[("d3", fmt("%RESPONSE_CODE%"))]))]),
+        )]);
+        assert_eq!(cjf.render(&r), "{\"d1\":{\"d2\":{\"d3\":200}}}\n");
+    }
+
+    #[test]
+    fn list_of_objects() {
+        // CASE-5 — a list of objects (each object internally sorted).
+        let r = fixture_record();
+        let cjf = top(&[(
+            "objlist",
+            JsonValueInput::Array(vec![obj(&[
+                ("k", fmt("%REQ(:METHOD)%")),
+                ("z", fmt("%PROTOCOL%")),
+            ])]),
+        )]);
+        assert_eq!(
+            cjf.render(&r),
+            "{\"objlist\":[{\"k\":\"GET\",\"z\":\"HTTP/1.1\"}]}\n"
+        );
+    }
+
+    #[test]
+    fn nested_key_and_value_escaping() {
+        // Reuse the phase-38 escaping at depth: a nested key + value both escaped.
+        let r = fixture_record();
+        let cjf = top(&[(
+            "o",
+            obj(&[("a\"b", fmt("x\ty"))]),
+        )]);
+        assert_eq!(cjf.render(&r), "{\"o\":{\"a\\\"b\":\"x\\ty\"}}\n");
+    }
+
+    #[test]
+    fn empty_value_string_leaf_renders_empty_quoted() {
+        // M38-3 fold — an empty value-string leaf ("") → "".
+        let r = fixture_record();
+        let cjf = top(&[("e", fmt(""))]);
+        assert_eq!(cjf.render(&r), "{\"e\":\"\"}\n");
+        // and nested:
+        let cjf2 = top(&[("o", obj(&[("e", fmt(""))]))]);
+        assert_eq!(cjf2.render(&r), "{\"o\":{\"e\":\"\"}}\n");
+    }
+
+    #[test]
+    fn m38_4_typed_path_gaps_in_nested_position() {
+        // M38-4 fold — exercise the typed-leaf path edges INSIDE a nested object:
+        //  - %REQ(...):N% truncation
+        //  - %REQ(MISSING?:METHOD)% alternate (?ALT)
+        //  - a non-zero %DURATION% (numeric)
+        //  - a control char in a rendered value (escaped via the leaf path)
+        let mut r = rec(); // method POST, user_agent curl/8.20.0
+        r.duration = std::time::Duration::from_millis(42);
+        r.user_agent = Some("a\u{0001}b".into());
+        let cjf = top(&[(
+            "o",
+            obj(&[
+                ("trunc", fmt("%REQ(:METHOD):2%")), // "POST" → "PO"
+                ("alt", fmt("%REQ(X-MISSING?:METHOD)%")), // absent → :METHOD → "POST"
+                ("dur", fmt("%DURATION%")),         // 42 (unquoted)
+                ("ctrl", fmt("%REQ(USER-AGENT)%")), // "ab" escaped
+            ]),
+        )]);
+        assert_eq!(
+            cjf.render(&r),
+            "{\"o\":{\"alt\":\"POST\",\"ctrl\":\"a\\u0001b\",\"dur\":42,\"trunc\":\"PO\"}}\n"
+        );
+    }
 }
