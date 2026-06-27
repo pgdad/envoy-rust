@@ -500,6 +500,36 @@ mod tests {
         assert_eq!(enc("r=%ROUTE_NAME%", &absent), "\"r=-\"");
     }
 
+    // --- phase 43 (ADR-0100): %UPSTREAM_CLUSTER% json typed render ---
+
+    #[test]
+    fn upstream_cluster_single_op_present_emits_quoted_string() {
+        let mut r = rec();
+        r.upstream_cluster = Some("my_backend_cluster".into());
+        assert_eq!(enc("%UPSTREAM_CLUSTER%", &r), "\"my_backend_cluster\"");
+    }
+
+    #[test]
+    fn upstream_cluster_single_op_absent_emits_null() {
+        let mut r = rec();
+        r.upstream_cluster = None;
+        assert_eq!(enc("%UPSTREAM_CLUSTER%", &r), "null");
+    }
+
+    #[test]
+    fn upstream_cluster_mixed_emits_quoted_string_with_dash_sentinel() {
+        let mut clustered = rec();
+        clustered.upstream_cluster = Some("my_backend_cluster".into());
+        assert_eq!(
+            enc("c=%UPSTREAM_CLUSTER%", &clustered),
+            "\"c=my_backend_cluster\""
+        );
+
+        let mut absent = rec();
+        absent.upstream_cluster = None;
+        assert_eq!(enc("c=%UPSTREAM_CLUSTER%", &absent), "\"c=-\"");
+    }
+
     // --- phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% json typed render ---
 
     #[test]
