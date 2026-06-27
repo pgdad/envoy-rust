@@ -1,0 +1,36 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0052-envoy-mount/access.log
+    envoy_rust: /tmp/0052-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to a STATIC cluster named `backend` whose SINGLE
+    # endpoint is the `{{BACKEND_IP}}` shared host-LAN-IP marker (rendered to ONE
+    # numeric IP IDENTICAL on BOTH sides, precedent fixture 0036), with a
+    # `json_format` carrying `%UPSTREAM_HOST%` plus deterministic cross-proxy
+    # anchors. Phase 44 (ADR-0101): `%UPSTREAM_HOST%` renders the resolved
+    # upstream endpoint `<ip>:<port>` — envoy-rust emits it via
+    # `SocketAddr::to_string()` (IPv4 unbracketed, = Envoy's format).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). There is NO static
+    # expected literal here: `%UPSTREAM_HOST%` is the DYNAMIC-but-SHARED
+    # `<host-LAN-IP>:<port>` — its exact bytes vary per CI run (the host's LAN
+    # IPv4 + the kernel-ephemeral backend port), but BOTH proxies dial the SAME
+    # `{{BACKEND_IP}}:{{HTTP1_BACKEND_PORT}}`, so the rendered `uh` value is
+    # IDENTICAL on both sides, shape `<ip>:<port>`. The `http1_access_log_byte_exact`
+    # driver asserts every line is byte-identical between the two proxies, which
+    # covers the dynamic `uh` token without a hard-coded value.
+    #
+    # The other tokens are config-deterministic regardless of CI run:
+    #   uc:     "%UPSTREAM_CLUSTER%"     → "backend"
+    #   rcd:    "%RESPONSE_CODE_DETAILS%"→ "via_upstream"   (real-upstream success arm)
+    #   method: "%REQ(:METHOD)%"         → "GET"
+    #   proto:  "%PROTOCOL%"             → "HTTP/1.1"
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rcd, uc, uh.
+    # Compact separators + ONE trailing `\n` (ADR-0092 §E). The emitted line
+    # (with `<ip>:<port>` standing for the per-run shared value) is:
+    #   {"method":"GET","proto":"HTTP/1.1","rcd":"via_upstream","uc":"backend","uh":"<ip>:<port>"}
+    - method: get
+      path: /
+      host: envoy-rust.test
