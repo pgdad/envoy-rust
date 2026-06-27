@@ -194,3 +194,27 @@ the PLAN's `0046_*` filter guess does not match; the descriptive name is filtera
   `header_to_metadata` (0042) → each `1 passed; 0 failed`.
 
 **Commit:** `phase 38 task 8: fixture 0046 byte-exact json_format access-log line [ADR-0092]`
+
+---
+
+## Task 9 — BEHAVIOR_CONTRACT json_format subsection + fuzz seed + re-exports — DONE
+
+**Implemented:**
+- `BEHAVIOR_CONTRACT.md` — new `### Phase 38 (ADR-0092): the json_format access-log
+  encoder` subsection documenting §A (sorted keys) / §B (type-inference table) / §C
+  (`typed_json_format` not a v1.33.0 field) / §D (separators + escaping) / §E
+  (validity, all boot-fatal) / §F (the quoted authoritative fixture-0046 line). Also
+  updated the stale 06.2-era "json_format out of scope" NOTE to record that phase 38
+  now supports `json_format` (only `typed_json_format`/`text_format`/top-level
+  `format` remain out of scope).
+- fuzz seed `crates/envoy-config/fuzz/corpus/parse_bootstrap/json_format_logger.yaml`
+  (a minimal H1 bootstrap with a `json_format` file logger) + a `!`-un-ignore line in
+  `crates/envoy-config/fuzz/.gitignore`. NO new fuzz TARGET (the existing
+  `parse_bootstrap` + `accesslog_format_parse` cover the surface, ADR-0092).
+- confirmed `CompiledJsonFormat` / `LogFormat` / `FormatParseError` are re-exported from
+  `envoy-accesslog/src/lib.rs` (lines 25/28/29).
+
+**Evidence:** `git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/json_format_logger.yaml`
+prints the path; `git check-ignore` → not-ignored (tracked).
+
+**Commit:** `phase 38 task 9: BEHAVIOR_CONTRACT json_format subsection + parse_bootstrap seed [ADR-0092]`

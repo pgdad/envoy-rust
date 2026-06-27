@@ -1028,23 +1028,27 @@ surrounding quotes).
 | `%REQ(:AUTHORITY)%` | `AccessLogRecord.authority: Option<String>`, populated from the `Host:` header on the H1 path (envoy_http1::codec produces this from the request-line) or the `:authority` pseudo-header on the H2 path (translated by 05.2 D3's adapter). | value-exact | Both proxies see the same wire-level request authority; both render the same value. |
 | `%UPSTREAM_HOST%` | `AccessLogRecord.upstream_host: Option<String>`, populated at HCM record-build time from the router-arm's resolved upstream `SocketAddr` (formatted via `SocketAddr` Display). `None` on direct_response paths. | value-exact `-` (direct_response, fixture 0012); value-exact for STRICT_DNS single-A-record resolution; name-required, value-may-differ for multi-A non-deterministic resolution | Fixture 0012's direct_response path produces `-`; both proxies emit `-`. Future router-proxy fixtures use STRICT_DNS with single-A resolution (matches the 04.3 fixture 0008 / 05.3 fixture 0010 posture). |
 
-> **NOTE (06.2-era posture, NOW PARTIALLY SUPERSEDED by phase 32).** The
+> **NOTE (06.2-era posture, NOW PARTIALLY SUPERSEDED by phases 32 + 38).** The
 > paragraph below records the original 06.2 stance that format-string
 > customization was wholly out of scope. Phase 32 (ADR-0079) SUPERSEDES it for
 > the modern `log_format.text_format_source.inline_string` path, which is now
 > a supported configurable command-operator format engine — see the
 > [Phase 32 (ADR-0079)](#phase-32-adr-0079-configurable-command-operator-format-engine)
-> subsection below. The remaining out-of-scope claims (the `json_format` /
-> `typed_json_format` fields, the DEPRECATED inline `text_format` field, and
-> the top-level `format` field) STILL HOLD and are still rejected.
+> subsection below. **Phase 38 (ADR-0092) FURTHER SUPERSEDES it for `json_format`**,
+> which is now the supported v1.33.0 oneof sibling of `text_format_source` — see the
+> [Phase 38 (ADR-0092)](#phase-38-adr-0092-the-json_format-access-log-encoder)
+> subsection below. The remaining out-of-scope claims (`typed_json_format` — NOT a
+> v1.33.0 field, ADR-0092 §C; the DEPRECATED inline `text_format` scalar; and the
+> top-level `format` field) STILL HOLD and are still rejected.
 
-Format-string customization via `json_format` / `typed_json_format`, the
-DEPRECATED inline `text_format` field, and the top-level `format` field is OUT
-of scope. The `envoy-config` validator at `validate_access_logs` rejects
+Format-string customization via `typed_json_format`, the DEPRECATED inline
+`text_format` field, and the top-level `format` field is OUT of scope. The
+`envoy-config` validator at `validate_access_logs` rejects
 non-`envoy.access_loggers.file` access-log names; those format fields are not
 modeled on envoy-rust's `FileAccessLog` struct and serde `deny_unknown_fields`
-rejects them. (The modern `log_format.text_format_source.inline_string` path is
-the EXCEPTION — it IS modeled and IS supported per phase 32 below.) Future
+rejects them. (The modern `log_format.text_format_source.inline_string` and
+`log_format.json_format` paths are the EXCEPTIONS — they ARE modeled and ARE
+supported per phases 32 + 38 below.) Future
 observability-family phases extend this section with new tokens
 (`%FILTER_STATE%`, `%DYNAMIC_METADATA%`, `%RESPONSE_CODE_DETAILS%`, etc.) when
 the corresponding machinery lands.
@@ -1515,6 +1519,66 @@ seeds (`rbac_present_match.yaml`, `rbac_safe_regex.yaml`) — NO new fuzz target
 > unknown sub-key, malformed regex) is boot-fatal on BOTH proxies (ADR-0090 §D).
 > CARRY-FORWARD M37-1: `#fragment` in the request-target is rejected at the H1 codec
 > (400) before url_path matching — a separate codec surface, OUT of phase-37 scope.
+
+---
+
+### Phase 38 (ADR-0092): the `json_format` access-log encoder
+
+> Phase 38 adds the `json_format` output mode to
+> `envoy.config.core.v3.SubstitutionFormatString` (the `log_format` on
+> `FileAccessLog`). `SubstitutionFormatString` becomes the v1.33.0 oneof
+> `{text_format_source | json_format}`; `json_format` is a
+> `google.protobuf.Struct` of key → command-operator value string, modelled on
+> envoy-rust as a `BTreeMap<String,String>`. Each value compiles through the
+> EXISTING phase-32 command-operator engine (`parse_format`); a NEW
+> `CompiledJsonFormat` renders ONE JSON object per request. The text/default
+> render path is BYTE-FROZEN — JSON is a strict sibling (`LogFormat::{Text,Json}`).
+> The cross-proxy witness is **fixture 0046** (`0046-accesslog-json-format`): a
+> bare `GET /` on an H1 `direct_response` listener emits one byte-identical JSON
+> object. All facts below are empirically locked against live
+> `envoyproxy/envoy:v1.33.0` (ADR-0092 §A–§F).
+
+**§A — key ordering.** Keys emit SORTED by UTF-8 bytes (digits < uppercase <
+lowercase), exactly `BTreeMap<String>` iteration order — regardless of the order
+the keys appear in the config. (Envoy's `json_format` sorts; the `BTreeMap`
+config model reproduces it with no custom serde.)
+
+**§B — value type inference.** A value is TYPE-INFERRED, not always a string:
+
+| value shape | JSON token |
+|---|---|
+| EXACTLY one operator, numeric (`%RESPONSE_CODE%`, `%BYTES_RECEIVED%`, `%BYTES_SENT%`, `%DURATION%`) | unquoted number (`200`) |
+| EXACTLY one operator, string-valued + present (`%REQ(:METHOD)%`, `%PROTOCOL%`, `%RESPONSE_FLAGS%`, `%START_TIME%`, present `%UPSTREAM_HOST%`/`%REQ(...)%`/`%RESP(...)%`/`%DYNAMIC_METADATA%`) | quoted, JSON-escaped string (`"GET"`) |
+| EXACTLY one operator, Option-backed + ABSENT | `null` (NOT `"-"`) |
+| literals + operator(s) (multi-segment) OR a literal-only value | quoted string via the engine; an ABSENT operator inside renders the `-` sentinel (`code-%RESPONSE_CODE%` → `"code-200"`; `x=%REQ(X-FORWARDED-FOR)%` → `"x=-"`; `1` → `"1"`) |
+
+> Only OPERATORS are typed. `%DYNAMIC_METADATA%`'s single-operator classification
+> (quoted-when-present / `null`-when-absent) follows §B's general rule; it is not
+> in fixture 0046 and was not separately recon'd — backstop-test only.
+
+**§C — `typed_json_format` is NOT a v1.33.0 field.** The typed behavior is
+inherent to plain `json_format`; type inference is folded INTO this phase
+(mandatory for byte-exactness), not deferred.
+
+**§D — separators + escaping.** Compact separators `{"k":v,"k2":v2}`; ONE trailing
+`\n` per object; escaping matches `serde_json` defaults (`"`→`\"`, `\`→`\\`,
+`\n`/`\t`/`\b`/`\f`/`\r` short escapes, other C0 controls → `\u00XX`, non-ASCII
+verbatim UTF-8, `/` NOT escaped). Hand-rolled (no new dependency). Both KEYS and
+string VALUES are escaped this way.
+
+**§E — validity (all boot-fatal, ADR-0049).** Exactly-one-of
+`{text_format_source, json_format}`: BOTH-set AND NEITHER-set are boot-fatal
+(`ConfigError::AmbiguousLogFormat`). An empty `json_format: {}` is VALID → emits
+`{}\n`. An unknown key under `log_format` is boot-fatal (`deny_unknown_fields`). A
+malformed value-operator is boot-fatal (`InvalidAccessLogFormat`, reusing the
+phase-32 per-value `parse_format`).
+
+**§F — authoritative fixture-0046 line** (bare `GET /`, Host `envoy-rust.test`,
+`direct_response` `{status:200, body:"ok\n"}`):
+
+```
+{"bytes_rcvd":0,"bytes_sent":3,"flags":"-","method":"GET","mixed":"code-200","path":"/","protocol":"HTTP/1.1","status":200,"upstream":null}
+```
 
 ---
 
