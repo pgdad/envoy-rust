@@ -51,5 +51,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/omit_empty_values.yaml
 !corpus/parse_bootstrap/route_name.yaml
 !corpus/parse_bootstrap/response_code_details.yaml
+!corpus/parse_bootstrap/upstream_cluster.yaml
 artifacts/
 target/

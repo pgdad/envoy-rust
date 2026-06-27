@@ -1,0 +1,38 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0051-envoy-mount/access.log
+    envoy_rust: /tmp/0051-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to a STRICT_DNS cluster named `backend` (both
+    # proxies dial the same auto-spawned Http1EchoBackend via the
+    # {{BACKEND_HOST}}/{{HTTP1_BACKEND_PORT}} markers, like fixture 0008), with a
+    # `json_format` carrying `%UPSTREAM_CLUSTER%` in a single-operator leaf
+    # (`uc`) and a mixed leaf (`mixed: "c=%UPSTREAM_CLUSTER%"`). Phase 43
+    # (ADR-0100): `%UPSTREAM_CLUSTER%` renders the routed cluster's name — for a
+    # `route: { cluster: backend }` route this is the literal `backend`. An
+    # `Option<String>` shaped exactly like `%UPSTREAM_HOST%`/`%ROUTE_NAME%`
+    # (present → the name; absent → the `-` sentinel / json null).
+    #   uc:    "%UPSTREAM_CLUSTER%"      → "backend"      (json single-op → quoted)
+    #   mixed: "c=%UPSTREAM_CLUSTER%"    → "c=backend"    (mixed leaf → string)
+    # Also witnesses `%RESPONSE_CODE_DETAILS%` = "via_upstream" on a REAL upstream
+    # (the proxy-success arm, advancing carry-forward M42-1 — fixture 0050 only
+    # witnessed the `direct_response` arm).
+    #
+    # `%UPSTREAM_HOST%` is DELIBERATELY NOT logged: its value (the backend
+    # ip:port) resolves to host-gateway IP on the Envoy-container side vs
+    # 127.0.0.1 on the envoy-rust-host-subprocess side — structurally
+    # non-byte-identical per-side (the §6.2-LOCKED decision). The 5 tokens here
+    # depend only on the request + the cluster config, NOT the backend's response
+    # body/status, so they are byte-identical cross-proxy regardless of the echo
+    # backend's exact response.
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, mixed, proto, rcd, uc.
+    # Compact separators + ONE trailing `\n` (ADR-0092 §E).
+    #
+    # Expected line (byte-identical on both sides; LIVE-CAPTURED from
+    # `envoyproxy/envoy:v1.33.0`, phase-43 state-1 recon):
+    #   {"method":"GET","mixed":"c=backend","proto":"HTTP/1.1","rcd":"via_upstream","uc":"backend"}
+    - method: get
+      path: /
+      host: envoy-rust.test
