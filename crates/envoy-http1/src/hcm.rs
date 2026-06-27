@@ -1215,6 +1215,9 @@ async fn serve_connection(
                 request_id: access_log_header_value(&req.headers, "x-request-id"),
                 authority: access_log_header_value(&req.headers, "host"),
                 upstream_host: upstream_host_for_log,
+                // phase 43: %UPSTREAM_CLUSTER% backing field. The HCM that SETS
+                // the routed cluster name is a later task — None for now.
+                upstream_cluster: None,
                 // phase 41: the matched route's config `name` (empty = unnamed
                 // → None), rendered by %ROUTE_NAME%. `matched_route` (bound at
                 // resolve_route above) is still live here.
@@ -1828,6 +1831,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            upstream_cluster: None,
             route_name: None,
             response_code_details: None,
             dynamic_metadata: std::collections::BTreeMap::new(),

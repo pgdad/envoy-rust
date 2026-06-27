@@ -82,6 +82,13 @@ pub struct AccessLogRecord {
     /// IPv6). `None` on direct_response paths.
     pub upstream_host: Option<String>,
 
+    /// Config `name` of the cluster the request was routed to, if any (a
+    /// non-proxy / direct_response path → `None`). Rendered by
+    /// `%UPSTREAM_CLUSTER%` (phase 43) — mirrors `upstream_host`'s
+    /// `Option<String>` (`Some`→the cluster name, `None`→absent → `-` sentinel
+    /// / json `null`).
+    pub upstream_cluster: Option<String>,
+
     /// Config `name` of the matched route, if the route is named (an empty
     /// route `name` = unnamed → `None`). Rendered by the `%ROUTE_NAME%`
     /// command-operator (phase 41) — mirrors `upstream_host`'s `Option<String>`
@@ -127,6 +134,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            upstream_cluster: None,
             route_name: None,
             response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
@@ -162,6 +170,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            upstream_cluster: None,
             route_name: None,
             response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
@@ -193,6 +202,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            upstream_cluster: None,
             route_name: None,
             response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
@@ -206,6 +216,41 @@ mod tests {
         assert_eq!(
             detailed.response_code_details.as_deref(),
             Some("direct_response")
+        );
+    }
+
+    #[test]
+    fn record_upstream_cluster_defaults_and_carries_value() {
+        let absent = AccessLogRecord {
+            start_time: UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            protocol: "HTTP/1.1".into(),
+            response_code: 200,
+            response_flags: "-".into(),
+            bytes_received: 0,
+            bytes_sent: 3,
+            duration: Duration::from_millis(5),
+            upstream_service_time: None,
+            forwarded_for: None,
+            user_agent: None,
+            request_id: None,
+            authority: None,
+            upstream_host: None,
+            upstream_cluster: None,
+            route_name: None,
+            response_code_details: None,
+            dynamic_metadata: BTreeMap::new(),
+        };
+        assert!(absent.upstream_cluster.is_none());
+
+        let clustered = AccessLogRecord {
+            upstream_cluster: Some("my_backend_cluster".into()),
+            ..absent
+        };
+        assert_eq!(
+            clustered.upstream_cluster.as_deref(),
+            Some("my_backend_cluster")
         );
     }
 
@@ -227,6 +272,7 @@ mod tests {
             request_id: None,
             authority: Some("envoy-rust.test".into()),
             upstream_host: None,
+            upstream_cluster: None,
             route_name: None,
             response_code_details: None,
             dynamic_metadata: BTreeMap::new(),
@@ -258,6 +304,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            upstream_cluster: None,
             route_name: None,
             response_code_details: None,
             dynamic_metadata: BTreeMap::new(),

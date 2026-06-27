@@ -940,6 +940,9 @@ async fn finalize_h2_stream(
             request_id: access_log_header_value(&envoy_req.headers, "x-request-id"),
             authority: access_log_header_value(&envoy_req.headers, "host"),
             upstream_host: upstream_host_for_log_h2,
+            // phase 43: %UPSTREAM_CLUSTER% backing field. The HCM that SETS
+            // the routed cluster name is a later task — None for now.
+            upstream_cluster: None,
             route_name: route_name_for_log_h2,
             // phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% backing field, set per
             // response-path (direct_response / via_upstream).
