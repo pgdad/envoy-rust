@@ -300,7 +300,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("access.log");
         let mut map = std::collections::BTreeMap::new();
-        map.insert("status".to_string(), "%RESPONSE_CODE%".to_string());
+        map.insert(
+            "status".to_string(),
+            crate::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
         let fmt = crate::CompiledJsonFormat::from_map(&map).unwrap();
         let sink = FileSink::new(path.clone(), fmt).await.unwrap(); // CompiledJsonFormat: Into<LogFormat>
         sink.emit(&make_record()).await.unwrap();

@@ -8,36 +8,132 @@ use std::fmt::Write as _;
 use crate::command_operator::{FormatParseError, Op, Segment, parse_format, render_value_segments};
 use crate::record::AccessLogRecord;
 
-/// A compiled `json_format`: sorted (BTreeMap) key → compiled value segments
-/// (ADR-0092 §A). `render` assembles ONE sorted JSON object per record.
+/// An accesslog-side MIRROR of `envoy_config::JsonFormatValue` — the recursive
+/// `json_format` config value (ADR-0094 §A–§D). This crate must NOT depend on
+/// `envoy-config` (the dependency direction is `envoy-config` → `envoy-accesslog`;
+/// a reverse edge would be a cycle), so the caller (`envoy-http1`'s HCM bridge)
+/// maps the config `JsonFormatValue` into this mirror at the `from_map` call site.
+///
+/// Variants: `Null`/`Bool` literal leaves (emitted native-typed, §D);
+/// `Format` a command-operator string (compiled per-leaf, §C); `Array` an
+/// ordered list (config order, §B); `Object` a nested map (keys sorted, §A).
+/// NUMERIC literals are NOT representable (rejected at config-parse — CF-39-1).
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompiledJsonFormat(std::collections::BTreeMap<String, Vec<Segment>>);
+pub enum JsonValueInput {
+    Null,
+    Bool(bool),
+    Format(String),
+    Array(Vec<JsonValueInput>),
+    Object(std::collections::BTreeMap<String, JsonValueInput>),
+}
+
+/// A compiled `json_format` value (ADR-0094). `Leaf` holds the phase-38 compiled
+/// command-operator segments (rendered via the EXISTING `encode_json_value`
+/// leaf helper, VERBATIM); `Bool`/`Null` carry literal leaves emitted native-typed
+/// (§D); `Object` sorts keys at every level (§A); `Array` preserves config order (§B).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompiledJsonValue {
+    Null,
+    Bool(bool),
+    Leaf(Vec<Segment>),
+    Array(Vec<CompiledJsonValue>),
+    Object(std::collections::BTreeMap<String, CompiledJsonValue>),
+}
+
+impl CompiledJsonValue {
+    /// Compile a `JsonValueInput` tree: `Format`→`Leaf(parse_format(s)?)`,
+    /// `Bool`/`Null` carried verbatim, `Object`/`Array` recurse (returning the
+    /// first `FormatParseError`, surfaced at config-load as `InvalidAccessLogFormat`).
+    fn compile(value: &JsonValueInput) -> Result<Self, FormatParseError> {
+        Ok(match value {
+            JsonValueInput::Null => CompiledJsonValue::Null,
+            JsonValueInput::Bool(b) => CompiledJsonValue::Bool(*b),
+            JsonValueInput::Format(s) => CompiledJsonValue::Leaf(parse_format(s)?),
+            JsonValueInput::Array(items) => CompiledJsonValue::Array(
+                items
+                    .iter()
+                    .map(CompiledJsonValue::compile)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            JsonValueInput::Object(map) => {
+                let mut compiled = std::collections::BTreeMap::new();
+                for (k, v) in map {
+                    compiled.insert(k.clone(), CompiledJsonValue::compile(v)?);
+                }
+                CompiledJsonValue::Object(compiled)
+            }
+        })
+    }
+
+    /// Render this value as a JSON token into `out` (ADR-0094 §C/§D/§E/§F). The
+    /// recursion is purely structural; `Leaf` defers to the phase-38
+    /// `encode_json_value` helper VERBATIM. No inter-element/inter-level `\n`.
+    fn render_into(&self, out: &mut String, record: &AccessLogRecord) {
+        match self {
+            CompiledJsonValue::Null => out.push_str("null"),
+            CompiledJsonValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            CompiledJsonValue::Leaf(segments) => encode_json_value(out, segments, record),
+            CompiledJsonValue::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.render_into(out, record);
+                }
+                out.push(']');
+            }
+            CompiledJsonValue::Object(map) => {
+                out.push('{');
+                for (i, (key, value)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push('"');
+                    json_escape_into(out, key);
+                    out.push_str("\":");
+                    value.render_into(out, record);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+/// A compiled `json_format`: a top-level sorted (BTreeMap) key → recursive
+/// `CompiledJsonValue` (ADR-0094 §A). `render` assembles ONE sorted JSON object
+/// per record (the top level is always an object, as Envoy's `Struct` is).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledJsonFormat(std::collections::BTreeMap<String, CompiledJsonValue>);
 
 impl CompiledJsonFormat {
-    /// Compile each value string via `parse_format`. Returns the first
+    /// Compile each value via `CompiledJsonValue::compile` (recursing nested
+    /// objects/lists, compiling each `Format` leaf). Returns the first
     /// `FormatParseError` (surfaced at config-load as `InvalidAccessLogFormat`).
     pub fn from_map(
-        map: &std::collections::BTreeMap<String, String>,
+        map: &std::collections::BTreeMap<String, JsonValueInput>,
     ) -> Result<Self, FormatParseError> {
         let mut compiled = std::collections::BTreeMap::new();
         for (k, v) in map {
-            compiled.insert(k.clone(), parse_format(v)?);
+            compiled.insert(k.clone(), CompiledJsonValue::compile(v)?);
         }
         Ok(Self(compiled))
     }
 
-    /// Render ONE sorted JSON object + trailing `\n` (ADR-0092 §A/§B/§D/§F).
+    /// Render ONE sorted JSON object + trailing `\n` (ADR-0094 §A/§E). The
+    /// nested structure is emitted inline; only this top-level render appends
+    /// the single `\n`.
     pub fn render(&self, record: &AccessLogRecord) -> String {
         let mut out = String::with_capacity(64 + self.0.len() * 16);
         out.push('{');
-        for (i, (key, segments)) in self.0.iter().enumerate() {
+        for (i, (key, value)) in self.0.iter().enumerate() {
             if i > 0 {
                 out.push(',');
             }
             out.push('"');
             json_escape_into(&mut out, key);
             out.push_str("\":");
-            encode_json_value(&mut out, segments, record);
+            value.render_into(&mut out, record);
         }
         out.push_str("}\n");
         out
@@ -217,7 +313,7 @@ mod tests {
             ("upstream", "%UPSTREAM_HOST%"),
             ("mixed", "code-%RESPONSE_CODE%"),
         ] {
-            map.insert(k.to_string(), v.to_string());
+            map.insert(k.to_string(), JsonValueInput::Format(v.to_string()));
         }
         let cjf = CompiledJsonFormat::from_map(&map).unwrap();
         assert_eq!(
@@ -228,14 +324,19 @@ mod tests {
 
     #[test]
     fn empty_map_renders_empty_object() {
-        let cjf = CompiledJsonFormat::from_map(&std::collections::BTreeMap::new()).unwrap();
+        let empty: std::collections::BTreeMap<String, JsonValueInput> =
+            std::collections::BTreeMap::new();
+        let cjf = CompiledJsonFormat::from_map(&empty).unwrap();
         assert_eq!(cjf.render(&fixture_record()), "{}\n"); // ADR-0092 §E
     }
 
     #[test]
     fn key_is_json_escaped() {
         let mut map = std::collections::BTreeMap::new();
-        map.insert("a\"b".to_string(), "%PROTOCOL%".to_string());
+        map.insert(
+            "a\"b".to_string(),
+            JsonValueInput::Format("%PROTOCOL%".to_string()),
+        );
         let cjf = CompiledJsonFormat::from_map(&map).unwrap();
         assert_eq!(cjf.render(&fixture_record()), "{\"a\\\"b\":\"HTTP/1.1\"}\n");
     }
@@ -243,7 +344,53 @@ mod tests {
     #[test]
     fn from_map_rejects_malformed_operator() {
         let mut map = std::collections::BTreeMap::new();
-        map.insert("a".to_string(), "%NOPE%".to_string());
+        map.insert("a".to_string(), JsonValueInput::Format("%NOPE%".to_string()));
+        assert!(CompiledJsonFormat::from_map(&map).is_err());
+    }
+
+    // --- Phase 39 T3 (ADR-0094): recursive compile via JsonValueInput mirror ---
+
+    #[test]
+    fn from_map_compiles_recursive_tree() {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "method".to_string(),
+            JsonValueInput::Format("%REQ(:METHOD)%".to_string()),
+        );
+        obj.insert(
+            "code".to_string(),
+            JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("obj".to_string(), JsonValueInput::Object(obj));
+        map.insert(
+            "list".to_string(),
+            JsonValueInput::Array(vec![
+                JsonValueInput::Format("%PROTOCOL%".to_string()),
+                JsonValueInput::Bool(true),
+                JsonValueInput::Null,
+            ]),
+        );
+        map.insert("flag".to_string(), JsonValueInput::Bool(false));
+        map.insert("missing".to_string(), JsonValueInput::Null);
+        let cjf = CompiledJsonFormat::from_map(&map).expect("recursive compile Ok");
+        // Bool/Null carried verbatim; Format compiled to Leaf.
+        assert_eq!(cjf.0["flag"], CompiledJsonValue::Bool(false));
+        assert_eq!(cjf.0["missing"], CompiledJsonValue::Null);
+        assert!(matches!(cjf.0["obj"], CompiledJsonValue::Object(_)));
+        assert!(matches!(cjf.0["list"], CompiledJsonValue::Array(_)));
+    }
+
+    #[test]
+    fn from_map_rejects_malformed_nested_operator() {
+        // ADR-0094 §G: a malformed operator in a NESTED leaf returns the error.
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "b".to_string(),
+            JsonValueInput::Format("%NOPE%".to_string()),
+        );
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("a".to_string(), JsonValueInput::Object(obj));
         assert!(CompiledJsonFormat::from_map(&map).is_err());
     }
 
