@@ -2500,9 +2500,12 @@ static_resources:
             );
             let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("parse");
             Arc::new(
-                envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
-                    .await
-                    .expect("from_bootstrap"),
+                envoy_cluster::from_bootstrap(
+                    &bootstrap,
+                    Arc::new(envoy_stats::StatsRegistry::new()),
+                )
+                .await
+                .expect("from_bootstrap"),
             )
         };
 

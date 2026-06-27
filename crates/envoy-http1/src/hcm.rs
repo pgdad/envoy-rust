@@ -4094,8 +4094,7 @@ static_resources:
         use std::path::PathBuf;
         use tempfile::tempdir;
 
-        let upstream_response: &'static [u8] =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let upstream_response: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
         let upstream_port = spawn_in_process_upstream(upstream_response).await;
         let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
 
