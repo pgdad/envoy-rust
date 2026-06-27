@@ -690,14 +690,22 @@ pub struct FileAccessLog {
     pub log_format: Option<SubstitutionFormatString>,
 }
 
-/// Models `envoy.config.core.v3.SubstitutionFormatString` — only the
-/// `text_format_source` (inline `DataSource`) variant is supported in phase 32
-/// (ADR-0079). `json_format` and the deprecated `text_format` scalar are
-/// deferred.
+/// Models `envoy.config.core.v3.SubstitutionFormatString` — the
+/// `{text_format_source | json_format}` oneof (phase 38, ADR-0092). Exactly one
+/// arm must be set; the cardinality is enforced by `validate_access_logs`
+/// (`ConfigError::AmbiguousLogFormat`), not by serde. `json_format` is a
+/// `google.protobuf.Struct` modelled as a `BTreeMap<String,String>` — the keys
+/// emit in sorted (UTF-8-byte) order, matching v1.33.0's `json_format` wire
+/// order (ADR-0092 §A); each value is a command-operator format string compiled
+/// per-value via `envoy_accesslog::parse_format`. The deprecated `text_format`
+/// scalar + `json_format_options`/`omit_empty_values`/`content_type` are deferred.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstitutionFormatString {
-    pub text_format_source: DataSourceInline,
+    #[serde(default)]
+    pub text_format_source: Option<DataSourceInline>,
+    #[serde(default)]
+    pub json_format: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Models the `inline_string` arm of an `envoy.config.core.v3.DataSource`. The
@@ -4360,11 +4368,15 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                     return Err(crate::ConfigError::InvalidAccessLogPath);
                 }
                 if let Some(fmt) = &cfg.log_format {
-                    envoy_accesslog::parse_format(&fmt.text_format_source.inline_string).map_err(
-                        |e| crate::ConfigError::InvalidAccessLogFormat {
-                            detail: e.to_string(),
-                        },
-                    )?;
+                    // Task-1 temporary guard (the text arm only); Task 2 replaces
+                    // this with the exactly-one-of cardinality + json_format validation.
+                    if let Some(ds) = &fmt.text_format_source {
+                        envoy_accesslog::parse_format(&ds.inline_string).map_err(|e| {
+                            crate::ConfigError::InvalidAccessLogFormat {
+                                detail: e.to_string(),
+                            }
+                        })?;
+                    }
                 }
             }
         }
@@ -11006,7 +11018,10 @@ static_resources:
         match &hcm.access_log[0].typed_config {
             AccessLogTypedConfig::FileAccessLog(cfg) => {
                 let fmt = cfg.log_format.as_ref().expect("log_format present");
-                assert_eq!(fmt.text_format_source.inline_string, "%RESPONSE_CODE%");
+                assert_eq!(
+                    fmt.text_format_source.as_ref().unwrap().inline_string,
+                    "%RESPONSE_CODE%"
+                );
             }
         }
     }
@@ -11094,6 +11109,35 @@ static_resources:
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
         assert!(matches!(err, crate::ConfigError::Yaml(_)));
+    }
+
+    // --- phase 38 t1: SubstitutionFormatString {text_format_source|json_format} oneof ---
+
+    #[test]
+    fn json_format_parses_into_sorted_btreemap() {
+        let yaml = r#"
+text_format_source: null
+json_format:
+  zebra: "%PROTOCOL%"
+  alpha: "%RESPONSE_CODE%"
+"#;
+        let sfs: SubstitutionFormatString = serde_yaml::from_str(yaml).unwrap();
+        let jf = sfs.json_format.expect("json_format set");
+        // BTreeMap iteration is sorted by key (ADR-0092 §A): alpha before zebra.
+        let keys: Vec<&str> = jf.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["alpha", "zebra"]);
+        assert!(sfs.text_format_source.is_none());
+    }
+
+    #[test]
+    fn text_format_source_arm_still_parses() {
+        let yaml = r#"text_format_source: { inline_string: "%RESPONSE_CODE%" }"#;
+        let sfs: SubstitutionFormatString = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            sfs.text_format_source.unwrap().inline_string,
+            "%RESPONSE_CODE%"
+        );
+        assert!(sfs.json_format.is_none());
     }
 
     // --- 06.3 Task 2: D14.3 H1-listener × H2-cluster parse-time validator gate ---

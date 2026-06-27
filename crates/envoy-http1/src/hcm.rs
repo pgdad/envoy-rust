@@ -1255,12 +1255,15 @@ fn compiled_log_format(
     file_cfg: &envoy_config::FileAccessLog,
 ) -> Result<envoy_accesslog::CompiledFormat, Http1Error> {
     match &file_cfg.log_format {
-        Some(s) => {
-            envoy_accesslog::CompiledFormat::from_inline(&s.text_format_source.inline_string)
-                .map_err(|err| Http1Error::AccessLogFormat {
+        // Task-1 temporary form (text arm only); Task 7 returns `LogFormat`.
+        Some(s) => match &s.text_format_source {
+            Some(ds) => envoy_accesslog::CompiledFormat::from_inline(&ds.inline_string).map_err(
+                |err| Http1Error::AccessLogFormat {
                     message: err.to_string(),
-                })
-        }
+                },
+            ),
+            None => Ok(envoy_accesslog::CompiledFormat::default()),
+        },
         None => Ok(envoy_accesslog::CompiledFormat::default()),
     }
 }
@@ -1765,9 +1768,10 @@ mod tests {
         let file_cfg = envoy_config::FileAccessLog {
             path: "/tmp/x".into(),
             log_format: Some(envoy_config::SubstitutionFormatString {
-                text_format_source: envoy_config::DataSourceInline {
+                text_format_source: Some(envoy_config::DataSourceInline {
                     inline_string: "%REQ(:METHOD)% %RESPONSE_CODE%".into(),
-                },
+                }),
+                json_format: None,
             }),
         };
         let fmt = compiled_log_format(&file_cfg).expect("valid");

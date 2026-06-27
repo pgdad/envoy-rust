@@ -1348,11 +1348,12 @@ static_resources:
                 typed_config: AccessLogTypedConfig::FileAccessLog(FileAccessLog {
                     path: log_path.to_str().unwrap().to_string(),
                     log_format: Some(SubstitutionFormatString {
-                        text_format_source: DataSourceInline {
+                        text_format_source: Some(DataSourceInline {
                             inline_string:
                                 "%DYNAMIC_METADATA(envoy.test:tier)% / %DYNAMIC_METADATA(envoy.test:missing)%\n"
                                     .to_string(),
-                        },
+                        }),
+                        json_format: None,
                     }),
                 }),
             }],
@@ -1458,11 +1459,12 @@ static_resources:
                 typed_config: AccessLogTypedConfig::FileAccessLog(FileAccessLog {
                     path: log_path.to_str().unwrap().to_string(),
                     log_format: Some(SubstitutionFormatString {
-                        text_format_source: DataSourceInline {
+                        text_format_source: Some(DataSourceInline {
                             inline_string:
                                 "%DYNAMIC_METADATA(envoy.lb:tier)% / %DYNAMIC_METADATA(envoy.lb:missing)%\n"
                                     .to_string(),
-                        },
+                        }),
+                        json_format: None,
                     }),
                 }),
             }],
