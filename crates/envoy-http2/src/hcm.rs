@@ -467,6 +467,14 @@ async fn handle_one_stream(
     // apply_route_config clones the policy into the Cors instance, so the borrow
     // of `config.inner` via `matched_route` ends before mem::take of `envoy_req`.
     let matched_route = envoy_http1::hcm::resolve_route(&config.inner, &envoy_req);
+    // phase 41: capture the matched route's config `name` HERE (empty = unnamed
+    // → None) for %ROUTE_NAME%, before `matched_route`'s borrow of `config.inner`
+    // ends; threaded into `finalize_h2_stream` (mirrors `upstream_host_for_log_h2`).
+    let route_name_for_log_h2: Option<String> = matched_route
+        .as_ref()
+        .map(|r| envoy_http1::hcm::ResolvedRoute::route(r).name.as_str())
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned);
     pipeline.apply_route_config(
         matched_route
             .as_ref()
@@ -800,6 +808,7 @@ async fn handle_one_stream(
         &envoy_req,
         request_body_len,
         upstream_host_for_log_h2,
+        route_name_for_log_h2,
         dynamic_metadata,
     )
     .await
@@ -826,6 +835,9 @@ async fn finalize_h2_stream(
     envoy_req: &Request,
     request_body_len: u64,
     upstream_host_for_log_h2: Option<String>,
+    // Phase 41: the matched route's config `name` (None = unnamed), computed at
+    // the `handle_one_stream` match site and threaded here for %ROUTE_NAME%.
+    route_name_for_log_h2: Option<String>,
     // Phase 33 T10: the pipeline's dynamic metadata, captured before
     // `filter_req` was dropped at the decode site, threaded here so the H2
     // record build can render %DYNAMIC_METADATA%.
@@ -915,7 +927,7 @@ async fn finalize_h2_stream(
             request_id: access_log_header_value(&envoy_req.headers, "x-request-id"),
             authority: access_log_header_value(&envoy_req.headers, "host"),
             upstream_host: upstream_host_for_log_h2,
-            route_name: None,
+            route_name: route_name_for_log_h2,
             dynamic_metadata,
         };
         // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
@@ -2222,6 +2234,104 @@ static_resources:
         assert_eq!(lines_per_sink[0].len(), 1);
         let line = &lines_per_sink[0][0];
         assert!(line.contains("\"GET / HTTP/2\""), "line: {}", line);
+    }
+
+    /// phase 41 (ADR-0098 §C): the H2 HCM sets `route_name` on the access-log
+    /// record from the matched route's config `name`, threaded from the
+    /// `handle_one_stream` match site into `finalize_h2_stream`. A NAMED route →
+    /// the name renders via `%ROUTE_NAME%`; an UNNAMED route → the `-` sentinel.
+    async fn h2_route_name_line(route_name: &str) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(
+                path.clone(),
+                envoy_accesslog::CompiledFormat::from_inline("r=%ROUTE_NAME%")
+                    .expect("format parses"),
+            )
+            .await
+            .expect("open sink"),
+        );
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: route_name.to_string(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::fs::read_to_string(&path).await.unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h2_sets_route_name_from_matched_route() {
+        let named = h2_route_name_line("myroute").await;
+        assert!(
+            named.contains("r=myroute"),
+            "NAMED route → %ROUTE_NAME% renders the name; got: {}",
+            named.trim()
+        );
+        let unnamed = h2_route_name_line("").await;
+        assert!(
+            unnamed.contains("r=-"),
+            "UNNAMED route → %ROUTE_NAME% renders the `-` sentinel; got: {}",
+            unnamed.trim()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

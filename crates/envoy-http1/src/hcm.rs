@@ -1209,7 +1209,14 @@ async fn serve_connection(
                 request_id: access_log_header_value(&req.headers, "x-request-id"),
                 authority: access_log_header_value(&req.headers, "host"),
                 upstream_host: upstream_host_for_log,
-                route_name: None,
+                // phase 41: the matched route's config `name` (empty = unnamed
+                // → None), rendered by %ROUTE_NAME%. `matched_route` (bound at
+                // resolve_route above) is still live here.
+                route_name: matched_route
+                    .as_ref()
+                    .map(|r| r.route().name.as_str())
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned),
                 dynamic_metadata: dynamic_metadata.clone(),
             };
             // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
@@ -3902,6 +3909,81 @@ static_resources:
             contents.contains("200"),
             "access-log must carry response_code=200; got: {}",
             contents.trim()
+        );
+    }
+
+    /// phase 41 (ADR-0098 §C): the H1 HCM sets `route_name` on the access-log
+    /// record from the matched route's config `name`. A NAMED route → the name
+    /// renders via `%ROUTE_NAME%`; an UNNAMED route → the `-` sentinel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h1_sets_route_name_from_matched_route() {
+        use std::path::PathBuf;
+        use tempfile::tempdir;
+
+        async fn run_with_route_name(route_name: &str) -> String {
+            let dir = tempdir().expect("tempdir");
+            let path: PathBuf = dir.path().join("access.log");
+            let sink = Arc::new(
+                envoy_accesslog::FileSink::new(
+                    path.clone(),
+                    envoy_accesslog::CompiledFormat::from_inline("r=%ROUTE_NAME%")
+                        .expect("format parses"),
+                )
+                .await
+                .expect("open sink"),
+            );
+            let config = Arc::new(HCMConfig {
+                stat_prefix: "ingress_http".to_string(),
+                cluster_mgr: cluster_mgr_empty().await,
+                http2_protocol_options: None,
+                stats: mk_stats("ingress_http"),
+                access_log: vec![sink],
+                filter_pipeline: test_router_only_pipeline(),
+                pool_mgr: None,
+                route_config: RwLock::new(Arc::new(RouteConfiguration {
+                    name: "local_route".to_string(),
+                    validate_clusters: None,
+                    virtual_hosts: vec![VirtualHost {
+                        name: "default".to_string(),
+                        domains: vec!["*".to_string()],
+                        include_attempt_count_in_response: false,
+                        routes: vec![Route {
+                            name: route_name.to_string(),
+                            r#match: RouteMatch {
+                                prefix: Some("/".to_string()),
+                                path: None,
+                                headers: vec![],
+                            },
+                            action: RouteAction::DirectResponse(DirectResponse {
+                                status: 200,
+                                body: DataSource {
+                                    filename: None,
+                                    inline_string: Some("ok\n".to_string()),
+                                },
+                            }),
+                            typed_per_filter_config: Default::default(),
+                        }],
+                    }],
+                })),
+            });
+            let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            let _ = drive(config, req).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::fs::read_to_string(&path).await.unwrap_or_default()
+        }
+
+        let named = run_with_route_name("myroute").await;
+        assert!(
+            named.contains("r=myroute"),
+            "NAMED route → %ROUTE_NAME% renders the name; got: {}",
+            named.trim()
+        );
+
+        let unnamed = run_with_route_name("").await;
+        assert!(
+            unnamed.contains("r=-"),
+            "UNNAMED route → %ROUTE_NAME% renders the `-` sentinel; got: {}",
+            unnamed.trim()
         );
     }
 
