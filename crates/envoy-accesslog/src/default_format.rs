@@ -217,6 +217,7 @@ mod tests {
             request_id: None,
             authority: Some("envoy-rust.test".into()),
             upstream_host: None,
+            route_name: None,
             dynamic_metadata: std::collections::BTreeMap::new(),
         }
     }

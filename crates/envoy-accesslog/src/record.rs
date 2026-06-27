@@ -82,6 +82,12 @@ pub struct AccessLogRecord {
     /// IPv6). `None` on direct_response paths.
     pub upstream_host: Option<String>,
 
+    /// Config `name` of the matched route, if the route is named (an empty
+    /// route `name` = unnamed → `None`). Rendered by the `%ROUTE_NAME%`
+    /// command-operator (phase 41) — mirrors `upstream_host`'s `Option<String>`
+    /// (`Some`→the name, `None`→absent → `-` sentinel / json `null`).
+    pub route_name: Option<String>,
+
     /// Per-request dynamic metadata (namespace → key → string value), copied
     /// from the pipeline's `FilterRequest.dynamic_metadata` at the HCM
     /// record-build site (H1 hcm.rs ~1189, H2 hcm.rs ~888). Rendered by the
@@ -114,6 +120,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            route_name: None,
             dynamic_metadata: BTreeMap::new(),
         };
         assert!(empty.dynamic_metadata.is_empty());
@@ -127,6 +134,36 @@ mod tests {
             ..empty
         };
         assert_eq!(populated.dynamic_metadata["envoy.test"]["tier"], "prod");
+    }
+
+    #[test]
+    fn record_route_name_defaults_and_carries_value() {
+        let absent = AccessLogRecord {
+            start_time: UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            protocol: "HTTP/1.1".into(),
+            response_code: 200,
+            response_flags: "-".into(),
+            bytes_received: 0,
+            bytes_sent: 3,
+            duration: Duration::from_millis(5),
+            upstream_service_time: None,
+            forwarded_for: None,
+            user_agent: None,
+            request_id: None,
+            authority: None,
+            upstream_host: None,
+            route_name: None,
+            dynamic_metadata: BTreeMap::new(),
+        };
+        assert!(absent.route_name.is_none());
+
+        let named = AccessLogRecord {
+            route_name: Some("myroute".into()),
+            ..absent
+        };
+        assert_eq!(named.route_name.as_deref(), Some("myroute"));
     }
 
     #[test]
@@ -147,6 +184,7 @@ mod tests {
             request_id: None,
             authority: Some("envoy-rust.test".into()),
             upstream_host: None,
+            route_name: None,
             dynamic_metadata: BTreeMap::new(),
         };
         let dbg = format!("{:?}", record);
@@ -176,6 +214,7 @@ mod tests {
             request_id: None,
             authority: None,
             upstream_host: None,
+            route_name: None,
             dynamic_metadata: BTreeMap::new(),
         };
         let mut clone = original.clone();

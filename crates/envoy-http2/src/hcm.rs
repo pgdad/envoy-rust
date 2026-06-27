@@ -915,6 +915,7 @@ async fn finalize_h2_stream(
             request_id: access_log_header_value(&envoy_req.headers, "x-request-id"),
             authority: access_log_header_value(&envoy_req.headers, "host"),
             upstream_host: upstream_host_for_log_h2,
+            route_name: None,
             dynamic_metadata,
         };
         // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
