@@ -154,3 +154,24 @@ plus all `0001`-`0047`, and the live-captured control bytes are recorded in the
 0048 README + expectations.yaml + the BEHAVIOR_CONTRACT. The text-format swap,
 the recursive (§D) swap, and the §C single-op carve-out are additionally proven
 by the in-process `envoy-accesslog` backstop (T2/T3).
+
+---
+
+## State-4 — Verification gate (§7.5 (a)-(e)) — COMPLETE
+
+Routed via `superpowers:verification-before-completion`. All outputs FRESH (run at state-4 against `HEAD` = `c4f95b1`). The AUTHORITATIVE full-suite pass is the Linux CI run on the state-3 commit.
+
+**AUTHORITATIVE — Linux CI run `28297297375` @ `c4f95b1` (state-3 implementation commit) = `completed/success`.** The full §7.5 gate on CI: the entire differential fixture suite (`0001`-`0048`, incl. the new `0048-accesslog-omit-empty` + the `0046`/`0047` default-off regression witnesses), h2spec, `cargo build`/`test`/`clippy`/`fmt`/`deny`, and the `parse_bootstrap` + `accesslog_format_parse` fuzz short-budget runs (with the new `omit_empty_values.yaml` seed). All green.
+
+**Local gate (fresh, this state-4 session):**
+- **(e) `cargo fmt --all -- --check`** → CLEAN (exit 0).
+- **(e) `cargo build --workspace --all-targets`** → `Finished` (exit 0).
+- **(e) `cargo clippy --workspace --all-targets --all-features -- -D warnings`** → `Finished` (exit 0, no warnings).
+- **(e) `cargo deny check`** → `advisories ok, bans ok, licenses ok, sources ok`. NO new dependency.
+- **(e) `cargo test --workspace --exclude differential`** → 42 suites `ok`, 0 FAILED. (The differential crate false-REDs under full-workspace parallel load on this host — `admin_config_dump_server_info` bridge-IP `192.168.65.2` + others — so it is run in isolation below and is CI-authoritative.)
+- **(a) fixture `0048-accesslog-omit-empty`** (isolation, debug `envoy-bin` rebuilt) → `cargo test -p differential --test access_log_omit_empty -- --test-threads=1` → `test result: ok. 1 passed`. Cross-proxy byte-identical sentinel-swap line `{"method":"GET","proto":"HTTP/1.1","single_up":null,"up":"up=","xff":"x="}` vs live `envoyproxy/envoy:v1.33.0` (ADR-0096 §B swap `up=`/`x=` + §C `single_up:null`).
+- **(b) fixtures `0046`/`0047`** (default-off regression witnesses) → `cargo test -p differential --test access_log_json_format` / `--test access_log_json_nested` (isolation) → `test result: ok. 1 passed` each. Byte-identical — `omit_empty_values` defaults `false`, the flag-off render is byte-unchanged. The remaining `0001`-`0045` are CI-authoritative (the full suite ran green on `c4f95b1`).
+- **(c) h2spec** → unchanged (no HTTP/2 codec change this phase); CI-confirmed green on `c4f95b1` (≥95%).
+- **(d) fuzz** → the EXISTING `parse_bootstrap` + `accesslog_format_parse` targets cover the new bool surface (the new `omit_empty_values.yaml` seed is tracked — verified `git ls-files`); NO new fuzz target, `ci.yml` unchanged; short-budget runs green on `c4f95b1`.
+
+**Gate verdict:** §7.5 (a)-(e) GREEN (authoritative CI `28297297375` @ `c4f95b1` `completed/success`; local gate green modulo the documented host false-REDs run in isolation). `#![forbid(unsafe_code)]` holds; NO new crate/dependency/fuzz-target; NO new `ConfigError` variant. (f) `REVIEW.md` is the state-5 code-review (next session). Phase 40 advances to state-5.
