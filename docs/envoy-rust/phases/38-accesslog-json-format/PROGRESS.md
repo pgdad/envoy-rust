@@ -101,3 +101,24 @@ Confirmed RED (`cannot find function encode_json_value`).
 escaper + ALL pre-existing `command_operator`/`file_sink` tests — text path byte-frozen).
 
 **Commit:** `phase 38 task 4: per-operator typed JSON value encoder (number/string/null) [ADR-0092]`
+
+---
+
+## Task 5 — `CompiledJsonFormat` compile + sorted-object render — DONE
+
+**TDD:** wrote 4 failing tests first in `json_format.rs` + a `fixture_record()` helper
+(GET /, HTTP/1.1, 200, flags "-", bytes_rcvd 0, bytes_sent 3, upstream None):
+`renders_authoritative_fixture_line` (the locked ADR-0092 §F line), `empty_map_renders_empty_object`
+(§E `{}\n`), `key_is_json_escaped`, `from_map_rejects_malformed_operator`. Confirmed
+RED (`use of undeclared type CompiledJsonFormat`).
+
+**Implemented:** `pub struct CompiledJsonFormat(BTreeMap<String, Vec<Segment>>)` with
+`from_map` (per-value `parse_format`, first error surfaced) + `render` (assemble one
+sorted JSON object — `{`, comma-separated `"key":value` via `json_escape_into` +
+`encode_json_value`, `}\n`). Re-exported `CompiledJsonFormat` from `lib.rs`.
+
+**Evidence:** `cargo test -p envoy-accesslog` → `57 passed; 0 failed`. The
+`renders_authoritative_fixture_line` test asserts the byte-exact §F line:
+`{"bytes_rcvd":0,"bytes_sent":3,"flags":"-","method":"GET","mixed":"code-200","path":"/","protocol":"HTTP/1.1","status":200,"upstream":null}\n`.
+
+**Commit:** `phase 38 task 5: CompiledJsonFormat compile + sorted-object render [ADR-0092]`

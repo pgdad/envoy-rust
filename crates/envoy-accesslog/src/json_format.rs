@@ -5,8 +5,44 @@
 //! v1.33.0 wire behavior. Hand-rolled JSON escaping (no new dependency, D-3.2).
 use std::fmt::Write as _;
 
-use crate::command_operator::{render_value_segments, Op, Segment};
+use crate::command_operator::{parse_format, render_value_segments, FormatParseError, Op, Segment};
 use crate::record::AccessLogRecord;
+
+/// A compiled `json_format`: sorted (BTreeMap) key → compiled value segments
+/// (ADR-0092 §A). `render` assembles ONE sorted JSON object per record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledJsonFormat(std::collections::BTreeMap<String, Vec<Segment>>);
+
+impl CompiledJsonFormat {
+    /// Compile each value string via `parse_format`. Returns the first
+    /// `FormatParseError` (surfaced at config-load as `InvalidAccessLogFormat`).
+    pub fn from_map(
+        map: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, FormatParseError> {
+        let mut compiled = std::collections::BTreeMap::new();
+        for (k, v) in map {
+            compiled.insert(k.clone(), parse_format(v)?);
+        }
+        Ok(Self(compiled))
+    }
+
+    /// Render ONE sorted JSON object + trailing `\n` (ADR-0092 §A/§B/§D/§F).
+    pub fn render(&self, record: &AccessLogRecord) -> String {
+        let mut out = String::with_capacity(64 + self.0.len() * 16);
+        out.push('{');
+        for (i, (key, segments)) in self.0.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            json_escape_into(&mut out, key);
+            out.push_str("\":");
+            encode_json_value(&mut out, segments, record);
+        }
+        out.push_str("}\n");
+        out
+    }
+}
 
 /// Append `s` to `out` with JSON string-body escaping (ADR-0092 §D — matches
 /// serde_json: short escapes for `\b \t \n \f \r \" \\`; `\u00XX` for other C0
@@ -112,7 +148,6 @@ fn encode_single_op(out: &mut String, op: &Op, r: &AccessLogRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command_operator::parse_format;
     use crate::record::AccessLogRecord;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -142,6 +177,74 @@ mod tests {
         let mut out = String::new();
         encode_json_value(&mut out, &parse_format(value_fmt).unwrap(), r);
         out
+    }
+
+    // Record matching the fixture-0046 probe (ADR-0092 §F): GET /, HTTP/1.1, 200,
+    // flags "-", bytes_received 0, bytes_sent 3, upstream_host None.
+    fn fixture_record() -> AccessLogRecord {
+        AccessLogRecord {
+            start_time: UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            protocol: "HTTP/1.1".into(),
+            response_code: 200,
+            response_flags: "-".into(),
+            bytes_received: 0,
+            bytes_sent: 3,
+            duration: Duration::from_millis(0),
+            upstream_service_time: None,
+            forwarded_for: None,
+            user_agent: None,
+            request_id: None,
+            authority: None,
+            upstream_host: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn renders_authoritative_fixture_line() {
+        let r = fixture_record();
+        let mut map = std::collections::BTreeMap::new();
+        for (k, v) in [
+            ("method", "%REQ(:METHOD)%"),
+            ("path", "%REQ(:PATH)%"),
+            ("protocol", "%PROTOCOL%"),
+            ("status", "%RESPONSE_CODE%"),
+            ("flags", "%RESPONSE_FLAGS%"),
+            ("bytes_rcvd", "%BYTES_RECEIVED%"),
+            ("bytes_sent", "%BYTES_SENT%"),
+            ("upstream", "%UPSTREAM_HOST%"),
+            ("mixed", "code-%RESPONSE_CODE%"),
+        ] {
+            map.insert(k.to_string(), v.to_string());
+        }
+        let cjf = CompiledJsonFormat::from_map(&map).unwrap();
+        assert_eq!(
+            cjf.render(&r),
+            "{\"bytes_rcvd\":0,\"bytes_sent\":3,\"flags\":\"-\",\"method\":\"GET\",\"mixed\":\"code-200\",\"path\":\"/\",\"protocol\":\"HTTP/1.1\",\"status\":200,\"upstream\":null}\n"
+        );
+    }
+
+    #[test]
+    fn empty_map_renders_empty_object() {
+        let cjf = CompiledJsonFormat::from_map(&std::collections::BTreeMap::new()).unwrap();
+        assert_eq!(cjf.render(&fixture_record()), "{}\n"); // ADR-0092 §E
+    }
+
+    #[test]
+    fn key_is_json_escaped() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("a\"b".to_string(), "%PROTOCOL%".to_string());
+        let cjf = CompiledJsonFormat::from_map(&map).unwrap();
+        assert_eq!(cjf.render(&fixture_record()), "{\"a\\\"b\":\"HTTP/1.1\"}\n");
+    }
+
+    #[test]
+    fn from_map_rejects_malformed_operator() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("a".to_string(), "%NOPE%".to_string());
+        assert!(CompiledJsonFormat::from_map(&map).is_err());
     }
 
     #[test]
