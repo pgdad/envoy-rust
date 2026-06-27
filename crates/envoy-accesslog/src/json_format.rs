@@ -171,7 +171,9 @@ pub(crate) fn encode_json_value(out: &mut String, segments: &[Segment], r: &Acce
     if let [Segment::Op(op)] = segments {
         encode_single_op(out, op, r);
     } else {
-        let s = render_value_segments(segments, r); // existing render semantics, `-` for absent
+        // M40-B placeholder: T3 threads the real `omit_empty` flag here. For now
+        // `false` keeps the json path byte-unchanged (the `-` sentinel) + the crate green.
+        let s = render_value_segments(segments, r, false); // existing render semantics, `-` for absent
         quote(out, &s);
     }
 }

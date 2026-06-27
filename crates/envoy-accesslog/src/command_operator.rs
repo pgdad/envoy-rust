@@ -400,24 +400,49 @@ fn parse_dynamic_metadata_op(rest: Option<&str>) -> Result<Op, FormatParseError>
 /// later task (the default-format re-expression). Same-crate code (and these
 /// tests) may use the tuple constructor directly.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompiledFormat(pub(crate) Vec<Segment>);
+pub struct CompiledFormat {
+    pub(crate) segments: Vec<Segment>,
+    /// `omit_empty_values` (ADR-0096 §B): when `true`, an absent operator renders
+    /// as the empty string `""` instead of the `-` sentinel. Default `false`.
+    pub(crate) omit_empty: bool,
+}
 
 impl CompiledFormat {
+    /// Same-crate tuple-style constructor: wrap segments with `omit_empty=false`
+    /// (the default-off path). Kept so the in-crate tests + the json/text default
+    /// sites can construct a format from raw segments unchanged.
+    pub(crate) fn new(segments: Vec<Segment>) -> Self {
+        Self {
+            segments,
+            omit_empty: false,
+        }
+    }
+
     /// Parse and compile an inline format STRING into a `CompiledFormat`.
     /// Returns a [`FormatParseError`] (later surfaced as a config-load
-    /// failure) if any operator is unknown, malformed, or unbacked.
+    /// failure) if any operator is unknown, malformed, or unbacked. The
+    /// resulting format has `omit_empty=false`; use [`Self::with_omit_empty`]
+    /// to set the flag from `SubstitutionFormatString.omit_empty_values`.
     pub fn from_inline(s: &str) -> Result<Self, FormatParseError> {
-        parse_format(s).map(CompiledFormat)
+        parse_format(s).map(CompiledFormat::new)
+    }
+
+    /// Builder setter for the `omit_empty_values` flag (ADR-0096 §B); the HCM
+    /// bridge calls this from the config `SubstitutionFormatString`.
+    pub fn with_omit_empty(mut self, omit_empty: bool) -> Self {
+        self.omit_empty = omit_empty;
+        self
     }
 
     /// Evaluate every segment against `record` and concatenate into one line.
     ///
     /// `Literal` segments are emitted verbatim. `Op` segments resolve to their
     /// backing field per §B; absent `Option` fields render as the Envoy
-    /// no-value sentinel `-`. `Req`/`Resp` apply `?`-alt fallback then `:N`
+    /// no-value sentinel `-` (or, when `omit_empty`, the empty string `""` —
+    /// ADR-0096 §B). `Req`/`Resp` apply `?`-alt fallback then `:N`
     /// byte-truncation to the resolved value.
     pub fn render(&self, record: &AccessLogRecord) -> String {
-        render_value_segments(&self.0, record)
+        render_value_segments(&self.segments, record, self.omit_empty)
     }
 }
 
@@ -428,7 +453,11 @@ impl CompiledFormat {
 ///
 /// Data-driven pre-allocation (M32-6): size the buffer to the sum of the literal
 /// segments' byte lengths (an exact lower bound) plus a small operator allowance.
-pub(crate) fn render_value_segments(segments: &[Segment], record: &AccessLogRecord) -> String {
+pub(crate) fn render_value_segments(
+    segments: &[Segment],
+    record: &AccessLogRecord,
+    omit_empty: bool,
+) -> String {
     let literal_len: usize = segments
         .iter()
         .map(|seg| match seg {
@@ -440,7 +469,7 @@ pub(crate) fn render_value_segments(segments: &[Segment], record: &AccessLogReco
     for seg in segments {
         match seg {
             Segment::Literal(s) => out.push_str(s),
-            Segment::Op(op) => render_op(&mut out, op, record),
+            Segment::Op(op) => render_op(&mut out, op, record, omit_empty),
         }
     }
     out
@@ -453,13 +482,16 @@ impl Default for CompiledFormat {
     /// always-valid format string, so the parse cannot fail.
     fn default() -> Self {
         parse_format(crate::default_format::DEFAULT_FORMAT)
-            .map(CompiledFormat)
+            .map(CompiledFormat::new)
             .expect("default format is valid")
     }
 }
 
-/// Render a single operator into `out`.
-fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord) {
+/// Render a single operator into `out`. `omit_empty` (ADR-0096 §B): when `true`,
+/// an absent `Option` operator renders as the empty string `""` instead of the
+/// `-` sentinel (the four substitution sites below).
+fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord, omit_empty: bool) {
+    let empty_or_dash = if omit_empty { "" } else { "-" };
     match op {
         Op::Protocol => out.push_str(&record.protocol),
         Op::ResponseCode => {
@@ -476,14 +508,14 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord) {
             let _ = write!(out, "{}", record.duration.as_millis());
         }
         Op::StartTime => out.push_str(&crate::format_iso8601(record.start_time)),
-        Op::UpstreamHost => out.push_str(record.upstream_host.as_deref().unwrap_or("-")),
+        Op::UpstreamHost => out.push_str(record.upstream_host.as_deref().unwrap_or(empty_or_dash)),
         Op::DynamicMetadata { namespace, key } => out.push_str(
             record
                 .dynamic_metadata
                 .get(namespace)
                 .and_then(|m| m.get(key))
                 .map(String::as_str)
-                .unwrap_or("-"),
+                .unwrap_or(empty_or_dash),
         ),
         Op::Req {
             name,
@@ -493,7 +525,7 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord) {
             // REQ values are all borrowed `&str` from the record.
             let value = resolve_req(name, record)
                 .or_else(|| alt.as_deref().and_then(|a| resolve_req(a, record)))
-                .unwrap_or("-");
+                .unwrap_or(empty_or_dash);
             out.push_str(truncate_bytes(value, *truncate));
         }
         Op::Resp {
@@ -505,7 +537,7 @@ fn render_op(out: &mut String, op: &Op, record: &AccessLogRecord) {
             // from a `Duration` → decimal-ms string).
             let value = resolve_resp(name, record)
                 .or_else(|| alt.as_deref().and_then(|a| resolve_resp(a, record)));
-            let value = value.as_deref().unwrap_or("-");
+            let value = value.as_deref().unwrap_or(empty_or_dash);
             out.push_str(truncate_bytes(value, *truncate));
         }
     }
@@ -597,7 +629,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            CompiledFormat(f).render(&rec()),
+            CompiledFormat::new(f).render(&rec()),
             "m=POST code=200 ua=curl/8.20.0 up=1.2.3.4:80"
         );
     }
@@ -605,19 +637,43 @@ mod tests {
     #[test]
     fn absent_header_renders_dash() {
         let f = parse_format("xff=%REQ(X-FORWARDED-FOR)%").unwrap(); // forwarded_for=None
-        assert_eq!(CompiledFormat(f).render(&rec()), "xff=-");
+        assert_eq!(CompiledFormat::new(f).render(&rec()), "xff=-");
+    }
+
+    // --- phase 40 t2 (ADR-0096 §B): omit_empty sentinel swap on the TEXT path ---
+
+    // A record with no upstream host and no forwarded-for — both absent ops.
+    fn rec_no_upstream() -> AccessLogRecord {
+        let mut r = rec();
+        r.upstream_host = None;
+        r.forwarded_for = None;
+        r
+    }
+
+    #[test]
+    fn omit_empty_swaps_dash_for_empty_in_multi_segment() {
+        let segs = parse_format("up=%UPSTREAM_HOST% x=%REQ(X-FORWARDED-FOR)%").unwrap();
+        // omit=false → the `-` sentinel; omit=true → the empty string (§B / CASE-3).
+        assert_eq!(
+            render_value_segments(&segs, &rec_no_upstream(), false),
+            "up=- x=-"
+        );
+        assert_eq!(
+            render_value_segments(&segs, &rec_no_upstream(), true),
+            "up= x="
+        );
     }
 
     #[test]
     fn truncate_is_byte_count() {
         let f = parse_format("%REQ(USER-AGENT):5%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&rec()), "curl/"); // first 5 bytes
+        assert_eq!(CompiledFormat::new(f).render(&rec()), "curl/"); // first 5 bytes
     }
 
     #[test]
     fn alt_used_when_primary_absent() {
         let f = parse_format("%REQ(X-FORWARDED-FOR?USER-AGENT)%").unwrap(); // xff absent → ua
-        assert_eq!(CompiledFormat(f).render(&rec()), "curl/8.20.0");
+        assert_eq!(CompiledFormat::new(f).render(&rec()), "curl/8.20.0");
     }
 
     // Literals + a simple operator.
@@ -722,7 +778,7 @@ mod tests {
         let mut r = rec();
         r.upstream_service_time = Some(Duration::from_millis(7));
         let f = parse_format("%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "7");
+        assert_eq!(CompiledFormat::new(f).render(&r), "7");
     }
 
     // RESP absent: an unset `upstream_service_time` (the base `rec()`) renders
@@ -730,7 +786,7 @@ mod tests {
     #[test]
     fn resp_upstream_service_time_absent() {
         let f = parse_format("%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&rec()), "-"); // upstream_service_time=None
+        assert_eq!(CompiledFormat::new(f).render(&rec()), "-"); // upstream_service_time=None
     }
 
     // Multi-byte truncation rounds DOWN to a char boundary. "café" is 5 bytes
@@ -741,11 +797,11 @@ mod tests {
         let mut r = rec();
         r.user_agent = Some("café".into());
         let f = parse_format("%REQ(USER-AGENT):4%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "caf"); // byte 4 is mid-"é" → floor to 3
+        assert_eq!(CompiledFormat::new(f).render(&r), "caf"); // byte 4 is mid-"é" → floor to 3
 
         // Truncating to the full 5 bytes is a char boundary → the whole "café".
         let f = parse_format("%REQ(USER-AGENT):5%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "café");
+        assert_eq!(CompiledFormat::new(f).render(&r), "café");
     }
 
     // alt + `:N`: the primary header is absent, so the alt resolves; the `:N`
@@ -754,7 +810,7 @@ mod tests {
     fn alt_resolved_value_is_truncated() {
         // xff absent → alt user-agent "curl/8.20.0" → truncate to 4 bytes.
         let f = parse_format("%REQ(X-FORWARDED-FOR?USER-AGENT):4%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&rec()), "curl");
+        assert_eq!(CompiledFormat::new(f).render(&rec()), "curl");
     }
 
     // M32-2: an empty alternate after '?' (a '?' with nothing after) is
@@ -772,7 +828,7 @@ mod tests {
     #[test]
     fn truncate_zero_is_valid_and_empty() {
         let f = parse_format("%REQ(USER-AGENT):0%").expect("`:0` is a valid truncation");
-        assert_eq!(CompiledFormat(f).render(&rec()), ""); // user_agent present, truncated to 0 bytes
+        assert_eq!(CompiledFormat::new(f).render(&rec()), ""); // user_agent present, truncated to 0 bytes
     }
 
     // ── Task 8: %DYNAMIC_METADATA(namespace:key)% ───────────────────────────
@@ -800,7 +856,7 @@ mod tests {
             .or_default()
             .insert("tier".into(), "prod".into());
         let f = parse_format("%DYNAMIC_METADATA(envoy.test:tier)%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "prod"); // no quotes
+        assert_eq!(CompiledFormat::new(f).render(&r), "prod"); // no quotes
     }
 
     // §A4: an absent key OR an absent namespace renders the single dash `-`.
@@ -813,10 +869,10 @@ mod tests {
             .insert("tier".into(), "prod".into());
         // Absent KEY in a present namespace → `-`.
         let f = parse_format("%DYNAMIC_METADATA(envoy.test:missing)%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "-");
+        assert_eq!(CompiledFormat::new(f).render(&r), "-");
         // Absent NAMESPACE → `-`.
         let f = parse_format("%DYNAMIC_METADATA(envoy.absent:tier)%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "-");
+        assert_eq!(CompiledFormat::new(f).render(&r), "-");
     }
 
     // §A2: a trailing `:N` length suffix is BOOT-FATAL on this operator.
@@ -860,9 +916,9 @@ mod tests {
             .insert("Tier".into(), "prod".into());
         // lowercase `tier` does NOT match the stored `Tier` → `-`.
         let f = parse_format("%DYNAMIC_METADATA(envoy.test:tier)%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "-");
+        assert_eq!(CompiledFormat::new(f).render(&r), "-");
         // exact-case `Tier` matches → `prod`.
         let f = parse_format("%DYNAMIC_METADATA(envoy.test:Tier)%").unwrap();
-        assert_eq!(CompiledFormat(f).render(&r), "prod");
+        assert_eq!(CompiledFormat::new(f).render(&r), "prod");
     }
 }
