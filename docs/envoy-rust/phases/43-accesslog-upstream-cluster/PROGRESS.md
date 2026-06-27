@@ -53,10 +53,36 @@ simultaneously, h2spec, and the fuzz run are the state-4 gate (a)-(e) — NOT ru
 differential pass + the green per-crate tests are state-3 evidence only; the AUTHORITATIVE evidence is the
 Linux CI run quoted at state-4.
 
+## §7.5 Verification gate (state-4) — GREEN on AUTHORITATIVE Linux CI
+
+**AUTHORITATIVE run: `28302749216` @ `1221471` — `completed/success`**
+(https://github.com/pgdad/envoy-rust/actions/runs/28302749216). Both CI jobs green:
+- **`build + test + lint`** → success — covers gates **(a)** fixture `0051-accesslog-upstream-cluster` green
+  (the FIRST proxy/upstream-routed access-log fixture — the byte-exact line
+  `{"method":"GET","mixed":"c=backend","proto":"HTTP/1.1","rcd":"via_upstream","uc":"backend"}`, dialing a
+  real `Http1EchoBackend` over the host-gateway on BOTH proxies) + **(b)** all `0001`-`0050` green
+  SIMULTANEOUSLY (default-absent byte-preservation — the new `upstream_cluster` field defaults `None` + the
+  operator is new) + **(c)** h2spec ≥95% (NO HTTP/2 codec change) + **(e)** `cargo build`/`clippy`/
+  `fmt --check`/`test`/`deny` clean.
+- **`fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)`** → success —
+  covers gate **(d)** the fuzz targets are clean WITH the new `upstream_cluster.yaml` `parse_bootstrap` seed;
+  NO new fuzz target.
+
+**State-4 gate-fix commit:** `1221471` (`style: cargo fmt the phase-43 HCM upstream_cluster routed-cluster
+tests`) — the state-3 T4 implementer's new routed-cluster HCM tests had drifted formatting; `cargo fmt`
+reformats them (pure formatting, NO behavior change). This is the documented "State-4 = CI's first real
+execution" red-at-fmt — caught + fixed at THIS gate per project discipline. The superseded implementation-HEAD
+run (`9d9275c`) was auto-cancelled by the `1221471` push.
+
+**§7.5 (a)-(e) = GREEN — and notably the FIRST proxy access-log fixture (`0051`) passed on Linux CI on its
+first run** (the host-gateway backend dial worked cross-proxy; no bridge-IP false-RED on CI). (f) `REVIEW.md`
+is the state-5 code-review (the SESSION AFTER). The `…h2_handshake…` host-flake that false-REDs locally is
+GREEN on this Linux CI run (CI-authoritative).
+
 ## Carry-forwards (NONE blocks)
 **M42-1** (ADVANCED — `via_upstream` now witnessed on the upstream-success path; the failure-path vocabulary
 still owed) + M39-1/M39-2 + M38-1/M38-2 + CF-39-1 + M40-1 + M37-*/M36-*/M34-*/M33-* + older. Phase 43 does not
 touch `rbac.rs`.
 
-_State-3 implementation COMPLETE. The next session is the state-4 §7.5 verification gate
-(`superpowers:verification-before-completion`)._
+_State-3 implementation COMPLETE; state-4 §7.5 (a)-(e) gate GREEN on AUTHORITATIVE CI `28302749216` @ `1221471`.
+The next session is the state-5 code-review (`superpowers:requesting-code-review`)._
