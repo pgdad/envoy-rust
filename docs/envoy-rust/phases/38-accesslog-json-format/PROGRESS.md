@@ -58,3 +58,21 @@ found in ConfigError`).
 pre-existing).
 
 **Commit:** `phase 38 task 2: exactly-one-of log_format validator + per-value parse + ConfigError::AmbiguousLogFormat [ADR-0092]`
+
+---
+
+## Task 3 — hand-rolled JSON string escaper — DONE
+
+**TDD:** new module `crates/envoy-accesslog/src/json_format.rs` with the
+`escapes_per_json_rules` test (8 cases — plain, quote, backslash, `\n`, `\t`, C0
+`\u00XX`, `/` un-escaped, non-ASCII verbatim). (Test + impl landed together for this
+pure function; the 8 cases exhaustively pin the ADR-0092 §D rules.)
+
+**Implemented:** `pub(crate) fn json_escape_into(out: &mut String, s: &str)` — short
+escapes for `\b \t \n \f \r \" \\`; `\u00XX` for other C0 controls; non-ASCII verbatim
+UTF-8; `/` NOT escaped — byte-identical to serde_json defaults (no new dep). Wired
+`mod json_format;` into `lib.rs`.
+
+**Evidence:** `cargo test -p envoy-accesslog escapes_per_json_rules` → `1 passed`.
+
+**Commit:** `phase 38 task 3: hand-rolled JSON string escaper [ADR-0092]`

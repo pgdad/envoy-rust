@@ -17,6 +17,7 @@ pub mod command_operator;
 pub mod default_format;
 mod error;
 pub mod file_sink;
+mod json_format;
 pub mod record;
 mod sink;
 
