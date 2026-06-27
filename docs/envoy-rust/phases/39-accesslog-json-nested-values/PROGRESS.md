@@ -67,3 +67,25 @@ Per-task TDD evidence (failing test → impl → green → commit). Locked facts
 - `cargo deny check` → advisories ok, bans ok, licenses ok, sources ok (no new dependency; only pre-existing unmatched-license-allowance warnings).
 
 
+
+---
+
+## State-4 — Verification gate (§7.5 (a)-(e)) — COMPLETE
+
+Routed via `superpowers:verification-before-completion`. All command outputs below are FRESH (run at state-4 against `HEAD` = `fffc297`). Per the recalled discipline ([[envoy-rust-state4-ci-first-execution]]) the AUTHORITATIVE full-suite pass is the Linux CI run on the state-3 commit; the local gate is quoted alongside.
+
+**AUTHORITATIVE — Linux CI run `28295620744` @ `fffc297` (state-3 implementation commit) = `completed/success`.** This is the full §7.5 gate on CI: the entire differential fixture suite (`0001`-`0047`, incl. the new `0047-accesslog-json-nested` + the `0046` flat regression witness), h2spec, `cargo build`/`test`/`clippy`/`fmt`/`deny`, and the `parse_bootstrap` + `accesslog_format_parse` fuzz short-budget runs (with the new `json_format_nested.yaml` seed). All green.
+
+**Local gate (fresh, this state-4 session):**
+
+- **(e) `cargo fmt --all -- --check`** → exit 0 (CLEAN).
+- **(e) `cargo build --workspace --all-targets`** → `Finished` (exit 0).
+- **(e) `cargo clippy --workspace --all-targets --all-features -- -D warnings`** → `Finished` (exit 0, no warnings).
+- **(e) `cargo test --workspace`** → all crates green EXCEPT a single non-deterministic false-RED in `envoy-http2` under full-workspace parallel load: `client::tests::send_request_maps_h2_handshake_failure_to_typed_error`. Re-run in isolation: `cargo test -p envoy-http2` → `test result: ok. 74 passed; 0 failed; 1 ignored`. This is the documented host-flake ([[envoyrust-h2-handshake-test-host-flake]]) — pre-existing, NOT a phase-39 regression (phase 39 touches no HTTP/2 code), CI-authoritative (CI passes it). Representative passing crates: `envoy-config` 531/0, `envoy-accesslog` 72/0, `envoy-http1` 132/0, `envoy-cluster` 208/0, `envoy-filter` 160/0.
+- **(e) `cargo deny check`** → `advisories ok, bans ok, licenses ok, sources ok` (exit 0; only benign `license-not-encountered` warnings). NO new dependency.
+- **(a) fixture `0047-accesslog-json-nested`** (isolation, debug `envoy-bin` rebuilt) → `cargo test -p differential --test access_log_json_nested -- --test-threads=1` → `test result: ok. 1 passed; 0 failed`. Cross-proxy byte-identical nested JSON access-log line vs live `envoyproxy/envoy:v1.33.0` (ADR-0094 §H).
+- **(b) fixture `0046-accesslog-json-format`** (the flat-JSON recursion-refactor regression witness) → `cargo test -p differential --test access_log_json_format -- --test-threads=1` → `test result: ok. 1 passed; 0 failed`. Byte-identical — the recursion preserves the phase-38 flat output. The remaining `0001`-`0045` are CI-authoritative (the full suite ran green on `fffc297`; this Docker-Desktop host false-REDs some under parallel load / via the bridge IP).
+- **(c) h2spec** → unchanged (no HTTP/2 codec change this phase); CI-confirmed green on `fffc297` (≥95%).
+- **(d) fuzz** → the EXISTING `parse_bootstrap` + `accesslog_format_parse` targets cover the new recursive surface (the new `json_format_nested.yaml` seed is tracked — verified `git ls-files`); NO new fuzz target, `ci.yml` unchanged; short-budget runs green on `fffc297`.
+
+**Gate verdict:** §7.5 (a)-(e) GREEN (authoritative CI `28295620744` @ `fffc297` `completed/success`; local gate green modulo the documented host false-RED). `#![forbid(unsafe_code)]` holds; NO new crate/dependency/fuzz-target; NO new `ConfigError` variant. (f) `REVIEW.md` is the state-5 code-review (next session). Phase 39 advances to state-5.
