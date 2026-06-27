@@ -833,6 +833,11 @@ async fn serve_connection(
         // once below the writer-arm match from the unified `outgoing:
         // Response` value (see comment at the unified factored site).
         let mut upstream_host_for_log: Option<String> = None; // stays mut — only proxy arm populates
+        // phase 43 (ADR-0100): per-request %UPSTREAM_CLUSTER%. Set at the proxy
+        // ARM ENTRY (where a route resolves to a cluster) — NOT gated on
+        // upstream success, mirroring Envoy: the operator renders the cluster
+        // name even when the upstream attempt then fails.
+        let mut upstream_cluster_for_log: Option<String> = None;
         // phase 42 (ADR-0099): per-request %RESPONSE_CODE_DETAILS%. Set by the
         // synth writer-arm (carries the BuildOutcome detail) and the
         // proxy-success arm (`via_upstream`); error/filter synths leave it None.
@@ -867,6 +872,12 @@ async fn serve_connection(
                     request_hash_key,
                     subset_match,
                 } => {
+                    // phase 43 (ADR-0100): the route resolved to a cluster —
+                    // capture its name for %UPSTREAM_CLUSTER% at the ARM ENTRY,
+                    // BEFORE the endpoint pick / attempt loop, so it renders
+                    // even if the upstream attempt then fails (cluster_name is
+                    // borrowed below, so clone).
+                    upstream_cluster_for_log = Some(cluster_name.clone());
                     // The validator (envoy-config Task 2) ensures every cluster
                     // name referenced from a RouteAction::Route exists in the
                     // bootstrap; the .expect() is defense-in-depth.
@@ -1215,9 +1226,10 @@ async fn serve_connection(
                 request_id: access_log_header_value(&req.headers, "x-request-id"),
                 authority: access_log_header_value(&req.headers, "host"),
                 upstream_host: upstream_host_for_log,
-                // phase 43: %UPSTREAM_CLUSTER% backing field. The HCM that SETS
-                // the routed cluster name is a later task — None for now.
-                upstream_cluster: None,
+                // phase 43 (ADR-0100): %UPSTREAM_CLUSTER% — set at the proxy
+                // arm entry (Some on a routed request, None for direct_response
+                // / synth / error paths).
+                upstream_cluster: upstream_cluster_for_log,
                 // phase 41: the matched route's config `name` (empty = unnamed
                 // → None), rendered by %ROUTE_NAME%. `matched_route` (bound at
                 // resolve_route above) is still live here.
@@ -4067,6 +4079,107 @@ static_resources:
         assert!(
             contents.contains("d=direct_response"),
             "direct_response route → %RESPONSE_CODE_DETAILS% renders `direct_response`; got: {}",
+            contents.trim()
+        );
+    }
+
+    /// phase 43 Task 4: a request routed to a cluster → the access-log
+    /// record's `%UPSTREAM_CLUSTER%` renders the matched cluster's name.
+    /// Set at the proxy-ARM ENTRY (not gated on upstream success), mirroring
+    /// Envoy: the route resolves to `backend` so the operator renders
+    /// regardless of the upstream attempt's outcome. Real routed test: a
+    /// live in-process upstream backs the cluster.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h1_sets_upstream_cluster_from_routed_cluster() {
+        use std::path::PathBuf;
+        use tempfile::tempdir;
+
+        let upstream_response: &'static [u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let upstream_port = spawn_in_process_upstream(upstream_response).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", upstream_port).await;
+
+        let dir = tempdir().expect("tempdir");
+        let path: PathBuf = dir.path().join("access.log");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(
+                path.clone(),
+                envoy_accesslog::CompiledFormat::from_inline("c=%UPSTREAM_CLUSTER%")
+                    .expect("format parses"),
+            )
+            .await
+            .expect("open sink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "to_backend".to_string(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".into(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let contents = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        assert!(
+            contents.contains("c=backend"),
+            "routed-to-cluster request → %UPSTREAM_CLUSTER% renders `backend`; got: {}",
+            contents.trim()
+        );
+    }
+
+    /// phase 43 Task 4: a `direct_response` route never resolves to a
+    /// cluster → `%UPSTREAM_CLUSTER%` renders the `-` empty token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hcm_h1_upstream_cluster_none_for_direct_response() {
+        use std::path::PathBuf;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path: PathBuf = dir.path().join("access.log");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(
+                path.clone(),
+                envoy_accesslog::CompiledFormat::from_inline("c=%UPSTREAM_CLUSTER%")
+                    .expect("format parses"),
+            )
+            .await
+            .expect("open sink"),
+        );
+        let config = hcm_config_with_access_log(vec![sink]).await;
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let _ = drive(config, req).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let contents = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        assert!(
+            contents.contains("c=-"),
+            "direct_response route → %UPSTREAM_CLUSTER% renders the empty `-` token; got: {}",
             contents.trim()
         );
     }
