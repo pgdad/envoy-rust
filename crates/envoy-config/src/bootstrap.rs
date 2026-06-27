@@ -705,7 +705,33 @@ pub struct SubstitutionFormatString {
     #[serde(default)]
     pub text_format_source: Option<DataSourceInline>,
     #[serde(default)]
-    pub json_format: Option<std::collections::BTreeMap<String, String>>,
+    pub json_format: Option<std::collections::BTreeMap<String, JsonFormatValue>>,
+}
+
+/// A `json_format` value — a single `google.protobuf.Struct` value (ADR-0094
+/// §A–§D). Recursive: a command-operator format string (`Format`), a `bool` or
+/// `null` literal (emitted native-typed per §D), a nested object (keys SORTED at
+/// every level, §A — a `BTreeMap`), or a list (CONFIG order preserved, §B — a
+/// `Vec`). NUMERIC literals are NOT accepted: a YAML number matches no
+/// `#[serde(untagged)]` arm → boot-reject (ADR-0094 §D / CF-39-1 — the
+/// protobuf-`double` JSON formatting `1e+06`/`"1.5"` rabbit hole is deferred).
+///
+/// `#[serde(untagged)]` arm ORDER is load-bearing: YAML `null/~` → `Null`,
+/// `true/false` → `Bool`, a string → `Format`, a sequence → `Array`, a map →
+/// `Object`. A bare number deserializes to none of these arms.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonFormatValue {
+    /// YAML `null` / `~` → native JSON `null` (ADR-0094 §D).
+    Null,
+    /// YAML `true` / `false` → native JSON `true` / `false` (ADR-0094 §D).
+    Bool(bool),
+    /// YAML string → a command-operator format string (compiled per-leaf, §C).
+    Format(String),
+    /// YAML sequence → an ordered list (config order, §B).
+    Array(Vec<JsonFormatValue>),
+    /// YAML map → a nested object (keys sorted per level, §A).
+    Object(std::collections::BTreeMap<String, JsonFormatValue>),
 }
 
 /// Models the `inline_string` arm of an `envoy.config.core.v3.DataSource`. The
@@ -4378,13 +4404,10 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                         }
                         (None, Some(map)) => {
                             // Empty map is VALID (ADR-0092 §E → emits `{}\n`);
-                            // validate each value-operator.
+                            // recurse the tree, validating each `Format` LEAF
+                            // operator at any depth (ADR-0094 §G).
                             for value in map.values() {
-                                envoy_accesslog::parse_format(value).map_err(|e| {
-                                    crate::ConfigError::InvalidAccessLogFormat {
-                                        detail: e.to_string(),
-                                    }
-                                })?;
+                                validate_json_format_value(value)?;
                             }
                         }
                         (Some(_), Some(_)) => {
@@ -4401,6 +4424,35 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Recursively validate a `json_format` value tree (ADR-0094 §G). Every `Format`
+/// LEAF (a command-operator string) at any depth is parsed via the EXISTING
+/// `envoy_accesslog::parse_format`; a malformed/unknown operator surfaces as the
+/// EXISTING `ConfigError::InvalidAccessLogFormat`. `Object`/`Array` recurse;
+/// `Bool`/`Null` literal leaves are no-ops. No new `ConfigError` variant.
+fn validate_json_format_value(value: &JsonFormatValue) -> Result<(), crate::ConfigError> {
+    match value {
+        JsonFormatValue::Format(s) => {
+            envoy_accesslog::parse_format(s).map_err(|e| {
+                crate::ConfigError::InvalidAccessLogFormat {
+                    detail: e.to_string(),
+                }
+            })?;
+        }
+        JsonFormatValue::Object(map) => {
+            for v in map.values() {
+                validate_json_format_value(v)?;
+            }
+        }
+        JsonFormatValue::Array(items) => {
+            for v in items {
+                validate_json_format_value(v)?;
+            }
+        }
+        JsonFormatValue::Bool(_) | JsonFormatValue::Null => {}
     }
     Ok(())
 }
@@ -11249,6 +11301,74 @@ json_format:
         crate::parse_bootstrap(&yaml).expect("valid json_format passes");
     }
 
+    // --- Phase 39 T2 (ADR-0094 §G): recursive per-leaf json_format validator ---
+
+    #[test]
+    fn malformed_operator_in_nested_object_leaf_is_invalid_format() {
+        // ADR-0094 §G: a malformed operator in a NESTED object leaf is boot-fatal
+        // via the EXISTING InvalidAccessLogFormat (recursive walk).
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        json_format:
+                          a:
+                            b: "%NOPE%"
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InvalidAccessLogFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_operator_in_nested_list_leaf_is_invalid_format() {
+        // ADR-0094 §G: a malformed operator inside a LIST leaf is boot-fatal too.
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        json_format:
+                          a: [ "%PROTOCOL%", "%NOPE%" ]
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InvalidAccessLogFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn well_formed_nested_json_format_validates_ok() {
+        // ADR-0094 §A–§F: a well-formed recursive config (nested object + list +
+        // bool/null literal leaves) validates Ok.
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/access.log
+                      log_format:
+                        json_format:
+                          top: "%PROTOCOL%"
+                          obj: { method: "%REQ(:METHOD)%", code: "%RESPONSE_CODE%" }
+                          list: [ "%REQ(:METHOD)%", "%RESPONSE_CODE%", "%UPSTREAM_HOST%" ]
+                          flag: true
+                          missing: ~
+"#,
+        );
+        crate::parse_bootstrap(&yaml).expect("well-formed nested json_format validates");
+    }
+
     // --- 06.3 Task 2: D14.3 H1-listener × H2-cluster parse-time validator gate ---
 
     /// Positive: codec_type HTTP1 + cluster with NO typed_extension_protocol_options →
@@ -16706,5 +16826,73 @@ admin:
             matches!(err, crate::ConfigError::UnsupportedHttpFilter { .. }),
             "expected UnsupportedHttpFilter for name mismatch, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod json_format_value_tests {
+    //! Phase 39 T1 (ADR-0094 §A–§D) — recursive `JsonFormatValue` deserialization.
+    use super::{JsonFormatValue, SubstitutionFormatString};
+
+    #[test]
+    fn json_format_recursive_deserialization() {
+        let s: SubstitutionFormatString = serde_yaml::from_str(
+            "json_format:\n  a: \"%PROTOCOL%\"\n  b: true\n  c: ~\n  d: { z: \"%REQ(:METHOD)%\", a: \"x\" }\n  e: [ \"%PROTOCOL%\", false ]\n",
+        )
+        .unwrap();
+        let map = s.json_format.expect("json_format present");
+
+        // string scalar → Format
+        assert_eq!(map["a"], JsonFormatValue::Format("%PROTOCOL%".into()));
+        // true/false → Bool (ADR-0094 §D)
+        assert_eq!(map["b"], JsonFormatValue::Bool(true));
+        // null/~ → Null (ADR-0094 §D)
+        assert_eq!(map["c"], JsonFormatValue::Null);
+
+        // nested map → Object; BTreeMap iterates keys SORTED (a before z) — §A
+        match &map["d"] {
+            JsonFormatValue::Object(inner) => {
+                let keys: Vec<&String> = inner.keys().collect();
+                assert_eq!(keys, vec!["a", "z"], "nested object keys sorted (a,z)");
+                assert_eq!(inner["a"], JsonFormatValue::Format("x".into()));
+                assert_eq!(inner["z"], JsonFormatValue::Format("%REQ(:METHOD)%".into()));
+            }
+            other => panic!("d should be Object, got {other:?}"),
+        }
+
+        // sequence → Array; ORDER PRESERVED (NOT sorted) — §B
+        match &map["e"] {
+            JsonFormatValue::Array(items) => {
+                assert_eq!(
+                    items,
+                    &vec![
+                        JsonFormatValue::Format("%PROTOCOL%".into()),
+                        JsonFormatValue::Bool(false),
+                    ]
+                );
+            }
+            other => panic!("e should be Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_literal_leaf_is_rejected() {
+        // CF-39-1 (ADR-0094 §D): a numeric scalar matches NO untagged arm → ERR.
+        assert!(
+            serde_yaml::from_str::<SubstitutionFormatString>("json_format:\n  n: 42\n").is_err(),
+            "integer literal leaf must be boot-rejected (CF-39-1)"
+        );
+        assert!(
+            serde_yaml::from_str::<SubstitutionFormatString>("json_format:\n  f: 1.5\n").is_err(),
+            "float literal leaf must be boot-rejected (CF-39-1)"
+        );
+    }
+
+    #[test]
+    fn empty_top_map_still_valid() {
+        // ADR-0094 §G: empty top-level map UNCHANGED.
+        let s: SubstitutionFormatString =
+            serde_yaml::from_str("json_format: {}\n").expect("empty map parses");
+        assert!(s.json_format.unwrap().is_empty());
     }
 }
