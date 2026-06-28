@@ -5366,6 +5366,97 @@ static_resources:
         );
     }
 
+    /// Phase 49 T1 backstop (ADR-0106): the no-healthy `pick()->None` synth-503
+    /// arm (hcm.rs:1000-1001) emits `%RESPONSE_FLAGS%` = `UH` (NoHealthyUpstream).
+    /// Clone of `h1_no_healthy_access_log_carries_no_healthy_upstream_rcd` with
+    /// `rf` added to the json_format. `no_healthy_upstream` (set at the
+    /// `pick()->None` arm) is 1:1 with the UH flag, derived at the record-build
+    /// site (hcm.rs:1232). The 503 status/body are UNCHANGED (additive). Keys
+    /// sort UTF-8: rc, rcd, rf.
+    #[tokio::test]
+    async fn h1_no_healthy_access_log_carries_uh_flag() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        // json_format logging %RESPONSE_CODE% (rc) + %RESPONSE_CODE_DETAILS%
+        // (rcd) + %RESPONSE_FLAGS% (rf) — keys sort by UTF-8 byte order
+        // (rc, rcd, rf).
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        // A route to `subset_cluster` whose metadata_match selects a
+        // non-existent subset (`{stage:nonexistent}`) → subset-miss → 503.
+        let mut envoy_lb = std::collections::BTreeMap::new();
+        envoy_lb.insert("stage".to_string(), "nonexistent".to_string());
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_no_fallback_subset().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "subset_cluster".into(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: Some(LbMetadata { envoy_lb }),
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        // The 503 + body must be UNCHANGED by the additive flag derive.
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "no-healthy synth-503 status unchanged: {resp_str}"
+        );
+        assert!(
+            resp_str.ends_with("no healthy upstream"),
+            "no-healthy synth-503 body unchanged: {resp_str}"
+        );
+        // Brief yield so the FileSink flush reaches disk.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rcd\":\"no_healthy_upstream\",\"rf\":\"UH\"}\n",
+            "no-healthy access-log line carries rf:\"UH\": {logged:?}"
+        );
+    }
+
     /// Phase 46 T1 backstop (ADR-0103): drive the FULL H1 dispatch path with a
     /// vhost (`domains:["*"]`) whose SINGLE route matches only `/specific`, then
     /// probe a NON-matching path (`/nomatch`) so the route-walk hits the
