@@ -1,0 +1,49 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0055-envoy-mount/access.log
+    envoy_rust: /tmp/0055-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: GET / with `Host: nomatch.test` on a route table whose SINGLE
+    # vhost has a NON-wildcard `domains: ["match.test"]`. The probe Host
+    # `nomatch.test` is NON-EMPTY and matches NO `domains` entry → the
+    # route-walk's no-matching-virtual_host arm → the deterministic 404
+    # `route_not_found` synth (`synth_404`) at the host-miss (`hcm.rs:1535`)
+    # arm. This is the THIRD failure-path `%RESPONSE_CODE_DETAILS%` witness
+    # (phase 47, ADR-0104), after `no_healthy_upstream` (fixture 0053) and the
+    # route-miss `route_not_found` (fixture 0054). It CONSUMES carry-forward
+    # M46-1 (the host-miss 404 detail, previously `None`).
+    #
+    # The Host MUST be NON-EMPTY: an empty/missing Host trips the codec's
+    # `synth_400` guard BEFORE the vhost-walk (a different path). A non-matching
+    # NON-EMPTY Host reaches the vhost-walk, where `vh_matches` returns false →
+    # `vh = None` → the no-matching-virtual_host `synth_404` arm.
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). There is NO static
+    # expected literal: the `http1_access_log_byte_exact` driver asserts every
+    # line is byte-identical between upstream Envoy v1.33.0 and envoy-rust. The
+    # host-miss synth-404 is deterministic on BOTH sides, so the rendered line
+    # is identical. envoy-rust now SETS `%RESPONSE_CODE_DETAILS%` =
+    # `route_not_found` at the H1 no-matching-virtual_host `synth_404` arm
+    # (`hcm.rs:1535`; was `None` → `null`). Upstream Envoy v1.33 emits the same
+    # string here (state-1 recon: `{"rc":404,"rcd":"route_not_found","rf":"NR"}`).
+    #
+    # The tokens are all config-deterministic regardless of CI run:
+    #   rc:     "%RESPONSE_CODE%"          → 404  (json NUMBER, not a string —
+    #                                              precedent fixture 0047/0053/0054)
+    #   rcd:    "%RESPONSE_CODE_DETAILS%"  → "route_not_found"
+    #   method: "%REQ(:METHOD)%"           → "GET"
+    #   proto:  "%PROTOCOL%"              → "HTTP/1.1"
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rc, rcd (the
+    # `json_format` AUTHORING order { rc, rcd, method, proto } is irrelevant —
+    # the renderer re-sorts at emit time). Compact separators + ONE trailing
+    # `\n` (ADR-0092 §E). The emitted line is:
+    #   {"method":"GET","proto":"HTTP/1.1","rc":404,"rcd":"route_not_found"}
+    # `expected_status: 404` — the driver asserts each probe's status on BOTH
+    # sides before scraping the access-log line (it defaults to 200, the
+    # `direct_response` status). The host-miss synth returns 404, so declare it.
+    - method: get
+      path: /
+      host: nomatch.test
+      expected_status: 404
