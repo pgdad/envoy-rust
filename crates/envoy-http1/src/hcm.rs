@@ -1222,7 +1222,21 @@ async fn serve_connection(
                 path: x_envoy_original_path_or_path(&req).to_owned(),
                 protocol: "HTTP/1.1".to_owned(),
                 response_code: response_status_for_log,
-                response_flags: "-".to_owned(), // 06.2 always emits "-"
+                // phase 48 (ADR-0105): %RESPONSE_FLAGS% = NR (NoRoute) on the
+                // no-route 404 path. `route_not_found` is set (via the writer-arm
+                // at :866) ONLY at the two no-route synth_404 arms (host-miss
+                // :1536 + route-miss :1555) → it is 1:1 with Envoy's NR flag.
+                // All other paths keep the "-" no-flags sentinel. Read by-ref
+                // here; `response_code_details_for_log` is moved into the
+                // `response_code_details:` field below.
+                response_flags: if response_code_details_for_log.as_deref()
+                    == Some("route_not_found")
+                {
+                    "NR"
+                } else {
+                    "-"
+                }
+                .to_owned(),
                 bytes_received: request_body_len,
                 bytes_sent: response_body_len,
                 duration,
