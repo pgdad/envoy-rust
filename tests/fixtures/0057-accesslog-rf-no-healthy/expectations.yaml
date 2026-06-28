@@ -1,0 +1,44 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0057-envoy-mount/access.log
+    envoy_rust: /tmp/0057-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `subset_cluster` via a `metadata_match`
+    # selecting the NON-EXISTENT `stage: nonexistent` subset (the fixture-0038
+    # `/nope` pattern). The `lb_subset_config` is NO_FALLBACK, so the subset
+    # resolves to NO eligible endpoint → `pick()->None` → the no-healthy-upstream
+    # synth-503 (`no healthy upstream`) at ROUTING time — the literal
+    # `127.0.0.1:1` endpoint is never dialed. This is the SECOND non-`-`
+    # %RESPONSE_FLAGS% witness: UH (NoHealthyUpstream) (phase 49, ADR-0106), the
+    # %RESPONSE_FLAGS% analogue of phase 45's %RESPONSE_CODE_DETAILS% =
+    # `no_healthy_upstream` (fixture 0053).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). There is NO static
+    # expected literal: the `http1_access_log_byte_exact` driver asserts every
+    # line is byte-identical between upstream Envoy v1.33.0 and envoy-rust. The
+    # no-healthy synth-503 is deterministic on BOTH sides, so the rendered line
+    # is identical. envoy-rust now DERIVES `%RESPONSE_FLAGS%` = `UH` from
+    # `%RESPONSE_CODE_DETAILS%` = `no_healthy_upstream` at the H1 record-build
+    # site (hcm.rs:1232; was the no-flags sentinel `"-"`).
+    #
+    # The tokens are all config-deterministic regardless of CI run:
+    #   rc:     "%RESPONSE_CODE%"          → 503  (json NUMBER, not a string —
+    #                                              precedent fixture 0047)
+    #   rcd:    "%RESPONSE_CODE_DETAILS%"  → "no_healthy_upstream"
+    #   rf:     "%RESPONSE_FLAGS%"         → "UH"
+    #   method: "%REQ(:METHOD)%"           → "GET"
+    #   proto:  "%PROTOCOL%"              → "HTTP/1.1"
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rc, rcd, rf —
+    # the json_format AUTHORING order { rc, rcd, rf, method, proto } is
+    # irrelevant. Compact separators + ONE trailing `\n` (ADR-0092 §E). The
+    # emitted line is:
+    #   {"method":"GET","proto":"HTTP/1.1","rc":503,"rcd":"no_healthy_upstream","rf":"UH"}
+    # `expected_status: 503` — the driver asserts each probe's upstream status on
+    # BOTH sides before scraping the access-log line (it defaults to 200). The
+    # no-healthy synth returns 503, so declare it.
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
