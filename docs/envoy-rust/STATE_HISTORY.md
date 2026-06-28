@@ -8093,3 +8093,17 @@ Per `BOOTSTRAP_PROMPT.md` §5 state 2 + `SKILL_ROUTING.md`: phase 44 is PICKED +
 **Last commit (state-3):** Phase-48 state-3 implementation — derive + backstops + fixture `0056` + differential test + BEHAVIOR_CONTRACT row + `PROGRESS.md` + STATE advance. 5 code/fixture/doc commits `c406c51` → `29d11b9` → `872a2ac` → `a0d260b` → `4c29e36` plus the state-marker commit. ADR-0105; ledger head ADR-0105.
 
 **Last updated (state-3):** 2026-06-28 (phase-48 STATE-3 IMPLEMENTATION COMPLETE — executed the §5 state-3 implementation, 6 tasks IN ORDER; next session is the §5 state-4 verification).
+
+---
+
+## Phase-48 state-4 verification — superseded four top-section narratives (relocated at the phase-48 state-5 code-review per ADR-0035)
+
+> The `**id:**` / `**status:**` / `## Next expected skill` / `## Last commit` / `## Last updated` blocks that described the phase-48 state-4 verification, superseded in `STATE.md` when the phase-48 state-5 code-review session rewrote them. Preserved verbatim in substance.
+
+**id/status (state-4):** PHASE 48 (`48-accesslog-rf-no-route`) — STATE-4 VERIFICATION COMPLETE; STATE-5 CODE-REVIEW NEXT. Ran the §5 state-4 verification (`superpowers:verification-before-completion`): the full §7.5 gate (a)-(e) PASSED — `cargo build --workspace --all-targets` exit 0; `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0; `cargo fmt --all -- --check` exit 0; `cargo deny check` `advisories ok, bans ok, licenses ok, sources ok`; `cargo test --workspace` green except the SOLE documented Docker host-bridge-IP false-RED `admin_config_dump_server_info` (CI-green); and the new `0056` differential `cargo test -p differential --test access_log_rf_no_route` = 1 passed locally (real Docker, 10.66s, byte-exact both probes) AND green on CI. No new fuzz target (sub-gate (d) N/A). CI for state-3 commit `8c62e5c` (run `28328762177`) = `completed success`.
+
+**Next expected skill (state-4):** phase 48 has `SPEC.md` + `PLAN.md` + `PROGRESS.md` (with the state-4 verification block) but NO `REVIEW.md` → next session is the state-5 code review (`superpowers:requesting-code-review`) → `REVIEW.md`.
+
+**Last commit (state-4):** Phase-48 state-4 verification — §7.5 gate re-run + quoted into `PROGRESS.md` + STATE advance. Docs-only state-marker commit `6dd1b91` (no code/fixture change — verification only). CI run `28333135284` for `6dd1b91` = `completed success`.
+
+**Last updated (state-4):** 2026-06-28 (phase-48 STATE-4 VERIFICATION COMPLETE — ran the §5 state-4 verification, §7.5 gate (a)-(e) PASS; next session is the §5 state-5 code review).
