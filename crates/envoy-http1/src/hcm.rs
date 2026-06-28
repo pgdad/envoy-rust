@@ -1222,19 +1222,22 @@ async fn serve_connection(
                 path: x_envoy_original_path_or_path(&req).to_owned(),
                 protocol: "HTTP/1.1".to_owned(),
                 response_code: response_status_for_log,
-                // phase 48 (ADR-0105): %RESPONSE_FLAGS% = NR (NoRoute) on the
-                // no-route 404 path. `route_not_found` is set (via the writer-arm
-                // at :866) ONLY at the two no-route synth_404 arms (host-miss
-                // :1536 + route-miss :1555) → it is 1:1 with Envoy's NR flag.
-                // All other paths keep the "-" no-flags sentinel. Read by-ref
-                // here; `response_code_details_for_log` is moved into the
+                // phase 48 (ADR-0105) / phase 49 (ADR-0106): %RESPONSE_FLAGS% is
+                // derived 1:1 from the per-request %RESPONSE_CODE_DETAILS%:
+                //   route_not_found     → NR (NoRoute)          — the two no-route
+                //                          synth_404 arms (host-miss :1536 +
+                //                          route-miss :1555).
+                //   no_healthy_upstream → UH (NoHealthyUpstream) — the single
+                //                          pick()->None no-healthy synth-503 arm
+                //                          (:1000-1001).
+                // Each detail is set ONLY on its own arm(s) → each is 1:1 with
+                // its flag. All other paths keep the "-" no-flags sentinel. Read
+                // by-ref here; `response_code_details_for_log` is moved into the
                 // `response_code_details:` field below.
-                response_flags: if response_code_details_for_log.as_deref()
-                    == Some("route_not_found")
-                {
-                    "NR"
-                } else {
-                    "-"
+                response_flags: match response_code_details_for_log.as_deref() {
+                    Some("route_not_found") => "NR",
+                    Some("no_healthy_upstream") => "UH",
+                    _ => "-",
                 }
                 .to_owned(),
                 bytes_received: request_body_len,
