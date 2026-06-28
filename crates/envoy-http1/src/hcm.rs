@@ -1532,7 +1532,8 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
                 path = %req.path,
                 "request rejected: no matching virtual_host"
             );
-            return BuildOutcome::Synth(synth_404(close), None);
+            // phase 47 (ADR-0104): %RESPONSE_CODE_DETAILS% = route_not_found on the host-miss 404 path
+            return BuildOutcome::Synth(synth_404(close), Some("route_not_found"));
         }
     };
 
@@ -5437,6 +5438,99 @@ static_resources:
         assert_eq!(
             logged, "{\"rc\":404,\"rcd\":\"route_not_found\"}\n",
             "route-miss access-log line carries rcd:\"route_not_found\": {logged:?}"
+        );
+    }
+
+    /// Phase 47 T1 backstop (ADR-0104): drive the FULL H1 dispatch path with a
+    /// vhost whose `domains:["match.test"]` is NON-wildcard and a catch-all
+    /// `/` route, then probe with a NON-EMPTY, NON-MATCHING `Host: nomatch.test`
+    /// so the route-walk hits the no-matching-VIRTUAL_HOST `synth_404` arm
+    /// (hcm.rs:1535 — the host-miss arm, NOT the route-miss arm at :1553),
+    /// capturing the emitted FILE json access-log line and asserting it carries
+    /// `rcd:"route_not_found"` (the phase-47 detail set at that arm) — while the
+    /// response is STILL the byte-exact 404 with the standard empty 404 body
+    /// (UNCHANGED). This is the sole in-process proof that the host-miss detail
+    /// threads into the record built unconditionally below the writer-arm match.
+    /// The `Host: nomatch.test` MUST be non-empty: an empty Host would trip the
+    /// codec's `synth_400` guard before the vhost-walk (a different path).
+    #[tokio::test]
+    async fn h1_host_miss_access_log_carries_route_not_found_rcd() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        // json_format logging %RESPONSE_CODE_DETAILS% (key `rcd`) + %RESPONSE_CODE%
+        // (key `rc`) — keys sort by UTF-8 byte order (rc, rcd).
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        // A vhost `domains:["match.test"]` (NON-wildcard) with a catch-all `/`
+        // direct_response route. Probing `Host: nomatch.test` matches NO vhost
+        // → the no-matching-virtual_host arm at :1535 → synth_404 (the route
+        // walk never even runs).
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_empty().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["match.test".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(envoy_config::DirectResponse {
+                            status: 200,
+                            body: envoy_config::DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: nomatch.test\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        // The 404 + standard (empty) 404 body must be UNCHANGED by the additive
+        // detail set.
+        assert!(
+            resp_str.starts_with("HTTP/1.1 404 "),
+            "host-miss synth-404 status unchanged: {resp_str}"
+        );
+        assert!(
+            resp_str.contains("content-length: 0\r\n"),
+            "host-miss synth-404 body unchanged (empty): {resp_str}"
+        );
+        // Brief yield so the FileSink flush reaches disk.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "{\"rc\":404,\"rcd\":\"route_not_found\"}\n",
+            "host-miss access-log line carries rcd:\"route_not_found\": {logged:?}"
         );
     }
 
