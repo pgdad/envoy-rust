@@ -997,7 +997,8 @@ async fn serve_connection(
                                 // phase 45 (ADR-0102): pick()->None is the no-healthy-upstream synth-503
                                 // path (the ONLY `endpoint: None` AttemptResult, hcm.rs:438). Envoy emits
                                 // %RESPONSE_CODE_DETAILS% = "no_healthy_upstream" here (state-1 recon).
-                                response_code_details_for_log = Some("no_healthy_upstream".to_owned());
+                                response_code_details_for_log =
+                                    Some("no_healthy_upstream".to_owned());
                             }
 
                             // L5: per-attempt upstream_rq_total — only for received
