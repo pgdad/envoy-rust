@@ -128,3 +128,105 @@ no §A-§E fact). `#![forbid(unsafe_code)]` holds. The state-4 verification gate
 (the full §7.5 set — Docker differential `0057` + all `0001`-`0056` byte-identical
 + h2spec + fuzz + build/clippy/fmt/test/deny, quoted into this file) runs in the
 SESSION AFTER this one (`superpowers:verification-before-completion`).
+
+---
+
+## State-4 verification
+
+`superpowers:verification-before-completion` + the full BOOTSTRAP_PROMPT §7.5
+(a)-(e) gate. Disk confirmed at entry: `git status` clean, HEAD at the state-3
+commit `3acca8c`, `SPEC.md`+`PLAN.md`+`PROGRESS.md` present, `REVIEW.md` absent,
+STATE `## Active phase` = phase-49 state-3-complete / state-4-next, ROADMAP row
+`49` `in-progress`.
+
+### (a) NEW differential fixture `0057-accesslog-rf-no-healthy` GREEN
+
+`cargo test -p differential access_log_rf_no_healthy`:
+```
+     Running tests/access_log_rf_no_healthy.rs (target/debug/deps/access_log_rf_no_healthy-1c67c56ea59f0ff8)
+test access_log_rf_no_healthy ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
+```
+Cross-proxy-equal `rf:"UH"` on the no-healthy-upstream 503 path. ✅
+
+### (b) all `0001`-`0056` differential fixtures still GREEN (additive — byte-identical)
+
+`cargo test -p differential` (full run). Aggregate fixture file:
+```
+test result: ok. 151 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.60s
+```
+plus every per-fixture binary `test result: ok. 1 passed; 0 failed`. ONE
+non-fixture binary RED — `admin_config_dump_server_info` — is the KNOWN host
+artifact (memory `differential-host-bridge-ip-192-168-65-2`): the `/clusters`
+admin dump lists the backend at `192.168.65.2` (this host's bridge IP, not the
+allow-listed `192.168.65.254`/`172.17.0.1`), so `envoy-only` carries the cluster
+rows and `envoy-rust-only` is empty — a host-routing artifact, NOT a phase-49
+regression (phase 49 touches only the H1 `%RESPONSE_FLAGS%` derive; the admin
+`/clusters` endpoint is untouched). CI-authoritative. ✅ (additive holds)
+
+### (c) h2spec ≥95%
+
+NO HTTP/2 codec change this phase (the single `src/` edit is the H1
+`%RESPONSE_FLAGS%` derive at `hcm.rs:1232`). h2spec is CI-authoritative
+(memory `h2spec-3-5-2-preface-host-sensitive`). ✅ (unchanged surface)
+
+### (d) fuzz clean
+
+NO new fuzz target this phase (`%RESPONSE_FLAGS%` is a pre-existing operator;
+`ci.yml` unchanged). `parse_bootstrap` / `accesslog_format_parse` are
+CI-authoritative. ✅ (SKIP — no target added)
+
+### (e) build / clippy / fmt / test / deny ALL clean
+
+- `cargo fmt --all -- --check` → exit 0 (clean).
+- `cargo build --workspace --all-targets` → `Finished dev profile`, exit 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  → `Finished dev profile`, exit 0 (no warnings).
+- `cargo test --workspace --exclude differential` → every crate
+  `test result: ok` **0 failed** EXCEPT the KNOWN host-flake
+  `client::tests::send_request_maps_h2_handshake_failure_to_typed_error`
+  (memory `envoyrust-h2-handshake-test-host-flake`: handshake unexpectedly
+  succeeds on this host's networking; pre-existing, CI-authoritative, not a
+  regression). envoy-http1 unit tests all green incl. the new `rf:"UH"` backstop.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`,
+  exit 0 (only `license-not-encountered` warnings — allow-list entries unused,
+  non-fatal).
+
+### Known host artifacts (NOT regressions — CI re-run authoritative)
+
+Two locally-RED items are pre-existing host-specific artifacts, both documented
+in memory and both CI-authoritative: `admin_config_dump_server_info` (bridge-IP
+`192.168.65.2`) and `send_request_maps_h2_handshake_failure_to_typed_error`
+(h2-handshake host-flake). The Docker differential full `0001`-`0057` set,
+h2spec, and fuzz are CI-authoritative per memory
+`envoy-rust-state4-ci-first-execution`.
+
+### CI verdict (AUTHORITATIVE — the §7.5 gate is met by CI)
+
+The state-3 implementation HEAD `3acca8c` (which carries the full phase-49 diff:
+the `hcm.rs:1232` derive arm + the backstop + fixture `0057` + the differential
+test + the BEHAVIOR_CONTRACT row) is **CI-GREEN** on the Linux runner that runs
+the Docker differential, h2spec, and fuzz:
+
+```
+$ gh run view 28336975751
+✓ main ci · 28336975751
+Triggered via push
+
+JOBS
+✓ fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each) in 4m3s
+✓ build + test + lint in 5m9s
+```
+`gh run list --branch main`: `completed  success  phase 49: state-3
+implementation COMPLETE …  ci  main  push  28336975751  5m12s`.
+
+- The `build + test + lint` job (GREEN) runs the full Docker differential —
+  fixture `0057` cross-proxy-equal `rf:"UH"` **(a)** + all `0001`-`0056`
+  byte-identical **(b)** — plus h2spec ≥95% **(c)** and
+  build/clippy/fmt/test/deny **(e)**.
+- The `fuzz` job (GREEN) runs `parse_bootstrap` + `accesslog_format_parse`
+  (among others) clean **(d)**.
+
+All §7.5 (a)-(e) gate items PASS on CI. The state-4 advance commit (this
+`PROGRESS.md` section + the STATE/STATE_HISTORY narrative roll-over) is docs-only
+and does not alter the verified verdict.
