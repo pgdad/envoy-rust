@@ -136,3 +136,68 @@ deferred.
 the session AFTER this — re-runs the full §7.5 gate in CI (Docker differential
 `0056` green + all `0001`-`0055` byte-identical + h2spec + fuzz + deny) and
 quotes the outputs here.
+
+---
+
+## State-4 verification (`superpowers:verification-before-completion`) — ✅ GATE PASSED
+
+Fresh §7.5 phase-done gate re-run this session (a separate session from state-3).
+All six sub-gates evaluated; every command output quoted below.
+
+**(e) Local toolchain gates — all clean:**
+
+- `cargo build --workspace --all-targets` →
+  `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 1.20s` — **exit 0**.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` →
+  `Finished \`dev\` profile … in 3.63s`, no warnings — **exit 0**.
+- `cargo fmt --all -- --check` → no output — **exit 0** (tree already formatted).
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` — **exit 0**
+  (the four `license-not-encountered` warnings for `BSD-2-Clause`/`MPL-2.0`/
+  `Unicode-DFS-2016`/`Zlib` are pre-existing unmatched-allowance notes, non-fatal).
+- `cargo test --workspace` → 153-test unit run `151 passed; 0 failed; 2 ignored`
+  plus the per-fixture differential runs; the **sole** failure is
+  `differential::admin_config_dump_server_info` — the DOCUMENTED Docker
+  host-bridge-IP false-RED (`text_lines diverged after allow-lists: envoy-only:
+  ["backend::192.168.65.2:35541::… hostname::host.docker.internal …"]`,
+  `envoy-rust-only: []`; memory `differential-host-bridge-ip-192-168-65-2`). It is
+  the admin `/clusters` endpoint, unrelated to access-log response-flags / phase
+  48, and is **green on CI** (run `28328762177`, below).
+
+**(a) New differential fixture `0056-accesslog-rf-no-route` — GREEN locally + CI:**
+
+- `cargo test -p differential --test access_log_rf_no_route` →
+  `test access_log_rf_no_route ... ok` / `test result: ok. 1 passed; 0 failed`
+  (real Docker run, 10.66s) — **exit 0**. The no-route 404 path never reaches a
+  backend, so it does NOT hit the `192.168.65.2` bridge-IP flake; passes BYTE-EXACT
+  locally on this host as well as on CI. Both probes (route-miss `Host: match.test`
+  `GET /nomatch`; host-miss `Host: nomatch.test` `GET /specific`) match Envoy's
+  `{… "rf":"NR"}` line byte-for-byte.
+
+**(b) Pre-existing differential fixtures `0001`-`0055` — still green:**
+
+- All pass except the single documented `admin_config_dump_server_info` host-flake
+  above (CI-green). No existing fixture both hits a no-route 404 AND logs
+  `%RESPONSE_FLAGS%`, so all `0001`-`0055` remain byte-identical (the additive
+  derive at `hcm.rs:1225` only fires on `route_not_found`).
+
+**(c) Conformance suites (h2spec) — CI-green:** the phase introduces no H2/H1
+framing change (H1-only access-log field derive), and the state-3 commit's CI run
+passed the h2spec gate at threshold.
+
+**(d) New fuzzers — N/A:** phase 48 adds NO new `cargo-fuzz` target (no new
+parser/decoder surface — a single in-process field-expression change), so sub-gate
+(d) has nothing to run.
+
+**(f) `REVIEW.md` — deferred to state-5** (`superpowers:requesting-code-review`),
+the session after this per §5.1 (one state per session).
+
+**CI authority — state-3 commit `8c62e5c` run `28328762177` = `completed success`
+(5m8s):** the Docker differential (all fixtures incl. `0056`), h2spec, fuzz
+short-budget, and `cargo deny` all green in CI on the pushed HEAD. `HEAD` is in
+sync with `origin/main` (nothing to push for verification; state-4 adds only this
+PROGRESS append + STATE advance).
+
+**State-4 outcome:** §7.5 gate (a)-(e) PASS with the sole exception being the
+documented, CI-green Docker host-bridge-IP false-RED (`admin_config_dump_server_info`).
+Implementation is VERIFIED. `#![forbid(unsafe_code)]` holds. **Next:** state-5
+code review (`superpowers:requesting-code-review`) → `REVIEW.md`.
