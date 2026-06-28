@@ -993,6 +993,11 @@ async fn serve_connection(
                                 // attempt's endpoint wins). Skipped on pick()->None.
                                 upstream_host_for_log = Some(endpoint.to_string());
                                 response_code_details_for_log = Some("via_upstream".to_owned());
+                            } else {
+                                // phase 45 (ADR-0102): pick()->None is the no-healthy-upstream synth-503
+                                // path (the ONLY `endpoint: None` AttemptResult, hcm.rs:438). Envoy emits
+                                // %RESPONSE_CODE_DETAILS% = "no_healthy_upstream" here (state-1 recon).
+                                response_code_details_for_log = Some("no_healthy_upstream".to_owned());
                             }
 
                             // L5: per-attempt upstream_rq_total — only for received
@@ -5212,6 +5217,135 @@ static_resources:
         assert_eq!(
             logged, "prod / -\n",
             "access log renders present key `prod` and absent key `-`: {logged:?}"
+        );
+    }
+
+    /// Phase 45 T1 backstop (ADR-0102): build a STATIC NO_FALLBACK subset
+    /// cluster `subset_cluster` with ONE endpoint at a literal-unreachable
+    /// `127.0.0.1:1` carrying `metadata.filter_metadata.envoy.lb: {stage:prod}`.
+    /// A route whose `metadata_match` selects `{stage:nonexistent}` resolves to
+    /// NO subset → `pick_endpoint -> None` → the no-healthy synth-503 (the
+    /// endpoint is never dialed). Mirrors fixture-0038's `/nope` trigger.
+    async fn cluster_mgr_no_fallback_subset() -> Arc<envoy_cluster::ClusterManager> {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: subset_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      lb_subset_config:
+        fallback_policy: NO_FALLBACK
+        subset_selectors:
+          - keys: [stage]
+      load_assignment:
+        cluster_name: subset_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+                metadata:
+                  filter_metadata:
+                    envoy.lb: { stage: prod }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
+        Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+                .await
+                .expect("cluster mgr"),
+        )
+    }
+
+    /// Phase 45 T1 backstop (ADR-0102): drive the FULL H1 dispatch path to a
+    /// NO_FALLBACK subset-miss cluster so `pick_endpoint -> None` (the no-healthy
+    /// synth-503 arm, hcm.rs:438), capturing the emitted FILE json access-log
+    /// line and asserting it carries `rcd:"no_healthy_upstream"` (the phase-45
+    /// `else`-branch set at the Proxy arm) — while the response is STILL the
+    /// byte-exact 503 + `no healthy upstream` body (UNCHANGED). This is the sole
+    /// in-process proof that the no-healthy detail threads into the record built
+    /// unconditionally below the writer-arm match (hcm.rs:~1243).
+    #[tokio::test]
+    async fn h1_no_healthy_access_log_carries_no_healthy_upstream_rcd() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        // json_format logging %RESPONSE_CODE_DETAILS% (key `rcd`) + %RESPONSE_CODE%
+        // (key `rc`) — keys sort by UTF-8 byte order (rc, rcd).
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        // A route to `subset_cluster` whose metadata_match selects a
+        // non-existent subset (`{stage:nonexistent}`) → subset-miss → 503.
+        let mut envoy_lb = std::collections::BTreeMap::new();
+        envoy_lb.insert("stage".to_string(), "nonexistent".to_string());
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: cluster_mgr_no_fallback_subset().await,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "subset_cluster".into(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: Some(LbMetadata { envoy_lb }),
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        // The 503 + body must be UNCHANGED by the additive detail set.
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "no-healthy synth-503 status unchanged: {resp_str}"
+        );
+        assert!(
+            resp_str.ends_with("no healthy upstream"),
+            "no-healthy synth-503 body unchanged: {resp_str}"
+        );
+        // Brief yield so the FileSink flush reaches disk.
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rcd\":\"no_healthy_upstream\"}\n",
+            "no-healthy access-log line carries rcd:\"no_healthy_upstream\": {logged:?}"
         );
     }
 
