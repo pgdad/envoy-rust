@@ -992,7 +992,28 @@ async fn serve_connection(
                                 // for the access-log `%UPSTREAM_HOST%` token (last
                                 // attempt's endpoint wins). Skipped on pick()->None.
                                 upstream_host_for_log = Some(endpoint.to_string());
-                                response_code_details_for_log = Some("via_upstream".to_owned());
+                                // phase 50 (ADR-0107): discriminate the pool-overflow
+                                // outcome (endpoint:Some + outcome:None — UNIQUELY the
+                                // AcquireOutcome::Overflow result, hcm.rs:640; success
+                                // :600 / reset :620 / connect-fail :629 all carry a
+                                // non-None outcome) from a real upstream response. The
+                                // overflow path is NOT a real upstream response →
+                                // Envoy emits %RESPONSE_CODE_DETAILS% =
+                                // "upstream_reset_before_response_started{overflow}"
+                                // / %RESPONSE_FLAGS% = "UO" (state-0 recon); the
+                                // derive at :1258 maps the detail => "UO". Covers BOTH
+                                // pool arms (max_connections :503/:508 +
+                                // max_pending_requests :510/:515). All other
+                                // endpoint:Some outcomes keep "via_upstream"
+                                // (byte-identical to pre-phase-50).
+                                response_code_details_for_log = Some(
+                                    if attempt.outcome.is_none() {
+                                        "upstream_reset_before_response_started{overflow}"
+                                    } else {
+                                        "via_upstream"
+                                    }
+                                    .to_owned(),
+                                );
                             } else {
                                 // phase 45 (ADR-0102): pick()->None is the no-healthy-upstream synth-503
                                 // path (the ONLY `endpoint: None` AttemptResult, hcm.rs:438). Envoy emits
@@ -1222,14 +1243,20 @@ async fn serve_connection(
                 path: x_envoy_original_path_or_path(&req).to_owned(),
                 protocol: "HTTP/1.1".to_owned(),
                 response_code: response_status_for_log,
-                // phase 48 (ADR-0105) / phase 49 (ADR-0106): %RESPONSE_FLAGS% is
-                // derived 1:1 from the per-request %RESPONSE_CODE_DETAILS%:
+                // phase 48 (ADR-0105) / phase 49 (ADR-0106) / phase 50 (ADR-0107):
+                // %RESPONSE_FLAGS% is derived 1:1 from the per-request
+                // %RESPONSE_CODE_DETAILS%:
                 //   route_not_found     → NR (NoRoute)          — the two no-route
-                //                          synth_404 arms (host-miss :1536 +
-                //                          route-miss :1555).
+                //                          synth_404 arms (host-miss :1574 +
+                //                          route-miss :1593).
                 //   no_healthy_upstream → UH (NoHealthyUpstream) — the single
                 //                          pick()->None no-healthy synth-503 arm
-                //                          (:1000-1001).
+                //                          (:1021-1022).
+                //   upstream_reset_before_response_started{overflow}
+                //                       → UO (UpstreamOverflow) — the overflow
+                //                          synth-503: both pool arms (the
+                //                          outcome:None discriminator at :1010) and
+                //                          the request-budget arm (:923).
                 // Each detail is set ONLY on its own arm(s) → each is 1:1 with
                 // its flag. All other paths keep the "-" no-flags sentinel. Read
                 // by-ref here; `response_code_details_for_log` is moved into the
@@ -1237,6 +1264,7 @@ async fn serve_connection(
                 response_flags: match response_code_details_for_log.as_deref() {
                     Some("route_not_found") => "NR",
                     Some("no_healthy_upstream") => "UH",
+                    Some("upstream_reset_before_response_started{overflow}") => "UO",
                     _ => "-",
                 }
                 .to_owned(),
@@ -5457,6 +5485,137 @@ static_resources:
         assert_eq!(
             logged, "{\"rc\":503,\"rcd\":\"no_healthy_upstream\",\"rf\":\"UH\"}\n",
             "no-healthy access-log line carries rf:\"UH\": {logged:?}"
+        );
+    }
+
+    /// Phase 50 (ADR-0107) §F backstop: drive the FULL H1 dispatch path with a
+    /// CONFIGURED pool (`pool_mgr: Some`) whose cluster carries
+    /// `circuit_breakers.thresholds:[{max_connections:1, max_pending_requests:0}]`
+    /// and a single dead endpoint (`127.0.0.1:1`, never dialed). The first
+    /// connect-on-miss is rejected with `PoolError::PendingOverflow` → the
+    /// `AcquireOutcome::Overflow` → `AttemptResult{endpoint:Some, outcome:None}`
+    /// consumed at the retry-loop site (hcm.rs:990) → the overflow synth-503.
+    /// Asserts the FILE json access-log line carries the overflow detail and the
+    /// derived UO flag — the sole in-process proof of §A's outcome discriminator
+    /// + §B's derive arm on the POOL-overflow path. Fail-first: pre-change it
+    /// renders `"rcd":"via_upstream","rf":"-"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_pool_overflow_access_log_carries_uo_flag() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        // STATIC cluster, dead endpoint 127.0.0.1:1 (never dialed), circuit
+        // breakers max_connections:1 / max_pending_requests:0 → the
+        // connect-on-miss pending-gate rejects the first request.
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1
+            max_pending_requests: 0
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 1 } } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("cluster mgr"),
+        );
+        let pool_token = tokio_util::sync::CancellationToken::new();
+        let pool_mgr = crate::pool::H1PoolManager::for_bootstrap(
+            &bootstrap,
+            &cluster_mgr,
+            Arc::clone(&registry),
+            pool_token.clone(),
+        )
+        .expect("pool manager builds");
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr: Arc::clone(&cluster_mgr),
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: Some(Arc::clone(&pool_mgr)),
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        // The overflow synth-503 + 81-byte body must be UNCHANGED.
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "overflow synth-503 status unchanged: {resp_str}"
+        );
+        assert!(
+            resp_str.ends_with(
+                "upstream connect error or disconnect/reset before headers. reset reason: overflow"
+            ),
+            "overflow synth-503 body unchanged: {resp_str}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged,
+            "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{overflow}\",\"rf\":\"UO\"}\n",
+            "pool-overflow access-log line carries the overflow rcd + rf:\"UO\": {logged:?}"
         );
     }
 
