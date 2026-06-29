@@ -87,3 +87,56 @@
 ## Acceptance (§7.5 — re-run at state-4 on CI)
 
 (a) fixture `0060` green (cross-proxy status `503` + whole-line `{"rc":503,"rf":"UF"}`) — **CI-authoritative**; (b) `0001`–`0059` all green simultaneously (additive — `connect_failure_for_log` is false on every existing fixture; the 502→503 change touches no existing GREEN fixture); (c) h2spec ≥95% (no HTTP/2 change); (d) `parse_bootstrap`/`accesslog_format_parse` fuzz clean (no new target); (e) build/clippy/fmt/test/deny clean (Tasks 1/2/6/7 — done locally); (f) `REVIEW.md` approved. `#![forbid(unsafe_code)]` holds; NO new crate/dependency/fuzz-target/`Op`/`AccessLogRecord` field/`ConfigError` variant.
+
+---
+
+# State-4 verification (§7.5 gate) — COMPLETE
+
+> Ran `superpowers:verification-before-completion`. Fresh evidence quoted below. The Docker differential + h2spec + fuzz gates (a)–(d) are **CI-authoritative** on this dev host (its Docker bridge routes the backend via `192.168.65.2` and flakes accept-ready/port-reuse under parallel load — memories `differential-host-bridge-ip-192-168-65-2`, `differential-fixtures-flake-under-parallel-load`, `eds-fatal-startup-test-port-reuse-flake`). The authoritative evidence is the CI run on the exact state-3 commit `d10fdc4`.
+
+## (a)+(b)+(c)+(d) — CI run on `d10fdc4` = SUCCESS (authoritative)
+
+```
+$ gh run view 28401920739 --json conclusion,status,headSha
+conclusion=success status=completed sha=d10fdc4e6ebaaa32fa150aaa63e853d009d0018d
+  ✓ build + test + lint in 5m30s
+    ✓ fmt  ✓ clippy  ✓ build
+    ✓ install h2spec
+    ✓ pre-pull upstream Envoy image
+    ✓ test (includes differential harness → Docker)   ← fixture 0060 + 0001-0059 + h2spec
+    ✓ cargo deny check
+  ✓ fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each) in 4m3s
+```
+
+- **(a) fixture `0060` green** + **(b) `0001`–`0059` green** — the CI `test` job (which runs the differential harness against real upstream Envoy v1.33.0) passed on `d10fdc4`. Locally too, `access_log_rf_connect_failure` (the `0060` driver) PASSED this session (`test result: ok. 1 passed` — see (e) below).
+- **(c) h2spec ≥95%** — the CI `test` job (which installs + runs h2spec as a conformance gate) passed; NO HTTP/2 codec change this phase.
+- **(d) fuzz clean** — the CI `fuzz` job passed all four targets (no new target — `%RESPONSE_FLAGS%` is an existing operator; `ci.yml` unchanged).
+
+## (e) — local deterministic gate, fresh this session
+
+```
+$ cargo build --workspace --all-targets            → Finished; EXIT=0
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings → Finished; EXIT=0
+$ cargo fmt --all -- --check                        → (no diff); EXIT=0
+$ cargo deny check                                  → advisories ok, bans ok, licenses ok, sources ok; EXIT=0
+$ cargo test --workspace
+    differential (lib): test result: ok. 151 passed; 0 failed; 2 ignored
+    access_log_rf_connect_failure (0060 driver): test result: ok. 1 passed; 0 failed   ← THIS PHASE
+    (all other access_log_* differential drivers: ok. 1 passed each)
+    envoy-http1 (state-3): 148 passed incl. h1_connect_failure_access_log_carries_uf_flag + the 3 flipped status tests
+```
+
+**Local-only Docker host-limitation failures (NOT regressions, CI-authoritative — confirmed green on CI):** under full-workspace parallel `cargo test`, the differential/fatal-startup fixtures rotate non-deterministically RED on this host:
+- `admin_config_dump_server_info` — RED on `192.168.65.2` cluster-stat keys (this host's Docker bridge routes the backend via the non-allow-listed `192.168.65.2`; deterministic host limitation, memory `differential-host-bridge-ip-192-168-65-2`). Unrelated to phase 52 (an admin config_dump fixture).
+- `access_log_route_name` — "upstream Envoy never became accept-ready" Docker testcontainer flake (passes in isolation; memory `differential-fixtures-flake-under-parallel-load`). Unrelated (fixture 0049/phase 41).
+- `missing_rds_file_is_fatal` — `reserve_port()` ephemeral-port-reuse flake (passes in isolation; memory `eds-fatal-startup-test-port-reuse-flake`). Unrelated (xDS RDS).
+
+All three are on surfaces untouched by phase 52, and the CI run on `d10fdc4` (which runs the same differential harness) is GREEN — confirming they are host limitations, not phase-52 regressions.
+
+## (f) `REVIEW.md` — NOT this state
+
+Gate (f) is the §5 state-5 code-review (`superpowers:requesting-code-review` → `REVIEW.md`), the SESSION AFTER this verification (§5.1: one state per session).
+
+## State-4 disposition
+
+§7.5 gates (a)–(e) **PASS** (CI-authoritative green on `d10fdc4` + local deterministic clean). `#![forbid(unsafe_code)]` holds; NO new crate/dependency/fuzz-target/`Op`/`AccessLogRecord` field/`ConfigError` variant. **ADR-0111 did NOT fire.** → advance STATE to "state-4 verification COMPLETE → state-5 code-review NEXT".
