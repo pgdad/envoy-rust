@@ -222,3 +222,73 @@ committed diff (T4, prose-only). All reviews returned ✅ spec compliant.
   run the full §7.5 (a)-(f) and quote all command outputs into this PROGRESS.md;
   the Docker differential (`0058` green + `0001`-`0057` byte-identical) is
   CI-authoritative.
+
+## State-4 verification
+
+Ran the FULL §7.5 (a)-(f) gate per `superpowers:verification-before-completion`.
+Disk was authoritative at gate time: `git status` clean, `HEAD` at the state-3
+STATE-marker `b200ac3`, no `REVIEW.md`. The DEBUG `envoy-bin` was rebuilt before
+the local differential (memory `differential-harness-uses-debug-envoy-bin`).
+
+**AUTHORITATIVE EVIDENCE — CI run `28365357127` on `b200ac3` (the state-3 push):**
+
+```
+$ gh run list --json databaseId,headSha,status,conclusion,workflowName
+{"conclusion":"success","databaseId":28365357127,"headSha":"b200ac3...","status":"completed","workflowName":"ci"}
+
+$ gh run view 28365357127 --json jobs --jq '.jobs[] | {name, conclusion}'
+{"conclusion":"success","name":"fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)"}
+{"conclusion":"success","name":"build + test + lint"}
+```
+
+Both jobs PASS — the `build + test + lint` job is the full Docker differential
+harness (incl. fixture `0058` + `0001`-`0057`), fmt, clippy, cargo-deny, test;
+the `fuzz` job is the four short-budget targets. This satisfies §7.5 (a)-(e)
+authoritatively (memory `envoy-rust-state4-ci-first-execution`: the Docker
+differential is CI-authoritative).
+
+**Local corroboration (this gate session), per §7.5 letter:**
+
+- **(a) fixture `0058-accesslog-rf-overflow` differential — GREEN.**
+  ```
+  $ cargo test --workspace  (… tests/access_log_rf_overflow.rs)
+  test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s
+  ```
+  Cross-proxy-equal `{"rc":503,"rcd":"upstream_reset_before_response_started{overflow}","rf":"UO"}`.
+
+- **(b) all pre-existing `0001`-`0057` differential fixtures — GREEN (additive /
+  byte-identical).** Every other access-log + differential test passed; the in-crate
+  differential lib reported `test result: ok. 151 passed; 0 failed; 2 ignored`.
+  The ONLY RED in the workspace run was `admin_config_dump_server_info`, which is
+  the documented **host-only bridge-IP false-RED** (memory
+  `differential-host-bridge-ip-192-168-65-2`) — diverged on
+  `backend::192.168.65.2:<port>::…` `/clusters` lines (this host routes the
+  backend via `192.168.65.2`, not the allow-listed IP). **NOT a regression**;
+  CI `28365357127` passed this fixture; `known-failures.txt` NOT trimmed.
+
+- **(c) h2spec ≥ threshold — N/A** (NO HTTP/2 codec change this phase); covered
+  GREEN by the CI `build + test + lint` job.
+
+- **(d) new fuzzer short-budget CI run — N/A** (NO new fuzz target;
+  `%RESPONSE_FLAGS%`/`%RESPONSE_CODE_DETAILS%` are existing operators). The CI
+  `fuzz` job (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse)
+  ran GREEN.
+
+- **(e) build / clippy / fmt / test / deny — ALL clean:**
+  ```
+  $ cargo fmt --all -- --check                                         → EXIT=0
+  $ cargo build --workspace --all-targets                              → Finished; BUILD_EXIT=0
+  $ cargo clippy --workspace --all-targets --all-features -- -D warnings → Finished; CLIPPY_EXIT=0
+  $ cargo test --workspace                                             → all GREEN except the host-only
+                                                                          bridge-IP false-RED above (CI-authoritative GREEN)
+  $ cargo deny check                                                   → advisories ok, bans ok, licenses ok, sources ok; DENY_EXIT=0
+  ```
+  (`cargo deny` emits two pre-existing `unmatched license allowance` WARNINGS for
+  `Unicode-DFS-2016`/`Zlib` — warnings, not errors; check result `ok`.)
+
+- **(f) `REVIEW.md` — DEFERRED to state-5** (NOT this session, per §5.1 one-state-per-session).
+
+**Verdict:** §7.5 (a)-(e) MET (CI-authoritative + locally corroborated; the sole
+local RED is a known host-only artifact, not a regression). Phase 50 advances to
+**state-5 (code-review) NEXT**. No `stop` file (mission incomplete — families 09+
+have unbuilt rows).
