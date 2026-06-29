@@ -842,6 +842,16 @@ async fn serve_connection(
         // synth writer-arm (carries the BuildOutcome detail) and the
         // proxy-success arm (`via_upstream`); error/filter synths leave it None.
         let mut response_code_details_for_log: Option<String> = None;
+        // phase 51 (ADR-0108): per-request %RESPONSE_FLAGS% = "URX" discriminator.
+        // URX (UpstreamRetryLimitExceeded) is the FIRST flag NOT 1:1 with a unique
+        // %RESPONSE_CODE_DETAILS% — the retry-limit-exceeded path's rcd is the
+        // SHARED "via_upstream" (a real upstream 503, already matching Envoy), so
+        // the :1274 derive cannot key on rcd here. Set true ONLY at the retry-loop
+        // limit-exceeded exit (the same gate as upstream_rq_retry_limit_exceeded);
+        // read by the %RESPONSE_FLAGS% derive below. `Copy` → no borrow/move
+        // interaction with the rcd String. Stays false on every other path
+        // (default → "-"/no-flags).
+        let mut retry_limit_exceeded_for_log = false;
 
         // 07.1 Task 5: per-arm-populated response value, written to the wire
         // once below the match (factored unified-site). 07.1 Task 6 flipped
@@ -1126,6 +1136,20 @@ async fn serve_connection(
                         if attempts > 1 && !retry_budget_blocked {
                             if final_retriable {
                                 cluster.upstream_rq_retry_limit_exceeded().inc();
+                                // phase 51 (ADR-0108): the L9 retry-limit-exceeded
+                                // exit — num_retries consumed with the final attempt
+                                // still retriable → the last upstream response is
+                                // surfaced downstream verbatim. Envoy renders
+                                // %RESPONSE_FLAGS% = "URX" here (access-log-only,
+                                // never a response header). Set the discriminator
+                                // co-located with the counter (one shared gate) so
+                                // the %RESPONSE_FLAGS% derive renders "URX". The rcd
+                                // stays "via_upstream" (a real upstream 503 —
+                                // UNCHANGED). EXCLUDED: the retry-BUDGET-blocked exit
+                                // (gated out by !retry_budget_blocked) and the
+                                // pre-loop request-budget overflow (bypasses the loop
+                                // → renders "UO").
+                                retry_limit_exceeded_for_log = true;
                             } else {
                                 cluster.upstream_rq_retry_success().inc();
                             }
@@ -1253,9 +1277,15 @@ async fn serve_connection(
                 path: x_envoy_original_path_or_path(&req).to_owned(),
                 protocol: "HTTP/1.1".to_owned(),
                 response_code: response_status_for_log,
-                // phase 48 (ADR-0105) / phase 49 (ADR-0106) / phase 50 (ADR-0107):
-                // %RESPONSE_FLAGS% is derived 1:1 from the per-request
-                // %RESPONSE_CODE_DETAILS%:
+                // phase 48 (ADR-0105) / 49 (ADR-0106) / 50 (ADR-0107) / 51
+                // (ADR-0108): %RESPONSE_FLAGS%. Phase 51 prepends a boolean branch
+                // for "URX" (UpstreamRetryLimitExceeded) — the FIRST flag NOT
+                // derivable from %RESPONSE_CODE_DETAILS% (the retry-limit-exceeded
+                // path's rcd is the shared "via_upstream"); it keys on the
+                // `retry_limit_exceeded_for_log` boolean set at the retry-loop
+                // limit-exceeded exit (the same gate as
+                // upstream_rq_retry_limit_exceeded). The else-branch is the
+                // unchanged phase-48/49/50 rcd-match:
                 //   route_not_found     → NR (NoRoute)          — the two no-route
                 //                          synth_404 arms (host-miss :1591 +
                 //                          route-miss :1610).
@@ -1267,15 +1297,20 @@ async fn serve_connection(
                 //                          synth-503: both pool arms (the
                 //                          outcome:None discriminator at :1020) and
                 //                          the request-budget arm (:932).
-                // Each detail is set ONLY on its own arm(s) → each is 1:1 with
-                // its flag. All other paths keep the "-" no-flags sentinel. Read
-                // by-ref here; `response_code_details_for_log` is moved into the
-                // `response_code_details:` field below.
-                response_flags: match response_code_details_for_log.as_deref() {
-                    Some("route_not_found") => "NR",
-                    Some("no_healthy_upstream") => "UH",
-                    Some("upstream_reset_before_response_started{overflow}") => "UO",
-                    _ => "-",
+                // The boolean is set ONLY on the L9 path (rcd = via_upstream → the
+                // else-match's `_ => "-"` arm), so the NR/UH/UO arms are unreachable
+                // with it set → byte-identical to phase 50. Read by-ref here;
+                // `response_code_details_for_log` is moved into the
+                // `response_code_details:` field below (bool is Copy — no interaction).
+                response_flags: if retry_limit_exceeded_for_log {
+                    "URX"
+                } else {
+                    match response_code_details_for_log.as_deref() {
+                        Some("route_not_found") => "NR",
+                        Some("no_healthy_upstream") => "UH",
+                        Some("upstream_reset_before_response_started{overflow}") => "UO",
+                        _ => "-",
+                    }
                 }
                 .to_owned(),
                 bytes_received: request_body_len,
@@ -7182,6 +7217,97 @@ static_resources:
             logged,
             "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{overflow}\",\"rf\":\"UO\"}\n",
             "request-budget overflow access-log line carries the overflow rcd + rf:\"UO\": {logged:?}"
+        );
+    }
+
+    /// Phase 51 (ADR-0108) §F backstop: drive the H1 retry-limit-exceeded (L9)
+    /// path — an always-503 backend (`spawn_fail_then_ok_upstream(503, 1000)`,
+    /// fail_count ≫ the 2 attempts) + `retry_policy{retry_on:"5xx",num_retries:1}`
+    /// → both attempts 503, the budget of 1 consumed, the last 503 surfaced
+    /// downstream verbatim — with a {rc,rcd,rf} FILE json access-log. Asserts the
+    /// logged line carries rcd:"via_upstream" (a REAL upstream 503, UNCHANGED —
+    /// matches Envoy, NOT rewritten) and the DERIVED rf:"URX" (set at the
+    /// limit-exceeded loop-exit boolean, NOT rcd-derived). The sole in-process
+    /// proof of §A's discriminator + §B's derive wrapper. Fail-first: pre-change
+    /// the derive's rcd-match falls to `_ => "-"` (via_upstream is unmatched) →
+    /// it renders `"rf":"-"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_retry_limit_exceeded_access_log_carries_urx_flag() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        // Always-503 backend: fail_count 1000 ≫ the 2 attempts → every attempt
+        // 503 → the retry budget of 1 is consumed → limit-exceeded (L9).
+        let (port, _reqs) = spawn_fail_then_ok_upstream(503, 1000).await;
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: Some(envoy_config::RetryPolicy {
+                                retry_on: "5xx".into(),
+                                num_retries: Some(1),
+                                retriable_status_codes: vec![],
+                            }),
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "retry-limit-exceeded surfaces the last upstream 503 verbatim: {resp_str}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged,
+            "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
+            "retry-limit-exceeded access-log line carries rcd:via_upstream + rf:URX: {logged:?}"
         );
     }
 
