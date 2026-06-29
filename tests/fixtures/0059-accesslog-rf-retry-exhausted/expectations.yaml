@@ -1,0 +1,31 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0059-envoy-mount/access.log
+    envoy_rust: /tmp/0059-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: GET /retry-exhausted routed to STRICT_DNS `backend`, which 503s
+    # every attempt (harness `--per-path /retry-exhausted=503`). The route's
+    # retry_policy{retry_on:"5xx",num_retries:1} consumes its single retry → both
+    # attempts 503 → the last upstream 503 is returned downstream VERBATIM
+    # (ADR-0045 L9). FOURTH non-`-` %RESPONSE_FLAGS% witness: URX
+    # (UpstreamRetryLimitExceeded) (phase 51, ADR-0108).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). The retry-exhausted
+    # 503 is deterministic on BOTH sides. The rcd is `via_upstream` (a REAL
+    # upstream 503 — NOT a unique failure string; envoy-rust already emits it,
+    # matching Envoy). envoy-rust DERIVES %RESPONSE_FLAGS% = URX from a SEPARATE
+    # boolean set at the retry-loop limit-exceeded exit (the same gate as
+    # upstream_rq_retry_limit_exceeded), NOT from the rcd (was the no-flags
+    # sentinel `-`).
+    # state-0 recon (live v1.33.0): {"rc":503,"rcd":"via_upstream","rf":"URX"}.
+    #   rc:  "%RESPONSE_CODE%"          → 503  (json NUMBER)
+    #   rcd: "%RESPONSE_CODE_DETAILS%"  → "via_upstream"
+    #   rf:  "%RESPONSE_FLAGS%"         → "URX"
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): rc, rcd, rf. Compact
+    # separators + ONE trailing `\n` (ADR-0092 §E). Emitted line:
+    #   {"rc":503,"rcd":"via_upstream","rf":"URX"}
+    - method: get
+      path: /retry-exhausted
+      host: envoy-rust.test
+      expected_status: 503

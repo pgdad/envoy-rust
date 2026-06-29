@@ -3097,7 +3097,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || fixture_name == "0020-upstream-connection-pooling-and-per-class-counters"
             || fixture_name == "0022-upstream-outlier-detection-consecutive-5xx"
             || fixture_name == "0024-upstream-retry-on-5xx"
-            || fixture_name == "0025-upstream-circuit-breaker-retry-budget");
+            || fixture_name == "0025-upstream-circuit-breaker-retry-budget"
+            || fixture_name == "0059-accesslog-rf-retry-exhausted");
     let _backend = if needs_backend && !needs_health_aware_backend {
         Some(
             backend::TcpProxyBackend::spawn()
@@ -3156,6 +3157,12 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 Some("/retry-exhausted=503".to_string())
             } else if fixture_name == "0025-upstream-circuit-breaker-retry-budget" {
                 Some("/budget-blocked=503".to_string())
+            } else if fixture_name == "0059-accesslog-rf-retry-exhausted" {
+                // phase 51 (ADR-0108) fixture 0059: the retry-limit-exceeded (L9)
+                // access-log %RESPONSE_FLAGS%=URX witness. STATELESS always-503
+                // `/retry-exhausted` (retry_script stays None — both attempts 503,
+                // the budget of 1 consumed, the last 503 surfaced verbatim).
+                Some("/retry-exhausted=503".to_string())
             } else {
                 per_path
             };
