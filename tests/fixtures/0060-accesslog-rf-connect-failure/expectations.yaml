@@ -1,0 +1,30 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0060-envoy-mount/access.log
+    envoy_rust: /tmp/0060-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `backend_cluster`, a STATIC cluster with NO
+    # circuit_breakers and NO retry_policy and one LITERAL dead endpoint
+    # 127.0.0.1:1. Both proxies DIAL it; the kernel refuses → the connect-failure
+    # synth-503. FIFTH non-`-` %RESPONSE_FLAGS% witness: UF
+    # (UpstreamConnectionFailure) (phase 52, ADR-0109).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). The fixture logs
+    # ONLY {rc, rf} — the connect-failure %RESPONSE_CODE_DETAILS% AND the
+    # response body carry the OS-derived transport-failure reason
+    # (non-deterministic across environments — M45-2), so rcd is OMITTED and the
+    # driver does not compare the body. envoy-rust returns 503 (Task 1 corrected
+    # the unvalidated 502) and DERIVES %RESPONSE_FLAGS% = UF from the
+    # connect-failure final-outcome boolean (NOT from rcd).
+    # state-0 recon (live v1.33.0, digest sha256:56da5afd…, byte-stable across 8
+    # repeats + a restart): status 503, rf "UF".
+    #   rc: "%RESPONSE_CODE%"   → 503  (json NUMBER)
+    #   rf: "%RESPONSE_FLAGS%"  → "UF"
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): rc, rf. Compact separators +
+    # ONE trailing `\n` (ADR-0092 §E). Emitted line:
+    #   {"rc":503,"rf":"UF"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
