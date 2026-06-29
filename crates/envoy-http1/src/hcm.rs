@@ -924,9 +924,9 @@ async fn serve_connection(
                         // phase 50 (ADR-0107): the request-budget (max_requests)
                         // overflow is the SAME UO/overflow disposition as the pool
                         // arms — same synth_overflow helper, same 503 wire shape.
-                        // Tag the rcd so the :1267 derive maps it => "UO". This arm
+                        // Tag the rcd so the :1277 derive maps it => "UO". This arm
                         // BYPASSES the retry loop, so it is tagged HERE (not via the
-                        // :1009 discriminator). In-process-backstopped (M50-C: its
+                        // :1020 discriminator). In-process-backstopped (M50-C: its
                         // differential witness is deferred — 0058 exercises only the
                         // pool PendingOverflow arm).
                         response_code_details_for_log =
@@ -1011,7 +1011,7 @@ async fn serve_connection(
                                 // Envoy emits %RESPONSE_CODE_DETAILS% =
                                 // "upstream_reset_before_response_started{overflow}"
                                 // / %RESPONSE_FLAGS% = "UO" (state-0 recon); the
-                                // derive at :1258 maps the detail => "UO". Covers BOTH
+                                // derive at :1277 maps the detail => "UO". Covers BOTH
                                 // pool arms (max_connections :503/:508 +
                                 // max_pending_requests :510/:515). All other
                                 // endpoint:Some outcomes keep "via_upstream"
@@ -1257,16 +1257,16 @@ async fn serve_connection(
                 // %RESPONSE_FLAGS% is derived 1:1 from the per-request
                 // %RESPONSE_CODE_DETAILS%:
                 //   route_not_found     → NR (NoRoute)          — the two no-route
-                //                          synth_404 arms (host-miss :1574 +
-                //                          route-miss :1593).
+                //                          synth_404 arms (host-miss :1591 +
+                //                          route-miss :1610).
                 //   no_healthy_upstream → UH (NoHealthyUpstream) — the single
                 //                          pick()->None no-healthy synth-503 arm
-                //                          (:1021-1022).
+                //                          (:1031-1032).
                 //   upstream_reset_before_response_started{overflow}
                 //                       → UO (UpstreamOverflow) — the overflow
                 //                          synth-503: both pool arms (the
-                //                          outcome:None discriminator at :1010) and
-                //                          the request-budget arm (:923).
+                //                          outcome:None discriminator at :1020) and
+                //                          the request-budget arm (:932).
                 // Each detail is set ONLY on its own arm(s) → each is 1:1 with
                 // its flag. All other paths keep the "-" no-flags sentinel. Read
                 // by-ref here; `response_code_details_for_log` is moved into the
