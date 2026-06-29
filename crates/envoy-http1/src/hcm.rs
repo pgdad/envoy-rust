@@ -7305,8 +7305,7 @@ static_resources:
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(
-            logged,
-            "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
+            logged, "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
             "retry-limit-exceeded access-log line carries rcd:via_upstream + rf:URX: {logged:?}"
         );
     }
