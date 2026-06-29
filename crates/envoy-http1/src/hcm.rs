@@ -496,9 +496,9 @@ async fn run_attempt(
                         cluster = %cluster.name(),
                         addr = %endpoint,
                         error = ?source,
-                        "upstream connect failed (pool) — returning 502",
+                        "upstream connect failed (pool) — returning 503",
                     );
-                    AcquireOutcome::ConnectFailure(synth_status(502, close))
+                    AcquireOutcome::ConnectFailure(synth_status(503, close))
                 }
                 Err(crate::pool::PoolError::Overflow { .. }) => {
                     tracing::warn!(
@@ -525,9 +525,9 @@ async fn run_attempt(
                         cluster = %cluster.name(),
                         addr = %endpoint,
                         error = ?source,
-                        "upstream connect failed — returning 502",
+                        "upstream connect failed — returning 503",
                     );
-                    AcquireOutcome::ConnectFailure(synth_status(502, close))
+                    AcquireOutcome::ConnectFailure(synth_status(503, close))
                 }
             },
         }
@@ -542,9 +542,9 @@ async fn run_attempt(
                     cluster = %cluster.name(),
                     addr = %endpoint,
                     error = ?source,
-                    "upstream connect failed — returning 502",
+                    "upstream connect failed — returning 503",
                 );
-                AcquireOutcome::ConnectFailure(synth_status(502, close))
+                AcquireOutcome::ConnectFailure(synth_status(503, close))
             }
         }
     };
@@ -3252,8 +3252,8 @@ static_resources:
     #[tokio::test(flavor = "multi_thread")]
     async fn route_walk_returns_upstream_connect_on_refused_port() {
         // Cluster's single endpoint is 127.0.0.1:1 (kernel-refused). HCM's
-        // Route arm should propagate the connect failure as a 502 Bad Gateway
-        // downstream response.
+        // Route arm should propagate the connect failure as a 503 Service
+        // Unavailable downstream response.
         let cluster_mgr = cluster_mgr_with_endpoint("backend", 1).await;
         let cfg = hcm_config_with_cluster(
             "/",
@@ -3269,8 +3269,8 @@ static_resources:
         let resp = drive(cfg, req).await;
         let s = String::from_utf8_lossy(&resp);
         assert!(
-            s.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
-            "expected 502 on UpstreamConnect, got: {s}"
+            s.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "expected 503 on UpstreamConnect, got: {s}"
         );
     }
 
@@ -6731,7 +6731,7 @@ static_resources:
     /// refused — a deterministic connect failure), retry_on "connect-failure",
     /// num_retries 1. The connect failure MUST classify as
     /// `AttemptOutcome::ConnectFailure` and therefore be retriable under
-    /// `connect-failure` (without `reset`). Asserts: downstream synth-502,
+    /// `connect-failure` (without `reset`). Asserts: downstream synth-503,
     /// upstream_rq_retry=1 (the retry fired → ConnectFailure classification),
     /// limit_exceeded=1 (the retried attempt also refused), retry_success=0,
     /// upstream_rq_total=0 (no upstream RESPONSE was ever received). Sibling of
@@ -6755,8 +6755,8 @@ static_resources:
         let resp = drive(cfg, req).await;
         let s = String::from_utf8_lossy(&resp);
         assert!(
-            s.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
-            "downstream must be synth-502 after exhausting connect-failure retries: {s}"
+            s.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "downstream must be synth-503 after exhausting connect-failure retries: {s}"
         );
         assert_eq!(
             cluster.upstream_rq_retry().value(),
@@ -6780,10 +6780,10 @@ static_resources:
         );
     }
 
-    /// 16 state-5 review fix: a connect-failure synth-502 with NO retry_policy
+    /// 16 state-5 review fix: a connect-failure synth-503 with NO retry_policy
     /// (1 attempt) must NOT tick `upstream_rq_5xx`. The post-loop 5xx tick is
     /// gated on the completing attempt having received a REAL upstream response;
-    /// the synth-502 (kernel-refused connect) never reached an upstream, so per
+    /// the synth-503 (kernel-refused connect) never reached an upstream, so per
     /// ADR-0045 L5 the 1-attempt path is byte-identical to the pre-phase-16
     /// baseline where this path never ticked rq_5xx. Sibling of H2's
     /// `h2_connect_failure_synth_does_not_tick_upstream_rq_5xx`.
@@ -6797,13 +6797,13 @@ static_resources:
         let resp = drive(cfg, req).await;
         let s = String::from_utf8_lossy(&resp);
         assert!(
-            s.starts_with("HTTP/1.1 502 Bad Gateway\r\n"),
-            "downstream must be connect-failure synth-502: {s}"
+            s.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "downstream must be connect-failure synth-503: {s}"
         );
         assert_eq!(
             cluster.upstream_rq_5xx().value(),
             0,
-            "rq_5xx 0 — synth-502 (no real upstream response) must not tick the completing-5xx counter"
+            "rq_5xx 0 — synth-503 (no real upstream response) must not tick the completing-5xx counter"
         );
         assert_eq!(
             cluster.upstream_rq_total().value(),
