@@ -15,7 +15,7 @@
 #
 # This is the FIRST Upstream-robustness-family fixture and the FIRST
 # fixture exercising synth-503 from the no-healthy-upstream arm (the
-# `hcm.rs:582` arm; vs synth_status (502 connect-fail) at the connect-fail
+# `hcm.rs:582` arm; vs synth_status (503 connect-fail) at the connect-fail
 # arm). The bilateral assertion is status 503 + body byte-exact + the 5
 # standard HTTP/1.1 headers via set-equal-modulo-allow-list.
 #
