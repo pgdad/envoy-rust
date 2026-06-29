@@ -149,3 +149,87 @@ verification (`superpowers:verification-before-completion`, the full §7.5 gate)
 the SESSION AFTER. §5.1: ONE state per session. Push per-session + confirm CI (this
 push touches `src/` + fixtures → CI runs cargo-fmt-check + the Docker differential
 for the FIRST time at this push).
+
+---
+
+## State-4 verification (the §7.5 phase-done gate — `superpowers:verification-before-completion`)
+
+> Separate session AFTER state-3. Ran the FULL BOOTSTRAP_PROMPT.md §7.5 gate.
+> Local workspace gate (fmt/build/clippy/deny/test) + the **CI-authoritative**
+> Docker differential / h2spec / fuzz (memory `envoy-rust-state4-ci-first-execution`).
+> All outputs quoted verbatim below.
+
+### (e) Local workspace gate
+
+**`cargo fmt --all -- --check`** → **EXIT 0** (clean, no diff).
+
+**`cargo deny check`** → **EXIT 0**: `advisories ok, bans ok, licenses ok, sources ok`
+(only benign `license-not-encountered` warnings for unmatched allowances `0BSD` /
+`BSD-2-Clause` / `MPL-2.0` / `Unicode-DFS-2016` / `Zlib` — informational, not errors).
+
+**`cargo build --workspace --all-targets`** → **EXIT 0**:
+`Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 12.06s`
+(rebuilt the DEBUG `envoy-bin` the differential runs — memory
+`differential-harness-uses-debug-envoy-bin`).
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`** → **EXIT 0**:
+`Finished \`dev\` profile … in 2.59s` (zero warnings → `-D warnings` satisfied).
+
+**`cargo test --workspace`** → all crates GREEN **except two DOCUMENTED host-flakes**
+(CI-authoritative — both GREEN on CI, see below):
+- `envoy-http1` **147 passed; 0 failed** (the §F backstop
+  `h1_retry_limit_exceeded_access_log_carries_urx_flag` GREEN).
+- `envoy-accesslog` **98 passed; 0 failed**.
+- `differential` lib **151 passed; 0 failed; 2 ignored**; the phase-51 surface test
+  **`tests/access_log_rf_retry_exhausted.rs` (fixture `0059`) → 1 passed** (both
+  proxies byte-identical `{"rc":503,"rcd":"via_upstream","rf":"URX"}` — Docker
+  available locally) AND every other `access_log_rf_*` differential green.
+- ALL other workspace crates (envoy-config 533, envoy-cluster 208, envoy-http2 lib
+  77, …) **0 failed**.
+- **Host-flake #1** — `differential --test admin_config_dump_server_info`:
+  `envoy-only: ["backend::192.168.65.2:39625::…"]` — the documented bridge-IP route
+  (memory `differential-host-bridge-ip-192-168-65-2`: this host routes the backend
+  via `192.168.65.2`, NOT the allow-listed `192.168.65.254`/`172.17.0.1`); NOT a
+  phase-51 regression (phase 51 touches no admin/config-dump surface). GREEN on CI.
+- **Host-flake #2** — `envoy-http2 --lib
+  client::tests::send_request_maps_h2_handshake_failure_to_typed_error`
+  (`client.rs:551`): the documented h2-handshake host-flake (memory
+  `envoyrust-h2-handshake-test-host-flake`: the handshake unexpectedly succeeds on
+  this host's networking); pre-existing, NOT a phase-51 regression (no HTTP/2 change
+  this phase). GREEN on CI.
+
+### (a)/(b)/(c)/(d) CI-authoritative gate (Docker differential + h2spec + fuzz)
+
+The state-3 work was already pushed; CI is the authority for the Docker differential,
+h2spec, and fuzz (memory `envoy-rust-state4-ci-first-execution`). `gh run list`:
+
+- HEAD **`2c46cd5`** (`deps: bump anyhow 1.0.102 → 1.0.103 to clear RUSTSEC-2026-0190`)
+  → **CI SUCCESS** (5m42s): `✓ build + test + lint in 5m28s` (fmt ✓ clippy ✓ build ✓
+  install h2spec ✓ **test [includes differential harness → Docker] ✓** cargo deny ✓)
+  + `✓ fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse,
+  30s each) in 4m3s`. This is the **CI-authoritative GREEN** for gate (a) the `0059`
+  Docker differential, (b) `0001`-`0058` byte-identical, (c) h2spec ≥95% (NO HTTP/2
+  codec change → unaffected), (d) the `parse_bootstrap`/`accesslog_format_parse`
+  fuzz short-budget runs, AND (e) the full workspace build/clippy/fmt/test/deny.
+- The intermediate state-3 commit **`9085e39`** showed CI `failure` — job breakdown:
+  fmt ✓ clippy ✓ build ✓ install h2spec ✓ **test (includes differential harness →
+  Docker) ✓** fuzz ✓ — the ONLY red was **`X cargo deny check`**, the freshly-published
+  **RUSTSEC-2026-0190** advisory against `anyhow 1.0.102` (memory
+  `cargo-deny-reds-on-unrelated-advisory` — a per-session push reds CI on an unrelated
+  advisory; patch-bump the dep, NOT a phase regression). Cleared by the anyhow
+  1.0.102→1.0.103 bump at HEAD `2c46cd5`. So gate items (a)/(b)/(c)/(d) ran **GREEN at
+  `9085e39` already** and (e) deny is GREEN at HEAD.
+
+### (f) REVIEW.md
+
+State-5 output — the SESSION AFTER this one (`superpowers:requesting-code-review`).
+NOT produced this session. §5.1: one state per session.
+
+### Gate verdict
+
+**§7.5 phase-done gate CLEAN.** Local fmt/build/clippy/deny EXIT 0; all
+non-host-flake workspace tests GREEN (envoy-http1 147 incl. the URX backstop,
+envoy-accesslog 98, the `0059` differential PASS); the 2 local failures are
+DOCUMENTED CI-authoritative host-flakes (both GREEN on CI). CI HEAD `2c46cd5` fully
+GREEN (Docker differential incl. `0059` + `0001`-`0058`, h2spec, fuzz, deny).
+→ **Advance STATE to state-5-next** (`superpowers:requesting-code-review`).
