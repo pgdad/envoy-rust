@@ -1,0 +1,30 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0058-envoy-mount/access.log
+    envoy_rust: /tmp/0058-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `backend_cluster`, whose circuit_breakers
+    # set max_connections:1 / max_pending_requests:0. The connect-on-miss
+    # pending-gate rejects the first request → the overflow synth-503
+    # (`…reset reason: overflow`) BEFORE the dead 127.0.0.1:1 endpoint is dialed.
+    # THIRD non-`-` %RESPONSE_FLAGS% witness: UO (UpstreamOverflow) (phase 50,
+    # ADR-0107), AND the FIRST witness of the overflow %RESPONSE_CODE_DETAILS%.
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). The overflow
+    # synth-503 is deterministic on BOTH sides; envoy-rust DERIVES
+    # %RESPONSE_FLAGS% = UO from %RESPONSE_CODE_DETAILS% =
+    # `upstream_reset_before_response_started{overflow}` at the H1 record-build
+    # site (was the no-flags sentinel `-` / `via_upstream`).
+    # state-0 recon (live v1.33.0): {"rc":503,
+    # "rcd":"upstream_reset_before_response_started{overflow}","rf":"UO"}.
+    #   rc:  "%RESPONSE_CODE%"          → 503  (json NUMBER)
+    #   rcd: "%RESPONSE_CODE_DETAILS%"  → "upstream_reset_before_response_started{overflow}"
+    #   rf:  "%RESPONSE_FLAGS%"         → "UO"
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): rc, rcd, rf. Compact
+    # separators + ONE trailing `\n` (ADR-0092 §E). Emitted line:
+    #   {"rc":503,"rcd":"upstream_reset_before_response_started{overflow}","rf":"UO"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
