@@ -921,6 +921,16 @@ async fn serve_connection(
                         // The overflow synth-503 (81-byte body + x-envoy-overloaded)
                         // — the SAME helper the pool PendingOverflow arm uses.
                         outgoing = synth_overflow(close);
+                        // phase 50 (ADR-0107): the request-budget (max_requests)
+                        // overflow is the SAME UO/overflow disposition as the pool
+                        // arms — same synth_overflow helper, same 503 wire shape.
+                        // Tag the rcd so the :1267 derive maps it => "UO". This arm
+                        // BYPASSES the retry loop, so it is tagged HERE (not via the
+                        // :1009 discriminator). In-process-backstopped (M50-C: its
+                        // differential witness is deferred — 0058 exercises only the
+                        // pool PendingOverflow arm).
+                        response_code_details_for_log =
+                            Some("upstream_reset_before_response_started{overflow}".to_owned());
                         // L11: the overflow local reply carries
                         // x-envoy-attempt-count: 1 when the vhost flag is set (only
                         // the would-be first attempt; none ever dispatched).
@@ -7088,6 +7098,90 @@ static_resources:
             cluster.upstream_rq_retry_overflow().value(),
             0,
             "upstream_rq_retry_overflow 0 — L9a exclusivity (retry budget never consulted)"
+        );
+    }
+
+    /// Phase 50 (ADR-0107) §A′ backstop: the pre-route request-budget overflow
+    /// (`max_requests:0`, BudgetAcquisition::Rejected at hcm.rs:911) calls
+    /// synth_overflow at :923 and BYPASSES the retry loop, so it is tagged
+    /// directly at :923 (not via the :995 discriminator). Asserts the FILE json
+    /// access-log line carries the overflow rcd + rf:"UO" — the in-process proof
+    /// for the budget arm (its differential witness is deferred: M50-C).
+    /// Fail-first: pre-change it renders `"rcd":null,"rf":"-"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_request_budget_overflow_access_log_carries_uo_flag() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        // A live backend port is required for cluster_mgr_with_endpoint_max_requests;
+        // it is NEVER contacted (the budget gate fires before any dispatch).
+        let (port, _reqs) = spawn_fail_then_ok_upstream(200, 0).await;
+        let (cluster_mgr, _registry) =
+            cluster_mgr_with_endpoint_max_requests("backend", port, 0).await;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "request-budget overflow synth-503 status unchanged: {resp_str}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged,
+            "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{overflow}\",\"rf\":\"UO\"}\n",
+            "request-budget overflow access-log line carries the overflow rcd + rf:\"UO\": {logged:?}"
         );
     }
 
