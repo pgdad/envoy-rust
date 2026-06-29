@@ -481,7 +481,7 @@ async fn run_attempt(
     enum AcquireOutcome {
         // Connected; ready to send.
         Stream(StreamHandle),
-        // Connect failed → synth-502, AttemptOutcome::ConnectFailure.
+        // Connect failed → synth-503, AttemptOutcome::ConnectFailure.
         ConnectFailure(Response),
         // Overflow / pending-overflow synth-503 — terminal, not retriable in
         // this phase (no AttemptOutcome).
@@ -1136,7 +1136,7 @@ async fn serve_connection(
                         // response only (retried-away 5xx attempts do NOT tick it).
                         // Gated on the completing attempt having received a real
                         // upstream response — synth local replies (the no-healthy-
-                        // upstream synth-503, connect-failure synth-502, reset synth-
+                        // upstream synth-503, connect-failure synth-503, reset synth-
                         // 502, and overflow synth-503 paths) do NOT tick it, preserving
                         // the pre-phase-16 baseline (they never did). Single source of
                         // truth (moved here from router::construct_proxied_response).
@@ -1804,7 +1804,7 @@ fn synth_status(status: u16, close: bool) -> Response {
 /// 72 65 61 6d`; no trailing newline) matching upstream Envoy v1.33.0's
 /// no-healthy-upstream wire shape (§6.2 item-2; locked at parent-12 split
 /// `4f9ba04`; ADR-0037). Used ONLY at the `pick() -> None` arm of HCM's
-/// per-request dispatch (`hcm.rs:582` in this file); the connect-fail 502
+/// per-request dispatch (`hcm.rs:582` in this file); the connect-fail 503
 /// and other synth paths keep `synth_status`'s empty body.
 fn synth_no_healthy_upstream(close: bool) -> Response {
     let body = Bytes::from_static(b"no healthy upstream");
@@ -4046,7 +4046,7 @@ static_resources:
     ///
     /// Coverage note: the existing `hcm_with_file_access_log_writes_one_line_per_request`
     /// test already exercises the synth-200 arm through the access-log dispatch, and
-    /// the 4 proxy-arm variants (no-endpoint-503, connect-fail-502, send-fail-502,
+    /// the 4 proxy-arm variants (no-endpoint-503, connect-fail-503, send-fail-502,
     /// proxy-success) are covered by tests in the 06.2 Task 6 and Task 9 router
     /// sections. This test adds an explicit regression tag for the I1 fix so any
     /// future refactor that breaks the posture fails at a named test rather than an

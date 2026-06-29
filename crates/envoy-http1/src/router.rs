@@ -60,7 +60,7 @@ pub const X_ENVOY_UPSTREAM_SERVICE_TIME: &str = "x-envoy-upstream-service-time";
 /// here next to `X_ENVOY_UPSTREAM_SERVICE_TIME` for header-name co-location;
 /// the injection itself happens in the retry loop (not in
 /// `construct_proxied_response`) because it must also decorate the
-/// limit-exceeded last-503 and the connect-fail synth-502.
+/// limit-exceeded last-503 and the connect-fail synth-503.
 pub const X_ENVOY_ATTEMPT_COUNT: &str = "x-envoy-attempt-count";
 
 /// Construct the synthesized downstream Response value WITHOUT writing it to
