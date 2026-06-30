@@ -180,3 +180,30 @@ the differential's first real execution is CI (memory
 `envoy-rust-state4-ci-first-execution`), which is authoritative. Not blocked on.
 
 **Commit:** `phase 53 task 7: differential test for fixture 0061 (UC witness) [ADR-0110]`
+
+---
+
+## Task 8 — BEHAVIOR_CONTRACT updates (§F) ✅
+
+`docs/envoy-rust/BEHAVIOR_CONTRACT.md` edits:
+- **`%RESPONSE_FLAGS%` row (`:1020`):** "five witnessed failure paths" → "six" + the `UC`
+  path added to the EXCEPT list; a `UC` per-flag-equivalence clause after the `UF` clause
+  (config-deterministic constant, NOT rcd-derived — keyed on `reset_for_log` set post-loop
+  on the reset final-outcome; synth-503; deterministic `connection_termination` rcd noted
+  but deferred M53-1); value-exact parenthetical extended with the `UC` upstream-reset
+  case; witnessing-fixtures sentence adds fixture **0061**.
+- **Per-attempt-counting paragraph (`:387`):** "reset synth-502" → "reset synth-503".
+- **`downstream_rq_5xx` row (`:289`):** "synth-502 (send-fail)" → "send-fail/reset" inside
+  the synth-503 group; parenthetical updated to "connect-fail / reset 502→503 corrections".
+- **No-healthy-upstream wire-shape note (`:36`):** "send-fail 502 paths" → "send-fail/reset
+  **503** paths".
+- **`cluster.<name>.upstream_rq_5xx` row (`:296`):** "send-fail 502" → "send-fail/reset **503**".
+
+**Sweep verify** (`grep -n '502' docs/envoy-rust/BEHAVIOR_CONTRACT.md`): the only remaining
+`502` are the LEGITIMATE survivors — `:1031` (the H2 no-healthy arm "returns 502", GENUINELY
+unchanged per SPEC §4 H2-deferral), the cdn_loop filter-local-reply 502 (`:826`/`:835`/`:870`),
+and the unrelated `:222` (H2 pick-none not asserted), `:289` (explanatory "both 502 and 503
+are 5xx"), `:364` (outlier-detection 502/503/504 list). NO send-fail/reset path still reads
+`502`. The `:1031` H2-502 survivor is intact (NOT touched).
+
+**Commit:** `phase 53 task 8: BEHAVIOR_CONTRACT %RESPONSE_FLAGS% UC + reset synth-503 [ADR-0110]`
