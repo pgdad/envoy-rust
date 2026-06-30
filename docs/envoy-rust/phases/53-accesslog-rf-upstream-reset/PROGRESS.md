@@ -207,3 +207,46 @@ are 5xx"), `:364` (outlier-detection 502/503/504 list). NO send-fail/reset path 
 `502`. The `:1031` H2-502 survivor is intact (NOT touched).
 
 **Commit:** `phase 53 task 8: BEHAVIOR_CONTRACT %RESPONSE_FLAGS% UC + reset synth-503 [ADR-0110]`
+
+---
+
+## Task 9 — local §7.5 dry-run (state-4 pre-flight) ✅
+
+**Clippy normalization (during this task):** `cargo clippy ... -D warnings` fired
+`clippy::while_let_loop` on the two new accept-then-close test listeners (Task 2/3,
+`hcm.rs:7467`/`:7539`). Refactored both `loop { match listener.accept().await { Ok(..) =>
+.., Err(_) => break } }` → `while let Ok((mut sock, _)) = listener.accept().await { .. }`
+(behavior-identical — breaks on `Err` the same way). Both reset tests re-confirmed GREEN.
+
+Local §7.5 subset:
+```
+cargo build --workspace --all-targets           → Finished (EXIT 0)
+cargo fmt --all -- --check                       → clean
+cargo clippy --workspace --all-targets --all-features -- -D warnings → Finished (EXIT 0)
+cargo test --workspace                           → ALL GREEN except 0061 (see below)
+cargo deny check                                 → advisories ok, bans ok, licenses ok, sources ok (EXIT 0)
+```
+- `envoy-http1`: 151 passed, 0 failed, 2 ignored (incl. the new `h1_upstream_reset_returns_503`
+  + `h1_upstream_reset_access_log_carries_uc_flag`).
+- `tcp-echo-server`: 9 passed (incl. `argv_parses_close_on_accept`).
+
+**Known LOCAL-RED (NOT a regression — CI-authoritative):** `differential::access_log_rf_upstream_reset`
+(fixture 0061) failed locally with a `UF`-vs-`UC` cross-proxy mismatch:
+```
+access log byte-exact mismatch: line 0 not byte-identical:
+  envoy     ="{"rc":503,"rf":"UF"}"
+  envoy-rust="{"rc":503,"rf":"UC"}"
+```
+**envoy-rust is CORRECT** (`{"rc":503,"rf":"UC"}`; its log shows `upstream request failed —
+returning 503 error=UnexpectedEof` → the genuine post-connect reset arm). The mismatch is
+the host-bridge artifact (memory `differential-host-bridge-ip-192-168-65-2`): the upstream
+Envoy *container* on this dev host cannot reach the host-running accept-then-close backend
+via `host.docker.internal`, so it sees a **connect-failure (UF)** instead of a
+connect-then-reset (UC). On native-Linux CI both proxies reach the backend → both emit `UC`.
+This is the documented backend-spawning-fixture posture (the 0052 precedent); the state-4
+gate is CI-authoritative.
+
+**Fuzz:** SKIP — no new fuzz target (`%RESPONSE_FLAGS%` is an existing operator; `ci.yml`
+unchanged; the new differential is an auto-discovered `#[tokio::test]`, not a fuzz target).
+
+**Commit:** `phase 53 task 9: clippy while_let_loop normalization on the new reset test listeners [ADR-0110]`

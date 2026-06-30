@@ -7464,17 +7464,12 @@ static_resources:
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((mut sock, _)) => {
-                        // read-then-close: drain the request (post-connect),
-                        // then FIN with no response.
-                        let mut buf = [0u8; 1024];
-                        let _ = sock.read(&mut buf).await;
-                        drop(sock);
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // read-then-close: drain the request (post-connect),
+                // then FIN with no response.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                drop(sock);
             }
         });
         let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
@@ -7536,15 +7531,10 @@ static_resources:
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((mut sock, _)) => {
-                        let mut buf = [0u8; 1024];
-                        let _ = sock.read(&mut buf).await;
-                        drop(sock);
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                drop(sock);
             }
         });
         let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
