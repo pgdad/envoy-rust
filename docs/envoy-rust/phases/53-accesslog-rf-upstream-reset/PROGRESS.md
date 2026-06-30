@@ -142,3 +142,20 @@ Clean compile. No fixture references `{{CLOSE_BACKEND_PORT}}` yet → `needs_clo
 false for all fixtures 0001–0060 → zero behavior change.
 
 **Commit:** `phase 53 task 5: wire {{CLOSE_BACKEND_PORT}} marker -> TcpCloseBackend in run_fixture [ADR-0110]`
+
+---
+
+## Task 6 — fixture `0061-accesslog-rf-upstream-reset` (§D) ✅
+
+Created 4 files modeled on 0060: `envoy.yaml`, `envoy-rust.yaml`, `expectations.yaml`,
+`README.md`. The cluster is swapped from 0060's dead-literal `127.0.0.1:1` STATIC to a
+STRICT_DNS `{{BACKEND_HOST}}:{{CLOSE_BACKEND_PORT}}` cluster (the 0004 `TcpProxyBackend`
+shape), NO `circuit_breakers`, NO `retry_policy`, `{rc,rf}` json_format, ONE `GET /`
+probe with `expected_status: 503`, cross-proxy-equal `{"rc":503,"rf":"UC"}`. Per-side
+deltas match 0060 (envoy-rust omits `admin:`, binds `127.0.0.1`, `0061-envoy-rust-mount`
+path) plus the per-side `{{BACKEND_HOST}}` render (host.docker.internal / 127.0.0.1).
+README flags: backend-spawning → LOCAL-RED on this dev host (bridge-IP flake), GREEN on
+CI (CI-authoritative); the read-then-close POST-connect guarantee; the deferred
+deterministic `UC` rcd (M53-1).
+
+**Commit:** `phase 53 task 6: fixture 0061 accept-then-close reset UC witness [ADR-0110]`

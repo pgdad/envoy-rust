@@ -1,0 +1,32 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0061-envoy-mount/access.log
+    envoy_rust: /tmp/0061-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `backend_cluster`, a STRICT_DNS cluster with
+    # NO circuit_breakers and NO retry_policy whose single endpoint is the
+    # SPAWNED accept-then-close backend ({{CLOSE_BACKEND_PORT}} -> TcpCloseBackend
+    # via tcp-echo-server --close-on-accept). Both proxies DIAL it, the connect
+    # completes, the upstream drains the request then closes (graceful FIN, NO
+    # response) → the reset synth-503. SIXTH non-`-` %RESPONSE_FLAGS% witness: UC
+    # (UpstreamConnectionTermination) (phase 53, ADR-0110).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). The fixture logs
+    # ONLY {rc, rf} — the reset %RESPONSE_CODE_DETAILS%
+    # (upstream_reset_before_response_started{connection_termination}) is
+    # DETERMINISTIC but deferred (M53-1, minimum-viable witness), and the driver
+    # does not compare the body. envoy-rust returns 503 (Task 2 corrected the
+    # unvalidated 502) and DERIVES %RESPONSE_FLAGS% = UC from the reset
+    # final-outcome boolean (NOT from rcd).
+    # state-0 recon (live v1.33.0, digest sha256:56da5afd…, byte-stable across 8
+    # repeats + a restart): status 503, rf "UC".
+    #   rc: "%RESPONSE_CODE%"   → 503  (json NUMBER)
+    #   rf: "%RESPONSE_FLAGS%"  → "UC"
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): rc, rf. Compact separators +
+    # ONE trailing `\n` (ADR-0092 §E). Emitted line:
+    #   {"rc":503,"rf":"UC"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
