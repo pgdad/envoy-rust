@@ -3271,6 +3271,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let http2_backend_port_str = _http2_backend.as_ref().map(|b| b.port().to_string());
 
+    // Phase 53 (ADR-0110): the accept-then-close upstream for the fixture-0061
+    // reset/UC witness. Distinct from {{BACKEND_PORT}} (which routes to the
+    // echoing TcpProxyBackend); this marker spawns the close-on-accept backend.
+    let needs_close_backend = scan_needs_marker(&backend_scan_sources, "CLOSE_BACKEND_PORT");
+    let _close_backend: Option<crate::backend::TcpCloseBackend> = if needs_close_backend {
+        Some(
+            crate::backend::TcpCloseBackend::spawn()
+                .await
+                .context("spawning TcpCloseBackend")?,
+        )
+    } else {
+        None
+    };
+    let close_backend_port_str = _close_backend.as_ref().map(|b| b.port().to_string());
+
     // (c) Build per-side substitution maps with TLS path keys.
     // Type is Vec<(&str, String)> to accommodate owned strings from TLS paths.
     let upstream_tls_paths = tls_pki.as_ref().map(|p| p.envoy_side_paths());
@@ -3297,19 +3312,24 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(h2p) = http2_backend_port_str.as_deref() {
             v.push(("HTTP2_BACKEND_PORT", h2p.to_string()));
         }
+        // Phase 53 (ADR-0110): the accept-then-close backend port.
+        if let Some(cp) = close_backend_port_str.as_deref() {
+            v.push(("CLOSE_BACKEND_PORT", cp.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
             || http1_backend_1_port_str.is_some()
             || http1_backend_2_port_str.is_some()
             || http2_backend_port_str.is_some()
+            || close_backend_port_str.is_some()
         {
             // Per ADR-0015: container-side reaches the host backend via
             // host.docker.internal (with the harness's with_host call below).
             // Generalized in Task 9 to fire for either backend variant; was
             // previously gated only on BACKEND_PORT (Task 8 cadence). Task 13
             // extends the gate to HTTP1_BACKEND_PORT. 05.3 Task 9 extends to
-            // HTTP2_BACKEND_PORT.
+            // HTTP2_BACKEND_PORT. Phase 53 extends to CLOSE_BACKEND_PORT.
             v.push(("BACKEND_HOST", "host.docker.internal".to_string()));
         }
         if needs_admin_port {
@@ -3382,12 +3402,17 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(h2p) = http2_backend_port_str.as_deref() {
             v.push(("HTTP2_BACKEND_PORT", h2p.to_string()));
         }
+        // Phase 53 (ADR-0110): the accept-then-close backend port.
+        if let Some(cp) = close_backend_port_str.as_deref() {
+            v.push(("CLOSE_BACKEND_PORT", cp.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
             || http1_backend_1_port_str.is_some()
             || http1_backend_2_port_str.is_some()
             || http2_backend_port_str.is_some()
+            || close_backend_port_str.is_some()
         {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
         }

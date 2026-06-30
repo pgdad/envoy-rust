@@ -121,3 +121,24 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.98s
 Clean compile (pub struct → no dead-code warning despite not-yet-wired).
 
 **Commit:** `phase 53 task 4: TcpCloseBackend harness struct (accept-then-close) [ADR-0110]`
+
+---
+
+## Task 5 — wire `{{CLOSE_BACKEND_PORT}}` into `run_fixture` (§C/§E) ✅
+
+Added to `tests/differential/src/lib.rs`: (1) the `needs_close_backend` launch arm after
+the `{{HTTP2_BACKEND_PORT}}` arm (`scan_needs_marker(...,"CLOSE_BACKEND_PORT")` → spawn
+`TcpCloseBackend` → `close_backend_port_str`); (2) the `CLOSE_BACKEND_PORT` push into BOTH
+`upstream_kvs` and `subject_kvs` (after each HTTP2 push); (3) `|| close_backend_port_str.is_some()`
+added to the `BACKEND_HOST` OR-gate at BOTH sites (upstream `host.docker.internal`, subject
+`127.0.0.1`).
+
+**Verify** (`cargo build -p differential --tests`):
+```
+Compiling differential v0.0.0 (/home/esa/git/envoy-rust/tests/differential)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.17s
+```
+Clean compile. No fixture references `{{CLOSE_BACKEND_PORT}}` yet → `needs_close_backend`
+false for all fixtures 0001–0060 → zero behavior change.
+
+**Commit:** `phase 53 task 5: wire {{CLOSE_BACKEND_PORT}} marker -> TcpCloseBackend in run_fixture [ADR-0110]`
