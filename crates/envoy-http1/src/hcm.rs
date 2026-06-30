@@ -862,16 +862,6 @@ async fn serve_connection(
         // "via_upstream"), so it keys on this boolean, not on the rcd.
         let mut connect_failure_for_log = false;
 
-        // phase 53 (ADR-0110): per-request %RESPONSE_FLAGS% = "UC"
-        // (UpstreamConnectionTermination) discriminator. Set true POST-LOOP when
-        // the FINAL attempt's outcome was AttemptOutcome::Reset (a reset RETRIED
-        // to success must NOT flag UC — so this is the final outcome, not a
-        // per-attempt set). Like URX/UF, UC is NOT 1:1 with a unique
-        // %RESPONSE_CODE_DETAILS% (the reset rcd is the shared "via_upstream"),
-        // so it keys on this boolean. `Copy` → no borrow/move interaction with
-        // the rcd String.
-        let mut reset_for_log = false;
-
         // 07.1 Task 5: per-arm-populated response value, written to the wire
         // once below the match (factored unified-site). 07.1 Task 6 flipped
         // this from `let outgoing` to `let mut outgoing` because the
@@ -1193,11 +1183,24 @@ async fn serve_connection(
                         // URX-before-UF ordering renders URX deterministically.
                         connect_failure_for_log =
                             matches!(final_outcome, Some(AttemptOutcome::ConnectFailure));
-                        // phase 53 (ADR-0110): flag UC when the FINAL attempt was a reset —
-                        // independent of the retry split (a single reset attempt with no
-                        // retry_policy flags it too). A reset retried to success has
-                        // final_outcome = Some(Response) → not flagged.
-                        reset_for_log = matches!(final_outcome, Some(AttemptOutcome::Reset));
+                        // phase 54 (ADR-0111): set the deterministic upstream-reset rcd on
+                        // the pure-reset final-outcome path. Envoy renders
+                        // %RESPONSE_CODE_DETAILS% =
+                        // "upstream_reset_before_response_started{connection_termination}"
+                        // here — a FIXED reset-reason enum (deterministic, UNLIKE the
+                        // connect-failure rcd's OS-derived brace). This OVERRIDES the shared
+                        // "via_upstream" the in-loop result-consumption arm wrote for the
+                        // reset path (:1055), and the %RESPONSE_FLAGS% derive below maps it
+                        // => "UC" (the phase-50 {overflow} => "UO" precedent). A reset
+                        // retried to success has final_outcome = Some(Response) → not set
+                        // (replay-safe, ADR-0044). [Task 2 adds the
+                        // `&& !retry_limit_exceeded_for_log` guard for the M53-3 edge.]
+                        if matches!(final_outcome, Some(AttemptOutcome::Reset)) {
+                            response_code_details_for_log = Some(
+                                "upstream_reset_before_response_started{connection_termination}"
+                                    .to_owned(),
+                            );
+                        }
                         // Release the retry-budget slot now, before building the outgoing response,
                         // so the slot (and its gauges) reflect completion rather than lingering
                         // until this stack frame unwinds.
@@ -1341,6 +1344,9 @@ async fn serve_connection(
                 //                          synth-503: both pool arms (the
                 //                          outcome:None discriminator at :1020) and
                 //                          the request-budget arm (:932).
+                //   upstream_reset_before_response_started{connection_termination}
+                //                       → UC (UpstreamConnectionTermination) — the
+                //                          pure-reset synth-503 (§A, phase 54).
                 // The boolean is set ONLY on the L9 path (rcd = via_upstream → the
                 // else-match's `_ => "-"` arm), so the NR/UH/UO arms are unreachable
                 // with it set → byte-identical to phase 50. Read by-ref here;
@@ -1355,25 +1361,26 @@ async fn serve_connection(
                 // attempt's AttemptOutcome is ConnectFailure. Ordered after URX
                 // (the un-recon'd retry-exhausted-connect-failure combination, if
                 // it ever sets both, renders URX deterministically — §4).
-                // phase 53 (ADR-0110): the `reset_for_log => "UC"`
-                // (UpstreamConnectionTermination) branch — the THIRD flag NOT
-                // derivable from %RESPONSE_CODE_DETAILS% (the reset rcd is the
-                // shared "via_upstream", which would otherwise fall to the
-                // else-match's `_ => "-"` arm); it keys on the `reset_for_log`
-                // boolean set post-loop when the FINAL attempt's AttemptOutcome
-                // is Reset. Ordered after UF — set ONLY on the reset final-outcome
-                // path, so the NR/UH/UO arms stay byte-identical.
+                // phase 54 (ADR-0111): "UC" (UpstreamConnectionTermination) is now
+                // derived 1:1 from %RESPONSE_CODE_DETAILS% =
+                // "upstream_reset_before_response_started{connection_termination}"
+                // (the rcd-match arm below — the phase-50 {overflow} => "UO"
+                // precedent), set by §A on the pure-reset final-outcome path. The
+                // phase-53 `reset_for_log` boolean was retired (the reset rcd is no
+                // longer the shared "via_upstream"). UNLIKE URX/UF, whose rcds
+                // genuinely STAY "via_upstream" (so they remain boolean-derived).
                 response_flags: if retry_limit_exceeded_for_log {
                     "URX"
                 } else if connect_failure_for_log {
                     "UF"
-                } else if reset_for_log {
-                    "UC"
                 } else {
                     match response_code_details_for_log.as_deref() {
                         Some("route_not_found") => "NR",
                         Some("no_healthy_upstream") => "UH",
                         Some("upstream_reset_before_response_started{overflow}") => "UO",
+                        Some("upstream_reset_before_response_started{connection_termination}") => {
+                            "UC"
+                        }
                         _ => "-",
                     }
                 }
@@ -7516,14 +7523,15 @@ static_resources:
         server.abort();
     }
 
-    /// phase 53 (ADR-0110): the accept-then-close reset path (NO retry_policy),
-    /// wired to a {rc,rf} FILE json access-log. Asserts the downstream is the
-    /// synth-503 AND the logged line carries the DERIVED rf:"UC" (set post-loop
-    /// from the reset final-outcome boolean, NOT rcd-derived — the reset rcd is
-    /// the shared "via_upstream"). The sole in-process proof of §A's
-    /// discriminator + §B's derive branch. Fail-first: pre-change the derive's
-    /// rcd-match falls to `_ => "-"` (via_upstream unmatched) → it renders
-    /// `"rf":"-"`.
+    /// phase 53 (ADR-0110) / 54 (ADR-0111): the accept-then-close reset path (NO
+    /// retry_policy), wired to a {rc,rcd,rf} FILE json access-log. Asserts the
+    /// downstream is the synth-503 AND the logged line carries the deterministic
+    /// reset rcd `upstream_reset_before_response_started{connection_termination}`
+    /// (set by §A on the pure-reset final-outcome path, overriding the in-loop
+    /// `via_upstream`) AND the rf:"UC" now DERIVED 1:1 from that rcd (the
+    /// phase-50 `{overflow} => "UO"` precedent — the phase-53 `reset_for_log`
+    /// boolean was retired). The in-process proof of §A's rcd-set + §B's
+    /// rcd-match arm. Fail-first: pre-change the rcd stays `via_upstream`.
     #[tokio::test(flavor = "multi_thread")]
     async fn h1_upstream_reset_access_log_carries_uc_flag() {
         let tmp = tempdir().unwrap();
@@ -7542,6 +7550,10 @@ static_resources:
         map.insert(
             "rc".to_string(),
             envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
         );
         map.insert(
             "rf".to_string(),
@@ -7596,8 +7608,9 @@ static_resources:
         tokio::time::sleep(StdDuration::from_millis(50)).await;
         let logged = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(
-            logged, "{\"rc\":503,\"rf\":\"UC\"}\n",
-            "upstream-reset access-log line carries rf:UC: {logged:?}"
+            logged,
+            "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"UC\"}\n",
+            "upstream-reset access-log line carries the deterministic reset rcd + rf:UC: {logged:?}"
         );
         server.abort();
     }
