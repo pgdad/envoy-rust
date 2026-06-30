@@ -18,6 +18,7 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(5);
 #[derive(Debug, PartialEq)]
 struct Args {
     port: u16,
+    close_on_accept: bool,
 }
 
 /// argv parse failure modes.
@@ -44,10 +45,15 @@ enum ArgvError {
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
     let mut i = 0;
     let mut port: Option<u16> = None;
+    let mut close_on_accept = false;
     while i < args.len() {
         match args[i].as_str() {
             "--help" => return Err(ArgvError::HelpRequested),
             "--version" => return Err(ArgvError::VersionRequested),
+            "--close-on-accept" => {
+                close_on_accept = true;
+                i += 1;
+            }
             "--port" => {
                 let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
                 port = Some(v.parse().map_err(|_| ArgvError::InvalidPort)?);
@@ -58,10 +64,11 @@ fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
     }
     Ok(Args {
         port: port.ok_or(ArgvError::MissingFlag("--port"))?,
+        close_on_accept,
     })
 }
 
-const USAGE: &str = "tcp-echo-server --port <PORT>";
+const USAGE: &str = "tcp-echo-server --port <PORT> [--close-on-accept]";
 const VERSION: &str = concat!("tcp-echo-server ", env!("CARGO_PKG_VERSION"));
 
 /// Accept loop on an already-bound listener. Returns when `shutdown` resolves
@@ -69,6 +76,7 @@ const VERSION: &str = concat!("tcp-echo-server ", env!("CARGO_PKG_VERSION"));
 async fn run_on(
     listener: TcpListener,
     shutdown: impl std::future::Future<Output = ()>,
+    close_on_accept: bool,
 ) -> Result<()> {
     let mut conns: JoinSet<()> = JoinSet::new();
     tokio::pin!(shutdown);
@@ -83,8 +91,22 @@ async fn run_on(
                     Ok((mut stream, peer)) => {
                         tracing::debug!(?peer, "accepted");
                         conns.spawn(async move {
-                            let (mut r, mut w) = stream.split();
-                            let _ = tokio::io::copy(&mut r, &mut w).await;
+                            if close_on_accept {
+                                // Phase 53 (ADR-0110): accept-then-close upstream.
+                                // The handshake has completed (post-connect); do ONE
+                                // best-effort read to drain whatever the client sent
+                                // (the request), THEN drop the stream — a graceful FIN
+                                // with NO response. The read-before-close guarantees
+                                // BOTH proxies classify this as a POST-connect reset
+                                // (UC), never a pre-connect connect-failure (UF).
+                                use tokio::io::AsyncReadExt;
+                                let mut buf = [0u8; 1024];
+                                let _ = stream.read(&mut buf).await;
+                                drop(stream);
+                            } else {
+                                let (mut r, mut w) = stream.split();
+                                let _ = tokio::io::copy(&mut r, &mut w).await;
+                            }
                         });
                     }
                     Err(e) => {
@@ -114,12 +136,16 @@ async fn run_on(
 }
 
 /// Full runtime entrypoint: bind → `run_on` with ctrl_c as shutdown.
-async fn run(port: u16) -> Result<()> {
+async fn run(port: u16, close_on_accept: bool) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "tcp-echo-server listening on 0.0.0.0:{port}");
-    run_on(listener, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    run_on(
+        listener,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+        close_on_accept,
+    )
     .await
 }
 
@@ -151,7 +177,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    match run(args.port).await {
+    match run(args.port, args.close_on_accept).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e:?}");
@@ -174,7 +200,25 @@ mod tests {
     #[test]
     fn argv_parses_port() {
         let got = parse_argv(&argv(&["--port", "10042"])).expect("ok");
-        assert_eq!(got, Args { port: 10042 });
+        assert_eq!(
+            got,
+            Args {
+                port: 10042,
+                close_on_accept: false
+            }
+        );
+    }
+
+    #[test]
+    fn argv_parses_close_on_accept() {
+        let got = parse_argv(&argv(&["--port", "10042", "--close-on-accept"])).expect("ok");
+        assert_eq!(
+            got,
+            Args {
+                port: 10042,
+                close_on_accept: true
+            }
+        );
     }
 
     #[test]
@@ -213,9 +257,13 @@ mod tests {
         let addr = listener.local_addr().expect("local_addr");
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
-            run_on(listener, async move {
-                let _ = rx.await;
-            })
+            run_on(
+                listener,
+                async move {
+                    let _ = rx.await;
+                },
+                false,
+            )
             .await
         });
 
@@ -238,9 +286,13 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let start = std::time::Instant::now();
         let server = tokio::spawn(async move {
-            run_on(listener, async move {
-                let _ = rx.await;
-            })
+            run_on(
+                listener,
+                async move {
+                    let _ = rx.await;
+                },
+                false,
+            )
             .await
         });
 
