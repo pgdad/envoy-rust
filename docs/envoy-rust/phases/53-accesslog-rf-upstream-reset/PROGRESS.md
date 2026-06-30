@@ -159,3 +159,24 @@ CI (CI-authoritative); the read-then-close POST-connect guarantee; the deferred
 deterministic `UC` rcd (M53-1).
 
 **Commit:** `phase 53 task 6: fixture 0061 accept-then-close reset UC witness [ADR-0110]`
+
+---
+
+## Task 7 — differential test `access_log_rf_upstream_reset.rs` (§E) ✅
+
+Created `tests/differential/tests/access_log_rf_upstream_reset.rs` — a thin
+`differential::run_fixture(&dir)` wrapper pointing at fixture 0061, a structural clone of
+`access_log_rf_connect_failure.rs`.
+
+**Verify** (`cargo test -p differential --no-run`):
+```
+Executable tests/access_log_rf_upstream_reset.rs (target/debug/deps/access_log_rf_upstream_reset-97d3a065d3193ddf)
+```
+Clean compile; new auto-discovered `#[tokio::test]` target (no ci.yml step needed).
+
+**Local Docker run: DEFERRED to the state-4 CI gate.** 0061 is backend-spawning →
+LOCAL-RED expected on this dev host (memory `differential-host-bridge-ip-192-168-65-2`);
+the differential's first real execution is CI (memory
+`envoy-rust-state4-ci-first-execution`), which is authoritative. Not blocked on.
+
+**Commit:** `phase 53 task 7: differential test for fixture 0061 (UC witness) [ADR-0110]`
