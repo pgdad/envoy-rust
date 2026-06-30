@@ -38,7 +38,7 @@ envoy-rust now (§A) SETS the deterministic reset rcd on the pure-reset final-
 outcome path (overriding the in-loop shared `via_upstream`, guarded
 `!retry_limit_exceeded_for_log` so a retry-exhausted reset keeps `via_upstream` +
 `URX`), and (§B) DERIVES `%RESPONSE_FLAGS%` = `UC` 1:1 from that rcd (the phase-50
-`{overflow} => "UO"` precedent), RETIRING the phase-53 `reset_for_log` boolean.
+`{overflow} => "UO"` precedent), RETIRING the phase-53 boolean discriminator.
 
 The assertion is **pure cross-proxy equality** — there is NO static expected
 literal; the byte-exact driver compares the lines + status (NOT the body).
@@ -83,6 +83,6 @@ no new harness code.
 - Related fixtures: 0061 (`{rc,rf}`-only `UC` sibling, whose accept-then-close
   backend harness this reuses), 0058 (`{overflow}` rcd, the deterministic
   reset-reason-enum precedent), 0050 (the `%RESPONSE_CODE_DETAILS%` baseline).
-- Consumes: M53-1. Retires: the phase-53 `reset_for_log` boolean.
+- Consumes: M53-1. Retires: the phase-53 boolean discriminator.
 - Deferred: the H2 reset rcd (M45-1), the `DC` flag (M45-2), an upstream RST vs
   the graceful FIN (un-recon'd reset-reason brace).

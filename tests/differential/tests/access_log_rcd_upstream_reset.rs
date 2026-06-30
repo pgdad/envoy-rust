@@ -10,8 +10,8 @@
 //! (graceful FIN, NO response) → the reset synth-503. envoy-rust now SETS the
 //! deterministic reset rcd (§A, overriding the in-loop `via_upstream`, guarded
 //! `!retry_limit_exceeded_for_log`) and DERIVES `%RESPONSE_FLAGS%` = `UC` from it
-//! (§B, the phase-50 `{overflow} => "UO"` precedent; the phase-53 `reset_for_log`
-//! boolean was retired). Upstream Envoy v1.33 emits status 503 +
+//! (§B, the phase-50 `{overflow} => "UO"` precedent; the phase-53 boolean
+//! discriminator was retired). Upstream Envoy v1.33 emits status 503 +
 //! `{"rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}`
 //! here (state-0 recon: byte-stable across 3 probes + a container restart).
 //! Drives `kind: http1_access_log_byte_exact` (a `GET /` probe,

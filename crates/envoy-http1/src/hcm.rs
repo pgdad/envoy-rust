@@ -1370,9 +1370,10 @@ async fn serve_connection(
                 // "upstream_reset_before_response_started{connection_termination}"
                 // (the rcd-match arm below — the phase-50 {overflow} => "UO"
                 // precedent), set by §A on the pure-reset final-outcome path. The
-                // phase-53 `reset_for_log` boolean was retired (the reset rcd is no
-                // longer the shared "via_upstream"). UNLIKE URX/UF, whose rcds
-                // genuinely STAY "via_upstream" (so they remain boolean-derived).
+                // phase-53 reset-discriminator boolean was retired (the reset rcd
+                // is no longer the shared "via_upstream"). UNLIKE URX/UF, whose
+                // rcds genuinely STAY "via_upstream" (so they remain
+                // boolean-derived).
                 response_flags: if retry_limit_exceeded_for_log {
                     "URX"
                 } else if connect_failure_for_log {
@@ -7533,9 +7534,10 @@ static_resources:
     /// reset rcd `upstream_reset_before_response_started{connection_termination}`
     /// (set by §A on the pure-reset final-outcome path, overriding the in-loop
     /// `via_upstream`) AND the rf:"UC" now DERIVED 1:1 from that rcd (the
-    /// phase-50 `{overflow} => "UO"` precedent — the phase-53 `reset_for_log`
-    /// boolean was retired). The in-process proof of §A's rcd-set + §B's
-    /// rcd-match arm. Fail-first: pre-change the rcd stays `via_upstream`.
+    /// phase-50 `{overflow} => "UO"` precedent — the phase-53 reset-
+    /// discriminator boolean was retired). The in-process proof of §A's
+    /// rcd-set + §B's rcd-match arm. Fail-first: pre-change the rcd stays
+    /// `via_upstream`.
     #[tokio::test(flavor = "multi_thread")]
     async fn h1_upstream_reset_access_log_carries_uc_flag() {
         let tmp = tempdir().unwrap();
