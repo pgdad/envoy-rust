@@ -612,10 +612,10 @@ async fn run_attempt(
                         cluster = %cluster.name(),
                         addr = %endpoint,
                         error = ?source,
-                        "upstream request failed — returning 502",
+                        "upstream request failed — returning 503",
                     );
                     AttemptResult {
-                        response: synth_status(502, close),
+                        response: synth_status(503, close),
                         endpoint: Some(endpoint),
                         outcome: Some(AttemptOutcome::Reset),
                         upstream_response: false,
@@ -1137,7 +1137,7 @@ async fn serve_connection(
                         // Gated on the completing attempt having received a real
                         // upstream response — synth local replies (the no-healthy-
                         // upstream synth-503, connect-failure synth-503, reset synth-
-                        // 502, and overflow synth-503 paths) do NOT tick it, preserving
+                        // 503, and overflow synth-503 paths) do NOT tick it, preserving
                         // the pre-phase-16 baseline (they never did). Single source of
                         // truth (moved here from router::construct_proxied_response).
                         if completing_upstream_response && final_response.status / 100 == 5 {
@@ -4046,7 +4046,7 @@ static_resources:
     ///
     /// Coverage note: the existing `hcm_with_file_access_log_writes_one_line_per_request`
     /// test already exercises the synth-200 arm through the access-log dispatch, and
-    /// the 4 proxy-arm variants (no-endpoint-503, connect-fail-503, send-fail-502,
+    /// the 4 proxy-arm variants (no-endpoint-503, connect-fail-503, send-fail-503,
     /// proxy-success) are covered by tests in the 06.2 Task 6 and Task 9 router
     /// sections. This test adds an explicit regression tag for the I1 fix so any
     /// future refactor that breaks the posture fails at a named test rather than an
@@ -7426,6 +7426,74 @@ static_resources:
             logged, "{\"rc\":503,\"rf\":\"UF\"}\n",
             "connect-failure access-log line carries rf:UF: {logged:?}"
         );
+    }
+
+    /// phase 53 (ADR-0110): an accept-then-close loopback upstream (completes
+    /// the TCP connect, drains the request, then drops the socket — a graceful
+    /// FIN with NO response) with NO retry_policy drives the single H1 reset arm
+    /// (hcm.rs:618, AttemptOutcome::Reset). Asserts the downstream response is
+    /// the synth-503 (Task 2 corrected the unvalidated 502 to match Envoy's UC
+    /// path). Fail-first: pre-change the reset arm synthesizes 502.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_upstream_reset_returns_503() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut sock, _)) => {
+                        // read-then-close: drain the request (post-connect),
+                        // then FIN with no response.
+                        let mut buf = [0u8; 1024];
+                        let _ = sock.read(&mut buf).await;
+                        drop(sock);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "upstream-reset surfaces the synth-503 downstream: {resp_str}"
+        );
+        server.abort();
     }
 
     /// 17 Task 5 (b) gate ordering (L9a): `max_requests: 0` AND a retry_policy.
