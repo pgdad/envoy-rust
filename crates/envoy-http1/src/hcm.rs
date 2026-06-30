@@ -1193,9 +1193,13 @@ async fn serve_connection(
                         // reset path (:1055), and the %RESPONSE_FLAGS% derive below maps it
                         // => "UC" (the phase-50 {overflow} => "UO" precedent). A reset
                         // retried to success has final_outcome = Some(Response) → not set
-                        // (replay-safe, ADR-0044). [Task 2 adds the
-                        // `&& !retry_limit_exceeded_for_log` guard for the M53-3 edge.]
-                        if matches!(final_outcome, Some(AttemptOutcome::Reset)) {
+                        // (replay-safe, ADR-0044). Guarded `!retry_limit_exceeded_for_log`
+                        // so the retry-exhausted-reset case (M53-3) keeps rcd =
+                        // "via_upstream" and renders %RESPONSE_FLAGS% = "URX" (the derive's
+                        // URX branch is checked first).
+                        if matches!(final_outcome, Some(AttemptOutcome::Reset))
+                            && !retry_limit_exceeded_for_log
+                        {
                             response_code_details_for_log = Some(
                                 "upstream_reset_before_response_started{connection_termination}"
                                     .to_owned(),
@@ -7611,6 +7615,100 @@ static_resources:
             logged,
             "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"UC\"}\n",
             "upstream-reset access-log line carries the deterministic reset rcd + rf:UC: {logged:?}"
+        );
+        server.abort();
+    }
+
+    /// phase 54 (ADR-0111) — the M53-3 NEGATIVE case: a retry-exhausted RESET
+    /// (retry_on:"reset", num_retries:1; the accept-then-close backend resets
+    /// every attempt). §A's rcd-set is guarded `!retry_limit_exceeded_for_log`,
+    /// so the rcd STAYS the shared "via_upstream" (NOT {connection_termination})
+    /// and the %RESPONSE_FLAGS% derive renders "URX" (its branch is checked
+    /// before the rcd-match). Proves the single most error-prone line in §A:
+    /// without the guard, §A would set rcd = "{connection_termination}" and the
+    /// rcd assertion fails. The differential 0062 cannot exercise this path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_retry_exhausted_reset_keeps_via_upstream_rcd_and_urx_flag() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                drop(sock);
+            }
+        });
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: Some(envoy_config::RetryPolicy {
+                                retry_on: "reset".into(),
+                                num_retries: Some(1),
+                                retriable_status_codes: vec![],
+                            }),
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "retry-exhausted reset surfaces the synth-503 downstream: {resp_str}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
+            "retry-exhausted reset keeps rcd:via_upstream + rf:URX (the §A guard): {logged:?}"
         );
         server.abort();
     }
