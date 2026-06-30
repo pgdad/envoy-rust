@@ -69,3 +69,35 @@ test result: ok. 149 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 No regression (the whole-crate grep confirmed no live test asserted reset→502).
 
 **Commit:** `phase 53 task 2: reset synth status 502->503 to match Envoy + 502 comment/doc sweep [ADR-0110]`
+
+---
+
+## Task 3 — `reset_for_log` boolean + `%RESPONSE_FLAGS%` = `UC` derive branch (§A(ii) + §B) ✅
+
+**RED** (`cargo test -p envoy-http1 h1_upstream_reset_access_log_carries_uc_flag`): the
+accept-then-close reset path wired to a `{rc,rf}` FILE json access-log, asserting
+`{"rc":503,"rf":"UC"}`:
+```
+assertion `left == right` failed: upstream-reset access-log line carries rf:UC: "{\"rc\":503,\"rf\":\"-\"}\n"
+  left: "{\"rc\":503,\"rf\":\"-\"}\n"
+ right: "{\"rc\":503,\"rf\":\"UC\"}\n"
+```
+(the reset rcd `via_upstream` falls to the derive's `_ => "-"` arm; no `reset_for_log`
+boolean yet.)
+
+**Implementation:** `hcm.rs` — `let mut reset_for_log = false;` decl alongside
+`connect_failure_for_log` (`:863`-region); post-loop set
+`reset_for_log = matches!(final_outcome, Some(AttemptOutcome::Reset));` immediately after
+the `connect_failure_for_log` set (`:1185`); derive `else if reset_for_log { "UC" }`
+branch after the `"UF"` branch (`:1346`) + a doc comment. Set ONLY on the reset
+final-outcome path → URX/UF/NR/UH/UO arms unreachable-with-it-set → byte-identical.
+
+**GREEN** (`cargo test -p envoy-http1`):
+```
+test hcm::tests::h1_upstream_reset_returns_503 ... ok
+test hcm::tests::h1_upstream_reset_access_log_carries_uc_flag ... ok
+test result: ok. 150 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+The new test logs `{"rc":503,"rf":"UC"}`; Task 2's status test still passes; no regression.
+
+**Commit:** `phase 53 task 3: reset_for_log boolean + %RESPONSE_FLAGS%=UC derive branch [ADR-0110]`

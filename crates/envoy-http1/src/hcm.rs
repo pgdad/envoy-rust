@@ -862,6 +862,16 @@ async fn serve_connection(
         // "via_upstream"), so it keys on this boolean, not on the rcd.
         let mut connect_failure_for_log = false;
 
+        // phase 53 (ADR-0110): per-request %RESPONSE_FLAGS% = "UC"
+        // (UpstreamConnectionTermination) discriminator. Set true POST-LOOP when
+        // the FINAL attempt's outcome was AttemptOutcome::Reset (a reset RETRIED
+        // to success must NOT flag UC — so this is the final outcome, not a
+        // per-attempt set). Like URX/UF, UC is NOT 1:1 with a unique
+        // %RESPONSE_CODE_DETAILS% (the reset rcd is the shared "via_upstream"),
+        // so it keys on this boolean. `Copy` → no borrow/move interaction with
+        // the rcd String.
+        let mut reset_for_log = false;
+
         // 07.1 Task 5: per-arm-populated response value, written to the wire
         // once below the match (factored unified-site). 07.1 Task 6 flipped
         // this from `let outgoing` to `let mut outgoing` because the
@@ -1183,6 +1193,11 @@ async fn serve_connection(
                         // URX-before-UF ordering renders URX deterministically.
                         connect_failure_for_log =
                             matches!(final_outcome, Some(AttemptOutcome::ConnectFailure));
+                        // phase 53 (ADR-0110): flag UC when the FINAL attempt was a reset —
+                        // independent of the retry split (a single reset attempt with no
+                        // retry_policy flags it too). A reset retried to success has
+                        // final_outcome = Some(Response) → not flagged.
+                        reset_for_log = matches!(final_outcome, Some(AttemptOutcome::Reset));
                         // Release the retry-budget slot now, before building the outgoing response,
                         // so the slot (and its gauges) reflect completion rather than lingering
                         // until this stack frame unwinds.
@@ -1340,10 +1355,20 @@ async fn serve_connection(
                 // attempt's AttemptOutcome is ConnectFailure. Ordered after URX
                 // (the un-recon'd retry-exhausted-connect-failure combination, if
                 // it ever sets both, renders URX deterministically — §4).
+                // phase 53 (ADR-0110): the `reset_for_log => "UC"`
+                // (UpstreamConnectionTermination) branch — the THIRD flag NOT
+                // derivable from %RESPONSE_CODE_DETAILS% (the reset rcd is the
+                // shared "via_upstream", which would otherwise fall to the
+                // else-match's `_ => "-"` arm); it keys on the `reset_for_log`
+                // boolean set post-loop when the FINAL attempt's AttemptOutcome
+                // is Reset. Ordered after UF — set ONLY on the reset final-outcome
+                // path, so the NR/UH/UO arms stay byte-identical.
                 response_flags: if retry_limit_exceeded_for_log {
                     "URX"
                 } else if connect_failure_for_log {
                     "UF"
+                } else if reset_for_log {
+                    "UC"
                 } else {
                     match response_code_details_for_log.as_deref() {
                         Some("route_not_found") => "NR",
@@ -7492,6 +7517,97 @@ static_resources:
         assert!(
             resp_str.starts_with("HTTP/1.1 503 "),
             "upstream-reset surfaces the synth-503 downstream: {resp_str}"
+        );
+        server.abort();
+    }
+
+    /// phase 53 (ADR-0110): the accept-then-close reset path (NO retry_policy),
+    /// wired to a {rc,rf} FILE json access-log. Asserts the downstream is the
+    /// synth-503 AND the logged line carries the DERIVED rf:"UC" (set post-loop
+    /// from the reset final-outcome boolean, NOT rcd-derived — the reset rcd is
+    /// the shared "via_upstream"). The sole in-process proof of §A's
+    /// discriminator + §B's derive branch. Fail-first: pre-change the derive's
+    /// rcd-match falls to `_ => "-"` (via_upstream unmatched) → it renders
+    /// `"rf":"-"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_upstream_reset_access_log_carries_uc_flag() {
+        let tmp = tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut sock, _)) => {
+                        let mut buf = [0u8; 1024];
+                        let _ = sock.read(&mut buf).await;
+                        drop(sock);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![sink],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "upstream-reset surfaces the synth-503 downstream: {resp_str}"
+        );
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rf\":\"UC\"}\n",
+            "upstream-reset access-log line carries rf:UC: {logged:?}"
         );
         server.abort();
     }
