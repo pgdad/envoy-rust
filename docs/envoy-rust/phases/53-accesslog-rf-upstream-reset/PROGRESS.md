@@ -250,3 +250,55 @@ gate is CI-authoritative.
 unchanged; the new differential is an auto-discovered `#[tokio::test]`, not a fuzz target).
 
 **Commit:** `phase 53 task 9: clippy while_let_loop normalization on the new reset test listeners [ADR-0110]`
+
+## State-4 verification ✅ (§5 state-4 / §7.5 phase-done gate — `superpowers:verification-before-completion`)
+
+Fresh re-run of the FULL §7.5 gate this session (`superpowers:verification-before-completion`
+— evidence before claims). **CI is AUTHORITATIVE for the Docker differential** (memory
+`envoy-rust-state4-ci-first-execution` + `differential-host-bridge-ip-192-168-65-2`).
+
+### (a)-(e) Local gate — all GREEN except the documented 0061 host-bridge artifact
+Rebuilt the DEBUG `envoy-bin` (`cargo build -p envoy-bin` → Finished, EXIT 0) before the
+differential (memory `differential-harness-uses-debug-envoy-bin`), then:
+```
+cargo build --workspace --all-targets                                 → Finished (EXIT 0)
+cargo clippy --workspace --all-targets --all-features -- -D warnings  → Finished (EXIT 0)
+cargo fmt --all -- --check                                            → clean (FMT_EXIT=0)
+cargo test --workspace                                                → 1 failure ONLY: 0061 (host-bridge UF/UC artifact, below)
+cargo deny check                                                      → advisories ok, bans ok, licenses ok, sources ok (DENY_EXIT=0)
+```
+`cargo test --workspace` failure census (grep `test result: FAILED` / `FAILED` across the
+whole run): exactly ONE — `differential::access_log_rf_upstream_reset` (fixture 0061). Every
+other crate/test binary reported `test result: ok`. The 0061 LOCAL-RED is the SAME documented
+host-bridge `UF`-vs-`UC` mismatch recorded under Task 9 (envoy-rust correctly logs
+`{"rc":503,"rf":"UC"}` via the `error=UnexpectedEof` post-connect-reset arm; the upstream
+Envoy *container* logs `UF` because it cannot reach the host-running accept-then-close backend
+via `host.docker.internal`). NOT a regression — the 0052 backend-spawning precedent.
+The `cargo deny check` warnings are benign `license-not-encountered` allowances
+(MPL-2.0 / Unicode-DFS-2016 / Zlib allowed but unused), not findings.
+
+### Differential surface + conformance + fuzz — CI AUTHORITATIVE, GREEN
+Authoritative Linux CI run **`28435164596`** @ code-HEAD `989791d` (the state-3 STATE-advance
+commit) — both jobs `success`:
+```
+build + test + lint                                                            → success
+fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse)   → success
+```
+- **fixture 0061 GREEN on native Linux**: CI log shows `test access_log_rf_upstream_reset ... ok`
+  — both proxies emit the byte-identical `{"rc":503,"rf":"UC"}` (the host-bridge artifact does
+  NOT occur on CI; both reach the backend → both `UC`).
+- **all 0001-0060 green simultaneously**: the run reports **132 `test result: ok`** and **0
+  `test result: FAILED`** across the whole workspace — the 502→503 reset-synth change and the
+  `reset_for_log` `%RESPONSE_FLAGS%`=`UC` derive branch are additive, touching no existing GREEN
+  fixture.
+- **conformance h2spec ≥95% (unchanged)**: `test h2spec_pass_rate_gate ... ok` — NO HTTP/2
+  codec change this phase, the gate is unmoved.
+- **Fuzz: NONE new** — the fuzz job ran the existing 4 targets (`%RESPONSE_FLAGS%` is an existing
+  operator; `ci.yml` unchanged; the new differential is an auto-discovered `#[tokio::test]`, not
+  a fuzz target). 0 crashes.
+
+### Disposition
+§7.5 gate (a)-(f-pending-review) MET. No §7.5 check failed for a real reason (the only LOCAL-RED
+is the documented host-bridge artifact, GREEN on the authoritative CI run). **No ADR fired** —
+verification overturned no PLAN/SPEC fact (ADR-0111/0112 stay reserved-but-UNFIRED). No
+re-implementation. → advance STATE to the §5 state-5 code-review (the SESSION AFTER).
