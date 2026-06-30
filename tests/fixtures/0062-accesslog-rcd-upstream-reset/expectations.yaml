@@ -1,0 +1,29 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0062-envoy-mount/access.log
+    envoy_rust: /tmp/0062-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `backend_cluster`, a STRICT_DNS cluster with
+    # NO circuit_breakers and NO retry_policy whose single endpoint is the
+    # SPAWNED accept-then-close backend ({{CLOSE_BACKEND_PORT}} -> TcpCloseBackend
+    # via tcp-echo-server --close-on-accept). Both proxies DIAL it, the connect
+    # completes, the upstream drains the request then closes (graceful FIN, NO
+    # response) → the reset synth-503. SEVENTH %RESPONSE_CODE_DETAILS% witness +
+    # the FIRST deterministic upstream-reset rcd (phase 54, ADR-0111).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). The reset rcd
+    # `upstream_reset_before_response_started{connection_termination}` is a FIXED
+    # reset-reason enum → DETERMINISTIC (state-0 recon: byte-stable across 3
+    # probes + a container restart at live v1.33.0, digest sha256:56da5afd…). The
+    # driver compares the access-log lines + status, NOT the body.
+    #   rc:  "%RESPONSE_CODE%"          → 503  (json NUMBER)
+    #   rcd: "%RESPONSE_CODE_DETAILS%"  → "upstream_reset_before_response_started{connection_termination}"
+    #   rf:  "%RESPONSE_FLAGS%"         → "UC"
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): rc, rcd, rf. Compact
+    # separators + ONE trailing `\n` (ADR-0092 §E). Emitted line:
+    #   {"rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
