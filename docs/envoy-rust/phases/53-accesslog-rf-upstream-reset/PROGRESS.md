@@ -101,3 +101,23 @@ test result: ok. 150 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 The new test logs `{"rc":503,"rf":"UC"}`; Task 2's status test still passes; no regression.
 
 **Commit:** `phase 53 task 3: reset_for_log boolean + %RESPONSE_FLAGS%=UC derive branch [ADR-0110]`
+
+---
+
+## Task 4 — `TcpCloseBackend` harness struct (§C(ii)) ✅
+
+Added `TcpCloseBackend` (a near-verbatim clone of `TcpProxyBackend`) to
+`tests/differential/src/backend.rs` after `TcpProxyBackend`: `spawn()` reserves a port,
+locates `tcp-echo-server`, spawns it with `--port <p> --close-on-accept`,
+`wait_accept_ready` (1s), `kill_on_drop(true)`; `port()`; `container_host() =
+"host.docker.internal"`; identical 2s-poll SIGKILL Drop. No standalone unit test (same
+as `TcpProxyBackend`); exercised by the Task 7 differential test.
+
+**Verify** (`cargo build -p differential --tests`):
+```
+Compiling differential v0.0.0 (/home/esa/git/envoy-rust/tests/differential)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.98s
+```
+Clean compile (pub struct → no dead-code warning despite not-yet-wired).
+
+**Commit:** `phase 53 task 4: TcpCloseBackend harness struct (accept-then-close) [ADR-0110]`

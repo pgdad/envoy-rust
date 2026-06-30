@@ -84,6 +84,71 @@ impl Drop for TcpProxyBackend {
     }
 }
 
+/// Phase 53 (ADR-0110): a running `tcp-echo-server --close-on-accept` host
+/// subprocess — an accept-then-close upstream that completes the TCP connect,
+/// drains the request, then closes (graceful FIN, NO response). Used by the
+/// fixture-0061 reset/`UC` witness via the `{{CLOSE_BACKEND_PORT}}` marker.
+/// Drop posture identical to `TcpProxyBackend`.
+pub struct TcpCloseBackend {
+    port: u16,
+    child: Option<tokio::process::Child>,
+}
+
+impl TcpCloseBackend {
+    pub async fn spawn() -> Result<Self> {
+        let port = reserve_port().context("reserving close-backend port")?;
+        let bin = locate_tcp_echo_server().context("locating tcp-echo-server binary")?;
+        let child = tokio::process::Command::new(&bin)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--close-on-accept")
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!("spawning {} --port {port} --close-on-accept", bin.display())
+            })?;
+
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        wait_accept_ready(addr, Duration::from_secs(1))
+            .await
+            .with_context(|| {
+                format!("tcp-echo-server --close-on-accept never became accept-ready on {addr}")
+            })?;
+
+        Ok(Self {
+            port,
+            child: Some(child),
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn container_host(&self) -> &'static str {
+        "host.docker.internal"
+    }
+}
+
+impl Drop for TcpCloseBackend {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+}
+
 /// `TlsEchoBackend` — spawns the workspace's `tls-echo-server` binary as a
 /// subprocess and tears it down on Drop. Sibling of `TcpProxyBackend`. Used
 /// by fixture 0005's TLS-upstream backend.
