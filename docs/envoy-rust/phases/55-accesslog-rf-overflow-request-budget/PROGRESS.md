@@ -135,6 +135,66 @@ needed for this task (skipped, as expected).
 
 ---
 
+## State-4 verification
+
+**Execution model:** `superpowers:verification-before-completion` — evidence before
+claims. Rebuilt `target/debug/envoy-bin` first (`cargo build -p envoy-bin`, memory
+`differential-harness-uses-debug-envoy-bin`) — already current, no rebuild needed.
+
+**Local §7.5 (a)-(e) subset:**
+```
+$ cargo build --workspace --all-targets
+Finished `dev` profile [unoptimized + debuginfo] target(s)
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+Finished `dev` profile [unoptimized + debuginfo] target(s)
+
+$ cargo fmt --all -- --check
+(clean, exit 0)
+```
+All clean (EXIT 0).
+
+`cargo test --workspace --no-fail-fast` for the complete local picture: two separate
+full runs, each showing a DIFFERENT set of local-only failures — confirming the
+project's documented parallel-load Docker-startup-race class (memory
+`differential-fixtures-flake-under-parallel-load`), NOT a phase-55 regression:
+- Run 1: `access_log_rcd_upstream_reset` (fixture `0062`, phase 54) + `access_log_rf_upstream_reset` (fixture `0061`, phase 53) both showed the documented host-bridge `UF`-vs-`UC` mismatch (memory `differential-host-bridge-ip-192-168-65-2`); `admin_config_dump_server_info` showed the documented `192.168.65.2` bridge-IP cluster-stat artifact; `xds_file_based_eds`/`admin_ready` showed container-startup races. **Fixture `0063` (this phase) was GREEN in this run.**
+- Run 2: a DIFFERENT set flaked — `access_log_rcd_upstream_reset`/`access_log_rf_upstream_reset`/`admin_config_dump_server_info` again (the same host-bridge artifacts), PLUS `access_log_rf_no_route` (fixture `0056`, phase 48 — an unrelated PRE-EXISTING fixture) and, this time, **`access_log_rf_overflow_request_budget` (fixture `0063`) FAILED** with `upstream Envoy never became accept-ready … Connection refused (os error 111)` — the classic Docker-container-startup-race signature (matching the `eds-fatal-startup-test-port-reuse-flake`/`upstream-h2-connection-pooling-backend-ready-flake` class exactly), NOT a code/fixture defect. `envoy-http2 --lib`'s `send_request_maps_h2_handshake_failure_to_typed_error` also failed both runs (memory `envoyrust-h2-handshake-test-host-flake`, pre-existing, unrelated to this phase).
+- **Isolated re-run confirms fixture `0063` is genuinely green when not contending for host resources:** `cargo test -p differential --test access_log_rf_overflow_request_budget -- --nocapture` → `test access_log_rf_overflow_request_budget ... ok` (`test result: ok. 1 passed; 0 failed`). The full-workspace-parallel failures are host-load artifacts, not a phase-55 regression.
+
+`cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok` (clean; only the
+standard benign license-not-encountered warnings, same as every prior phase).
+
+h2spec: `h2spec_runner: h2spec not found — skipping locally; test h2spec_pass_rate_gate ... ok` — the binary isn't installed on this dev host; the gate no-ops locally by design. NO HTTP/2 codec change this phase, so the gate is expected unmoved from phase 54's CI baseline — confirmed on CI below.
+
+**CI is AUTHORITATIVE for the Docker differential** (memory
+`envoy-rust-state4-ci-first-execution`): the phase-55 state-3 STATE-advance commit
+`d8301c3` was already pushed and its CI run (`28540697796`) already completed
+`success` on both jobs (`fuzz`, `build + test + lint`) BEFORE this state-4 session
+began verifying — this is the FIRST CI run to ever exercise fixture `0063` (it did
+not exist before commit `197e9d6`, itself part of this same push). Pulled the FULL
+job log (`gh run view 28540697796 --log`) and confirmed directly, not just from the
+job-summary conclusion: `cargo fmt --all -- --check` ran clean, `cargo clippy
+--workspace --all-targets --all-features -- -D warnings` ran clean, **fixture `0063`
+GREEN** — `test access_log_rf_overflow_request_budget ... ok` (both proxies emit the
+byte-identical `{"rc":503,"rcd":"upstream_reset_before_response_started{overflow}","rf":"UO"}`),
+**134 `test result: ok` / 0 `test result: FAILED`** across the whole workspace (one
+more green than phase 54's 133 — the net-new `0063`, confirming no pre-existing
+fixture regressed), `h2spec_pass_rate_gate ... ok` (no HTTP/2 codec change this
+phase — gate unmoved), `cargo deny check` → `advisories ok, bans ok, licenses ok,
+sources ok` clean on CI too, and the `fuzz` job `success` (the existing 4 targets —
+`parse_bootstrap`/`jwt_parse`/`cdn_loop_parse`/`accesslog_format_parse` — 0 crashes;
+no new fuzz target this phase, `ci.yml` unchanged per SPEC §2 SKIP).
+
+**Disposition:** §7.5 gate (a)-(e) MET on CI (the authoritative environment); (f)
+`REVIEW.md` is the next session's job (state-5 code-review). No ADR fired —
+verification overturned no PLAN/SPEC fact (ADR-0113/ADR-0114 stay
+reserved-but-unfired). No re-implementation needed. **CONSUMES M50-C — now
+CI-CONFIRMED** (no longer "pending"). Per §5.1, STOP here — advance STATE to the §5
+state-5 code-review, do not chain into it this session.
+
+---
+
 ## Summary
 
 All 3 PLAN.md tasks complete, each task-reviewed **Approved** (0 Critical / 0
@@ -147,6 +207,10 @@ Task 3's clean `envoy-http1` suite run with zero diffs to that crate). Carry-for
 dependency/fuzz-target/`ConfigError` variant/test-harness code/in-process backstop —
 all confirmed absent from the diffs. **DECISIONS.md ledger head unchanged: ADR-0112**
 (no new ADR fired this session — ADR-0113/ADR-0114 stay reserved-but-unfired, per
-PLAN.md's own projection, confirmed by the clean implementation). Next: **§5 state-4
-verification** — the full §7.5 gate on CI (`cargo test --workspace`, `cargo deny
-check`, the Docker differential suite including fixture `0063`, h2spec).
+PLAN.md's own projection, confirmed by the clean implementation).
+
+**State-4 verification (see `## State-4 verification` above): §7.5 gate (a)-(e) MET on
+CI** — fixture `0063` GREEN, 134/134 `test result: ok`, h2spec/deny/build/clippy/fmt
+all clean, no pre-existing fixture regressed. Carry-forward **M50-C** now
+CI-CONFIRMED (fully closed, no longer pending). Next: **§5 state-5 code-review**
+(`superpowers:requesting-code-review`).
