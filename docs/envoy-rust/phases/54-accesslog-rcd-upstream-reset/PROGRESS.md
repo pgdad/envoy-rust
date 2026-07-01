@@ -204,3 +204,94 @@ LOCAL-RED per the host's Docker bridge-IP flake, memory
 `cargo test --workspace`, `cargo deny check`, and h2spec, is the **state-4
 verification** session's job (the next session, NOT this one — `§5.1` one state per
 session).
+
+## State-4 verification ✅ (§5 state-4 / §7.5 phase-done gate — `superpowers:verification-before-completion`)
+
+Fresh re-run of the FULL §7.5 gate this session (`superpowers:verification-before-completion`
+— evidence before claims). **CI is AUTHORITATIVE for the Docker differential** (memory
+`envoy-rust-state4-ci-first-execution` + `differential-host-bridge-ip-192-168-65-2`).
+
+### (a)-(e) Local gate — all GREEN except documented host-artifact LOCAL-REDs
+Rebuilt the DEBUG `envoy-bin` (`cargo build -p envoy-bin` → Finished, EXIT 0) before the
+differential (memory `differential-harness-uses-debug-envoy-bin`), then:
+```
+cargo build --workspace --all-targets                                 → Finished (EXIT 0)
+cargo clippy --workspace --all-targets --all-features -- -D warnings  → Finished (EXIT 0)
+cargo fmt --all -- --check                                            → clean (FMT_EXIT=0)
+cargo test --workspace --no-fail-fast                                 → 4 failures, all documented host artifacts (below)
+cargo deny check                                                      → advisories ok, bans ok, licenses ok, sources ok (DENY_EXIT=0)
+```
+
+`cargo test --workspace` (first run, default fail-fast) stopped at the first
+alphabetically-ordered differential failure. Re-ran with `--no-fail-fast` to see the
+complete local picture: exactly **4** local failures, all pre-existing documented
+host-environment artifacts, NONE a regression from this phase's `hcm.rs` change:
+
+1. **`access_log_rcd_upstream_reset`** (fixture `0062`, NEW this phase): local mismatch
+   `envoy="...upstream_reset_before_response_started{remote_connection_failure|immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:45203}",rf:"UF"` vs
+   `envoy-rust="...upstream_reset_before_response_started{connection_termination}",rf:"UC"`.
+   The upstream Envoy *container* cannot reach the sibling accept-then-close backend over
+   this host's Docker bridge (sees a connect-failure) while envoy-rust reaches it directly
+   (sees the genuine post-connect reset) — the documented host-bridge artifact (memory
+   `differential-host-bridge-ip-192-168-65-2`), same failure class as fixture 0061's phase-53
+   precedent.
+2. **`access_log_rf_upstream_reset`** (fixture `0061`, PRE-EXISTING, phase 53): identical
+   `UF`-vs-`UC` host-bridge mismatch — the SAME documented artifact, unchanged from the
+   phase-53 state-4 record.
+3. **`admin_config_dump_server_info`** (PRE-EXISTING): `backend::192.168.65.2:<port>::*`
+   envoy-only cluster-stat lines — the documented `192.168.65.2` bridge-IP artifact (memory
+   `differential-host-bridge-ip-192-168-65-2`), unrelated to this phase's surface.
+4. **`xds_file_based_eds_fixture`** (PRE-EXISTING): "upstream Envoy never became accept-ready
+   … Connection refused" — a Docker container startup race under parallel `cargo test` load
+   (memory `differential-fixtures-flake-under-parallel-load` / `eds-fatal-startup-test-port-reuse-flake`
+   class), unrelated to this phase's surface.
+
+Every other test binary in the `--no-fail-fast` run reported `test result: ok` — no other
+fixture, unit, or integration test regressed. `cargo deny check` warnings are the same
+benign `license-not-encountered` allowances as every prior phase (MPL-2.0 /
+Unicode-DFS-2016 / Zlib / 0BSD / BSD-2-Clause allowed but unused), not findings.
+
+### Differential surface + conformance + fuzz — CI AUTHORITATIVE, GREEN
+Origin `main` already carried the phase-54 state-3 commits (`e12825e`..`352c0c0`) from the
+prior session's push — no new push was needed this session. Authoritative Linux CI run
+**`28481385288`** @ code-HEAD **`352c0c0`** (the state-3 STATE-advance commit, confirmed via
+`git fetch origin main` + `gh run list`) — both jobs `success`:
+```
+build + test + lint                                                            → success
+fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse)   → success
+```
+Pulled the full job log (`gh run view 28481385288 --log`) and confirmed directly:
+- **`cargo clippy --workspace --all-targets --all-features -- -D warnings`**: ran clean,
+  no errors before the next step.
+- **`cargo fmt --all -- --check`**: ran clean.
+- **fixture `0062` GREEN on native Linux CI**: `test access_log_rcd_upstream_reset ... ok`
+  — both proxies emit the byte-identical
+  `{"rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}`
+  (the host-bridge artifact does NOT occur on CI; both proxies reach the sibling backend).
+- **fixture `0061` GREEN on CI**: `test access_log_rf_upstream_reset ... ok` (unaffected by
+  this phase's change, re-confirmed).
+- **`admin_config_dump_server_info` GREEN on CI**: `test admin_config_dump_server_info ... ok`
+  (confirms the local failure was purely the host-bridge-IP artifact, not a real regression).
+- **`xds_file_based_eds_fixture` GREEN on CI**: `test xds_file_based_eds_fixture ... ok`
+  (confirms the local failure was the Docker-startup-race flake, not a real regression).
+- **all `0001`-`0061` green simultaneously**: the run reports **133 `test result: ok`** and
+  **0 `test result: FAILED`** across the whole workspace (one more green than phase 53's 132,
+  the net-new `0062` fixture) — the §A rcd-set / §B derive migration touch no existing GREEN
+  fixture.
+- **conformance h2spec ≥95% (unchanged)**: `test h2spec_pass_rate_gate ... ok` — NO HTTP/2
+  codec change this phase, the gate is unmoved.
+- **`cargo deny check` on CI**: `advisories ok, bans ok, licenses ok, sources ok` — same
+  benign license-not-encountered warnings as local.
+- **Fuzz: NONE new** — the fuzz job ran the existing 4 targets (`%RESPONSE_CODE_DETAILS%` is
+  an existing operator; `ci.yml` unchanged; the new differential is an auto-discovered
+  `#[tokio::test]`, not a fuzz target). Job `success`, 0 crashes.
+
+### Disposition
+§7.5 gate (a)-(e) MET on CI (the authoritative environment); (f) REVIEW.md is the next
+session's job (state-5 code-review). No §7.5 check failed for a real reason — all 4
+LOCAL-REDs are documented pre-existing host-environment artifacts (2 already-known from
+phase 53's precedent record, 2 newly-confirmed-benign this session by cross-referencing the
+CI green), none a regression from this phase's `hcm.rs` change. **No ADR fired** —
+verification overturned no PLAN/SPEC fact (ADR-0112/ADR-0113 stay reserved-but-UNFIRED). No
+re-implementation. → advance STATE to the §5 state-5 code-review (the SESSION AFTER). Per
+§5.1, STOP here — do not chain to state-5 in this session.
