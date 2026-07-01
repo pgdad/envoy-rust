@@ -1,0 +1,32 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0063-envoy-mount/access.log
+    envoy_rust: /tmp/0063-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `rq_zero`, a STRICT_DNS cluster whose
+    # circuit_breakers set max_requests:0 (the request-budget gate,
+    # hcm.rs:913-952) and whose single endpoint is a REACHABLE spawned
+    # Http1EchoBackend ({{HTTP1_BACKEND_PORT}}). The request-budget gate
+    # rejects every request before any pool/backend dispatch (envoy-rust) →
+    # the overflow synth-503, closing carry-forward M50-C (the SECOND of the
+    # two set-sites phase 50/ADR-0107 tagged with the identical rcd string —
+    # fixture 0058 witnesses only the pool-overflow arm; this fixture
+    # witnesses the request-budget arm).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). The overflow
+    # synth-503 is deterministic on BOTH sides (reconfirmed this session
+    # against a freshly-built target/debug/envoy-bin, byte-identical to the
+    # state-1 live-Envoy recon).
+    # state-0/state-2 recon (live v1.33.0 + current envoy-rust tree):
+    #   {"rc":503,"rcd":"upstream_reset_before_response_started{overflow}","rf":"UO"}
+    #   rc:  "%RESPONSE_CODE%"          → 503  (json NUMBER)
+    #   rcd: "%RESPONSE_CODE_DETAILS%"  → "upstream_reset_before_response_started{overflow}"
+    #   rf:  "%RESPONSE_FLAGS%"         → "UO"
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): rc, rcd, rf. Compact
+    # separators + ONE trailing `\n` (ADR-0092 §E). Emitted line:
+    #   {"rc":503,"rcd":"upstream_reset_before_response_started{overflow}","rf":"UO"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
