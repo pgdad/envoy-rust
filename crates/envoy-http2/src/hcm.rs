@@ -939,13 +939,23 @@ async fn finalize_h2_stream(
     // (covering both empty-body and non-empty-body emit branches).
     if !config.inner.access_log.is_empty() {
         let duration = req_arrival_instant.elapsed();
+        // Phase 56 (ADR-0113): the H2 sibling of the H1 phase-48 one-arm
+        // %RESPONSE_FLAGS% derive (crates/envoy-http1/src/hcm.rs:1377,
+        // ORIGINAL one-arm scope before phases 49-54 each added one more
+        // arm). Deliberately mirrors ONLY that original scope, not H1's
+        // current six-arm derive — the remaining H2 flags (UH/UO/URX/UF/UC)
+        // are carry-forward M56-1, witnessed one-at-a-time by future phases.
+        let response_flags_for_log_h2: &str = match response_code_details_for_log_h2.as_deref() {
+            Some("route_not_found") => "NR",
+            _ => "-",
+        };
         let record = envoy_accesslog::AccessLogRecord {
             start_time: req_arrival_systime,
             method: envoy_req.method.clone(),
             path: x_envoy_original_path_or_path(envoy_req).to_owned(),
             protocol: "HTTP/2".to_owned(),
             response_code: response_status_for_log,
-            response_flags: "-".to_owned(),
+            response_flags: response_flags_for_log_h2.to_owned(),
             bytes_received: request_body_len,
             bytes_sent: response_body_len,
             duration,
@@ -2269,6 +2279,217 @@ static_resources:
         assert_eq!(lines_per_sink[0].len(), 1);
         let line = &lines_per_sink[0][0];
         assert!(line.contains("\"GET / HTTP/2\""), "line: {}", line);
+    }
+
+    /// Phase 56 (ADR-0113): the H2 sibling of the H1 phase-48 backstop
+    /// `h1_route_miss_access_log_carries_nr_flag`
+    /// (`crates/envoy-http1/src/hcm.rs:5933`). Builds an H2 HCM with a
+    /// SINGLE non-wildcard vhost `domains: ["match.test"]` (one `/specific`
+    /// direct_response route), drives `GET /nomatch` with `:authority:
+    /// match.test` (route-miss — matches the vhost, no route matches), and
+    /// asserts the access-log line carries `rf: "NR"`. Uses the existing
+    /// `h2_hcm_config_with_access_log` helper, extended with a
+    /// non-wildcard-domain route table instead of its default `domains:
+    /// ["*"]` — see the inline `HttpConnectionManagerConfig` literal below
+    /// (this test builds its OWN config rather than reusing the helper's
+    /// default route table, since the helper's route table is wildcard-only).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_route_miss_access_log_carries_nr_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "backend_vh".to_string(),
+                    domains: vec!["match.test".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "myroute".to_string(),
+                        r#match: RouteMatch {
+                            prefix: Some("/specific".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://match.test/nomatch")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status(), 404, "route-miss synth-404 status unchanged");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "{\"rc\":404,\"rcd\":\"route_not_found\",\"rf\":\"NR\"}\n",
+            "H2 route-miss access-log line carries rf:\"NR\": {logged:?}"
+        );
+    }
+
+    /// Phase 56 (ADR-0113): the H2 sibling of the H1 phase-48 backstop
+    /// `h1_host_miss_access_log_carries_nr_flag`
+    /// (`crates/envoy-http1/src/hcm.rs:6016`). Same HCM config as
+    /// `h2_route_miss_access_log_carries_nr_flag`; drives `GET /specific`
+    /// with `:authority: nomatch.test` (host-miss — no vhost `domains` entry
+    /// matches, the route walk never runs) and asserts the SAME `rf: "NR"`
+    /// line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_host_miss_access_log_carries_nr_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "backend_vh".to_string(),
+                    domains: vec!["match.test".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "myroute".to_string(),
+                        r#match: RouteMatch {
+                            prefix: Some("/specific".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("ok\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://nomatch.test/specific")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status(), 404, "host-miss synth-404 status unchanged");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "{\"rc\":404,\"rcd\":\"route_not_found\",\"rf\":\"NR\"}\n",
+            "H2 host-miss access-log line carries rf:\"NR\": {logged:?}"
+        );
     }
 
     /// phase 41 (ADR-0098 §C): the H2 HCM sets `route_name` on the access-log
