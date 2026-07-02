@@ -125,6 +125,21 @@ pub enum Driver {
         probes: Vec<AccessLogByteExactProbe>,
         expected_access_log_paths: AccessLogPaths,
     },
+    /// Phase 56 (ADR-0113): the H2 sibling of `Http1AccessLogByteExact`.
+    /// Drives a SEQUENCE of H2-prior-knowledge probes via `drive_http2`
+    /// against an H2C listener whose file access-logger carries a CUSTOM
+    /// `log_format`. After all probes complete, scrapes BOTH proxies'
+    /// access-log files and asserts every emitted line is byte-identical via
+    /// `access_log::assert_access_log_lines_byte_identical` — identical
+    /// assertion machinery to the H1 sibling, only the wire driver differs.
+    /// `drive_http2` currently supports GET/OPTIONS with no request body
+    /// (see its `debug_assert!`); every probe's `body` field is therefore
+    /// ignored on this arm (H2 fixtures needing a body must extend
+    /// `drive_http2` first — none do as of this phase).
+    Http2AccessLogByteExact {
+        probes: Vec<AccessLogByteExactProbe>,
+        expected_access_log_paths: AccessLogPaths,
+    },
     /// 05.2 NEW: drive an HTTP/2 cleartext (H2C prior-knowledge) request and
     /// assert the response shape. Mirrors `Http1`'s shape; the `host` field
     /// becomes `:authority` on the H2 wire. Per SPEC §3 D5.
@@ -2811,6 +2826,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         | Driver::Http2KeepAlive { .. }
         | Driver::Http2 { .. }
         | Driver::Http2ProbeList { .. }
+        // Phase 56 (ADR-0113): the H2 access-log byte-exact driver runs over
+        // the same {{PORT}} H2C listener convention as its H1 sibling and
+        // the other HCM-shaped drivers.
+        | Driver::Http2AccessLogByteExact { .. }
         // 06.1 D6.a: AdminScrape's HCM listener uses {{PORT}} like the other
         // HCM-shaped drivers. The admin listener is separately substituted
         // via {{ADMIN_PORT}} (see admin_host_port reservation below).
@@ -5232,6 +5251,124 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
 
             // Each probe emits exactly one access-log line.
+            if envoy_lines.len() != expected_lines {
+                bail!(
+                    "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
+                    envoy_lines.len(),
+                    expected_lines,
+                    envoy_lines,
+                );
+            }
+            if envoy_rust_lines.len() != expected_lines {
+                bail!(
+                    "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
+                    envoy_rust_lines.len(),
+                    expected_lines,
+                    envoy_rust_lines,
+                );
+            }
+
+            crate::access_log::assert_access_log_lines_byte_identical(
+                &envoy_lines,
+                &envoy_rust_lines,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "access log byte-exact mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
+                    e,
+                    envoy_lines,
+                    envoy_rust_lines,
+                )
+            })?;
+        }
+        // Phase 56 (ADR-0113): the H2 sibling of the byte-exact access-log
+        // driver above. Drives a SEQUENCE of H2 probes (via `drive_http2`),
+        // then scrapes BOTH proxies' access-log files and asserts every
+        // emitted line is byte-identical.
+        Driver::Http2AccessLogByteExact {
+            probes,
+            expected_access_log_paths,
+        } => {
+            let expected_lines = probes.len();
+
+            for (idx, probe) in probes.iter().enumerate() {
+                let upstream_resp = drive_http2(
+                    upstream_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                )
+                .await
+                .with_context(|| {
+                    format!("upstream envoy http2 drive (Http2AccessLogByteExact probe {idx})")
+                })?;
+                let subject_resp = drive_http2(
+                    subject_addr,
+                    &probe.method,
+                    &probe.path,
+                    &probe.host,
+                    &probe.extra_headers,
+                )
+                .await
+                .with_context(|| {
+                    format!("envoy-rust http2 drive (Http2AccessLogByteExact probe {idx})")
+                })?;
+                if upstream_resp.status != probe.expected_status {
+                    bail!(
+                        "probe {idx}: upstream status {} != expected {}",
+                        upstream_resp.status,
+                        probe.expected_status,
+                    );
+                }
+                if subject_resp.status != probe.expected_status {
+                    bail!(
+                        "probe {idx}: subject status {} != expected {}",
+                        subject_resp.status,
+                        probe.expected_status,
+                    );
+                }
+            }
+
+            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+            if !wait_file_lines(&envoy_rust_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+                tracing::warn!(
+                    "differential: envoy-rust access-log file {} still has < {} lines after {:?} (pre-shutdown wait)",
+                    envoy_rust_path.display(),
+                    expected_lines,
+                    ACCESS_LOG_FLUSH_WAIT,
+                );
+            }
+
+            let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
+            if !wait_file_lines(&envoy_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+                tracing::warn!(
+                    "differential: envoy access-log file {} still has < {} lines after {:?} (pre-stop wait)",
+                    envoy_path.display(),
+                    expected_lines,
+                    ACCESS_LOG_FLUSH_WAIT,
+                );
+            }
+
+            subject.shutdown(Duration::from_secs(5)).await.ok();
+            drop(upstream);
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
+                format!("read envoy access-log file at {}", envoy_path.display())
+            })?;
+            let envoy_rust_contents =
+                std::fs::read_to_string(&envoy_rust_path).with_context(|| {
+                    format!(
+                        "read envoy-rust access-log file at {}",
+                        envoy_rust_path.display()
+                    )
+                })?;
+            let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
+            let envoy_rust_lines: Vec<String> =
+                envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
+
             if envoy_lines.len() != expected_lines {
                 bail!(
                     "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
