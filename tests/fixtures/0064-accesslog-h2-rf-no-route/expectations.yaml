@@ -1,0 +1,28 @@
+driver:
+  kind: http2_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0064-envoy-mount/access.log
+    envoy_rust: /tmp/0064-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — ROUTE-MISS. `Host: match.test` (`:authority` on H2) MATCHES
+    # the non-wildcard vhost; `GET /nomatch` matches no route → the
+    # no-matching-route synth_404. Envoy emits %RESPONSE_FLAGS% = NR
+    # (state-0 recon, ADR-0113: {"rc":404,"rcd":"route_not_found","rf":"NR"}).
+    - method: get
+      path: /nomatch
+      host: match.test
+      expected_status: 404
+    # Probe 2 — HOST-MISS. `Host: nomatch.test` matches NO vhost `domains`
+    # entry → the no-matching-virtual_host synth_404. Envoy emits the same
+    # NR flag here (state-0 recon, ADR-0113).
+    - method: get
+      path: /specific
+      host: nomatch.test
+      expected_status: 404
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static
+  # literal: the `http2_access_log_byte_exact` driver asserts each emitted
+  # line is byte-identical between upstream Envoy v1.33.0 and envoy-rust.
+  # Both no-route synth_404 arms are deterministic on both sides, so each
+  # rendered line is identical. Keys sort UTF-8 (ADR-0094 §A): method,
+  # proto, rc, rcd, rf. Each line is:
+  #   {"method":"GET","proto":"HTTP/2","rc":404,"rcd":"route_not_found","rf":"NR"}
