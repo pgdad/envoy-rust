@@ -3677,12 +3677,17 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // directly to the host path; only the upstream Envoy needs the mount.
     let upstream_access_log_mounts: Vec<(String, String)> = match &expectations.driver {
         // Phase 32 Task 6 (ADR-0079): the byte-exact access-log driver mounts
-        // both log dirs identically to `Http1WithAccessLog`.
+        // both log dirs identically to `Http1WithAccessLog`. Phase 56 Task 1
+        // extends this to HTTP/2 via `Http2AccessLogByteExact`.
         Driver::Http1WithAccessLog {
             expected_access_log_paths,
             ..
         }
         | Driver::Http1AccessLogByteExact {
+            expected_access_log_paths,
+            ..
+        }
+        | Driver::Http2AccessLogByteExact {
             expected_access_log_paths,
             ..
         } => {
