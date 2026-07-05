@@ -501,6 +501,7 @@ dependencies = [
  "envoy-config",
  "envoy-stats",
  "serde_yaml",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",

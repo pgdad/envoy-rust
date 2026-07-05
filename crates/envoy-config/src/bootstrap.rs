@@ -583,6 +583,20 @@ pub struct Listener {
     /// rejection on any path that parses envoy.yaml through envoy-config.
     #[serde(default)]
     pub listener_filters: Vec<serde_yaml::Value>,
+    /// Envoy `Listener.enable_reuse_port` (bool, **default true** upstream since
+    /// v1.15 for TCP). Parse-and-store: envoy-config only records it; the data
+    /// plane (`envoy-bin`) consumes it to decide whether to bind one
+    /// `SO_REUSEPORT` socket per worker (spreading the accept path + RX softirq
+    /// across cores) or a single accepting socket. Defaulting to `true` matches
+    /// Envoy so an `enable_reuse_port`-bearing bootstrap round-trips; a bootstrap
+    /// that omits it keeps the field at `true` without any wire-observable change
+    /// (the option is transparent to clients).
+    #[serde(default = "default_enable_reuse_port")]
+    pub enable_reuse_port: bool,
+}
+
+fn default_enable_reuse_port() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -14659,6 +14673,38 @@ static_resources:
     /// Parse a standalone Listener YAML (test convenience — no listener helper exists).
     fn parse_listener(yaml: &str) -> Listener {
         serde_yaml::from_str(yaml).expect("listener parses")
+    }
+
+    #[test]
+    fn listener_enable_reuse_port_defaults_true_when_absent() {
+        // A bootstrap that omits enable_reuse_port keeps Envoy's default (true)
+        // without tripping deny_unknown_fields.
+        let l = parse_listener(
+            r#"
+name: a
+address: { socket_address: { address: 0.0.0.0, port_value: 1 } }
+filter_chains: [{ filters: [{ name: envoy.filters.network.echo }] }]
+"#,
+        );
+        assert!(l.enable_reuse_port, "defaults to true when omitted");
+    }
+
+    #[test]
+    fn listener_enable_reuse_port_round_trips_true_and_false() {
+        for (yaml_val, expected) in [("true", true), ("false", false)] {
+            let l = parse_listener(&format!(
+                r#"
+name: a
+address: {{ socket_address: {{ address: 0.0.0.0, port_value: 1 }} }}
+enable_reuse_port: {yaml_val}
+filter_chains: [{{ filters: [{{ name: envoy.filters.network.echo }}] }}]
+"#
+            ));
+            assert_eq!(
+                l.enable_reuse_port, expected,
+                "enable_reuse_port: {yaml_val}"
+            );
+        }
     }
 
     #[test]
