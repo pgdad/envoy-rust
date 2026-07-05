@@ -2007,6 +2007,179 @@ static_resources:
         token.cancel();
     }
 
+    /// Phase 58 (ADR-0115) §A/§C/§F1 backstop: drive the FULL H2 dispatch path
+    /// with a CONFIGURED `H2PoolManager` whose cluster carries
+    /// `circuit_breakers.thresholds:[{max_connections:1,
+    /// max_pending_requests:0}]` and a single dead endpoint (`127.0.0.1:1`,
+    /// never dialed). The first connect-on-miss is rejected with
+    /// `PoolError::PendingOverflow` → `AcquireOutcome::Overflow` →
+    /// `H2AttemptResult{endpoint:Some, outcome:None}` (`hcm.rs:407`-`417`)
+    /// consumed at the caller-loop site (`hcm.rs:691`). Asserts the FILE json
+    /// access-log line carries the overflow detail and the derived `UO` flag
+    /// — the sole in-process proof of §A's outcome discriminator + §C's
+    /// derive arm on the POOL-overflow path. Fail-first: pre-change it
+    /// renders `"rcd":"via_upstream","rf":"-"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_pool_overflow_access_log_carries_uo_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        // STATIC cluster, dead endpoint 127.0.0.1:1 (never dialed), H2 upstream
+        // (typed_extension_protocol_options), circuit breakers
+        // max_connections:1 / max_pending_requests:0 → the H2 pool's
+        // connect-on-miss pending-gate rejects the first request.
+        let yaml = r#"
+node: { id: x, cluster: y }
+admin: { address: { socket_address: { address: 127.0.0.1, port_value: 9901 } } }
+static_resources:
+  listeners: []
+  clusters:
+    - name: backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1
+            max_pending_requests: 0
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 1 } } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("cluster mgr"),
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let pool_mgr = crate::pool::H2PoolManager::for_bootstrap(
+            &bootstrap,
+            &cluster_mgr,
+            Arc::clone(&registry),
+            token.clone(),
+        )
+        .expect("H2PoolManager::for_bootstrap");
+
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let mut built = Http1HCMConfig::from_config(&cfg, Arc::clone(&cluster_mgr), Arc::clone(&registry), None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let inner = Arc::new(built);
+        let hcm_config = Arc::new(HCMConfig::wrap(Arc::clone(&inner), Some(Arc::clone(&pool_mgr))));
+
+        // Manual spawn (mirrors `h2_hcm_pool_reuses_upstream_conn_across_sequential_requests`
+        // — the existing `spawn_h2_hcm` helper hard-codes `pool: None`).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hcm = HCM::new(hcm_config);
+        let _server_handle = tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let hcm_clone = hcm.clone();
+                tokio::spawn(async move {
+                    let _ = hcm_clone.handle(stream).await;
+                });
+            }
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://x/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(
+            resp.status(),
+            503,
+            "pool-overflow synth-503 status unchanged"
+        );
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged,
+            "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{overflow}\",\"rf\":\"UO\"}\n",
+            "H2 pool-overflow access-log line carries the overflow rcd + rf:\"UO\": {logged:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_handshake_fails_on_garbage_preamble() {
         // Connect raw TCP to the HCM port and write a bare HTTP/1.1 request
