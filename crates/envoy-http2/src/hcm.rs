@@ -694,6 +694,12 @@ async fn handle_one_stream(
                             // endpoint wins). Skipped on pick()->None.
                             upstream_host_for_log_h2 = Some(endpoint.to_string());
                             response_code_details_for_log_h2 = Some("via_upstream".to_owned());
+                        } else {
+                            // 57 (ADR-0114) §B: the pick()->None no-healthy arm —
+                            // mirrors the H1 caller-loop if/else pattern
+                            // (crates/envoy-http1/src/hcm.rs:1029-1059).
+                            response_code_details_for_log_h2 =
+                                Some("no_healthy_upstream".to_owned());
                         }
 
                         // L5: per-attempt upstream_rq_total — only for received
@@ -942,14 +948,17 @@ async fn finalize_h2_stream(
     // (covering both empty-body and non-empty-body emit branches).
     if !config.inner.access_log.is_empty() {
         let duration = req_arrival_instant.elapsed();
-        // Phase 56 (ADR-0113): the H2 sibling of the H1 phase-48 one-arm
-        // %RESPONSE_FLAGS% derive (crates/envoy-http1/src/hcm.rs:1377,
-        // ORIGINAL one-arm scope before phases 49-54 each added one more
-        // arm). Deliberately mirrors ONLY that original scope, not H1's
-        // current six-arm derive — the remaining H2 flags (UH/UO/URX/UF/UC)
-        // are carry-forward M56-1, witnessed one-at-a-time by future phases.
+        // Phase 56 (ADR-0113) / phase 57 (ADR-0114): the H2 sibling of the H1
+        // %RESPONSE_FLAGS% derive (crates/envoy-http1/src/hcm.rs:1377), grown
+        // one arm per phase exactly as H1 did (48->49->50->51->52->53).
+        // route_not_found => NR (phase 56); no_healthy_upstream => UH (phase
+        // 57 — ALSO corrects the H2 no-healthy synth status 502->503, see
+        // synth_h2_no_healthy_upstream()). The remaining H2 flags
+        // (UO/URX/UF/UC) are the continuing carry-forward M56-1, witnessed
+        // one-at-a-time by future phases.
         let response_flags_for_log_h2: &str = match response_code_details_for_log_h2.as_deref() {
             Some("route_not_found") => "NR",
+            Some("no_healthy_upstream") => "UH",
             _ => "-",
         };
         let record = envoy_accesslog::AccessLogRecord {
