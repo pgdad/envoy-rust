@@ -1,0 +1,31 @@
+driver:
+  kind: http2_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0065-envoy-mount/access.log
+    envoy_rust: /tmp/0065-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / (any :authority — domains: ["*"]) routed to
+    # `subset_cluster` via a `metadata_match` selecting the NON-EXISTENT
+    # `stage: nonexistent` subset (the fixture-0038/0057 pattern). NO_FALLBACK
+    # → no eligible subset → `pick()->None` → the no-healthy-upstream
+    # synth-503 at ROUTING time — the literal `127.0.0.1:1` endpoint is never
+    # dialed. This is the SECOND non-`-` H2 %RESPONSE_FLAGS% witness: UH
+    # (NoHealthyUpstream) (phase 57, ADR-0114), the H2 analogue of fixture
+    # 0057 (phase 49) and phase 56's H2 NR witness (fixture 0064).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static
+    # literal: the `http2_access_log_byte_exact` driver asserts every line is
+    # byte-identical between upstream Envoy v1.33.0 and envoy-rust. The
+    # no-healthy synth-503 is deterministic on BOTH sides, so the rendered
+    # line is identical. envoy-rust now (a) emits the dedicated
+    # synth_h2_no_healthy_upstream() 503 (was the generic synth_h2_502()), (b)
+    # sets rcd:"no_healthy_upstream" (was null), and (c) derives rf:"UH" from
+    # that rcd (was "-").
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rc, rcd, rf.
+    # The emitted line is:
+    #   {"method":"GET","proto":"HTTP/2","rc":503,"rcd":"no_healthy_upstream","rf":"UH"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
