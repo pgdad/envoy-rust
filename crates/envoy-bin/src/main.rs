@@ -254,6 +254,16 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 )
             })?;
 
+        // Number of SO_REUSEPORT accept sockets to request when the listener has
+        // `enable_reuse_port` (the default) — one per logical CPU, matching the
+        // tokio runtime's default worker-thread count so each worker drives its
+        // own kernel accept queue. `Listener::bind_with_concurrency` clamps this
+        // to a single plain socket when reuse_port is off, the platform is not
+        // Linux, or the value is 1 — so non-Linux/dev runs are unchanged.
+        let listener_concurrency = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
         match filter.name.as_str() {
             envoy_config::ECHO_FILTER => {
                 let lst = TcpListener::bind(bind_addr)
@@ -310,10 +320,11 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         None => proxy,
                     };
 
-                let listener = envoy_listener::Listener::bind(
+                let listener = envoy_listener::Listener::bind_with_concurrency(
                     listener_cfg,
                     handler,
                     std::sync::Arc::clone(&registry),
+                    listener_concurrency,
                 )
                 .await
                 .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
@@ -463,10 +474,11 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 }
                 let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = hcm;
 
-                let listener = envoy_listener::Listener::bind(
+                let listener = envoy_listener::Listener::bind_with_concurrency(
                     listener_cfg,
                     handler,
                     std::sync::Arc::clone(&registry),
+                    listener_concurrency,
                 )
                 .await
                 .with_context(|| format!("binding HCM listener to {bind_addr}"))?;

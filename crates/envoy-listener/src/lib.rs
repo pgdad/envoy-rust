@@ -69,7 +69,14 @@ pub enum ListenerError {
 /// A bound TCP listener with a per-connection handler. Construct via
 /// `Listener::bind`; drive via `Listener::serve` (Task 6).
 pub struct Listener {
-    listener: tokio::net::TcpListener,
+    /// One or more bound accepting sockets. In the default single-socket case
+    /// this is a one-element `Vec` and `serve` runs the original inline accept
+    /// loop — byte-for-byte the pre-`SO_REUSEPORT` behavior. When
+    /// `bind_with_concurrency` binds N `SO_REUSEPORT` sockets (Linux, worker
+    /// count > 1), `serve` fans out one accept loop per socket, each with its
+    /// own kernel accept queue, spreading the accept path across cores. All N
+    /// share the one per-listener stat set below (one logical listener).
+    listeners: Vec<tokio::net::TcpListener>,
     handler: Arc<dyn ConnectionHandler>,
     /// 06.1 D4.a: per-listener counter incremented once per accepted TCP
     /// connection. Registered at construct time as
@@ -131,7 +138,11 @@ impl Drop for ListenerManagerActiveGuard {
 impl std::fmt::Debug for Listener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Listener")
-            .field("local_addr", &self.listener.local_addr())
+            .field(
+                "local_addr",
+                &self.listeners.first().map(|l| l.local_addr()),
+            )
+            .field("sockets", &self.listeners.len())
             .finish_non_exhaustive()
     }
 }
@@ -147,14 +158,54 @@ impl Listener {
         handler: Arc<dyn ConnectionHandler>,
         registry: Arc<envoy_stats::StatsRegistry>,
     ) -> Result<Self, ListenerError> {
+        // A single plain accepting socket, no `SO_REUSEPORT` — the original
+        // behavior. Every existing caller and test flows through here unchanged;
+        // `serve` then runs the inline single-socket accept loop.
+        Self::bind_inner(cfg, handler, registry, 1, false).await
+    }
+
+    /// Like [`Listener::bind`] but binds one `SO_REUSEPORT` accepting socket per
+    /// worker when the listener's `enable_reuse_port` is set, the platform
+    /// load-balances `SO_REUSEPORT` across sockets (Linux), and `concurrency > 1`.
+    /// Each socket gets its own kernel accept queue, so `serve` runs an accept
+    /// loop per core and the accept path (and RX softirq steering) spreads across
+    /// cores instead of funnelling through one queue. `concurrency` is typically
+    /// the tokio worker-thread count.
+    ///
+    /// Falls back to a single plain socket — byte-for-byte [`Listener::bind`] —
+    /// when `enable_reuse_port` is false, the platform is not Linux (elsewhere
+    /// `SO_REUSEPORT` does not load-balance, so extra sockets would only starve),
+    /// or `concurrency <= 1`. The bootstrap's wire bytes are unaffected either
+    /// way; only the number of accepting sockets changes.
+    pub async fn bind_with_concurrency(
+        cfg: &envoy_config::Listener,
+        handler: Arc<dyn ConnectionHandler>,
+        registry: Arc<envoy_stats::StatsRegistry>,
+        concurrency: usize,
+    ) -> Result<Self, ListenerError> {
+        Self::bind_inner(cfg, handler, registry, concurrency, cfg.enable_reuse_port).await
+    }
+
+    async fn bind_inner(
+        cfg: &envoy_config::Listener,
+        handler: Arc<dyn ConnectionHandler>,
+        registry: Arc<envoy_stats::StatsRegistry>,
+        concurrency: usize,
+        reuse_port: bool,
+    ) -> Result<Self, ListenerError> {
         let sock = &cfg.address.socket_address;
         let addr_str = format!("{}:{}", sock.address, sock.port_value);
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|_| ListenerError::AddressParse(sock.address.clone(), sock.port_value))?;
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|source| ListenerError::Bind { addr, source })?;
+        let listeners = bind_listeners(addr, reuse_port, concurrency).await?;
+        if listeners.len() > 1 {
+            tracing::info!(
+                %addr,
+                sockets = listeners.len(),
+                "listener bound with SO_REUSEPORT (one accept queue per worker)"
+            );
+        }
         // 06.1 D4.a: register `listener.<name>.downstream_cx_total`. The
         // registry call is idempotent for same-kind re-registration, so
         // multiple `Listener::bind` calls with the same `cfg.name` (a
@@ -185,7 +236,7 @@ impl Listener {
             .register_gauge("listener_manager.total_listeners_active")
             .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
         Ok(Self {
-            listener,
+            listeners,
             handler,
             cx_total,
             cx_active,
@@ -195,9 +246,10 @@ impl Listener {
     }
 
     /// Returns the actual bound socket address (resolves `port_value: 0` to
-    /// the kernel-assigned ephemeral port).
+    /// the kernel-assigned ephemeral port). With `SO_REUSEPORT` all sockets
+    /// share the same address, so the first socket's address is authoritative.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.listeners[0].local_addr()
     }
 
     /// 08.2 D14: accessor for the shared `listener_manager.total_listeners_active`
@@ -241,112 +293,263 @@ impl Listener {
         drain: Arc<DrainState>,
     ) -> Result<(), ListenerError> {
         // 08.2 Task 6 (D12): RAII guard MUST be the first local so its Drop
-        // fires LAST (after the post-loop drain-wait block + stragglers
-        // join). Construction increments the gauge; Drop decrements.
+        // fires LAST (after every accept loop's drain-wait completes). It counts
+        // ONE logical listener regardless of how many SO_REUSEPORT sockets back
+        // it. Construction increments the gauge; Drop decrements.
         let _lm_guard = ListenerManagerActiveGuard::new(Arc::clone(self.listener_manager_active()));
 
-        let listener = self.listener;
+        let mut listeners = self.listeners;
         let handler = self.handler;
-        // 06.1 D4.a: hoist the per-listener counter out of `self` so the
-        // accept arm of `tokio::select!` can call `cx_total.inc()` without
-        // borrowing `self` (which has been consumed by the `let listener =
-        // self.listener;` move above).
         let cx_total = self.cx_total;
-        // 06.3 D15.3.b: hoist the per-listener gauge; mirrors cx_total above.
         let cx_active = self.cx_active;
-        // 06.3 D15.3.d: hoist the accept-failure counter; mirrors cx_total + cx_active above.
         let cx_accept_failed = self.cx_accept_failed;
-        let mut join_set: tokio::task::JoinSet<
-            Result<(), Box<dyn std::error::Error + Send + Sync>>,
-        > = tokio::task::JoinSet::new();
-        tokio::pin!(shutdown);
 
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => {
-                    tracing::info!("listener shutdown signal received; draining");
-                    drop(listener);
-                    break;
-                }
-                // 08.2 Task 6 (D12): drain-signal arm. Either this or the
-                // shutdown arm triggers the same drain code path. Each loop
-                // iteration constructs a fresh `drain_signal()` future; if
-                // state is already `Draining`, the future returns ready
-                // immediately (drain is sticky + idempotent — see
-                // `DrainState::drain_signal` for the TOCTOU-safe shape).
-                _ = drain.drain_signal() => {
-                    tracing::info!("listener drain signal received; draining");
-                    drop(listener);
-                    break;
-                }
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, peer)) => {
-                            // 06.1 D4.a: increment per-listener accept counter.
-                            cx_total.inc();
-                            // 06.3 D15.3.b: increment active-connection gauge.
-                            cx_active.inc();
-                            // Disable Nagle's algorithm on the downstream socket.
-                            // Without this, ~40ms delayed-ACK + Nagle stalls every
-                            // small response — measured 60ms p50 latency drops to
-                            // sub-ms with TCP_NODELAY. Matches Envoy's default.
-                            let _ = stream.set_nodelay(true);
-                            tracing::debug!(%peer, "listener accepted connection");
-                            let h = handler.clone();
-                            // Clone the gauge Arc into the task; dec after
-                            // handle returns (both success and error paths).
-                            let cx_active_clone = Arc::clone(&cx_active);
-                            join_set.spawn(async move {
-                                let result = h.handle(stream).await;
-                                cx_active_clone.dec();
-                                result
-                            });
-                        }
-                        Err(err) => {
-                            // 06.3 D15.3.d + signpost 6: ALL accept errors
-                            // count, no carve-outs. Increment BEFORE the warn
-                            // so the counter fires even if tracing is filtered.
-                            cx_accept_failed.inc();
-                            // Accept errors are not fatal — log and continue,
-                            // matching `envoy-bin::admin::serve` and
-                            // `envoy-bin::echo::serve` from phases 00–01.
-                            tracing::warn!(error = %err, "accept failed; continuing");
-                        }
+        // Single-socket path (the default): run the original inline accept loop
+        // directly, so behavior is byte-for-byte the pre-SO_REUSEPORT code.
+        if listeners.len() == 1 {
+            let listener = listeners.pop().expect("len checked == 1");
+            return accept_loop(
+                listener,
+                handler,
+                cx_total,
+                cx_active,
+                cx_accept_failed,
+                shutdown,
+                drain,
+            )
+            .await;
+        }
+
+        // SO_REUSEPORT fan-out: one accept loop per socket, each with its own
+        // kernel accept queue and its own in-flight-connection JoinSet + drain.
+        // The single `shutdown` future is broadcast to every loop via a
+        // watch<bool>; the drain Arc and stat Arcs are cloned per loop.
+        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        // Driver: turn the one-shot shutdown future into a broadcast flag.
+        // Aborted below if still pending when the loops exit via drain instead.
+        let shutdown_driver = tokio::spawn(async move {
+            shutdown.await;
+            let _ = sd_tx.send(true);
+        });
+
+        let mut loops: tokio::task::JoinSet<Result<(), ListenerError>> =
+            tokio::task::JoinSet::new();
+        for listener in listeners {
+            let handler = Arc::clone(&handler);
+            let cx_total = Arc::clone(&cx_total);
+            let cx_active = Arc::clone(&cx_active);
+            let cx_accept_failed = Arc::clone(&cx_accept_failed);
+            let drain = Arc::clone(&drain);
+            let mut sd_rx = sd_rx.clone();
+            loops.spawn(async move {
+                // Per-loop shutdown: resolve once the broadcast flag is true.
+                // `wait_for` checks the current value first, so an already-fired
+                // shutdown resolves immediately (no missed-wakeup race).
+                let shutdown = async move {
+                    let _ = sd_rx.wait_for(|&fired| fired).await;
+                };
+                accept_loop(
+                    listener,
+                    handler,
+                    cx_total,
+                    cx_active,
+                    cx_accept_failed,
+                    shutdown,
+                    drain,
+                )
+                .await
+            });
+        }
+
+        // Await every per-socket loop; surface the first error (e.g. a
+        // DrainTimeout from any loop) after all have settled.
+        let mut first_err: Option<ListenerError> = None;
+        while let Some(joined) = loops.join_next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
                     }
                 }
-                Some(done) = join_set.join_next(), if !join_set.is_empty() => {
-                    match done {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => tracing::warn!(error = %err, "connection task failed"),
-                        Err(join_err) => tracing::warn!(error = %join_err, "connection task panicked"),
-                    }
+                Err(join_err) => {
+                    tracing::warn!(error = %join_err, "accept loop task panicked")
                 }
             }
         }
+        // Loops have exited; if the shutdown driver is still parked on a
+        // never-fired shutdown (we exited via drain), cancel it.
+        shutdown_driver.abort();
 
-        // Drain.
-        let drain = async {
-            while let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        tracing::warn!(error = %err, "connection task failed during drain")
-                    }
-                    Err(join_err) => {
-                        tracing::warn!(error = %join_err, "connection task panicked during drain")
-                    }
-                }
-            }
-        };
-        if tokio::time::timeout(DRAIN_BUDGET, drain).await.is_err() {
-            tracing::warn!(?DRAIN_BUDGET, "drain budget exceeded; aborting stragglers");
-            join_set.abort_all();
-            // Let aborted tasks unwind; ignore their results.
-            while join_set.join_next().await.is_some() {}
-            return Err(ListenerError::DrainTimeout(DRAIN_BUDGET));
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-        Ok(())
     }
+}
+
+/// One accept loop over a single socket, with the shutdown-gated graceful drain.
+/// Extracted from the original single-socket `serve` body so both the default
+/// single-socket path and each SO_REUSEPORT worker share identical accept/drain
+/// semantics. On `shutdown` or `drain.drain_signal()` it stops accepting and
+/// waits up to `DRAIN_BUDGET` for in-flight connections to complete, aborting
+/// stragglers (and returning `DrainTimeout`) if the budget expires.
+#[allow(clippy::too_many_arguments)]
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    handler: Arc<dyn ConnectionHandler>,
+    cx_total: Arc<envoy_stats::Counter>,
+    cx_active: Arc<envoy_stats::Gauge>,
+    cx_accept_failed: Arc<envoy_stats::Counter>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: Arc<DrainState>,
+) -> Result<(), ListenerError> {
+    let mut join_set: tokio::task::JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>> =
+        tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("listener shutdown signal received; draining");
+                drop(listener);
+                break;
+            }
+            // 08.2 Task 6 (D12): drain-signal arm. Either this or the
+            // shutdown arm triggers the same drain code path. Each loop
+            // iteration constructs a fresh `drain_signal()` future; if
+            // state is already `Draining`, the future returns ready
+            // immediately (drain is sticky + idempotent — see
+            // `DrainState::drain_signal` for the TOCTOU-safe shape).
+            _ = drain.drain_signal() => {
+                tracing::info!("listener drain signal received; draining");
+                drop(listener);
+                break;
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        // 06.1 D4.a: increment per-listener accept counter.
+                        cx_total.inc();
+                        // 06.3 D15.3.b: increment active-connection gauge.
+                        cx_active.inc();
+                        // Disable Nagle's algorithm on the downstream socket.
+                        // Without this, ~40ms delayed-ACK + Nagle stalls every
+                        // small response — measured 60ms p50 latency drops to
+                        // sub-ms with TCP_NODELAY. Matches Envoy's default.
+                        let _ = stream.set_nodelay(true);
+                        tracing::debug!(%peer, "listener accepted connection");
+                        let h = handler.clone();
+                        // Clone the gauge Arc into the task; dec after
+                        // handle returns (both success and error paths).
+                        let cx_active_clone = Arc::clone(&cx_active);
+                        join_set.spawn(async move {
+                            let result = h.handle(stream).await;
+                            cx_active_clone.dec();
+                            result
+                        });
+                    }
+                    Err(err) => {
+                        // 06.3 D15.3.d + signpost 6: ALL accept errors
+                        // count, no carve-outs. Increment BEFORE the warn
+                        // so the counter fires even if tracing is filtered.
+                        cx_accept_failed.inc();
+                        // Accept errors are not fatal — log and continue,
+                        // matching `envoy-bin::admin::serve` and
+                        // `envoy-bin::echo::serve` from phases 00–01.
+                        tracing::warn!(error = %err, "accept failed; continuing");
+                    }
+                }
+            }
+            Some(done) = join_set.join_next(), if !join_set.is_empty() => {
+                match done {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::warn!(error = %err, "connection task failed"),
+                    Err(join_err) => tracing::warn!(error = %join_err, "connection task panicked"),
+                }
+            }
+        }
+    }
+
+    // Drain.
+    let drain_fut = async {
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "connection task failed during drain")
+                }
+                Err(join_err) => {
+                    tracing::warn!(error = %join_err, "connection task panicked during drain")
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(DRAIN_BUDGET, drain_fut).await.is_err() {
+        tracing::warn!(?DRAIN_BUDGET, "drain budget exceeded; aborting stragglers");
+        join_set.abort_all();
+        // Let aborted tasks unwind; ignore their results.
+        while join_set.join_next().await.is_some() {}
+        return Err(ListenerError::DrainTimeout(DRAIN_BUDGET));
+    }
+    Ok(())
+}
+
+/// Bind the accepting socket(s) for a listener address. Returns a single plain
+/// socket (identical to the pre-`SO_REUSEPORT` `tokio::net::TcpListener::bind`)
+/// unless `reuse_port` is set, the platform load-balances `SO_REUSEPORT` across
+/// sockets (Linux only — elsewhere the kernel does not spread connections, so
+/// extra sockets would just starve), and `concurrency > 1`; in that case it
+/// returns `concurrency` independent `SO_REUSEPORT` sockets on the same address.
+async fn bind_listeners(
+    addr: SocketAddr,
+    reuse_port: bool,
+    concurrency: usize,
+) -> Result<Vec<tokio::net::TcpListener>, ListenerError> {
+    let effective_n = if reuse_port && cfg!(target_os = "linux") {
+        concurrency.max(1)
+    } else {
+        1
+    };
+    if effective_n <= 1 {
+        // Original single-socket path — no SO_REUSEPORT, byte-identical.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|source| ListenerError::Bind { addr, source })?;
+        return Ok(vec![listener]);
+    }
+    let mut listeners = Vec::with_capacity(effective_n);
+    for _ in 0..effective_n {
+        listeners.push(
+            bind_reuseport_socket(addr).map_err(|source| ListenerError::Bind { addr, source })?,
+        );
+    }
+    Ok(listeners)
+}
+
+/// Build one `SO_REUSEPORT` accepting socket via **safe** `socket2` APIs. The
+/// `socket2::Socket` → `std::net::TcpListener` → `tokio::net::TcpListener`
+/// conversions are all safe (`From` / `from_std`); no `from_raw_fd`, so
+/// `#![forbid(unsafe_code)]` holds. The socket is set non-blocking before
+/// `from_std` (tokio requires it). `listen(1024)` matches tokio's default
+/// bind backlog.
+fn bind_reuseport_socket(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    // SO_REUSEADDR + SO_REUSEPORT: N sockets share the one address; the kernel
+    // hashes incoming connections across their independent accept queues.
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    let std_listener: std::net::TcpListener = sock.into();
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 /// 19 D4 (ADR-0050; §6.2 L3/L10): the `listener_manager.lds.*` stat family +
@@ -470,6 +673,146 @@ mod tests {
 
     fn mk_registry() -> Arc<envoy_stats::StatsRegistry> {
         Arc::new(envoy_stats::StatsRegistry::new())
+    }
+
+    /// Build a multi-socket `Listener` directly (in-crate access to the private
+    /// fields) so the SO_REUSEPORT fan-out `serve` path can be exercised on any
+    /// platform, independent of `bind_with_concurrency`'s Linux gate.
+    fn mk_multi_socket_listener(
+        listeners: Vec<tokio::net::TcpListener>,
+        handler: Arc<dyn ConnectionHandler>,
+        registry: &Arc<envoy_stats::StatsRegistry>,
+        name: &str,
+    ) -> Listener {
+        Listener {
+            listeners,
+            handler,
+            cx_total: registry
+                .register_counter(&format!("listener.{name}.downstream_cx_total"))
+                .unwrap(),
+            cx_active: registry
+                .register_gauge(&format!("listener.{name}.downstream_cx_active"))
+                .unwrap(),
+            cx_accept_failed: registry
+                .register_counter(&format!("listener.{name}.downstream_cx_accept_failed"))
+                .unwrap(),
+            listener_manager_active: registry
+                .register_gauge("listener_manager.total_listeners_active")
+                .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reuseport_binds_multiple_sockets_on_same_port() {
+        // A first SO_REUSEPORT socket takes an ephemeral port.
+        let s1 = bind_reuseport_socket("127.0.0.1:0".parse().unwrap()).expect("bind s1");
+        let port = s1.local_addr().unwrap().port();
+        // A SECOND socket binds the SAME port — impossible without SO_REUSEPORT
+        // (a plain second bind gets EADDRINUSE, as `bind_fails_cleanly_on_address_in_use`
+        // asserts). Success here proves the option is set on both sockets.
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let s2 = bind_reuseport_socket(addr).expect("second bind on same port via SO_REUSEPORT");
+        assert_eq!(s2.local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reuseport_fanout_serves_and_drains() {
+        // Two SO_REUSEPORT sockets on one port → the fan-out `serve` path (one
+        // accept loop per socket, watch-broadcast shutdown, per-loop drain).
+        let s1 = bind_reuseport_socket("127.0.0.1:0".parse().unwrap()).expect("bind s1");
+        let port = s1.local_addr().unwrap().port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let s2 = bind_reuseport_socket(addr).expect("bind s2");
+
+        let registry = mk_registry();
+        let h: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
+        let listener = mk_multi_socket_listener(vec![s1, s2], h, &registry, "reuseport_test");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+
+        let drain = Arc::new(DrainState::new(&registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            listener
+                .serve(
+                    async move {
+                        let _ = rx.await;
+                    },
+                    drain,
+                )
+                .await
+                .expect("serve ok")
+        });
+
+        // Several sequential clients — each is echoed regardless of which of the
+        // two sockets the kernel routes it to.
+        for i in 0..8u8 {
+            let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let payload = [b'a' + i; 16];
+            c.write_all(&payload).await.expect("write");
+            let mut buf = [0u8; 16];
+            c.read_exact(&mut buf).await.expect("read");
+            assert_eq!(buf, payload, "client {i} echoed");
+        }
+
+        tx.send(()).expect("signal shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("serve resolves within 6s")
+            .expect("join");
+    }
+
+    /// Linux load-balances SO_REUSEPORT across sockets by a 4-tuple hash. Drive
+    /// many short connections at N sockets and assert the kernel spread them
+    /// across at least two accept queues — the property the whole feature buys.
+    /// Gated to Linux: macOS/BSD do not load-balance (delivery is to a single
+    /// socket), so this assertion is meaningful only where the kernel spreads.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reuseport_distributes_connections_across_sockets_linux() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const N: usize = 4;
+        let first = bind_reuseport_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = first.local_addr().unwrap().port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut socks = vec![first];
+        for _ in 1..N {
+            socks.push(bind_reuseport_socket(addr).unwrap());
+        }
+
+        let counts: Vec<Arc<AtomicU64>> = (0..N).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let mut acceptors = Vec::new();
+        for (i, s) in socks.into_iter().enumerate() {
+            let c = Arc::clone(&counts[i]);
+            acceptors.push(tokio::spawn(async move {
+                while let Ok((stream, _)) = s.accept().await {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    drop(stream);
+                }
+            }));
+        }
+
+        // 200 short connections is plenty for the hash to touch >= 2 buckets.
+        for _ in 0..200 {
+            if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
+                drop(s);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for a in acceptors {
+            a.abort();
+        }
+
+        let nonzero = counts
+            .iter()
+            .filter(|c| c.load(Ordering::Relaxed) > 0)
+            .count();
+        let total: u64 = counts.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        assert!(total >= 190, "most connections accepted (got {total}/200)");
+        assert!(
+            nonzero >= 2,
+            "connections spread across >= 2 sockets (got {nonzero} of {N} nonzero)"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1317,6 +1660,7 @@ filter_chains:
                 },
             },
             listener_filters: vec![],
+            enable_reuse_port: true,
             filter_chains: vec![envoy_config::FilterChain {
                 filter_chain_match: None,
                 transport_socket: None,
