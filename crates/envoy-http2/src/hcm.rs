@@ -1083,8 +1083,8 @@ mod tests {
     use super::*;
     use envoy_config::{
         AppendAction, CodecType, DataSource, DirectResponse, HeaderMatcher, HeaderMatcherMode,
-        HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, Route, RouteAction,
-        RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, VirtualHost,
+        HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, LbMetadata, Route,
+        RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, VirtualHost,
     };
     use envoy_http1::HCMConfig as Http1HCMConfig;
     use envoy_listener::ConnectionHandler;
@@ -2279,6 +2279,137 @@ static_resources:
         assert_eq!(lines_per_sink[0].len(), 1);
         let line = &lines_per_sink[0][0];
         assert!(line.contains("\"GET / HTTP/2\""), "line: {}", line);
+    }
+
+    /// Phase 57 (ADR-0114): a ClusterManager with ONE STATIC cluster
+    /// `subset_cluster` carrying an `lb_subset_config` (single selector
+    /// `keys:[stage]`, NO_FALLBACK). The ONE endpoint's `envoy.lb` metadata is
+    /// `{stage: prod}` at the LITERAL unreachable address `127.0.0.1:1` — a
+    /// route `metadata_match` selecting the non-existent `stage: nonexistent`
+    /// subset makes `pick_endpoint` return `None` (NO_FALLBACK, no eligible
+    /// subset) without ever dialing the endpoint. Structural clone of the H1
+    /// helper of the same name (`crates/envoy-http1/src/hcm.rs:5399`) — test
+    /// helpers are not shared cross-crate.
+    async fn cluster_mgr_no_fallback_subset() -> Arc<envoy_cluster::ClusterManager> {
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: subset_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      lb_subset_config:
+        fallback_policy: NO_FALLBACK
+        subset_selectors:
+          - keys: [stage]
+      load_assignment:
+        cluster_name: subset_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+                metadata:
+                  filter_metadata:
+                    envoy.lb: { stage: prod }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
+        Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+                .await
+                .expect("cluster mgr"),
+        )
+    }
+
+    /// Phase 57 (ADR-0114) Task 1: the H2 `pick()->None` no-healthy-upstream
+    /// arm (`run_h2_attempt`, `hcm.rs:186`-`194`) must emit Envoy's byte-exact
+    /// 503 `no healthy upstream` local reply — matching the H1
+    /// `synth_no_healthy_upstream` precedent — NOT the generic H2 502
+    /// (`synth_h2_502()`) it emits today. Drives a NO_FALLBACK subset-miss
+    /// route (the fixture-0057/0038 pattern) over a real H2 connection.
+    /// Fail-first: pre-change, the pick-none arm still calls `synth_h2_502()`
+    /// → status 502, empty body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_no_healthy_upstream_returns_503() {
+        let mut envoy_lb = std::collections::BTreeMap::new();
+        envoy_lb.insert("stage".to_string(), "nonexistent".to_string());
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "subset_cluster".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: Some(LbMetadata { envoy_lb }),
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = cluster_mgr_no_fallback_subset().await;
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let config = Arc::new(
+            Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+                .await
+                .expect("build HCM config"),
+        );
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://x/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(
+            resp.status(),
+            503,
+            "H2 no-healthy pick()->None arm must emit Envoy's 503, not the generic 502"
+        );
+        let mut body = resp.into_body();
+        let mut collected: Vec<u8> = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+            collected.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            collected, b"no healthy upstream",
+            "H2 no-healthy synth-503 body must be byte-exact"
+        );
     }
 
     /// Phase 56 (ADR-0113): the H2 sibling of the H1 phase-48 backstop
