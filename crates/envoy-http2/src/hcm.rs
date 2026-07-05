@@ -180,13 +180,16 @@ async fn run_h2_attempt(
     subset_match: Option<&std::collections::BTreeMap<String, String>>,
 ) -> H2AttemptResult {
     // Re-pick the endpoint each attempt — Envoy re-runs LB on every retry.
-    // On `pick() -> None`, no endpoint is attributable: emit the H2 synth-502
-    // (preserving the pre-phase-16 H2 pick-none shape) and return (not
-    // retriable; no record_response).
+    // On `pick() -> None`, no endpoint is attributable: emit the H2 synth-503
+    // (57, ADR-0114: corrected from the generic synth_h2_502()) and return
+    // (not retriable; no record_response).
     let Some(endpoint) = cluster.pick_endpoint(request_hash_key, subset_match) else {
-        tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 502");
+        // 57 (ADR-0114): corrected from the generic synth_h2_502() to the
+        // dedicated no-healthy 503, matching Envoy and the H1 precedent
+        // (synth_no_healthy_upstream).
+        tracing::warn!(cluster = %cluster.name(), "no healthy endpoint — emitting 503");
         return H2AttemptResult {
-            response: synth_h2_502(),
+            response: synth_h2_no_healthy_upstream(),
             endpoint: None,
             outcome: None,
             upstream_response: false,
@@ -1047,6 +1050,28 @@ fn synth_h2_502() -> Response {
             ("content-type".to_string(), "text/plain".to_string()),
         ],
         body: Bytes::from_static(b""),
+    }
+}
+
+/// 57 (ADR-0114) §A: the H2 no-healthy `pick()->None` synth-503 — mirrors
+/// `envoy_http1::hcm::synth_no_healthy_upstream` exactly (status 503, body
+/// byte-exact `no healthy upstream`, 19 bytes, NO trailing newline). Used
+/// ONLY at `run_h2_attempt`'s `pick()->None` arm. Headers mirror
+/// `synth_h2_502`'s H2-appropriate set (`server`, `content-type` — H2 has its
+/// own connection lifecycle, no `connection` header, and the differential
+/// fixture asserts status + access-log line only, not headers/body).
+/// `synth_h2_502()`'s OTHER call sites (connect-error `:387`, send-error
+/// `:398`) are UNCHANGED — still 502, deferred as the continuing M56-1
+/// carry-forward (the H2 `UF`/`UC` slices, future phases).
+fn synth_h2_no_healthy_upstream() -> Response {
+    Response {
+        status: 503,
+        reason: None,
+        headers: vec![
+            ("server".to_string(), "envoy-rust".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ],
+        body: Bytes::from_static(b"no healthy upstream"),
     }
 }
 
