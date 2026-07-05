@@ -623,6 +623,16 @@ async fn handle_one_stream(
                     // The overflow synth-503 (81-byte body + x-envoy-overloaded)
                     // — the SAME helper the pool PendingOverflow arm uses.
                     let mut overflow_resp = synth_h2_overflow();
+                    // 58 (ADR-0115) §B: the request-budget (max_requests)
+                    // overflow is the SAME UO/overflow disposition as the pool
+                    // arms — same synth_h2_overflow() helper, same 503 wire
+                    // shape. Tag the rcd so the §C derive maps it => "UO".
+                    // This arm BYPASSES the retry loop entirely (no
+                    // run_h2_attempt call), so it is tagged HERE directly
+                    // (not via §A's discriminator) — mirrors the H1 tag
+                    // exactly (crates/envoy-http1/src/hcm.rs:951-952).
+                    response_code_details_for_log_h2 =
+                        Some("upstream_reset_before_response_started{overflow}".to_owned());
                     // L11: the overflow local reply carries
                     // x-envoy-attempt-count: 1 when the vhost flag is set (only
                     // the would-be first attempt; none ever dispatched).
