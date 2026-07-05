@@ -528,11 +528,24 @@ impl H1PoolManager {
                  single-bootstrap-per-process invariant violated",
                 cfg.name
             );
+            // 62 D1 (ADR-0119): per-cluster upstream idle timeout from
+            // `common_http_protocol_options.idle_timeout`, falling back to
+            // `DEFAULT_IDLE_TIMEOUT` (60s) when unset. `validate_cluster` has
+            // already rejected a malformed/zero value at parse_bootstrap time,
+            // so a present value parses here; the `unwrap_or` keeps this total
+            // (and preserves the byte-identical default path when absent).
+            let idle_timeout = cfg
+                .common_http_protocol_options
+                .as_ref()
+                .and_then(|o| o.idle_timeout.as_ref())
+                .and_then(|s| envoy_config::bootstrap::parse_duration(s).ok())
+                .filter(|d| !d.is_zero())
+                .unwrap_or(DEFAULT_IDLE_TIMEOUT);
             let pool = H1Pool::new(
                 cfg.name.clone(),
                 max_connections,
                 max_pending_requests,
-                DEFAULT_IDLE_TIMEOUT,
+                idle_timeout,
                 cx_total,
                 cx_destroy,
                 cx_http1_total,
@@ -932,6 +945,68 @@ admin:
             "expected cluster.c1.upstream_cx_http1_total in registry; got: {:?}",
             snapshot.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    /// 62 D1 (ADR-0119): `common_http_protocol_options.idle_timeout` threads
+    /// into the per-cluster `H1Pool`; a cluster without it keeps the 60s
+    /// `DEFAULT_IDLE_TIMEOUT` (the byte-identical regression-equivalence path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_pool_manager_applies_configured_idle_timeout() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: tuned
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      common_http_protocol_options:
+        idle_timeout: 30s
+      load_assignment:
+        cluster_name: tuned
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8080 } }
+    - name: defaulted
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: defaulted
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 8081 } }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("parse");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+            .await
+            .expect("cluster mgr");
+        let token = CancellationToken::new();
+        let pool_mgr =
+            H1PoolManager::for_bootstrap(&bootstrap, &mgr, Arc::clone(&registry), token.clone())
+                .expect("pool mgr");
+        assert_eq!(
+            pool_mgr
+                .pools
+                .get("tuned")
+                .expect("tuned pool")
+                .idle_timeout,
+            Duration::from_secs(30),
+            "configured idle_timeout must reach the pool"
+        );
+        assert_eq!(
+            pool_mgr
+                .pools
+                .get("defaulted")
+                .expect("defaulted pool")
+                .idle_timeout,
+            DEFAULT_IDLE_TIMEOUT,
+            "unconfigured cluster keeps the 60s default (regression-equivalence)"
+        );
+        token.cancel();
     }
 
     /// 13.2 A-I3 closure: post-mutex-switch, Drop is synchronous — an

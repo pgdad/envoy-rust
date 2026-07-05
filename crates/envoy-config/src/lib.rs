@@ -604,6 +604,15 @@ pub enum ConfigError {
         field: &'static str,
     },
 
+    /// 62 D1 (ADR-0119): `common_http_protocol_options.idle_timeout` is present
+    /// but not a positive `parse_duration` scalar (`"<N>s"`/`"<N>ms"`/`"<N>us"`).
+    /// Fail-closed at parse time, mirroring Envoy's Duration validation, rather
+    /// than silently falling back to the 60s default.
+    #[error(
+        "cluster '{cluster}' common_http_protocol_options.idle_timeout is not a positive duration (e.g. `30s`)"
+    )]
+    InvalidClusterIdleTimeout { cluster: String },
+
     /// 12.1: `http_health_check.path` is empty.
     #[error("cluster '{cluster}' http_health_check.path must be non-empty")]
     EmptyHealthCheckPath { cluster: String },
