@@ -1,0 +1,27 @@
+driver:
+  kind: http2_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0066-envoy-mount/access.log
+    envoy_rust: /tmp/0066-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / (any :authority — domains: ["*"]) routed to
+    # `backend_cluster`, whose circuit_breakers max_pending_requests:0 rejects
+    # the connect-on-miss with the overflow synth-503 BEFORE any connect. This
+    # is the THIRD non-`-` H2 %RESPONSE_FLAGS% witness: UO (UpstreamOverflow)
+    # (phase 58, ADR-0115), the H2 analogue of fixture 0058 (phase 50).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static
+    # literal: the `http2_access_log_byte_exact` driver asserts every line is
+    # byte-identical between upstream Envoy v1.33.0 and envoy-rust. The
+    # overflow synth-503 is deterministic on BOTH sides (the brace content
+    # `overflow` is a FIXED reset-reason enum, not OS-derived), so the
+    # rendered line is identical. UNLIKE fixtures 0058/0065, envoy-rust's
+    # status here was ALREADY correct (503) — only rcd/rf change.
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rc, rcd, rf.
+    # The emitted line is:
+    #   {"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{overflow}","rf":"UO"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
