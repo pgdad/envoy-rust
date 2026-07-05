@@ -2062,6 +2062,7 @@ static_resources:
                 transport_socket: None,
             }],
             listener_filters: vec![],
+            enable_reuse_port: true,
         }
     }
 
@@ -2099,6 +2100,7 @@ static_resources:
                 transport_socket: None,
             }],
             listener_filters: vec![],
+            enable_reuse_port: true,
         }
     }
 
@@ -2297,6 +2299,7 @@ static_resources:
                 transport_socket: None,
             }],
             listener_filters: vec![],
+            enable_reuse_port: true,
         }
     }
 
