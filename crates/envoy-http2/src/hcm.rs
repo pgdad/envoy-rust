@@ -2197,6 +2197,150 @@ static_resources:
         );
     }
 
+    /// Phase 58 (ADR-0115) §B/§F2 backstop: the pre-route request-budget
+    /// overflow (`max_requests:0`, `BudgetAcquisition::Rejected` at
+    /// `hcm.rs:613`) calls `synth_h2_overflow()` at `:625` and BYPASSES the
+    /// retry loop entirely (no `run_h2_attempt` call), so it is tagged
+    /// DIRECTLY at `:625`-ish (not via Task 1's §A discriminator). Asserts
+    /// the FILE json access-log line carries the overflow rcd + the derived
+    /// `rf:"UO"` — the in-process proof for the budget arm (its OWN
+    /// differential witness is deferred as a candidate future carry-forward
+    /// slice, mirroring H1's M50-C). Fail-first: pre-change it renders
+    /// `"rcd":null,"rf":"-"` (the arm never sets `response_code_details_for_log_h2`
+    /// today).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_request_budget_overflow_access_log_carries_uo_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        // STATIC cluster, dead endpoint 127.0.0.1:1 (NEVER dialed — the
+        // request-budget gate rejects BEFORE any pool/connect contact), plain
+        // H1 upstream (no typed_extension_protocol_options needed — this arm
+        // is protocol-agnostic, checked before run_h2_attempt is ever called),
+        // circuit breakers max_requests:0.
+        let yaml = r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+static_resources:
+  listeners: []
+  clusters:
+    - name: budget_cluster
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_requests: 0
+      load_assignment:
+        cluster_name: budget_cluster
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: 127.0.0.1, port_value: 1 } } }
+"#;
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("cluster mgr"),
+        );
+
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "budget_cluster".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://x/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(
+            resp.status(),
+            503,
+            "request-budget overflow synth-503 status unchanged"
+        );
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged,
+            "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{overflow}\",\"rf\":\"UO\"}\n",
+            "H2 request-budget-overflow access-log line carries the overflow rcd + rf:\"UO\": {logged:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_handshake_fails_on_garbage_preamble() {
         // Connect raw TCP to the HCM port and write a bare HTTP/1.1 request
