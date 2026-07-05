@@ -2437,6 +2437,114 @@ static_resources:
         );
     }
 
+    /// Phase 57 (ADR-0114) Task 2: the H2 no-healthy `pick()->None` arm's
+    /// access-log line must carry `rcd:"no_healthy_upstream"` (set by the
+    /// caller-loop's NEW `else` branch, §B) AND `rf:"UH"` (derived from that
+    /// rcd by the extended two-arm match, §C). Structural clone of
+    /// `h2_route_miss_access_log_carries_nr_flag`, using
+    /// `cluster_mgr_no_fallback_subset()` (Task 1) + a `metadata_match`
+    /// selecting the non-existent `stage: nonexistent` subset instead of a
+    /// direct_response route. Fail-first: pre-change, the caller-loop only
+    /// sets `response_code_details_for_log_h2` inside the `if let Some(...)`
+    /// arm, so the pick-none path leaves it `None` → the derive's `_ => "-"`
+    /// arm fires → `{"rc":503,"rcd":null,"rf":"-"}`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_no_healthy_access_log_carries_uh_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        let mut envoy_lb = std::collections::BTreeMap::new();
+        envoy_lb.insert("stage".to_string(), "nonexistent".to_string());
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "subset_cluster".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: Some(LbMetadata { envoy_lb }),
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = cluster_mgr_no_fallback_subset().await;
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://x/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status(), 503, "no-healthy synth-503 status unchanged");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rcd\":\"no_healthy_upstream\",\"rf\":\"UH\"}\n",
+            "H2 no-healthy access-log line carries rcd:\"no_healthy_upstream\",rf:\"UH\": {logged:?}"
+        );
+    }
+
     /// Phase 56 (ADR-0113): the H2 sibling of the H1 phase-48 backstop
     /// `h1_route_miss_access_log_carries_nr_flag`
     /// (`crates/envoy-http1/src/hcm.rs:5933`). Builds an H2 HCM with a
