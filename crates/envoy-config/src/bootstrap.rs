@@ -241,6 +241,15 @@ pub struct Cluster {
     /// `max_connections: 1024` per upstream Envoy v1.33). See `CircuitBreakers`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breakers: Option<CircuitBreakers>,
+    /// 62 D1 (ADR-0119): OPTIONAL upstream HTTP protocol options. Phase-62
+    /// consumes only `common_http_protocol_options.idle_timeout` — the
+    /// upstream keep-alive pool's per-connection idle timeout, previously the
+    /// hard-coded `DEFAULT_IDLE_TIMEOUT` (60s) in `envoy-http1`'s `H1Pool`.
+    /// `None` (or a `None` inner `idle_timeout`) preserves that 60s default
+    /// byte-for-byte, so the regression suite is unchanged. See
+    /// `CommonHttpProtocolOptions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub common_http_protocol_options: Option<CommonHttpProtocolOptions>,
     /// 14.1 D1 (parent-14 D1): per-cluster outlier-detection configuration.
     /// `None` (the §5.3 inert-when-unconfigured invariant — preserves 21-fixture
     /// regression-equivalence).
@@ -265,6 +274,23 @@ pub struct Cluster {
     /// `validate_cluster` block; accept-all. See `LbSubsetConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lb_subset_config: Option<LbSubsetConfig>,
+}
+
+/// 62 D1 (ADR-0119): upstream `common_http_protocol_options`, Envoy's
+/// `core.v3.HttpProtocolOptions`. Phase-62 parses-and-stores only
+/// `idle_timeout` — the upstream keep-alive connection idle timeout consumed
+/// by `envoy-http1`'s `H1Pool` (per-cluster). Like every other duration in this
+/// schema it is a free-form scalar parsed via `parse_duration` (`"<N>s"` /
+/// `"<N>ms"` / `"<N>us"`) at pool-build time, NOT at deserialize. Absent (or
+/// present-but-null) → the `H1Pool` keeps its `DEFAULT_IDLE_TIMEOUT` (60s), so
+/// the default path is byte-identical and the regression suite is untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CommonHttpProtocolOptions {
+    /// Upstream per-connection idle timeout (Envoy Duration string, e.g.
+    /// `"30s"`). `None` → `H1Pool` uses its 60s default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -3114,6 +3140,21 @@ fn is_prime(n: u64) -> bool {
 /// this function — they require the full cluster list and listener context, so
 /// they stay in `validate()` / `validate_hcm` / `load_dynamic_resources`.
 pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigError> {
+    // 62 D1 (ADR-0119): fail-closed on a malformed upstream idle_timeout, like
+    // Envoy's Duration validation. Absent (or absent inner field) is the 60s
+    // default and validates trivially — the regression-equivalence path.
+    if let Some(opts) = cluster.common_http_protocol_options.as_ref()
+        && let Some(raw) = opts.idle_timeout.as_ref()
+    {
+        match parse_duration(raw) {
+            Ok(d) if !d.is_zero() => {}
+            _ => {
+                return Err(crate::ConfigError::InvalidClusterIdleTimeout {
+                    cluster: cluster.name.clone(),
+                });
+            }
+        }
+    }
     // 28 D1 (ADR-0069/0070): RING_HASH sub-config validation. Gated to
     // RING_HASH clusters — upstream Envoy accepts-and-ignores a
     // `ring_hash_lb_config` on a non-RING_HASH cluster, so we don't validate it
@@ -13728,6 +13769,100 @@ admin:
                 .circuit_breakers
                 .is_none()
         );
+    }
+
+    // ---- 62 D1 (ADR-0119): common_http_protocol_options.idle_timeout ----
+
+    #[test]
+    fn cluster_idle_timeout_parses_and_round_trips() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: pooled
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      common_http_protocol_options:
+        idle_timeout: 30s
+      load_assignment:
+        cluster_name: pooled
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 8080 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parse");
+        let opts = bootstrap.static_resources.clusters[0]
+            .common_http_protocol_options
+            .as_ref()
+            .expect("common_http_protocol_options present");
+        assert_eq!(opts.idle_timeout.as_deref(), Some("30s"));
+        // The stored scalar parses to the intended Duration at pool-build time.
+        assert_eq!(
+            parse_duration(opts.idle_timeout.as_deref().unwrap()),
+            Ok(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn cluster_idle_timeout_omitted_yields_none() {
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        let bootstrap = crate::parse_bootstrap(yaml).expect("parse");
+        assert!(
+            bootstrap.static_resources.clusters[0]
+                .common_http_protocol_options
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cluster_idle_timeout_rejects_malformed() {
+        // Fail-closed: a non-parse_duration scalar is rejected at parse time
+        // rather than silently defaulting to 60s (ADR-0119).
+        let yaml = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: c
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      common_http_protocol_options:
+        idle_timeout: banana
+      load_assignment:
+        cluster_name: c
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 1 }
+admin:
+  address: { socket_address: { address: 127.0.0.1, port_value: 9901 } }
+"#;
+        match crate::parse_bootstrap(yaml) {
+            Err(crate::ConfigError::InvalidClusterIdleTimeout { cluster }) => {
+                assert_eq!(cluster, "c");
+            }
+            other => panic!("expected InvalidClusterIdleTimeout, got {other:?}"),
+        }
     }
 
     #[test]
