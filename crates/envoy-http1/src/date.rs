@@ -4,33 +4,45 @@
 //! choice but the parent-04 SPEC §3 D1 locks the hand-rolled approach so
 //! 04.1 doesn't pre-emptively land an `httpdate` ADR. ~30 LoC.
 
-use std::sync::Mutex;
+use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Cached IMF-fixdate string, refreshed at most once per second. Match's
-/// Envoy's behavior of regenerating the Date header at ~1 Hz rather than
-/// per request — the format granularity is seconds, so per-request work
-/// would just rebuild an identical string in the common case.
-static DATE_CACHE: Mutex<Option<(u64, String)>> = Mutex::new(None);
+thread_local! {
+    /// Per-worker-thread cached IMF-fixdate string, refreshed at most once per
+    /// second on the thread that observes the tick. Matches Envoy's behavior of
+    /// regenerating the Date header at ~1 Hz rather than per request — the format
+    /// granularity is seconds, so per-request work would just rebuild an identical
+    /// string in the common case.
+    ///
+    /// Thread-local (not a global `Mutex`) so concurrent worker threads never
+    /// contend on a shared lock: under the old global mutex, aggregate throughput
+    /// *fell* as worker count rose (every response serialized on one lock). The
+    /// per-second `format_imf_fixdate` cost is paid at most once per thread per
+    /// second — a handful of tokio workers → negligible duplication — and every
+    /// thread produces the identical string for a given second, so the emitted
+    /// `date:` header is byte-for-byte unchanged.
+    static DATE_CACHE: RefCell<Option<(u64, String)>> = const { RefCell::new(None) };
+}
 
 /// Cached variant of `format_imf_fixdate(SystemTime::now())`. Returns the
 /// same string for the entire wall-clock second; only the first caller
-/// in a given second pays the format cost.
+/// on a given thread in a given second pays the format cost.
 pub fn now_imf_fixdate() -> String {
     let now = SystemTime::now();
     let secs = now
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let mut guard = DATE_CACHE.lock().expect("date cache poisoned");
-    if let Some((cached_secs, ref cached_str)) = *guard
-        && cached_secs == secs
-    {
-        return cached_str.clone();
-    }
-    let fresh = format_imf_fixdate(now);
-    *guard = Some((secs, fresh.clone()));
-    fresh
+    DATE_CACHE.with_borrow_mut(|cache| {
+        if let Some((cached_secs, ref cached_str)) = *cache
+            && cached_secs == secs
+        {
+            return cached_str.clone();
+        }
+        let fresh = format_imf_fixdate(now);
+        *cache = Some((secs, fresh.clone()));
+        fresh
+    })
 }
 
 /// Format a `SystemTime` as an IMF-fixdate string per RFC 7231 §7.1.1.1.

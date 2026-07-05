@@ -21,6 +21,7 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+bytes = "1"
 envoy-accesslog = { path = "../envoy-accesslog", features = ["test-util"] }
 envoy-filter = { path = "../envoy-filter", features = ["test-util"] }
 tempfile = "3"

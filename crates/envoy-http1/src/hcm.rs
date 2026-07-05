@@ -649,6 +649,11 @@ async fn serve_connection(
     mut downstream: TcpStream,
 ) -> Result<(), Http1Error> {
     let mut buf = BytesMut::with_capacity(READ_BUFFER_INITIAL_CAPACITY);
+    // Per-connection response wire buffer, reused across every keep-alive
+    // request on this connection (cleared+refilled per response in
+    // `write_to_buf`) so response serialization allocates once per connection
+    // rather than once per response.
+    let mut write_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER_INITIAL_CAPACITY);
     // 13.1 Task 4: the per-connection tier-1 micro-cache (a single cached
     // `(cluster, endpoint, ClientStream)` reused on the next request) was
     // removed at Task 4 and SUBSUMED by `H1Pool` (lock-in #5). The pool is
@@ -1027,7 +1032,13 @@ async fn serve_connection(
                                 // 06.2 Task 6: capture the resolved upstream endpoint
                                 // for the access-log `%UPSTREAM_HOST%` token (last
                                 // attempt's endpoint wins). Skipped on pick()->None.
-                                upstream_host_for_log = Some(endpoint.to_string());
+                                // Only consumed under the `!config.access_log.is_empty()`
+                                // guard below (record build at :1401), so skip the
+                                // per-request `SocketAddr` Display allocation entirely
+                                // when no access-log sink is configured.
+                                if !config.access_log.is_empty() {
+                                    upstream_host_for_log = Some(endpoint.to_string());
+                                }
                                 // phase 50 (ADR-0107): discriminate the pool-overflow
                                 // outcome (endpoint:Some + outcome:None — UNIQUELY the
                                 // AcquireOutcome::Overflow result, hcm.rs:640; success
@@ -1290,12 +1301,15 @@ async fn serve_connection(
         // explicitly pushed into `response_headers_for_log`.
         let response_status_for_log: u16 = outgoing.status;
         let response_body_len: u64 = outgoing.body.len() as u64;
-        let response_headers_for_log: Vec<(String, String)> = outgoing.headers.clone();
+        // `outgoing` stays owned and alive through the access-log block below, so
+        // the single consumer (`extract_upstream_service_time` at the record build)
+        // borrows `outgoing.headers` directly rather than paying a per-request clone
+        // of the whole response-header vec (it was only ever read once, logging-on).
 
         // 07.1 Task 5: unified wire-write site. 07.1 Task 6 inserted
         // `pipeline.encode_headers` above (boundary conversion + write-back
         // / replacement) so the wire-write below sees the post-encode value.
-        Http1Response::write_to(&outgoing, &mut downstream).await?;
+        Http1Response::write_to_buf(&outgoing, &mut downstream, &mut write_buf).await?;
 
         // 06.3 D15.3.a NEW — per-response-class HCM counters. Increment fires
         // AFTER all 5 writer arms have populated `response_status_for_log`,
@@ -1393,7 +1407,7 @@ async fn serve_connection(
                 bytes_received: request_body_len,
                 bytes_sent: response_body_len,
                 duration,
-                upstream_service_time: extract_upstream_service_time(&response_headers_for_log),
+                upstream_service_time: extract_upstream_service_time(&outgoing.headers),
                 forwarded_for: access_log_header_value(&req.headers, "x-forwarded-for"),
                 user_agent: access_log_header_value(&req.headers, "user-agent"),
                 request_id: access_log_header_value(&req.headers, "x-request-id"),

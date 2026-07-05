@@ -23,12 +23,34 @@ pub struct Http1Response;
 impl Http1Response {
     /// Serializes `resp` onto `w` as a wire-format HTTP/1.1 response:
     /// status line + headers (in emission order) + blank line + body.
+    ///
+    /// Allocates a fresh scratch buffer per call. On a keep-alive connection
+    /// prefer [`Http1Response::write_to_buf`] with a per-connection buffer to
+    /// avoid a per-response allocation.
     pub async fn write_to<W>(resp: &Response, w: &mut W) -> Result<(), Http1Error>
     where
         W: AsyncWrite + Unpin,
     {
+        let mut buf: Vec<u8> = Vec::new();
+        Self::write_to_buf(resp, w, &mut buf).await
+    }
+
+    /// Like [`Http1Response::write_to`] but serializes into a caller-provided
+    /// scratch buffer, reused across requests on a keep-alive connection so the
+    /// response wire buffer is allocated once per connection rather than once
+    /// per response. The buffer is cleared on entry (retaining its capacity);
+    /// the emitted bytes are identical to `write_to`.
+    pub async fn write_to_buf<W>(
+        resp: &Response,
+        w: &mut W,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), Http1Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let reason = resp.reason.unwrap_or_else(|| canonical_reason(resp.status));
-        let mut buf: Vec<u8> = Vec::with_capacity(
+        buf.clear();
+        buf.reserve(
             64 + resp
                 .headers
                 .iter()
@@ -53,7 +75,7 @@ impl Http1Response {
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(&resp.body);
 
-        w.write_all(&buf).await?;
+        w.write_all(buf).await?;
         w.flush().await?;
         Ok(())
     }
@@ -143,5 +165,50 @@ mod tests {
         let expected: &[u8] =
             b"HTTP/1.1 204 No Content\r\nserver: envoy-rust\r\nconnection: keep-alive\r\n\r\n";
         assert_eq!(buf, expected);
+    }
+
+    #[tokio::test]
+    async fn write_to_buf_matches_write_to_and_reuses_buffer() {
+        let a = Response {
+            status: 200,
+            reason: None,
+            headers: vec![
+                ("server".to_string(), "envoy-rust".to_string()),
+                ("content-length".to_string(), "3".to_string()),
+                ("connection".to_string(), "keep-alive".to_string()),
+            ],
+            body: Bytes::from_static(b"ok\n"),
+        };
+        let b = Response {
+            status: 404,
+            reason: None,
+            headers: vec![
+                ("server".to_string(), "envoy-rust".to_string()),
+                ("content-length".to_string(), "0".to_string()),
+                ("connection".to_string(), "close".to_string()),
+            ],
+            body: Bytes::new(),
+        };
+
+        // Reference bytes via the allocating path.
+        let a_ref = write_to_vec(&a).await;
+        let b_ref = write_to_vec(&b).await;
+
+        // Drive both through one reused buffer, in sequence, into a shared sink;
+        // each call must emit exactly the reference bytes (buffer is cleared on
+        // entry, so no bleed-through from the previous, larger response).
+        let mut scratch: Vec<u8> = Vec::new();
+
+        let mut out_a: Vec<u8> = Vec::new();
+        Http1Response::write_to_buf(&a, &mut out_a, &mut scratch)
+            .await
+            .expect("write a");
+        assert_eq!(out_a, a_ref, "write_to_buf(a) == write_to(a)");
+
+        let mut out_b: Vec<u8> = Vec::new();
+        Http1Response::write_to_buf(&b, &mut out_b, &mut scratch)
+            .await
+            .expect("write b");
+        assert_eq!(out_b, b_ref, "write_to_buf(b) == write_to(b) on reused buf");
     }
 }
