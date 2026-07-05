@@ -117,3 +117,118 @@ session did **not** run the full §7.5 verification gate (Docker differential
 suite in CI, h2spec, cargo-deny, fuzz) — that is state-4, a separate session
 per `BOOTSTRAP_PROMPT.md` §5.1. No new ADR fired (SPEC §A-§H were not
 overturned during implementation); ADR-0114 remains the ledger head.
+
+## State-4 verification
+
+Executed via `superpowers:verification-before-completion`. Cold-started fully
+(`BOOTSTRAP_PROMPT.md` §1, `STATE.md`, `ROADMAP.md`, `DECISIONS.md`,
+`BEHAVIOR_CONTRACT.md`, `SKILL_ROUTING.md`, plus this phase's
+SPEC/PLAN/PROGRESS) before running the gate. `git status --porcelain` clean
+and `HEAD` at the phase-57 state-3 commit `e78b019` both before and after the
+local run (concurrency guard, memory
+`concurrent-loop-sessions-race-on-phase-pick`) — no sibling had advanced.
+
+### `cargo build --workspace --all-targets`
+
+Clean. `Finished \`dev\` profile [unoptimized + debuginfo] target(s)`.
+
+### `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+Clean, no warnings. `Finished \`dev\` profile [unoptimized + debuginfo]
+target(s) in 0.96s`.
+
+### `cargo fmt --all -- --check`
+
+Clean (exit 0, no output).
+
+### `cargo test --workspace` (debug `envoy-bin` rebuilt first, per memory
+`differential-harness-uses-debug-envoy-bin`)
+
+Ran twice (once fail-fast, once `--no-fail-fast` for the full picture).
+Totals across the `--no-fail-fast` run: **1770 passed, 3 failed, 3 ignored.**
+Fixture `0065`'s differential test passed cleanly both times (`test
+access_log_h2_rf_no_healthy ... ok`), with the subject's tracing output
+showing `no healthy endpoint — emitting 503` — confirming the fix is
+exercised end-to-end. All 3 failures are documented pre-existing
+host-environment flakes, none touching this phase's changed files
+(`crates/envoy-http2/src/hcm.rs`, fixture `0065`, its differential test,
+`BEHAVIOR_CONTRACT.md`) and none newer than phase 54:
+
+- **`access_log_rcd_upstream_reset`** (fixture `0062`, phase 54) and
+  **`access_log_rf_upstream_reset`** (fixture `0061`, phase 53) — both show
+  the `UF`-vs-`UC` divergence keyed to an IPv6 `remote_address:[fdc4:...]`
+  connect-failure address, exactly matching memory
+  `differential-host-bridge-ip-192-168-65-2`'s class (this dev host's Docker
+  network-routing topology diverges from the allow-listed
+  `192.168.65.254`/`172.17.0.1`). Confirmed via `git log` that both fixture
+  files predate phase 57 (commits `c2c7acf`/`c222ab4`, phases 53/54).
+- **`admin_config_dump_server_info`** (fixture `0014`, phase 08.1) — diverges
+  on `backend::192.168.65.2:<port>::*` stats fields, the literal
+  `192.168.65.2` bridge-IP divergence memory `differential-host-bridge-ip-192-168-65-2`
+  documents by name verbatim (confirmed via a standalone rerun with
+  `--nocapture`).
+
+`envoy-http2` unit tests: all passed as part of the workspace run (no
+regression versus the phase-57 state-3 session's `81`/`82`-passed counts —
+the two new backstops from Tasks 1/2 are included in the workspace total).
+
+### `cargo deny check`
+
+Clean: `advisories ok, bans ok, licenses ok, sources ok` (only the same 5
+pre-existing `license-not-encountered` warnings for unmatched allow-list
+entries — `0BSD`/`BSD-2-Clause`/`MPL-2.0`/`Unicode-DFS-2016`/`Zlib` — present
+on `main` before this phase, not phase-57-related).
+
+### Docker differential suite (fixture `0065` + all `0001`-`0064`), h2spec,
+fuzz — **CI-authoritative** (memory `envoy-rust-state4-ci-first-execution`)
+
+Per the handoff prompt: CI run `28728281325` was already green on the
+current HEAD `e78b0197f50a3696502613976d208872f79cc54c` (confirmed via `gh
+run view 28728281325 --json status,conclusion,headSha,jobs`: `headSha` =
+`e78b019...`, `status` = `completed`, `conclusion` = `success`, both jobs
+(`build + test + lint`, `fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse +
+accesslog_format_parse, 30s each)`) `conclusion` = `success`). This session's
+own local re-verification found no regression to fix (the local gate above
+is clean modulo the 3 documented pre-existing host flakes), so per the
+handoff's own guidance no new commit/re-trigger was needed — the existing
+green run is cited directly as the authoritative §7.5(a)/(b)/(c)/(d)
+evidence.
+
+Pulled the full job log (`gh run view 28728281325 --log`, 28728 lines) and
+confirmed:
+
+- **Zero occurrences of the literal `FAILED` anywhere in the entire job
+  log** — every differential fixture, including the 3 that flake locally on
+  this dev host (`0061`/`0062`/`0014`), passed in CI's environment.
+- `test access_log_h2_rf_no_healthy ... ok` (fixture `0065`, this phase's
+  witness) — present in the `build + test + lint` job's `test` step output.
+- `test h2spec_pass_rate_gate ... ok` — CI's h2spec gate passes with the
+  unmodified `known-failures.txt` (no H2 codec/framing change this phase, so
+  the gate is unmoved from phase 56's baseline).
+- The `cargo deny check` step ran the same 5 pre-existing
+  `license-not-encountered` warnings as the local run, and the job step
+  completed successfully (job `conclusion` = `success`).
+- The `fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse +
+  accesslog_format_parse, 30s each)` job completed `success` — no new fuzz
+  target required this phase (SPEC §H), and the existing 4 targets ran clean.
+
+§7.5 gate status: **(a)** fixture `0065` green ✅ (CI: `access_log_h2_rf_no_healthy
+... ok`, cross-proxy-equal status 503 + whole-line
+`{"method":"GET","proto":"HTTP/2","rc":503,"rcd":"no_healthy_upstream","rf":"UH"}`,
+also confirmed locally); **(b)** all `0001`-`0064` green simultaneously ✅
+(CI: zero `FAILED` in the job log; the 3 fixtures that flake locally are
+pre-existing host-environment issues, confirmed non-regressions by
+`git log` predating phase 57); **(c)** h2spec ≥95% ✅ (CI:
+`h2spec_pass_rate_gate ... ok`, unmoved — no H2 codec/framing change this
+phase per SPEC §H); **(d)** no new fuzz target ✅ (SPEC §H — N/A; the fuzz
+job itself green); **(e)** build/clippy/fmt/test/deny all clean, confirmed
+both locally (this session) and in CI (job `success`); **(f)** `REVIEW.md`
+not yet authored — that is the state-5 code-review, a separate session per
+§5.1.
+
+**Conclusion: the §7.5 phase-done gate is satisfied for phase 57's
+implementation surface**, on the authoritative CI run `28728281325` @
+`e78b019`, corroborated by this session's own local re-verification (clean
+modulo 3 documented pre-existing host flakes unrelated to this phase). No
+code changes were needed this session. The next session is the **§5
+state-5 code-review** (`superpowers:requesting-code-review`).
