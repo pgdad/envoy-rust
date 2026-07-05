@@ -2150,12 +2150,20 @@ static_resources:
                 typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
             }],
         };
-        let mut built = Http1HCMConfig::from_config(&cfg, Arc::clone(&cluster_mgr), Arc::clone(&registry), None)
-            .await
-            .expect("build HCM config");
+        let mut built = Http1HCMConfig::from_config(
+            &cfg,
+            Arc::clone(&cluster_mgr),
+            Arc::clone(&registry),
+            None,
+        )
+        .await
+        .expect("build HCM config");
         built.access_log = vec![sink];
         let inner = Arc::new(built);
-        let hcm_config = Arc::new(HCMConfig::wrap(Arc::clone(&inner), Some(Arc::clone(&pool_mgr))));
+        let hcm_config = Arc::new(HCMConfig::wrap(
+            Arc::clone(&inner),
+            Some(Arc::clone(&pool_mgr)),
+        ));
 
         // Manual spawn (mirrors `h2_hcm_pool_reuses_upstream_conn_across_sequential_requests`
         // — the existing `spawn_h2_hcm` helper hard-codes `pool: None`).
