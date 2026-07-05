@@ -693,7 +693,21 @@ async fn handle_one_stream(
                             // the access-log `%UPSTREAM_HOST%` token (last attempt's
                             // endpoint wins). Skipped on pick()->None.
                             upstream_host_for_log_h2 = Some(endpoint.to_string());
-                            response_code_details_for_log_h2 = Some("via_upstream".to_owned());
+                            // 58 (ADR-0115) §A: discriminate the pool-overflow
+                            // outcome (endpoint:Some + outcome:None — UNIQUELY
+                            // the AcquireOutcome::Overflow result, hcm.rs:414;
+                            // every other endpoint:Some path carries a
+                            // non-None outcome) from a real upstream response
+                            // — mirrors the H1 discriminator exactly
+                            // (crates/envoy-http1/src/hcm.rs:1045-1052).
+                            response_code_details_for_log_h2 = Some(
+                                if attempt.outcome.is_none() {
+                                    "upstream_reset_before_response_started{overflow}"
+                                } else {
+                                    "via_upstream"
+                                }
+                                .to_owned(),
+                            );
                         } else {
                             // 57 (ADR-0114) §B: the pick()->None no-healthy arm —
                             // mirrors the H1 caller-loop if/else pattern
@@ -948,17 +962,20 @@ async fn finalize_h2_stream(
     // (covering both empty-body and non-empty-body emit branches).
     if !config.inner.access_log.is_empty() {
         let duration = req_arrival_instant.elapsed();
-        // Phase 56 (ADR-0113) / phase 57 (ADR-0114): the H2 sibling of the H1
-        // %RESPONSE_FLAGS% derive (crates/envoy-http1/src/hcm.rs:1377), grown
-        // one arm per phase exactly as H1 did (48->49->50->51->52->53).
-        // route_not_found => NR (phase 56); no_healthy_upstream => UH (phase
-        // 57 — ALSO corrects the H2 no-healthy synth status 502->503, see
-        // synth_h2_no_healthy_upstream()). The remaining H2 flags
-        // (UO/URX/UF/UC) are the continuing carry-forward M56-1, witnessed
-        // one-at-a-time by future phases.
+        // Phase 56 (ADR-0113) / phase 57 (ADR-0114) / phase 58 (ADR-0115): the
+        // H2 sibling of the H1 %RESPONSE_FLAGS% derive
+        // (crates/envoy-http1/src/hcm.rs:1377), grown one arm per phase
+        // exactly as H1 did (48->49->50->51->52->53). route_not_found => NR
+        // (phase 56); no_healthy_upstream => UH (phase 57); the
+        // pool/request-budget overflow detail => UO (phase 58 — set on BOTH
+        // the pool-overflow arm, §A, and the request-budget arm, §B — no
+        // status-code fix needed this phase, unlike 50/57). The remaining H2
+        // flags (URX/UF/UC) are the continuing carry-forward M56-1,
+        // witnessed one-at-a-time by future phases.
         let response_flags_for_log_h2: &str = match response_code_details_for_log_h2.as_deref() {
             Some("route_not_found") => "NR",
             Some("no_healthy_upstream") => "UH",
+            Some("upstream_reset_before_response_started{overflow}") => "UO",
             _ => "-",
         };
         let record = envoy_accesslog::AccessLogRecord {
