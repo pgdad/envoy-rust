@@ -4473,6 +4473,109 @@ static_resources:
         );
     }
 
+    /// Phase 61 (ADR-0118) §A/§B/§C/§D/§G backstop: drive the H2
+    /// retry-limit-exceeded (L9) path — an always-503 H1 upstream
+    /// (`spawn_fail_then_ok_h1_upstream(503, 1000)`, fail_count much greater
+    /// than the 2 attempts) + `retry_policy{retry_on:"5xx",num_retries:1}` ->
+    /// both attempts 503, the budget of 1 consumed, the last 503 surfaced
+    /// downstream verbatim -- with a {rc,rcd,rf} FILE json access-log.
+    /// Asserts the logged line carries rcd:"via_upstream" (a REAL upstream
+    /// 503, UNCHANGED -- matches Envoy, NOT rewritten) and the DERIVED
+    /// rf:"URX" (set at the limit-exceeded loop-exit boolean, §B, NOT
+    /// rcd-derived). H2 mirror of the H1 backstop
+    /// `h1_retry_limit_exceeded_access_log_carries_urx_flag`
+    /// (`crates/envoy-http1/src/hcm.rs:7326`). The counter/header assertions
+    /// for this SAME topology are ALREADY covered by the existing phase-16
+    /// test `h2_retry_limit_exceeded_path_always_503` (above) -- this test
+    /// adds ONLY the access-log proof, not a duplicate counter check.
+    /// Fail-first: pre-change the derive's rcd-match falls to `_ => "-"`
+    /// (via_upstream is unmatched) -> it renders `"rf":"-"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_retry_limit_exceeded_access_log_carries_urx_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        // Always-503 H1 backend: fail_count 1000 >> the 2 attempts -> every
+        // attempt 503 -> the retry budget of 1 is consumed -> limit-exceeded (L9).
+        let (upstream_addr, _reqs) = spawn_fail_then_ok_h1_upstream(503, 1000).await;
+        let (cluster_mgr, _cluster) = h1_backend_cluster(upstream_addr).await;
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test-retry".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: Some(envoy_config::RetryPolicy {
+                                retry_on: "5xx".into(),
+                                num_retries: Some(1),
+                                retriable_status_codes: vec![],
+                            }),
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (status, _headers) = drive_h2_once(config).await;
+        assert_eq!(
+            status, 503,
+            "retry-limit-exceeded surfaces the last upstream 503 verbatim"
+        );
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
+            "retry-limit-exceeded access-log line carries rcd:via_upstream + rf:URX: {logged:?}"
+        );
+    }
+
     /// 16 Task 5 (no-retry regression): NO retry_policy, H1 backend 503.
     /// Downstream 503, exactly 1 attempt, upstream_rq_total=1, upstream_rq_5xx=1,
     /// NO x-envoy-attempt-count header, all 3 retry counters 0. Proves the
