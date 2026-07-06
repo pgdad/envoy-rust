@@ -862,11 +862,16 @@ async fn serve_connection(
             buf.advance(from_buf);
             let mut remaining = body_len - from_buf;
             while remaining > 0 {
-                let mut chunk = [0u8; 4096];
-                let to_read = chunk.len().min(remaining);
+                // Read the CL-framed remainder straight into body_buf — no 4 KiB
+                // stack bounce buffer + second memcpy. `take` bounds the read to
+                // the declared body length so a following pipelined request's
+                // bytes are never consumed (identical framing to the old
+                // `chunk[..to_read]` cap). Same pattern as client.rs's response
+                // body read.
+                let mut limited = (&mut downstream).take(remaining as u64);
                 let n = match tokio::time::timeout(
                     IDLE_READ_TIMEOUT,
-                    downstream.read(&mut chunk[..to_read]),
+                    limited.read_buf(&mut body_buf),
                 )
                 .await
                 {
@@ -875,7 +880,6 @@ async fn serve_connection(
                     Ok(Err(source)) => return Err(Http1Error::Io { source }),
                     Err(_elapsed) => return Ok(()),
                 };
-                body_buf.extend_from_slice(&chunk[..n]);
                 remaining -= n;
             }
             body_buf.freeze()
