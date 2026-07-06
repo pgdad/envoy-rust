@@ -365,7 +365,18 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 // balancing), >= 2 workers, H1 codec, no rds (per-worker
                 // route tables would not observe hot reloads), no downstream
                 // TLS (falls through to the existing detect-and-bail).
-                // `ENVOY_RUST_TPC=0` forces the shared-runtime path.
+                //
+                // Opt-in via `ENVOY_RUST_TPC=1`, NOT opt-out: each worker
+                // builds its own HCMConfig (fresh filter-chain instances), so
+                // any filter or resource limit whose state must be shared
+                // across the whole listener — the local_ratelimit token
+                // bucket, the max_connections circuit-breaker counter — is
+                // silently fragmented into N independent per-worker copies
+                // instead of one. Confirmed regressions: the differential
+                // `http_filter_local_rate_limit` fixture, the envoy-bin
+                // backstops `local_rate_limit_enforces_429_after_token_exhaustion`
+                // and `cx_overflow_yields_200_503_multiset_and_cx_open_both_edges`.
+                // Default off until per-worker state sharing is fixed.
                 let tpc_workers = if cfg!(target_os = "linux")
                     && listener_cfg.enable_reuse_port
                     && listener_concurrency > 1
@@ -376,8 +387,8 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     && hcm_cfg.rds.is_none()
                     && build_downstream_tls_for_listener(listener_cfg)?.is_none()
                     && std::env::var("ENVOY_RUST_TPC")
-                        .map(|v| v != "0")
-                        .unwrap_or(true)
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
                 {
                     listener_concurrency
                 } else {
