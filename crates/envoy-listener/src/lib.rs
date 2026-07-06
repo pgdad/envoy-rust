@@ -615,12 +615,12 @@ async fn bind_listeners(
         .map_err(|source| ListenerError::Bind { addr, source })?;
     listeners.push(first);
     for _ in 1..effective_n {
-        listeners.push(
-            bind_reuseport_socket(bound_addr).map_err(|source| ListenerError::Bind {
+        listeners.push(bind_reuseport_socket(bound_addr).map_err(|source| {
+            ListenerError::Bind {
                 addr: bound_addr,
                 source,
-            })?,
-        );
+            }
+        })?);
     }
     Ok(listeners)
 }

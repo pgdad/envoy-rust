@@ -25,6 +25,11 @@ ignore = [
     # migrating to rustls-pki-types' PemObject trait, tracked at testcontainers
     # upstream. See ADR-0005.
     { id = "RUSTSEC-2025-0134", reason = "dev-only testcontainers chain; no safe upgrade; tracked via ADR-0005" },
+    # RUSTSEC-2025-0057 — fxhash unmaintained. Path: envoy-http1 → monoio 0.2
+    # (optional `uring` feature; io_uring prototype, off by default,
+    # ENVOY_RUST_URING=1 opt-in) → fxhash 0.2.1. Upstream monoio pins this
+    # fxhash version; "no safe upgrade is available". See ADR-0005.
+    { id = "RUSTSEC-2025-0057", reason = "monoio's io_uring prototype (optional `uring` feature, off by default) pins fxhash; no safe upgrade; tracked via ADR-0005" },
 ]
 
 [licenses]
