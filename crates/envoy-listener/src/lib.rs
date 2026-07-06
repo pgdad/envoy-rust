@@ -64,6 +64,15 @@ pub enum ListenerError {
     /// `envoy_stats::StatsError` in its error surface.
     #[error("registering listener stats: {0}")]
     StatsRegistration(String),
+    /// `bind_per_worker` was asked for more than one shard on a platform or
+    /// configuration where `SO_REUSEPORT` does not load-balance (non-Linux, or
+    /// the listener's `enable_reuse_port` is false). Callers gate on those
+    /// conditions before choosing the per-worker path; this error surfaces a
+    /// gating bug instead of silently starving all but one shard.
+    #[error(
+        "per-worker sharding requires enable_reuse_port and a platform with SO_REUSEPORT load-balancing (Linux)"
+    )]
+    ShardingUnavailable,
 }
 
 /// A bound TCP listener with a per-connection handler. Construct via
@@ -111,6 +120,13 @@ pub struct Listener {
     /// therefore naturally excluded from this gauge per
     /// architecture-decision lock-in #12.
     listener_manager_active: Arc<envoy_stats::Gauge>,
+    /// Whether this `Listener` counts itself in
+    /// `listener_manager.total_listeners_active` while serving. Always true
+    /// for `bind` / `bind_with_concurrency`. `bind_per_worker` returns N
+    /// shards that back ONE logical listener, so only shard 0 carries `true`
+    /// — the gauge stays at 1 per configured listener regardless of the
+    /// worker count.
+    count_listener_active: bool,
 }
 
 /// 08.2 Task 6 (D12): RAII guard that increments
@@ -242,7 +258,72 @@ impl Listener {
             cx_active,
             cx_accept_failed,
             listener_manager_active,
+            count_listener_active: true,
         })
+    }
+
+    /// Thread-per-core sharding: bind `handlers.len()` `SO_REUSEPORT` sockets
+    /// on the listener address and return ONE single-socket `Listener` per
+    /// handler, so each shard can be served on its own (typically
+    /// single-threaded) runtime with its own per-worker connection handler —
+    /// upstream Envoy's per-worker-dispatcher architecture. All shards share
+    /// the one per-listener stat set (one logical listener); only shard 0
+    /// counts in `listener_manager.total_listeners_active`.
+    ///
+    /// Errors with [`ListenerError::ShardingUnavailable`] when more than one
+    /// handler is passed but the platform (non-Linux) or the listener config
+    /// (`enable_reuse_port: false`) cannot load-balance across sockets —
+    /// callers gate on those conditions and fall back to
+    /// [`Listener::bind_with_concurrency`].
+    pub async fn bind_per_worker(
+        cfg: &envoy_config::Listener,
+        handlers: Vec<Arc<dyn ConnectionHandler>>,
+        registry: Arc<envoy_stats::StatsRegistry>,
+    ) -> Result<Vec<Self>, ListenerError> {
+        let n = handlers.len();
+        if n > 1 && !(cfg.enable_reuse_port && cfg!(target_os = "linux")) {
+            return Err(ListenerError::ShardingUnavailable);
+        }
+        let sock = &cfg.address.socket_address;
+        let addr_str = format!("{}:{}", sock.address, sock.port_value);
+        let addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|_| ListenerError::AddressParse(sock.address.clone(), sock.port_value))?;
+        let sockets = bind_listeners(addr, cfg.enable_reuse_port, n).await?;
+        debug_assert_eq!(sockets.len(), n, "bind_listeners honored the shard count");
+
+        // Same stat registrations as bind_inner — idempotent by name, and the
+        // resulting Arcs are cloned into every shard (one logical stat set).
+        let cx_total = registry
+            .register_counter(&format!("listener.{}.downstream_cx_total", cfg.name))
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        let cx_active = registry
+            .register_gauge(&format!("listener.{}.downstream_cx_active", cfg.name))
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        let cx_accept_failed = registry
+            .register_counter(&format!(
+                "listener.{}.downstream_cx_accept_failed",
+                cfg.name
+            ))
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        let listener_manager_active = registry
+            .register_gauge("listener_manager.total_listeners_active")
+            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+
+        Ok(sockets
+            .into_iter()
+            .zip(handlers)
+            .enumerate()
+            .map(|(i, (socket, handler))| Self {
+                listeners: vec![socket],
+                handler,
+                cx_total: Arc::clone(&cx_total),
+                cx_active: Arc::clone(&cx_active),
+                cx_accept_failed: Arc::clone(&cx_accept_failed),
+                listener_manager_active: Arc::clone(&listener_manager_active),
+                count_listener_active: i == 0,
+            })
+            .collect())
     }
 
     /// Returns the actual bound socket address (resolves `port_value: 0` to
@@ -295,8 +376,12 @@ impl Listener {
         // 08.2 Task 6 (D12): RAII guard MUST be the first local so its Drop
         // fires LAST (after every accept loop's drain-wait completes). It counts
         // ONE logical listener regardless of how many SO_REUSEPORT sockets back
-        // it. Construction increments the gauge; Drop decrements.
-        let _lm_guard = ListenerManagerActiveGuard::new(Arc::clone(self.listener_manager_active()));
+        // it. Construction increments the gauge; Drop decrements. Non-primary
+        // `bind_per_worker` shards skip the guard so N shards of one logical
+        // listener still read as 1.
+        let _lm_guard = self
+            .count_listener_active
+            .then(|| ListenerManagerActiveGuard::new(Arc::clone(self.listener_manager_active())));
 
         let mut listeners = self.listeners;
         let handler = self.handler;
@@ -519,9 +604,22 @@ async fn bind_listeners(
         return Ok(vec![listener]);
     }
     let mut listeners = Vec::with_capacity(effective_n);
-    for _ in 0..effective_n {
+    // Bind the first socket, then bind the rest to the RESOLVED address —
+    // with `port_value: 0` each fresh bind would otherwise get its own
+    // ephemeral port and the sockets would not share one accept address
+    // (SO_REUSEPORT groups form per concrete port).
+    let first =
+        bind_reuseport_socket(addr).map_err(|source| ListenerError::Bind { addr, source })?;
+    let bound_addr = first
+        .local_addr()
+        .map_err(|source| ListenerError::Bind { addr, source })?;
+    listeners.push(first);
+    for _ in 1..effective_n {
         listeners.push(
-            bind_reuseport_socket(addr).map_err(|source| ListenerError::Bind { addr, source })?,
+            bind_reuseport_socket(bound_addr).map_err(|source| ListenerError::Bind {
+                addr: bound_addr,
+                source,
+            })?,
         );
     }
     Ok(listeners)
@@ -699,6 +797,7 @@ mod tests {
             listener_manager_active: registry
                 .register_gauge("listener_manager.total_listeners_active")
                 .unwrap(),
+            count_listener_active: true,
         }
     }
 
@@ -813,6 +912,129 @@ mod tests {
             nonzero >= 2,
             "connections spread across >= 2 sockets (got {nonzero} of {N} nonzero)"
         );
+    }
+
+    /// `bind_per_worker` with a single handler works on every platform (the
+    /// single-socket path needs no SO_REUSEPORT load-balancing) and serves
+    /// exactly like `Listener::bind`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_per_worker_single_shard_serves() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let registry = mk_registry();
+        let shards = Listener::bind_per_worker(
+            &cfg,
+            vec![Arc::new(EchoHandler) as Arc<dyn ConnectionHandler>],
+            Arc::clone(&registry),
+        )
+        .await
+        .expect("single-shard bind ok");
+        assert_eq!(shards.len(), 1);
+        let listener = shards.into_iter().next().unwrap();
+        let addr = listener.local_addr().expect("local_addr");
+
+        let drain = Arc::new(DrainState::new(&registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(listener.serve(
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        c.write_all(b"shard").await.expect("write");
+        let mut buf = [0u8; 5];
+        c.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"shard");
+        drop(c);
+
+        tx.send(()).expect("shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(6), server)
+            .await
+            .expect("serve resolves")
+            .expect("join")
+            .expect("serve ok");
+    }
+
+    /// Multi-shard `bind_per_worker` is gated to platforms where SO_REUSEPORT
+    /// load-balances (Linux); elsewhere it must refuse rather than silently
+    /// starve all but one shard.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn bind_per_worker_multi_shard_unavailable_off_linux() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let handlers: Vec<Arc<dyn ConnectionHandler>> =
+            vec![Arc::new(NullHandler), Arc::new(NullHandler)];
+        let err = Listener::bind_per_worker(&cfg, handlers, mk_registry())
+            .await
+            .expect_err("multi-shard must fail off-Linux");
+        assert!(matches!(err, ListenerError::ShardingUnavailable));
+    }
+
+    /// Linux: N handlers → N shards on one port, each serving its own accept
+    /// queue; connections spread by the kernel are handled by whichever shard
+    /// they land on, and `listener_manager.total_listeners_active` counts the
+    /// N shards as ONE logical listener (only shard 0 carries the guard).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_per_worker_multi_shard_serves_as_one_logical_listener() {
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let registry = mk_registry();
+        let handlers: Vec<Arc<dyn ConnectionHandler>> =
+            vec![Arc::new(EchoHandler), Arc::new(EchoHandler)];
+        let shards = Listener::bind_per_worker(&cfg, handlers, Arc::clone(&registry))
+            .await
+            .expect("2-shard bind ok");
+        assert_eq!(shards.len(), 2);
+        let addr = shards[0].local_addr().expect("local_addr");
+        assert_eq!(shards[1].local_addr().expect("local_addr"), addr);
+
+        let lm_gauge = registry
+            .register_gauge("listener_manager.total_listeners_active")
+            .expect("gauge");
+        let drain = Arc::new(DrainState::new(&registry));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut servers = Vec::new();
+        for shard in shards {
+            let mut rx = rx.clone();
+            let drain = Arc::clone(&drain);
+            servers.push(tokio::spawn(async move {
+                shard
+                    .serve(
+                        async move {
+                            let _ = rx.wait_for(|&f| f).await;
+                        },
+                        drain,
+                    )
+                    .await
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            lm_gauge.value(),
+            1,
+            "N shards of one listener must read as 1 active listener"
+        );
+
+        // Echo round-trips regardless of which shard's queue each lands on.
+        for i in 0..8u8 {
+            let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let payload = [b'a' + i; 8];
+            c.write_all(&payload).await.expect("write");
+            let mut buf = [0u8; 8];
+            c.read_exact(&mut buf).await.expect("read");
+            assert_eq!(buf, payload);
+        }
+
+        tx.send(true).expect("shutdown");
+        for s in servers {
+            tokio::time::timeout(std::time::Duration::from_secs(6), s)
+                .await
+                .expect("serve resolves")
+                .expect("join")
+                .expect("serve ok");
+        }
+        assert_eq!(lm_gauge.value(), 0, "gauge returns to 0 after serve exits");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -30,7 +30,7 @@ pub struct Http1Response;
 /// 1 KiB is a conservative round threshold at which the vectored win is
 /// unambiguous (≈1.15× and rising) and well outside run-to-run noise, so the
 /// change never regresses a small response.
-const VECTORED_BODY_THRESHOLD: usize = 1024;
+pub(crate) const VECTORED_BODY_THRESHOLD: usize = 1024;
 
 impl Http1Response {
     /// Serializes `resp` onto `w` as a wire-format HTTP/1.1 response:
@@ -72,36 +72,7 @@ impl Http1Response {
     where
         W: AsyncWrite + Unpin,
     {
-        let reason = resp.reason.unwrap_or_else(|| canonical_reason(resp.status));
-        buf.clear();
-        // Reserve for the head only — the body is written vectored, not copied.
-        buf.reserve(
-            64 + resp
-                .headers
-                .iter()
-                .map(|(n, v)| n.len() + v.len() + 4)
-                .sum::<usize>(),
-        );
-        // Status line.
-        buf.extend_from_slice(b"HTTP/1.1 ");
-        {
-            // Format the 3-digit status without the former per-response
-            // `to_string()` heap allocation.
-            use std::io::Write as _;
-            let _ = write!(buf, "{}", resp.status);
-        }
-        buf.push(b' ');
-        buf.extend_from_slice(reason.as_bytes());
-        buf.extend_from_slice(b"\r\n");
-        // Headers.
-        for (name, value) in &resp.headers {
-            buf.extend_from_slice(name.as_bytes());
-            buf.extend_from_slice(b": ");
-            buf.extend_from_slice(value.as_bytes());
-            buf.extend_from_slice(b"\r\n");
-        }
-        // Blank line terminating the head.
-        buf.extend_from_slice(b"\r\n");
+        serialize_response_head(resp, buf);
 
         if resp.body.len() >= VECTORED_BODY_THRESHOLD {
             // Large body: emit head + body vectored, skipping the body memcpy.
@@ -117,6 +88,44 @@ impl Http1Response {
         w.flush().await?;
         Ok(())
     }
+}
+
+/// Serialize the response HEAD (status line + headers + terminating blank
+/// line) into `buf`, clearing it first. Extracted from
+/// [`Http1Response::write_to_buf`] so runtime-agnostic callers (the io_uring
+/// data-plane prototype) share the exact serialization — byte-for-byte the
+/// same wire head as the tokio writer.
+pub(crate) fn serialize_response_head(resp: &Response, buf: &mut Vec<u8>) {
+    let reason = resp.reason.unwrap_or_else(|| canonical_reason(resp.status));
+    buf.clear();
+    // Reserve for the head only — the body may be written vectored, not copied.
+    buf.reserve(
+        64 + resp
+            .headers
+            .iter()
+            .map(|(n, v)| n.len() + v.len() + 4)
+            .sum::<usize>(),
+    );
+    // Status line.
+    buf.extend_from_slice(b"HTTP/1.1 ");
+    {
+        // Format the 3-digit status without the former per-response
+        // `to_string()` heap allocation.
+        use std::io::Write as _;
+        let _ = write!(buf, "{}", resp.status);
+    }
+    buf.push(b' ');
+    buf.extend_from_slice(reason.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    // Headers.
+    for (name, value) in &resp.headers {
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    // Blank line terminating the head.
+    buf.extend_from_slice(b"\r\n");
 }
 
 /// Write `head` followed by `body` to `w` with vectored I/O, draining across

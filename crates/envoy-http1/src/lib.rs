@@ -21,6 +21,8 @@ pub mod pool; // 13.1 NEW (Task 3): per-cluster H1 connection pool.
 pub mod rds_watcher; // 26 NEW (Task 3): the 5th periodic-background primitive.
 pub mod response;
 pub mod router; // 04.3 NEW (Task 8)
+#[cfg(all(feature = "uring", target_os = "linux"))]
+pub mod uring; // EXPERIMENTAL io_uring data-plane worker (perf prototype).
 
 pub use client::{Client, ClientStream};
 pub use codec::{Http1Codec, HttpVersion, Request};

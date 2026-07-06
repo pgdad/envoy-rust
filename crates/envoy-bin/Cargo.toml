@@ -9,6 +9,10 @@ license = "Apache-2.0"
 name = "envoy-bin"
 path = "src/main.rs"
 
+[features]
+# EXPERIMENTAL: forward the io_uring data-plane prototype (see envoy-http1).
+uring = ["envoy-http1/uring"]
+
 [dependencies]
 anyhow = "1"
 envoy-admin = { path = "../envoy-admin" }

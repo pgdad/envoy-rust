@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 
 const DEFAULT_SERVER_NAME: &str = "envoy-rust";
 const DEFAULT_CONTENT_TYPE: &str = "text/plain";
-const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// 25.2 M25.1-1: cap the UP-FRONT body-buffer reservation so an untrusted,
 /// uncapped client `Content-Length` cannot trigger a proportional allocation
 /// before any body byte arrives (a client sending only `Content-Length:
@@ -34,7 +34,7 @@ const INITIAL_BODY_BUF_CAP: usize = 64 * 1024;
 /// 4 KiB initial capacity: typical proxied requests/responses are far below
 /// this; BytesMut grows on demand for larger traffic. Halved from 8 KiB to cut
 /// steady-state per-connection anon memory (2 buffers x N connections).
-const READ_BUFFER_INITIAL_CAPACITY: usize = 4096;
+pub(crate) const READ_BUFFER_INITIAL_CAPACITY: usize = 4096;
 
 /// 06.1 D4.c: per-HCM counters registered against the global StatsRegistry.
 /// Names use the configured `stat_prefix` from `HCMConfig`. Currently
@@ -599,7 +599,9 @@ async fn run_attempt(
                     })
             } else {
                 match &mut handle {
-                    StreamHandle::Pooled(g) => g.stream_mut().send_request_borrowed(req, true).await,
+                    StreamHandle::Pooled(g) => {
+                        g.stream_mut().send_request_borrowed(req, true).await
+                    }
                     StreamHandle::OneShot(s) => s.send_request_borrowed(req, true).await,
                 }
                 .map(SendOk::Owned)
@@ -1418,8 +1420,12 @@ async fn serve_connection(
             // Fast path: the transformed head is already serialized in
             // `direct_head_buf`; emit head + body with the same
             // threshold/vectored strategy as `write_to_buf`.
-            crate::response::write_head_and_body(&mut downstream, &mut direct_head_buf, &outgoing.body)
-                .await?;
+            crate::response::write_head_and_body(
+                &mut downstream,
+                &mut direct_head_buf,
+                &outgoing.body,
+            )
+            .await?;
         } else {
             Http1Response::write_to_buf(&outgoing, &mut downstream, &mut write_buf).await?;
         }
@@ -1572,7 +1578,7 @@ async fn serve_connection(
     }
 }
 
-fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Error> {
+pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Error> {
     match find_header(headers, headers::CONTENT_LENGTH) {
         Some(v) => v.parse::<usize>().map_err(|_| Http1Error::MalformedHeader),
         None => Ok(0),
@@ -1942,7 +1948,7 @@ fn synth_direct_response(dr: &DirectResponse, close: bool) -> Response {
     }
 }
 
-fn synth_status(status: u16, close: bool) -> Response {
+pub(crate) fn synth_status(status: u16, close: bool) -> Response {
     let body = Bytes::new();
     Response {
         status,
@@ -1972,7 +1978,7 @@ fn synth_status(status: u16, close: bool) -> Response {
 /// `4f9ba04`; ADR-0037). Used ONLY at the `pick() -> None` arm of HCM's
 /// per-request dispatch (`hcm.rs:582` in this file); the connect-fail 503
 /// and other synth paths keep `synth_status`'s empty body.
-fn synth_no_healthy_upstream(close: bool) -> Response {
+pub(crate) fn synth_no_healthy_upstream(close: bool) -> Response {
     let body = Bytes::from_static(b"no healthy upstream");
     Response {
         status: 503,
@@ -2113,7 +2119,7 @@ fn synth_400(close: bool) -> Response {
 fn synth_404(close: bool) -> Response {
     synth_status(404, close)
 }
-fn synth_501(close: bool) -> Response {
+pub(crate) fn synth_501(close: bool) -> Response {
     synth_status(501, close)
 }
 

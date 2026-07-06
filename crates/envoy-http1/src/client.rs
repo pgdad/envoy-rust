@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const RESPONSE_HEADERS_CAP: usize = 8192;
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-connection plaintext HTTP/1.1 client. Stateless; the per-stream
 /// state lives on `ClientStream`.
@@ -62,6 +62,171 @@ pub struct ClientStream {
     /// `send_request*`; on a pooled keep-alive stream the allocation
     /// amortizes across every request the stream carries.
     pub(crate) wire: Vec<u8>,
+}
+
+/// Parsed facts about an upstream response head, expressed as byte-offset
+/// spans into the read buffer it was parsed from. Produced by
+/// [`parse_response_head`]; consumed by [`serialize_direct_head`] (and the
+/// chunked fallback arm, which materializes owned headers from the spans).
+/// Runtime-agnostic on purpose: the io_uring data-plane prototype shares
+/// these helpers with the tokio path so both emit byte-identical responses.
+pub(crate) struct DirectHead {
+    pub(crate) status: u16,
+    pub(crate) headers_end: usize,
+    pub(crate) nspans: usize,
+    pub(crate) spans: [(u32, u32, u32, u32); 64],
+    pub(crate) chunked: bool,
+    pub(crate) cl: usize,
+    pub(crate) upstream_close: bool,
+}
+
+/// Parse an upstream response head out of `buf`. Returns `Ok(None)` when the
+/// buffer does not yet hold a complete head (caller reads more and retries),
+/// enforcing `RESPONSE_HEADERS_CAP` on the partial. Header locations are
+/// returned as u32 byte-offset spans into `buf` (name_start, name_len,
+/// value_start, value_len) so no per-header allocation happens; the framing
+/// facts (chunked / content-length / connection: close) are derived in the
+/// same pass.
+pub(crate) fn parse_response_head(buf: &[u8]) -> Result<Option<DirectHead>, Http1Error> {
+    let mut hp_storage = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut hp_storage);
+    match parsed.parse(buf) {
+        Ok(httparse::Status::Complete(headers_end)) => {
+            let status = parsed.code.ok_or(Http1Error::MalformedResponseLine)?;
+            let base = buf.as_ptr() as usize;
+            let mut spans = [(0u32, 0u32, 0u32, 0u32); 64];
+            let mut nspans = 0usize;
+            let mut chunked = false;
+            let mut cl: usize = 0;
+            let mut upstream_close = false;
+            for h in parsed.headers.iter().filter(|h| !h.name.is_empty()) {
+                // UTF-8 validation parity with the owned path (which rejects
+                // non-UTF-8 values with MalformedResponseLine).
+                let value =
+                    std::str::from_utf8(h.value).map_err(|_| Http1Error::MalformedResponseLine)?;
+                if h.name.eq_ignore_ascii_case("transfer-encoding")
+                    && value.eq_ignore_ascii_case("chunked")
+                {
+                    chunked = true;
+                } else if h.name.eq_ignore_ascii_case(hdr::CONTENT_LENGTH) {
+                    cl = value.parse().unwrap_or(0);
+                } else if h.name.eq_ignore_ascii_case(hdr::CONNECTION)
+                    && value.eq_ignore_ascii_case("close")
+                {
+                    upstream_close = true;
+                }
+                let ns = (h.name.as_ptr() as usize - base) as u32;
+                let vs = (h.value.as_ptr() as usize - base) as u32;
+                spans[nspans] = (ns, h.name.len() as u32, vs, h.value.len() as u32);
+                nspans += 1;
+            }
+            Ok(Some(DirectHead {
+                status,
+                headers_end,
+                nspans,
+                spans,
+                chunked,
+                cl,
+                upstream_close,
+            }))
+        }
+        Ok(httparse::Status::Partial) => {
+            if buf.len() > RESPONSE_HEADERS_CAP {
+                return Err(Http1Error::HeadersTooLarge {
+                    cap: RESPONSE_HEADERS_CAP,
+                });
+            }
+            Ok(None)
+        }
+        Err(httparse::Error::Token)
+        | Err(httparse::Error::Version)
+        | Err(httparse::Error::Status) => Err(Http1Error::MalformedResponseLine),
+        Err(httparse::Error::HeaderName)
+        | Err(httparse::Error::HeaderValue)
+        | Err(httparse::Error::NewLine) => Err(Http1Error::MalformedHeader),
+        Err(httparse::Error::TooManyHeaders) => Err(Http1Error::HeadersTooLarge {
+            cap: RESPONSE_HEADERS_CAP,
+        }),
+    }
+}
+
+/// Serialize the TRANSFORMED downstream response head from the parsed spans
+/// of an upstream response — byte-for-byte identical to
+/// `construct_proxied_response` + `Http1Response::write_to_buf` for the
+/// Router-only / no-access-log configuration that gates the direct path:
+/// status line with canonical reason; upstream headers in order with names
+/// lowercased; `server` replaced with `envoy-rust`; `date` replaced with the
+/// cached IMF-fixdate; `connection`/`transfer-encoding` dropped;
+/// `content-length` passed through (or synthesized from `body_len`); then
+/// `x-envoy-upstream-service-time: <elapsed_ms>` and the authoritative
+/// `Connection:` per `close`.
+pub(crate) fn serialize_direct_head(
+    out: &mut Vec<u8>,
+    buf: &[u8],
+    head: &DirectHead,
+    body_len: usize,
+    elapsed_ms: u128,
+    close: bool,
+) {
+    use std::io::Write as _;
+    let now_date = crate::date::now_imf_fixdate();
+    out.clear();
+    out.reserve(96 + head.headers_end);
+    out.extend_from_slice(b"HTTP/1.1 ");
+    let _ = write!(out, "{}", head.status);
+    out.push(b' ');
+    out.extend_from_slice(crate::response::canonical_reason(head.status).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    let (mut saw_server, mut saw_date, mut saw_cl) = (false, false, false);
+    for &(ns, nl, vs, vl) in &head.spans[..head.nspans] {
+        let name = &buf[ns as usize..(ns + nl) as usize];
+        let value = &buf[vs as usize..(vs + vl) as usize];
+        if name.eq_ignore_ascii_case(b"server") {
+            saw_server = true;
+            out.extend_from_slice(b"server: envoy-rust\r\n");
+        } else if name.eq_ignore_ascii_case(b"date") {
+            saw_date = true;
+            out.extend_from_slice(b"date: ");
+            out.extend_from_slice(now_date.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        } else if name.eq_ignore_ascii_case(b"connection")
+            || name.eq_ignore_ascii_case(b"transfer-encoding")
+        {
+            continue;
+        } else if name.eq_ignore_ascii_case(b"content-length") {
+            saw_cl = true;
+            out.extend_from_slice(b"content-length: ");
+            out.extend_from_slice(value);
+            out.extend_from_slice(b"\r\n");
+        } else {
+            out.extend(name.iter().map(u8::to_ascii_lowercase));
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    if !saw_server {
+        out.extend_from_slice(b"server: envoy-rust\r\n");
+    }
+    if !saw_date {
+        out.extend_from_slice(b"date: ");
+        out.extend_from_slice(now_date.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if !saw_cl {
+        out.extend_from_slice(b"content-length: ");
+        let _ = write!(out, "{}", body_len);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"x-envoy-upstream-service-time: ");
+    let _ = write!(out, "{}", elapsed_ms);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(if close {
+        b"connection: close\r\n".as_slice()
+    } else {
+        b"connection: keep-alive\r\n".as_slice()
+    });
+    out.extend_from_slice(b"\r\n");
 }
 
 /// Result of [`ClientStream::send_request_direct`].
@@ -138,77 +303,20 @@ impl ClientStream {
                 return Err(Http1Error::UnexpectedEof);
             }
 
-            let mut hp_storage = [httparse::EMPTY_HEADER; 64];
-            let mut parsed = httparse::Response::new(&mut hp_storage);
-            let (status, headers_end, nspans, spans, chunked, cl, upstream_close) = match parsed
-                .parse(&self.buf)
-            {
-                Ok(httparse::Status::Complete(headers_end)) => {
-                    let status = parsed.code.ok_or(Http1Error::MalformedResponseLine)?;
-                    // Extract header byte OFFSETS into `self.buf` (u32 spans)
-                    // so the borrow of `parsed`/`self.buf` ends before the
-                    // body read below. Also derive the framing facts in the
-                    // same pass.
-                    let base = self.buf.as_ptr() as usize;
-                    let mut spans = [(0u32, 0u32, 0u32, 0u32); 64];
-                    let mut nspans = 0usize;
-                    let mut chunked = false;
-                    let mut cl: usize = 0;
-                    let mut upstream_close = false;
-                    for h in parsed.headers.iter().filter(|h| !h.name.is_empty()) {
-                        // UTF-8 validation parity with the owned path (which
-                        // rejects non-UTF-8 values with MalformedResponseLine).
-                        let value = std::str::from_utf8(h.value)
-                            .map_err(|_| Http1Error::MalformedResponseLine)?;
-                        if h.name.eq_ignore_ascii_case("transfer-encoding")
-                            && value.eq_ignore_ascii_case("chunked")
-                        {
-                            chunked = true;
-                        } else if h.name.eq_ignore_ascii_case(hdr::CONTENT_LENGTH) {
-                            cl = value.parse().unwrap_or(0);
-                        } else if h.name.eq_ignore_ascii_case(hdr::CONNECTION)
-                            && value.eq_ignore_ascii_case("close")
-                        {
-                            upstream_close = true;
-                        }
-                        let ns = (h.name.as_ptr() as usize - base) as u32;
-                        let vs = (h.value.as_ptr() as usize - base) as u32;
-                        spans[nspans] = (ns, h.name.len() as u32, vs, h.value.len() as u32);
-                        nspans += 1;
-                    }
-                    (status, headers_end, nspans, spans, chunked, cl, upstream_close)
-                }
-                Ok(httparse::Status::Partial) => {
-                    if self.buf.len() > RESPONSE_HEADERS_CAP {
-                        return Err(Http1Error::HeadersTooLarge {
-                            cap: RESPONSE_HEADERS_CAP,
-                        });
-                    }
-                    continue;
-                }
-                Err(httparse::Error::Token)
-                | Err(httparse::Error::Version)
-                | Err(httparse::Error::Status) => {
-                    return Err(Http1Error::MalformedResponseLine);
-                }
-                Err(httparse::Error::HeaderName)
-                | Err(httparse::Error::HeaderValue)
-                | Err(httparse::Error::NewLine) => {
-                    return Err(Http1Error::MalformedHeader);
-                }
-                Err(httparse::Error::TooManyHeaders) => {
-                    return Err(Http1Error::HeadersTooLarge {
-                        cap: RESPONSE_HEADERS_CAP,
-                    });
-                }
+            // Parse into byte-offset spans (no borrow of `self.buf` survives —
+            // the body read below can extend the buffer freely).
+            let Some(head) = parse_response_head(&self.buf)? else {
+                continue;
             };
+            let headers_end = head.headers_end;
+            let cl = head.cl;
 
-            if chunked {
+            if head.chunked {
                 // Rare path: chunked upstream framing mutates `self.buf`, so
                 // fall back to the owned representation (identical to
                 // `send_request_borrowed`'s chunked arm).
-                let mut headers: Vec<(String, String)> = Vec::with_capacity(nspans);
-                for &(ns, nl, vs, vl) in &spans[..nspans] {
+                let mut headers: Vec<(String, String)> = Vec::with_capacity(head.nspans);
+                for &(ns, nl, vs, vl) in &head.spans[..head.nspans] {
                     let name = std::str::from_utf8(&self.buf[ns as usize..(ns + nl) as usize])
                         .map_err(|_| Http1Error::MalformedResponseLine)?
                         .to_string();
@@ -218,11 +326,10 @@ impl ClientStream {
                     headers.push((name, value));
                 }
                 let already = self.buf.len() - headers_end;
-                let body =
-                    read_chunked_body(&mut self.stream, &mut self.buf, headers_end, already)
-                        .await?;
+                let body = read_chunked_body(&mut self.stream, &mut self.buf, headers_end, already)
+                    .await?;
                 return Ok(DirectOutcome::Fallback(Response {
-                    status,
+                    status: head.status,
                     reason: None,
                     headers,
                     body: Bytes::from(body),
@@ -249,70 +356,12 @@ impl ClientStream {
 
             // Serialize the transformed head. Byte-parity contract with
             // `construct_proxied_response` + `write_to_buf` (see doc above).
-            use std::io::Write as _;
             let elapsed_ms = crate::date::coarse_monotonic_ms().saturating_sub(start_ms);
-            let now_date = crate::date::now_imf_fixdate();
-            out.clear();
-            out.reserve(96 + (headers_end - 0));
-            out.extend_from_slice(b"HTTP/1.1 ");
-            let _ = write!(out, "{}", status);
-            out.push(b' ');
-            out.extend_from_slice(crate::response::canonical_reason(status).as_bytes());
-            out.extend_from_slice(b"\r\n");
-            let (mut saw_server, mut saw_date, mut saw_cl) = (false, false, false);
-            for &(ns, nl, vs, vl) in &spans[..nspans] {
-                let name = &self.buf[ns as usize..(ns + nl) as usize];
-                let value = &self.buf[vs as usize..(vs + vl) as usize];
-                if name.eq_ignore_ascii_case(b"server") {
-                    saw_server = true;
-                    out.extend_from_slice(b"server: envoy-rust\r\n");
-                } else if name.eq_ignore_ascii_case(b"date") {
-                    saw_date = true;
-                    out.extend_from_slice(b"date: ");
-                    out.extend_from_slice(now_date.as_bytes());
-                    out.extend_from_slice(b"\r\n");
-                } else if name.eq_ignore_ascii_case(b"connection")
-                    || name.eq_ignore_ascii_case(b"transfer-encoding")
-                {
-                    continue;
-                } else if name.eq_ignore_ascii_case(b"content-length") {
-                    saw_cl = true;
-                    out.extend_from_slice(b"content-length: ");
-                    out.extend_from_slice(value);
-                    out.extend_from_slice(b"\r\n");
-                } else {
-                    out.extend(name.iter().map(u8::to_ascii_lowercase));
-                    out.extend_from_slice(b": ");
-                    out.extend_from_slice(value);
-                    out.extend_from_slice(b"\r\n");
-                }
-            }
-            if !saw_server {
-                out.extend_from_slice(b"server: envoy-rust\r\n");
-            }
-            if !saw_date {
-                out.extend_from_slice(b"date: ");
-                out.extend_from_slice(now_date.as_bytes());
-                out.extend_from_slice(b"\r\n");
-            }
-            if !saw_cl {
-                out.extend_from_slice(b"content-length: ");
-                let _ = write!(out, "{}", body.len());
-                out.extend_from_slice(b"\r\n");
-            }
-            out.extend_from_slice(b"x-envoy-upstream-service-time: ");
-            let _ = write!(out, "{}", elapsed_ms);
-            out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(if close {
-                b"connection: close\r\n".as_slice()
-            } else {
-                b"connection: keep-alive\r\n".as_slice()
-            });
-            out.extend_from_slice(b"\r\n");
+            serialize_direct_head(out, &self.buf, &head, body.len(), elapsed_ms, close);
 
             return Ok(DirectOutcome::Direct {
-                status,
-                upstream_close,
+                status: head.status,
+                upstream_close: head.upstream_close,
                 body: Bytes::from(body),
             });
         }
@@ -477,7 +526,12 @@ impl ClientStream {
 /// and [`ClientStream::send_request_direct`]: request-line + headers (+ Host
 /// injection, hop-header strip, synthetic content-length) + body, appended to
 /// a cleared `wire`. Extracted so the two send paths cannot drift.
-fn build_request_wire(wire: &mut Vec<u8>, host: &str, request: &Request, strip_hop_headers: bool) {
+pub(crate) fn build_request_wire(
+    wire: &mut Vec<u8>,
+    host: &str,
+    request: &Request,
+    strip_hop_headers: bool,
+) {
     wire.clear();
     wire.reserve(256 + request.body_len_estimate());
     wire.extend_from_slice(request.method.as_bytes());
@@ -535,7 +589,6 @@ fn build_request_wire(wire: &mut Vec<u8>, host: &str, request: &Request, strip_h
     if let Some(body) = request.body_bytes() {
         wire.extend_from_slice(body);
     }
-
 }
 
 async fn read_chunked_body(

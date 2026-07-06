@@ -21,6 +21,15 @@ parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
 
+[features]
+# EXPERIMENTAL: io_uring data-plane worker (Linux-only; see src/uring.rs).
+# Off by default; even when compiled in, engagement requires ENVOY_RUST_URING=1.
+uring = ["dep:monoio", "dep:socket2"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio = { version = "0.2", optional = true }
+socket2 = { version = "0.5", optional = true }
+
 [dev-dependencies]
 bytes = "1"
 envoy-accesslog = { path = "../envoy-accesslog", features = ["test-util"] }

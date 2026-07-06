@@ -54,7 +54,6 @@ pub fn now_imf_fixdate() -> String {
     })
 }
 
-
 /// Coarse monotonic milliseconds for latency spans whose OUTPUT granularity
 /// is already milliseconds (`x-envoy-upstream-service-time`). On Linux this
 /// reads CLOCK_MONOTONIC_COARSE — no hardware counter read (the dominant
