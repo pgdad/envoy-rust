@@ -28,8 +28,17 @@ thread_local! {
 /// same string for the entire wall-clock second; only the first caller
 /// on a given thread in a given second pays the format cost.
 pub fn now_imf_fixdate() -> String {
-    let now = SystemTime::now();
-    let secs = now
+    // Coarse realtime clock for the once-per-second cache check: the cache
+    // granularity is a full second, so the ~4 ms coarse-clock granularity is
+    // irrelevant, and the coarse read skips the hardware counter read that a
+    // full `SystemTime::now()` pays (measurably hot on virtualized hosts).
+    #[cfg(target_os = "linux")]
+    let secs = {
+        let ts = rustix::time::clock_gettime(rustix::time::ClockId::RealtimeCoarse);
+        if ts.tv_sec < 0 { 0 } else { ts.tv_sec as u64 }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
@@ -39,10 +48,34 @@ pub fn now_imf_fixdate() -> String {
         {
             return cached_str.clone();
         }
-        let fresh = format_imf_fixdate(now);
+        let fresh = format_imf_fixdate(UNIX_EPOCH + std::time::Duration::from_secs(secs));
         *cache = Some((secs, fresh.clone()));
         fresh
     })
+}
+
+
+/// Coarse monotonic milliseconds for latency spans whose OUTPUT granularity
+/// is already milliseconds (`x-envoy-upstream-service-time`). On Linux this
+/// reads CLOCK_MONOTONIC_COARSE — no hardware counter read (the dominant
+/// cost of `Instant::now()` on virtualized hosts) at the price of scheduler-
+/// tick granularity (1–4 ms), which only quantizes a value that is itself
+/// reported in whole milliseconds. Non-Linux falls back to `Instant`.
+pub(crate) fn coarse_monotonic_ms() -> u128 {
+    #[cfg(target_os = "linux")]
+    {
+        let ts = rustix::time::clock_gettime(rustix::time::ClockId::MonotonicCoarse);
+        (ts.tv_sec.max(0) as u128) * 1000 + (ts.tv_nsec as u128) / 1_000_000
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::sync::OnceLock;
+        static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
+        ANCHOR
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis()
+    }
 }
 
 /// Format a `SystemTime` as an IMF-fixdate string per RFC 7231 §7.1.1.1.

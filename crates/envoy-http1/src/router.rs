@@ -112,33 +112,34 @@ pub fn construct_proxied_response(
     let mut saw_date = false;
     let mut saw_cl = false;
 
-    for (name, value) in upstream_response.headers.into_iter() {
-        let lc = name.to_ascii_lowercase();
-        if lc == hdr::SERVER {
+    for (mut name, value) in upstream_response.headers.into_iter() {
+        // Lowercase in place (RFC 7230 §3.2 — header names are case-insensitive;
+        // envoy-rust normalises egress to lowercase). In-place avoids the former
+        // per-header `to_ascii_lowercase()` allocation on the hot path.
+        name.make_ascii_lowercase();
+        if name == hdr::SERVER {
             saw_server = true;
-            headers.push((hdr::SERVER.to_string(), "envoy-rust".to_string()));
-        } else if lc == hdr::DATE {
+            headers.push((name, "envoy-rust".to_string()));
+        } else if name == hdr::DATE {
             saw_date = true;
-            headers.push((hdr::DATE.to_string(), now_date.clone()));
-        } else if lc == hdr::CONNECTION {
+            headers.push((name, now_date.clone()));
+        } else if name == hdr::CONNECTION {
             // Drop any upstream Connection: header — we authoritatively set it
             // below per the downstream posture.
             continue;
-        } else if lc == hdr::TRANSFER_ENCODING {
+        } else if name == hdr::TRANSFER_ENCODING {
             // Drop upstream Transfer-Encoding: the body has been fully decoded
             // into a known-length Bytes by client.rs's chunked reader. Keeping
             // this header while also emitting Content-Length violates RFC 7230
             // §3.3.3 rule 3 and causes real clients to reject the response.
             continue;
-        } else if lc == hdr::CONTENT_LENGTH {
+        } else if name == hdr::CONTENT_LENGTH {
             saw_cl = true;
-            headers.push((hdr::CONTENT_LENGTH.to_string(), value));
+            headers.push((name, value));
         } else {
-            // Pass through with the name lowercased (RFC 7230 §3.2 — header names are
-            // case-insensitive; envoy-rust normalises egress to lowercase to match the
-            // rest of the response.write_to wire format). Includes content-type and
+            // Pass through (already lowercased above). Includes content-type and
             // any allow-listed headers that envoy-rust does not authoritatively set.
-            headers.push((lc, value));
+            headers.push((name, value));
         }
     }
     // Inject defaults for HCM-emitted headers the upstream didn't carry.

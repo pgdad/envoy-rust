@@ -44,7 +44,8 @@ impl Client {
         Ok(ClientStream {
             stream,
             host: host.to_string(),
-            buf: bytes::BytesMut::with_capacity(8192),
+            buf: bytes::BytesMut::with_capacity(4096),
+            wire: Vec::with_capacity(256),
         })
     }
 }
@@ -57,6 +58,24 @@ pub struct ClientStream {
     pub(crate) stream: tokio::net::TcpStream,
     pub(crate) host: String,
     pub(crate) buf: bytes::BytesMut,
+    /// Reusable request-serialization buffer. Cleared at the top of each
+    /// `send_request*`; on a pooled keep-alive stream the allocation
+    /// amortizes across every request the stream carries.
+    pub(crate) wire: Vec<u8>,
+}
+
+/// Result of [`ClientStream::send_request_direct`].
+pub enum DirectOutcome {
+    /// The transformed response head was serialized into the caller's `out`
+    /// buffer; `body` carries the (already fully read) response body.
+    Direct {
+        status: u16,
+        upstream_close: bool,
+        body: Bytes,
+    },
+    /// Chunked upstream framing — owned fallback; treat exactly like a
+    /// [`ClientStream::send_request_borrowed`] result.
+    Fallback(Response),
 }
 
 impl ClientStream {
@@ -71,6 +90,247 @@ impl ClientStream {
     /// implementation handles only the Content-Length response path. Chunked
     /// responses surface as `Http1Error::MalformedChunkedFraming` until Task 7.
     pub async fn send_request(&mut self, request: Request) -> Result<Response, Http1Error> {
+        self.send_request_borrowed(&request, false).await
+    }
+
+    /// Zero-copy proxied-response fast path. Sends `request` like
+    /// [`send_request_borrowed`] and then, instead of materializing an owned
+    /// `Response` header vec, serializes the TRANSFORMED downstream response
+    /// head straight into `out` from the parsed byte ranges of the upstream
+    /// response — byte-for-byte identical to
+    /// `construct_proxied_response` + `Http1Response::write_to_buf` for the
+    /// Router-only / no-access-log HCM configuration that gates it:
+    /// status line with canonical reason; upstream headers in order with
+    /// names lowercased; `server` replaced with `envoy-rust`; `date` replaced
+    /// with the cached IMF-fixdate; `connection`/`transfer-encoding` dropped;
+    /// `content-length` passed through (or synthesized); then
+    /// `x-envoy-upstream-service-time` and the authoritative `Connection:`
+    /// per `close`. Chunked upstream framing takes the owned fallback
+    /// (`DirectOutcome::Fallback`) — the caller proceeds exactly as with
+    /// [`send_request_borrowed`].
+    ///
+    /// `start_ms` is the attempt start in coarse-monotonic milliseconds
+    /// (`date::coarse_monotonic_ms`); elapsed-ms is computed after the full
+    /// response is read, matching the caller-side timing of the owned path.
+    pub async fn send_request_direct(
+        &mut self,
+        request: &Request,
+        strip_hop_headers: bool,
+        start_ms: u128,
+        close: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<DirectOutcome, Http1Error> {
+        self.buf.clear();
+
+        let mut wire = std::mem::take(&mut self.wire);
+        build_request_wire(&mut wire, &self.host, request, strip_hop_headers);
+        let write_result = self.stream.write_all(&wire).await;
+        self.wire = wire;
+        write_result?;
+        self.stream.flush().await?;
+
+        loop {
+            self.buf.reserve(4096);
+            let n = tokio::time::timeout(READ_TIMEOUT, self.stream.read_buf(&mut self.buf))
+                .await
+                .map_err(|_| Http1Error::UnexpectedEof)??;
+            if n == 0 {
+                return Err(Http1Error::UnexpectedEof);
+            }
+
+            let mut hp_storage = [httparse::EMPTY_HEADER; 64];
+            let mut parsed = httparse::Response::new(&mut hp_storage);
+            let (status, headers_end, nspans, spans, chunked, cl, upstream_close) = match parsed
+                .parse(&self.buf)
+            {
+                Ok(httparse::Status::Complete(headers_end)) => {
+                    let status = parsed.code.ok_or(Http1Error::MalformedResponseLine)?;
+                    // Extract header byte OFFSETS into `self.buf` (u32 spans)
+                    // so the borrow of `parsed`/`self.buf` ends before the
+                    // body read below. Also derive the framing facts in the
+                    // same pass.
+                    let base = self.buf.as_ptr() as usize;
+                    let mut spans = [(0u32, 0u32, 0u32, 0u32); 64];
+                    let mut nspans = 0usize;
+                    let mut chunked = false;
+                    let mut cl: usize = 0;
+                    let mut upstream_close = false;
+                    for h in parsed.headers.iter().filter(|h| !h.name.is_empty()) {
+                        // UTF-8 validation parity with the owned path (which
+                        // rejects non-UTF-8 values with MalformedResponseLine).
+                        let value = std::str::from_utf8(h.value)
+                            .map_err(|_| Http1Error::MalformedResponseLine)?;
+                        if h.name.eq_ignore_ascii_case("transfer-encoding")
+                            && value.eq_ignore_ascii_case("chunked")
+                        {
+                            chunked = true;
+                        } else if h.name.eq_ignore_ascii_case(hdr::CONTENT_LENGTH) {
+                            cl = value.parse().unwrap_or(0);
+                        } else if h.name.eq_ignore_ascii_case(hdr::CONNECTION)
+                            && value.eq_ignore_ascii_case("close")
+                        {
+                            upstream_close = true;
+                        }
+                        let ns = (h.name.as_ptr() as usize - base) as u32;
+                        let vs = (h.value.as_ptr() as usize - base) as u32;
+                        spans[nspans] = (ns, h.name.len() as u32, vs, h.value.len() as u32);
+                        nspans += 1;
+                    }
+                    (status, headers_end, nspans, spans, chunked, cl, upstream_close)
+                }
+                Ok(httparse::Status::Partial) => {
+                    if self.buf.len() > RESPONSE_HEADERS_CAP {
+                        return Err(Http1Error::HeadersTooLarge {
+                            cap: RESPONSE_HEADERS_CAP,
+                        });
+                    }
+                    continue;
+                }
+                Err(httparse::Error::Token)
+                | Err(httparse::Error::Version)
+                | Err(httparse::Error::Status) => {
+                    return Err(Http1Error::MalformedResponseLine);
+                }
+                Err(httparse::Error::HeaderName)
+                | Err(httparse::Error::HeaderValue)
+                | Err(httparse::Error::NewLine) => {
+                    return Err(Http1Error::MalformedHeader);
+                }
+                Err(httparse::Error::TooManyHeaders) => {
+                    return Err(Http1Error::HeadersTooLarge {
+                        cap: RESPONSE_HEADERS_CAP,
+                    });
+                }
+            };
+
+            if chunked {
+                // Rare path: chunked upstream framing mutates `self.buf`, so
+                // fall back to the owned representation (identical to
+                // `send_request_borrowed`'s chunked arm).
+                let mut headers: Vec<(String, String)> = Vec::with_capacity(nspans);
+                for &(ns, nl, vs, vl) in &spans[..nspans] {
+                    let name = std::str::from_utf8(&self.buf[ns as usize..(ns + nl) as usize])
+                        .map_err(|_| Http1Error::MalformedResponseLine)?
+                        .to_string();
+                    let value = std::str::from_utf8(&self.buf[vs as usize..(vs + vl) as usize])
+                        .map_err(|_| Http1Error::MalformedResponseLine)?
+                        .to_string();
+                    headers.push((name, value));
+                }
+                let already = self.buf.len() - headers_end;
+                let body =
+                    read_chunked_body(&mut self.stream, &mut self.buf, headers_end, already)
+                        .await?;
+                return Ok(DirectOutcome::Fallback(Response {
+                    status,
+                    reason: None,
+                    headers,
+                    body: Bytes::from(body),
+                }));
+            }
+
+            // CL-framed body (identical read strategy to the owned path).
+            let already = self.buf.len() - headers_end;
+            let mut body: Vec<u8> = Vec::with_capacity(cl);
+            if already > 0 {
+                let take = already.min(cl);
+                body.extend_from_slice(&self.buf[headers_end..headers_end + take]);
+            }
+            while body.len() < cl {
+                let need = cl - body.len();
+                let mut limited = (&mut self.stream).take(need as u64);
+                let n = tokio::time::timeout(READ_TIMEOUT, limited.read_buf(&mut body))
+                    .await
+                    .map_err(|_| Http1Error::UnexpectedEof)??;
+                if n == 0 {
+                    return Err(Http1Error::UnexpectedEof);
+                }
+            }
+
+            // Serialize the transformed head. Byte-parity contract with
+            // `construct_proxied_response` + `write_to_buf` (see doc above).
+            use std::io::Write as _;
+            let elapsed_ms = crate::date::coarse_monotonic_ms().saturating_sub(start_ms);
+            let now_date = crate::date::now_imf_fixdate();
+            out.clear();
+            out.reserve(96 + (headers_end - 0));
+            out.extend_from_slice(b"HTTP/1.1 ");
+            let _ = write!(out, "{}", status);
+            out.push(b' ');
+            out.extend_from_slice(crate::response::canonical_reason(status).as_bytes());
+            out.extend_from_slice(b"\r\n");
+            let (mut saw_server, mut saw_date, mut saw_cl) = (false, false, false);
+            for &(ns, nl, vs, vl) in &spans[..nspans] {
+                let name = &self.buf[ns as usize..(ns + nl) as usize];
+                let value = &self.buf[vs as usize..(vs + vl) as usize];
+                if name.eq_ignore_ascii_case(b"server") {
+                    saw_server = true;
+                    out.extend_from_slice(b"server: envoy-rust\r\n");
+                } else if name.eq_ignore_ascii_case(b"date") {
+                    saw_date = true;
+                    out.extend_from_slice(b"date: ");
+                    out.extend_from_slice(now_date.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                } else if name.eq_ignore_ascii_case(b"connection")
+                    || name.eq_ignore_ascii_case(b"transfer-encoding")
+                {
+                    continue;
+                } else if name.eq_ignore_ascii_case(b"content-length") {
+                    saw_cl = true;
+                    out.extend_from_slice(b"content-length: ");
+                    out.extend_from_slice(value);
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    out.extend(name.iter().map(u8::to_ascii_lowercase));
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(value);
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+            if !saw_server {
+                out.extend_from_slice(b"server: envoy-rust\r\n");
+            }
+            if !saw_date {
+                out.extend_from_slice(b"date: ");
+                out.extend_from_slice(now_date.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+            if !saw_cl {
+                out.extend_from_slice(b"content-length: ");
+                let _ = write!(out, "{}", body.len());
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(b"x-envoy-upstream-service-time: ");
+            let _ = write!(out, "{}", elapsed_ms);
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(if close {
+                b"connection: close\r\n".as_slice()
+            } else {
+                b"connection: keep-alive\r\n".as_slice()
+            });
+            out.extend_from_slice(b"\r\n");
+
+            return Ok(DirectOutcome::Direct {
+                status,
+                upstream_close,
+                body: Bytes::from(body),
+            });
+        }
+    }
+
+    /// Borrowed-request variant of [`send_request`]: serializes directly from
+    /// `&Request` so the retry-loop caller can keep ONE owned request and
+    /// replay it across attempts without cloning method/path/headers/body per
+    /// attempt. When `strip_hop_headers` is true, `Connection:` and
+    /// `Transfer-Encoding:` headers are skipped during serialization — the
+    /// same effect as the former caller-side `retain` (SPEC §3 D1 one-shot
+    /// upstream posture / RFC 7230 §3.3.3), without materializing a filtered
+    /// header Vec.
+    pub async fn send_request_borrowed(
+        &mut self,
+        request: &Request,
+        strip_hop_headers: bool,
+    ) -> Result<Response, Http1Error> {
         // Reset the read buffer. After a prior response, leftover bytes (the
         // already-consumed response headers + body bytes that came in the
         // same read chunk) remain in `self.buf`; without clearing, the
@@ -78,65 +338,26 @@ impl ClientStream {
         // for first-use too — clear() on an empty buf is a no-op.
         self.buf.clear();
 
-        // (a) Serialize the request.
-        let mut wire: Vec<u8> = Vec::with_capacity(256 + request.body_len_estimate());
-        wire.extend_from_slice(request.method.as_bytes());
-        wire.push(b' ');
-        wire.extend_from_slice(request.path.as_bytes());
-        wire.extend_from_slice(b" HTTP/1.1\r\n");
+        // (a) Serialize the request into the reusable per-stream buffer.
+        let mut wire = std::mem::take(&mut self.wire);
+        build_request_wire(&mut wire, &self.host, request, strip_hop_headers);
 
-        // Host de-dup: if request.headers already carries a Host (any case),
-        // emit that one. Otherwise inject the connect-time host.
-        let request_has_host = request
-            .headers
-            .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case(hdr::HOST));
-        if !request_has_host {
-            wire.extend_from_slice(b"host: ");
-            wire.extend_from_slice(self.host.as_bytes());
-            wire.extend_from_slice(b"\r\n");
-        }
-        for (name, value) in &request.headers {
-            wire.extend_from_slice(name.to_ascii_lowercase().as_bytes());
-            wire.extend_from_slice(b": ");
-            wire.extend_from_slice(value.as_bytes());
-            wire.extend_from_slice(b"\r\n");
-        }
-        // CL header — emit synthetic content-length only when the request
-        // does not carry an explicit Content-Length AND the body is
-        // non-empty. RFC 7230 §3.3.2 + Envoy v1.33 parity per ADR-0025
-        // ("a user agent SHOULD NOT send a Content-Length header field
-        // when the request message does not contain a payload body").
-        let request_has_cl = request
-            .headers
-            .iter()
-            .any(|(n, _)| n.eq_ignore_ascii_case(hdr::CONTENT_LENGTH));
-        let body_is_nonempty = request.body_bytes().is_some_and(|b| !b.is_empty());
-        if !request_has_cl && body_is_nonempty {
-            wire.extend_from_slice(b"content-length: ");
-            wire.extend_from_slice(request.body_len_string().as_bytes());
-            wire.extend_from_slice(b"\r\n");
-        }
-        wire.extend_from_slice(b"\r\n");
-        // Body bytes (CL-framed; Task 6 supports CL only — chunked-request
-        // forwarding from downstream is deferred per SPEC §4 non-goals).
-        if let Some(body) = request.body_bytes() {
-            wire.extend_from_slice(body);
-        }
-
-        self.stream.write_all(&wire).await?;
+        let write_result = self.stream.write_all(&wire).await;
+        self.wire = wire; // return the buffer for reuse before error-checking
+        write_result?;
         self.stream.flush().await?;
 
-        // (b) Read the response headers.
+        // (b) Read the response headers. `read_buf` appends straight into
+        // `self.buf` — the former stack-chunk + extend_from_slice path paid a
+        // 4 KiB zero-init plus a memcpy per read.
         loop {
-            let mut chunk = [0u8; 4096];
-            let n = tokio::time::timeout(READ_TIMEOUT, self.stream.read(&mut chunk))
+            self.buf.reserve(4096);
+            let n = tokio::time::timeout(READ_TIMEOUT, self.stream.read_buf(&mut self.buf))
                 .await
                 .map_err(|_| Http1Error::UnexpectedEof)??;
             if n == 0 {
                 return Err(Http1Error::UnexpectedEof);
             }
-            self.buf.extend_from_slice(&chunk[..n]);
 
             let mut hp_storage = [httparse::EMPTY_HEADER; 64];
             let mut parsed = httparse::Response::new(&mut hp_storage);
@@ -190,15 +411,19 @@ impl ClientStream {
                         body.extend_from_slice(&self.buf[headers_end..headers_end + take]);
                     }
                     while body.len() < cl {
-                        let mut chunk = [0u8; 4096];
-                        let n = tokio::time::timeout(READ_TIMEOUT, self.stream.read(&mut chunk))
+                        // Read straight into the body Vec (capacity-bounded via
+                        // take) — avoids the former per-read 4 KiB stack
+                        // zero-init + memcpy. A keep-alive upstream never sends
+                        // more than `cl` body bytes before our next request, but
+                        // guard with `take` so a misbehaving peer can't overfill.
+                        let need = cl - body.len();
+                        let mut limited = (&mut self.stream).take(need as u64);
+                        let n = tokio::time::timeout(READ_TIMEOUT, limited.read_buf(&mut body))
                             .await
                             .map_err(|_| Http1Error::UnexpectedEof)??;
                         if n == 0 {
                             return Err(Http1Error::UnexpectedEof);
                         }
-                        let need = cl - body.len();
-                        body.extend_from_slice(&chunk[..n.min(need)]);
                     }
 
                     return Ok(Response {
@@ -247,6 +472,72 @@ impl ClientStream {
 ///
 /// 04.3 ignores trailers (per SPEC §4 non-goals — trailer forwarding deferred).
 /// On any framing violation returns `Http1Error::MalformedChunkedFraming`.
+
+/// Shared request-wire serializer for [`ClientStream::send_request_borrowed`]
+/// and [`ClientStream::send_request_direct`]: request-line + headers (+ Host
+/// injection, hop-header strip, synthetic content-length) + body, appended to
+/// a cleared `wire`. Extracted so the two send paths cannot drift.
+fn build_request_wire(wire: &mut Vec<u8>, host: &str, request: &Request, strip_hop_headers: bool) {
+    wire.clear();
+    wire.reserve(256 + request.body_len_estimate());
+    wire.extend_from_slice(request.method.as_bytes());
+    wire.push(b' ');
+    wire.extend_from_slice(request.path.as_bytes());
+    wire.extend_from_slice(b" HTTP/1.1\r\n");
+
+    let skip = |name: &str| {
+        strip_hop_headers
+            && (name.eq_ignore_ascii_case(hdr::CONNECTION)
+                || name.eq_ignore_ascii_case(hdr::TRANSFER_ENCODING))
+    };
+
+    // Host de-dup: if request.headers already carries a Host (any case),
+    // emit that one. Otherwise inject the connect-time host.
+    let request_has_host = request
+        .headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(hdr::HOST));
+    if !request_has_host {
+        wire.extend_from_slice(b"host: ");
+        wire.extend_from_slice(host.as_bytes());
+        wire.extend_from_slice(b"\r\n");
+    }
+    for (name, value) in &request.headers {
+        if skip(name) {
+            continue;
+        }
+        // Lowercase the name byte-by-byte into the wire buffer — the
+        // former `to_ascii_lowercase()` allocated a String per header.
+        wire.extend(name.as_bytes().iter().map(u8::to_ascii_lowercase));
+        wire.extend_from_slice(b": ");
+        wire.extend_from_slice(value.as_bytes());
+        wire.extend_from_slice(b"\r\n");
+    }
+    // CL header — emit synthetic content-length only when the request
+    // does not carry an explicit Content-Length AND the body is
+    // non-empty. RFC 7230 §3.3.2 + Envoy v1.33 parity per ADR-0025
+    // ("a user agent SHOULD NOT send a Content-Length header field
+    // when the request message does not contain a payload body").
+    let request_has_cl = request
+        .headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case(hdr::CONTENT_LENGTH));
+    let body_is_nonempty = request.body_bytes().is_some_and(|b| !b.is_empty());
+    if !request_has_cl && body_is_nonempty {
+        use std::io::Write as _;
+        wire.extend_from_slice(b"content-length: ");
+        let _ = write!(wire, "{}", request.body_len_estimate());
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"\r\n");
+    // Body bytes (CL-framed; Task 6 supports CL only — chunked-request
+    // forwarding from downstream is deferred per SPEC §4 non-goals).
+    if let Some(body) = request.body_bytes() {
+        wire.extend_from_slice(body);
+    }
+
+}
+
 async fn read_chunked_body(
     stream: &mut tokio::net::TcpStream,
     buf: &mut bytes::BytesMut,

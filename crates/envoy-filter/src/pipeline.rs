@@ -63,6 +63,18 @@ impl FilterPipeline {
     /// Phase-23 D2: fan the matched route's per-filter config out to each filter
     /// instance before the decode pass. Inert for all non-CORS filters → the
     /// 07.1 foundation-slice property (all pre-existing fixtures unchanged).
+    /// True when the chain is exactly one Router terminus. The H1 HCM uses
+    /// this to gate its zero-copy proxied-response fast path: Router is a
+    /// no-op on both decode and encode, so skipping the owned response-header
+    /// materialization is unobservable to the filter chain.
+    pub fn is_router_only(&self) -> bool {
+        self.filters.len() == 1
+            && matches!(
+                self.filters[0],
+                crate::instance::HttpFilterInstance::Router(_)
+            )
+    }
+
     pub fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
         for filter in self.filters.iter_mut() {
             filter.apply_route_config(route);
