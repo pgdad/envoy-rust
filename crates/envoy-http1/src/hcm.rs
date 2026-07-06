@@ -731,6 +731,16 @@ async fn serve_connection(
         config.access_log.is_empty() && config.filter_pipeline.is_router_only();
     // Reusable buffer for the fast path's pre-serialized response head.
     let mut direct_head_buf: Vec<u8> = Vec::new();
+    // Per-connection idle-read timer, reused across every keep-alive read
+    // instead of constructing a fresh `tokio::time::timeout(..)` future (and
+    // its timer state) on each request's first read. It is reset to a fresh
+    // IDLE_READ_TIMEOUT deadline immediately before every blocking read, so the
+    // idle-close semantics are byte-identical to the former per-read `timeout`.
+    // `read_buf` is cancellation-safe (it only appends on a completed read), so
+    // losing the `select!` race to this timer never drops buffered bytes —
+    // exactly as when `timeout` dropped the pending read future.
+    let idle_timer = tokio::time::sleep(IDLE_READ_TIMEOUT);
+    tokio::pin!(idle_timer);
     // 13.1 Task 4: the per-connection tier-1 micro-cache (a single cached
     // `(cluster, endpoint, ClientStream)` reused on the next request) was
     // removed at Task 4 and SUBSUMED by `H1Pool` (lock-in #5). The pool is
@@ -744,18 +754,28 @@ async fn serve_connection(
         let req = match Http1Codec::parse_request(&buf)? {
             Some(req) => req,
             None => {
-                // 2. Need more bytes. Read with idle timeout.
-                match tokio::time::timeout(IDLE_READ_TIMEOUT, downstream.read_buf(&mut buf)).await {
-                    Ok(Ok(0)) => {
+                // 2. Need more bytes. Read with the reused per-connection idle
+                //    timer: arm a fresh IDLE_READ_TIMEOUT window, then race the
+                //    read against it. `biased` polls the read first so a ready
+                //    socket never pays for the timer branch.
+                idle_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + IDLE_READ_TIMEOUT);
+                let read = tokio::select! {
+                    biased;
+                    res = downstream.read_buf(&mut buf) => res,
+                    _ = idle_timer.as_mut() => return Ok(()), // idle timeout → clean close
+                };
+                match read {
+                    Ok(0) => {
                         // peer closed; clean exit if the buffer is empty.
                         if buf.is_empty() {
                             return Ok(());
                         }
                         return Err(Http1Error::UnexpectedEof);
                     }
-                    Ok(Ok(_)) => continue, // re-parse
-                    Ok(Err(source)) => return Err(Http1Error::Io { source }),
-                    Err(_elapsed) => return Ok(()), // idle timeout → clean close
+                    Ok(_) => continue, // re-parse
+                    Err(source) => return Err(Http1Error::Io { source }),
                 }
             }
         };
