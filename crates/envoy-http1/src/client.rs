@@ -140,68 +140,75 @@ impl ClientStream {
 
             let mut hp_storage = [httparse::EMPTY_HEADER; 64];
             let mut parsed = httparse::Response::new(&mut hp_storage);
-            let (status, headers_end, nspans, spans, chunked, cl, upstream_close) = match parsed
-                .parse(&self.buf)
-            {
-                Ok(httparse::Status::Complete(headers_end)) => {
-                    let status = parsed.code.ok_or(Http1Error::MalformedResponseLine)?;
-                    // Extract header byte OFFSETS into `self.buf` (u32 spans)
-                    // so the borrow of `parsed`/`self.buf` ends before the
-                    // body read below. Also derive the framing facts in the
-                    // same pass.
-                    let base = self.buf.as_ptr() as usize;
-                    let mut spans = [(0u32, 0u32, 0u32, 0u32); 64];
-                    let mut nspans = 0usize;
-                    let mut chunked = false;
-                    let mut cl: usize = 0;
-                    let mut upstream_close = false;
-                    for h in parsed.headers.iter().filter(|h| !h.name.is_empty()) {
-                        // UTF-8 validation parity with the owned path (which
-                        // rejects non-UTF-8 values with MalformedResponseLine).
-                        let value = std::str::from_utf8(h.value)
-                            .map_err(|_| Http1Error::MalformedResponseLine)?;
-                        if h.name.eq_ignore_ascii_case("transfer-encoding")
-                            && value.eq_ignore_ascii_case("chunked")
-                        {
-                            chunked = true;
-                        } else if h.name.eq_ignore_ascii_case(hdr::CONTENT_LENGTH) {
-                            cl = value.parse().unwrap_or(0);
-                        } else if h.name.eq_ignore_ascii_case(hdr::CONNECTION)
-                            && value.eq_ignore_ascii_case("close")
-                        {
-                            upstream_close = true;
+            let (status, headers_end, nspans, spans, chunked, cl, upstream_close) =
+                match parsed.parse(&self.buf) {
+                    Ok(httparse::Status::Complete(headers_end)) => {
+                        let status = parsed.code.ok_or(Http1Error::MalformedResponseLine)?;
+                        // Extract header byte OFFSETS into `self.buf` (u32 spans)
+                        // so the borrow of `parsed`/`self.buf` ends before the
+                        // body read below. Also derive the framing facts in the
+                        // same pass.
+                        let base = self.buf.as_ptr() as usize;
+                        let mut spans = [(0u32, 0u32, 0u32, 0u32); 64];
+                        let mut nspans = 0usize;
+                        let mut chunked = false;
+                        let mut cl: usize = 0;
+                        let mut upstream_close = false;
+                        for h in parsed.headers.iter().filter(|h| !h.name.is_empty()) {
+                            // UTF-8 validation parity with the owned path (which
+                            // rejects non-UTF-8 values with MalformedResponseLine).
+                            let value = std::str::from_utf8(h.value)
+                                .map_err(|_| Http1Error::MalformedResponseLine)?;
+                            if h.name.eq_ignore_ascii_case("transfer-encoding")
+                                && value.eq_ignore_ascii_case("chunked")
+                            {
+                                chunked = true;
+                            } else if h.name.eq_ignore_ascii_case(hdr::CONTENT_LENGTH) {
+                                cl = value.parse().unwrap_or(0);
+                            } else if h.name.eq_ignore_ascii_case(hdr::CONNECTION)
+                                && value.eq_ignore_ascii_case("close")
+                            {
+                                upstream_close = true;
+                            }
+                            let ns = (h.name.as_ptr() as usize - base) as u32;
+                            let vs = (h.value.as_ptr() as usize - base) as u32;
+                            spans[nspans] = (ns, h.name.len() as u32, vs, h.value.len() as u32);
+                            nspans += 1;
                         }
-                        let ns = (h.name.as_ptr() as usize - base) as u32;
-                        let vs = (h.value.as_ptr() as usize - base) as u32;
-                        spans[nspans] = (ns, h.name.len() as u32, vs, h.value.len() as u32);
-                        nspans += 1;
+                        (
+                            status,
+                            headers_end,
+                            nspans,
+                            spans,
+                            chunked,
+                            cl,
+                            upstream_close,
+                        )
                     }
-                    (status, headers_end, nspans, spans, chunked, cl, upstream_close)
-                }
-                Ok(httparse::Status::Partial) => {
-                    if self.buf.len() > RESPONSE_HEADERS_CAP {
+                    Ok(httparse::Status::Partial) => {
+                        if self.buf.len() > RESPONSE_HEADERS_CAP {
+                            return Err(Http1Error::HeadersTooLarge {
+                                cap: RESPONSE_HEADERS_CAP,
+                            });
+                        }
+                        continue;
+                    }
+                    Err(httparse::Error::Token)
+                    | Err(httparse::Error::Version)
+                    | Err(httparse::Error::Status) => {
+                        return Err(Http1Error::MalformedResponseLine);
+                    }
+                    Err(httparse::Error::HeaderName)
+                    | Err(httparse::Error::HeaderValue)
+                    | Err(httparse::Error::NewLine) => {
+                        return Err(Http1Error::MalformedHeader);
+                    }
+                    Err(httparse::Error::TooManyHeaders) => {
                         return Err(Http1Error::HeadersTooLarge {
                             cap: RESPONSE_HEADERS_CAP,
                         });
                     }
-                    continue;
-                }
-                Err(httparse::Error::Token)
-                | Err(httparse::Error::Version)
-                | Err(httparse::Error::Status) => {
-                    return Err(Http1Error::MalformedResponseLine);
-                }
-                Err(httparse::Error::HeaderName)
-                | Err(httparse::Error::HeaderValue)
-                | Err(httparse::Error::NewLine) => {
-                    return Err(Http1Error::MalformedHeader);
-                }
-                Err(httparse::Error::TooManyHeaders) => {
-                    return Err(Http1Error::HeadersTooLarge {
-                        cap: RESPONSE_HEADERS_CAP,
-                    });
-                }
-            };
+                };
 
             if chunked {
                 // Rare path: chunked upstream framing mutates `self.buf`, so
@@ -218,9 +225,8 @@ impl ClientStream {
                     headers.push((name, value));
                 }
                 let already = self.buf.len() - headers_end;
-                let body =
-                    read_chunked_body(&mut self.stream, &mut self.buf, headers_end, already)
-                        .await?;
+                let body = read_chunked_body(&mut self.stream, &mut self.buf, headers_end, already)
+                    .await?;
                 return Ok(DirectOutcome::Fallback(Response {
                     status,
                     reason: None,
@@ -253,7 +259,7 @@ impl ClientStream {
             let elapsed_ms = crate::date::coarse_monotonic_ms().saturating_sub(start_ms);
             let now_date = crate::date::now_imf_fixdate();
             out.clear();
-            out.reserve(96 + (headers_end - 0));
+            out.reserve(96 + headers_end);
             out.extend_from_slice(b"HTTP/1.1 ");
             let _ = write!(out, "{}", status);
             out.push(b' ');
@@ -461,18 +467,6 @@ impl ClientStream {
     }
 }
 
-/// Read a chunked-encoding response body from `stream`, having already read
-/// `already` bytes past the headers into `buf` starting at offset `headers_end`.
-/// Returns the decoded body bytes (chunks concatenated; trailers discarded).
-///
-/// Wire format per RFC 7230 §4.1:
-///   chunk        = chunk-size CRLF chunk-data CRLF
-///   last-chunk   = "0" CRLF [trailer-part] CRLF
-///   chunk-size   = 1*HEXDIG
-///
-/// 04.3 ignores trailers (per SPEC §4 non-goals — trailer forwarding deferred).
-/// On any framing violation returns `Http1Error::MalformedChunkedFraming`.
-
 /// Shared request-wire serializer for [`ClientStream::send_request_borrowed`]
 /// and [`ClientStream::send_request_direct`]: request-line + headers (+ Host
 /// injection, hop-header strip, synthetic content-length) + body, appended to
@@ -535,9 +529,19 @@ fn build_request_wire(wire: &mut Vec<u8>, host: &str, request: &Request, strip_h
     if let Some(body) = request.body_bytes() {
         wire.extend_from_slice(body);
     }
-
 }
 
+/// Read a chunked-encoding response body from `stream`, having already read
+/// `already` bytes past the headers into `buf` starting at offset `headers_end`.
+/// Returns the decoded body bytes (chunks concatenated; trailers discarded).
+///
+/// Wire format per RFC 7230 §4.1:
+///   chunk        = chunk-size CRLF chunk-data CRLF
+///   last-chunk   = "0" CRLF [trailer-part] CRLF
+///   chunk-size   = 1*HEXDIG
+///
+/// 04.3 ignores trailers (per SPEC §4 non-goals — trailer forwarding deferred).
+/// On any framing violation returns `Http1Error::MalformedChunkedFraming`.
 async fn read_chunked_body(
     stream: &mut tokio::net::TcpStream,
     buf: &mut bytes::BytesMut,

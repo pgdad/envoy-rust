@@ -599,7 +599,9 @@ async fn run_attempt(
                     })
             } else {
                 match &mut handle {
-                    StreamHandle::Pooled(g) => g.stream_mut().send_request_borrowed(req, true).await,
+                    StreamHandle::Pooled(g) => {
+                        g.stream_mut().send_request_borrowed(req, true).await
+                    }
                     StreamHandle::OneShot(s) => s.send_request_borrowed(req, true).await,
                 }
                 .map(SendOk::Owned)
@@ -1418,8 +1420,12 @@ async fn serve_connection(
             // Fast path: the transformed head is already serialized in
             // `direct_head_buf`; emit head + body with the same
             // threshold/vectored strategy as `write_to_buf`.
-            crate::response::write_head_and_body(&mut downstream, &mut direct_head_buf, &outgoing.body)
-                .await?;
+            crate::response::write_head_and_body(
+                &mut downstream,
+                &mut direct_head_buf,
+                &outgoing.body,
+            )
+            .await?;
         } else {
             Http1Response::write_to_buf(&outgoing, &mut downstream, &mut write_buf).await?;
         }
