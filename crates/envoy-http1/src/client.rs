@@ -257,64 +257,68 @@ impl ClientStream {
             // `construct_proxied_response` + `write_to_buf` (see doc above).
             use std::io::Write as _;
             let elapsed_ms = crate::date::coarse_monotonic_ms().saturating_sub(start_ms);
-            let now_date = crate::date::now_imf_fixdate();
-            out.clear();
-            out.reserve(96 + headers_end);
-            out.extend_from_slice(b"HTTP/1.1 ");
-            let _ = write!(out, "{}", status);
-            out.push(b' ');
-            out.extend_from_slice(crate::response::canonical_reason(status).as_bytes());
-            out.extend_from_slice(b"\r\n");
-            let (mut saw_server, mut saw_date, mut saw_cl) = (false, false, false);
-            for &(ns, nl, vs, vl) in &spans[..nspans] {
-                let name = &self.buf[ns as usize..(ns + nl) as usize];
-                let value = &self.buf[vs as usize..(vs + vl) as usize];
-                if name.eq_ignore_ascii_case(b"server") {
-                    saw_server = true;
+            // Serialize the `date:` value straight from the per-thread cache into
+            // `out` (no per-request String clone). The borrow is held only for
+            // this head-serialization block, which never re-enters the date cache.
+            crate::date::with_imf_fixdate(|now_date| {
+                out.clear();
+                out.reserve(96 + headers_end);
+                out.extend_from_slice(b"HTTP/1.1 ");
+                let _ = write!(out, "{}", status);
+                out.push(b' ');
+                out.extend_from_slice(crate::response::canonical_reason(status).as_bytes());
+                out.extend_from_slice(b"\r\n");
+                let (mut saw_server, mut saw_date, mut saw_cl) = (false, false, false);
+                for &(ns, nl, vs, vl) in &spans[..nspans] {
+                    let name = &self.buf[ns as usize..(ns + nl) as usize];
+                    let value = &self.buf[vs as usize..(vs + vl) as usize];
+                    if name.eq_ignore_ascii_case(b"server") {
+                        saw_server = true;
+                        out.extend_from_slice(b"server: envoy-rust\r\n");
+                    } else if name.eq_ignore_ascii_case(b"date") {
+                        saw_date = true;
+                        out.extend_from_slice(b"date: ");
+                        out.extend_from_slice(now_date.as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                    } else if name.eq_ignore_ascii_case(b"connection")
+                        || name.eq_ignore_ascii_case(b"transfer-encoding")
+                    {
+                        continue;
+                    } else if name.eq_ignore_ascii_case(b"content-length") {
+                        saw_cl = true;
+                        out.extend_from_slice(b"content-length: ");
+                        out.extend_from_slice(value);
+                        out.extend_from_slice(b"\r\n");
+                    } else {
+                        out.extend(name.iter().map(u8::to_ascii_lowercase));
+                        out.extend_from_slice(b": ");
+                        out.extend_from_slice(value);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                if !saw_server {
                     out.extend_from_slice(b"server: envoy-rust\r\n");
-                } else if name.eq_ignore_ascii_case(b"date") {
-                    saw_date = true;
+                }
+                if !saw_date {
                     out.extend_from_slice(b"date: ");
                     out.extend_from_slice(now_date.as_bytes());
                     out.extend_from_slice(b"\r\n");
-                } else if name.eq_ignore_ascii_case(b"connection")
-                    || name.eq_ignore_ascii_case(b"transfer-encoding")
-                {
-                    continue;
-                } else if name.eq_ignore_ascii_case(b"content-length") {
-                    saw_cl = true;
+                }
+                if !saw_cl {
                     out.extend_from_slice(b"content-length: ");
-                    out.extend_from_slice(value);
-                    out.extend_from_slice(b"\r\n");
-                } else {
-                    out.extend(name.iter().map(u8::to_ascii_lowercase));
-                    out.extend_from_slice(b": ");
-                    out.extend_from_slice(value);
+                    let _ = write!(out, "{}", body.len());
                     out.extend_from_slice(b"\r\n");
                 }
-            }
-            if !saw_server {
-                out.extend_from_slice(b"server: envoy-rust\r\n");
-            }
-            if !saw_date {
-                out.extend_from_slice(b"date: ");
-                out.extend_from_slice(now_date.as_bytes());
+                out.extend_from_slice(b"x-envoy-upstream-service-time: ");
+                let _ = write!(out, "{}", elapsed_ms);
                 out.extend_from_slice(b"\r\n");
-            }
-            if !saw_cl {
-                out.extend_from_slice(b"content-length: ");
-                let _ = write!(out, "{}", body.len());
+                out.extend_from_slice(if close {
+                    b"connection: close\r\n".as_slice()
+                } else {
+                    b"connection: keep-alive\r\n".as_slice()
+                });
                 out.extend_from_slice(b"\r\n");
-            }
-            out.extend_from_slice(b"x-envoy-upstream-service-time: ");
-            let _ = write!(out, "{}", elapsed_ms);
-            out.extend_from_slice(b"\r\n");
-            out.extend_from_slice(if close {
-                b"connection: close\r\n".as_slice()
-            } else {
-                b"connection: keep-alive\r\n".as_slice()
             });
-            out.extend_from_slice(b"\r\n");
 
             return Ok(DirectOutcome::Direct {
                 status,

@@ -27,7 +27,22 @@ thread_local! {
 /// Cached variant of `format_imf_fixdate(SystemTime::now())`. Returns the
 /// same string for the entire wall-clock second; only the first caller
 /// on a given thread in a given second pays the format cost.
+///
+/// Allocates an owned `String` (the clone). Hot write-into-buffer paths that
+/// only need `&str` should prefer [`with_imf_fixdate`], which hands the cached
+/// string out by reference and skips that per-call clone.
 pub fn now_imf_fixdate() -> String {
+    with_imf_fixdate(|d| d.to_owned())
+}
+
+/// Borrow-by-reference variant of [`now_imf_fixdate`]: computes/refreshes the
+/// per-thread once-per-second cache and passes the cached IMF-fixdate string to
+/// `f` WITHOUT cloning it. The zero-copy proxied-response head serializes the
+/// `date:` value straight into the wire buffer via this, avoiding a ~29-byte
+/// `String` alloc+copy per request on the hottest path. The cache borrow is held
+/// for the duration of `f`, so `f` must not itself call back into the date cache
+/// (none of the callers do).
+pub fn with_imf_fixdate<R>(f: impl FnOnce(&str) -> R) -> R {
     // Coarse realtime clock for the once-per-second cache check: the cache
     // granularity is a full second, so the ~4 ms coarse-clock granularity is
     // irrelevant, and the coarse read skips the hardware counter read that a
@@ -46,11 +61,12 @@ pub fn now_imf_fixdate() -> String {
         if let Some((cached_secs, ref cached_str)) = *cache
             && cached_secs == secs
         {
-            return cached_str.clone();
+            return f(cached_str);
         }
         let fresh = format_imf_fixdate(UNIX_EPOCH + std::time::Duration::from_secs(secs));
-        *cache = Some((secs, fresh.clone()));
-        fresh
+        let r = f(&fresh);
+        *cache = Some((secs, fresh));
+        r
     })
 }
 
