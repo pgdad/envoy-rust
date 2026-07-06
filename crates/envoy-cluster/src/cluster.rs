@@ -2323,6 +2323,7 @@ admin:
                 clusters: vec![Cluster {
                     name: "backend".into(),
                     cluster_type: ClusterType::Static,
+                    common_http_protocol_options: None,
                     lb_policy: LbPolicy::RoundRobin,
                     load_assignment: Some(LoadAssignment {
                         cluster_name: "backend".into(),
@@ -2366,6 +2367,7 @@ admin:
         let mk_cluster = || Cluster {
             name: "backend".into(),
             cluster_type: ClusterType::Static,
+            common_http_protocol_options: None,
             lb_policy: LbPolicy::RoundRobin,
             load_assignment: Some(LoadAssignment {
                 cluster_name: "backend".into(),
@@ -4226,6 +4228,7 @@ admin:
         Cluster {
             name: name.into(),
             cluster_type: ClusterType::Static,
+            common_http_protocol_options: None,
             lb_policy: LbPolicy::RoundRobin,
             load_assignment: Some(LoadAssignment {
                 cluster_name: name.into(),
@@ -4411,6 +4414,7 @@ admin:
         Cluster {
             name: name.into(),
             cluster_type: ClusterType::Eds,
+            common_http_protocol_options: None,
             lb_policy: LbPolicy::RoundRobin,
             load_assignment: Some(LoadAssignment {
                 cluster_name: name.into(),

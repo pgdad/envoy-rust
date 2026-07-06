@@ -84,7 +84,12 @@ impl Http1Response {
         );
         // Status line.
         buf.extend_from_slice(b"HTTP/1.1 ");
-        buf.extend_from_slice(resp.status.to_string().as_bytes());
+        {
+            // Format the 3-digit status without the former per-response
+            // `to_string()` heap allocation.
+            use std::io::Write as _;
+            let _ = write!(buf, "{}", resp.status);
+        }
         buf.push(b' ');
         buf.extend_from_slice(reason.as_bytes());
         buf.extend_from_slice(b"\r\n");
@@ -142,12 +147,36 @@ where
     Ok(())
 }
 
+/// Fast-path writer for a PRE-SERIALIZED response head (see
+/// `ClientStream::send_request_direct`): emits `head` + `body` with exactly
+/// the same threshold/vectored strategy as [`Http1Response::write_to_buf`],
+/// so the wire byte pattern is identical. `head` is the caller's reusable
+/// buffer; the sub-threshold arm appends the body into it before the single
+/// write (mirroring the coalesced arm of `write_to_buf`).
+pub(crate) async fn write_head_and_body<W>(
+    w: &mut W,
+    head: &mut Vec<u8>,
+    body: &[u8],
+) -> Result<(), Http1Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    if body.len() >= VECTORED_BODY_THRESHOLD {
+        write_all_vectored(w, head, body).await?;
+    } else {
+        head.extend_from_slice(body);
+        w.write_all(head).await?;
+    }
+    w.flush().await?;
+    Ok(())
+}
+
 /// Canonical reason phrase for a status code per RFC 7231 §6.1.
 /// Returns `"OK"` for unknown codes (matches Envoy's posture; cross-check
 /// at execution time — if Envoy emits a different reason for an unknown
 /// code, this fallback is harmless because the value-exact diff for the
 /// status line is not part of the equivalence matrix).
-fn canonical_reason(status: u16) -> &'static str {
+pub(crate) fn canonical_reason(status: u16) -> &'static str {
     match status {
         100 => "Continue",
         101 => "Switching Protocols",

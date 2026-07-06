@@ -13,6 +13,7 @@ envoy-filter = { path = "../envoy-filter" }
 envoy-listener = { path = "../envoy-listener" }
 envoy-stats = { path = "../envoy-stats" }
 httparse = "1"
+rustix = { version = "1", default-features = false, features = ["time"] }
 bytes = "1"
 tokio = { version = "1", features = ["net", "io-util", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -32,3 +32,28 @@ exclude = [
 
 # Workspace members grow as later phases introduce crates. Phase 00 lands the
 # binary (`crates/envoy-bin`) and the differential harness (`tests/differential`).
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# Startup-only dependencies: optimize for size. Their code executes once at
+# boot (config parse, tracing/env-filter setup) but the touched pages stay
+# resident for the process lifetime — smaller text directly cuts RSS.
+[profile.release.package.serde_yaml]
+opt-level = "z"
+[profile.release.package.unsafe-libyaml]
+opt-level = "z"
+[profile.release.package.tracing-subscriber]
+opt-level = "z"
+[profile.release.package.matchers]
+opt-level = "z"
+[profile.release.package.regex]
+opt-level = "z"
+[profile.release.package.regex-automata]
+opt-level = "z"
+[profile.release.package.regex-syntax]
+opt-level = "z"

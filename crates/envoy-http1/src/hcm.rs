@@ -31,7 +31,10 @@ const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// cap tied to the buffer filter's effective limit is a deferred non-goal (the
 /// effective limit is resolved later in the pipeline, not at this read site).
 const INITIAL_BODY_BUF_CAP: usize = 64 * 1024;
-const READ_BUFFER_INITIAL_CAPACITY: usize = 8192;
+/// 4 KiB initial capacity: typical proxied requests/responses are far below
+/// this; BytesMut grows on demand for larger traffic. Halved from 8 KiB to cut
+/// steady-state per-connection anon memory (2 buffers x N connections).
+const READ_BUFFER_INITIAL_CAPACITY: usize = 4096;
 
 /// 06.1 D4.c: per-HCM counters registered against the global StatsRegistry.
 /// Names use the configured `stat_prefix` from `HCMConfig`. Currently
@@ -383,6 +386,12 @@ impl ConnectionHandler for HCM {
 struct AttemptResult {
     /// The response (or synth) produced by this attempt.
     response: Response,
+    /// True when the attempt took the zero-copy fast path: the transformed
+    /// response HEAD was serialized into the caller's `direct_head_buf` and
+    /// `response.headers` is intentionally EMPTY (`response.status`/`body`
+    /// remain authoritative). The caller must write `direct_head_buf` + body
+    /// instead of `write_to_buf`.
+    direct_head: bool,
     /// The endpoint this attempt picked, if any. `None` ONLY on the
     /// `pick() -> None` path (no endpoint to attribute): the caller then skips
     /// both `record_response` and the `%UPSTREAM_HOST%` log capture. `Some` on
@@ -422,6 +431,7 @@ async fn run_attempt(
     close: bool,
     request_hash_key: Option<u64>,
     subset_match: Option<&std::collections::BTreeMap<String, String>>,
+    direct_out: Option<&mut Vec<u8>>,
 ) -> AttemptResult {
     // Re-pick the endpoint each attempt — Envoy re-runs LB on every retry (a
     // healthy host may have been ejected, or a round-robin cluster rotates).
@@ -435,34 +445,24 @@ async fn run_attempt(
         );
         return AttemptResult {
             response: synth_no_healthy_upstream(close),
+            direct_head: false,
             endpoint: None,
             outcome: None,
             upstream_response: false,
         };
     };
 
-    // Strip Connection: per SPEC §3 D1 (one-shot upstream connection) and
-    // Transfer-Encoding: per RFC 7230 §3.3.3. Rebuilt per attempt (the prior
-    // attempt's `out_req` was consumed by send_request).
-    let mut out_headers = req.headers.clone();
-    out_headers.retain(|(n, _)| {
-        !n.eq_ignore_ascii_case(headers::CONNECTION)
-            && !n.eq_ignore_ascii_case(headers::TRANSFER_ENCODING)
-    });
-    let out_req = Request {
-        method: req.method.clone(),
-        path: req.path.clone(),
-        version: HttpVersion::Http11,
-        headers: out_headers,
-        bytes_consumed: 0,
-        // 25.1 D1: forward the downstream request body (read before the pipeline)
-        // upstream. Cloned per attempt → replay-safe across retries (mirrors the
-        // H2 buffered-clone, ADR-0044). Chunked/streaming bodies remain a non-goal
-        // (chunked is 501-rejected before any body read; `req.body` is then empty).
-        body: req.body.clone(),
-    };
-
-    let start = std::time::Instant::now();
+    // Connection:/Transfer-Encoding: stripping (SPEC §3 D1 one-shot upstream
+    // posture / RFC 7230 §3.3.3) now happens inside the serializer via
+    // `send_request_borrowed(req, strip_hop_headers=true)` — the request is
+    // borrowed per attempt instead of deep-cloned, which is replay-safe by
+    // construction (nothing consumes it).
+    //
+    // Attempt-start timestamp for `x-envoy-upstream-service-time`: coarse
+    // monotonic ms (see `date::coarse_monotonic_ms`) — the header's own
+    // granularity is ms, and the coarse read skips the hot hardware-counter
+    // path of `Instant::now()`.
+    let start_ms = crate::date::coarse_monotonic_ms();
 
     // 13.1 Task 4 (D4): the per-attempt StreamHandle abstraction over a pooled
     // guard vs a one-shot connection.
@@ -567,12 +567,67 @@ async fn run_attempt(
 
     match acquire {
         AcquireOutcome::Stream(mut handle) => {
-            let send_result = match &mut handle {
-                StreamHandle::Pooled(g) => g.stream_mut().send_request(out_req).await,
-                StreamHandle::OneShot(s) => s.send_request(out_req).await,
+            // Direct (zero-copy head) vs owned send. `SendOk` unifies the two
+            // shapes so the error arm below is shared verbatim.
+            enum SendOk {
+                Owned(Response),
+                Direct {
+                    status: u16,
+                    upstream_close: bool,
+                    body: bytes::Bytes,
+                },
+            }
+            let send_result: Result<SendOk, Http1Error> = if let Some(out) = direct_out {
+                let stream = match &mut handle {
+                    StreamHandle::Pooled(g) => g.stream_mut(),
+                    StreamHandle::OneShot(s) => s,
+                };
+                stream
+                    .send_request_direct(req, true, start_ms, close, out)
+                    .await
+                    .map(|d| match d {
+                        crate::client::DirectOutcome::Direct {
+                            status,
+                            upstream_close,
+                            body,
+                        } => SendOk::Direct {
+                            status,
+                            upstream_close,
+                            body,
+                        },
+                        crate::client::DirectOutcome::Fallback(r) => SendOk::Owned(r),
+                    })
+            } else {
+                match &mut handle {
+                    StreamHandle::Pooled(g) => g.stream_mut().send_request_borrowed(req, true).await,
+                    StreamHandle::OneShot(s) => s.send_request_borrowed(req, true).await,
+                }
+                .map(SendOk::Owned)
             };
             match send_result {
-                Ok(upstream_response) => {
+                Ok(SendOk::Direct {
+                    status,
+                    upstream_close,
+                    body,
+                }) => {
+                    // Same pooled-stream invalidation rule as the owned arm.
+                    if upstream_close && let StreamHandle::Pooled(g) = &mut handle {
+                        g.invalidate();
+                    }
+                    AttemptResult {
+                        response: Response {
+                            status,
+                            reason: None,
+                            headers: Vec::new(),
+                            body,
+                        },
+                        direct_head: true,
+                        endpoint: Some(endpoint),
+                        outcome: Some(AttemptOutcome::Response),
+                        upstream_response: true,
+                    }
+                }
+                Ok(SendOk::Owned(upstream_response)) => {
                     // 23 D8.1: if the upstream responded with `Connection: close`
                     // (e.g. the http1-echo-server, which sets it unconditionally),
                     // the upstream peer has closed / will close the TCP connection
@@ -588,7 +643,7 @@ async fn run_attempt(
                     if upstream_close && let StreamHandle::Pooled(g) = &mut handle {
                         g.invalidate();
                     }
-                    let elapsed_ms = start.elapsed().as_millis();
+                    let elapsed_ms = crate::date::coarse_monotonic_ms().saturating_sub(start_ms);
                     let response = crate::router::construct_proxied_response(
                         upstream_response,
                         elapsed_ms,
@@ -596,6 +651,7 @@ async fn run_attempt(
                     );
                     AttemptResult {
                         response,
+                        direct_head: false,
                         endpoint: Some(endpoint),
                         outcome: Some(AttemptOutcome::Response),
                         upstream_response: true,
@@ -616,6 +672,7 @@ async fn run_attempt(
                     );
                     AttemptResult {
                         response: synth_status(503, close),
+                        direct_head: false,
                         endpoint: Some(endpoint),
                         outcome: Some(AttemptOutcome::Reset),
                         upstream_response: false,
@@ -625,6 +682,7 @@ async fn run_attempt(
         }
         AcquireOutcome::ConnectFailure(response) => AttemptResult {
             response,
+            direct_head: false,
             endpoint: Some(endpoint),
             outcome: Some(AttemptOutcome::ConnectFailure),
             upstream_response: false,
@@ -636,6 +694,7 @@ async fn run_attempt(
             // behavior at the old `cluster.record_response` site.
             AttemptResult {
                 response,
+                direct_head: false,
                 endpoint: Some(endpoint),
                 outcome: None,
                 upstream_response: false,
@@ -654,6 +713,22 @@ async fn serve_connection(
     // `write_to_buf`) so response serialization allocates once per connection
     // rather than once per response.
     let mut write_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER_INITIAL_CAPACITY);
+    // Per-CONNECTION filter-pipeline clone (was per-request). Safe because
+    // every route-config-sensitive filter (Cors/Csrf/Buffer) fully overwrites
+    // its per-request policy in `apply_route_config` — including the
+    // None-clears case — and stateful filters (LocalRateLimit) share state
+    // across clones by construction (per-request cloning would otherwise have
+    // reset their buckets). `apply_route_config` still runs per request below.
+    let mut pipeline = (*config.filter_pipeline).clone();
+    // Zero-copy proxied-response fast-path eligibility, decided once per
+    // connection: Router-only chain (decode/encode are no-ops) and no
+    // access-log sink (the record build needs the owned header vec). The
+    // per-request attempt additionally requires the vhost attempt-count
+    // response header to be OFF.
+    let direct_conn_eligible =
+        config.access_log.is_empty() && config.filter_pipeline.is_router_only();
+    // Reusable buffer for the fast path's pre-serialized response head.
+    let mut direct_head_buf: Vec<u8> = Vec::new();
     // 13.1 Task 4: the per-connection tier-1 micro-cache (a single cached
     // `(cluster, endpoint, ClientStream)` reused on the next request) was
     // removed at Task 4 and SUBSUMED by `H1Pool` (lock-in #5). The pool is
@@ -688,8 +763,14 @@ async fn serve_connection(
         // (monotonic); the SystemTime is for `%START_TIME%` rendering
         // (wall-clock). Both are sampled at request-arrival per Envoy's
         // %START_TIME% semantic.
-        let req_arrival_instant = std::time::Instant::now();
-        let req_arrival_systime = std::time::SystemTime::now();
+        // Perf: both samples feed ONLY the access-log record (duration /
+        // %START_TIME%); when no sink is configured, skip the two clock reads —
+        // on virtualized hosts each gettime is a measurable per-request cost.
+        // Lazy `OnceCell`-style capture is not needed: the only consumer is the
+        // single dispatch site at the bottom of this function.
+        let log_enabled = !config.access_log.is_empty();
+        let req_arrival_instant = log_enabled.then(std::time::Instant::now);
+        let req_arrival_systime = log_enabled.then(std::time::SystemTime::now);
 
         // 06.1 D4.c: per-request entry-path counter. Per SPEC §6 signpost 5,
         // the increment fires at the entry of the per-request handler — the
@@ -724,7 +805,6 @@ async fn serve_connection(
         // so the boundary conversion can write back the filter-visible
         // fields after the decode pass.
         let mut req = req;
-        let mut pipeline = (*config.filter_pipeline).clone();
         // Phase-23 D2: resolve the matched route up-front and thread its
         // per-filter config into the pipeline before decode (inert for every
         // non-CORS filter — the 07.1 foundation-slice property). MUST be
@@ -876,6 +956,10 @@ async fn serve_connection(
         // before the unified site reads it; a compile error (E0381) fires
         // if any arm is missed.
         let mut outgoing: Response;
+        // True when `outgoing` came from a direct-head attempt: the wire head
+        // is already serialized in `direct_head_buf` and `outgoing.headers`
+        // is intentionally empty. Reset per request; synth paths leave false.
+        let mut outgoing_direct = false;
 
         // 8. Dispatch the request_path to the wire. 07.1 Task 6 wraps the
         // Task 5 writer-arm match inside `RequestPath::Match(outcome)`; the
@@ -901,7 +985,11 @@ async fn serve_connection(
                     // BEFORE the endpoint pick / attempt loop, so it renders
                     // even if the upstream attempt then fails (cluster_name is
                     // borrowed below, so clone).
-                    upstream_cluster_for_log = Some(cluster_name.clone());
+                    // Only consumed under the access-log guard below — skip the
+                    // per-request String clone when no sink is configured.
+                    if log_enabled {
+                        upstream_cluster_for_log = Some(cluster_name.clone());
+                    }
                     // The validator (envoy-config Task 2) ensures every cluster
                     // name referenced from a RouteAction::Route exists in the
                     // bootstrap; the .expect() is defense-in-depth.
@@ -1008,7 +1096,13 @@ async fn serve_connection(
                         // overflow counter already ticked inside `try_acquire_retry`).
                         let mut retry_budget_blocked = false;
 
-                        let (final_response, completing_upstream_response): (Response, bool) = loop {
+                        let attempt_direct =
+                            direct_conn_eligible && !include_attempt_count_in_response;
+                        let (final_response, completing_upstream_response, final_direct): (
+                            Response,
+                            bool,
+                            bool,
+                        ) = loop {
                             attempts += 1;
 
                             // Run one attempt: pick → acquire → send → receive. All
@@ -1025,6 +1119,11 @@ async fn serve_connection(
                                 close,
                                 request_hash_key,
                                 subset_match.as_ref(),
+                                if attempt_direct {
+                                    Some(&mut direct_head_buf)
+                                } else {
+                                    None
+                                },
                             )
                             .await;
 
@@ -1139,7 +1238,11 @@ async fn serve_connection(
                                     }
                                 }
                             }
-                            break (attempt.response, attempt.upstream_response);
+                            break (
+                                attempt.response,
+                                attempt.upstream_response,
+                                attempt.direct_head,
+                            );
                         };
 
                         // Post-loop reconciliation.
@@ -1222,6 +1325,7 @@ async fn serve_connection(
                         drop(retry_guard_slot);
 
                         outgoing = final_response;
+                        outgoing_direct = final_direct;
 
                         // L6: x-envoy-attempt-count on the downstream response, ONLY
                         // when the vhost flag is set. Emitted on ALL outcomes that
@@ -1275,6 +1379,7 @@ async fn serve_connection(
             }
             envoy_filter::Decision::StopAndSend(replacement) => {
                 // Replace outgoing entirely with the filter's substitute response.
+                outgoing_direct = false;
                 outgoing = Response {
                     status: replacement.status,
                     reason: replacement.reason,
@@ -1309,7 +1414,15 @@ async fn serve_connection(
         // 07.1 Task 5: unified wire-write site. 07.1 Task 6 inserted
         // `pipeline.encode_headers` above (boundary conversion + write-back
         // / replacement) so the wire-write below sees the post-encode value.
-        Http1Response::write_to_buf(&outgoing, &mut downstream, &mut write_buf).await?;
+        if outgoing_direct {
+            // Fast path: the transformed head is already serialized in
+            // `direct_head_buf`; emit head + body with the same
+            // threshold/vectored strategy as `write_to_buf`.
+            crate::response::write_head_and_body(&mut downstream, &mut direct_head_buf, &outgoing.body)
+                .await?;
+        } else {
+            Http1Response::write_to_buf(&outgoing, &mut downstream, &mut write_buf).await?;
+        }
 
         // 06.3 D15.3.a NEW — per-response-class HCM counters. Increment fires
         // AFTER all 5 writer arms have populated `response_status_for_log`,
@@ -1334,7 +1447,9 @@ async fn serve_connection(
         // architectural Rule 4 (fire-and-forget option (b)):
         // synchronous-after-write; emission errors are logged via
         // tracing::warn! and discarded.
-        if !config.access_log.is_empty() {
+        if let (Some(req_arrival_instant), Some(req_arrival_systime)) =
+            (req_arrival_instant, req_arrival_systime)
+        {
             let duration = req_arrival_instant.elapsed();
             let record = envoy_accesslog::AccessLogRecord {
                 start_time: req_arrival_systime,

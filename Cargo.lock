@@ -454,6 +454,7 @@ dependencies = [
  "envoy-stats",
  "httparse",
  "parking_lot",
+ "rustix",
  "tempfile",
  "thiserror",
  "tokio",

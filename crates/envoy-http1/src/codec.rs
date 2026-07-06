@@ -110,19 +110,20 @@ impl Http1Codec {
             _ => return Err(Http1Error::MalformedRequestLine),
         };
 
-        // Convert borrowed httparse headers into owned String pairs.
-        let headers: Vec<(String, String)> = parsed
-            .headers
-            .iter()
-            .filter(|h| !h.name.is_empty())
-            .map(|h| {
-                let name = h.name.to_string();
-                let value = std::str::from_utf8(h.value)
-                    .map(str::to_string)
-                    .unwrap_or_default();
-                (name, value)
-            })
-            .collect();
+        // Convert borrowed httparse headers into owned String pairs. The
+        // filtered iterator's size hint is lossy, so reserve exactly once
+        // up front instead of letting `collect` grow the Vec.
+        let mut headers: Vec<(String, String)> = Vec::with_capacity(parsed.headers.len());
+        for h in parsed.headers.iter() {
+            if h.name.is_empty() {
+                continue;
+            }
+            let name = h.name.to_string();
+            let value = std::str::from_utf8(h.value)
+                .map(str::to_string)
+                .unwrap_or_default();
+            headers.push((name, value));
+        }
 
         Ok(Some(Request {
             method,
