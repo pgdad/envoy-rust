@@ -1,0 +1,27 @@
+driver:
+  kind: http2_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0067-envoy-mount/access.log
+    envoy_rust: /tmp/0067-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: GET /retry-exhausted, routed to `backend_cluster` via
+    # retry_policy{retry_on:"5xx",num_retries:1}. The health-aware backend
+    # serves 503 on EVERY attempt (stateless) -> both attempts 503 -> the
+    # retry budget of 1 is consumed -> limit-exceeded (L9) -> the last 503
+    # surfaces downstream verbatim. This is the FOURTH non-`-` H2
+    # %RESPONSE_FLAGS% witness: URX (UpstreamRetryLimitExceeded) (phase 61,
+    # ADR-0118), the H2 analogue of fixture 0059 (phase 51).
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static
+    # literal: the `http2_access_log_byte_exact` driver asserts every line is
+    # byte-identical between upstream Envoy v1.33.0 and envoy-rust. The
+    # retry-limit-exceeded rcd (via_upstream, a REAL completing 503, not a
+    # synth) is deterministic on BOTH sides.
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rc, rcd, rf.
+    # The emitted line is:
+    #   {"method":"GET","proto":"HTTP/2","rc":503,"rcd":"via_upstream","rf":"URX"}
+    - method: get
+      path: /retry-exhausted
+      host: envoy-rust.test
+      expected_status: 503
