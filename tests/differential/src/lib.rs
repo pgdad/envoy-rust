@@ -3117,7 +3117,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || fixture_name == "0022-upstream-outlier-detection-consecutive-5xx"
             || fixture_name == "0024-upstream-retry-on-5xx"
             || fixture_name == "0025-upstream-circuit-breaker-retry-budget"
-            || fixture_name == "0059-accesslog-rf-retry-exhausted");
+            || fixture_name == "0059-accesslog-rf-retry-exhausted"
+            || fixture_name == "0067-accesslog-h2-urx-retry-exhausted");
     let _backend = if needs_backend && !needs_health_aware_backend {
         Some(
             backend::TcpProxyBackend::spawn()
@@ -3176,11 +3177,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
                 Some("/retry-exhausted=503".to_string())
             } else if fixture_name == "0025-upstream-circuit-breaker-retry-budget" {
                 Some("/budget-blocked=503".to_string())
-            } else if fixture_name == "0059-accesslog-rf-retry-exhausted" {
-                // phase 51 (ADR-0108) fixture 0059: the retry-limit-exceeded (L9)
-                // access-log %RESPONSE_FLAGS%=URX witness. STATELESS always-503
-                // `/retry-exhausted` (retry_script stays None — both attempts 503,
-                // the budget of 1 consumed, the last 503 surfaced verbatim).
+            } else if fixture_name == "0059-accesslog-rf-retry-exhausted"
+                || fixture_name == "0067-accesslog-h2-urx-retry-exhausted"
+            {
+                // phase 51 (ADR-0108) fixture 0059 / phase 61 (ADR-0118)
+                // fixture 0067: the H1/H2 retry-limit-exceeded (L9) access-log
+                // %RESPONSE_FLAGS%=URX witnesses. STATELESS always-503
+                // `/retry-exhausted` (retry_script stays None — both attempts
+                // 503, the budget of 1 consumed, the last 503 surfaced
+                // verbatim). Identical per-path mapping reused for both
+                // fixtures — the retry loop is upstream-protocol-agnostic.
                 Some("/retry-exhausted=503".to_string())
             } else {
                 per_path
