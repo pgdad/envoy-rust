@@ -731,6 +731,16 @@ async fn serve_connection(
         config.access_log.is_empty() && config.filter_pipeline.is_router_only();
     // Reusable buffer for the fast path's pre-serialized response head.
     let mut direct_head_buf: Vec<u8> = Vec::new();
+    // Per-connection idle-read timer, reused across every keep-alive read
+    // instead of constructing a fresh `tokio::time::timeout(..)` future (and
+    // its timer state) on each request's first read. It is reset to a fresh
+    // IDLE_READ_TIMEOUT deadline immediately before every blocking read, so the
+    // idle-close semantics are byte-identical to the former per-read `timeout`.
+    // `read_buf` is cancellation-safe (it only appends on a completed read), so
+    // losing the `select!` race to this timer never drops buffered bytes —
+    // exactly as when `timeout` dropped the pending read future.
+    let idle_timer = tokio::time::sleep(IDLE_READ_TIMEOUT);
+    tokio::pin!(idle_timer);
     // 13.1 Task 4: the per-connection tier-1 micro-cache (a single cached
     // `(cluster, endpoint, ClientStream)` reused on the next request) was
     // removed at Task 4 and SUBSUMED by `H1Pool` (lock-in #5). The pool is
@@ -744,18 +754,28 @@ async fn serve_connection(
         let req = match Http1Codec::parse_request(&buf)? {
             Some(req) => req,
             None => {
-                // 2. Need more bytes. Read with idle timeout.
-                match tokio::time::timeout(IDLE_READ_TIMEOUT, downstream.read_buf(&mut buf)).await {
-                    Ok(Ok(0)) => {
+                // 2. Need more bytes. Read with the reused per-connection idle
+                //    timer: arm a fresh IDLE_READ_TIMEOUT window, then race the
+                //    read against it. `biased` polls the read first so a ready
+                //    socket never pays for the timer branch.
+                idle_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + IDLE_READ_TIMEOUT);
+                let read = tokio::select! {
+                    biased;
+                    res = downstream.read_buf(&mut buf) => res,
+                    _ = idle_timer.as_mut() => return Ok(()), // idle timeout → clean close
+                };
+                match read {
+                    Ok(0) => {
                         // peer closed; clean exit if the buffer is empty.
                         if buf.is_empty() {
                             return Ok(());
                         }
                         return Err(Http1Error::UnexpectedEof);
                     }
-                    Ok(Ok(_)) => continue, // re-parse
-                    Ok(Err(source)) => return Err(Http1Error::Io { source }),
-                    Err(_elapsed) => return Ok(()), // idle timeout → clean close
+                    Ok(_) => continue, // re-parse
+                    Err(source) => return Err(Http1Error::Io { source }),
                 }
             }
         };
@@ -814,7 +834,15 @@ async fn serve_connection(
         // (mem::take empties req's path + headers which resolve_route needs).
         // apply_route_config clones the policy into the Cors instance, so the
         // borrow of `config` via `matched_route` ends before mem::take of `req`.
-        let matched_route = resolve_route(&config, &req);
+        //
+        // Take the §5.4 read-once route-table snapshot ONCE per request and
+        // share it with `build_response_in` below: one `RwLock` read per
+        // request instead of two, and the up-front resolution + the post-decode
+        // re-match are backed by the identical table (a concurrent RDS swap can
+        // no longer split the two views). `route_snapshot` lives to the
+        // build_response_in call site in this same loop iteration.
+        let route_snapshot = config.current_route_config();
+        let matched_route = resolve_route_in(&route_snapshot, &req);
         pipeline.apply_route_config(matched_route.as_ref().map(ResolvedRoute::route));
 
         // 25.1 D1: read the Content-Length-delimited request body into `req.body`
@@ -834,20 +862,22 @@ async fn serve_connection(
             buf.advance(from_buf);
             let mut remaining = body_len - from_buf;
             while remaining > 0 {
-                let mut chunk = [0u8; 4096];
-                let to_read = chunk.len().min(remaining);
-                let n = match tokio::time::timeout(
-                    IDLE_READ_TIMEOUT,
-                    downstream.read(&mut chunk[..to_read]),
-                )
-                .await
-                {
-                    Ok(Ok(0)) => return Err(Http1Error::UnexpectedEof),
-                    Ok(Ok(n)) => n,
-                    Ok(Err(source)) => return Err(Http1Error::Io { source }),
-                    Err(_elapsed) => return Ok(()),
-                };
-                body_buf.extend_from_slice(&chunk[..n]);
+                // Read the CL-framed remainder straight into body_buf — no 4 KiB
+                // stack bounce buffer + second memcpy. `take` bounds the read to
+                // the declared body length so a following pipelined request's
+                // bytes are never consumed (identical framing to the old
+                // `chunk[..to_read]` cap). Same pattern as client.rs's response
+                // body read.
+                let mut limited = (&mut downstream).take(remaining as u64);
+                let n =
+                    match tokio::time::timeout(IDLE_READ_TIMEOUT, limited.read_buf(&mut body_buf))
+                        .await
+                    {
+                        Ok(Ok(0)) => return Err(Http1Error::UnexpectedEof),
+                        Ok(Ok(n)) => n,
+                        Ok(Err(source)) => return Err(Http1Error::Io { source }),
+                        Err(_elapsed) => return Ok(()),
+                    };
                 remaining -= n;
             }
             body_buf.freeze()
@@ -895,7 +925,9 @@ async fn serve_connection(
                     );
                     BuildOutcome::Synth(synth_501(close), None)
                 } else {
-                    build_response(&config, &req, close)
+                    // Reuse the per-request snapshot taken at resolve time —
+                    // no second RwLock read, identical table to `resolve_route_in`.
+                    build_response_in(&route_snapshot, &req, close)
                 };
                 RequestPath::Match(outcome)
             }
@@ -1776,13 +1808,25 @@ impl ResolvedRoute {
 /// returns a [`ResolvedRoute`] that owns that snapshot, so the borrowed route
 /// stays valid even if the RDS watcher swaps the table mid-request.
 pub fn resolve_route(config: &HCMConfig, req: &Request) -> Option<ResolvedRoute> {
+    // Public entry: take the §5.4 read-once snapshot here, then delegate. The
+    // H1 keep-alive loop instead snapshots ONCE per request and threads that
+    // single snapshot into both `resolve_route_in` and `build_response_in`
+    // (see the handler) — one lock read per request, and resolve/build share
+    // the exact same table even if the RDS watcher swaps concurrently.
+    resolve_route_in(&config.current_route_config(), req)
+}
+
+/// Snapshot-threaded core of [`resolve_route`]: the caller owns the §5.4
+/// read-once `Arc<RouteConfiguration>` snapshot and passes it in, so a single
+/// snapshot can back both the up-front resolution and the later
+/// [`build_response_in`] without a second `RwLock` read (and without the two
+/// views ever splitting across a concurrent `store_route_config`).
+pub(crate) fn resolve_route_in(
+    route_config: &Arc<RouteConfiguration>,
+    req: &Request,
+) -> Option<ResolvedRoute> {
     let host_raw = find_header(&req.headers, headers::HOST).filter(|h| !h.is_empty())?;
     let host = strip_port(host_raw);
-    // 26 Task 2: snapshot the route table once (§5.4 read-once). The matched
-    // route lives inside the snapshot Arc, so we return a single owned
-    // `ResolvedRoute` that holds that snapshot — keeping the table alive while
-    // the caller borrows the matched route, even across a concurrent swap.
-    let route_config = config.current_route_config();
     let vh_idx = route_config
         .virtual_hosts
         .iter()
@@ -1791,14 +1835,33 @@ pub fn resolve_route(config: &HCMConfig, req: &Request) -> Option<ResolvedRoute>
         .routes
         .iter()
         .position(|r| route_matches(r, &req.path, &req.headers))?;
+    // Cheap refcount bump: the returned `ResolvedRoute` keeps the snapshot
+    // alive for the caller's borrow, identical to the pre-snapshot-sharing
+    // behaviour.
     Some(ResolvedRoute {
-        route_config,
+        route_config: route_config.clone(),
         vh_idx,
         route_idx,
     })
 }
 
 pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOutcome {
+    // Public entry: take the §5.4 read-once snapshot here, then delegate. The
+    // H1 handler instead shares one snapshot with `resolve_route_in` (see the
+    // handler comment) — behaviour-identical for a stable table, and strictly
+    // MORE consistent under a concurrent RDS swap (resolve + build can no
+    // longer land on two different tables).
+    build_response_in(&config.current_route_config(), req, close)
+}
+
+/// Snapshot-threaded core of [`build_response`]: routes against the caller's
+/// §5.4 read-once `Arc<RouteConfiguration>` snapshot instead of re-reading the
+/// `RwLock`. See [`resolve_route_in`] for why the H1 loop shares one snapshot.
+pub(crate) fn build_response_in(
+    route_config: &Arc<RouteConfiguration>,
+    req: &Request,
+    close: bool,
+) -> BuildOutcome {
     // Validate Host header presence and non-emptiness (HTTP/1.1 §5.4 — mandatory).
     // Treat empty Host (`Host: \r\n`) as the same RFC violation as missing Host.
     let host_raw = match find_header(&req.headers, headers::HOST) {
@@ -1813,12 +1876,6 @@ pub fn build_response(config: &HCMConfig, req: &Request, close: bool) -> BuildOu
         }
     };
     let host = strip_port(host_raw);
-
-    // 26 Task 2: snapshot the swappable route table ONCE at entry (§5.4
-    // read-once). `route_config` is an owned `Arc` clone that lives for the
-    // rest of this function, so the `vh`/`route` borrows below stay valid even
-    // if the RDS watcher swaps the table concurrently.
-    let route_config = config.current_route_config();
 
     // Walk virtual_hosts first-match-wins on Host.
     let vh = match route_config

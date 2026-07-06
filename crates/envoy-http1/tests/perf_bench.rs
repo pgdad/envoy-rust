@@ -309,3 +309,42 @@ fn bench_response_write_coalesced_vs_vectored() {
         );
     }
 }
+
+/// Number of parse iterations for the codec bench.
+const N_PARSE: u64 = 10_000_000;
+
+/// Bench `Http1Codec::parse_request` on a representative fortio-shaped GET
+/// (method + path + 5 headers). This is the per-request request-parse cost
+/// whose per-header String allocations improvement #3 targets; run baseline
+/// vs. any change to confirm same-or-better.
+#[test]
+#[ignore]
+fn bench_parse_request_get() {
+    use envoy_http1::Http1Codec;
+    // A realistic keep-alive GET: request line + 5 headers, CRLF-terminated.
+    let raw: &[u8] = b"GET /echo HTTP/1.1\r\n\
+Host: echo.default.svc.cluster.local\r\n\
+User-Agent: fortio.org/fortio-1.60.3\r\n\
+Accept: */*\r\n\
+X-Request-Id: 6f1a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8\r\n\
+Connection: keep-alive\r\n\r\n";
+    // warm
+    let _ = Http1Codec::parse_request(raw).unwrap();
+    let start = Instant::now();
+    let mut acc = 0usize;
+    for _ in 0..N_PARSE {
+        let req = Http1Codec::parse_request(std::hint::black_box(raw))
+            .unwrap()
+            .unwrap();
+        acc += req.headers.len() + req.method.len() + req.path.len();
+        std::hint::black_box(&req);
+    }
+    let elapsed = start.elapsed();
+    std::hint::black_box(acc);
+    let ns_per = elapsed.as_nanos() as f64 / N_PARSE as f64;
+    let mops = N_PARSE as f64 / elapsed.as_secs_f64() / 1e6;
+    println!(
+        "PARSE get(5 hdrs): {N_PARSE} calls in {:?} = {ns_per:.1} ns/call, {mops:.2} Mreq/s",
+        elapsed
+    );
+}

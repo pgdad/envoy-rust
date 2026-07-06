@@ -169,64 +169,68 @@ pub(crate) fn serialize_direct_head(
     close: bool,
 ) {
     use std::io::Write as _;
-    let now_date = crate::date::now_imf_fixdate();
-    out.clear();
-    out.reserve(96 + head.headers_end);
-    out.extend_from_slice(b"HTTP/1.1 ");
-    let _ = write!(out, "{}", head.status);
-    out.push(b' ');
-    out.extend_from_slice(crate::response::canonical_reason(head.status).as_bytes());
-    out.extend_from_slice(b"\r\n");
-    let (mut saw_server, mut saw_date, mut saw_cl) = (false, false, false);
-    for &(ns, nl, vs, vl) in &head.spans[..head.nspans] {
-        let name = &buf[ns as usize..(ns + nl) as usize];
-        let value = &buf[vs as usize..(vs + vl) as usize];
-        if name.eq_ignore_ascii_case(b"server") {
-            saw_server = true;
+    // Serialize the `date:` value straight from the per-thread cache into
+    // `out` (no per-request String clone). The borrow is held only for
+    // this head-serialization block, which never re-enters the date cache.
+    crate::date::with_imf_fixdate(|now_date| {
+        out.clear();
+        out.reserve(96 + head.headers_end);
+        out.extend_from_slice(b"HTTP/1.1 ");
+        let _ = write!(out, "{}", head.status);
+        out.push(b' ');
+        out.extend_from_slice(crate::response::canonical_reason(head.status).as_bytes());
+        out.extend_from_slice(b"\r\n");
+        let (mut saw_server, mut saw_date, mut saw_cl) = (false, false, false);
+        for &(ns, nl, vs, vl) in &head.spans[..head.nspans] {
+            let name = &buf[ns as usize..(ns + nl) as usize];
+            let value = &buf[vs as usize..(vs + vl) as usize];
+            if name.eq_ignore_ascii_case(b"server") {
+                saw_server = true;
+                out.extend_from_slice(b"server: envoy-rust\r\n");
+            } else if name.eq_ignore_ascii_case(b"date") {
+                saw_date = true;
+                out.extend_from_slice(b"date: ");
+                out.extend_from_slice(now_date.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            } else if name.eq_ignore_ascii_case(b"connection")
+                || name.eq_ignore_ascii_case(b"transfer-encoding")
+            {
+                continue;
+            } else if name.eq_ignore_ascii_case(b"content-length") {
+                saw_cl = true;
+                out.extend_from_slice(b"content-length: ");
+                out.extend_from_slice(value);
+                out.extend_from_slice(b"\r\n");
+            } else {
+                out.extend(name.iter().map(u8::to_ascii_lowercase));
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(value);
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        if !saw_server {
             out.extend_from_slice(b"server: envoy-rust\r\n");
-        } else if name.eq_ignore_ascii_case(b"date") {
-            saw_date = true;
+        }
+        if !saw_date {
             out.extend_from_slice(b"date: ");
             out.extend_from_slice(now_date.as_bytes());
             out.extend_from_slice(b"\r\n");
-        } else if name.eq_ignore_ascii_case(b"connection")
-            || name.eq_ignore_ascii_case(b"transfer-encoding")
-        {
-            continue;
-        } else if name.eq_ignore_ascii_case(b"content-length") {
-            saw_cl = true;
+        }
+        if !saw_cl {
             out.extend_from_slice(b"content-length: ");
-            out.extend_from_slice(value);
-            out.extend_from_slice(b"\r\n");
-        } else {
-            out.extend(name.iter().map(u8::to_ascii_lowercase));
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value);
+            let _ = write!(out, "{}", body_len);
             out.extend_from_slice(b"\r\n");
         }
-    }
-    if !saw_server {
-        out.extend_from_slice(b"server: envoy-rust\r\n");
-    }
-    if !saw_date {
-        out.extend_from_slice(b"date: ");
-        out.extend_from_slice(now_date.as_bytes());
+        out.extend_from_slice(b"x-envoy-upstream-service-time: ");
+        let _ = write!(out, "{}", elapsed_ms);
         out.extend_from_slice(b"\r\n");
-    }
-    if !saw_cl {
-        out.extend_from_slice(b"content-length: ");
-        let _ = write!(out, "{}", body_len);
+        out.extend_from_slice(if close {
+            b"connection: close\r\n".as_slice()
+        } else {
+            b"connection: keep-alive\r\n".as_slice()
+        });
         out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b"x-envoy-upstream-service-time: ");
-    let _ = write!(out, "{}", elapsed_ms);
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(if close {
-        b"connection: close\r\n".as_slice()
-    } else {
-        b"connection: keep-alive\r\n".as_slice()
     });
-    out.extend_from_slice(b"\r\n");
 }
 
 /// Result of [`ClientStream::send_request_direct`].
@@ -510,18 +514,6 @@ impl ClientStream {
     }
 }
 
-/// Read a chunked-encoding response body from `stream`, having already read
-/// `already` bytes past the headers into `buf` starting at offset `headers_end`.
-/// Returns the decoded body bytes (chunks concatenated; trailers discarded).
-///
-/// Wire format per RFC 7230 §4.1:
-///   chunk        = chunk-size CRLF chunk-data CRLF
-///   last-chunk   = "0" CRLF [trailer-part] CRLF
-///   chunk-size   = 1*HEXDIG
-///
-/// 04.3 ignores trailers (per SPEC §4 non-goals — trailer forwarding deferred).
-/// On any framing violation returns `Http1Error::MalformedChunkedFraming`.
-
 /// Shared request-wire serializer for [`ClientStream::send_request_borrowed`]
 /// and [`ClientStream::send_request_direct`]: request-line + headers (+ Host
 /// injection, hop-header strip, synthetic content-length) + body, appended to
@@ -591,6 +583,17 @@ pub(crate) fn build_request_wire(
     }
 }
 
+/// Read a chunked-encoding response body from `stream`, having already read
+/// `already` bytes past the headers into `buf` starting at offset `headers_end`.
+/// Returns the decoded body bytes (chunks concatenated; trailers discarded).
+///
+/// Wire format per RFC 7230 §4.1:
+///   chunk        = chunk-size CRLF chunk-data CRLF
+///   last-chunk   = "0" CRLF [trailer-part] CRLF
+///   chunk-size   = 1*HEXDIG
+///
+/// 04.3 ignores trailers (per SPEC §4 non-goals — trailer forwarding deferred).
+/// On any framing violation returns `Http1Error::MalformedChunkedFraming`.
 async fn read_chunked_body(
     stream: &mut tokio::net::TcpStream,
     buf: &mut bytes::BytesMut,
