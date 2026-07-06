@@ -543,6 +543,14 @@ async fn handle_one_stream(
     // mirroring Envoy; threaded into `finalize_h2_stream` like
     // `response_code_details_for_log_h2`.
     let mut upstream_cluster_for_log_h2: Option<String> = None;
+    // phase 61 (ADR-0118): per-stream %RESPONSE_FLAGS% = "URX" discriminator.
+    // URX (UpstreamRetryLimitExceeded) is NOT derivable from
+    // %RESPONSE_CODE_DETAILS% (the completing response's rcd stays the
+    // shared "via_upstream") — set at the retry-loop's post-loop
+    // limit-exceeded exit (§B) and consumed by the derive wrapper (§D).
+    // Mirrors the H1 phase-51 `retry_limit_exceeded_for_log` local
+    // (crates/envoy-http1/src/hcm.rs:859) exactly.
+    let mut retry_limit_exceeded_for_log_h2: bool = false;
 
     let resp: Response = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
@@ -815,6 +823,11 @@ async fn handle_one_stream(
                     if attempts > 1 && !retry_budget_blocked {
                         if final_retriable {
                             cluster.upstream_rq_retry_limit_exceeded().inc();
+                            // phase 61 (ADR-0118) §B: same gate as the counter
+                            // above — the boolean and the counter provably
+                            // co-fire. Mirrors the H1 phase-51 set-site
+                            // (crates/envoy-http1/src/hcm.rs:1126-1128) exactly.
+                            retry_limit_exceeded_for_log_h2 = true;
                         } else {
                             cluster.upstream_rq_retry_success().inc();
                         }
@@ -863,6 +876,7 @@ async fn handle_one_stream(
         response_code_details_for_log_h2,
         upstream_cluster_for_log_h2,
         dynamic_metadata,
+        retry_limit_exceeded_for_log_h2,
     )
     .await
 }
@@ -906,6 +920,11 @@ async fn finalize_h2_stream(
         String,
         std::collections::BTreeMap<String, String>,
     >,
+    // Phase 61 (ADR-0118): the retry-limit-exceeded loop-exit discriminator
+    // (§B), consumed by the %RESPONSE_FLAGS% derive wrapper (§D). A `Copy`
+    // primitive — no lifetime/ownership complications, unlike the
+    // `Option<String>` fields above.
+    retry_limit_exceeded_for_log_h2: bool,
 ) -> Result<(), Http2Error> {
     // 07.1 Task 7: encode-side filter invocation. Boundary conversion
     // `envoy_http1::codec::Response` ↔ `envoy_filter::FilterResponse`
@@ -982,11 +1001,20 @@ async fn finalize_h2_stream(
         // status-code fix needed this phase, unlike 50/57). The remaining H2
         // flags (URX/UF/UC) are the continuing carry-forward M56-1,
         // witnessed one-at-a-time by future phases.
-        let response_flags_for_log_h2: &str = match response_code_details_for_log_h2.as_deref() {
-            Some("route_not_found") => "NR",
-            Some("no_healthy_upstream") => "UH",
-            Some("upstream_reset_before_response_started{overflow}") => "UO",
-            _ => "-",
+        // Phase 61 (ADR-0118): "URX" (UpstreamRetryLimitExceeded) is NOT
+        // derivable from %RESPONSE_CODE_DETAILS% (the completing response's
+        // rcd stays the shared "via_upstream") — checked FIRST via the
+        // boolean, mirroring the H1 phase-51 wrapper exactly
+        // (crates/envoy-http1/src/hcm.rs:1391-1392).
+        let response_flags_for_log_h2: &str = if retry_limit_exceeded_for_log_h2 {
+            "URX"
+        } else {
+            match response_code_details_for_log_h2.as_deref() {
+                Some("route_not_found") => "NR",
+                Some("no_healthy_upstream") => "UH",
+                Some("upstream_reset_before_response_started{overflow}") => "UO",
+                _ => "-",
+            }
         };
         let record = envoy_accesslog::AccessLogRecord {
             start_time: req_arrival_systime,
