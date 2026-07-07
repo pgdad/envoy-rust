@@ -694,7 +694,9 @@ async fn handle_one_stream(
                     // Mirrors H1's phase-52 `final_outcome` capture
                     // (crates/envoy-http1/src/hcm.rs:974) exactly.
                     #[allow(unused_assignments)]
-                    let mut final_outcome_h2: Option<envoy_config::AttemptOutcome> = None;
+                    let mut final_outcome_h2: Option<
+                        envoy_config::AttemptOutcome,
+                    > = None;
                     // 17 D4 (ADR-0047): retry-budget gate state. `retry_guard_slot`
                     // holds the budget slot acquired for the IN-FLIGHT retry; it is
                     // declared here so its lifetime spans the back-off + the next
