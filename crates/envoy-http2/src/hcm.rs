@@ -263,7 +263,7 @@ async fn run_h2_attempt(
                         cluster = %cluster.name(),
                         addr = %endpoint,
                         error = ?source,
-                        "upstream connect failed (H1 fork) — returning 502",
+                        "upstream connect failed (H1 fork) — returning 503",
                     );
                     AcquireOutcome::ConnectFailure
                 }
@@ -288,7 +288,7 @@ async fn run_h2_attempt(
                             cluster = %cluster.name(),
                             addr = %endpoint,
                             error = ?source,
-                            "H2 pool connect failed — returning 502",
+                            "H2 pool connect failed — returning 503",
                         );
                         AcquireOutcome::ConnectFailure
                     }
@@ -325,7 +325,7 @@ async fn run_h2_attempt(
                                 cluster = %cluster.name(),
                                 addr = %endpoint,
                                 error = ?source,
-                                "upstream connect failed (per-call) — returning 502",
+                                "upstream connect failed (per-call) — returning 503",
                             );
                             AcquireOutcome::ConnectFailure
                         }
@@ -396,9 +396,11 @@ async fn run_h2_attempt(
         AcquireOutcome::ConnectFailure => {
             // Connect-boundary failure (no request bytes left) → classify as
             // ConnectFailure, NOT Reset (mirrors envoy-http1's `run_attempt`).
-            // The H2 synth-502 preserves the pre-phase-16 connect-failure shape.
+            // 63 (ADR-0120) §B: corrected from the generic synth_h2_502() to
+            // the dedicated synth_h2_connect_failure() — matches upstream
+            // Envoy's 503 on this path (was a previously-unvalidated 502).
             H2AttemptResult {
-                response: synth_h2_502(),
+                response: synth_h2_connect_failure(),
                 endpoint: Some(endpoint),
                 outcome: Some(envoy_config::AttemptOutcome::ConnectFailure),
                 upstream_response: false,
@@ -1108,6 +1110,30 @@ fn extract_upstream_service_time(headers: &[(String, String)]) -> Option<std::ti
 fn synth_h2_502() -> Response {
     Response {
         status: 502,
+        reason: None,
+        headers: vec![
+            ("server".to_string(), "envoy-rust".to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ],
+        body: Bytes::from_static(b""),
+    }
+}
+
+/// 63 (ADR-0120) §A: the H2 connect-failure synth-503 — corrects the
+/// previously-unvalidated `synth_h2_502()` (which this arm called pre-phase-63)
+/// to match upstream Envoy's 503 on the connect-refused path. Mirrors
+/// `synth_h2_502()`'s exact header shape (`server`, `content-type`, empty
+/// body — NO `content-length`, matching the empty-body convention
+/// `synth_h2_502` uses) but status 503. Used ONLY at the SOLE
+/// `AcquireOutcome::ConnectFailure` match arm (`:396`-`406`), which covers
+/// all three connect-acquisition branches (H1-upstream-fork dial, H2-pool-
+/// manager `acquire()`, no-pool-wired per-call fallback). `synth_h2_502()`'s
+/// OTHER call site (the post-connect send/recv-failure `Reset` arm, `:384`-
+/// `395`) is UNCHANGED — still 502, deferred as the continuing M56-1 `UC`
+/// slice (a future phase).
+fn synth_h2_connect_failure() -> Response {
+    Response {
+        status: 503,
         reason: None,
         headers: vec![
             ("server".to_string(), "envoy-rust".to_string()),
@@ -4640,7 +4666,7 @@ static_resources:
     /// (kernel-refused — a deterministic connect failure), retry_on
     /// "connect-failure", num_retries 1. The connect failure MUST classify as
     /// `AttemptOutcome::ConnectFailure` (NOT Reset) and therefore be retriable
-    /// under `connect-failure` (without `reset`). Asserts: downstream synth-502,
+    /// under `connect-failure` (without `reset`). Asserts: downstream synth-503,
     /// upstream_rq_retry=1 (the retry fired → ConnectFailure classification),
     /// limit_exceeded=1 (the retried attempt also refused), retry_success=0,
     /// upstream_rq_total=0 (no upstream RESPONSE was ever received). Sibling of
@@ -4664,8 +4690,8 @@ static_resources:
         .await;
         let (status, _headers) = drive_h2_once(cfg).await;
         assert_eq!(
-            status, 502,
-            "downstream must be synth-502 after exhausting connect-failure retries"
+            status, 503,
+            "downstream must be synth-503 after exhausting connect-failure retries"
         );
         assert_eq!(
             cluster.upstream_rq_retry().value(),
@@ -4689,10 +4715,10 @@ static_resources:
         );
     }
 
-    /// 16 state-5 review fix: a connect-failure synth-502 with NO retry_policy
+    /// 16 state-5 review fix: a connect-failure synth-503 with NO retry_policy
     /// (1 attempt) must NOT tick `upstream_rq_5xx`. The post-loop 5xx tick is
     /// gated on the completing attempt having received a REAL upstream response;
-    /// the synth-502 (kernel-refused connect) never reached an upstream, so per
+    /// the synth-503 (kernel-refused connect) never reached an upstream, so per
     /// ADR-0045 L5 the 1-attempt path is byte-identical to the pre-phase-16
     /// baseline. Sibling of H1's
     /// `connect_failure_synth_does_not_tick_upstream_rq_5xx`.
@@ -4703,11 +4729,11 @@ static_resources:
         let (cluster_mgr, cluster) = h1_backend_cluster(refused_addr).await;
         let cfg = h2_hcm_config_with_retry(None, false, cluster_mgr).await;
         let (status, _headers) = drive_h2_once(cfg).await;
-        assert_eq!(status, 502, "downstream must be connect-failure synth-502");
+        assert_eq!(status, 503, "downstream must be connect-failure synth-503");
         assert_eq!(
             cluster.upstream_rq_5xx().value(),
             0,
-            "rq_5xx 0 — synth-502 (no real upstream response) must not tick the completing-5xx counter"
+            "rq_5xx 0 — synth-503 (no real upstream response) must not tick the completing-5xx counter"
         );
         assert_eq!(
             cluster.upstream_rq_total().value(),
