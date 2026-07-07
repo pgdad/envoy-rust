@@ -383,11 +383,12 @@ async fn run_h2_attempt(
         }
         AcquireOutcome::Sent(Err(e)) => {
             // Post-connect send/recv failure → classify as Reset (the upstream
-            // connected but did not deliver a complete response). The H2
-            // synth-502 preserves the pre-phase-16 dispatch-failure shape.
-            tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 502");
+            // connected but did not deliver a complete response). 64
+            // (ADR-0121) §A: corrected the previously-unvalidated synth-502
+            // to the synth-503 that matches upstream Envoy on this path.
+            tracing::warn!(error = %e, "H2 listener: upstream dispatch failed — emitting 503");
             H2AttemptResult {
-                response: synth_h2_502(),
+                response: synth_h2_reset(),
                 endpoint: Some(endpoint),
                 outcome: Some(envoy_config::AttemptOutcome::Reset),
                 upstream_response: false,
@@ -563,6 +564,17 @@ async fn handle_one_stream(
     // `connect_failure_for_log` local (crates/envoy-http1/src/hcm.rs:854)
     // exactly.
     let mut connect_failure_for_log_h2: bool = false;
+    // 64 (ADR-0121): per-stream %RESPONSE_FLAGS% = "UC" (UpstreamConnection-
+    // Termination) discriminator. Set true POST-LOOP when the FINAL attempt's
+    // outcome was AttemptOutcome::Reset (a reset RETRIED to success must NOT
+    // flag UC — so this reads the final outcome, not a per-attempt set). Like
+    // URX/UF, UC is NOT 1:1 with a unique %RESPONSE_CODE_DETAILS% (the reset
+    // rcd stays the shared "via_upstream" — the H2-side deterministic rcd is
+    // deferred, M64-1), so it keys on this boolean. Reuses the EXISTING
+    // final_outcome_h2 capture from phase 63 — no new loop-scoped state.
+    // Mirrors the H1 phase-53 `reset_for_log` local
+    // (crates/envoy-http1/src/hcm.rs:865) exactly.
+    let mut reset_for_log_h2: bool = false;
 
     let resp: Response = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
@@ -833,7 +845,7 @@ async fn handle_one_stream(
                     // response only (retried-away 5xx attempts do NOT tick it).
                     // Gated on the completing attempt having received a real upstream
                     // response — synth local replies (the no-healthy-upstream synth-
-                    // 503, connect-failure synth-502, reset synth-502, and overflow
+                    // 503, connect-failure synth-503, reset synth-503, and overflow
                     // synth-503 paths) do NOT tick it, preserving the pre-phase-16
                     // baseline (they never did). Single source of truth.
                     if completing_upstream_response && final_response.status / 100 == 5 {
@@ -873,6 +885,17 @@ async fn handle_one_stream(
                     connect_failure_for_log_h2 = matches!(
                         final_outcome_h2,
                         Some(envoy_config::AttemptOutcome::ConnectFailure)
+                    );
+                    // 64 (ADR-0121): flag UC when the FINAL attempt was a
+                    // reset — independent of the retry split. A reset
+                    // retried to success has final_outcome_h2 =
+                    // Some(Response) → not flagged. If BOTH this and
+                    // retry_limit_exceeded_for_log_h2 are set (un-recon'd
+                    // combination, SPEC §4), the derive's URX-before-UC
+                    // ordering renders URX deterministically.
+                    reset_for_log_h2 = matches!(
+                        final_outcome_h2,
+                        Some(envoy_config::AttemptOutcome::Reset)
                     );
                     // Release the retry-budget slot now, before building the outgoing response,
                     // so the slot (and its gauges) reflect completion rather than lingering
@@ -920,6 +943,7 @@ async fn handle_one_stream(
         dynamic_metadata,
         retry_limit_exceeded_for_log_h2,
         connect_failure_for_log_h2,
+        reset_for_log_h2,
     )
     .await
 }
@@ -972,6 +996,10 @@ async fn finalize_h2_stream(
     // (§E), consumed by the %RESPONSE_FLAGS% derive wrapper (§G). A `Copy`
     // primitive, same shape as retry_limit_exceeded_for_log_h2 above.
     connect_failure_for_log_h2: bool,
+    // Phase 64 (ADR-0121): the reset final-outcome discriminator (§B),
+    // consumed by the %RESPONSE_FLAGS% derive wrapper (§D). A `Copy`
+    // primitive, same shape as connect_failure_for_log_h2 above.
+    reset_for_log_h2: bool,
 ) -> Result<(), Http2Error> {
     // 07.1 Task 7: encode-side filter invocation. Boundary conversion
     // `envoy_http1::codec::Response` ↔ `envoy_filter::FilterResponse`
@@ -1062,6 +1090,15 @@ async fn finalize_h2_stream(
             "URX"
         } else if connect_failure_for_log_h2 {
             "UF"
+        } else if reset_for_log_h2 {
+            // Phase 64 (ADR-0121): "UC" (UpstreamConnectionTermination) is
+            // likewise NOT derivable from %RESPONSE_CODE_DETAILS% (the reset
+            // rcd stays the shared "via_upstream" on the H2 side — M64-1) —
+            // checked THIRD via the boolean, ORDERED AFTER UF, mirroring the
+            // H1 phase-52/53 wrapper ordering exactly. This CLOSES
+            // carry-forward M56-1 — all six H2 %RESPONSE_FLAGS% values are
+            // now witnessed.
+            "UC"
         } else {
             match response_code_details_for_log_h2.as_deref() {
                 Some("route_not_found") => "NR",
@@ -1154,14 +1191,15 @@ fn extract_upstream_service_time(headers: &[(String, String)]) -> Option<std::ti
     Some(std::time::Duration::from_millis(ms))
 }
 
-/// Emit a generic 502 Bad Gateway response with no body. Used by
-/// `handle_one_stream` when upstream dispatch fails (no healthy endpoint,
-/// connect error, or send_request error). Mirrors the shape of
-/// envoy-http1's `synth_status(502, _)` without the H1 Connection:
-/// header (H2 has its own connection lifecycle).
-fn synth_h2_502() -> Response {
+/// 64 (ADR-0121) §A: the H2 post-connect dispatch-failure synth-503 —
+/// renamed in place from `synth_h2_502()` (this was the function's SOLE
+/// remaining call site after phase 63 redirected the connect-failure arm
+/// to `synth_h2_connect_failure()`) and corrected 502→503 to match
+/// upstream Envoy's status on the upstream-reset path. Used ONLY at the
+/// `AcquireOutcome::Sent(Err(e))` arm (`:384`-`395`).
+fn synth_h2_reset() -> Response {
     Response {
-        status: 502,
+        status: 503,
         reason: None,
         headers: vec![
             ("server".to_string(), "envoy-rust".to_string()),
@@ -1181,8 +1219,8 @@ fn synth_h2_502() -> Response {
 /// all three connect-acquisition branches (H1-upstream-fork dial, H2-pool-
 /// manager `acquire()`, no-pool-wired per-call fallback). `synth_h2_502()`'s
 /// OTHER call site (the post-connect send/recv-failure `Reset` arm, `:384`-
-/// `395`) is UNCHANGED — still 502, deferred as the continuing M56-1 `UC`
-/// slice (a future phase).
+/// `395`) was corrected by phase 64 (ADR-0121), renaming the helper to
+/// `synth_h2_reset()` (also 503) — closing carry-forward M56-1.
 fn synth_h2_connect_failure() -> Response {
     Response {
         status: 503,
@@ -1202,9 +1240,10 @@ fn synth_h2_connect_failure() -> Response {
 /// `synth_h2_502`'s H2-appropriate set (`server`, `content-type` — H2 has its
 /// own connection lifecycle, no `connection` header, and the differential
 /// fixture asserts status + access-log line only, not headers/body).
-/// `synth_h2_502()`'s OTHER call sites (connect-error `:387`, send-error
-/// `:398`) are UNCHANGED — still 502, deferred as the continuing M56-1
-/// carry-forward (the H2 `UF`/`UC` slices, future phases).
+/// `synth_h2_502()`'s two OTHER call sites (connect-error, send-error) were
+/// both corrected to 503 by phases 63 (ADR-0120, `synth_h2_connect_failure()`)
+/// and 64 (ADR-0121, `synth_h2_reset()`) respectively — closing carry-forward
+/// M56-1.
 fn synth_h2_no_healthy_upstream() -> Response {
     Response {
         status: 503,
@@ -4880,6 +4919,120 @@ static_resources:
         assert_eq!(
             logged, "{\"rc\":503,\"rf\":\"UF\"}\n",
             "connect-failure access-log line carries rf:UF: {logged:?}"
+        );
+    }
+
+    /// Spawn an in-process H2 server that completes a genuine handshake,
+    /// accepts the FIRST request stream, then drops the `SendResponse`
+    /// handle WITHOUT calling `send_response` — an implicit stream reset.
+    /// Mirrors `spawn_upstream_h2_server` (`:1479`) but resets instead of
+    /// responding. Used ONLY by this phase's backstop.
+    async fn spawn_upstream_h2_reset_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (tcp, _peer) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut conn = match h2::server::handshake(tcp).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            if let Some(Ok((_req, send_response))) = conn.accept().await {
+                drop(send_response);
+            }
+        });
+        (addr, handle)
+    }
+
+    /// 64 (ADR-0121) §B/§C/§D/§H backstop: drive a single H2 request against
+    /// a backend that completes the handshake then resets the stream (NO
+    /// retry_policy), wired to a {rc,rf} FILE json access-log. Asserts the
+    /// downstream response is the synth-503 (§A) AND the logged line carries
+    /// the DERIVED rf:"UC" (set post-loop from the reset final-outcome
+    /// boolean, reading the EXISTING `final_outcome_h2` capture a second
+    /// time — NOT rcd-derived, since the H2-side reset rcd stays the shared
+    /// "via_upstream", deferred as M64-1). H2 mirror of the H1 backstop
+    /// `h1_upstream_reset_access_log_carries_uc_flag`
+    /// (`crates/envoy-http1/src/hcm.rs:7734`), adapted to H2's
+    /// boolean-not-rcd derive mechanism (matching the H2
+    /// `h2_connect_failure_access_log_carries_uf_flag` shape exactly, one
+    /// arm over). Fail-first: pre-change this observes status 502 and a
+    /// logged line of `{"rc":502,"rf":"-"}` (the rcd-match's `_ => "-"` arm,
+    /// since `response_code_details_for_log_h2` stays `via_upstream`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_upstream_reset_access_log_carries_uc_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        let (upstream_addr, _upstream_handle) = spawn_upstream_h2_reset_server().await;
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
+                .await;
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test-upstream-reset".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (status, _headers) = drive_h2_once(config).await;
+        assert_eq!(status, 503, "upstream-reset surfaces the synth-503 downstream");
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rf\":\"UC\"}\n",
+            "upstream-reset access-log line carries rf:UC: {logged:?}"
         );
     }
 
