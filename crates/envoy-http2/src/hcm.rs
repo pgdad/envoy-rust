@@ -553,6 +553,16 @@ async fn handle_one_stream(
     // Mirrors the H1 phase-51 `retry_limit_exceeded_for_log` local
     // (crates/envoy-http1/src/hcm.rs:859) exactly.
     let mut retry_limit_exceeded_for_log_h2: bool = false;
+    // 63 (ADR-0120): per-stream %RESPONSE_FLAGS% = "UF" (UpstreamConnection-
+    // Failure) discriminator. Set true POST-LOOP when the FINAL attempt's
+    // outcome was AttemptOutcome::ConnectFailure (a connect-failure RETRIED
+    // to success must NOT flag UF — so this reads the final outcome, not a
+    // per-attempt set). Like URX, UF is NOT 1:1 with a unique
+    // %RESPONSE_CODE_DETAILS% (the connect-failure rcd is the shared
+    // "via_upstream"), so it keys on this boolean. Mirrors the H1 phase-52
+    // `connect_failure_for_log` local (crates/envoy-http1/src/hcm.rs:854)
+    // exactly.
+    let mut connect_failure_for_log_h2: bool = false;
 
     let resp: Response = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
@@ -675,6 +685,16 @@ async fn handle_one_stream(
                     // split retry_success vs limit_exceeded (L4).
                     #[allow(unused_assignments)]
                     let mut final_retriable = false;
+                    // 63 (ADR-0120): the FINAL attempt's outcome. Captured
+                    // each iteration because the loop `break` carries only
+                    // (response, upstream_response), NOT attempt.outcome.
+                    // Read post-loop to set connect_failure_for_log_h2.
+                    // AttemptOutcome is Copy (no move/borrow interaction with
+                    // the per-iteration `match attempt.outcome` below).
+                    // Mirrors H1's phase-52 `final_outcome` capture
+                    // (crates/envoy-http1/src/hcm.rs:974) exactly.
+                    #[allow(unused_assignments)]
+                    let mut final_outcome_h2: Option<envoy_config::AttemptOutcome> = None;
                     // 17 D4 (ADR-0047): retry-budget gate state. `retry_guard_slot`
                     // holds the budget slot acquired for the IN-FLIGHT retry; it is
                     // declared here so its lifetime spans the back-off + the next
@@ -752,6 +772,9 @@ async fn handle_one_stream(
                             cluster.record_response(endpoint, attempt.response.status);
                         }
 
+                        // 63 (ADR-0120): capture the final attempt's outcome
+                        // (read post-loop to set connect_failure_for_log_h2).
+                        final_outcome_h2 = attempt.outcome;
                         // Retry decision. `final_retriable` mirrors whether THIS
                         // (final-so-far) attempt is retriable — used post-loop to
                         // split retry_success vs limit_exceeded (L4).
@@ -834,6 +857,21 @@ async fn handle_one_stream(
                             cluster.upstream_rq_retry_success().inc();
                         }
                     }
+                    // 63 (ADR-0120): flag UF when the FINAL attempt was a
+                    // connect failure — independent of the retry split (a
+                    // single connect-failure attempt with no retry_policy
+                    // flags it too). A connect-failure retried to success has
+                    // final_outcome_h2 = Some(Response) → not flagged. If
+                    // BOTH this and retry_limit_exceeded_for_log_h2 are set
+                    // (a retry-exhausted-connect-failure — un-recon'd
+                    // combination, SPEC §4), the derive's URX-before-UF
+                    // ordering renders URX deterministically. Mirrors H1's
+                    // phase-52 set-site (crates/envoy-http1/src/hcm.rs:1156)
+                    // exactly.
+                    connect_failure_for_log_h2 = matches!(
+                        final_outcome_h2,
+                        Some(envoy_config::AttemptOutcome::ConnectFailure)
+                    );
                     // Release the retry-budget slot now, before building the outgoing response,
                     // so the slot (and its gauges) reflect completion rather than lingering
                     // until this stack frame unwinds.
@@ -879,6 +917,7 @@ async fn handle_one_stream(
         upstream_cluster_for_log_h2,
         dynamic_metadata,
         retry_limit_exceeded_for_log_h2,
+        connect_failure_for_log_h2,
     )
     .await
 }
@@ -927,6 +966,10 @@ async fn finalize_h2_stream(
     // primitive — no lifetime/ownership complications, unlike the
     // `Option<String>` fields above.
     retry_limit_exceeded_for_log_h2: bool,
+    // Phase 63 (ADR-0120): the connect-failure final-outcome discriminator
+    // (§E), consumed by the %RESPONSE_FLAGS% derive wrapper (§G). A `Copy`
+    // primitive, same shape as retry_limit_exceeded_for_log_h2 above.
+    connect_failure_for_log_h2: bool,
 ) -> Result<(), Http2Error> {
     // 07.1 Task 7: encode-side filter invocation. Boundary conversion
     // `envoy_http1::codec::Response` ↔ `envoy_filter::FilterResponse`
@@ -1008,8 +1051,15 @@ async fn finalize_h2_stream(
         // rcd stays the shared "via_upstream") — checked FIRST via the
         // boolean, mirroring the H1 phase-51 wrapper exactly
         // (crates/envoy-http1/src/hcm.rs:1391-1392).
+        // Phase 63 (ADR-0120): "UF" (UpstreamConnectionFailure) is likewise
+        // NOT derivable from %RESPONSE_CODE_DETAILS% (the connect-failure
+        // rcd stays the shared "via_upstream") — checked SECOND via the
+        // boolean, ORDERED AFTER URX, mirroring the H1 phase-52 wrapper
+        // exactly (crates/envoy-http1/src/hcm.rs:1305).
         let response_flags_for_log_h2: &str = if retry_limit_exceeded_for_log_h2 {
             "URX"
+        } else if connect_failure_for_log_h2 {
+            "UF"
         } else {
             match response_code_details_for_log_h2.as_deref() {
                 Some("route_not_found") => "NR",
@@ -4739,6 +4789,95 @@ static_resources:
             cluster.upstream_rq_total().value(),
             0,
             "rq_total 0 — no upstream response was ever received"
+        );
+    }
+
+    /// 63 (ADR-0120) §C/§D/§E/§F/§G/§K backstop: drive a single H2
+    /// connect-failure attempt (endpoint 127.0.0.1:1, kernel-refused) with NO
+    /// retry_policy, wired to a {rc,rf} FILE json access-log. Asserts the
+    /// downstream response is the synth-503 (Task 1) AND the logged line
+    /// carries the DERIVED rf:"UF" (set post-loop from the connect-failure
+    /// final-outcome boolean, NOT rcd-derived — the connect-failure rcd is
+    /// the shared "via_upstream"). The sole in-process proof of the
+    /// discriminator + the derive branch. H2 mirror of the H1 backstop
+    /// `h1_connect_failure_access_log_carries_uf_flag`
+    /// (`crates/envoy-http1/src/hcm.rs:7592`). Fail-first: pre-change the
+    /// derive's rcd-match falls to `_ => "-"` (via_upstream is unmatched) →
+    /// it renders `"rf":"-"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_connect_failure_access_log_carries_uf_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        // 127.0.0.1:1 is kernel-refused — a deterministic connect failure.
+        let refused_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (cluster_mgr, _cluster) = h1_backend_cluster(refused_addr).await;
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test-connect-failure".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (status, _headers) = drive_h2_once(config).await;
+        assert_eq!(
+            status, 503,
+            "connect-failure surfaces the synth-503 downstream"
+        );
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "{\"rc\":503,\"rf\":\"UF\"}\n",
+            "connect-failure access-log line carries rf:UF: {logged:?}"
         );
     }
 
