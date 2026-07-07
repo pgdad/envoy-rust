@@ -3311,6 +3311,24 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let close_backend_port_str = _close_backend.as_ref().map(|b| b.port().to_string());
 
+    // Phase 64 (ADR-0121): the H2-aware handshake-then-reset upstream for
+    // the fixture-0069 reset/UC witness. Distinct from CLOSE_BACKEND_PORT
+    // (a raw TCP accept-then-close backend, which envoy-rust's H2 client
+    // would misclassify as a connect failure) — this marker spawns the
+    // Http2CloseBackend (a genuine H2 handshake, then a stream-level reset).
+    let needs_h2_close_backend =
+        scan_needs_marker(&backend_scan_sources, "H2_CLOSE_BACKEND_PORT");
+    let _h2_close_backend: Option<crate::backend::Http2CloseBackend> = if needs_h2_close_backend {
+        Some(
+            crate::backend::Http2CloseBackend::spawn()
+                .await
+                .context("spawning Http2CloseBackend")?,
+        )
+    } else {
+        None
+    };
+    let h2_close_backend_port_str = _h2_close_backend.as_ref().map(|b| b.port().to_string());
+
     // (c) Build per-side substitution maps with TLS path keys.
     // Type is Vec<(&str, String)> to accommodate owned strings from TLS paths.
     let upstream_tls_paths = tls_pki.as_ref().map(|p| p.envoy_side_paths());
@@ -3341,6 +3359,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(cp) = close_backend_port_str.as_deref() {
             v.push(("CLOSE_BACKEND_PORT", cp.to_string()));
         }
+        // Phase 64 (ADR-0121): the H2-aware handshake-then-reset backend port.
+        if let Some(h2cp) = h2_close_backend_port_str.as_deref() {
+            v.push(("H2_CLOSE_BACKEND_PORT", h2cp.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
@@ -3348,6 +3370,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || http1_backend_2_port_str.is_some()
             || http2_backend_port_str.is_some()
             || close_backend_port_str.is_some()
+            || h2_close_backend_port_str.is_some()
         {
             // Per ADR-0015: container-side reaches the host backend via
             // host.docker.internal (with the harness's with_host call below).
@@ -3355,6 +3378,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             // previously gated only on BACKEND_PORT (Task 8 cadence). Task 13
             // extends the gate to HTTP1_BACKEND_PORT. 05.3 Task 9 extends to
             // HTTP2_BACKEND_PORT. Phase 53 extends to CLOSE_BACKEND_PORT.
+            // Phase 64 extends to H2_CLOSE_BACKEND_PORT.
             v.push(("BACKEND_HOST", "host.docker.internal".to_string()));
         }
         if needs_admin_port {
@@ -3431,6 +3455,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(cp) = close_backend_port_str.as_deref() {
             v.push(("CLOSE_BACKEND_PORT", cp.to_string()));
         }
+        // Phase 64 (ADR-0121): the H2-aware handshake-then-reset backend port.
+        if let Some(h2cp) = h2_close_backend_port_str.as_deref() {
+            v.push(("H2_CLOSE_BACKEND_PORT", h2cp.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
@@ -3438,6 +3466,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || http1_backend_2_port_str.is_some()
             || http2_backend_port_str.is_some()
             || close_backend_port_str.is_some()
+            || h2_close_backend_port_str.is_some()
         {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
         }
