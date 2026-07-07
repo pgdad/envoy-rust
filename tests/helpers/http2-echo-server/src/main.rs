@@ -42,6 +42,7 @@ use tokio::task::JoinSet;
 #[derive(Debug, PartialEq)]
 struct Args {
     port: u16,
+    close_before_response: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -65,10 +66,15 @@ enum ArgvError {
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
     let mut i = 0;
     let mut port: Option<u16> = None;
+    let mut close_before_response = false;
     while i < args.len() {
         match args[i].as_str() {
             "--help" => return Err(ArgvError::HelpRequested),
             "--version" => return Err(ArgvError::VersionRequested),
+            "--close-before-response" => {
+                close_before_response = true;
+                i += 1;
+            }
             "--port" => {
                 let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
                 port = Some(v.parse().map_err(|_| ArgvError::InvalidPort)?);
@@ -79,6 +85,7 @@ fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
     }
     Ok(Args {
         port: port.ok_or(ArgvError::MissingFlag("--port"))?,
+        close_before_response,
     })
 }
 
@@ -86,7 +93,7 @@ fn print_help() {
     println!(
         "http2-echo-server: HTTP/2 cleartext echo server helper for the envoy-rust differential harness.\n\
          \n\
-         Usage:\n  http2-echo-server --port <u16>\n  \
+         Usage:\n  http2-echo-server --port <u16> [--close-before-response]\n  \
          http2-echo-server --help\n  http2-echo-server --version"
     );
 }
@@ -112,7 +119,11 @@ async fn run(args: Args) -> Result<()> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        join_set.spawn(handle_connection(stream));
+                        if args.close_before_response {
+                            join_set.spawn(handle_connection_close_before_response(stream));
+                        } else {
+                            join_set.spawn(handle_connection(stream));
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "accept failed; continuing");
@@ -172,6 +183,36 @@ async fn handle_connection(tcp: tokio::net::TcpStream) {
                 tracing::warn!(error = %e, "send_data failed");
             }
         });
+    }
+}
+
+/// `--close-before-response` mode: complete a genuine H2 handshake, accept
+/// the FIRST request stream, then drop the `SendResponse` handle WITHOUT
+/// calling `send_response` — an implicit stream reset (RST_STREAM). Used by
+/// fixture `0069`'s `Http2CloseBackend` to drive envoy-rust's H2 client into
+/// `AcquireOutcome::Sent(Err(e))` (phase 64, ADR-0121) — a raw TCP
+/// accept-then-close backend would instead be misclassified as a connect
+/// failure by envoy-rust's own H2 client (its `Client::connect` folds the
+/// TCP-connect and h2::client::handshake into one call with a 10 ms
+/// handshake-failure-detection window).
+async fn handle_connection_close_before_response(tcp: tokio::net::TcpStream) {
+    let mut conn = match envoy_http2::codec::server_handshake(tcp).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "h2 handshake failed (close-before-response)");
+            return;
+        }
+    };
+    if let Some(stream_result) = conn.accept().await {
+        match stream_result {
+            Ok((_req, send_response)) => {
+                tracing::debug!("close-before-response: resetting stream without responding");
+                drop(send_response);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "h2 stream accept failed (close-before-response)");
+            }
+        }
     }
 }
 
@@ -278,7 +319,30 @@ mod tests {
     #[test]
     fn parse_argv_accepts_port() {
         let args = parse_argv(&["--port".to_string(), "7000".to_string()]).unwrap();
-        assert_eq!(args, Args { port: 7000 });
+        assert_eq!(
+            args,
+            Args {
+                port: 7000,
+                close_before_response: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_argv_accepts_close_before_response() {
+        let args = parse_argv(&[
+            "--port".to_string(),
+            "7000".to_string(),
+            "--close-before-response".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            args,
+            Args {
+                port: 7000,
+                close_before_response: true,
+            }
+        );
     }
 
     #[test]
@@ -336,5 +400,37 @@ mod tests {
         assert!(s.contains("path: /test\n"), "body shape: {s}");
         assert!(s.contains(":authority: testharness\n"), "body shape: {s}");
         assert!(s.contains(":scheme: http\n"), "body shape: {s}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_before_response_resets_stream_without_responding() {
+        // Spawn the helper's close-before-response path directly (no argv
+        // parse needed — the connection handler is exercised in-process).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server_task = tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                handle_connection_close_before_response(tcp).await;
+            }
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        // The handshake succeeds (unlike a raw TCP close); the SUBSEQUENT
+        // request fails because the server resets the stream instead of
+        // responding.
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://testharness/test")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let result = response_fut.await;
+        assert!(
+            result.is_err(),
+            "close-before-response must reset the stream, not respond: {result:?}"
+        );
     }
 }
