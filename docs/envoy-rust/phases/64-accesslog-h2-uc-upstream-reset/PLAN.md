@@ -41,7 +41,7 @@ No §6.2 reconciliation ADR is needed — none of SPEC §A-§J is overturned by 
 
 This is the load-bearing task: it makes the SPEC's §A-§D+§H edits in one TDD cycle. The NEW in-process backstop (§H) is the fail-first vehicle — there is no pre-existing test on this arm to flip (SPEC §3 item 4's grep confirms zero status-asserting tests reference this call site today), so the backstop test itself proves both the status fix AND the `UC` derive.
 
-- [ ] **Step 1: Write the failing backstop test**
+- [x] **Step 1: Write the failing backstop test**
 
 Append to the `tests` module in `crates/envoy-http2/src/hcm.rs`, immediately after `h2_connect_failure_access_log_carries_uf_flag` (ends `:4884`):
 
@@ -161,12 +161,12 @@ Append to the `tests` module in `crates/envoy-http2/src/hcm.rs`, immediately aft
     }
 ```
 
-- [ ] **Step 2: Run the test — verify it FAILS**
+- [x] **Step 2: Run the test — verify it FAILS**
 
 Run: `cargo test -p envoy-http2 h2_upstream_reset_access_log_carries_uc_flag -- --nocapture`
 Expected: FAIL — actual status `502`, actual logged line `{"rc":502,"rf":"-"}\n`.
 
-- [ ] **Step 3: §A — rename `synth_h2_502()` → `synth_h2_reset()`, correct 502→503, fix the arm + its comment + warn string**
+- [x] **Step 3: §A — rename `synth_h2_502()` → `synth_h2_reset()`, correct 502→503, fix the arm + its comment + warn string**
 
 At `hcm.rs:384`-`395`, change:
 ```rust
@@ -292,7 +292,7 @@ to:
                     // baseline (they never did). Single source of truth.
 ```
 
-- [ ] **Step 4: §B — declare and set `reset_for_log_h2`**
+- [x] **Step 4: §B — declare and set `reset_for_log_h2`**
 
 At `hcm.rs:565` (immediately after `connect_failure_for_log_h2`'s declaration), add:
 ```rust
@@ -324,7 +324,7 @@ At `hcm.rs:876` (immediately after `connect_failure_for_log_h2`'s post-loop set,
                     );
 ```
 
-- [ ] **Step 5: §C — thread `reset_for_log_h2` through `finalize_h2_stream`**
+- [x] **Step 5: §C — thread `reset_for_log_h2` through `finalize_h2_stream`**
 
 At `hcm.rs:922` (the call site, immediately after `connect_failure_for_log_h2,`), add `reset_for_log_h2,` as a new argument:
 ```rust
@@ -349,7 +349,7 @@ At `hcm.rs:974` (the signature, immediately after `connect_failure_for_log_h2: b
 ) -> Result<(), Http2Error> {
 ```
 
-- [ ] **Step 6: §D — extend the H2 `%RESPONSE_FLAGS%` derive with the `UC` branch**
+- [x] **Step 6: §D — extend the H2 `%RESPONSE_FLAGS%` derive with the `UC` branch**
 
 At `hcm.rs:1061`-`1072`, change:
 ```rust
@@ -391,17 +391,17 @@ to:
         };
 ```
 
-- [ ] **Step 7: Run the backstop test — verify it PASSES**
+- [x] **Step 7: Run the backstop test — verify it PASSES**
 
 Run: `cargo test -p envoy-http2 h2_upstream_reset_access_log_carries_uc_flag -- --nocapture`
 Expected: PASS.
 
-- [ ] **Step 8: Run the full `envoy-http2` crate test suite — verify no regression**
+- [x] **Step 8: Run the full `envoy-http2` crate test suite — verify no regression**
 
 Run: `cargo test -p envoy-http2`
 Expected: PASS (all existing tests, including the phase-63 `h2_connect_failure_*` tests, which are unaffected by this task's changes — they hit the SIBLING `ConnectFailure` arm, untouched here).
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/envoy-http2/src/hcm.rs
@@ -415,7 +415,7 @@ git commit -m "phase 64: rename synth_h2_502->synth_h2_reset, correct 502->503, 
 **Files:**
 - Modify: `tests/helpers/http2-echo-server/src/main.rs` (`Args` struct `:43`-`45`; `parse_argv` `:65`-`83`; `print_help` `:85`-`92`; `run` `:98`-`125`; `handle_connection` `:127`-`176`; tests module `:274`-`341`)
 
-- [ ] **Step 1: Write the failing argv unit test**
+- [x] **Step 1: Write the failing argv unit test**
 
 Add to the `tests` module, immediately after `parse_argv_accepts_port`:
 ```rust
@@ -437,12 +437,12 @@ Add to the `tests` module, immediately after `parse_argv_accepts_port`:
     }
 ```
 
-- [ ] **Step 2: Run it — verify it FAILS**
+- [x] **Step 2: Run it — verify it FAILS**
 
 Run: `cargo test -p http2-echo-server parse_argv_accepts_close_before_response`
 Expected: FAIL — compile error (`Args` has no `close_before_response` field; `parse_argv_accepts_port`'s existing `Args { port: 7000 }` literal will also need the new field, see Step 3).
 
-- [ ] **Step 3: Add the `close_before_response` field + argv branch**
+- [x] **Step 3: Add the `close_before_response` field + argv branch**
 
 Change `Args` (`:42`-`45`):
 ```rust
@@ -509,12 +509,12 @@ fn print_help() {
 }
 ```
 
-- [ ] **Step 4: Run the argv tests — verify they PASS**
+- [x] **Step 4: Run the argv tests — verify they PASS**
 
 Run: `cargo test -p http2-echo-server parse_argv`
 Expected: PASS (all 5 argv tests: `accepts_port`, `accepts_close_before_response`, `rejects_missing_port`, `help_returns_help_requested`, `version_returns_version_requested`).
 
-- [ ] **Step 5: Write the failing integration test for the close-before-response behavior**
+- [x] **Step 5: Write the failing integration test for the close-before-response behavior**
 
 Add to the `tests` module, immediately after `echo_round_trip_against_in_test_h2_client`:
 ```rust
@@ -551,12 +551,12 @@ Add to the `tests` module, immediately after `echo_round_trip_against_in_test_h2
     }
 ```
 
-- [ ] **Step 6: Run it — verify it FAILS**
+- [x] **Step 6: Run it — verify it FAILS**
 
 Run: `cargo test -p http2-echo-server close_before_response_resets_stream_without_responding`
 Expected: FAIL — compile error (`handle_connection_close_before_response` does not exist yet).
 
-- [ ] **Step 7: Implement `handle_connection_close_before_response` + wire the dispatch**
+- [x] **Step 7: Implement `handle_connection_close_before_response` + wire the dispatch**
 
 Add immediately after `handle_connection` (`:176`):
 ```rust
@@ -627,17 +627,17 @@ async fn run(args: Args) -> Result<()> {
 }
 ```
 
-- [ ] **Step 8: Run the integration test — verify it PASSES**
+- [x] **Step 8: Run the integration test — verify it PASSES**
 
 Run: `cargo test -p http2-echo-server close_before_response_resets_stream_without_responding -- --nocapture`
 Expected: PASS.
 
-- [ ] **Step 9: Run the full `http2-echo-server` crate test suite**
+- [x] **Step 9: Run the full `http2-echo-server` crate test suite**
 
 Run: `cargo test -p http2-echo-server`
 Expected: PASS (all 7 tests: 5 argv + `echo_round_trip_against_in_test_h2_client` + `close_before_response_resets_stream_without_responding`).
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add tests/helpers/http2-echo-server/src/main.rs
@@ -653,7 +653,7 @@ git commit -m "phase 64: http2-echo-server gains --close-before-response mode [A
 
 No new test file — this struct's correctness is proven end-to-end by Task 5/6's fixture + differential test (Docker-gated) and Task 1's in-process backstop (which already proves the underlying protocol behavior in-process). This task is a structural harness addition mirroring `Http2EchoBackend` verbatim; its own "test" is a successful `cargo build -p differential`.
 
-- [ ] **Step 1: Add `Http2CloseBackend`**
+- [x] **Step 1: Add `Http2CloseBackend`**
 
 Insert after `Http2EchoBackend`'s `Drop` impl closing brace (`:521`), before the `wait_h2_accept_ready` doc comment (`:523`):
 ```rust
@@ -733,12 +733,12 @@ impl Drop for Http2CloseBackend {
 }
 ```
 
-- [ ] **Step 2: Build the differential crate — verify it compiles**
+- [x] **Step 2: Build the differential crate — verify it compiles**
 
 Run: `cargo build -p differential --tests`
 Expected: clean build (the new struct is unused until Task 4 wires it — expect an `unused` warning at this point, not an error; if `-D warnings` is enabled for this crate, silence it with `#[allow(dead_code)]` temporarily removed once Task 4 lands, since by then it IS used).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/differential/src/backend.rs
@@ -752,7 +752,7 @@ git commit -m "phase 64: add Http2CloseBackend harness struct [ADR-0121]"
 **Files:**
 - Modify: `tests/differential/src/lib.rs` (new marker-scan/launch block after the `_close_backend`/`CLOSE_BACKEND_PORT` block, `:3302`-`3312`; `upstream_kvs` block `:3319`-`3408`; `subject_kvs` block `:3409`-`~3452`)
 
-- [ ] **Step 1: Add the `H2_CLOSE_BACKEND_PORT` scan + spawn arm**
+- [x] **Step 1: Add the `H2_CLOSE_BACKEND_PORT` scan + spawn arm**
 
 Insert immediately after the existing `_close_backend`/`close_backend_port_str` block (`:3302`-`3312`), before the `// (c) Build per-side substitution maps` comment (`:3314`):
 ```rust
@@ -775,7 +775,7 @@ Insert immediately after the existing `_close_backend`/`close_backend_port_str` 
     let h2_close_backend_port_str = _h2_close_backend.as_ref().map(|b| b.port().to_string());
 ```
 
-- [ ] **Step 2: Thread `h2_close_backend_port_str` into `upstream_kvs`**
+- [x] **Step 2: Thread `h2_close_backend_port_str` into `upstream_kvs`**
 
 In the `upstream_kvs` block, immediately after the existing `CLOSE_BACKEND_PORT` push (`:3341`-`3343`), add:
 ```rust
@@ -801,7 +801,7 @@ And extend the `BACKEND_HOST`-gating `if` condition (`:3344`-`3351`) to also che
         }
 ```
 
-- [ ] **Step 3: Thread `h2_close_backend_port_str` into `subject_kvs`**
+- [x] **Step 3: Thread `h2_close_backend_port_str` into `subject_kvs`**
 
 In the `subject_kvs` block, immediately after its own `CLOSE_BACKEND_PORT` push (`:3431`-`3433`), add:
 ```rust
@@ -825,12 +825,12 @@ And extend its OWN `BACKEND_HOST`-gating `if` condition (mirrors upstream's, `:3
         }
 ```
 
-- [ ] **Step 4: Build the differential crate — verify it compiles clean (no `unused` warning now)**
+- [x] **Step 4: Build the differential crate — verify it compiles clean (no `unused` warning now)**
 
 Run: `cargo build -p differential --tests`
 Expected: clean build, no warnings on `Http2CloseBackend`/`h2_close_backend_port_str` (now used).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/differential/src/lib.rs
@@ -849,7 +849,7 @@ git commit -m "phase 64: wire H2_CLOSE_BACKEND_PORT marker into run_fixture [ADR
 
 Structural clone of fixture `0068`'s H2C listener shape + fixture `0061`'s spawned-backend cluster shape (STRICT_DNS, `{{BACKEND_HOST}}`/`{{H2_CLOSE_BACKEND_PORT}}`, NO `circuit_breakers`, NO `retry_policy`).
 
-- [ ] **Step 1: Write `envoy-rust.yaml`**
+- [x] **Step 1: Write `envoy-rust.yaml`**
 
 ```yaml
 node: { id: envoy-rust-phase-64-fixture-0069, cluster: envoy-rust-phase-64 }
@@ -915,7 +915,7 @@ static_resources:
                     socket_address: { address: {{BACKEND_HOST}}, port_value: {{H2_CLOSE_BACKEND_PORT}} }
 ```
 
-- [ ] **Step 2: Write `envoy.yaml`** (identical shape; `0.0.0.0` bind + admin block, per the standard per-side divergence discipline)
+- [x] **Step 2: Write `envoy.yaml`** (identical shape; `0.0.0.0` bind + admin block, per the standard per-side divergence discipline)
 
 ```yaml
 node: { id: envoy-rust-phase-64-fixture-0069, cluster: envoy-rust-phase-64 }
@@ -973,7 +973,7 @@ static_resources:
                     socket_address: { address: {{BACKEND_HOST}}, port_value: {{H2_CLOSE_BACKEND_PORT}} }
 ```
 
-- [ ] **Step 3: Write `expectations.yaml`**
+- [x] **Step 3: Write `expectations.yaml`**
 
 ```yaml
 driver:
@@ -1010,7 +1010,7 @@ driver:
       expected_status: 503
 ```
 
-- [ ] **Step 4: Write `README.md`**
+- [x] **Step 4: Write `README.md`**
 
 ```markdown
 # Fixture 0069 — H2 access-log `%RESPONSE_FLAGS%` upstream-reset path (`UC`, byte-exact)
@@ -1110,11 +1110,11 @@ observes the new `rf:"UC"` witness.
   analogue, distinct and still open).
 ```
 
-- [ ] **Step 5: Run the Docker-gated differential test locally (expect LOCAL-RED per §5/README)**
+- [x] **Step 5: Run the Docker-gated differential test locally (expect LOCAL-RED per §5/README)**
 
 Run: `cargo test -p differential access_log_h2_uc_upstream_reset -- --nocapture` (only runs after Task 6 creates the test file — if run now, this step is a no-op; defer this run to Task 6 Step 3).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add tests/fixtures/0069-accesslog-h2-uc-upstream-reset/
@@ -1128,7 +1128,7 @@ git commit -m "phase 64: add fixture 0069-accesslog-h2-uc-upstream-reset [ADR-01
 **Files:**
 - Create: `tests/differential/tests/access_log_h2_uc_upstream_reset.rs`
 
-- [ ] **Step 1: Write the test** (thin wrapper, structural clone of `access_log_h2_uf_connect_failure.rs`)
+- [x] **Step 1: Write the test** (thin wrapper, structural clone of `access_log_h2_uf_connect_failure.rs`)
 
 ```rust
 //! Docker-gated differential test for fixture
@@ -1166,17 +1166,17 @@ async fn access_log_h2_uc_upstream_reset() {
 }
 ```
 
-- [ ] **Step 2: Build the differential test crate**
+- [x] **Step 2: Build the differential test crate**
 
 Run: `cargo build -p differential --tests`
 Expected: clean build.
 
-- [ ] **Step 3: Run the test locally (expect LOCAL-RED per the fixture README — this dev host's Docker bridge-IP flake; NOT a regression)**
+- [x] **Step 3: Run the test locally (expect LOCAL-RED per the fixture README — this dev host's Docker bridge-IP flake; NOT a regression)**
 
 Run: `cargo test -p differential --test access_log_h2_uc_upstream_reset -- --nocapture`
 Expected: EITHER pass, or fail with a bridge-IP-related connectivity error (memory `differential-host-bridge-ip-192-168-65-2`). Record the actual local outcome in PROGRESS.md (Task 9) either way — CI is authoritative for the §7.5 gate (deferred to state-4).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/differential/tests/access_log_h2_uc_upstream_reset.rs
@@ -1190,7 +1190,7 @@ git commit -m "phase 64: add differential test access_log_h2_uc_upstream_reset [
 **Files:**
 - Modify: `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (the `%RESPONSE_FLAGS%` row, line 1020 — two distinct edits within the same long table-cell paragraph)
 
-- [ ] **Step 1: Extend the "Per-flag equivalence — `UC`" description to distinguish H1's rcd-derived `UC` from H2's boolean-derived `UC`**
+- [x] **Step 1: Extend the "Per-flag equivalence — `UC`" description to distinguish H1's rcd-derived `UC` from H2's boolean-derived `UC`**
 
 Find this exact substring (the end of the H1 `UC` per-flag description, immediately before the `DC` sentence) in `docs/envoy-rust/BEHAVIOR_CONTRACT.md`:
 
@@ -1204,7 +1204,7 @@ Replace it with:
 is now witnessed byte-exact at phase 54 (ADR-0111), fixture **0062**. **On H2, `UC` is witnessed differently** (fixture **0069**, phase 64, ADR-0121): the H2 reset arm's `%RESPONSE_CODE_DETAILS%` stays the shared `via_upstream` (the H2-side deterministic rcd is deferred as carry-forward **M64-1**, distinct from the H1-side M53-1 that phase 54 already consumed) — so H2's `UC` is derived from a `reset_for_log_h2` boolean set post-loop from the SAME final-outcome capture phase 63 introduced (`final_outcome_h2`), read a second time, NOT 1:1 from rcd, exactly like H2's own `URX`/`UF` siblings and UNLIKE H1's rcd-derived `UC`. Other non-`-` flags (`DC`) remain unwitnessed (M45-2, non-deterministic surfaces) and still need their own per-flag rules.
 ```
 
-- [ ] **Step 2: Extend the evidence cell to record fixture `0069` and close M56-1**
+- [x] **Step 2: Extend the evidence cell to record fixture `0069` and close M56-1**
 
 Find this exact substring (the end of the evidence cell, currently the last sentence of the row):
 
@@ -1218,12 +1218,12 @@ Replace it with:
 `UC` is now ALSO witnessed byte-exact on H2 by fixture **0069** (phase 64, ADR-0121) — set via the SAME final-outcome-capture mechanism as `URX`/`UF` (a `reset_for_log_h2` boolean reading the EXISTING `final_outcome_h2` capture a second time — NOT derivable from `%RESPONSE_CODE_DETAILS%`, which stays the shared `via_upstream` on this path, deferred as carry-forward **M64-1**, the H2-side deterministic `UC` rcd), threaded through `finalize_h2_stream` as a third new parameter, ordered AFTER `UF` in the derive — **CLOSING carry-forward M56-1**: all six H2 `%RESPONSE_FLAGS%` values (`NR`/`UH`/`UO`/`URX`/`UF`/`UC`) are now witnessed, full parity with H1's own six-flag completion at phase 53. Like `UF`, this phase ALSO corrected a genuine status-code divergence — envoy-rust's H2 post-connect-dispatch-failure arm previously emitted a previously-unvalidated `502` (via the generic `synth_h2_502()`, renamed in place); it now emits `503` via `synth_h2_reset()`, matching upstream Envoy and closing out the whole per-arm H2 status-correction sweep phases 52 (H1) / 57 / 63 / 64 progressively made.
 ```
 
-- [ ] **Step 3: Verify the edits landed correctly**
+- [x] **Step 3: Verify the edits landed correctly**
 
 Run: `grep -c "fixture \*\*0069\*\*" docs/envoy-rust/BEHAVIOR_CONTRACT.md`
 Expected: `2` (one hit per edit above).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/envoy-rust/BEHAVIOR_CONTRACT.md
@@ -1236,37 +1236,37 @@ git commit -m "phase 64: BEHAVIOR_CONTRACT.md — H2 UC witnessed, M56-1 closed 
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: cargo build**
+- [x] **Step 1: cargo build**
 
 Run: `cargo build --workspace --all-targets`
 Expected: clean build.
 
-- [ ] **Step 2: cargo clippy**
+- [x] **Step 2: cargo clippy**
 
 Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 Expected: clean.
 
-- [ ] **Step 3: cargo fmt --check**
+- [x] **Step 3: cargo fmt --check**
 
 Run: `cargo fmt --all -- --check`
 Expected: clean (if not, run `cargo fmt --all` and amend the commit — see Step 7).
 
-- [ ] **Step 4: cargo test --workspace**
+- [x] **Step 4: cargo test --workspace**
 
 Run: `cargo test --workspace`
 Expected: PASS (all existing tests + the 3 new tests this phase adds: the envoy-http2 backstop, the http2-echo-server argv test, the http2-echo-server integration test; the Docker-gated differential tests skip locally per the harness's own gating — a local skip is not a failure. The `0069` differential test is expected to be LOCAL-RED per Task 6 Step 3's own note — do not treat that as this step's failure; re-run this step with `--skip access_log_h2_uc_upstream_reset` if needed to confirm everything ELSE is green).
 
-- [ ] **Step 5: cargo deny**
+- [x] **Step 5: cargo deny**
 
 Run: `cargo deny check`
 Expected: clean. (If a fresh RustSec advisory reds an existing dep — NOT a phase regression — patch-bump it per memory `cargo-deny-reds-on-unrelated-advisory`.)
 
-- [ ] **Step 6: confirm byte-preservation reasoning (no existing H2 fixture regressed)**
+- [x] **Step 6: confirm byte-preservation reasoning (no existing H2 fixture regressed)**
 
 Run: `for f in 0009 0010 0018 0021 0064 0065 0066 0067 0068; do echo "=== $f ==="; grep -n "circuit_breakers\|retry_policy\|127.0.0.1:1" tests/fixtures/${f}-*/envoy-rust.yaml || echo "(none)"; done`
 Expected: matches §3 item 2's re-derivation above; `0001`-`0068` stay byte-identical; only `0069` observes the new `rf:"UC"` witness.
 
-- [ ] **Step 7: final fmt-fix commit if needed** (otherwise nothing to commit)
+- [x] **Step 7: final fmt-fix commit if needed** (otherwise nothing to commit)
 
 ```bash
 cargo fmt --all
@@ -1282,11 +1282,11 @@ git add -A && git commit -m "phase 64: cargo fmt [ADR-0121]" || echo "nothing to
 
 > **NOTE:** Tasks 1–8 are the STATE-3 implementation session(s) — NOT this state-2 PLAN-write session (§5.1: one state per session). This task closes the state-3 arc by recording the running log; the state-4 verification (the full §7.5 gate, quoting all command outputs into PROGRESS.md, plus the authoritative CI run) is the session AFTER.
 
-- [ ] **Step 1: Write PROGRESS.md**
+- [x] **Step 1: Write PROGRESS.md**
 
 Record, per task: what landed, the exact files touched, and the local command outputs (Tasks 1-4, 8). Note explicitly that the Docker differential `0069` (Task 5/6) is expected LOCAL-RED (host bridge-IP flake) and is deferred to the state-4 CI gate for authoritative confirmation, and that ADR-0122 did NOT fire (the §3 PLAN-VERIFY re-confirmation confirmed all §A-§J facts, including the backend-design re-verification in item 5).
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add docs/envoy-rust/phases/64-accesslog-h2-uc-upstream-reset/PROGRESS.md
