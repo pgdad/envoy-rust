@@ -161,9 +161,110 @@ this session's local run.
 c3a1ab7 phase 63: cargo fmt [ADR-0120]
 ```
 
-## Next: state-4 verification
+## State-4 verification
 
-The full §7.5 gate (Docker differential authoritative run, h2spec, fuzz —
-none new this phase, build/clippy/fmt/test/deny in CI) via
-`superpowers:verification-before-completion`, in a separate future session,
-per §5.1 (one state per session).
+> `superpowers:verification-before-completion`, run this session. STEP 0 /
+> STEP 0.5 confirmed clean: `git status --porcelain` empty, branch `main`,
+> `HEAD` = `origin/main` = `3c7e0b4` (unmoved since the state-3 session — no
+> sibling advanced phase 63 or moved `main` in between).
+
+### Local §7.5 pre-flight (re-confirming what state-3 already ran)
+
+**`cargo build --workspace --all-targets`** — clean:
+```
+   Compiling http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+```
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`** — clean:
+```
+    Checking envoy-http2 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Checking http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.94s
+```
+
+**`cargo fmt --all -- --check`** — clean, exit 0, no diff output.
+
+**`cargo test --workspace --no-fail-fast`** — **4 failures this run, ALL matching
+documented host-flake memory entries, NONE related to phase 63's change** (a
+different subset of the flake population than the state-3 session's 8 —
+expected, per memory `differential-fixtures-flake-under-parallel-load`: the
+Docker differential is non-deterministic under parallel load on this host, so
+the exact flaky-test set varies run to run):
+
+- `access_log_rcd_upstream_reset`, `access_log_rf_upstream_reset` — the
+  documented `tcpclosebackend-ipv6-unreachable-host-flake` (fixtures
+  0061/0062): real Envoy resolved the accept-then-close backend to an
+  unreachable IPv6 address (`[fdc4:f303:9324::254]`) and reported
+  `UF`/`remote_connection_failure`, where envoy-rust reported its intended
+  `UC`/`connection_termination` — a host-networking artifact, not a code
+  regression.
+  ```
+  envoy="{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{remote_connection_failure|immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:35203}\",\"rf\":\"UF\"}"
+  envoy-rust="{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"UC\"}"
+  ```
+- `access_log_route_name` — `"upstream Envoy never became accept-ready"` /
+  `Connection refused (os error 111)` — the documented Docker accept-ready
+  flake class (memory `envoy-rust-state4-ci-first-execution` /
+  `differential-fixtures-flake-under-parallel-load`).
+- `admin_config_dump_server_info` — the documented
+  `differential-host-bridge-ip-192-168-65-2` divergence (`backend::192.168.65.2:...`
+  present on the envoy-only side; this host routes the backend via
+  `192.168.65.2`, not an allow-listed IP).
+
+**This phase's own new/changed artifacts stayed green**: `envoy-http2`'s two
+flipped Task-1 tests, the new Task-2 backstop `h2_connect_failure_access_log_carries_uf_flag`,
+and the new differential test `access_log_h2_uf_connect_failure` (not in the
+4-failure set above — full log saved at
+`/tmp/claude-1000/-home-esa-git-envoy-rust/9ddf91ea-fd86-4065-91a8-ece477df3cfe/scratchpad/phase63_state4_test_output.log`
+this session, not committed — a local scratch artifact).
+
+**`cargo deny check`** — clean:
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+(5 pre-existing `license-not-encountered` informational warnings — not errors,
+same set as every prior phase.)
+
+### CI-authoritative Docker differential + h2spec + fuzz (run `28863138464` @ `3c7e0b4`)
+
+Per memory `envoy-rust-state4-ci-first-execution`, this dev host's Docker
+differential is non-deterministic under parallel load — the Docker-gated
+surface is CI-authoritative this session. `HEAD` (`3c7e0b4`) was already
+pushed by the state-3 session and CI already ran; re-confirmed via
+`gh run view 28863138464 --json ...` this session that `origin/main` is
+STILL `3c7e0b4` (no sibling moved it) and the run is `conclusion: success`
+for BOTH jobs:
+
+```
+{"conclusion":"success","id":28863138464,"jobs":[
+  {"conclusion":"success","name":"fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)"},
+  {"conclusion":"success","name":"build + test + lint"}
+],"sha":"3c7e0b49121bee6ee2805ef83e11238791a7b0cf","status":"completed"}
+```
+
+Pulled the full `build + test + lint` job log (`gh run view 28863138464
+--job=85606481629 --log`, 3543 lines) and extracted:
+
+- **Fixture `0068`'s own differential test — green.** `test access_log_h2_uf_connect_failure ... ok`. The preceding warn line confirms the Task-1 status fix landed on the CI runner too: `H2 pool connect failed — returning 503 cluster=backend_cluster addr=127.0.0.1:1 error=UpstreamConnect { ... ConnectionRefused ... }` (503, not the pre-phase-63 502).
+- **Zero `FAILED` lines anywhere in the job log** (`grep -c "FAILED"` → `0`) and zero `##[error]` / non-zero-exit-code lines — confirming `0001`-`0067` stay green alongside `0068` simultaneously (the additivity invariant holds on CI, not just locally). 141 `test result: ok` summary blocks across the whole job (unit suites + differential fixtures + h2spec + conformance harness's own unit tests).
+- **`h2spec_pass_rate_gate` passed**: `test h2spec_pass_rate_gate ... ok` (the gate's own internal ≥95% threshold check is inside the test body — a passing test result means the threshold held; no H2 codec/framing change this phase, so the pass rate is unmoved from phase 61's baseline, as projected).
+- **`cargo fmt --all -- --check`** and **`cargo clippy --workspace --all-targets --all-features -- -D warnings`** CI steps both completed with no `##[error]` lines (job-level `conclusion: success` covers this — a failing fmt/clippy step would have failed the job).
+- **`cargo deny check`** on CI: `advisories ok, bans ok, licenses ok, sources ok` (same 5 informational license-not-encountered warnings as local).
+- **Fuzz job** (`gh run view 28863138464 --job=85606481573 --log`) — all 4 existing targets (`parse_bootstrap`, `jwt_parse`, `cdn_loop_parse`, `accesslog_format_parse`) ran their 30s short-budget clean; the log's tail shows `accesslog_format_parse`'s corpus-minimization summary ending `Done 2239492 runs in 31 second(s)` with no crash/leak report. No new fuzz target this phase (SPEC §M) — nothing new to wire in, and nothing new to check.
+
+### §7.5 gate-item disposition table
+
+| Gate item | Disposition | Evidence |
+|---|---|---|
+| (a) new/changed fixture `0068` green | ✅ | CI job log: `test access_log_h2_uf_connect_failure ... ok`; local state-3 run also passed (bonus, not authoritative) |
+| (b) all pre-existing fixtures `0001`-`0067` still green | ✅ | CI job log: zero `FAILED` lines anywhere; 141 `test result: ok` blocks; additivity invariant holds on CI |
+| (c) conformance suites (h2spec) pass at declared threshold | ✅ | CI job log: `test h2spec_pass_rate_gate ... ok`; no H2 codec/framing change this phase, threshold unmoved from phase 61 |
+| (d) any new fuzzer ran clean for its short-budget CI run | ✅ N/A | No new fuzz target this phase (SPEC §M); existing 4 targets (`parse_bootstrap`/`jwt_parse`/`cdn_loop_parse`/`accesslog_format_parse`) ran clean on CI, no crash/leak |
+| (e) build/clippy/fmt/test/deny clean | ✅ | Local: all 5 clean this session (test: 4 pre-existing host-flakes, none related to phase 63). CI: job `conclusion: success` for both jobs, zero `FAILED`/`##[error]` lines, `cargo deny check` clean |
+| (f) `REVIEW.md` approved | ⏳ pending | State-5 code-review is a separate future session (§5.1: one state per session) |
+
+**Verdict: §7.5 gate items (a)-(e) are ALL GREEN, confirmed both locally and
+via CI run `28863138464` @ `3c7e0b4`.** Item (f) is the state-5 code-review,
+not attempted this session.
