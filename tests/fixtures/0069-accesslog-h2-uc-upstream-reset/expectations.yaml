@@ -1,0 +1,32 @@
+driver:
+  kind: http2_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0069-envoy-mount/access.log
+    envoy_rust: /tmp/0069-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `backend_cluster`, a STRICT_DNS H2-upstream
+    # cluster with NO circuit_breakers and NO retry_policy whose single
+    # endpoint is the SPAWNED Http2CloseBackend ({{H2_CLOSE_BACKEND_PORT}} ->
+    # http2-echo-server --close-before-response). Both proxies DIAL it, the H2
+    # handshake completes, the backend accepts the stream then resets it
+    # without responding -> the reset synth-503. SIXTH and FINAL H2
+    # %RESPONSE_FLAGS% witness: UC (UpstreamConnectionTermination) (phase 64,
+    # ADR-0121) -- closes carry-forward M56-1.
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static
+    # literal: the fixture logs ONLY {method, proto, rc, rf} -- the reset
+    # %RESPONSE_CODE_DETAILS% (deterministic but deferred, M64-1) and the
+    # response body are NOT compared. envoy-rust returns 503 (Task 1
+    # corrected the unvalidated 502) and DERIVES %RESPONSE_FLAGS% = UC from
+    # the reset final-outcome boolean (NOT from rcd).
+    # state-0 recon (SPEC, live v1.33.0, digest sha256:56da5afd..., byte-stable
+    # across 3 repeats + a restart): status 503, rf "UC" -- IDENTICAL to the
+    # H1 UC witness (fixture 0061).
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rc, rf. The
+    # emitted line is:
+    #   {"method":"GET","proto":"HTTP/2","rc":503,"rf":"UC"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503
