@@ -893,10 +893,8 @@ async fn handle_one_stream(
                     // retry_limit_exceeded_for_log_h2 are set (un-recon'd
                     // combination, SPEC §4), the derive's URX-before-UC
                     // ordering renders URX deterministically.
-                    reset_for_log_h2 = matches!(
-                        final_outcome_h2,
-                        Some(envoy_config::AttemptOutcome::Reset)
-                    );
+                    reset_for_log_h2 =
+                        matches!(final_outcome_h2, Some(envoy_config::AttemptOutcome::Reset));
                     // Release the retry-budget slot now, before building the outgoing response,
                     // so the slot (and its gauges) reflect completion rather than lingering
                     // until this stack frame unwinds.
@@ -5028,7 +5026,10 @@ static_resources:
         let config = Arc::new(built);
 
         let (status, _headers) = drive_h2_once(config).await;
-        assert_eq!(status, 503, "upstream-reset surfaces the synth-503 downstream");
+        assert_eq!(
+            status, 503,
+            "upstream-reset surfaces the synth-503 downstream"
+        );
         let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
         assert_eq!(
             logged, "{\"rc\":503,\"rf\":\"UC\"}\n",

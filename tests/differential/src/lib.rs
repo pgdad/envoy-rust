@@ -3316,8 +3316,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // (a raw TCP accept-then-close backend, which envoy-rust's H2 client
     // would misclassify as a connect failure) — this marker spawns the
     // Http2CloseBackend (a genuine H2 handshake, then a stream-level reset).
-    let needs_h2_close_backend =
-        scan_needs_marker(&backend_scan_sources, "H2_CLOSE_BACKEND_PORT");
+    let needs_h2_close_backend = scan_needs_marker(&backend_scan_sources, "H2_CLOSE_BACKEND_PORT");
     let _h2_close_backend: Option<crate::backend::Http2CloseBackend> = if needs_h2_close_backend {
         Some(
             crate::backend::Http2CloseBackend::spawn()
