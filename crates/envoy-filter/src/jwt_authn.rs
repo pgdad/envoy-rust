@@ -20,7 +20,7 @@ use envoy_stats::{Counter, StatsRegistry};
 
 use crate::error::FilterError;
 use crate::pipeline::Decision;
-use crate::types::{FilterRequest, FilterResponse};
+use crate::types::{FilterRequest, FilterResponse, header_ci};
 
 #[derive(Debug, Clone)]
 struct CompiledProvider {
@@ -87,11 +87,10 @@ impl JwtAuthnFilter {
             });
         }
         let reg = |suffix: &str| {
-            registry
-                .register_counter(&format!("http.{hcm_stat_prefix}.jwt_authn.{suffix}"))
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: format!("StatsRegistry: {e}"),
-                })
+            crate::error::register_counter(
+                registry,
+                &format!("http.{hcm_stat_prefix}.jwt_authn.{suffix}"),
+            )
         };
         Ok(Self {
             rules: Arc::new(rules),
@@ -151,13 +150,6 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
 }
 
 /// Extracts the token after a literal `Bearer ` scheme prefix. Case-sensitive
@@ -350,11 +342,8 @@ mod tests {
 
     fn req(headers: Vec<(String, String)>, path: &str) -> FilterRequest {
         FilterRequest {
-            method: "GET".to_string(),
-            path: path.to_string(),
             headers,
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
+            ..FilterRequest::test("GET", path, &[])
         }
     }
 
@@ -619,12 +608,7 @@ mod tests {
         let reg = registry();
         let cfg = build_cfg(&jwks, ISS, vec![], false, "/");
         let mut f = JwtAuthnFilter::build_from_config(&cfg, &reg, "ingress_http").unwrap();
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
     }
 

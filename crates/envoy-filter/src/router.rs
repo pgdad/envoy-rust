@@ -43,11 +43,8 @@ mod tests {
     fn decode_headers_returns_continue_and_does_not_mutate_request() {
         let mut router = RouterTerminus::new();
         let mut req = FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![("host".to_string(), "example.com".to_string())],
             body: Some(Bytes::from_static(b"hello")),
-            dynamic_metadata: std::collections::BTreeMap::new(),
+            ..FilterRequest::test("GET", "/", &[("host", "example.com")])
         };
         let before = req.clone();
         let decision = router.decode_headers(&mut req);

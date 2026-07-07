@@ -84,21 +84,7 @@ impl DownstreamTls {
         // 03.1 honors the first tls_certificate only. The validator rejects
         // the empty case; multi-cert SNI selection lands in 03.2 via
         // `from_listener`.
-        let cert_path = Path::new(
-            certs[0]
-                .certificate_chain
-                .filename
-                .as_deref()
-                .expect("validator ensures TLS DataSource carries filename"),
-        );
-        let key_path = Path::new(
-            certs[0]
-                .private_key
-                .filename
-                .as_deref()
-                .expect("validator ensures TLS DataSource carries filename"),
-        );
-        let key = load_certified_key(cert_path, key_path)?;
+        let key = certified_key_for(&certs[0])?;
         let resolver: Arc<dyn ResolvesServerCert> = Arc::new(SingleCertResolver(Arc::new(key)));
         let config = ServerConfig::builder()
             .with_no_client_auth()
@@ -139,19 +125,7 @@ impl DownstreamTls {
 
             let certs = &ctx.common_tls_context.tls_certificates;
             let cert = certs.first().ok_or(TlsError::DownstreamRequiresCert)?;
-            let cert_path = Path::new(
-                cert.certificate_chain
-                    .filename
-                    .as_deref()
-                    .expect("validator ensures TLS DataSource carries filename"),
-            );
-            let key_path = Path::new(
-                cert.private_key
-                    .filename
-                    .as_deref()
-                    .expect("validator ensures TLS DataSource carries filename"),
-            );
-            let certified_key = Arc::new(load_certified_key(cert_path, key_path)?);
+            let certified_key = Arc::new(certified_key_for(cert)?);
 
             let server_names = chain
                 .filter_chain_match
@@ -211,13 +185,14 @@ impl ResolvesServerCert for SingleCertResolver {
 /// signpost 21 (rustls 0.23's `ClientHello::server_name()` returns lowercase).
 /// The validator (`envoy_config::ConfigError::MultipleListenersWithOverlappingSni`)
 /// rejects overlapping SNIs at config-load time, so this resolver assumes
-/// well-formed input.
-pub struct SniResolver {
-    pub map: std::collections::HashMap<String, std::sync::Arc<rustls::sign::CertifiedKey>>,
+/// well-formed input. `pub(crate)`: constructed only by `from_listener` and
+/// the in-crate tests — no external consumer exists.
+pub(crate) struct SniResolver {
+    pub(crate) map: std::collections::HashMap<String, std::sync::Arc<rustls::sign::CertifiedKey>>,
     /// Catch-all chain's certified key. None when the listener has no
     /// catch-all chain — unknown SNIs then return None and rustls aborts the
     /// handshake with `unrecognized_name`.
-    pub default: Option<std::sync::Arc<rustls::sign::CertifiedKey>>,
+    pub(crate) default: Option<std::sync::Arc<rustls::sign::CertifiedKey>>,
 }
 
 impl std::fmt::Debug for SniResolver {
@@ -347,6 +322,26 @@ fn parse_dns_server_name(sni: &str) -> Result<ServerName<'static>, TlsError> {
             reason: "unsupported ServerName variant".into(),
         }),
     }
+}
+
+/// Resolve a `TlsCertificate`'s `certificate_chain` / `private_key`
+/// filenames (the validator guarantees both DataSources carry `filename`)
+/// and load them into a `CertifiedKey`. Shared by
+/// `DownstreamTls::from_context` and `DownstreamTls::from_listener`.
+fn certified_key_for(cert: &envoy_config::TlsCertificate) -> Result<CertifiedKey, TlsError> {
+    let cert_path = Path::new(
+        cert.certificate_chain
+            .filename
+            .as_deref()
+            .expect("validator ensures TLS DataSource carries filename"),
+    );
+    let key_path = Path::new(
+        cert.private_key
+            .filename
+            .as_deref()
+            .expect("validator ensures TLS DataSource carries filename"),
+    );
+    load_certified_key(cert_path, key_path)
 }
 
 /// Load + verify a PEM cert chain + PEM private key from disk; return the

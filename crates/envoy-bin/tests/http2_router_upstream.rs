@@ -17,6 +17,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+mod common;
+
+use common::reserve_port;
+
 fn locate_http2_echo_server() -> Result<PathBuf> {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest
@@ -38,13 +42,6 @@ fn locate_http2_echo_server() -> Result<PathBuf> {
     Ok(bin)
 }
 
-fn reserve_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn http2_router_upstream_in_process() -> Result<()> {
     // Locate http2-echo-server. Skip if not built.
@@ -58,7 +55,7 @@ async fn http2_router_upstream_in_process() -> Result<()> {
     }
 
     // Spawn http2-echo-server.
-    let helper_port = reserve_port()?;
+    let helper_port = reserve_port();
     let mut helper_child = tokio::process::Command::new(&helper_bin)
         .arg("--port")
         .arg(helper_port.to_string())
@@ -74,7 +71,7 @@ async fn http2_router_upstream_in_process() -> Result<()> {
     wait_h2_ready(helper_addr).await?;
 
     // Build the envoy-rust config pointing at the helper.
-    let envoy_port = reserve_port()?;
+    let envoy_port = reserve_port();
     let envoy_yaml = format!(
         r#"node: {{ id: backstop, cluster: envoy-rust-05-3 }}
 static_resources:

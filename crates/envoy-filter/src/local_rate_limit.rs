@@ -89,35 +89,22 @@ impl LocalRateLimitFilter {
             .iter()
             .map(|opt| (opt.header.key.clone(), opt.header.value.clone()))
             .collect();
-        let enabled_counter = registry
-            .register_counter(&format!(
-                "http_local_rate_limit.{}.enabled",
-                cfg.stat_prefix
-            ))
-            .map_err(|e| FilterError::InvalidConfig {
-                message: format!("StatsRegistry: {e}"),
-            })?;
-        let ok_counter = registry
-            .register_counter(&format!("http_local_rate_limit.{}.ok", cfg.stat_prefix))
-            .map_err(|e| FilterError::InvalidConfig {
-                message: format!("StatsRegistry: {e}"),
-            })?;
-        let rate_limited_counter = registry
-            .register_counter(&format!(
-                "http_local_rate_limit.{}.rate_limited",
-                cfg.stat_prefix
-            ))
-            .map_err(|e| FilterError::InvalidConfig {
-                message: format!("StatsRegistry: {e}"),
-            })?;
-        let enforced_counter = registry
-            .register_counter(&format!(
-                "http_local_rate_limit.{}.enforced",
-                cfg.stat_prefix
-            ))
-            .map_err(|e| FilterError::InvalidConfig {
-                message: format!("StatsRegistry: {e}"),
-            })?;
+        let enabled_counter = crate::error::register_counter(
+            registry,
+            &format!("http_local_rate_limit.{}.enabled", cfg.stat_prefix),
+        )?;
+        let ok_counter = crate::error::register_counter(
+            registry,
+            &format!("http_local_rate_limit.{}.ok", cfg.stat_prefix),
+        )?;
+        let rate_limited_counter = crate::error::register_counter(
+            registry,
+            &format!("http_local_rate_limit.{}.rate_limited", cfg.stat_prefix),
+        )?;
+        let enforced_counter = crate::error::register_counter(
+            registry,
+            &format!("http_local_rate_limit.{}.enforced", cfg.stat_prefix),
+        )?;
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
             bucket: Arc::new(TokenBucketState::new(max_tokens)),
@@ -387,13 +374,7 @@ mod tests {
     use envoy_stats::StatsRegistry;
 
     fn test_request() -> FilterRequest {
-        FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![("host".to_string(), "envoy-rust.test".to_string())],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test("GET", "/", &[("host", "envoy-rust.test")])
     }
 
     fn ok_cfg() -> envoy_config::LocalRateLimitConfig {

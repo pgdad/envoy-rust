@@ -596,7 +596,6 @@ pub struct Endpoint {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
-    #[allow(dead_code)]
     pub name: String,
     pub address: Address,
     pub filter_chains: Vec<FilterChain>,
@@ -1101,6 +1100,29 @@ pub enum HttpFilterTypedConfig {
         rename = "type.googleapis.com/envoy.extensions.filters.http.header_to_metadata.v3.Config"
     )]
     HeaderToMetadata(HeaderToMetadataConfig),
+}
+
+impl HttpFilterTypedConfig {
+    /// The canonical `HttpFilter.name` each `typed_config` variant requires.
+    /// `validate_http_filters` rejects any name/typed_config mismatch with
+    /// `ConfigError::UnsupportedHttpFilter` before running the per-filter
+    /// validators.
+    fn expected_name(&self) -> &'static str {
+        match self {
+            Self::Router(_) => "envoy.filters.http.router",
+            Self::HeaderMutation(_) => "envoy.filters.http.header_mutation",
+            Self::LocalRateLimit(_) => "envoy.filters.http.local_ratelimit",
+            Self::Rbac(_) => "envoy.filters.http.rbac",
+            Self::Fault(_) => "envoy.filters.http.fault",
+            Self::JwtAuthn(_) => "envoy.filters.http.jwt_authn",
+            Self::Cors(_) => "envoy.filters.http.cors",
+            Self::Csrf(_) => "envoy.filters.http.csrf",
+            Self::Buffer(_) => "envoy.filters.http.buffer",
+            Self::CdnLoop(_) => "envoy.filters.http.cdn_loop",
+            Self::SetMetadata(_) => "envoy.filters.http.set_metadata",
+            Self::HeaderToMetadata(_) => "envoy.filters.http.header_to_metadata",
+        }
+    }
 }
 
 /// Empty in 04.1; Envoy's Router has many fields (suppress_envoy_headers,
@@ -1761,7 +1783,7 @@ pub struct Http2ProtocolOptions {
     pub max_frame_size: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfiguration {
     pub name: String,
@@ -1778,7 +1800,7 @@ pub struct RouteConfiguration {
     pub validate_clusters: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct VirtualHost {
     pub name: String,
@@ -2563,49 +2585,42 @@ impl<'de> serde::Deserialize<'de> for StringMatcher {
             {
                 let mut mode: Option<StringMatcherMode> = None;
                 let mut ignore_case: Option<bool> = None;
+
+                fn set_mode<E: Error>(
+                    slot: &mut Option<StringMatcherMode>,
+                    new: StringMatcherMode,
+                ) -> Result<(), E> {
+                    if slot.is_some() {
+                        return Err(E::custom(
+                            "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
+                        ));
+                    }
+                    *slot = Some(new);
+                    Ok(())
+                }
+
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
-                        "exact" => {
-                            if mode.is_some() {
-                                return Err(M::Error::custom(
-                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
-                                ));
-                            }
-                            mode = Some(StringMatcherMode::Exact(map.next_value::<String>()?));
-                        }
-                        "prefix" => {
-                            if mode.is_some() {
-                                return Err(M::Error::custom(
-                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
-                                ));
-                            }
-                            mode = Some(StringMatcherMode::Prefix(map.next_value::<String>()?));
-                        }
-                        "suffix" => {
-                            if mode.is_some() {
-                                return Err(M::Error::custom(
-                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
-                                ));
-                            }
-                            mode = Some(StringMatcherMode::Suffix(map.next_value::<String>()?));
-                        }
-                        "safe_regex" => {
-                            if mode.is_some() {
-                                return Err(M::Error::custom(
-                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
-                                ));
-                            }
-                            mode =
-                                Some(StringMatcherMode::SafeRegex(map.next_value::<SafeRegex>()?));
-                        }
-                        "contains" => {
-                            if mode.is_some() {
-                                return Err(M::Error::custom(
-                                    "StringMatcher: multiple mode keys (each variant is mutually exclusive)",
-                                ));
-                            }
-                            mode = Some(StringMatcherMode::Contains(map.next_value::<String>()?));
-                        }
+                        "exact" => set_mode(
+                            &mut mode,
+                            StringMatcherMode::Exact(map.next_value::<String>()?),
+                        )?,
+                        "prefix" => set_mode(
+                            &mut mode,
+                            StringMatcherMode::Prefix(map.next_value::<String>()?),
+                        )?,
+                        "suffix" => set_mode(
+                            &mut mode,
+                            StringMatcherMode::Suffix(map.next_value::<String>()?),
+                        )?,
+                        "safe_regex" => set_mode(
+                            &mut mode,
+                            StringMatcherMode::SafeRegex(map.next_value::<SafeRegex>()?),
+                        )?,
+                        "contains" => set_mode(
+                            &mut mode,
+                            StringMatcherMode::Contains(map.next_value::<String>()?),
+                        )?,
                         "ignore_case" => {
                             if ignore_case.is_some() {
                                 return Err(M::Error::duplicate_field("ignore_case"));
@@ -3145,15 +3160,11 @@ pub(crate) fn validate_cluster(cluster: &Cluster) -> Result<(), crate::ConfigErr
     // default and validates trivially — the regression-equivalence path.
     if let Some(opts) = cluster.common_http_protocol_options.as_ref()
         && let Some(raw) = opts.idle_timeout.as_ref()
+        && parse_positive_duration(raw).is_none()
     {
-        match parse_duration(raw) {
-            Ok(d) if !d.is_zero() => {}
-            _ => {
-                return Err(crate::ConfigError::InvalidClusterIdleTimeout {
-                    cluster: cluster.name.clone(),
-                });
-            }
-        }
+        return Err(crate::ConfigError::InvalidClusterIdleTimeout {
+            cluster: cluster.name.clone(),
+        });
     }
     // 28 D1 (ADR-0069/0070): RING_HASH sub-config validation. Gated to
     // RING_HASH clusters — upstream Envoy accepts-and-ignores a
@@ -3407,19 +3418,7 @@ fn validate_hcm(
         }
         for r in &mut vh.routes {
             // RouteMatch: exactly one of {prefix, path} is Some.
-            match (&r.r#match.prefix, &r.r#match.path) {
-                (Some(_), None) | (None, Some(_)) => {}
-                (Some(_), Some(_)) => {
-                    return Err(crate::ConfigError::UnsupportedRouteMatcher {
-                        matcher: "both prefix and path are set",
-                    });
-                }
-                (None, None) => {
-                    return Err(crate::ConfigError::UnsupportedRouteMatcher {
-                        matcher: "neither prefix nor path is set",
-                    });
-                }
-            }
+            validate_route_match_cardinality(r.r#match.prefix.is_some(), r.r#match.path.is_some())?;
             // 04.3: dispatch on the action variant. DirectResponse keeps its
             // 04.1 status-range + body-shape checks. The Route(_) arm has no
             // validator obligation in Task 1; Task 2 wires UnknownCluster.
@@ -3586,110 +3585,57 @@ pub(crate) fn validate_http_filters(
         });
     }
 
-    let router_name = "envoy.filters.http.router";
     let last_index = filters.len() - 1;
     let mut router_positions: Vec<usize> = Vec::new();
 
     for (i, f) in filters.iter().enumerate() {
+        // Name/typed_config consistency gate, shared by every filter kind.
+        // Each arm below already ran this check FIRST (before its per-filter
+        // validator), so hoisting it preserves error ordering.
+        if f.name != f.typed_config.expected_name() {
+            return Err(crate::ConfigError::UnsupportedHttpFilter {
+                name: f.name.clone(),
+            });
+        }
         match &f.typed_config {
             crate::HttpFilterTypedConfig::Router(_) => {
-                if f.name != router_name {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 router_positions.push(i);
             }
             crate::HttpFilterTypedConfig::HeaderMutation(cfg) => {
-                if f.name != "envoy.filters.http.header_mutation" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_header_mutation_entries(&cfg.mutations.request_mutations, listener_name)?;
                 validate_header_mutation_entries(&cfg.mutations.response_mutations, listener_name)?;
             }
             crate::HttpFilterTypedConfig::LocalRateLimit(cfg) => {
-                if f.name != "envoy.filters.http.local_ratelimit" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_local_rate_limit_config(cfg, listener_name)?;
             }
             crate::HttpFilterTypedConfig::Rbac(cfg) => {
-                if f.name != "envoy.filters.http.rbac" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_rbac_config(cfg, listener_name)?;
             }
             crate::HttpFilterTypedConfig::Fault(cfg) => {
-                if f.name != "envoy.filters.http.fault" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_fault_config(cfg, listener_name)?;
             }
             crate::HttpFilterTypedConfig::JwtAuthn(cfg) => {
-                if f.name != "envoy.filters.http.jwt_authn" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_jwt_authn_config(cfg, listener_name)?;
             }
             crate::HttpFilterTypedConfig::Cors(_cfg) => {
-                if f.name != "envoy.filters.http.cors" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 // CorsConfig is empty (near-zero; no per-filter-chain fields to validate);
                 // name/typed_config consistency check above is the sole gate.
             }
             crate::HttpFilterTypedConfig::Csrf(cfg) => {
-                if f.name != "envoy.filters.http.csrf" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_csrf_config(cfg, listener_name)?;
             }
             crate::HttpFilterTypedConfig::Buffer(_cfg) => {
-                if f.name != "envoy.filters.http.buffer" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 // Buffer.max_request_bytes is a required u32 (serde-enforced;
                 // absent/malformed → fatal parse error); `0` is a valid limit.
                 // No further validation (ADR-0063 — NO stats, NO new ConfigError).
             }
             crate::HttpFilterTypedConfig::CdnLoop(cfg) => {
-                if f.name != "envoy.filters.http.cdn_loop" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_cdn_loop_config(cfg, listener_name)?;
             }
             crate::HttpFilterTypedConfig::SetMetadata(cfg) => {
-                if f.name != "envoy.filters.http.set_metadata" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_set_metadata_config(cfg, listener_name)?;
             }
             crate::HttpFilterTypedConfig::HeaderToMetadata(cfg) => {
-                if f.name != "envoy.filters.http.header_to_metadata" {
-                    return Err(crate::ConfigError::UnsupportedHttpFilter {
-                        name: f.name.clone(),
-                    });
-                }
                 validate_header_to_metadata_config(cfg, listener_name)?;
             }
         }
@@ -3891,23 +3837,29 @@ pub(crate) fn validate_jwt_authn_config(
             });
         }
         // RouteMatch structural validity: exactly one of prefix/path must be set.
-        // Inlined because the existing inline check in validate_http_connection_manager
-        // is not extracted into a standalone function; mirrors the same logic at ~2543.
-        match (rule.r#match.prefix.is_some(), rule.r#match.path.is_some()) {
-            (true, false) | (false, true) => {}
-            (true, true) => {
-                return Err(crate::ConfigError::UnsupportedRouteMatcher {
-                    matcher: "both prefix and path are set",
-                });
-            }
-            (false, false) => {
-                return Err(crate::ConfigError::UnsupportedRouteMatcher {
-                    matcher: "neither prefix nor path is set",
-                });
-            }
-        }
+        validate_route_match_cardinality(
+            rule.r#match.prefix.is_some(),
+            rule.r#match.path.is_some(),
+        )?;
     }
     Ok(())
+}
+
+/// RouteMatch structural validity, shared by `validate_http_connection_manager`
+/// and `validate_jwt_authn_config`: exactly one of `prefix`/`path` must be set.
+fn validate_route_match_cardinality(
+    prefix_set: bool,
+    path_set: bool,
+) -> Result<(), crate::ConfigError> {
+    match (prefix_set, path_set) {
+        (true, false) | (false, true) => Ok(()),
+        (true, true) => Err(crate::ConfigError::UnsupportedRouteMatcher {
+            matcher: "both prefix and path are set",
+        }),
+        (false, false) => Err(crate::ConfigError::UnsupportedRouteMatcher {
+            matcher: "neither prefix nor path is set",
+        }),
+    }
 }
 
 /// Phase 11: validate the fault filter config. Rejects invalid abort status
@@ -4255,31 +4207,20 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     ))
 }
 
-/// RFC 7230 §3.2.6 `token` validation: a header field name is a non-empty
-/// sequence of `tchar`. No existing helper in `envoy-config` covers this
-/// (the 04.2 HeaderMatcher work does case-insensitive name *matching*, not
-/// token-set *validation*) — landed inline here per 07.2 SPEC §6 signpost 1.
-fn is_valid_rfc7230_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+/// Parse a duration string via [`parse_duration`] and additionally require it
+/// to be non-zero. Returns `None` on a parse failure or a zero duration;
+/// callers map `None` to their own error variant.
+fn parse_positive_duration(raw: &str) -> Option<std::time::Duration> {
+    parse_duration(raw).ok().filter(|d| !d.is_zero())
 }
 
-/// 06.2 Task 5 — validate an HCM's `access_log` Vec.
-///
-/// Two rejections enforced here (see SPEC §3 D2.2):
-///   1. `name` allow-list: only `envoy.access_loggers.file` is accepted.
-///      Anything else surfaces as `ConfigError::UnsupportedAccessLogType`.
-///      The `@type` URL allow-list is enforced by serde's tagged-enum
-///      deserialization on `AccessLogTypedConfig` (unknown URLs surface as
-///      `ConfigError::Yaml`); this validator does NOT re-check the URL.
-///   2. Non-empty path: `FileAccessLog.path` must not be the empty string.
-///      Empty paths surface as `ConfigError::InvalidAccessLogPath`. The
-///      sink-side `FileSink::new` would also fail on `""`, but rejecting
-///      at parse time gives a clearer diagnostic.
-///
-/// Mutates nothing; returns the first error encountered (validator-wide
-/// convention).
+/// RFC 7230 §3.2.6 `token` validation: a header field name is a non-empty
+/// sequence of `tchar`. Delegates to [`is_cdn_id_tchar`] — the one RFC 7230
+/// `tchar` set in this crate.
+fn is_valid_rfc7230_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(is_cdn_id_tchar)
+}
+
 /// 12.1 (parent-12 D2): validate a cluster's `health_checks` + `common_lb_config`.
 /// Returns the first error encountered (validator-wide convention). HTTP-only,
 /// 0-or-1; TCP/gRPC/custom checkers are rejected (the schema's
@@ -4310,14 +4251,11 @@ fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
             });
         }
         for (field, raw) in [("timeout", &hc.timeout), ("interval", &hc.interval)] {
-            match parse_duration(raw) {
-                Ok(d) if !d.is_zero() => {}
-                _ => {
-                    return Err(crate::ConfigError::InvalidHealthCheckTiming {
-                        cluster: cluster.name.clone(),
-                        field,
-                    });
-                }
+            if parse_positive_duration(raw).is_none() {
+                return Err(crate::ConfigError::InvalidHealthCheckTiming {
+                    cluster: cluster.name.clone(),
+                    field,
+                });
             }
         }
         if http.path.is_empty() {
@@ -4431,16 +4369,13 @@ fn validate_outlier_detection(cluster: &Cluster) -> Result<(), crate::ConfigErro
         ("interval", od.interval.as_deref()),
         ("base_ejection_time", od.base_ejection_time.as_deref()),
     ] {
-        if let Some(raw) = raw_opt {
-            match parse_duration(raw) {
-                Ok(d) if !d.is_zero() => {}
-                _ => {
-                    return Err(crate::ConfigError::InvalidOutlierDetectionTiming {
-                        cluster: cluster.name.clone(),
-                        field,
-                    });
-                }
-            }
+        if let Some(raw) = raw_opt
+            && parse_positive_duration(raw).is_none()
+        {
+            return Err(crate::ConfigError::InvalidOutlierDetectionTiming {
+                cluster: cluster.name.clone(),
+                field,
+            });
         }
     }
     if let Some(v) = od.max_ejection_percent
@@ -4464,6 +4399,21 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
     Ok(())
 }
 
+/// 06.2 Task 5 — validate an HCM's `access_log` Vec.
+///
+/// Two rejections enforced here (see SPEC §3 D2.2):
+///   1. `name` allow-list: only `envoy.access_loggers.file` is accepted.
+///      Anything else surfaces as `ConfigError::UnsupportedAccessLogType`.
+///      The `@type` URL allow-list is enforced by serde's tagged-enum
+///      deserialization on `AccessLogTypedConfig` (unknown URLs surface as
+///      `ConfigError::Yaml`); this validator does NOT re-check the URL.
+///   2. Non-empty path: `FileAccessLog.path` must not be the empty string.
+///      Empty paths surface as `ConfigError::InvalidAccessLogPath`. The
+///      sink-side `FileSink::new` would also fail on `""`, but rejecting
+///      at parse time gives a clearer diagnostic.
+///
+/// Mutates nothing; returns the first error encountered (validator-wide
+/// convention).
 fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigError> {
     for entry in access_logs {
         if entry.name != "envoy.access_loggers.file" {
@@ -4739,6 +4689,15 @@ impl ValueMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Correctly-named terminal router filter, shared by the per-filter
+    /// validator test submodules.
+    fn router_filter() -> HttpFilter {
+        HttpFilter {
+            name: "envoy.filters.http.router".to_string(),
+            typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+        }
+    }
 
     const MINIMAL: &str = r#"
 static_resources:
@@ -8470,13 +8429,14 @@ static_resources:
         )
     }
 
-    /// Drill into the parsed bootstrap and return the first HCM.
+    /// Pull the first HCM from the first static listener (test convenience).
     fn first_hcm(b: &Bootstrap) -> &HttpConnectionManagerConfig {
-        let filter = &b.static_resources.listeners[0].filter_chains[0].filters[0];
-        match filter.typed_config.as_ref().expect("typed_config present") {
-            TypedConfig::HttpConnectionManager(hcm) => hcm,
-            other => panic!("expected HCM typed_config, got {other:?}"),
+        for filter in &b.static_resources.listeners[0].filter_chains[0].filters {
+            if let Some(TypedConfig::HttpConnectionManager(hcm)) = &filter.typed_config {
+                return hcm;
+            }
         }
+        panic!("no HCM on first static listener");
     }
 
     // (a) the `Rds` struct parses; route_config is None.
@@ -9342,16 +9302,6 @@ dynamic_resources:
         )
     }
 
-    /// Pull the single HCM from the first static listener (test convenience).
-    fn first_static_hcm(b: &Bootstrap) -> &HttpConnectionManagerConfig {
-        for filter in &b.static_resources.listeners[0].filter_chains[0].filters {
-            if let Some(TypedConfig::HttpConnectionManager(hcm)) = &filter.typed_config {
-                return hcm;
-            }
-        }
-        panic!("no HCM on first static listener");
-    }
-
     // (a) the RDS pass loads + populates route_config (name-selected).
     #[test]
     fn rds_pass_loads_and_populates_route_config() {
@@ -9365,10 +9315,10 @@ dynamic_resources:
         let yaml = bootstrap_yaml_with_rds("local_route", rds_path.to_str().unwrap());
         let mut b = crate::parse_bootstrap(&yaml).unwrap();
         // Before the load: rds is Some, route_config is None.
-        assert!(first_static_hcm(&b).rds.is_some());
-        assert!(first_static_hcm(&b).route_config.is_none());
+        assert!(first_hcm(&b).rds.is_some());
+        assert!(first_hcm(&b).route_config.is_none());
         crate::load_dynamic_resources(&mut b).unwrap();
-        let hcm = first_static_hcm(&b);
+        let hcm = first_hcm(&b);
         // route_config is now populated (§5.3 uniform shape); rds remains Some.
         let rc = hcm.route_config.as_ref().expect("route_config populated");
         assert_eq!(rc.name, "local_route");
@@ -9444,7 +9394,7 @@ dynamic_resources:
         let mut b = crate::parse_bootstrap(&yaml).unwrap();
         crate::load_dynamic_resources(&mut b)
             .expect("RDS route to a CDS cluster must resolve (§5.7)");
-        let rc = first_static_hcm(&b).route_config.as_ref().unwrap();
+        let rc = first_hcm(&b).route_config.as_ref().unwrap();
         assert_eq!(rc.name, "local_route");
         assert!(b.all_clusters().any(|c| c.name == "dynamic_backend"));
     }
@@ -12012,9 +11962,10 @@ static_resources:
     }
 
     mod header_mutation_validator_tests {
+        use super::router_filter;
         use crate::{
             AppendAction, HeaderMutationConfig, HeaderMutationEntry, HeaderValue,
-            HeaderValueOption, HttpFilter, HttpFilterTypedConfig, Mutations, RouterConfig,
+            HeaderValueOption, HttpFilter, HttpFilterTypedConfig, Mutations,
         };
 
         fn entry(key: &str, value: &str, action: AppendAction) -> HeaderMutationEntry {
@@ -12041,13 +11992,6 @@ static_resources:
                         response_mutations,
                     },
                 }),
-            }
-        }
-
-        fn router_filter() -> HttpFilter {
-            HttpFilter {
-                name: "envoy.filters.http.router".to_string(),
-                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
             }
         }
 
@@ -12216,6 +12160,7 @@ static_resources:
     // -------------------------------------------------------------------
     mod local_rate_limit_tests {
         use super::super::{parse_duration, validate_http_filters};
+        use super::router_filter;
         use crate::{
             AppendAction, ConfigError, HttpFilter, HttpFilterTypedConfig, HttpStatus,
             LocalRateLimitConfig, TokenBucket,
@@ -12302,13 +12247,6 @@ descriptors: []
             HttpFilter {
                 name: "envoy.filters.http.local_ratelimit".to_string(),
                 typed_config: HttpFilterTypedConfig::LocalRateLimit(cfg),
-            }
-        }
-
-        fn router_filter() -> HttpFilter {
-            HttpFilter {
-                name: "envoy.filters.http.router".to_string(),
-                typed_config: HttpFilterTypedConfig::Router(crate::RouterConfig {}),
             }
         }
 
@@ -12864,13 +12802,6 @@ rules:
             }
         }
 
-        fn router_filter() -> HttpFilter {
-            HttpFilter {
-                name: "envoy.filters.http.router".to_string(),
-                typed_config: HttpFilterTypedConfig::Router(crate::RouterConfig {}),
-            }
-        }
-
         #[test]
         fn validate_accepts_rbac_followed_by_router() {
             let filters = vec![make_filter(ok_cfg()), router_filter()];
@@ -13164,13 +13095,6 @@ admin:
             ConfigError, DenominatorType, FaultAbort, FaultConfig, FractionalPercent, HttpFilter,
             HttpFilterTypedConfig,
         };
-
-        fn router_filter() -> HttpFilter {
-            HttpFilter {
-                name: "envoy.filters.http.router".to_string(),
-                typed_config: HttpFilterTypedConfig::Router(crate::RouterConfig {}),
-            }
-        }
 
         // ── schema deserialization ─────────────────────────────────────────
 

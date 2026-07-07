@@ -42,6 +42,11 @@ const MAX_REQUEST_HEAD: usize = 8 * 1024;
 /// budget; the connection task does not hold a JoinSet slot indefinitely.
 const IDLE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `Clone` is derived so `ConnectionHandler::handle` can rebuild an owning
+/// `Arc<Self>` from `&self` without a hand-written field-by-field clone (which
+/// could silently drop a newly-added field). Every field is an `Arc` handle, a
+/// `Copy` `Instant`, or a small map/vec — the clone is cheap (refcount bumps).
+#[derive(Clone)]
 pub struct AdminHandler {
     config: Arc<AdminConfig>,
     registry: Arc<StatsRegistry>,
@@ -333,39 +338,20 @@ impl AdminHandler {
 
 impl ConnectionHandler for AdminHandler {
     /// Phase 08.1 D6 reshape: the trait surface only hands us `&self`, but
-    /// `handle_inner` now needs an `Arc<Self>` so the new
-    /// [`AdminEndpoint::render_with`] dispatch path can reach handler-scoped
-    /// state. We rebuild an owning handle by cloning each internal `Arc`
-    /// field (cheap — `Arc::clone` is a refcount bump) and constructing a
-    /// fresh `AdminHandler`. `start_instant: Instant` is `Copy`;
-    /// `command_line_options` clones the `BTreeMap` (small in 08.1 — single
-    /// `config_path` entry per `envoy-bin/src/main.rs`).
-    ///
-    /// The 06.1 production path used `Arc::clone(&self.registry)` here for
-    /// the same reason; we extend that pattern to the four new handles. The
-    /// `serve` accept loop continues to dispatch through this trait method
-    /// unchanged (see commit `1d546bc` for the pre-08.1-Task-6 baseline).
+    /// `handle_inner` needs an `Arc<Self>` so the [`AdminEndpoint::render_with`]
+    /// dispatch path can reach handler-scoped state. We rebuild an owning
+    /// handle via the derived `Clone` (each internal `Arc` field is a cheap
+    /// refcount bump; `start_instant: Instant` is `Copy`;
+    /// `command_line_options`/`live_route_configs` clone small collections).
+    /// Every spawned task therefore observes the same process-wide shared
+    /// state (e.g. `DrainState` writes from one connection are immediately
+    /// visible to subsequent reads from any connection). The `serve` accept
+    /// loop continues to dispatch through this trait method unchanged.
     fn handle(
         &self,
         downstream: TcpStream,
     ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        let cloned = Arc::new(AdminHandler {
-            config: Arc::clone(&self.config),
-            registry: Arc::clone(&self.registry),
-            bootstrap: Arc::clone(&self.bootstrap),
-            cluster_manager: Arc::clone(&self.cluster_manager),
-            start_instant: self.start_instant,
-            command_line_options: self.command_line_options.clone(),
-            // Phase 08.2 D13b: extend the per-connection handle-clone to the
-            // new DrainState Arc so each spawned task observes the same
-            // process-wide DrainState (writes from one connection are
-            // immediately visible to subsequent reads from any connection).
-            drain: Arc::clone(&self.drain),
-            // 26 Task 6: extend the per-connection handle-clone to the live
-            // route-table sources (cheap — String + Arc bump per entry) so each
-            // spawned task's `/config_dump` reads the same swappable cells.
-            live_route_configs: self.live_route_configs.clone(),
-        });
+        let cloned = Arc::new(self.clone());
         Box::pin(Self::handle_inner(cloned, downstream))
     }
 }
@@ -492,169 +478,104 @@ mod tests {
         buf
     }
 
-    #[tokio::test]
-    async fn handler_serves_ready_in_process() {
-        let (lst, addr) = bind_random().await;
-        let registry = Arc::new(StatsRegistry::new());
-        let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
+    /// Shared `AdminHandler` construction for these tests: dummy bootstrap,
+    /// empty cluster manager, no command-line options, no live route configs,
+    /// and an explicit caller-supplied `DrainState` (for the drain-observing
+    /// tests). `AdminHandler::new`'s widening lineage is documented on the
+    /// constructor itself; the tests only need "a handler over this registry".
+    fn test_handler_with_drain(
+        registry: &Arc<StatsRegistry>,
+        port: u16,
+        drain: Arc<envoy_listener::DrainState>,
+    ) -> AdminHandler {
+        AdminHandler::new(
+            Arc::new(admin_config(port)),
+            Arc::clone(registry),
             dummy_bootstrap(),
             dummy_cluster_manager(),
             Instant::now(),
             BTreeMap::new(),
-            Arc::new(envoy_listener::DrainState::new(&registry)),
+            drain,
             Vec::new(),
-        ));
+        )
+    }
+
+    /// [`test_handler_with_drain`] with a fresh (never-observed) `DrainState`.
+    fn test_handler(registry: &Arc<StatsRegistry>, port: u16) -> AdminHandler {
+        let drain = Arc::new(envoy_listener::DrainState::new(registry));
+        test_handler_with_drain(registry, port, drain)
+    }
+
+    /// The shared in-process serve choreography: bind an ephemeral listener,
+    /// spawn `serve` with a handler over `registry`, drive exactly one `req`,
+    /// shut the server down within the 5s budget, and return the raw response
+    /// as a UTF-8 string.
+    async fn serve_one(registry: &Arc<StatsRegistry>, req: &[u8]) -> String {
+        let (lst, addr) = bind_random().await;
+        let handler = Arc::new(test_handler(registry, addr.port()));
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
         }));
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let resp = drive_request(addr, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        let s = std::str::from_utf8(&resp).unwrap();
-        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {s:?}");
-        assert!(s.ends_with("LIVE\n"), "body: {s:?}");
+        let resp = drive_request(addr, req).await;
+        let s = String::from_utf8(resp).expect("UTF-8 response");
         let _ = tx.send(());
         tokio::time::timeout(std::time::Duration::from_secs(5), server)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn handler_serves_ready_in_process() {
+        let registry = Arc::new(StatsRegistry::new());
+        let s = serve_one(&registry, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status line: {s:?}");
+        assert!(s.ends_with("LIVE\n"), "body: {s:?}");
     }
 
     #[tokio::test]
     async fn handler_serves_stats_prometheus_in_process() {
-        let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
         let c = registry
             .register_counter("listener.foo.downstream_cx_total")
             .unwrap();
         c.add(3);
-        let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::new(envoy_listener::DrainState::new(&registry)),
-            Vec::new(),
-        ));
-        let (tx, rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(serve(lst, handler, async move {
-            let _ = rx.await;
-        }));
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let resp = drive_request(addr, b"GET /stats/prometheus HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        let s = std::str::from_utf8(&resp).unwrap();
+        let s = serve_one(
+            &registry,
+            b"GET /stats/prometheus HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("envoy_listener_foo_downstream_cx_total 3"));
-        let _ = tx.send(());
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
     }
 
     #[tokio::test]
     async fn handler_returns_404_for_unknown_path() {
-        let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
-        let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::new(envoy_listener::DrainState::new(&registry)),
-            Vec::new(),
-        ));
-        let (tx, rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(serve(lst, handler, async move {
-            let _ = rx.await;
-        }));
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let resp = drive_request(addr, b"GET /unknown HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        let s = std::str::from_utf8(&resp).unwrap();
+        let s = serve_one(&registry, b"GET /unknown HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"));
-        let _ = tx.send(());
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
     }
 
     #[tokio::test]
     async fn handler_returns_405_for_post_method() {
-        let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
-        let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::new(envoy_listener::DrainState::new(&registry)),
-            Vec::new(),
-        ));
-        let (tx, rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(serve(lst, handler, async move {
-            let _ = rx.await;
-        }));
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let resp = drive_request(addr, b"POST /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        let s = std::str::from_utf8(&resp).unwrap();
+        let s = serve_one(&registry, b"POST /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(s.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
         assert!(s.contains("allow: GET\r\n"));
-        let _ = tx.send(());
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
     }
 
     #[tokio::test]
     async fn handler_response_carries_server_header() {
-        let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
-        let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::new(envoy_listener::DrainState::new(&registry)),
-            Vec::new(),
-        ));
-        let (tx, rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(serve(lst, handler, async move {
-            let _ = rx.await;
-        }));
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let resp = drive_request(addr, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        let s = std::str::from_utf8(&resp).unwrap();
+        let s = serve_one(&registry, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(
             s.contains("server: envoy-rust\r\n"),
             "missing server header: {s:?}"
         );
-        let _ = tx.send(());
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
     }
 
     /// 06.3 Task 9 — closes 06.1 REVIEW I1: verifies that a silent client
@@ -664,19 +585,11 @@ mod tests {
     /// indefinitely and the test exceeds 7s.
     #[tokio::test]
     async fn admin_handler_idle_read_times_out_at_5s() {
+        // Deliberately NOT `serve_one`: this test sends nothing and observes
+        // the server-side close, so it needs the raw bind/spawn scaffold.
         let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
-        let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::new(envoy_listener::DrainState::new(&registry)),
-            Vec::new(),
-        ));
+        let handler = Arc::new(test_handler(&registry, addr.port()));
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(serve(lst, handler, async move {
             let _ = rx.await;
@@ -724,17 +637,7 @@ mod tests {
     async fn admin_handler_new_takes_drain_state_as_seventh_arg() {
         let registry = Arc::new(StatsRegistry::new());
         let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        let cfg = Arc::new(admin_config(0));
-        let handler = AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::clone(&drain),
-            Vec::new(),
-        );
+        let handler = test_handler_with_drain(&registry, 0, Arc::clone(&drain));
         // Verify the new accessor returns the same Arc (pointer equality).
         assert!(Arc::ptr_eq(handler.drain(), &drain));
     }
@@ -750,17 +653,7 @@ mod tests {
     async fn drain_listeners_endpoint_invokes_drain_via_render_with() {
         let registry = Arc::new(StatsRegistry::new());
         let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        let cfg = Arc::new(admin_config(0));
-        let handler = AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::clone(&drain),
-            Vec::new(),
-        );
+        let handler = test_handler_with_drain(&registry, 0, Arc::clone(&drain));
         assert_eq!(drain.current(), envoy_listener::DrainStage::Live);
         let resp = crate::endpoint::AdminEndpoint::DrainListeners.render_with(&handler);
         assert_eq!(resp.status, 200);
@@ -769,26 +662,8 @@ mod tests {
 
     #[tokio::test]
     async fn handler_response_carries_admin_headers() {
-        let (lst, addr) = bind_random().await;
         let registry = Arc::new(StatsRegistry::new());
-        let cfg = Arc::new(admin_config(addr.port()));
-        let handler = Arc::new(AdminHandler::new(
-            cfg,
-            Arc::clone(&registry),
-            dummy_bootstrap(),
-            dummy_cluster_manager(),
-            Instant::now(),
-            BTreeMap::new(),
-            Arc::new(envoy_listener::DrainState::new(&registry)),
-            Vec::new(),
-        ));
-        let (tx, rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(serve(lst, handler, async move {
-            let _ = rx.await;
-        }));
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let resp = drive_request(addr, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        let s = std::str::from_utf8(&resp).unwrap();
+        let s = serve_one(&registry, b"GET /ready HTTP/1.1\r\nHost: x\r\n\r\n").await;
         // SPEC §3 D3 "non-negotiable mirroring" — all 4 standard admin headers present.
         assert!(
             s.contains("cache-control: no-cache, max-age=0\r\n"),
@@ -808,12 +683,22 @@ mod tests {
             s.contains(" GMT\r\n"),
             "date header malformed (no GMT): {s:?}"
         );
-        let _ = tx.send(());
-        tokio::time::timeout(std::time::Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+    }
+
+    /// Phase 08.1 D13a: `AdminHandler::new` widened from the 2-arg
+    /// `(config, registry)` shape to capture the handles Tasks 6/7/8/9 need at
+    /// render time; 08.2 D13b appended the `Arc<DrainState>`; 26 Task 6
+    /// appended `live_route_configs`. This test asserts the constructor still
+    /// accepts all handles and produces a usable `AdminHandler` (the test name
+    /// retains its 08.1 "six_args" suffix as a deliberate historical
+    /// artifact). Detailed field-routing coverage lives with the consumer
+    /// endpoints' tests.
+    #[test]
+    fn admin_handler_new_accepts_six_args_and_constructs() {
+        let registry = Arc::new(StatsRegistry::new());
+        let handler = test_handler(&registry, 0);
+        // Sanity: the existing `config()` accessor still works post-widening.
+        assert_eq!(handler.config().address.port(), 0);
     }
 }
 
@@ -939,91 +824,5 @@ mod drain_budget_lockstep_tests {
         // Compile-time tautology: if envoy-admin does not import
         // envoy_listener::DRAIN_BUDGET, this fails to compile.
         assert_eq!(envoy_listener::DRAIN_BUDGET, Duration::from_secs(5));
-    }
-}
-
-#[cfg(test)]
-mod admin_handler_new_6arg_tests {
-    //! Phase 08.1 D13a: `AdminHandler::new` widens from a 2-arg
-    //! `(config, registry)` shape to a 6-arg shape that captures the four
-    //! additional handles that Tasks 6/7/8/9 (`/server_info`, `/config_dump`,
-    //! `/clusters`, `/stats` JSON timestamps) need at render time: an
-    //! `Arc<Bootstrap>` for serialization, an `Arc<ClusterManager>` for the
-    //! cluster surface, an `Instant` startup mark for uptime computation, and
-    //! a `BTreeMap<String, serde_yaml::Value>` of command-line options.
-    //!
-    //! SPEC §3 D13a called this widening "5-arg"; the PLAN refined that to
-    //! 6-arg by lock-in #7 (`command_line_options` is built once at
-    //! construction time, not lazily at first render). Recorded as PROGRESS
-    //! deviation #2 for this task.
-
-    use super::AdminHandler;
-    use crate::config::AdminConfig;
-    use envoy_cluster::ClusterManager;
-    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
-    use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    fn dummy_admin_config() -> Arc<AdminConfig> {
-        Arc::new(
-            AdminConfig::from_envoy_config(&Admin {
-                address: Address {
-                    socket_address: SocketAddress {
-                        address: "127.0.0.1".to_string(),
-                        port_value: 0,
-                    },
-                },
-                access_log_path: None,
-            })
-            .unwrap(),
-        )
-    }
-
-    fn dummy_bootstrap() -> Arc<Bootstrap> {
-        let yaml =
-            "node:\n  id: t\n  cluster: t\nstatic_resources:\n  listeners: []\n  clusters: []\n";
-        Arc::new(serde_yaml::from_str::<Bootstrap>(yaml).unwrap())
-    }
-
-    fn dummy_cluster_manager() -> Arc<ClusterManager> {
-        Arc::new(ClusterManager::empty())
-    }
-
-    #[test]
-    fn admin_handler_new_accepts_six_args_and_constructs() {
-        // The body of the test is intentionally minimal: the constructor
-        // must accept all (now seven) handles and produce a usable
-        // `AdminHandler`. The 7th-parameter `Arc<DrainState>` is the 08.2
-        // D13b (Task 4) widening — the test name retains its 08.1
-        // "six_args" suffix as a deliberate historical artifact (the
-        // sibling `admin_handler_new_takes_drain_state_as_seventh_arg`
-        // test in `super::tests` is the post-Task-4-shape-specific
-        // coverage; this test continues to assert the constructor + the
-        // `config()` accessor still works post-widening). Detailed
-        // field-routing tests live with the consumer tasks (6/7/8/9)
-        // which render the handles into their endpoints.
-        let cfg = dummy_admin_config();
-        let registry = Arc::new(StatsRegistry::new());
-        let bootstrap = dummy_bootstrap();
-        let cluster_manager = dummy_cluster_manager();
-        let start_instant = Instant::now();
-        let command_line_options: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-
-        let handler = AdminHandler::new(
-            cfg,
-            registry,
-            bootstrap,
-            cluster_manager,
-            start_instant,
-            command_line_options,
-            drain,
-            Vec::new(),
-        );
-
-        // Sanity: the existing `config()` accessor still works post-widening.
-        assert_eq!(handler.config().address.port(), 0);
     }
 }

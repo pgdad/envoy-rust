@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use envoy_stats::{Counter, StatsRegistry};
 
 use crate::error::FilterError;
@@ -41,11 +40,10 @@ impl FaultFilter {
         registry: &Arc<StatsRegistry>,
         hcm_stat_prefix: &str,
     ) -> Result<Self, FilterError> {
-        let aborts_injected = registry
-            .register_counter(&format!("http.{hcm_stat_prefix}.fault.aborts_injected"))
-            .map_err(|e| FilterError::InvalidConfig {
-                message: format!("StatsRegistry: {e}"),
-            })?;
+        let aborts_injected = crate::error::register_counter(
+            registry,
+            &format!("http.{hcm_stat_prefix}.fault.aborts_injected"),
+        )?;
         Ok(Self {
             abort_status: cfg.abort.http_status,
             abort_selects: cfg.abort.percentage.selects_deterministic(),
@@ -57,12 +55,11 @@ impl FaultFilter {
     pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         if header_gate_matches(&self.header_gate, req) && self.abort_selects {
             self.aborts_injected.inc();
-            return Decision::StopAndSend(FilterResponse {
-                status: self.abort_status,
-                reason: None,
-                headers: vec![],
-                body: Bytes::from_static(FAULT_ABORT_BODY),
-            });
+            return Decision::StopAndSend(FilterResponse::static_reply(
+                self.abort_status,
+                None,
+                FAULT_ABORT_BODY,
+            ));
         }
         Decision::Continue
     }
@@ -82,9 +79,9 @@ fn header_gate_matches(gate: &[envoy_config::HeaderMatcher], req: &FilterRequest
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::header_matcher_exact;
     use envoy_config::{
         DenominatorType, FaultAbort, FaultConfig, FractionalPercent, HeaderMatcher,
-        HeaderMatcherMode, StringMatcher, StringMatcherMode,
     };
     use envoy_stats::StatsRegistry;
     use std::sync::Arc;
@@ -102,24 +99,10 @@ mod tests {
         }
     }
 
-    fn header_matcher_exact(name: &str, value: &str) -> HeaderMatcher {
-        HeaderMatcher {
-            name: name.to_string(),
-            mode: HeaderMatcherMode::StringMatch(StringMatcher {
-                mode: StringMatcherMode::Exact(value.to_string()),
-                ignore_case: false,
-            }),
-            invert_match: false,
-        }
-    }
-
     fn req(headers: Vec<(String, String)>) -> FilterRequest {
         FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
             headers,
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
+            ..FilterRequest::test("GET", "/", &[])
         }
     }
 
@@ -190,12 +173,7 @@ mod tests {
         let registry = Arc::new(StatsRegistry::new());
         let mut f =
             FaultFilter::build_from_config(&cfg(100, vec![]), &registry, "ingress_http").unwrap();
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
     }
 }

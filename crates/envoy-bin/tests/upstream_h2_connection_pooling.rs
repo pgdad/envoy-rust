@@ -59,103 +59,20 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+mod common;
+
+use common::{assert_stat, reserve_port, scrape_admin_stats, wait_ready};
 
 /// Settle window past the last response before scraping admin stats.
 /// Matches fixture 0021's `settle_ms: 500` (Task 5 ADR-0039 pivot).
 const SETTLE_MS: u64 = 500;
-
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
-/// Wait for TCP-accept readiness on `addr` within `budget`. Identical
-/// shape to the H1 sibling's `wait_ready`.
-///
-/// Backend H2-handshake-readiness probe is NOT required here. The
-/// helper's accept loop is poll-immediate after `TcpListener::bind`
-/// (no async work between bind and `listener.accept().await` — see
-/// `tests/helpers/http2-echo-server/src/main.rs:99-122`), and the
-/// kernel buffers SYNs at the listening socket between bind and
-/// userspace `accept()`, so incoming TCP connections aren't lost
-/// during the brief poll-then-accept window. The h2 client preface
-/// at `crates/envoy-http2/src/client.rs:42-56` uses a ~10ms detection
-/// window that ONLY fails on immediate H2-incompatible bytes; it does
-/// NOT wait for the server's SETTINGS frame, so the helper's own h2
-/// server-handshake doesn't have to be ready in <10ms — the client
-/// doesn't block waiting for it. Empirically the test passes in ~2s
-/// with no flake; if the race were practically reachable, it would
-/// surface as `upstream_cx_total != 1` on first attempt. If a future
-/// flake does surface, the differential harness's `wait_h2_accept_ready`
-/// at `tests/differential/src/backend.rs:424-447` shows the
-/// h2-handshake-ready probe pattern that can be borrowed here.
-async fn wait_ready(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Open a fresh TCP conn to admin, GET `/stats`, parse the
-/// `<name>: <value>` text lines into a map (only rows with a numeric
-/// value are retained). Identical shape to the H1 sibling — the admin
-/// listener is HTTP/1.1 regardless of the data-plane HCM `codec_type`.
-async fn scrape_admin_stats(admin: SocketAddr) -> HashMap<String, u64> {
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(admin))
-        .await
-        .expect("admin connect timeout")
-        .expect("admin connect");
-    let req = "GET /stats HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n";
-    stream.write_all(req.as_bytes()).await.expect("admin write");
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
-        .await
-        .expect("admin read timeout")
-        .expect("admin read");
-    let head_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("admin head terminator");
-    let body = std::str::from_utf8(&buf[head_end + 4..]).expect("admin body utf8");
-    let mut out = HashMap::new();
-    for line in body.lines() {
-        if let Some((name, value)) = line.split_once(": ")
-            && let Ok(v) = value.trim().parse::<u64>()
-        {
-            out.insert(name.trim().to_string(), v);
-        }
-    }
-    out
-}
-
-fn assert_stat(stats: &HashMap<String, u64>, name: &str, expected: u64) {
-    let actual = stats
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| panic!("stat {name:?} absent; have {} rows", stats.len()));
-    assert_eq!(
-        actual, expected,
-        "stat {name:?}: expected {expected}, got {actual}"
-    );
-}
 
 /// Spawn the `http2-echo-server` helper. Mirrors the H1 sibling's
 /// `cargo run --manifest-path` pattern (the helper isn't pre-built;

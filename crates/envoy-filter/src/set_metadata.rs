@@ -37,7 +37,6 @@ impl SetMetadataFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn entry(ns: &str, kv: &[(&str, &str)], allow_overwrite: bool) -> envoy_config::MetadataEntry {
         envoy_config::MetadataEntry {
@@ -55,13 +54,7 @@ mod tests {
     }
 
     fn req() -> FilterRequest {
-        FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: vec![],
-            body: None,
-            dynamic_metadata: BTreeMap::new(),
-        }
+        FilterRequest::test("GET", "/", &[])
     }
 
     #[test]
@@ -111,12 +104,7 @@ mod tests {
     #[test]
     fn encode_is_inert() {
         let mut f = filter(vec![entry("envoy.test", &[("tier", "prod")], false)]);
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
     }
 }

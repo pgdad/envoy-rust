@@ -38,36 +38,17 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
+mod common;
 
-async fn wait_ready(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
+use common::{assert_stat, reserve_port, scrape_admin_stats, wait_ready};
 
 /// Single-request keep-alive helper: writes one request on the existing stream,
 /// reads the status line + headers + `Content-Length`-bounded body so the next
@@ -185,48 +166,6 @@ fn assert_5_standard_headers_present(headers: &[(String, String)]) {
             "missing standard header {required:?}\nactual: {headers:?}",
         );
     }
-}
-
-/// Open a fresh TCP conn to admin, GET `/stats`, parse the `<name>: <value>`
-/// text lines into a map (only rows with a numeric value retained). Copied from
-/// `upstream_connection_pooling.rs`.
-async fn scrape_admin_stats(admin: SocketAddr) -> HashMap<String, u64> {
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(admin))
-        .await
-        .expect("admin connect timeout")
-        .expect("admin connect");
-    let req = "GET /stats HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n";
-    stream.write_all(req.as_bytes()).await.expect("admin write");
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
-        .await
-        .expect("admin read timeout")
-        .expect("admin read");
-    let head_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("admin head terminator");
-    let body = std::str::from_utf8(&buf[head_end + 4..]).expect("admin body utf8");
-    let mut out = HashMap::new();
-    for line in body.lines() {
-        if let Some((name, value)) = line.split_once(": ")
-            && let Ok(v) = value.trim().parse::<u64>()
-        {
-            out.insert(name.trim().to_string(), v);
-        }
-    }
-    out
-}
-
-fn assert_stat(stats: &HashMap<String, u64>, name: &str, expected: u64) {
-    let actual = stats
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| panic!("stat {name:?} absent; have {} rows", stats.len()));
-    assert_eq!(
-        actual, expected,
-        "stat {name:?}: expected {expected}, got {actual}"
-    );
 }
 
 /// Spawn the `health-aware-http1-backend` helper with `/fail=500`

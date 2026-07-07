@@ -45,205 +45,20 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
 
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
+mod common;
 
-async fn wait_ready(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Single one-shot H1 request over a fresh downstream conn (`Connection: close`):
-/// writes the request, reads the status line + headers + `Content-Length`-bounded
-/// body. Returns `(status, body)`.
-async fn http1_oneshot(hcm: SocketAddr, path: &str) -> (u16, Vec<u8>) {
-    let mut stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(hcm))
-        .await
-        .expect("downstream connect timeout")
-        .expect("downstream connect");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: dynamic_backend\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("write");
-
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let head_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let mut chunk = [0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .expect("header read timeout")
-            .expect("header read");
-        assert!(n > 0, "EOF before headers complete on {path}");
-        buf.extend_from_slice(&chunk[..n]);
-    };
-
-    let head = std::str::from_utf8(&buf[..head_end - 4]).expect("utf8 head");
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().expect("status");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .expect("status code")
-        .parse()
-        .expect("status numeric");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|l| {
-            let (n, v) = l.split_once(':')?;
-            Some((n.trim().to_string(), v.trim().to_string()))
-        })
-        .collect();
-
-    let cl: usize = headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-        .map(|(_, v)| v.parse().expect("content-length numeric"))
-        .expect("content-length header present");
-
-    let body_start = head_end;
-    while buf.len() < body_start + cl {
-        let mut chunk = [0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .expect("body read timeout")
-            .expect("body read");
-        assert!(n > 0, "EOF before body complete on {path}");
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body = buf[body_start..body_start + cl].to_vec();
-    (status, body)
-}
-
-/// Open a fresh TCP conn to admin, GET `path`, read the whole response, split off
-/// the body. Returns the raw body bytes.
-async fn admin_get_body(admin: SocketAddr, path: &str) -> Vec<u8> {
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(admin))
-        .await
-        .expect("admin connect timeout")
-        .expect("admin connect");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("admin write");
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
-        .await
-        .expect("admin read timeout")
-        .expect("admin read");
-    let head_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("admin head terminator");
-    buf[head_end + 4..].to_vec()
-}
-
-/// GET admin `/stats` and parse `<name>: <value>` numeric rows into a map.
-async fn scrape_admin_stats(admin: SocketAddr) -> HashMap<String, u64> {
-    let body = admin_get_body(admin, "/stats").await;
-    let text = std::str::from_utf8(&body).expect("admin body utf8");
-    let mut out = HashMap::new();
-    for line in text.lines() {
-        if let Some((name, value)) = line.split_once(": ")
-            && let Ok(v) = value.trim().parse::<u64>()
-        {
-            out.insert(name.trim().to_string(), v);
-        }
-    }
-    out
-}
-
-fn assert_stat(stats: &HashMap<String, u64>, name: &str, expected: u64) {
-    let actual = stats
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| panic!("stat {name:?} absent; have {} rows", stats.len()));
-    assert_eq!(
-        actual, expected,
-        "stat {name:?}: expected {expected}, got {actual}"
-    );
-}
-
-// ── in-process backend ──────────────────────────────────────────────────────
-
-/// Spawn an in-process H1 backend that replies to every request with a 200 whose
-/// body is the fixed `body` string. Returns the bound port. The backend serves a
-/// keep-alive request loop per connection (honoring `Connection: close`).
-async fn spawn_backend(body: &'static str) -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("bind backend");
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        loop {
-            let (sock, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => break,
-            };
-            tokio::spawn(serve_backend_conn(sock, body));
-        }
-    });
-    port
-}
-
-async fn serve_backend_conn(mut sock: TcpStream, body: &'static str) {
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    loop {
-        let head_end = loop {
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-            let mut chunk = [0u8; 512];
-            match sock.read(&mut chunk).await {
-                Ok(0) => return,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(_) => return,
-            }
-        };
-        let head = std::str::from_utf8(&buf[..head_end]).unwrap_or("");
-        let wants_close = head.lines().any(|l| {
-            l.to_ascii_lowercase().starts_with("connection:")
-                && l.to_ascii_lowercase().contains("close")
-        });
-        buf.drain(..head_end);
-
-        let conn = if wants_close { "close" } else { "keep-alive" };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\n\
-             content-length: {len}\r\n\
-             content-type: text/plain\r\n\
-             connection: {conn}\r\n\r\n{body}",
-            len = body.len(),
-        );
-        if sock.write_all(resp.as_bytes()).await.is_err() {
-            return;
-        }
-        let _ = sock.flush().await;
-        if wants_close {
-            return;
-        }
-    }
-}
+use common::{
+    admin_get_body, assert_stat, http1_oneshot, reserve_port, scrape_admin_stats, spawn_backend,
+    spawn_envoy_bin, wait_ready, write_file,
+};
 
 // ── bootstrap builders ────────────────────────────────────────────────────────
 
@@ -349,28 +164,6 @@ fn bootstrap_with_route(
     )
 }
 
-/// Write `contents` to `dir/name` and return the absolute path string.
-fn write_file(dir: &std::path::Path, name: &str, contents: &str) -> String {
-    let path = dir.join(name);
-    std::fs::File::create(&path)
-        .unwrap()
-        .write_all(contents.as_bytes())
-        .unwrap();
-    path.to_str().unwrap().to_string()
-}
-
-/// Spawn `envoy-bin -c <cfg>` with the established stdio discipline.
-fn spawn_envoy_bin(cfg: &std::path::Path) -> tokio::process::Child {
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_envoy-bin"))
-        .arg("-c")
-        .arg(cfg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn envoy-bin")
-}
-
 // ── (i) happy path ──────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -399,7 +192,7 @@ async fn happy_path_dynamic_cluster_serves_and_reports() {
         .expect("envoy-bin admin ready");
 
     // Data plane: GET / routed through the CDS-supplied cluster → 200 + body.
-    let (status, body) = http1_oneshot(hcm_addr, "/").await;
+    let (status, _, body) = http1_oneshot(hcm_addr, "/", "dynamic_backend").await;
     assert_eq!(
         status, 200,
         "(i) happy path: expected 200 via dynamic cluster"
@@ -586,7 +379,7 @@ async fn static_dynamic_collision_static_wins() {
         .expect("envoy-bin admin ready");
 
     // DATA PLANE proof: static wins → backend A's body.
-    let (status, body) = http1_oneshot(hcm_addr, "/").await;
+    let (status, _, body) = http1_oneshot(hcm_addr, "/", "dynamic_backend").await;
     assert_eq!(
         status, 200,
         "(iv) collision: expected 200 (static cluster serves)"

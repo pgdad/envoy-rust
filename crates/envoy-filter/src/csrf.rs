@@ -19,16 +19,15 @@
 //! introduction is no longer needed now that every item is reachable from the
 //! instance dispatch.
 //!
-//! `header_ci` is duplicated from jwt_authn/cors (now N=3); the shared-util
-//! extraction stays deferred (the standing M-track consolidation item).
+//! `header_ci` lives in `crate::types` — the shared utility that closed the
+//! former jwt_authn/cors/csrf triplication (the standing M-track item).
 use std::sync::Arc;
 
-use bytes::Bytes;
 use envoy_stats::{Counter, StatsRegistry};
 
 use crate::error::FilterError;
 use crate::pipeline::Decision;
-use crate::types::{FilterRequest, FilterResponse};
+use crate::types::{FilterRequest, FilterResponse, header_ci};
 
 const CSRF_FILTER_NAME: &str = "envoy.filters.http.csrf";
 const MODIFY_METHODS: &[&str] = &["POST", "PUT", "DELETE", "PATCH"];
@@ -88,11 +87,10 @@ impl CsrfFilter {
         hcm_stat_prefix: &str,
     ) -> Result<Self, FilterError> {
         let reg = |suffix: &str| {
-            registry
-                .register_counter(&format!("http.{hcm_stat_prefix}.csrf.{suffix}"))
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: format!("StatsRegistry: {e}"),
-                })
+            crate::error::register_counter(
+                registry,
+                &format!("http.{hcm_stat_prefix}.csrf.{suffix}"),
+            )
         };
         let base = CompiledCsrfPolicy::from(cfg);
         Ok(Self {
@@ -172,12 +170,7 @@ impl CsrfFilter {
 // ---------------------------------------------------------------------------
 
 fn failure_response() -> FilterResponse {
-    FilterResponse {
-        status: 403,
-        reason: Some("Forbidden"),
-        headers: Vec::new(),
-        body: Bytes::from_static(FAILURE_BODY),
-    }
+    FilterResponse::static_reply(403, Some("Forbidden"), FAILURE_BODY)
 }
 
 /// Reduce an origin/host value to the scheme-stripped `host[:port]` authority
@@ -192,15 +185,6 @@ fn host_and_port(value: &str) -> &str {
     }
 }
 
-/// Case-insensitive header lookup — duplicated from jwt_authn/cors per SC5
-/// (no shared utility extraction; N=3).
-fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,7 +193,6 @@ mod tests {
         StringMatcherMode,
     };
     use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     fn fe(n: u32) -> RuntimeFractionalPercent {
@@ -237,16 +220,7 @@ mod tests {
         Arc::new(StatsRegistry::new())
     }
     fn req(method: &str, headers: &[(&str, &str)]) -> FilterRequest {
-        FilterRequest {
-            method: method.into(),
-            path: "/".into(),
-            headers: headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test(method, "/", headers)
     }
     fn cval(r: &Arc<StatsRegistry>, s: &str) -> u64 {
         r.register_counter(&format!("http.ingress_http.csrf.{s}"))
@@ -254,27 +228,7 @@ mod tests {
             .value()
     }
     fn route_with_csrf(p: CsrfPolicy) -> envoy_config::Route {
-        let mut pfc_map = BTreeMap::new();
-        pfc_map.insert(
-            CSRF_FILTER_NAME.to_string(),
-            envoy_config::PerFilterConfig::Csrf(p),
-        );
-        envoy_config::Route {
-            name: String::new(),
-            r#match: envoy_config::RouteMatch {
-                prefix: Some("/".to_string()),
-                path: None,
-                headers: vec![],
-            },
-            action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
-                status: 200,
-                body: envoy_config::DataSource {
-                    filename: None,
-                    inline_string: None,
-                },
-            }),
-            typed_per_filter_config: pfc_map,
-        }
+        crate::types::test_route_with_pfc(CSRF_FILTER_NAME, envoy_config::PerFilterConfig::Csrf(p))
     }
 
     // host_and_port (ADR-0061 L3)

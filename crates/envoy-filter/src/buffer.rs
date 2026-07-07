@@ -16,8 +16,6 @@
 //!   with no buffer override keeps the chain base.
 //! - Decode-side only; `encode_headers` is the trivial `Continue` arm. NO stats
 //!   (ADR-0063 finding 4 — Envoy emits no buffer-scoped counters).
-use bytes::Bytes;
-
 use crate::pipeline::Decision;
 use crate::types::{FilterRequest, FilterResponse};
 
@@ -104,55 +102,30 @@ impl BufferFilter {
 /// `content-length`, `server`, `date`(, `connection`) are stamped by the H1/H2
 /// synth decorators downstream of the pipeline (the rbac/csrf precedent).
 fn over_limit_response() -> FilterResponse {
-    FilterResponse {
-        status: 413,
-        reason: Some("Payload Too Large"),
-        headers: Vec::new(),
-        body: Bytes::from_static(OVER_LIMIT_BODY),
-    }
+    FilterResponse::static_reply(413, Some("Payload Too Large"), OVER_LIMIT_BODY)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use bytes::Bytes;
 
     fn req_with_body(method: &str, path: &str, body: &[u8]) -> FilterRequest {
         FilterRequest {
-            method: method.into(),
-            path: path.into(),
-            headers: vec![],
             body: if body.is_empty() {
                 None
             } else {
                 Some(Bytes::copy_from_slice(body))
             },
-            dynamic_metadata: std::collections::BTreeMap::new(),
+            ..FilterRequest::test(method, path, &[])
         }
     }
 
     fn route_with_buffer(pr: envoy_config::BufferPerRoute) -> envoy_config::Route {
-        let mut pfc = BTreeMap::new();
-        pfc.insert(
-            BUFFER_FILTER_NAME.to_string(),
+        crate::types::test_route_with_pfc(
+            BUFFER_FILTER_NAME,
             envoy_config::PerFilterConfig::Buffer(pr),
-        );
-        envoy_config::Route {
-            name: String::new(),
-            r#match: envoy_config::RouteMatch {
-                prefix: Some("/".to_string()),
-                path: None,
-                headers: vec![],
-            },
-            action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
-                status: 200,
-                body: envoy_config::DataSource {
-                    filename: None,
-                    inline_string: None,
-                },
-            }),
-            typed_per_filter_config: pfc,
-        }
+        )
     }
 
     fn filter(max: u32) -> BufferFilter {

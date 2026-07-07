@@ -1,7 +1,8 @@
-//! AccessLogRecord — POD value-type carrying the 14 fields rendered by
-//! the Envoy default-format access-log emitter (plus a leading
-//! `start_time` SystemTime that the emitter formats per
-//! `default_format::format_iso8601`).
+//! AccessLogRecord — POD value-type carrying the per-request fields
+//! rendered by the Envoy access-log emitters: the 14 default-format
+//! substitution targets, a leading `start_time` SystemTime (formatted
+//! per `default_format::format_iso8601`), and 4 later-phase
+//! command-operator targets (19 fields total).
 //!
 //! Built at HCM on-response-complete time by `envoy-http1::hcm`'s
 //! factored join point; consumed (by reference) by
@@ -10,10 +11,11 @@
 use std::time::{Duration, SystemTime};
 
 /// AccessLogRecord — value-type carrying the per-request state that
-/// the Envoy default-format emitter renders. 15 fields total: a
-/// leading SystemTime for `%START_TIME%`, then 14 substitution
-/// targets matching the Envoy default access-log format (one per
-/// token).
+/// the Envoy access-log emitters render. 19 fields total: a leading
+/// SystemTime for `%START_TIME%`, 14 substitution targets matching
+/// the Envoy default access-log format (one per token), plus 4
+/// later-phase command-operator targets (`upstream_cluster`,
+/// `route_name`, `response_code_details`, `dynamic_metadata`).
 ///
 /// Built at HCM on-response-complete time; consumed by reference by
 /// the default-format emitter and the FileSink. Owns its String
@@ -110,16 +112,21 @@ pub struct AccessLogRecord {
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
+/// Shared test-fixture constructor. Lives on the type (not in a test module)
+/// so every in-crate test module can build the canonical baseline record from
+/// ONE literal — adding a record field forces exactly one test-side update.
+///
+/// Deliberately NOT a `Default` impl: the struct's no-Default rule (see the
+/// struct doc above) is load-bearing for the production record-build site.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-    use std::time::UNIX_EPOCH;
-
-    #[test]
-    fn record_dynamic_metadata_defaults_empty_and_carries_values() {
-        let empty = AccessLogRecord {
-            start_time: UNIX_EPOCH,
+impl AccessLogRecord {
+    /// The GET `/` → 200 baseline fixture record (mirrors fixture 0012's
+    /// direct_response surface): `HTTP/1.1`, flags `-`, 0 bytes received,
+    /// 3 bytes sent, 5 ms duration, every `Option` field absent, empty
+    /// dynamic metadata. Tests mutate a copy for their variant shapes.
+    pub(crate) fn test_baseline() -> Self {
+        AccessLogRecord {
+            start_time: std::time::UNIX_EPOCH,
             method: "GET".into(),
             path: "/".into(),
             protocol: "HTTP/1.1".into(),
@@ -137,8 +144,19 @@ mod tests {
             upstream_cluster: None,
             route_name: None,
             response_code_details: None,
-            dynamic_metadata: BTreeMap::new(),
-        };
+            dynamic_metadata: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn record_dynamic_metadata_defaults_empty_and_carries_values() {
+        let empty = AccessLogRecord::test_baseline();
         assert!(empty.dynamic_metadata.is_empty());
 
         let mut dm: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -154,27 +172,7 @@ mod tests {
 
     #[test]
     fn record_route_name_defaults_and_carries_value() {
-        let absent = AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "GET".into(),
-            path: "/".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 0,
-            bytes_sent: 3,
-            duration: Duration::from_millis(5),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: None,
-            request_id: None,
-            authority: None,
-            upstream_host: None,
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: BTreeMap::new(),
-        };
+        let absent = AccessLogRecord::test_baseline();
         assert!(absent.route_name.is_none());
 
         let named = AccessLogRecord {
@@ -186,27 +184,7 @@ mod tests {
 
     #[test]
     fn record_response_code_details_defaults_and_carries_value() {
-        let absent = AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "GET".into(),
-            path: "/".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 0,
-            bytes_sent: 3,
-            duration: Duration::from_millis(5),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: None,
-            request_id: None,
-            authority: None,
-            upstream_host: None,
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: BTreeMap::new(),
-        };
+        let absent = AccessLogRecord::test_baseline();
         assert!(absent.response_code_details.is_none());
 
         let detailed = AccessLogRecord {
@@ -221,27 +199,7 @@ mod tests {
 
     #[test]
     fn record_upstream_cluster_defaults_and_carries_value() {
-        let absent = AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "GET".into(),
-            path: "/".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 0,
-            bytes_sent: 3,
-            duration: Duration::from_millis(5),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: None,
-            request_id: None,
-            authority: None,
-            upstream_host: None,
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: BTreeMap::new(),
-        };
+        let absent = AccessLogRecord::test_baseline();
         assert!(absent.upstream_cluster.is_none());
 
         let clustered = AccessLogRecord {
@@ -256,27 +214,8 @@ mod tests {
 
     #[test]
     fn record_construction_full() {
-        let record = AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "GET".into(),
-            path: "/".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 0,
-            bytes_sent: 3,
-            duration: Duration::from_millis(5),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: None,
-            request_id: None,
-            authority: Some("envoy-rust.test".into()),
-            upstream_host: None,
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: BTreeMap::new(),
-        };
+        let mut record = AccessLogRecord::test_baseline();
+        record.authority = Some("envoy-rust.test".into());
         let dbg = format!("{:?}", record);
         assert!(dbg.contains("method: \"GET\""), "debug output: {}", dbg);
         assert!(
@@ -288,27 +227,7 @@ mod tests {
 
     #[test]
     fn record_clone_is_deep_for_strings() {
-        let original = AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "GET".into(),
-            path: "/".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 0,
-            bytes_sent: 3,
-            duration: Duration::from_millis(5),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: None,
-            request_id: None,
-            authority: None,
-            upstream_host: None,
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: BTreeMap::new(),
-        };
+        let original = AccessLogRecord::test_baseline();
         let mut clone = original.clone();
         clone.method = "POST".into();
         assert_eq!(original.method, "GET");

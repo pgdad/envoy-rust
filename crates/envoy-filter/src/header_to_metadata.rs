@@ -4,7 +4,7 @@
 //! `req.dynamic_metadata[namespace][key]`; an absent header applies on_header_missing's static
 //! `value`; a present-but-empty header writes nothing (§A4). Encode inert.
 use crate::pipeline::Decision;
-use crate::types::{FilterRequest, FilterResponse};
+use crate::types::{FilterRequest, FilterResponse, header_ci};
 
 #[derive(Debug, Clone)]
 pub struct HeaderToMetadataFilter {
@@ -20,11 +20,7 @@ impl HeaderToMetadataFilter {
 
     pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         for rule in &self.rules {
-            let found = req
-                .headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(&rule.header))
-                .map(|(_, v)| v.clone());
+            let found = header_ci(&req.headers, &rule.header).map(str::to_owned);
             let action = match found.as_deref() {
                 Some(v) if !v.is_empty() => rule
                     .on_header_present
@@ -56,7 +52,6 @@ impl HeaderToMetadataFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn kv(ns: &str, key: &str, value: Option<&str>) -> envoy_config::HeaderToMetadataKeyValue {
         envoy_config::HeaderToMetadataKeyValue {
@@ -86,16 +81,7 @@ mod tests {
     }
 
     fn req(headers: Vec<(&str, &str)>) -> FilterRequest {
-        FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: headers
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: None,
-            dynamic_metadata: BTreeMap::new(),
-        }
+        FilterRequest::test("GET", "/", &headers)
     }
 
     #[test]
@@ -182,12 +168,7 @@ mod tests {
             Some(kv("envoy.lb", "tier", None)),
             None,
         )]);
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
     }
 }

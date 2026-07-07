@@ -377,13 +377,7 @@ mod tests {
         assert!(matches!(inst, HttpFilterInstance::JwtAuthn(_)));
 
         // missing Authorization header → filter must short-circuit with 401
-        let mut req = FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: vec![("host".into(), "envoy.test".into())],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
+        let mut req = FilterRequest::test("GET", "/", &[("host", "envoy.test")]);
         match inst.decode_headers(&mut req) {
             Decision::StopAndSend(r) => assert_eq!(r.status, 401),
             Decision::Continue => {
@@ -392,12 +386,7 @@ mod tests {
         }
 
         // encode_headers is a no-op for JwtAuthn — must return Continue
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
     }
 
@@ -428,28 +417,21 @@ mod tests {
         // No route override → chain base (100%) guards. A POST with a mismatched
         // Origin must short-circuit with 403 (decode-side enforcement).
         inst.apply_route_config(None);
-        let mut req = FilterRequest {
-            method: "POST".into(),
-            path: "/".into(),
-            headers: vec![
-                ("host".into(), "localhost:10000".into()),
-                ("origin".into(), "http://evil.example.com".into()),
+        let mut req = FilterRequest::test(
+            "POST",
+            "/",
+            &[
+                ("host", "localhost:10000"),
+                ("origin", "http://evil.example.com"),
             ],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
+        );
         match inst.decode_headers(&mut req) {
             Decision::StopAndSend(r) => assert_eq!(r.status, 403),
             Decision::Continue => panic!("expected StopAndSend(403) for cross-origin POST"),
         }
 
         // encode_headers is a no-op for Csrf — must return Continue.
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
     }
 
@@ -470,26 +452,14 @@ mod tests {
         assert!(matches!(inst, HttpFilterInstance::CdnLoop(_)));
 
         // Self id already present at limit 0 → 502 loop rejection (decode-side).
-        let mut req = FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: vec![("cdn-loop".into(), "mycdn.example".into())],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
+        let mut req = FilterRequest::test("GET", "/", &[("cdn-loop", "mycdn.example")]);
         match inst.decode_headers(&mut req) {
             Decision::StopAndSend(r) => assert_eq!(r.status, 502),
             Decision::Continue => panic!("expected StopAndSend(502) for self-loop"),
         }
 
         // No header → append + Continue.
-        let mut req2 = FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: vec![],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
+        let mut req2 = FilterRequest::test("GET", "/", &[]);
         assert!(matches!(inst.decode_headers(&mut req2), Decision::Continue));
         assert!(
             req2.headers
@@ -498,12 +468,7 @@ mod tests {
         );
 
         // encode_headers is a no-op for CdnLoop — must return Continue.
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
     }
 
@@ -532,23 +497,12 @@ mod tests {
 
         // decode on an empty-metadata request → Continue AND the value lands
         // under the namespace.
-        let mut req = FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: vec![],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
+        let mut req = FilterRequest::test("GET", "/", &[]);
         assert!(matches!(inst.decode_headers(&mut req), Decision::Continue));
         assert_eq!(req.dynamic_metadata["envoy.test"]["tier"], "prod");
 
         // encode_headers is inert for SetMetadata — must return Continue.
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
     }
 
@@ -577,23 +531,12 @@ mod tests {
         assert!(matches!(inst, HttpFilterInstance::HeaderToMetadata(_)));
 
         // decode with x-tier: prod → Continue AND the value lands under envoy.lb.tier.
-        let mut req = FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: vec![("x-tier".into(), "prod".into())],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
+        let mut req = FilterRequest::test("GET", "/", &[("x-tier", "prod")]);
         assert!(matches!(inst.decode_headers(&mut req), Decision::Continue));
         assert_eq!(req.dynamic_metadata["envoy.lb"]["tier"], "prod");
 
         // encode_headers is inert for HeaderToMetadata — must return Continue.
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(inst.encode_headers(&mut resp), Decision::Continue));
     }
 
@@ -657,13 +600,7 @@ mod tests {
         for cdn_loop_value in ["mycdn.example", "othercdn.example", "\"abc", "a@b"] {
             let mut pipe = build_chain();
 
-            let mut req = FilterRequest {
-                method: "GET".to_string(),
-                path: "/".to_string(),
-                headers: vec![("cdn-loop".to_string(), cdn_loop_value.to_string())],
-                body: None,
-                dynamic_metadata: std::collections::BTreeMap::new(),
-            };
+            let mut req = FilterRequest::test("GET", "/", &[("cdn-loop", cdn_loop_value)]);
             pipe.apply_route_config(None);
 
             // Never 400/502 (never any StopAndSend) — the chain Continues.
@@ -704,10 +641,9 @@ mod tests {
     fn buffer_pipeline_backstop_all_dispositions() {
         use crate::FilterPipeline;
         use envoy_config::{
-            Buffer, BufferPerRoute, DataSource, DirectResponse, HttpFilter, HttpFilterTypedConfig,
-            PerFilterConfig, Route, RouteAction, RouteMatch, RouterConfig,
+            Buffer, BufferPerRoute, HttpFilter, HttpFilterTypedConfig, PerFilterConfig, Route,
+            RouterConfig,
         };
-        use std::collections::BTreeMap;
 
         let buffer_hf = HttpFilter {
             name: "envoy.filters.http.buffer".to_string(),
@@ -725,39 +661,19 @@ mod tests {
                 .expect("pipeline builds");
 
         let mk_req = |body: &[u8]| FilterRequest {
-            method: "POST".to_string(),
-            path: "/".to_string(),
-            headers: vec![],
             body: if body.is_empty() {
                 None
             } else {
                 Some(bytes::Bytes::copy_from_slice(body))
             },
-            dynamic_metadata: std::collections::BTreeMap::new(),
+            ..FilterRequest::test("POST", "/", &[])
         };
 
         fn route_with_buffer_pr(pr: BufferPerRoute) -> Route {
-            let mut pfc = BTreeMap::new();
-            pfc.insert(
-                "envoy.filters.http.buffer".to_string(),
+            crate::types::test_route_with_pfc(
+                "envoy.filters.http.buffer",
                 PerFilterConfig::Buffer(pr),
-            );
-            Route {
-                name: String::new(),
-                r#match: RouteMatch {
-                    prefix: Some("/".to_string()),
-                    path: None,
-                    headers: vec![],
-                },
-                action: RouteAction::DirectResponse(DirectResponse {
-                    status: 200,
-                    body: DataSource {
-                        filename: None,
-                        inline_string: None,
-                    },
-                }),
-                typed_per_filter_config: pfc,
-            }
+            )
         }
 
         // (1) within-limit (no route override) → Continue (reaches the router).

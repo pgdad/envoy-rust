@@ -49,64 +49,23 @@ pub fn build_http_response(resp: &Response) -> Result<HttpResponse<()>, Http2Err
         .map_err(|_| Http2Error::MalformedH2HeaderBlock)
 }
 
-/// Decorate a filter-synth H2 response with the standard response headers,
-/// symmetric to H1's `decorate_filter_synth_response` (`crates/envoy-http1/src/hcm.rs:968`)
-/// — minus `connection`, which is an H2-forbidden hop-by-hop header stripped by
-/// `build_http_response` per `H2_FORBIDDEN_HOP_BY_HOP` (RFC 7540 §8.1.2.2).
+/// Decorate a filter-synth H2 response with the standard response headers —
+/// a delegating wrapper over the shared H1/H2 implementation at
+/// `envoy_http1::hcm::decorate_filter_synth_response`, called with
+/// `connection: None` because `connection` is an H2-forbidden hop-by-hop
+/// header stripped by `build_http_response` per `H2_FORBIDDEN_HOP_BY_HOP`
+/// (RFC 7540 §8.1.2.2).
 ///
-/// - `content-length` is ALWAYS set from `resp.body.len()` (overwrites any
-///   filter-provided value).
-/// - `server` / `date` are added only-if-missing (a filter that sets its own
-///   value wins).
-/// - `content-type` is added only-if-missing AND only when the body is
-///   non-empty. Empty-body local replies (e.g. CORS preflight 200) get no
-///   `content-type` — matching Envoy v1.33 empirical behaviour confirmed by
-///   fixture 0031 §6.2 verification. Symmetric with the H1 fix at
-///   `crates/envoy-http1/src/hcm.rs` `decorate_filter_synth_response`.
+/// Semantics (see the shared fn's doc for the full ADR-0033 contract):
+/// `content-length` always overwritten from `resp.body.len()`; `server` /
+/// `date` only-if-missing; `content-type` only-if-missing AND only when the
+/// body is non-empty (Envoy v1.33 empirical behaviour, fixture 0031 §6.2).
 ///
 /// Closes the 09 REVIEW M2 implementation arm (phase 11 D6): the H1 writer
 /// path has decorated filter-synth responses since 09 ADR-0033 Commit C; this
 /// brings the H2 writer path to parity.
 pub(crate) fn decorate_filter_synth_response_h2(resp: &mut Response) {
-    // content-length: always derived from body.len(); overwrite if present.
-    let cl_value = resp.body.len().to_string();
-    let mut cl_set = false;
-    for (k, v) in resp.headers.iter_mut() {
-        if k.eq_ignore_ascii_case("content-length") {
-            *v = cl_value.clone();
-            cl_set = true;
-            break;
-        }
-    }
-    if !cl_set {
-        resp.headers.push(("content-length".to_string(), cl_value));
-    }
-    // server / date: add only-if-missing (always). NO connection (H2-forbidden).
-    // content-type: add only-if-missing AND only when the body is non-empty —
-    // upstream Envoy v1.33 does not emit content-type on empty-body local
-    // replies (e.g. the CORS preflight 200). Symmetric with the H1 fix at
-    // envoy-http1/src/hcm.rs `decorate_filter_synth_response`.
-    let has_content_type = resp
-        .headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
-    if !has_content_type && !resp.body.is_empty() {
-        resp.headers
-            .push(("content-type".to_string(), "text/plain".to_string()));
-    }
-    let standards: [(&str, String); 2] = [
-        ("server", "envoy-rust".to_string()),
-        ("date", envoy_http1::date::now_imf_fixdate()),
-    ];
-    for (name, value) in standards {
-        if !resp
-            .headers
-            .iter()
-            .any(|(k, _)| k.eq_ignore_ascii_case(name))
-        {
-            resp.headers.push((name.to_string(), value));
-        }
-    }
+    envoy_http1::hcm::decorate_filter_synth_response(resp, None);
 }
 
 /// Drive the actual H2 response emission. Sends the response head via

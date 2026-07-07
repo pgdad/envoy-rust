@@ -9,9 +9,8 @@ use crate::response::{Http1Response, Response};
 
 use bytes::{Buf, Bytes, BytesMut};
 use envoy_config::{
-    AttemptOutcome, DataSource, DirectResponse, HashPolicy, HttpConnectionManagerConfig,
-    RetryConfig, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch,
-    VirtualHost,
+    AttemptOutcome, DirectResponse, HashPolicy, HttpConnectionManagerConfig, RetryConfig, Route,
+    RouteAction, RouteConfiguration, VirtualHost,
 };
 use envoy_listener::{BoxFuture, ConnectionHandler};
 use std::sync::{Arc, RwLock};
@@ -230,11 +229,12 @@ impl HCMConfig {
         )?);
         Ok(Self {
             stat_prefix: cfg.stat_prefix.clone(),
-            route_config: RwLock::new(Arc::new(clone_route_config(
+            route_config: RwLock::new(Arc::new(
                 cfg.route_config
                     .as_ref()
-                    .expect("route_config populated post-load — §5.3 invariant"),
-            ))),
+                    .expect("route_config populated post-load — §5.3 invariant")
+                    .clone(),
+            )),
             cluster_mgr,
             http2_protocol_options: cfg.http2_protocol_options.clone(),
             stats,
@@ -280,59 +280,6 @@ impl HCMConfig {
             .route_config
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = rc;
-    }
-}
-
-fn clone_route_config(rc: &RouteConfiguration) -> RouteConfiguration {
-    // envoy-config's RouteConfiguration is not Clone; hand-clone so HCM can
-    // hold the data inside an Arc without coupling envoy-config's deriving.
-    // (If envoy-config later derives Clone on these types, this helper retires.)
-    RouteConfiguration {
-        name: rc.name.clone(),
-        validate_clusters: rc.validate_clusters,
-        virtual_hosts: rc
-            .virtual_hosts
-            .iter()
-            .map(|vh| VirtualHost {
-                name: vh.name.clone(),
-                domains: vh.domains.clone(),
-                include_attempt_count_in_response: vh.include_attempt_count_in_response,
-                routes: vh
-                    .routes
-                    .iter()
-                    .map(|r| Route {
-                        name: r.name.clone(),
-                        r#match: RouteMatch {
-                            prefix: r.r#match.prefix.clone(),
-                            path: r.r#match.path.clone(),
-                            headers: r.r#match.headers.clone(),
-                        },
-                        action: clone_route_action(&r.action),
-                        typed_per_filter_config: r.typed_per_filter_config.clone(),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
-fn clone_route_action(a: &RouteAction) -> RouteAction {
-    match a {
-        RouteAction::DirectResponse(dr) => RouteAction::DirectResponse(DirectResponse {
-            status: dr.status,
-            body: DataSource {
-                filename: dr.body.filename.clone(),
-                inline_string: dr.body.inline_string.clone(),
-            },
-        }),
-        RouteAction::Route(ar) => RouteAction::Route(RouteAction_Route {
-            cluster: ar.cluster.clone(),
-            retry_policy: ar.retry_policy.clone(),
-            // 28 Task 6: carry the route-level hash policies through the clone.
-            hash_policy: ar.hash_policy.clone(),
-            // 30 Task 3: carry the route-level metadata_match through the clone.
-            metadata_match: ar.metadata_match.clone(),
-        }),
     }
 }
 
@@ -1387,7 +1334,7 @@ async fn serve_connection(
                 // the 5 standard HTTP/1.1 response headers if the filter did
                 // not provide them, and ALWAYS overwrite content-length from
                 // body.len() (the filter's body is the source of truth).
-                decorate_filter_synth_response(&mut outgoing, close);
+                decorate_filter_synth_response(&mut outgoing, Some(connection_value(close)));
             }
         }
 
@@ -1426,7 +1373,7 @@ async fn serve_connection(
                 // future filters that emit encode-side StopAndSend (e.g., a
                 // hypothetical RBAC-on-encode rejection) inherit the standard
                 // HTTP/1.1 response header set on the wire.
-                decorate_filter_synth_response(&mut outgoing, close);
+                decorate_filter_synth_response(&mut outgoing, Some(connection_value(close)));
             }
         }
 
@@ -1768,7 +1715,6 @@ pub enum BuildOutcome {
 /// `SynthFromDecode` — a decode-side filter short-circuited the request
 /// with `StopAndSend`; the response goes directly to the unified
 /// factored site without consulting the writer arms or `build_response`.
-#[allow(dead_code)] // SynthFromDecode unused under 07.1 Router-only chain; 07.2 lights it up.
 enum RequestPath {
     Match(BuildOutcome),
     SynthFromDecode(Response),
@@ -1982,11 +1928,18 @@ fn connection_value(close: bool) -> &'static str {
     if close { "close" } else { "keep-alive" }
 }
 
-fn synth_direct_response(dr: &DirectResponse, close: bool) -> Response {
-    let body_str = dr.body.inline_string.as_deref().unwrap_or("");
-    let body = Bytes::copy_from_slice(body_str.as_bytes());
+/// Shared skeleton behind every synth-response builder: `status` + `body`
+/// with EXACTLY the 5 standard HTTP/1.1 headers in canonical order
+/// `[server, date, content-length, content-type, connection]`
+/// (`content-length` derived from `body.len()`). The wrappers below
+/// (`synth_direct_response`, `synth_status`, `synth_no_healthy_upstream`,
+/// `synth_overflow`) exist so each synth path keeps its documented wire
+/// contract; `synth_overflow` appends `x-envoy-overloaded` AFTER these 5.
+/// Header ORDER is load-bearing — the differential harness byte-compares
+/// against upstream Envoy.
+fn synth_with(status: u16, body: Bytes, close: bool) -> Response {
     Response {
-        status: dr.status,
+        status,
         reason: None,
         headers: vec![
             (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
@@ -2005,26 +1958,17 @@ fn synth_direct_response(dr: &DirectResponse, close: bool) -> Response {
     }
 }
 
+fn synth_direct_response(dr: &DirectResponse, close: bool) -> Response {
+    let body_str = dr.body.inline_string.as_deref().unwrap_or("");
+    synth_with(
+        dr.status,
+        Bytes::copy_from_slice(body_str.as_bytes()),
+        close,
+    )
+}
+
 pub(crate) fn synth_status(status: u16, close: bool) -> Response {
-    let body = Bytes::new();
-    Response {
-        status,
-        reason: None,
-        headers: vec![
-            (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
-            (headers::DATE.to_string(), now_imf_fixdate()),
-            (headers::CONTENT_LENGTH.to_string(), "0".to_string()),
-            (
-                headers::CONTENT_TYPE.to_string(),
-                DEFAULT_CONTENT_TYPE.to_string(),
-            ),
-            (
-                headers::CONNECTION.to_string(),
-                connection_value(close).to_string(),
-            ),
-        ],
-        body,
-    }
+    synth_with(status, Bytes::new(), close)
 }
 
 /// 12.2 (parent-12 D6.2 per ADR-0037): no-healthy-upstream synth-503 response.
@@ -2033,28 +1977,10 @@ pub(crate) fn synth_status(status: u16, close: bool) -> Response {
 /// 72 65 61 6d`; no trailing newline) matching upstream Envoy v1.33.0's
 /// no-healthy-upstream wire shape (§6.2 item-2; locked at parent-12 split
 /// `4f9ba04`; ADR-0037). Used ONLY at the `pick() -> None` arm of HCM's
-/// per-request dispatch (`hcm.rs:582` in this file); the connect-fail 503
-/// and other synth paths keep `synth_status`'s empty body.
+/// per-request dispatch in this file; the connect-fail 503 and other synth
+/// paths keep `synth_status`'s empty body.
 pub(crate) fn synth_no_healthy_upstream(close: bool) -> Response {
-    let body = Bytes::from_static(b"no healthy upstream");
-    Response {
-        status: 503,
-        reason: None,
-        headers: vec![
-            (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
-            (headers::DATE.to_string(), now_imf_fixdate()),
-            (headers::CONTENT_LENGTH.to_string(), body.len().to_string()),
-            (
-                headers::CONTENT_TYPE.to_string(),
-                DEFAULT_CONTENT_TYPE.to_string(),
-            ),
-            (
-                headers::CONNECTION.to_string(),
-                connection_value(close).to_string(),
-            ),
-        ],
-        body,
-    }
+    synth_with(503, Bytes::from_static(b"no healthy upstream"), close)
 }
 
 /// 15 D5 (ADR-0043 §6.2 finding 3): the `max_connections` /
@@ -2066,64 +1992,60 @@ pub(crate) fn synth_no_healthy_upstream(close: bool) -> Response {
 /// HTTP/1.1 headers (6 headers total). Envoy itself omits the `connection`
 /// header on this reply; envoy-rust keeps it (allow-listed by the harness —
 /// the 0019/0022 synth-503 precedent). Called from BOTH the pool cap-overflow
-/// arm AND the pending-overflow arm (`hcm.rs:542`); H1/H2 parity sibling is
+/// arm AND the pending-overflow arm; H1/H2 parity sibling is
 /// `synth_h2_overflow` (Task 5).
 fn synth_overflow(close: bool) -> Response {
-    let body = Bytes::from_static(
-        b"upstream connect error or disconnect/reset before headers. reset reason: overflow",
+    let mut resp = synth_with(
+        503,
+        Bytes::from_static(
+            b"upstream connect error or disconnect/reset before headers. reset reason: overflow",
+        ),
+        close,
     );
-    Response {
-        status: 503,
-        reason: None,
-        headers: vec![
-            (headers::SERVER.to_string(), DEFAULT_SERVER_NAME.to_string()),
-            (headers::DATE.to_string(), now_imf_fixdate()),
-            (headers::CONTENT_LENGTH.to_string(), body.len().to_string()),
-            (
-                headers::CONTENT_TYPE.to_string(),
-                DEFAULT_CONTENT_TYPE.to_string(),
-            ),
-            (
-                headers::CONNECTION.to_string(),
-                connection_value(close).to_string(),
-            ),
-            ("x-envoy-overloaded".to_string(), "true".to_string()),
-        ],
-        body,
-    }
+    // x-envoy-overloaded goes AFTER the 5 standard headers (wire order).
+    resp.headers
+        .push(("x-envoy-overloaded".to_string(), "true".to_string()));
+    resp
 }
 
-/// Decorate a filter-synth response with the standard HTTP/1.1 response
-/// headers (`server`, `date`, `content-length`, `content-type`, `connection`)
-/// per phase-09 ADR-0033. Called from both writer-arm sites where a filter
-/// emits `Decision::StopAndSend` (decode-side `RequestPath::SynthFromDecode`
-/// at the writer-arm match; encode-side `Decision::StopAndSend(replacement)`
-/// after the encode iteration). The 07.1-landed framework converts
-/// `FilterResponse` ↔ `Response` verbatim; filter implementations are not
-/// expected to populate the standard HTTP/1.1 response headers (their
-/// responsibility ends at the application-semantic content). This helper
-/// brings filter-synth responses to wire-shape parity with the synth-from-build
-/// paths (`synth_status`, `synth_direct_response`) that already populate
-/// these headers inline.
+/// Decorate a filter-synth response with the standard response headers
+/// (`server`, `date`, `content-length`, `content-type`, and — on HTTP/1.1 —
+/// `connection`) per phase-09 ADR-0033. Called from both H1 writer-arm sites
+/// where a filter emits `Decision::StopAndSend` (decode-side
+/// `RequestPath::SynthFromDecode` at the writer-arm match; encode-side
+/// `Decision::StopAndSend(replacement)` after the encode iteration), and —
+/// via envoy-http2's `decorate_filter_synth_response_h2` wrapper — from the
+/// H2 writer path. The 07.1-landed framework converts `FilterResponse` ↔
+/// `Response` verbatim; filter implementations are not expected to populate
+/// the standard response headers (their responsibility ends at the
+/// application-semantic content). This helper brings filter-synth responses
+/// to wire-shape parity with the synth-from-build paths (`synth_status`,
+/// `synth_direct_response`) that already populate these headers inline.
+///
+/// `connection`: H1 passes `Some(connection_value(close))`; H2 passes `None`
+/// because `connection` is an H2-forbidden hop-by-hop header
+/// (RFC 7540 §8.1.2.2).
 ///
 /// Semantics per ADR-0033:
 ///
 /// - `content-length` is ALWAYS set from `resp.body.len()` (overwrites any
 ///   filter-provided value). The filter's body is the source of truth; a
 ///   stale filter-provided `content-length` would corrupt downstream parsing.
-/// - `server`, `date`, `connection` are added only-if-missing (case-insensitive
-///   name check) — matches the 06.1 D1 / 08.1 D1 dedupe precedent at
-///   `crates/envoy-admin/src/handler.rs::serialize_response`. If a filter
-///   chooses to set its own value (e.g., `server: my-proxy`), the filter wins.
+/// - `server`, `date`, `connection` (when `Some`) are added only-if-missing
+///   (case-insensitive name check) — matches the 06.1 D1 / 08.1 D1 dedupe
+///   precedent at `crates/envoy-admin/src/handler.rs::serialize_response`. If
+///   a filter chooses to set its own value (e.g., `server: my-proxy`), the
+///   filter wins.
 /// - `content-type` is added only-if-missing AND only when the body is
 ///   non-empty. Empty-body local replies (e.g. CORS preflight 200) get no
 ///   `content-type` — matching Envoy v1.33 empirical behaviour confirmed by
 ///   fixture 0031 §6.2 verification.
 ///
-/// Symmetric to `synth_status` at lines 866-887 — same defaults
-/// (`DEFAULT_SERVER_NAME`, `DEFAULT_CONTENT_TYPE`, `now_imf_fixdate()`,
-/// `connection_value(close)`).
-fn decorate_filter_synth_response(resp: &mut Response, close: bool) {
+/// Symmetric to `synth_status` — same defaults (`DEFAULT_SERVER_NAME`,
+/// `DEFAULT_CONTENT_TYPE`, `now_imf_fixdate()`, `connection_value(close)`).
+/// Push order is load-bearing (differential byte-compare):
+/// `[content-length][content-type][server, date][connection?]`.
+pub fn decorate_filter_synth_response(resp: &mut Response, connection: Option<&str>) {
     // content-length: always derived from body.len(); overwrite if present.
     let cl_value = resp.body.len().to_string();
     let mut cl_set = false;
@@ -2138,7 +2060,7 @@ fn decorate_filter_synth_response(resp: &mut Response, close: bool) {
         resp.headers
             .push((headers::CONTENT_LENGTH.to_string(), cl_value));
     }
-    // server / date / connection: add only-if-missing (always).
+    // server / date / connection (when requested): add only-if-missing (always).
     // content-type: add only-if-missing AND only when the body is non-empty —
     // upstream Envoy v1.33 does not emit content-type on empty-body local
     // replies (e.g. the CORS preflight 200). The §6.2 empirical verification
@@ -2154,12 +2076,12 @@ fn decorate_filter_synth_response(resp: &mut Response, close: bool) {
             DEFAULT_CONTENT_TYPE.to_string(),
         ));
     }
-    let standards: [(&str, String); 3] = [
-        (headers::SERVER, DEFAULT_SERVER_NAME.to_string()),
-        (headers::DATE, now_imf_fixdate()),
-        (headers::CONNECTION, connection_value(close).to_string()),
+    let standards = [
+        Some((headers::SERVER, DEFAULT_SERVER_NAME.to_string())),
+        Some((headers::DATE, now_imf_fixdate())),
+        connection.map(|c| (headers::CONNECTION, c.to_string())),
     ];
-    for (name, value) in standards {
+    for (name, value) in standards.into_iter().flatten() {
         if !resp
             .headers
             .iter()
@@ -2183,7 +2105,7 @@ pub(crate) fn synth_501(close: bool) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use envoy_config::{HashPolicyHeader, LbMetadata};
+    use envoy_config::{DataSource, HashPolicyHeader, LbMetadata, RouteAction_Route, RouteMatch};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2461,56 +2383,44 @@ mod tests {
         assert_eq!(key, None, "empty hash_policy → None");
     }
 
-    /// Build a ClusterManager with a single static cluster `name` whose only
-    /// endpoint is `127.0.0.1:<port>`. Reused by the 04.3 Task 9 router-proxy
-    /// arm tests.
-    async fn cluster_mgr_with_endpoint(
-        name: &str,
-        port: u16,
-    ) -> Arc<envoy_cluster::ClusterManager> {
-        let yaml = format!(
-            r#"
-admin:
-  address:
-    socket_address:
-      address: 127.0.0.1
-      port_value: 9901
-static_resources:
-  listeners: []
-  clusters:
-    - name: {name}
-      type: STATIC
-      lb_policy: ROUND_ROBIN
-      load_assignment:
-        cluster_name: {name}
-        endpoints:
-          - lb_endpoints:
-              - endpoint: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: {port} }} }} }}
-"#
-        );
-        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
-        Arc::new(
-            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
-                .await
-                .expect("cluster mgr"),
-        )
+    /// Optional `circuit_breakers` shape for [`cluster_mgr_with_endpoint_opts`].
+    enum TestBreakers {
+        /// No `circuit_breakers` block at all.
+        Absent,
+        /// A single DEFAULT-priority threshold with `track_remaining: true`
+        /// and an optional cap line rendered BEFORE it, e.g.
+        /// `Some(("max_retries", 2))` or `Some(("max_requests", 0))`.
+        Threshold(Option<(&'static str, u32)>),
     }
 
-    /// 17 Task 4: like `cluster_mgr_with_endpoint` but with a
-    /// `circuit_breakers` block. `track_remaining` is always set so the
-    /// remaining gauges register too (inert for these tests). When
-    /// `max_retries` is `Some(n)` the explicit cap is emitted; `None` omits
-    /// the `max_retries:` line so the default cap (3) applies. Used by the
-    /// retry-budget gate tests to build a cluster whose `try_acquire_retry`
-    /// actively gates.
-    async fn cluster_mgr_with_endpoint_max_retries(
+    /// Shared builder behind `cluster_mgr_with_endpoint`,
+    /// `cluster_mgr_with_endpoint_max_retries` and
+    /// `cluster_mgr_with_endpoint_max_requests`: a ClusterManager with a
+    /// single static cluster `name` whose only endpoint is
+    /// `127.0.0.1:<port>`, plus the StatsRegistry it was built against
+    /// (only the `_max_requests` wrapper consumes the registry — see its doc).
+    async fn cluster_mgr_with_endpoint_opts(
         name: &str,
         port: u16,
-        max_retries: Option<u32>,
-    ) -> Arc<envoy_cluster::ClusterManager> {
-        let max_retries_line = match max_retries {
-            Some(n) => format!("            max_retries: {n}\n"),
-            None => String::new(),
+        breakers: TestBreakers,
+    ) -> (
+        Arc<envoy_cluster::ClusterManager>,
+        Arc<envoy_stats::StatsRegistry>,
+    ) {
+        let circuit_breakers_block = match breakers {
+            TestBreakers::Absent => String::new(),
+            TestBreakers::Threshold(cap) => {
+                let cap_line = match cap {
+                    Some((key, n)) => format!("            {key}: {n}\n"),
+                    None => String::new(),
+                };
+                format!(
+                    "      circuit_breakers:\n        \
+                     thresholds:\n          \
+                     - priority: DEFAULT\n\
+                     {cap_line}            track_remaining: true\n"
+                )
+            }
         };
         let yaml = format!(
             r#"
@@ -2525,11 +2435,7 @@ static_resources:
     - name: {name}
       type: STATIC
       lb_policy: ROUND_ROBIN
-      circuit_breakers:
-        thresholds:
-          - priority: DEFAULT
-{max_retries_line}            track_remaining: true
-      load_assignment:
+{circuit_breakers_block}      load_assignment:
         cluster_name: {name}
         endpoints:
           - lb_endpoints:
@@ -2537,11 +2443,46 @@ static_resources:
 "#
         );
         let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
-        Arc::new(
-            envoy_cluster::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mgr = Arc::new(
+            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
                 .await
                 .expect("cluster mgr"),
+        );
+        (mgr, registry)
+    }
+
+    /// Build a ClusterManager with a single static cluster `name` whose only
+    /// endpoint is `127.0.0.1:<port>`. Reused by the 04.3 Task 9 router-proxy
+    /// arm tests.
+    async fn cluster_mgr_with_endpoint(
+        name: &str,
+        port: u16,
+    ) -> Arc<envoy_cluster::ClusterManager> {
+        cluster_mgr_with_endpoint_opts(name, port, TestBreakers::Absent)
+            .await
+            .0
+    }
+
+    /// 17 Task 4: like `cluster_mgr_with_endpoint` but with a
+    /// `circuit_breakers` block. `track_remaining` is always set so the
+    /// remaining gauges register too (inert for these tests). When
+    /// `max_retries` is `Some(n)` the explicit cap is emitted; `None` omits
+    /// the `max_retries:` line so the default cap (3) applies. Used by the
+    /// retry-budget gate tests to build a cluster whose `try_acquire_retry`
+    /// actively gates.
+    async fn cluster_mgr_with_endpoint_max_retries(
+        name: &str,
+        port: u16,
+        max_retries: Option<u32>,
+    ) -> Arc<envoy_cluster::ClusterManager> {
+        cluster_mgr_with_endpoint_opts(
+            name,
+            port,
+            TestBreakers::Threshold(max_retries.map(|n| ("max_retries", n))),
         )
+        .await
+        .0
     }
 
     /// Build an empty ClusterManager (no clusters). Used by the existing
@@ -2997,7 +2938,7 @@ static_resources:
             headers: Vec::new(),
             body: bytes::Bytes::from_static(b"local_rate_limited"),
         };
-        super::decorate_filter_synth_response(&mut resp, true);
+        super::decorate_filter_synth_response(&mut resp, Some("close"));
         let name = |n: &str| -> Option<&str> {
             resp.headers
                 .iter()
@@ -3034,7 +2975,7 @@ static_resources:
             ],
             body: bytes::Bytes::from_static(b"local_rate_limited"),
         };
-        super::decorate_filter_synth_response(&mut resp, false);
+        super::decorate_filter_synth_response(&mut resp, Some("keep-alive"));
         let name = |n: &str| -> Option<String> {
             resp.headers
                 .iter()
@@ -3064,7 +3005,7 @@ static_resources:
             headers: Vec::new(),
             body: bytes::Bytes::new(),
         };
-        super::decorate_filter_synth_response(&mut resp, false);
+        super::decorate_filter_synth_response(&mut resp, Some("keep-alive"));
         let name = |n: &str| -> Option<&str> {
             resp.headers
                 .iter()
@@ -7295,39 +7236,12 @@ static_resources:
         Arc<envoy_cluster::ClusterManager>,
         Arc<envoy_stats::StatsRegistry>,
     ) {
-        let yaml = format!(
-            r#"
-admin:
-  address:
-    socket_address:
-      address: 127.0.0.1
-      port_value: 9901
-static_resources:
-  listeners: []
-  clusters:
-    - name: {name}
-      type: STATIC
-      lb_policy: ROUND_ROBIN
-      circuit_breakers:
-        thresholds:
-          - priority: DEFAULT
-            max_requests: {max_requests}
-            track_remaining: true
-      load_assignment:
-        cluster_name: {name}
-        endpoints:
-          - lb_endpoints:
-              - endpoint: {{ address: {{ socket_address: {{ address: 127.0.0.1, port_value: {port} }} }} }}
-"#
-        );
-        let bootstrap = envoy_config::parse_bootstrap(&yaml).expect("bootstrap parses");
-        let registry = Arc::new(envoy_stats::StatsRegistry::new());
-        let mgr = Arc::new(
-            envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
-                .await
-                .expect("cluster mgr"),
-        );
-        (mgr, registry)
+        cluster_mgr_with_endpoint_opts(
+            name,
+            port,
+            TestBreakers::Threshold(Some(("max_requests", max_requests))),
+        )
+        .await
     }
 
     /// Read `cluster.<name>.upstream_rq_pending_overflow` from a shared
@@ -8288,11 +8202,13 @@ static_resources:
     }
 
     // ---------------------------------------------------------------------------
-    // clone_route_config: regression test for typed_per_filter_config preservation
+    // RouteConfiguration::clone: regression test for typed_per_filter_config
+    // preservation (guards field-exhaustive cloning — HCMConfig::new snapshots
+    // the loaded route table via `.clone()` into its RwLock<Arc<_>> handle).
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn clone_route_config_preserves_typed_per_filter_config() {
+    fn route_config_clone_preserves_typed_per_filter_config() {
         use std::collections::BTreeMap;
 
         // Build a Route that carries a non-empty typed_per_filter_config (CORS).
@@ -8346,19 +8262,19 @@ static_resources:
             }],
         };
 
-        let cloned = super::clone_route_config(&rc);
+        let cloned = rc.clone();
 
         assert!(
             !cloned.virtual_hosts[0].routes[0]
                 .typed_per_filter_config
                 .is_empty(),
-            "clone_route_config must preserve typed_per_filter_config (was dropped)"
+            "RouteConfiguration::clone must preserve typed_per_filter_config (was dropped)"
         );
         assert!(
             cloned.virtual_hosts[0].routes[0]
                 .typed_per_filter_config
                 .contains_key("envoy.filters.http.cors"),
-            "clone_route_config must preserve the cors key in typed_per_filter_config"
+            "RouteConfiguration::clone must preserve the cors key in typed_per_filter_config"
         );
     }
 

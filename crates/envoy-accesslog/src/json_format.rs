@@ -55,13 +55,7 @@ impl CompiledJsonValue {
                     .map(CompiledJsonValue::compile)
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            JsonValueInput::Object(map) => {
-                let mut compiled = std::collections::BTreeMap::new();
-                for (k, v) in map {
-                    compiled.insert(k.clone(), CompiledJsonValue::compile(v)?);
-                }
-                CompiledJsonValue::Object(compiled)
-            }
+            JsonValueInput::Object(map) => CompiledJsonValue::Object(compile_map(map)?),
         })
     }
 
@@ -89,21 +83,46 @@ impl CompiledJsonValue {
                 }
                 out.push(']');
             }
-            CompiledJsonValue::Object(map) => {
-                out.push('{');
-                for (i, (key, value)) in map.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    out.push('"');
-                    json_escape_into(out, key);
-                    out.push_str("\":");
-                    value.render_into(out, record, omit_empty);
-                }
-                out.push('}');
-            }
+            CompiledJsonValue::Object(map) => render_object_into(map, out, record, omit_empty),
         }
     }
+}
+
+/// Compile a key → `JsonValueInput` map into its key → `CompiledJsonValue`
+/// mirror (returning the first `FormatParseError`). The single compile path
+/// shared by the top-level [`CompiledJsonFormat::from_map`] and the nested
+/// `Object` arm of [`CompiledJsonValue::compile`].
+fn compile_map(
+    map: &std::collections::BTreeMap<String, JsonValueInput>,
+) -> Result<std::collections::BTreeMap<String, CompiledJsonValue>, FormatParseError> {
+    let mut compiled = std::collections::BTreeMap::new();
+    for (k, v) in map {
+        compiled.insert(k.clone(), CompiledJsonValue::compile(v)?);
+    }
+    Ok(compiled)
+}
+
+/// Render one sorted JSON object `{...}` (compact separators, NO trailing
+/// newline) into `out`. The single object-render path shared by the nested
+/// `Object` arm of [`CompiledJsonValue::render_into`] and the top-level
+/// [`CompiledJsonFormat::render`] (which appends the one `\n`).
+fn render_object_into(
+    map: &std::collections::BTreeMap<String, CompiledJsonValue>,
+    out: &mut String,
+    record: &AccessLogRecord,
+    omit_empty: bool,
+) {
+    out.push('{');
+    for (i, (key, value)) in map.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        json_escape_into(out, key);
+        out.push_str("\":");
+        value.render_into(out, record, omit_empty);
+    }
+    out.push('}');
 }
 
 /// A compiled `json_format`: a top-level sorted (BTreeMap) key → recursive
@@ -126,12 +145,8 @@ impl CompiledJsonFormat {
     pub fn from_map(
         map: &std::collections::BTreeMap<String, JsonValueInput>,
     ) -> Result<Self, FormatParseError> {
-        let mut compiled = std::collections::BTreeMap::new();
-        for (k, v) in map {
-            compiled.insert(k.clone(), CompiledJsonValue::compile(v)?);
-        }
         Ok(Self {
-            map: compiled,
+            map: compile_map(map)?,
             omit_empty: false,
         })
     }
@@ -148,17 +163,8 @@ impl CompiledJsonFormat {
     /// the single `\n`.
     pub fn render(&self, record: &AccessLogRecord) -> String {
         let mut out = String::with_capacity(64 + self.map.len() * 16);
-        out.push('{');
-        for (i, (key, value)) in self.map.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('"');
-            json_escape_into(&mut out, key);
-            out.push_str("\":");
-            value.render_into(&mut out, record, self.omit_empty);
-        }
-        out.push_str("}\n");
+        render_object_into(&self.map, &mut out, record, self.omit_empty);
+        out.push('\n');
         out
     }
 }
@@ -280,31 +286,21 @@ fn encode_single_op(out: &mut String, op: &Op, r: &AccessLogRecord) {
 mod tests {
     use super::*;
     use crate::record::AccessLogRecord;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
-    // Deterministic record mirroring `command_operator::tests::rec()`.
+    // Deterministic record mirroring `command_operator::tests::rec()`: the
+    // shared `test_baseline()` fixture mutated into the POST /p 16/433 variant.
     fn rec() -> AccessLogRecord {
-        AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "POST".into(),
-            path: "/p".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 16,
-            bytes_sent: 433,
-            duration: Duration::from_millis(0),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: Some("curl/8.20.0".into()),
-            request_id: None,
-            authority: Some("h:1".into()),
-            upstream_host: Some("1.2.3.4:80".into()),
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        let mut r = AccessLogRecord::test_baseline();
+        r.method = "POST".into();
+        r.path = "/p".into();
+        r.bytes_received = 16;
+        r.bytes_sent = 433;
+        r.duration = Duration::from_millis(0);
+        r.user_agent = Some("curl/8.20.0".into());
+        r.authority = Some("h:1".into());
+        r.upstream_host = Some("1.2.3.4:80".into());
+        r
     }
 
     fn enc(value_fmt: &str, r: &AccessLogRecord) -> String {
@@ -314,29 +310,12 @@ mod tests {
     }
 
     // Record matching the fixture-0046 probe (ADR-0092 §F): GET /, HTTP/1.1, 200,
-    // flags "-", bytes_received 0, bytes_sent 3, upstream_host None.
+    // flags "-", bytes_received 0, bytes_sent 3, upstream_host None — the shared
+    // `test_baseline()` fixture with the duration zeroed.
     fn fixture_record() -> AccessLogRecord {
-        AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "GET".into(),
-            path: "/".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 0,
-            bytes_sent: 3,
-            duration: Duration::from_millis(0),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: None,
-            request_id: None,
-            authority: None,
-            upstream_host: None,
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        let mut r = AccessLogRecord::test_baseline();
+        r.duration = Duration::from_millis(0);
+        r
     }
 
     #[test]

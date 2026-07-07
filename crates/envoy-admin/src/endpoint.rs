@@ -153,61 +153,13 @@ impl AdminEndpoint {
         }
     }
 
-    /// Render the response for this endpoint. Reads the registry only on
-    /// the `Stats` / `StatsPrometheus` arms; `Ready` ignores the registry.
-    ///
-    /// Phase 08.1 D6: this is the registry-only render path retained for the
-    /// 06.1 endpoints. New endpoints introduced in 08.1 (ConfigDump and the
-    /// Tasks 7-9 cohort) need handler-scoped state and dispatch through
-    /// [`AdminEndpoint::render_with`] instead. Calling `render` on `ConfigDump`
-    /// is a programming error — the dispatch path in `handler.rs` routes
-    /// `ConfigDump` through `render_with` exclusively.
-    pub fn render(&self, registry: &StatsRegistry) -> envoy_http1::Response {
-        match self {
-            // Phase 08.2 Task 5 (D-ready): `Ready` now requires the
-            // handler-scoped `DrainState` to compute the response shape
-            // (200 LIVE / 503 Service Unavailable / 503 DRAINING). The
-            // registry-only path can no longer satisfy this and must
-            // dispatch through `render_with`.
-            AdminEndpoint::Ready => unreachable!(
-                "Ready requires handler-scoped DrainState; dispatch via AdminEndpoint::render_with"
-            ),
-            AdminEndpoint::Stats => Self::render_stats(registry),
-            AdminEndpoint::StatsPrometheus => Self::render_stats_prometheus(registry),
-            AdminEndpoint::ConfigDump => unreachable!(
-                "ConfigDump requires handler-scoped state; dispatch via AdminEndpoint::render_with"
-            ),
-            AdminEndpoint::ServerInfo => unreachable!(
-                "ServerInfo requires handler-scoped state; dispatch via AdminEndpoint::render_with"
-            ),
-            AdminEndpoint::Clusters => unreachable!(
-                "Clusters requires handler-scoped state; dispatch via AdminEndpoint::render_with"
-            ),
-            AdminEndpoint::Listeners => unreachable!(
-                "Listeners requires handler-scoped state; dispatch via AdminEndpoint::render_with"
-            ),
-            // 08.2 D9 / D10 — POST endpoints need DrainState, which the
-            // registry-only render path does not carry. The dispatch path in
-            // `handler.rs` routes these variants through `render_with` (Task 4
-            // wires `handler.drain()`); reaching here is a programming error.
-            AdminEndpoint::DrainListeners => unreachable!(
-                "DrainListeners requires DrainState; dispatch via AdminEndpoint::render_with"
-            ),
-            AdminEndpoint::HealthcheckFail => unreachable!(
-                "HealthcheckFail requires DrainState; dispatch via AdminEndpoint::render_with"
-            ),
-            AdminEndpoint::HealthcheckOk => unreachable!(
-                "HealthcheckOk requires DrainState; dispatch via AdminEndpoint::render_with"
-            ),
-        }
-    }
-
     /// Phase 08.1 D6 introduces `render_with(&AdminHandler)` to reach
     /// handler-scoped state (`Arc<Bootstrap>`, `ClusterManager`,
-    /// `start_instant`, `command_line_options`). The existing
-    /// [`AdminEndpoint::render`] carries forward for `/ready`, `/stats`, and
-    /// `/stats/prometheus`; new endpoints add explicit arms here. Tasks 7/8/9
-    /// add `ServerInfo`, `Clusters`, `Listeners`.
+    /// `start_instant`, `command_line_options`). The registry-only endpoints
+    /// (`/stats`, `/stats/prometheus`) render through `handler.registry()`;
+    /// every other endpoint needs additional handler-scoped state. The match
+    /// is exhaustive on purpose (no wildcard arm) so a future variant fails
+    /// to compile until it declares how it renders.
     pub fn render_with(&self, handler: &crate::handler::AdminHandler) -> envoy_http1::Response {
         match self {
             // Phase 08.2 Task 5 (D-ready): `/ready` widens to a drain-aware
@@ -228,9 +180,10 @@ impl AdminEndpoint {
             AdminEndpoint::DrainListeners => render_drain_listeners(handler.drain()),
             AdminEndpoint::HealthcheckFail => render_healthcheck_fail(handler.drain()),
             AdminEndpoint::HealthcheckOk => render_healthcheck_ok(handler.drain()),
-            // Registry-only endpoints (`/stats`, `/stats/prometheus`) carry
-            // forward through the original `render` path.
-            _ => self.render(handler.registry()),
+            // Registry-only endpoints (`/stats`, `/stats/prometheus`): the
+            // renderers read nothing but the stats registry.
+            AdminEndpoint::Stats => Self::render_stats(handler.registry()),
+            AdminEndpoint::StatsPrometheus => Self::render_stats_prometheus(handler.registry()),
         }
     }
 
@@ -248,16 +201,7 @@ impl AdminEndpoint {
                 }
             }
         }
-        let body = buf.freeze();
-        envoy_http1::Response {
-            status: 200,
-            reason: Some("OK"),
-            headers: vec![
-                ("content-type".to_string(), "text/plain".to_string()),
-                ("content-length".to_string(), body.len().to_string()),
-            ],
-            body,
-        }
+        text_response(200, Some("OK"), buf.freeze())
     }
 
     fn render_stats_prometheus(registry: &StatsRegistry) -> envoy_http1::Response {
@@ -283,6 +227,52 @@ impl AdminEndpoint {
             ],
             body,
         }
+    }
+}
+
+/// Shared `text/plain` + `content-length` + caller-controlled-reason response
+/// shape (the 06.1-era admin convention): `/stats`, `/ready`, 404, 405.
+/// Header order (content-type, then content-length) is load-bearing — the
+/// admin differential fixtures byte-compare the wire output.
+fn text_response(status: u16, reason: Option<&'static str>, body: Bytes) -> envoy_http1::Response {
+    envoy_http1::Response {
+        status,
+        reason,
+        headers: vec![
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("content-length".to_string(), body.len().to_string()),
+        ],
+        body,
+    }
+}
+
+/// Shared pretty-JSON 200 response shape for `/config_dump` + `/server_info`:
+/// `application/json`, `reason: None` (serialize-time `reason_for_status`
+/// supplies "OK" per PLAN lock-in #7), and — deliberately — NO
+/// `content-length` header (the established wire shape for these endpoints;
+/// distinct from [`text_response`], do NOT merge). `what` names the body type
+/// in the cannot-happen serialization panic.
+fn json_pretty_200<T: Serialize>(body: &T, what: &'static str) -> envoy_http1::Response {
+    let body_bytes = serde_json::to_vec_pretty(body)
+        .unwrap_or_else(|e| panic!("{what} serializes (all subtypes derive Serialize): {e}"));
+    envoy_http1::Response {
+        status: 200,
+        reason: None,
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: Bytes::from(body_bytes),
+    }
+}
+
+/// Shared plain-text 200 response shape for `/clusters` + `/listeners`:
+/// `text/plain`, `reason: None`, and — deliberately — NO `content-length`
+/// header. Distinct on the wire from [`text_response`] (header presence
+/// differs); do NOT merge the two.
+fn text_200_no_len(body: String) -> envoy_http1::Response {
+    envoy_http1::Response {
+        status: 200,
+        reason: None,
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        body: Bytes::from(body),
     }
 }
 
@@ -528,15 +518,7 @@ pub(crate) fn render_ready_with(handler: &crate::handler::AdminHandler) -> envoy
             Bytes::from_static(b"DRAINING\n"),
         ),
     };
-    envoy_http1::Response {
-        status,
-        reason: Some(reason),
-        headers: vec![
-            ("content-type".to_string(), "text/plain".to_string()),
-            ("content-length".to_string(), body.len().to_string()),
-        ],
-        body,
-    }
+    text_response(status, Some(reason), body)
 }
 
 /// Phase 08.1 D6: render `/config_dump` as pretty JSON. Borrows the cached
@@ -824,16 +806,7 @@ pub(crate) fn render_config_dump(handler: &crate::handler::AdminHandler) -> envo
         });
     }
     let body = ConfigDumpBody { configs };
-    let body_bytes = serde_json::to_vec_pretty(&body)
-        .expect("ConfigDumpBody serializes (all subtypes derive Serialize per Task 4)");
-    envoy_http1::Response {
-        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
-        // leave `reason: None` per PLAN lock-in #7.
-        status: 200,
-        reason: None,
-        headers: vec![("content-type".to_string(), "application/json".to_string())],
-        body: Bytes::from(body_bytes),
-    }
+    json_pretty_200(&body, "ConfigDumpBody")
 }
 
 /// Phase 08.1 D5: top-level body envelope for `/server_info`. Mirrors upstream
@@ -893,16 +866,7 @@ pub(crate) fn render_server_info(handler: &crate::handler::AdminHandler) -> envo
         uptime_current_epoch_seconds: uptime,
         uptime_all_epochs_seconds: uptime,
     };
-    let body_bytes = serde_json::to_vec_pretty(&body)
-        .expect("ServerInfoBody serializes (all subtypes derive Serialize)");
-    envoy_http1::Response {
-        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
-        // leave `reason: None` per PLAN lock-in #7.
-        status: 200,
-        reason: None,
-        headers: vec![("content-type".to_string(), "application/json".to_string())],
-        body: Bytes::from(body_bytes),
-    }
+    json_pretty_200(&body, "ServerInfoBody")
 }
 
 /// Phase 08.1 D7: render `/clusters` as plain text per Envoy v1.33's
@@ -926,15 +890,7 @@ pub(crate) fn render_clusters(handler: &crate::handler::AdminHandler) -> envoy_h
         let _ = writeln!(&mut body, "{name}::observability_name::{name}");
         let _ = writeln!(&mut body, "{name}::default_priority::endpoints");
     }
-    envoy_http1::Response {
-        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
-        // leave `reason: None` per PLAN lock-in #7 (consistent with
-        // `render_config_dump` + `render_server_info`).
-        status: 200,
-        reason: None,
-        headers: vec![("content-type".to_string(), "text/plain".to_string())],
-        body: Bytes::from(body),
-    }
+    text_200_no_len(body)
 }
 
 /// Phase 08.1 D8: render `/listeners` as plain text. Emits one line per
@@ -971,15 +927,7 @@ pub(crate) fn render_listeners(handler: &crate::handler::AdminHandler) -> envoy_
     for (name, addr) in &lines {
         let _ = writeln!(&mut body, "{name}::{addr}");
     }
-    envoy_http1::Response {
-        // Task 1's `reason_for_status(200)` supplies "OK" at serialize time;
-        // leave `reason: None` per PLAN lock-in #7 (consistent with
-        // `render_config_dump` + `render_server_info` + `render_clusters`).
-        status: 200,
-        reason: None,
-        headers: vec![("content-type".to_string(), "text/plain".to_string())],
-        body: Bytes::from(body),
-    }
+    text_200_no_len(body)
 }
 
 /// Phase 08.2 D9: `/drain_listeners` POST endpoint. Invokes `DrainState::drain()`
@@ -1032,16 +980,11 @@ fn empty_200_ok() -> envoy_http1::Response {
 /// Render a 404 for unknown admin paths. Used by `AdminHandler::handle_inner`
 /// when `from_path` returns `None`.
 pub(crate) fn render_404() -> envoy_http1::Response {
-    let body = Bytes::from_static(b"unknown admin endpoint\n");
-    envoy_http1::Response {
-        status: 404,
-        reason: Some("Not Found"),
-        headers: vec![
-            ("content-type".to_string(), "text/plain".to_string()),
-            ("content-length".to_string(), body.len().to_string()),
-        ],
-        body,
-    }
+    text_response(
+        404,
+        Some("Not Found"),
+        Bytes::from_static(b"unknown admin endpoint\n"),
+    )
 }
 
 /// Render a 405 for method-not-allowed responses. Used by
@@ -1053,18 +996,13 @@ pub(crate) fn render_404() -> envoy_http1::Response {
 /// structurally: every endpoint variant declares its own allowed method.
 pub(crate) fn render_405(allow: &'static str) -> envoy_http1::Response {
     let body = Bytes::from(format!("Method not allowed. Allow: {allow}\n"));
-    envoy_http1::Response {
-        status: 405,
-        // Task 1's reason_for_status renders "Method Not Allowed" when reason
-        // is None; leaving it None lets the helper supply the canonical text.
-        reason: None,
-        headers: vec![
-            ("content-type".to_string(), "text/plain".to_string()),
-            ("content-length".to_string(), body.len().to_string()),
-            ("allow".to_string(), allow.to_string()),
-        ],
-        body,
-    }
+    // Task 1's reason_for_status renders "Method Not Allowed" when reason is
+    // None; leaving it None lets the helper supply the canonical text. The
+    // `allow` header is appended AFTER the shared pair — header order
+    // (content-type, content-length, allow) is the established wire shape.
+    let mut resp = text_response(405, None, body);
+    resp.headers.push(("allow".to_string(), allow.to_string()));
+    resp
 }
 
 #[cfg(test)]
@@ -1118,7 +1056,7 @@ mod tests {
         // preserved (default `DrainState::new` → `DrainStage::Live` →
         // 200 OK "LIVE\n"). Per-stage coverage (HealthcheckFailing,
         // Draining) lives in the colocated `ready_drain_tests` submodule.
-        use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap};
+        use super::test_support::{TINY_BOOTSTRAP, handler_with_bootstrap};
         let handler = handler_with_bootstrap(TINY_BOOTSTRAP);
         let resp = AdminEndpoint::Ready.render_with(&handler);
         assert_eq!(resp.status, 200);
@@ -1143,7 +1081,7 @@ mod tests {
             .register_counter("listener.foo.downstream_cx_total")
             .unwrap();
         c.add(7);
-        let resp = AdminEndpoint::Stats.render(&reg);
+        let resp = AdminEndpoint::render_stats(&reg);
         assert_eq!(resp.status, 200);
         let body_str = std::str::from_utf8(&resp.body).unwrap();
         assert!(body_str.contains("listener.foo.downstream_cx_total: 7\n"));
@@ -1156,7 +1094,7 @@ mod tests {
             .register_counter("listener.foo.downstream_cx_total")
             .unwrap();
         c.add(7);
-        let resp = AdminEndpoint::StatsPrometheus.render(&reg);
+        let resp = AdminEndpoint::render_stats_prometheus(&reg);
         assert_eq!(resp.status, 200);
         let body_str = std::str::from_utf8(&resp.body).unwrap();
         assert!(body_str.contains("# TYPE envoy_listener_foo_downstream_cx_total counter\n"));
@@ -1166,7 +1104,7 @@ mod tests {
     #[test]
     fn render_response_carries_correct_content_type() {
         let reg = StatsRegistry::new();
-        let stats = AdminEndpoint::Stats.render(&reg);
+        let stats = AdminEndpoint::render_stats(&reg);
         assert!(
             stats
                 .headers
@@ -1174,7 +1112,7 @@ mod tests {
                 .any(|(k, v)| k == "content-type" && v == "text/plain")
         );
 
-        let prom = AdminEndpoint::StatsPrometheus.render(&reg);
+        let prom = AdminEndpoint::render_stats_prometheus(&reg);
         assert!(
             prom.headers
                 .iter()
@@ -1206,55 +1144,8 @@ mod config_dump_tests {
     //! top-level `configs` array; one `BootstrapConfigDump` entry; the
     //! `bootstrap` subtree carries the parsed `node.id`).
 
+    use super::test_support::{TINY_BOOTSTRAP, handler_with_bootstrap};
     use super::{AdminEndpoint, Dispatch};
-    use crate::config::AdminConfig;
-    use crate::handler::AdminHandler;
-    use envoy_cluster::ClusterManager;
-    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
-    use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    pub(super) fn handler_with_bootstrap(yaml: &str) -> AdminHandler {
-        let bootstrap: Bootstrap = serde_yaml::from_str(yaml).expect("yaml parses");
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let registry = Arc::new(StatsRegistry::new());
-        // Phase 08.2 Task 4 (D13b): every `AdminHandler::new` call site adds
-        // the trailing `Arc<DrainState>` arg. The shared helper here covers
-        // the 08.1 endpoint-task test cohort (config_dump / server_info /
-        // clusters / listeners); the DrainState constructed here is
-        // never observed by those tests (they read bootstrap / cluster /
-        // listener state, not drain state), so a fresh per-call DrainState
-        // is sufficient.
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        )
-    }
-
-    /// Phase 08.1 Task 9: hoisted to `pub(super)` so sibling test modules
-    /// (`server_info_tests`, `clusters_tests`, `listeners_tests`) share one
-    /// source for the minimal valid bootstrap YAML. Pre-Task-9 each sibling
-    /// inlined the same literal; closes Task 7 review M2 carryforward.
-    pub(super) const TINY_BOOTSTRAP: &str =
-        "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
 
     #[test]
     fn config_dump_path_dispatches_on_get() {
@@ -1339,115 +1230,15 @@ mod clusters_config_dump_tests {
     //! `dynamic_resources` but NOT the loaded clusters (the `#[serde(skip)]`
     //! `dynamic_clusters` separation, §5.5).
 
-    use super::AdminEndpoint;
-    use crate::config::AdminConfig;
-    use crate::handler::AdminHandler;
-    use envoy_cluster::ClusterManager;
-    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
-    use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    /// A single STRICT_DNS cluster named `dynamic_backend`, the L5 fixture
-    /// shape. Parsed standalone (not via the bootstrap path) so the test can
-    /// inject it into `dynamic_clusters` directly.
-    const DYNAMIC_BACKEND_CLUSTER: &str = "\
-name: dynamic_backend
-type: STRICT_DNS
-lb_policy: ROUND_ROBIN
-load_assignment:
-  cluster_name: dynamic_backend
-  endpoints:
-  - lb_endpoints:
-    - endpoint:
-        address:
-          socket_address:
-            address: backend.example.com
-            port_value: 8080
-";
-
-    /// A static cluster (type STATIC) named `static_backend`, used by the
-    /// static_clusters-key-presence test (group c inverse).
-    const STATIC_BACKEND_CLUSTER: &str = "\
-name: static_backend
-type: STATIC
-lb_policy: ROUND_ROBIN
-load_assignment:
-  cluster_name: static_backend
-  endpoints:
-  - lb_endpoints:
-    - endpoint:
-        address:
-          socket_address:
-            address: 127.0.0.1
-            port_value: 9000
-";
-
-    /// Bootstrap WITH `dynamic_resources.cds_config` configured (triggers the
-    /// conditional ClustersConfigDump emission). The `path` is never read at
-    /// render time — the loaded clusters live in `dynamic_clusters`.
-    const DR_BOOTSTRAP: &str = "\
-node:
-  id: t
-  cluster: c
-dynamic_resources:
-  cds_config:
-    path_config_source:
-      path: /etc/cds.yaml
-static_resources:
-  listeners: []
-  clusters: []
-";
-
-    fn parse_cluster(yaml: &str) -> envoy_config::Cluster {
-        serde_yaml::from_str(yaml).expect("cluster yaml parses")
-    }
-
-    /// Build a handler from an already-constructed `Bootstrap` (mirrors
-    /// `config_dump_tests::handler_with_bootstrap`, but takes the owned
-    /// `Bootstrap` so a test can populate `dynamic_clusters` first).
-    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let registry = Arc::new(StatsRegistry::new());
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        )
-    }
-
-    fn parse_bootstrap(yaml: &str) -> Bootstrap {
-        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
-    }
-
-    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
-        let resp = AdminEndpoint::ConfigDump.render_with(handler);
-        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
-        serde_json::from_str(body_str).expect("valid JSON")
-    }
+    use super::test_support::{
+        CDS_ONLY_BOOTSTRAP, DYNAMIC_BACKEND_CLUSTER, STATIC_BACKEND_CLUSTER, TINY_BOOTSTRAP,
+        dump_value, handler_from_bootstrap, parse_bootstrap, parse_cluster,
+    };
 
     // (a) conditional emission: no dynamic_resources ⇒ exactly ONE entry.
     #[test]
     fn no_dynamic_resources_emits_single_bootstrap_entry() {
-        let bootstrap = parse_bootstrap(
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n",
-        );
+        let bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
         let configs = value.get("configs").and_then(|c| c.as_array()).unwrap();
@@ -1462,7 +1253,7 @@ static_resources:
     // ClustersConfigDump with the expected nested shape.
     #[test]
     fn dynamic_cluster_emits_clusters_config_dump_at_configs_1() {
-        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
         bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
@@ -1502,7 +1293,7 @@ static_resources:
     // (c) empty-key omission (L5): zero static clusters ⇒ NO static_clusters key.
     #[test]
     fn zero_static_clusters_omits_static_clusters_key() {
-        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
         bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
@@ -1519,7 +1310,7 @@ static_resources:
     // static_clusters key present, carrying it.
     #[test]
     fn static_cluster_present_emits_static_clusters_key() {
-        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
         bootstrap.static_resources.clusters = vec![parse_cluster(STATIC_BACKEND_CLUSTER)];
         bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
         let handler = handler_from_bootstrap(bootstrap);
@@ -1543,7 +1334,7 @@ static_resources:
     // but NOT the loaded clusters (dynamic_clusters is #[serde(skip)]).
     #[test]
     fn bootstrap_entry_shows_dynamic_resources_not_loaded_clusters() {
-        let mut bootstrap = parse_bootstrap(DR_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
         bootstrap.dynamic_clusters = Some(vec![parse_cluster(DYNAMIC_BACKEND_CLUSTER)]);
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
@@ -1590,15 +1381,10 @@ mod listeners_config_dump_tests {
     //! (d) the BootstrapConfigDump never shows `dynamic_listeners` (the
     //! `#[serde(skip)]` separation, §5.5).
 
-    use super::AdminEndpoint;
-    use crate::config::AdminConfig;
-    use crate::handler::AdminHandler;
-    use envoy_cluster::ClusterManager;
-    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
-    use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-    use std::time::Instant;
+    use super::test_support::{
+        CDS_LDS_BOOTSTRAP, CDS_ONLY_BOOTSTRAP, DYNAMIC_BACKEND_CLUSTER, TINY_BOOTSTRAP, dump_value,
+        handler_from_bootstrap, parse_bootstrap, parse_cluster,
+    };
 
     /// A single listener named `dynamic_listener`, the L5 fixture shape. Parsed
     /// standalone (not via the bootstrap path) so the test can inject it into
@@ -1623,103 +1409,8 @@ address:
 filter_chains: []
 ";
 
-    /// Bootstrap WITH BOTH `cds_config` and `lds_config` configured (triggers
-    /// the conditional Clusters AND Listeners emission — the Listeners entry
-    /// must land at `configs[2]`, AFTER Clusters). The `path`s are never read at
-    /// render time — the loaded resources live in `dynamic_clusters` /
-    /// `dynamic_listeners`.
-    const CDS_LDS_BOOTSTRAP: &str = "\
-node:
-  id: t
-  cluster: c
-dynamic_resources:
-  cds_config:
-    path_config_source:
-      path: /etc/cds.yaml
-  lds_config:
-    path_config_source:
-      path: /etc/lds.yaml
-static_resources:
-  listeners: []
-  clusters: []
-";
-
-    /// Bootstrap with ONLY `cds_config` (the fixture-0026 regression shape — it
-    /// renders exactly Bootstrap[0] + Clusters[1], NO Listeners).
-    const CDS_ONLY_BOOTSTRAP: &str = "\
-node:
-  id: t
-  cluster: c
-dynamic_resources:
-  cds_config:
-    path_config_source:
-      path: /etc/cds.yaml
-static_resources:
-  listeners: []
-  clusters: []
-";
-
     fn parse_listener(yaml: &str) -> envoy_config::Listener {
         serde_yaml::from_str(yaml).expect("listener yaml parses")
-    }
-
-    fn parse_cluster(yaml: &str) -> envoy_config::Cluster {
-        serde_yaml::from_str(yaml).expect("cluster yaml parses")
-    }
-
-    /// A STRICT_DNS cluster named `dynamic_backend` — used to populate
-    /// `dynamic_clusters` so the Clusters entry is present and the Listeners
-    /// entry must order AFTER it.
-    const DYNAMIC_BACKEND_CLUSTER: &str = "\
-name: dynamic_backend
-type: STRICT_DNS
-lb_policy: ROUND_ROBIN
-load_assignment:
-  cluster_name: dynamic_backend
-  endpoints:
-  - lb_endpoints:
-    - endpoint:
-        address:
-          socket_address:
-            address: backend.example.com
-            port_value: 8080
-";
-
-    /// Build a handler from an already-constructed `Bootstrap` (mirrors
-    /// `clusters_config_dump_tests::handler_from_bootstrap`).
-    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let registry = Arc::new(StatsRegistry::new());
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        )
-    }
-
-    fn parse_bootstrap(yaml: &str) -> Bootstrap {
-        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
-    }
-
-    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
-        let resp = AdminEndpoint::ConfigDump.render_with(handler);
-        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
-        serde_json::from_str(body_str).expect("valid JSON")
     }
 
     const LISTENERS_TYPE: &str = "type.googleapis.com/envoy.admin.v3.ListenersConfigDump";
@@ -1737,9 +1428,7 @@ load_assignment:
     // renders NO ListenersConfigDump entry (fixture-0014 regression shape).
     #[test]
     fn plain_bootstrap_emits_no_listeners_config_dump() {
-        let bootstrap = parse_bootstrap(
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n",
-        );
+        let bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
         assert!(
@@ -1921,54 +1610,17 @@ mod routes_config_dump_tests {
     //! ordering — on a cds+rds (no lds) bootstrap the Routes entry lands at
     //! `configs[2]`; on a cds+lds+rds bootstrap it lands at `configs[3]`.
 
-    use super::AdminEndpoint;
-    use crate::config::AdminConfig;
-    use crate::handler::AdminHandler;
+    use super::test_support::{
+        CDS_LDS_BOOTSTRAP, CDS_ONLY_BOOTSTRAP, TINY_BOOTSTRAP, dump_value, handler_from_bootstrap,
+        handler_with, parse_bootstrap,
+    };
     use envoy_cluster::ClusterManager;
     use envoy_config::{
-        Address, Admin, Bootstrap, CodecType, FilterChain, HttpConnectionManagerConfig, Listener,
-        NetworkFilter, Rds, RouteConfiguration, SocketAddress, TypedConfig, VirtualHost,
+        Address, CodecType, FilterChain, HttpConnectionManagerConfig, Listener, NetworkFilter, Rds,
+        RouteConfiguration, SocketAddress, TypedConfig, VirtualHost,
     };
     use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::Instant;
-
-    /// Build a handler from an already-constructed `Bootstrap`.
-    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let registry = Arc::new(StatsRegistry::new());
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        )
-    }
-
-    fn parse_bootstrap(yaml: &str) -> Bootstrap {
-        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
-    }
-
-    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
-        let resp = AdminEndpoint::ConfigDump.render_with(handler);
-        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
-        serde_json::from_str(body_str).expect("valid JSON")
-    }
 
     const ROUTES_TYPE: &str = "type.googleapis.com/envoy.admin.v3.RoutesConfigDump";
 
@@ -1980,40 +1632,6 @@ mod routes_config_dump_tests {
             .iter()
             .any(|e| e.get("@type").and_then(|v| v.as_str()) == Some(ROUTES_TYPE))
     }
-
-    /// Bootstrap WITH `dynamic_resources.cds_config` but NO `lds_config`.
-    /// Used for the ordering test: Bootstrap[0] + Clusters[1] + Routes[2].
-    const CDS_ONLY_BOOTSTRAP: &str = "\
-node:
-  id: t
-  cluster: c
-dynamic_resources:
-  cds_config:
-    path_config_source:
-      path: /etc/cds.yaml
-static_resources:
-  listeners: []
-  clusters: []
-";
-
-    /// Bootstrap WITH BOTH `cds_config` AND `lds_config`.
-    /// Used for the cds+lds+rds ordering test: Bootstrap[0] + Clusters[1] +
-    /// Listeners[2] + Routes[3].
-    const CDS_LDS_BOOTSTRAP: &str = "\
-node:
-  id: t
-  cluster: c
-dynamic_resources:
-  cds_config:
-    path_config_source:
-      path: /etc/cds.yaml
-  lds_config:
-    path_config_source:
-      path: /etc/lds.yaml
-static_resources:
-  listeners: []
-  clusters: []
-";
 
     /// Build a `Listener` whose single filter chain has an HCM with
     /// `rds: Some(...)` AND `route_config: Some(...)` (the post-load state).
@@ -2174,9 +1792,7 @@ static_resources:
     // exactly ONE entry (the Bootstrap entry only).
     #[test]
     fn plain_bootstrap_emits_no_routes_config_dump() {
-        let bootstrap = parse_bootstrap(
-            "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n",
-        );
+        let bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
         assert!(
@@ -2357,27 +1973,10 @@ static_resources:
         let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
         bootstrap.static_resources.listeners =
             vec![rds_listener_with_route("local_route", initial)];
-
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let handler_registry = Arc::new(StatsRegistry::new());
-        let drain = Arc::new(envoy_listener::DrainState::new(&handler_registry));
-        let handler = AdminHandler::new(
-            cfg,
-            handler_registry,
-            Arc::new(bootstrap),
+        let handler = handler_with(
+            bootstrap,
             Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
+            None,
             vec![("local_route".to_string(), Arc::clone(&hcm_config))],
         );
 
@@ -2427,7 +2026,7 @@ mod server_info_tests {
     //! `state == "LIVE"` constant per SPEC §5.4; `node` subtree carries the
     //! parsed `node.id`; uptime is non-negative).
 
-    use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap}; // reuse Task 6 helper + hoisted YAML literal
+    use super::test_support::{TINY_BOOTSTRAP, handler_with_bootstrap};
     use super::{AdminEndpoint, Dispatch};
 
     #[test]
@@ -2527,7 +2126,7 @@ mod clusters_tests {
     //! and two body-shape tests (200 + `text/plain`; empty cluster set
     //! renders an empty body).
 
-    use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap};
+    use super::test_support::{TINY_BOOTSTRAP, handler_with_bootstrap};
     use super::{AdminEndpoint, Dispatch};
 
     #[test]
@@ -2577,7 +2176,7 @@ mod listeners_tests {
     //! `<name>::<addr>:<port>` line per listener; output is deterministic
     //! by-name regardless of declaration order).
 
-    use super::config_dump_tests::{TINY_BOOTSTRAP, handler_with_bootstrap};
+    use super::test_support::{TINY_BOOTSTRAP, handler_with_bootstrap};
     use super::{AdminEndpoint, Dispatch};
 
     /// Two-listener bootstrap with `zebra` declared BEFORE `alpha`. Used to
@@ -2692,18 +2291,11 @@ static_resources:
     // dynamic listener in the body.
     #[test]
     fn listeners_body_includes_dynamic_listeners() {
-        use crate::config::AdminConfig;
-        use crate::handler::AdminHandler;
-        use envoy_cluster::ClusterManager;
-        use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
-        use envoy_stats::StatsRegistry;
-        use std::collections::BTreeMap;
-        use std::sync::Arc;
-        use std::time::Instant;
+        use super::test_support::{handler_from_bootstrap, parse_bootstrap};
 
         // A bootstrap with ZERO static listeners; the LDS-supplied listener
         // `dyn_l` lives only in `dynamic_listeners`.
-        let mut bootstrap: Bootstrap = serde_yaml::from_str(TINY_BOOTSTRAP).expect("yaml parses");
+        let mut bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         let dyn_l: envoy_config::Listener = serde_yaml::from_str(
             "name: dyn_l
 address:
@@ -2721,29 +2313,7 @@ filter_chains:
         )
         .expect("dynamic listener parses");
         bootstrap.dynamic_listeners = Some(vec![dyn_l]);
-
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let registry = Arc::new(StatsRegistry::new());
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        let handler = AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        );
+        let handler = handler_from_bootstrap(bootstrap);
 
         let resp = AdminEndpoint::Listeners.render_with(&handler);
         let body = std::str::from_utf8(&resp.body).unwrap();
@@ -2980,47 +2550,16 @@ mod ready_drain_tests {
     //! (Live → 200 LIVE; Draining → 503 DRAINING; HealthcheckFailing →
     //! 503 Service Unavailable).
     //!
-    //! Test helper `test_handler_with_drain(drain)` mirrors the existing
-    //! `handler_with_bootstrap` helper in `config_dump_tests` but accepts
-    //! a pre-constructed `Arc<DrainState>` so the test can drive the
-    //! underlying state transitions BEFORE invoking the render fn.
+    //! Test helper `test_support::handler_with_drain(drain)` mirrors the
+    //! shared `handler_with_bootstrap` helper but accepts a pre-constructed
+    //! `Arc<DrainState>` so the test can drive the underlying state
+    //! transitions BEFORE invoking the render fn.
 
-    use super::config_dump_tests::TINY_BOOTSTRAP;
+    use super::test_support::handler_with_drain as test_handler_with_drain;
     use super::{AdminEndpoint, render_server_info};
-    use crate::config::AdminConfig;
-    use crate::handler::AdminHandler;
-    use envoy_cluster::ClusterManager;
-    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
     use envoy_listener::DrainState;
     use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::Instant;
-
-    fn test_handler_with_drain(drain: Arc<DrainState>) -> AdminHandler {
-        let bootstrap: Bootstrap = serde_yaml::from_str(TINY_BOOTSTRAP).expect("yaml parses");
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let registry = Arc::new(StatsRegistry::new());
-        AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        )
-    }
 
     #[test]
     fn server_info_state_is_draining_when_drain_state_is_draining() {
@@ -3101,15 +2640,15 @@ mod endpoints_config_dump_tests {
     //! (b) conditional emission with an EDS cluster present; (c) inertness — only
     //! STATIC/STRICT_DNS clusters ⇒ NO EndpointsConfigDump entry; (d) ordering.
 
+    use super::test_support::{
+        CDS_ONLY_BOOTSTRAP, STATIC_BACKEND_CLUSTER, TINY_BOOTSTRAP, dump_value,
+        handler_from_bootstrap, handler_with, parse_bootstrap, parse_cluster,
+    };
     use super::{AdminEndpoint, Dispatch};
-    use crate::config::AdminConfig;
     use crate::handler::AdminHandler;
-    use envoy_cluster::ClusterManager;
-    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_config::Bootstrap;
     use envoy_stats::StatsRegistry;
-    use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::Instant;
 
     /// An EDS cluster named `eds_backend`. The `load_assignment` is the
     /// resolved CLA that `load_dynamic_resources` would populate from the EDS
@@ -3135,23 +2674,6 @@ load_assignment:
             port_value: 8080
 ";
 
-    /// A STATIC cluster named `static_backend` (no EDS) — used by the inertness
-    /// test (only STATIC/STRICT_DNS ⇒ no EndpointsConfigDump entry).
-    const STATIC_BACKEND_CLUSTER: &str = "\
-name: static_backend
-type: STATIC
-lb_policy: ROUND_ROBIN
-load_assignment:
-  cluster_name: static_backend
-  endpoints:
-  - lb_endpoints:
-    - endpoint:
-        address:
-          socket_address:
-            address: 127.0.0.1
-            port_value: 9000
-";
-
     /// A STRICT_DNS cluster named `dns_backend` (no EDS) — second inertness arm.
     const DNS_BACKEND_CLUSTER: &str = "\
 name: dns_backend
@@ -3167,72 +2689,6 @@ load_assignment:
             address: backend.example.com
             port_value: 8080
 ";
-
-    /// Bootstrap WITH `cds_config` configured (so the ClustersConfigDump entry
-    /// lands at configs[1] and the EndpointsConfigDump entry must order AFTER it
-    /// at configs[2]).
-    const CDS_BOOTSTRAP: &str = "\
-node:
-  id: t
-  cluster: c
-dynamic_resources:
-  cds_config:
-    path_config_source:
-      path: /etc/cds.yaml
-static_resources:
-  listeners: []
-  clusters: []
-";
-
-    /// Bootstrap with NO `dynamic_resources` (so the EndpointsConfigDump entry
-    /// lands at configs[1], directly after the Bootstrap entry).
-    const PLAIN_BOOTSTRAP: &str = "\
-node:
-  id: t
-  cluster: c
-static_resources:
-  listeners: []
-  clusters: []
-";
-
-    fn parse_cluster(yaml: &str) -> envoy_config::Cluster {
-        serde_yaml::from_str(yaml).expect("cluster yaml parses")
-    }
-
-    fn parse_bootstrap(yaml: &str) -> Bootstrap {
-        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
-    }
-
-    fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let registry = Arc::new(StatsRegistry::new());
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(ClusterManager::empty()),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        )
-    }
-
-    fn dump_value(handler: &AdminHandler) -> serde_json::Value {
-        let resp = AdminEndpoint::ConfigDump.render_with(handler);
-        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
-        serde_json::from_str(body_str).expect("valid JSON")
-    }
 
     const ENDPOINTS_TYPE: &str = "type.googleapis.com/envoy.admin.v3.EndpointsConfigDump";
 
@@ -3268,7 +2724,7 @@ static_resources:
     // an EndpointsConfigDump entry carrying static_endpoint_configs[0].
     #[test]
     fn eds_cluster_emits_endpoints_config_dump() {
-        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
@@ -3315,7 +2771,7 @@ static_resources:
     // (c) inertness: only STATIC/STRICT_DNS clusters ⇒ NO EndpointsConfigDump.
     #[test]
     fn non_eds_clusters_emit_no_endpoints_config_dump() {
-        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         bootstrap.static_resources.clusters = vec![
             parse_cluster(STATIC_BACKEND_CLUSTER),
             parse_cluster(DNS_BACKEND_CLUSTER),
@@ -3348,27 +2804,7 @@ static_resources:
         let manager = envoy_cluster::from_bootstrap(&bootstrap, Arc::clone(&registry))
             .await
             .expect("from_bootstrap");
-        let admin = Admin {
-            address: Address {
-                socket_address: SocketAddress {
-                    address: "127.0.0.1".to_string(),
-                    port_value: 0,
-                },
-            },
-            access_log_path: None,
-        };
-        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
-        let drain = Arc::new(envoy_listener::DrainState::new(&registry));
-        AdminHandler::new(
-            cfg,
-            registry,
-            Arc::new(bootstrap),
-            Arc::new(manager),
-            Instant::now(),
-            BTreeMap::new(),
-            drain,
-            Vec::new(),
-        )
+        handler_with(bootstrap, Arc::new(manager), None, Vec::new())
     }
 
     // 27 Task 5 (TDD core / D5): `/config_dump?include_eds`'s EndpointsConfigDump
@@ -3382,7 +2818,7 @@ static_resources:
     async fn config_dump_reflects_hot_reloaded_endpoints() {
         // 1. Build a live manager whose `eds_backend` cluster starts at the
         //    bootstrap load_assignment endpoint (127.0.0.1:8080).
-        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
         let handler = handler_with_live_manager(bootstrap).await;
 
@@ -3453,7 +2889,7 @@ static_resources:
     #[test]
     fn endpoints_entry_orders_after_clusters() {
         // cds present ⇒ Endpoints at configs[2].
-        let mut bootstrap = parse_bootstrap(CDS_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(CDS_ONLY_BOOTSTRAP);
         bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
@@ -3464,7 +2900,7 @@ static_resources:
         );
 
         // no cds ⇒ Endpoints at configs[1].
-        let mut bootstrap = parse_bootstrap(PLAIN_BOOTSTRAP);
+        let mut bootstrap = parse_bootstrap(TINY_BOOTSTRAP);
         bootstrap.static_resources.clusters = vec![parse_cluster(EDS_CLUSTER)];
         let handler = handler_from_bootstrap(bootstrap);
         let value = dump_value(&handler);
@@ -3473,5 +2909,183 @@ static_resources:
             Some(1),
             "with no cds_config the EndpointsConfigDump lands at configs[1]; value was {value}"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Shared construction helpers + YAML fixtures for this file's endpoint
+    //! test modules. Consolidates the per-module `AdminHandler` builders,
+    //! parse helpers, and bootstrap/cluster YAML literals that were
+    //! copy-pasted across the config-dump-era test cohort — each module now
+    //! imports from here (extending the Task-9 precedent of sharing
+    //! `config_dump_tests::handler_with_bootstrap`).
+
+    use crate::config::AdminConfig;
+    use crate::handler::AdminHandler;
+    use envoy_cluster::ClusterManager;
+    use envoy_config::{Address, Admin, Bootstrap, SocketAddress};
+    use envoy_listener::DrainState;
+    use envoy_stats::StatsRegistry;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// The minimal valid bootstrap YAML (originally hoisted at 08.1 Task 9;
+    /// closes Task 7 review M2 carryforward). Also the "plain bootstrap"
+    /// (no `dynamic_resources`) shape of the conditional-emission tests.
+    pub(crate) const TINY_BOOTSTRAP: &str =
+        "node:\n  id: t\n  cluster: c\nstatic_resources:\n  listeners: []\n  clusters: []\n";
+
+    /// Bootstrap WITH `dynamic_resources.cds_config` configured (triggers the
+    /// conditional ClustersConfigDump emission; the fixture-0026 regression
+    /// shape). The `path` is never read at render time — loaded resources
+    /// live in `dynamic_clusters`.
+    pub(crate) const CDS_ONLY_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    /// Bootstrap WITH BOTH `cds_config` AND `lds_config` configured (triggers
+    /// the conditional Clusters AND Listeners emission — order lock:
+    /// Bootstrap[0], Clusters[1], Listeners[2]).
+    pub(crate) const CDS_LDS_BOOTSTRAP: &str = "\
+node:
+  id: t
+  cluster: c
+dynamic_resources:
+  cds_config:
+    path_config_source:
+      path: /etc/cds.yaml
+  lds_config:
+    path_config_source:
+      path: /etc/lds.yaml
+static_resources:
+  listeners: []
+  clusters: []
+";
+
+    /// A single STRICT_DNS cluster named `dynamic_backend`, the L5 fixture
+    /// shape. Parsed standalone (not via the bootstrap path) so a test can
+    /// inject it into `dynamic_clusters` directly.
+    pub(crate) const DYNAMIC_BACKEND_CLUSTER: &str = "\
+name: dynamic_backend
+type: STRICT_DNS
+lb_policy: ROUND_ROBIN
+load_assignment:
+  cluster_name: dynamic_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: backend.example.com
+            port_value: 8080
+";
+
+    /// A static cluster (type STATIC) named `static_backend`, used by the
+    /// static_clusters-key-presence and EDS-inertness tests.
+    pub(crate) const STATIC_BACKEND_CLUSTER: &str = "\
+name: static_backend
+type: STATIC
+lb_policy: ROUND_ROBIN
+load_assignment:
+  cluster_name: static_backend
+  endpoints:
+  - lb_endpoints:
+    - endpoint:
+        address:
+          socket_address:
+            address: 127.0.0.1
+            port_value: 9000
+";
+
+    pub(crate) fn parse_bootstrap(yaml: &str) -> Bootstrap {
+        serde_yaml::from_str(yaml).expect("bootstrap yaml parses")
+    }
+
+    pub(crate) fn parse_cluster(yaml: &str) -> envoy_config::Cluster {
+        serde_yaml::from_str(yaml).expect("cluster yaml parses")
+    }
+
+    /// Render `/config_dump` through the dispatch surface and parse the body.
+    pub(crate) fn dump_value(handler: &AdminHandler) -> serde_json::Value {
+        let resp = super::AdminEndpoint::ConfigDump.render_with(handler);
+        let body_str = std::str::from_utf8(&resp.body).expect("utf-8");
+        serde_json::from_str(body_str).expect("valid JSON")
+    }
+
+    /// Full-parameter `AdminHandler` builder: a port-0 `AdminConfig`, a fresh
+    /// registry, `Instant::now()`, empty command-line options, and the
+    /// caller-supplied bootstrap / cluster manager / drain / live-route
+    /// handles. `drain: None` constructs a fresh (never-observed) `DrainState`
+    /// against the handler's registry — every `AdminHandler::new` call site in
+    /// this file routes through here (08.2 Task 4 / D13b: the trailing
+    /// `Arc<DrainState>`; 26 Task 6: the trailing `live_route_configs`).
+    pub(crate) fn handler_with(
+        bootstrap: Bootstrap,
+        cluster_manager: Arc<ClusterManager>,
+        drain: Option<Arc<DrainState>>,
+        live_route_configs: Vec<(String, Arc<envoy_http1::HCMConfig>)>,
+    ) -> AdminHandler {
+        let admin = Admin {
+            address: Address {
+                socket_address: SocketAddress {
+                    address: "127.0.0.1".to_string(),
+                    port_value: 0,
+                },
+            },
+            access_log_path: None,
+        };
+        let cfg = Arc::new(AdminConfig::from_envoy_config(&admin).expect("AdminConfig"));
+        let registry = Arc::new(StatsRegistry::new());
+        let drain = drain.unwrap_or_else(|| Arc::new(DrainState::new(&registry)));
+        AdminHandler::new(
+            cfg,
+            registry,
+            Arc::new(bootstrap),
+            cluster_manager,
+            Instant::now(),
+            BTreeMap::new(),
+            drain,
+            live_route_configs,
+        )
+    }
+
+    /// Build a handler from an already-constructed `Bootstrap` (so a test can
+    /// populate `dynamic_clusters` / `dynamic_listeners` first) with an empty
+    /// cluster manager and no drain/live-route handles.
+    pub(crate) fn handler_from_bootstrap(bootstrap: Bootstrap) -> AdminHandler {
+        handler_with(
+            bootstrap,
+            Arc::new(ClusterManager::empty()),
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// Build a handler straight from bootstrap YAML.
+    pub(crate) fn handler_with_bootstrap(yaml: &str) -> AdminHandler {
+        handler_from_bootstrap(parse_bootstrap(yaml))
+    }
+
+    /// Build a `TINY_BOOTSTRAP` handler over a pre-constructed
+    /// `Arc<DrainState>` so a test can drive the underlying state transitions
+    /// BEFORE invoking the render fn (08.2 Task 5 — D5e + D-ready cohort).
+    pub(crate) fn handler_with_drain(drain: Arc<DrainState>) -> AdminHandler {
+        handler_with(
+            parse_bootstrap(TINY_BOOTSTRAP),
+            Arc::new(ClusterManager::empty()),
+            Some(drain),
+            Vec::new(),
+        )
     }
 }

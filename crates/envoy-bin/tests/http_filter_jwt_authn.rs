@@ -34,12 +34,16 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+mod common;
+
+use common::{dump_stderr_and_kill, reserve_port, wait_ready};
 
 // ---- Static JWT tokens + JWKS (RSA-2048 / RS256, deterministic forever) -----
 // Source: tests/fixtures/0030-http-filter-jwt-authn/inputs/
@@ -55,34 +59,6 @@ const TAMPERED_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.
 const EXPIRED_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyIsImF1ZCI6WyJqd3QtZml4dHVyZS1hdWQiXSwiZXhwIjoxNTAwMDAwMDAwfQ.GJiQRUrdhigMHUoRYEHBh1AJ1m6qi857vx-iLrUKvDH0DJGizJWsttmLYPz-LhTalqzmCZLkIXRiM4rpt2XrZdQRfDWFnX4JxIcSJlANpQt6Bt06c-R7CEikPk2Jqsyeskf5QEoRTM2y900bPEVZddWaGrQhkBInxkyM_Y0VhQHWeHrC_BzIm76hFSGDcSs3GzuR2pVs1YHNmI_3KMmJ0HtU3LgFPwqr4dC9_j85truS-AOlpLkxZL_hLti1eT2Fvc0o89vF_zg0mwgRnT5UpJPGNPvDXsjQv_Ok287yd2HzTtKQVBY5a9kyzdan2pZeLMyNYh6Kj6qEpxbhizY4pg";
 
 const WRONG_AUD_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ0ZXN0aW5nQHNlY3VyZS5pc3Rpby5pbyIsImF1ZCI6WyJvdGhlci1hdWQiXSwiZXhwIjo0MTAyNDQ0ODAwfQ.etnKuLttA3_ODRK4sd5IVNWh8tf_xWXQjV0nfhIUQaqdmOkey8JN-TbP4fQujesa3TGIPZOE7D5euTjiPjKriGIfDFs4OVDNqYWAbIky3lFhLw2hiOeTallecUsCFn8sXIn_2UonZIFxtB_DMUCbv3aUE1gop4vXKFjB0ZBKH5nPoX0J_NHgQoZZ3tyt8p1LsCxIEyYb3ew9OByaumLkOqrT5m7sBW3K7urFRf_SZkt6V49HK6WU3DLn7aVsZInicyoUr33XgnrWdfjMjoPG_MVjj_JLymZWLxQd7Oc4qCZo0avjTG1p2c3fhFbJJvd6-tELa44adyGwuHGG00o4DQ";
-
-/// Reserve a free TCP port on 127.0.0.1 by binding an ephemeral port and
-/// immediately dropping the listener (matching the rbac/fault backstop precedent
-/// `StdListener::bind(("127.0.0.1", 0))` style).
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
-/// Wait for a TCP listener at `addr` to accept a connection, with exponential
-/// backoff up to `budget`. Returns `Ok(())` on success; `Err` on timeout.
-/// Mirrors the `wait_ready_result` shape from the rbac backstop precedent.
-async fn wait_ready_result(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
 
 /// Open a fresh TCP connection to `addr`, write an HTTP/1.1 GET with
 /// `Connection: close` and `Host: envoy.test` (and optionally an
@@ -142,30 +118,6 @@ async fn probe(
         })
         .collect();
     (status, headers, body)
-}
-
-/// Dump stderr from the child process (if available) and kill + wait on it.
-/// Used on the failure path so envoy-bin runtime errors surface in test output.
-async fn dump_stderr_and_kill(child: &mut tokio::process::Child) {
-    // KILL FIRST: while the child is alive it holds the write end of the stderr
-    // pipe open, so `read_to_end` on a live child blocks forever (the pipe never
-    // EOFs). Killing first closes the write end, so the buffered stderr drains
-    // then EOFs. The `timeout` is a belt-and-suspenders guard so this can never
-    // hang again even if the kill races.
-    child.kill().await.ok();
-    if let Some(mut err_pipe) = child.stderr.take() {
-        let mut stderr_buf = Vec::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            err_pipe.read_to_end(&mut stderr_buf),
-        )
-        .await;
-        eprintln!(
-            "envoy-bin stderr:\n{}",
-            String::from_utf8_lossy(&stderr_buf)
-        );
-    }
-    let _ = child.wait().await;
 }
 
 #[tokio::test]
@@ -257,7 +209,7 @@ static_resources:
     // envoy-bin startup error surfaces in test output (rbac + fault precedent).
     let ready = tokio::time::timeout(
         Duration::from_secs(10),
-        wait_ready_result(listener_addr, Duration::from_secs(10)),
+        wait_ready(listener_addr, Duration::from_secs(10)),
     )
     .await;
     if ready.is_err() || matches!(&ready, Ok(Err(_))) {

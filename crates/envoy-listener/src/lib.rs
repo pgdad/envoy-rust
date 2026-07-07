@@ -209,11 +209,7 @@ impl Listener {
         concurrency: usize,
         reuse_port: bool,
     ) -> Result<Self, ListenerError> {
-        let sock = &cfg.address.socket_address;
-        let addr_str = format!("{}:{}", sock.address, sock.port_value);
-        let addr: SocketAddr = addr_str
-            .parse()
-            .map_err(|_| ListenerError::AddressParse(sock.address.clone(), sock.port_value))?;
+        let addr = parse_listener_addr(cfg)?;
         let listeners = bind_listeners(addr, reuse_port, concurrency).await?;
         if listeners.len() > 1 {
             tracing::info!(
@@ -222,35 +218,8 @@ impl Listener {
                 "listener bound with SO_REUSEPORT (one accept queue per worker)"
             );
         }
-        // 06.1 D4.a: register `listener.<name>.downstream_cx_total`. The
-        // registry call is idempotent for same-kind re-registration, so
-        // multiple `Listener::bind` calls with the same `cfg.name` (a
-        // configuration error in production but possible in tests) reuse
-        // the existing handle rather than erroring.
-        let cx_total = registry
-            .register_counter(&format!("listener.{}.downstream_cx_total", cfg.name))
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
-        // 06.3 D15.3.b: register `listener.<name>.downstream_cx_active`.
-        // Idempotent same-kind re-registration mirrors cx_total above.
-        let cx_active = registry
-            .register_gauge(&format!("listener.{}.downstream_cx_active", cfg.name))
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
-        // 06.3 D15.3.d: register `listener.<name>.downstream_cx_accept_failed`.
-        // Idempotent same-kind re-registration mirrors cx_total above.
-        let cx_accept_failed = registry
-            .register_counter(&format!(
-                "listener.{}.downstream_cx_accept_failed",
-                cfg.name
-            ))
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
-        // 08.2 D14: register the shared `listener_manager.total_listeners_active`
-        // gauge. Idempotent same-name re-registration across multiple `bind`
-        // calls mirrors the 06.1 cx_total / 06.3 cx_active / 06.3 cx_accept_failed
-        // pattern at adjacent registration sites. RAII inc/dec wiring at
-        // `serve` entry/exit lands at Task 6 (D12).
-        let listener_manager_active = registry
-            .register_gauge("listener_manager.total_listeners_active")
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        let (cx_total, cx_active, cx_accept_failed, listener_manager_active) =
+            register_listener_stats(&registry, &cfg.name)?;
         Ok(Self {
             listeners,
             handler,
@@ -284,31 +253,14 @@ impl Listener {
         if n > 1 && !(cfg.enable_reuse_port && cfg!(target_os = "linux")) {
             return Err(ListenerError::ShardingUnavailable);
         }
-        let sock = &cfg.address.socket_address;
-        let addr_str = format!("{}:{}", sock.address, sock.port_value);
-        let addr: SocketAddr = addr_str
-            .parse()
-            .map_err(|_| ListenerError::AddressParse(sock.address.clone(), sock.port_value))?;
+        let addr = parse_listener_addr(cfg)?;
         let sockets = bind_listeners(addr, cfg.enable_reuse_port, n).await?;
         debug_assert_eq!(sockets.len(), n, "bind_listeners honored the shard count");
 
         // Same stat registrations as bind_inner — idempotent by name, and the
         // resulting Arcs are cloned into every shard (one logical stat set).
-        let cx_total = registry
-            .register_counter(&format!("listener.{}.downstream_cx_total", cfg.name))
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
-        let cx_active = registry
-            .register_gauge(&format!("listener.{}.downstream_cx_active", cfg.name))
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
-        let cx_accept_failed = registry
-            .register_counter(&format!(
-                "listener.{}.downstream_cx_accept_failed",
-                cfg.name
-            ))
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
-        let listener_manager_active = registry
-            .register_gauge("listener_manager.total_listeners_active")
-            .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+        let (cx_total, cx_active, cx_accept_failed, listener_manager_active) =
+            register_listener_stats(&registry, &cfg.name)?;
 
         Ok(sockets
             .into_iter()
@@ -471,6 +423,70 @@ impl Listener {
             None => Ok(()),
         }
     }
+}
+
+/// Resolve `cfg.address.socket_address` to a `SocketAddr`. Phase-02.1
+/// `envoy-config` does not parse the address field into a `SocketAddr`; that
+/// happens here, so configuration with a malformed `address` (e.g.
+/// `"not-a-host"`) returns `ListenerError::AddressParse`. Shared by
+/// `bind_inner` and `bind_per_worker`.
+fn parse_listener_addr(cfg: &envoy_config::Listener) -> Result<SocketAddr, ListenerError> {
+    let sock = &cfg.address.socket_address;
+    let addr_str = format!("{}:{}", sock.address, sock.port_value);
+    addr_str
+        .parse()
+        .map_err(|_| ListenerError::AddressParse(sock.address.clone(), sock.port_value))
+}
+
+/// Register the per-listener stat set against the global `StatsRegistry`.
+/// Shared by `bind_inner` and `bind_per_worker` (one logical stat set either
+/// way). Returns `(cx_total, cx_active, cx_accept_failed,
+/// listener_manager_active)` — registration order is load-bearing history:
+/// it mirrors the original inline sites byte-for-byte.
+///
+/// - 06.1 D4.a: `listener.<name>.downstream_cx_total`. The registry call is
+///   idempotent for same-kind re-registration, so multiple `Listener::bind`
+///   calls with the same `cfg.name` (a configuration error in production but
+///   possible in tests) reuse the existing handle rather than erroring.
+/// - 06.3 D15.3.b: `listener.<name>.downstream_cx_active`. Idempotent
+///   same-kind re-registration mirrors cx_total above.
+/// - 06.3 D15.3.d: `listener.<name>.downstream_cx_accept_failed`. Idempotent
+///   same-kind re-registration mirrors cx_total above.
+/// - 08.2 D14: the shared `listener_manager.total_listeners_active` gauge.
+///   Idempotent same-name re-registration across multiple `bind` calls
+///   mirrors the cx_* pattern at adjacent registration sites. RAII inc/dec
+///   wiring at `serve` entry/exit landed at Task 6 (D12).
+#[allow(clippy::type_complexity)]
+fn register_listener_stats(
+    registry: &envoy_stats::StatsRegistry,
+    name: &str,
+) -> Result<
+    (
+        Arc<envoy_stats::Counter>,
+        Arc<envoy_stats::Gauge>,
+        Arc<envoy_stats::Counter>,
+        Arc<envoy_stats::Gauge>,
+    ),
+    ListenerError,
+> {
+    let cx_total = registry
+        .register_counter(&format!("listener.{name}.downstream_cx_total"))
+        .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+    let cx_active = registry
+        .register_gauge(&format!("listener.{name}.downstream_cx_active"))
+        .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+    let cx_accept_failed = registry
+        .register_counter(&format!("listener.{name}.downstream_cx_accept_failed"))
+        .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+    let listener_manager_active = registry
+        .register_gauge("listener_manager.total_listeners_active")
+        .map_err(|e| ListenerError::StatsRegistration(e.to_string()))?;
+    Ok((
+        cx_total,
+        cx_active,
+        cx_accept_failed,
+        listener_manager_active,
+    ))
 }
 
 /// One accept loop over a single socket, with the shutdown-gated graceful drain.

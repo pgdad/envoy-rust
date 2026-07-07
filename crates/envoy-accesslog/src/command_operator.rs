@@ -245,41 +245,42 @@ fn parse_operator(body: &str) -> Result<Op, FormatParseError> {
         "REQ" => parse_header_op(keyword, rest, Side::Req),
         "RESP" => parse_header_op(keyword, rest, Side::Resp),
         "DYNAMIC_METADATA" => parse_dynamic_metadata_op(rest),
-        // Non-arg keywords: must NOT carry parens.
-        "PROTOCOL"
-        | "RESPONSE_CODE"
-        | "RESPONSE_FLAGS"
-        | "BYTES_RECEIVED"
-        | "BYTES_SENT"
-        | "UPSTREAM_HOST"
-        | "UPSTREAM_CLUSTER"
-        | "ROUTE_NAME"
-        | "RESPONSE_CODE_DETAILS"
-        | "START_TIME"
-        | "DURATION" => {
-            if rest.is_some() {
-                return Err(FormatParseError::MalformedArgument {
-                    keyword: keyword.to_string(),
-                    detail: "this operator takes no '(...)' argument".to_string(),
-                });
+        other => match no_arg_op(other) {
+            // Non-arg keywords: must NOT carry parens.
+            Some(op) => {
+                if rest.is_some() {
+                    return Err(FormatParseError::MalformedArgument {
+                        keyword: other.to_string(),
+                        detail: "this operator takes no '(...)' argument".to_string(),
+                    });
+                }
+                Ok(op)
             }
-            Ok(match keyword {
-                "PROTOCOL" => Op::Protocol,
-                "RESPONSE_CODE" => Op::ResponseCode,
-                "RESPONSE_FLAGS" => Op::ResponseFlags,
-                "BYTES_RECEIVED" => Op::BytesReceived,
-                "BYTES_SENT" => Op::BytesSent,
-                "UPSTREAM_HOST" => Op::UpstreamHost,
-                "UPSTREAM_CLUSTER" => Op::UpstreamCluster,
-                "ROUTE_NAME" => Op::RouteName,
-                "RESPONSE_CODE_DETAILS" => Op::ResponseCodeDetails,
-                "START_TIME" => Op::StartTime,
-                "DURATION" => Op::Duration,
-                _ => unreachable!("matched above"),
-            })
-        }
-        other => Err(FormatParseError::UnknownKeyword(other.to_string())),
+            None => Err(FormatParseError::UnknownKeyword(other.to_string())),
+        },
     }
+}
+
+/// Resolve a no-argument operator keyword to its [`Op`], or `None` for an
+/// unknown keyword. The SINGLE source of truth for the no-arg keyword set —
+/// `parse_operator` derives both its recognition and its construction from
+/// this table, so a new operator cannot be added to one and forgotten in the
+/// other.
+fn no_arg_op(keyword: &str) -> Option<Op> {
+    Some(match keyword {
+        "PROTOCOL" => Op::Protocol,
+        "RESPONSE_CODE" => Op::ResponseCode,
+        "RESPONSE_FLAGS" => Op::ResponseFlags,
+        "BYTES_RECEIVED" => Op::BytesReceived,
+        "BYTES_SENT" => Op::BytesSent,
+        "UPSTREAM_HOST" => Op::UpstreamHost,
+        "UPSTREAM_CLUSTER" => Op::UpstreamCluster,
+        "ROUTE_NAME" => Op::RouteName,
+        "RESPONSE_CODE_DETAILS" => Op::ResponseCodeDetails,
+        "START_TIME" => Op::StartTime,
+        "DURATION" => Op::Duration,
+        _ => return None,
+    })
 }
 
 /// Parse a `REQ`/`RESP` operator: `KEYWORD(ARG)` optionally followed by `:N`.
@@ -626,32 +627,21 @@ pub(crate) fn truncate_bytes(value: &str, truncate: Option<usize>) -> &str {
 mod tests {
     use super::*;
     use crate::record::AccessLogRecord;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::Duration;
 
-    // A fully-populated, deterministic record for evaluator tests. The record
-    // intentionally has no `Default` impl, so every field is set explicitly.
+    // A fully-populated, deterministic record for evaluator tests: the shared
+    // `test_baseline()` fixture mutated into the POST /p 16/433 variant.
     fn rec() -> AccessLogRecord {
-        AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "POST".into(),
-            path: "/p".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 16,
-            bytes_sent: 433,
-            duration: Duration::from_millis(0),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: Some("curl/8.20.0".into()),
-            request_id: None,
-            authority: Some("h:1".into()),
-            upstream_host: Some("1.2.3.4:80".into()),
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        let mut r = AccessLogRecord::test_baseline();
+        r.method = "POST".into();
+        r.path = "/p".into();
+        r.bytes_received = 16;
+        r.bytes_sent = 433;
+        r.duration = Duration::from_millis(0);
+        r.user_agent = Some("curl/8.20.0".into());
+        r.authority = Some("h:1".into());
+        r.upstream_host = Some("1.2.3.4:80".into());
+        r
     }
 
     #[test]

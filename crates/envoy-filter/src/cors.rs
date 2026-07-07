@@ -14,12 +14,6 @@
 //!   `access-control-allow-origin` + optionally `access-control-allow-credentials`
 //!   + optionally `access-control-expose-headers`.
 //! - **Disallowed / no-origin**: pass-through, no decoration.
-//!
-//! ## Wiring status
-//! The filter is intentionally NOT wired into `HttpFilterInstance` at Task-3
-//! scope; the `HttpFilterInstance::Cors` variant + `apply_route_config`
-//! fan-out land in Task 4.  Dead-code lints for the public-crate items are
-//! suppressed here until the Task-4 wiring activates them.
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -27,7 +21,7 @@ use envoy_stats::{Counter, StatsRegistry};
 
 use crate::error::FilterError;
 use crate::pipeline::Decision;
-use crate::types::{FilterRequest, FilterResponse};
+use crate::types::{FilterRequest, FilterResponse, header_ci};
 
 const CORS_FILTER_NAME: &str = "envoy.filters.http.cors";
 
@@ -91,11 +85,10 @@ impl CorsFilter {
         hcm_stat_prefix: &str,
     ) -> Result<Self, FilterError> {
         let reg = |suffix: &str| {
-            registry
-                .register_counter(&format!("http.{hcm_stat_prefix}.cors.{suffix}"))
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: format!("StatsRegistry: {e}"),
-                })
+            crate::error::register_counter(
+                registry,
+                &format!("http.{hcm_stat_prefix}.cors.{suffix}"),
+            )
         };
         Ok(Self {
             origin_valid: reg("origin_valid")?,
@@ -232,15 +225,6 @@ fn build_preflight_response(policy: &CompiledCorsPolicy, origin: &str) -> Filter
     }
 }
 
-/// Case-insensitive header lookup — duplicated from `jwt_authn` per SC2
-/// (no shared utility extraction).
-fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -294,25 +278,11 @@ mod tests {
     }
 
     fn req(method: &str, headers: Vec<(&str, &str)>) -> FilterRequest {
-        FilterRequest {
-            method: method.to_string(),
-            path: "/".to_string(),
-            headers: headers
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test(method, "/", &headers)
     }
 
     fn empty_resp() -> FilterResponse {
-        FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: Bytes::new(),
-        }
+        FilterResponse::test_200()
     }
 
     fn origin_valid_value(reg: &Arc<StatsRegistry>) -> u64 {
@@ -592,26 +562,10 @@ mod tests {
         )
         .expect("build");
 
-        let cors_policy = policy();
-        let pfc = envoy_config::PerFilterConfig::Cors(cors_policy.clone());
-        let mut pfc_map = BTreeMap::new();
-        pfc_map.insert(CORS_FILTER_NAME.to_string(), pfc);
-        let route = envoy_config::Route {
-            name: String::new(),
-            r#match: envoy_config::RouteMatch {
-                prefix: Some("/".to_string()),
-                path: None,
-                headers: vec![],
-            },
-            action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
-                status: 200,
-                body: envoy_config::DataSource {
-                    filename: None,
-                    inline_string: None,
-                },
-            }),
-            typed_per_filter_config: pfc_map,
-        };
+        let route = crate::types::test_route_with_pfc(
+            CORS_FILTER_NAME,
+            envoy_config::PerFilterConfig::Cors(policy()),
+        );
 
         assert!(f.active_policy.is_none(), "initially no policy");
         f.apply_route_config(Some(&route));
@@ -659,22 +613,7 @@ mod tests {
         .expect("build");
 
         // Route with no typed_per_filter_config entries at all.
-        let route = envoy_config::Route {
-            name: String::new(),
-            r#match: envoy_config::RouteMatch {
-                prefix: Some("/".to_string()),
-                path: None,
-                headers: vec![],
-            },
-            action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
-                status: 200,
-                body: envoy_config::DataSource {
-                    filename: None,
-                    inline_string: None,
-                },
-            }),
-            typed_per_filter_config: BTreeMap::new(),
-        };
+        let route = crate::types::test_route_with_pfc_map(BTreeMap::new());
 
         f.apply_route_config(Some(&route));
         assert!(

@@ -25,35 +25,16 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdListener};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::sleep;
 
-fn reserve_port() -> u16 {
-    let listener = StdListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind ephemeral");
-    let port = listener.local_addr().expect("local_addr").port();
-    drop(listener);
-    port
-}
+mod common;
 
-async fn wait_ready(addr: SocketAddr, budget: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + budget;
-    let mut backoff = Duration::from_millis(50);
-    while Instant::now() < deadline {
-        if TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_millis(500));
-    }
-    Err(format!(
-        "listener at {addr} did not become ready within {budget:?}"
-    ))
-}
+use common::{reserve_port, wait_ready};
 
 async fn send_request_and_collect(addr: SocketAddr) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))

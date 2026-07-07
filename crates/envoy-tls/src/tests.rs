@@ -19,10 +19,8 @@ mod pki {
     /// SNI-keyed multi-cert resolver tests; leaf-A's fields keep their pre-03.2
     /// names (`leaf_cert_pem` / `leaf_key_pem`) so existing 03.1 tests are
     /// unchanged.
-    #[allow(dead_code)]
     pub struct Pki {
         pub _dir: TempDir,
-        pub ca_cert_pem: PathBuf,
         pub leaf_cert_pem: PathBuf,
         pub leaf_key_pem: PathBuf,
         pub leaf_b_cert_pem: PathBuf,
@@ -90,7 +88,6 @@ mod pki {
 
         Pki {
             _dir: dir,
-            ca_cert_pem: ca_path,
             leaf_cert_pem: leaf_path,
             leaf_key_pem: leaf_key_path,
             leaf_b_cert_pem: leaf_b_path,
@@ -154,6 +151,21 @@ mod pki {
 
 fn install_provider_once() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Test-local `ResolvesServerCert` that returns the wrapped `CertifiedKey`
+/// for every ClientHello. Shared by the upstream-side handshake tests
+/// (`loads_upstream_client_config`, `upstream_rejects_untrusted_cert`).
+#[derive(Debug)]
+struct StaticResolver(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::server::ResolvesServerCert for StaticResolver {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -370,13 +382,9 @@ mod upstream_pki {
     /// Test PKI for upstream-side tests: a CA + a server cert with SAN
     /// `envoy-rust.test`. Same shape as `pki::build` but the server cert is
     /// what the upstream presents.
-    #[allow(dead_code)]
     pub struct UpstreamPki {
         pub _dir: TempDir,
         pub ca_pem: PathBuf,
-        pub server_cert_pem: PathBuf,
-        pub server_key_pem: PathBuf,
-        pub ca_der_for_root_store: rustls::pki_types::CertificateDer<'static>,
         pub server_certified_key: rustls::sign::CertifiedKey,
     }
 
@@ -416,8 +424,6 @@ mod upstream_pki {
         std::fs::write(&srv_path, &srv_pem).expect("write server cert");
         std::fs::write(&srv_key_path, &srv_key_pem).expect("write server key");
 
-        let ca_der_for_root_store: rustls::pki_types::CertificateDer<'static> =
-            ca_cert.der().clone().into_owned();
         let server_certified_key = {
             let cert_der: rustls::pki_types::CertificateDer<'static> =
                 srv_cert.der().clone().into_owned();
@@ -436,9 +442,6 @@ mod upstream_pki {
         UpstreamPki {
             _dir: dir,
             ca_pem: ca_path,
-            server_cert_pem: srv_path,
-            server_key_pem: srv_key_path,
-            ca_der_for_root_store,
             server_certified_key,
         }
     }
@@ -472,17 +475,6 @@ async fn loads_upstream_client_config() {
     // Server: stand up a tokio_rustls TlsAcceptor with the rcgen-built server
     // cert. Exercise the upstream's connect against it.
     use rustls::server::ResolvesServerCert;
-
-    #[derive(Debug)]
-    struct StaticResolver(Arc<rustls::sign::CertifiedKey>);
-    impl ResolvesServerCert for StaticResolver {
-        fn resolve(
-            &self,
-            _client_hello: rustls::server::ClientHello<'_>,
-        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-            Some(self.0.clone())
-        }
-    }
 
     let resolver: Arc<dyn ResolvesServerCert> =
         Arc::new(StaticResolver(Arc::new(pki.server_certified_key)));
@@ -547,16 +539,6 @@ async fn upstream_rejects_untrusted_cert() {
     let upstream = UpstreamTls::from_context(&ctx).expect("from_context");
 
     use rustls::server::ResolvesServerCert;
-    #[derive(Debug)]
-    struct StaticResolver(Arc<rustls::sign::CertifiedKey>);
-    impl ResolvesServerCert for StaticResolver {
-        fn resolve(
-            &self,
-            _client_hello: rustls::server::ClientHello<'_>,
-        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-            Some(self.0.clone())
-        }
-    }
     let resolver: Arc<dyn ResolvesServerCert> =
         Arc::new(StaticResolver(Arc::new(other.server_certified_key)));
     let server_cfg = rustls::ServerConfig::builder()

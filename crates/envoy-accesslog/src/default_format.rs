@@ -200,28 +200,12 @@ mod tests {
 
     fn make_baseline_record() -> AccessLogRecord {
         // Mirrors fixture 0012's direct_response surface: GET / → 200
-        // "ok\n"; no upstream; no extra request headers.
-        AccessLogRecord {
-            start_time: UNIX_EPOCH,
-            method: "GET".into(),
-            path: "/".into(),
-            protocol: "HTTP/1.1".into(),
-            response_code: 200,
-            response_flags: "-".into(),
-            bytes_received: 0,
-            bytes_sent: 3,
-            duration: Duration::from_millis(5),
-            upstream_service_time: None,
-            forwarded_for: None,
-            user_agent: None,
-            request_id: None,
-            authority: Some("envoy-rust.test".into()),
-            upstream_host: None,
-            upstream_cluster: None,
-            route_name: None,
-            response_code_details: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        // "ok\n"; no upstream; no extra request headers. The shared
+        // `test_baseline()` fixture plus the `authority` header this
+        // module's expected-suffix assertions pin.
+        let mut r = AccessLogRecord::test_baseline();
+        r.authority = Some("envoy-rust.test".into());
+        r
     }
 
     #[test]

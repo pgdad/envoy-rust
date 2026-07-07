@@ -24,7 +24,7 @@
 //! No Docker — this is the in-process happy-path complement to Task 8's
 //! Docker-gated `0015-admin-drain-listeners` differential wrapper. Mirrors
 //! the shape of `admin_config_dump_server_info.rs` (08.1 D17.4a — single
-//! `#[tokio::test]`, inline `reserve_port()` + `wait_ready_result()` +
+//! `#[tokio::test]`, inline `reserve_port()` + `wait_ready()` +
 //! one-shot TCP scrape with `Connection: close` + `shutdown(Write)`
 //! against the admin handler's 5-second idle-read timeout).
 //!
@@ -44,34 +44,16 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
+mod common;
 
-async fn wait_ready_result(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
+use common::{reserve_port, wait_ready};
 
 /// One-shot HTTP/1.1 scrape against the admin port. Sends `Connection: close`
 /// (and for POSTs, `Content-Length: 0`), half-closes the write side so the
@@ -166,7 +148,7 @@ static_resources:
     // "Connection refused".
     let ready = tokio::time::timeout(
         Duration::from_secs(10),
-        wait_ready_result(admin_addr, Duration::from_secs(10)),
+        wait_ready(admin_addr, Duration::from_secs(10)),
     )
     .await;
     if ready.is_err() || matches!(&ready, Ok(Err(_))) {

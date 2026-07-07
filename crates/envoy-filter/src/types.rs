@@ -54,20 +54,124 @@ pub struct FilterResponse {
     pub body: Bytes,
 }
 
+impl FilterResponse {
+    /// Local-reply constructor for filters' static short-circuit responses:
+    /// no headers (`content-type` / `content-length` / `server` etc. are
+    /// stamped by the H1/H2 synth decorators downstream), status/reason/body
+    /// passed through verbatim.
+    pub(crate) fn static_reply(
+        status: u16,
+        reason: Option<&'static str>,
+        body: &'static [u8],
+    ) -> Self {
+        Self {
+            status,
+            reason,
+            headers: Vec::new(),
+            body: Bytes::from_static(body),
+        }
+    }
+}
+
+/// Case-insensitive header lookup (first match wins). Shared by the
+/// jwt_authn / cors / csrf / header_to_metadata filters.
+pub(crate) fn header_ci<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+// ---------------------------------------------------------------------------
+// Shared test support
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+impl FilterRequest {
+    /// Canonical test request: `body: None`, empty dynamic metadata.
+    pub(crate) fn test(method: &str, path: &str, headers: &[(&str, &str)]) -> Self {
+        Self {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: None,
+            dynamic_metadata: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl FilterResponse {
+    /// Canonical empty 200 test response (no reason, no headers, empty body).
+    pub(crate) fn test_200() -> Self {
+        Self {
+            status: 200,
+            reason: None,
+            headers: vec![],
+            body: Bytes::new(),
+        }
+    }
+}
+
+/// Test-support: a Route with a `DirectResponse(200)` action carrying a single
+/// `typed_per_filter_config` entry keyed by `filter_name`.
+#[cfg(test)]
+pub(crate) fn test_route_with_pfc(
+    filter_name: &str,
+    pfc: envoy_config::PerFilterConfig,
+) -> envoy_config::Route {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(filter_name.to_string(), pfc);
+    test_route_with_pfc_map(map)
+}
+
+/// Test-support: the `test_route_with_pfc` base with an arbitrary (possibly
+/// empty) `typed_per_filter_config` map.
+#[cfg(test)]
+pub(crate) fn test_route_with_pfc_map(
+    typed_per_filter_config: std::collections::BTreeMap<String, envoy_config::PerFilterConfig>,
+) -> envoy_config::Route {
+    envoy_config::Route {
+        name: String::new(),
+        r#match: envoy_config::RouteMatch {
+            prefix: Some("/".to_string()),
+            path: None,
+            headers: vec![],
+        },
+        action: envoy_config::RouteAction::DirectResponse(envoy_config::DirectResponse {
+            status: 200,
+            body: envoy_config::DataSource {
+                filename: None,
+                inline_string: None,
+            },
+        }),
+        typed_per_filter_config,
+    }
+}
+
+/// Test-support: a `HeaderMatcher` with an exact-value `StringMatch` mode.
+#[cfg(test)]
+pub(crate) fn header_matcher_exact(name: &str, exact: &str) -> envoy_config::HeaderMatcher {
+    envoy_config::HeaderMatcher {
+        name: name.to_string(),
+        mode: envoy_config::HeaderMatcherMode::StringMatch(envoy_config::StringMatcher {
+            mode: envoy_config::StringMatcherMode::Exact(exact.to_string()),
+            ignore_case: false,
+        }),
+        invert_match: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn filter_request_dynamic_metadata_defaults_empty_and_is_writable() {
-        use std::collections::BTreeMap;
-        let mut r = FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: vec![],
-            body: None,
-            dynamic_metadata: BTreeMap::new(),
-        };
+        let mut r = FilterRequest::test("GET", "/", &[]);
         assert!(r.dynamic_metadata.is_empty());
         r.dynamic_metadata
             .entry("ns".into())

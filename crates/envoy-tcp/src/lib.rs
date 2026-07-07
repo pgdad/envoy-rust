@@ -420,7 +420,6 @@ admin:
     /// involvement (envoy-tcp + a stub TLS pair built in-test).
     #[tokio::test(flavor = "multi_thread")]
     async fn proxies_payload_through_tls_downstream_stream() {
-        use rcgen::{CertificateParams, KeyPair};
         use rustls::pki_types::ServerName;
         use std::convert::TryFrom;
 
@@ -430,53 +429,9 @@ admin:
         let upstream_addr = spawn_echo().await;
 
         // rcgen-built CA + leaf with SAN `localhost` for the in-test TLS pair.
-        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).expect("ca params");
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_kp = KeyPair::generate().expect("ca kp");
-        let ca_cert = ca_params.self_signed(&ca_kp).expect("ca");
-
-        let leaf_params = CertificateParams::new(vec!["localhost".into()]).expect("leaf params");
-        let leaf_kp = KeyPair::generate().expect("leaf kp");
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_kp, &ca_cert, &ca_kp)
-            .expect("leaf");
-        let leaf_der: rustls::pki_types::CertificateDer<'static> =
-            leaf_cert.der().clone().into_owned();
-
-        let leaf_key_pem = leaf_kp.serialize_pem();
-        let mut key_slice = leaf_key_pem.as_bytes();
-        let key = rustls_pemfile::private_key(&mut key_slice)
-            .expect("priv key parse")
-            .expect("priv key present");
-        let signing =
-            rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).expect("any_supported_type");
-        let certified = rustls::sign::CertifiedKey::new(vec![leaf_der], signing);
-        let resolver_arc = Arc::new(certified);
-
-        #[derive(Debug)]
-        struct StaticResolver(Arc<rustls::sign::CertifiedKey>);
-        impl rustls::server::ResolvesServerCert for StaticResolver {
-            fn resolve(
-                &self,
-                _hello: rustls::server::ClientHello<'_>,
-            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-                Some(self.0.clone())
-            }
-        }
-
-        let server_cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(StaticResolver(resolver_arc)) as Arc<_>);
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(ca_cert.der().clone().into_owned())
-            .expect("root add");
-        let client_cfg = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let pki = build_upstream_pki("localhost");
+        let acceptor = acceptor_from_pki(&pki);
+        let connector = client_connector_for(&pki);
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let downstream_addr = downstream_listener.local_addr().expect("local_addr");
@@ -547,7 +502,6 @@ admin:
     /// half-close propagation property over a TLS-wrapped downstream.
     #[tokio::test(flavor = "multi_thread")]
     async fn tls_downstream_proxy_closes_upstream_on_downstream_close() {
-        use rcgen::{CertificateParams, KeyPair};
         use rustls::pki_types::ServerName;
         use std::convert::TryFrom;
 
@@ -566,46 +520,9 @@ admin:
         });
 
         // Build a TLS pair as in `proxies_payload_through_tls_downstream_stream`.
-        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).expect("ca");
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_kp = KeyPair::generate().expect("ca kp");
-        let ca_cert = ca_params.self_signed(&ca_kp).expect("ca");
-        let leaf_params = CertificateParams::new(vec!["localhost".into()]).expect("leaf");
-        let leaf_kp = KeyPair::generate().expect("leaf kp");
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_kp, &ca_cert, &ca_kp)
-            .expect("leaf");
-        let leaf_der: rustls::pki_types::CertificateDer<'static> =
-            leaf_cert.der().clone().into_owned();
-        let leaf_key_pem = leaf_kp.serialize_pem();
-        let mut key_slice = leaf_key_pem.as_bytes();
-        let key = rustls_pemfile::private_key(&mut key_slice)
-            .unwrap()
-            .unwrap();
-        let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).unwrap();
-        let certified = Arc::new(rustls::sign::CertifiedKey::new(vec![leaf_der], signing));
-
-        #[derive(Debug)]
-        struct R(Arc<rustls::sign::CertifiedKey>);
-        impl rustls::server::ResolvesServerCert for R {
-            fn resolve(
-                &self,
-                _: rustls::server::ClientHello<'_>,
-            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-                Some(self.0.clone())
-            }
-        }
-        let server_cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(R(certified)) as Arc<_>);
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca_cert.der().clone().into_owned()).expect("root");
-        let client_cfg = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let pki = build_upstream_pki("localhost");
+        let acceptor = acceptor_from_pki(&pki);
+        let connector = client_connector_for(&pki);
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let downstream_addr = downstream_listener.local_addr().expect("local_addr");
@@ -642,53 +559,15 @@ admin:
     /// the upstream is plaintext).
     #[tokio::test(flavor = "multi_thread")]
     async fn tls_downstream_proxy_returns_err_on_upstream_connect_refused() {
-        use rcgen::{CertificateParams, KeyPair};
         use rustls::pki_types::ServerName;
         use std::convert::TryFrom;
 
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let refused: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-        let mut ca_params = CertificateParams::new(vec!["test-ca".into()]).expect("ca");
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_kp = KeyPair::generate().expect("ca kp");
-        let ca_cert = ca_params.self_signed(&ca_kp).expect("ca");
-        let leaf_params = CertificateParams::new(vec!["localhost".into()]).expect("leaf");
-        let leaf_kp = KeyPair::generate().expect("leaf kp");
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_kp, &ca_cert, &ca_kp)
-            .expect("leaf");
-        let leaf_der: rustls::pki_types::CertificateDer<'static> =
-            leaf_cert.der().clone().into_owned();
-        let leaf_key_pem = leaf_kp.serialize_pem();
-        let mut key_slice = leaf_key_pem.as_bytes();
-        let key = rustls_pemfile::private_key(&mut key_slice)
-            .unwrap()
-            .unwrap();
-        let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).unwrap();
-        let certified = Arc::new(rustls::sign::CertifiedKey::new(vec![leaf_der], signing));
-
-        #[derive(Debug)]
-        struct R(Arc<rustls::sign::CertifiedKey>);
-        impl rustls::server::ResolvesServerCert for R {
-            fn resolve(
-                &self,
-                _: rustls::server::ClientHello<'_>,
-            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-                Some(self.0.clone())
-            }
-        }
-        let server_cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(R(certified)) as Arc<_>);
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca_cert.der().clone().into_owned()).unwrap();
-        let client_cfg = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let pki = build_upstream_pki("localhost");
+        let acceptor = acceptor_from_pki(&pki);
+        let connector = client_connector_for(&pki);
 
         let downstream_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let downstream_addr = downstream_listener.local_addr().expect("local_addr");
@@ -812,6 +691,22 @@ admin:
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(R(certified)) as Arc<_>);
         tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg))
+    }
+
+    /// Build a `tokio_rustls::TlsConnector` whose root store trusts `pki`'s
+    /// CA (read back from the TempDir-materialized `ca_pem_path`). Used by
+    /// the downstream-TLS tests as the in-test client side of the pair.
+    fn client_connector_for(pki: &UpstreamPki) -> tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let ca_pem = std::fs::read(&pki.ca_pem_path).expect("read ca pem");
+        let mut slice = ca_pem.as_slice();
+        for cert in rustls_pemfile::certs(&mut slice) {
+            roots.add(cert.expect("parse ca cert")).expect("root add");
+        }
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(client_cfg))
     }
 
     /// 03.2 Task 5 (test 1): byte-exact round-trip via a TLS upstream when

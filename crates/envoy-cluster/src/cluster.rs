@@ -466,9 +466,8 @@ impl Cluster {
                 "outlier ejection must align with endpoints"
             );
         }
-        let is_eligible = |i: usize| self.endpoint_eligible(i);
-        let eligible_count = (0..total).filter(|&i| is_eligible(i)).count();
-        let eligible_percent = 100.0 * (eligible_count as f64) / (total as f64);
+        let eligible_idx: Vec<usize> = (0..total).filter(|&i| self.endpoint_eligible(i)).collect();
+        let eligible_percent = 100.0 * (eligible_idx.len() as f64) / (total as f64);
         // Panic threshold (strictly-below): route over ALL endpoints when the
         // eligible fraction is below the threshold. `value: 0` disables panic
         // (`0.0 < 0.0` is false), so a 0-eligible cluster falls through to None.
@@ -477,7 +476,6 @@ impl Cluster {
             return Some(eps[i % total]);
         }
         // Round-robin over the eligible endpoints only.
-        let eligible_idx: Vec<usize> = (0..total).filter(|&i| is_eligible(i)).collect();
         if eligible_idx.is_empty() {
             // No eligible endpoints + panic not engaged → None → the pre-built
             // synth-503 path fires (unchanged at 12.1; body reconciliation is 12.2).
@@ -1061,6 +1059,19 @@ pub async fn from_bootstrap(
 ) -> Result<ClusterManager, ClusterError> {
     let mut clusters: HashMap<String, Arc<Cluster>> = HashMap::new();
     for cfg in bootstrap.all_clusters() {
+        // Every per-cluster stat registration maps failures to the same
+        // `ClusterError::StatsRegistration { cluster, message }` shape, so the
+        // error mapping + registry calls are hoisted into shared helpers here.
+        let stats_err = |e: envoy_stats::StatsError| ClusterError::StatsRegistration {
+            cluster: cfg.name.clone(),
+            message: e.to_string(),
+        };
+        let reg_counter = |name: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
+            registry.register_counter(name).map_err(&stats_err)
+        };
+        let reg_gauge = |name: &str| -> Result<Arc<envoy_stats::Gauge>, ClusterError> {
+            registry.register_gauge(name).map_err(&stats_err)
+        };
         // envoy-config enforces cluster_type ∈ {Static, StrictDns} (post-05.1),
         // lb_policy == RoundRobin, load_assignment.cluster_name == cfg.name,
         // and total endpoints ≥ 1 at parse time. We don't re-check those here;
@@ -1204,69 +1215,31 @@ pub async fn from_bootstrap(
         // (Task 5 contract); a `Bootstrap` with two clusters of the same
         // name is rejected by the `clusters.insert(...).is_some()` check
         // below, so this is the cluster's first registration in practice.
-        let cx_total = registry
-            .register_counter(&format!("cluster.{}.upstream_cx_total", cfg.name))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
+        let cx_total = reg_counter(&format!("cluster.{}.upstream_cx_total", cfg.name))?;
         // 06.3 D15.3.b: register `cluster.<name>.upstream_cx_active` gauge.
         // Idempotent for same-kind re-registration (Task 5 contract).
-        let cx_active = registry
-            .register_gauge(&format!("cluster.{}.upstream_cx_active", cfg.name))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
+        let cx_active = reg_gauge(&format!("cluster.{}.upstream_cx_active", cfg.name))?;
         // 06.3 D15.3.c: register per-cluster upstream-request counters.
-        let upstream_rq_total = registry
-            .register_counter(&format!("cluster.{}.upstream_rq_total", cfg.name))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
-        let upstream_rq_5xx = registry
-            .register_counter(&format!("cluster.{}.upstream_rq_5xx", cfg.name))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
+        let upstream_rq_total = reg_counter(&format!("cluster.{}.upstream_rq_total", cfg.name))?;
+        let upstream_rq_5xx = reg_counter(&format!("cluster.{}.upstream_rq_5xx", cfg.name))?;
         // 16 Task 3: register per-cluster retry counters unconditionally at 0.
         // A route's retry config is not known here; these are inert until the
         // retry loop (Tasks 4/5) increments them. All 23 existing fixtures remain
         // green because they do not assert the absence of these names.
-        let upstream_rq_retry = registry
-            .register_counter(&format!("cluster.{}.upstream_rq_retry", cfg.name))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
-        let upstream_rq_retry_success = registry
-            .register_counter(&format!("cluster.{}.upstream_rq_retry_success", cfg.name))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
-        let upstream_rq_retry_limit_exceeded = registry
-            .register_counter(&format!(
-                "cluster.{}.upstream_rq_retry_limit_exceeded",
-                cfg.name
-            ))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
+        let upstream_rq_retry = reg_counter(&format!("cluster.{}.upstream_rq_retry", cfg.name))?;
+        let upstream_rq_retry_success =
+            reg_counter(&format!("cluster.{}.upstream_rq_retry_success", cfg.name))?;
+        let upstream_rq_retry_limit_exceeded = reg_counter(&format!(
+            "cluster.{}.upstream_rq_retry_limit_exceeded",
+            cfg.name
+        ))?;
         // 17 Task 3: register `cluster.<name>.upstream_rq_retry_overflow`
         // unconditionally (every cluster gets it, inert at 0). When a
         // `BudgetState` is also constructed below, its idempotent
         // registration of the same name returns the SAME Arc (they share
         // the counter — single source of truth per §5.3).
-        let upstream_rq_retry_overflow = registry
-            .register_counter(&format!("cluster.{}.upstream_rq_retry_overflow", cfg.name))
-            .map_err(|e| ClusterError::StatsRegistration {
-                cluster: cfg.name.clone(),
-                message: e.to_string(),
-            })?;
+        let upstream_rq_retry_overflow =
+            reg_counter(&format!("cluster.{}.upstream_rq_retry_overflow", cfg.name))?;
         // 17 Task 3: conditionally build the circuit-breaker budget when
         // `circuit_breakers` is configured. Clusters WITHOUT the block get
         // `budget: None` and register ZERO new `circuit_breakers.default.*`
@@ -1279,10 +1252,7 @@ pub async fn from_bootstrap(
                 let track = t.and_then(|t| t.track_remaining).unwrap_or(false);
                 Some(
                     crate::BudgetState::new(max_retries, max_requests, track, &registry, &cfg.name)
-                        .map_err(|e| ClusterError::StatsRegistration {
-                            cluster: cfg.name.clone(),
-                            message: e.to_string(),
-                        })?,
+                        .map_err(&stats_err)?,
                 )
             } else {
                 None
@@ -1309,12 +1279,8 @@ pub async fn from_bootstrap(
         // health checks ⇒ endpoint_health: None ⇒ pick() filters on outlier
         // detection only (or is phase-02 round-robin if neither is configured).
         let endpoint_health = if let Some(hc) = cfg.health_checks.first() {
-            let membership_healthy = registry
-                .register_gauge(&format!("cluster.{}.membership_healthy", cfg.name))
-                .map_err(|e| ClusterError::StatsRegistration {
-                    cluster: cfg.name.clone(),
-                    message: e.to_string(),
-                })?;
+            let membership_healthy =
+                reg_gauge(&format!("cluster.{}.membership_healthy", cfg.name))?;
             let health: Vec<Arc<crate::EndpointHealth>> = endpoints
                 .iter()
                 .map(|_| {
@@ -1347,14 +1313,7 @@ pub async fn from_bootstrap(
         // like update_failure/update_empty; do NOT `.add(1)` it (the V4 "trio = 0
         // on a successful initial load" witness depends on it).
         let eds_reload = if cfg.cluster_type == envoy_config::ClusterType::Eds {
-            let mk = |suffix: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
-                registry
-                    .register_counter(&format!("cluster.{}.{suffix}", cfg.name))
-                    .map_err(|e| ClusterError::StatsRegistration {
-                        cluster: cfg.name.clone(),
-                        message: e.to_string(),
-                    })
-            };
+            let mk = |suffix: &str| reg_counter(&format!("cluster.{}.{suffix}", cfg.name));
             let update_attempt = mk("update_attempt")?;
             let update_success = mk("update_success")?;
             let update_failure = mk("update_failure")?; // registers at 0 (L4)
@@ -1416,27 +1375,11 @@ pub async fn from_bootstrap(
                 .as_deref()
                 .and_then(|s| envoy_config::parse_duration(s).ok())
                 .unwrap_or(std::time::Duration::from_secs(10));
-            let mk_counter = |suffix: &str| -> Result<Arc<envoy_stats::Counter>, ClusterError> {
-                registry
-                    .register_counter(&format!(
-                        "cluster.{}.outlier_detection.{}",
-                        cfg.name, suffix
-                    ))
-                    .map_err(|e| ClusterError::StatsRegistration {
-                        cluster: cfg.name.clone(),
-                        message: e.to_string(),
-                    })
+            let mk_counter = |suffix: &str| {
+                reg_counter(&format!("cluster.{}.outlier_detection.{suffix}", cfg.name))
             };
-            let mk_gauge = |suffix: &str| -> Result<Arc<envoy_stats::Gauge>, ClusterError> {
-                registry
-                    .register_gauge(&format!(
-                        "cluster.{}.outlier_detection.{}",
-                        cfg.name, suffix
-                    ))
-                    .map_err(|e| ClusterError::StatsRegistration {
-                        cluster: cfg.name.clone(),
-                        message: e.to_string(),
-                    })
+            let mk_gauge = |suffix: &str| {
+                reg_gauge(&format!("cluster.{}.outlier_detection.{suffix}", cfg.name))
             };
             let stats = crate::EndpointEjectionStats {
                 ejections_active: mk_gauge("ejections_active")?,
@@ -1592,59 +1535,66 @@ mod tests {
             .collect()
     }
 
-    /// Construct a per-test Cluster + ClusterHandle bypassing
-    /// `from_bootstrap`. Counter and gauge are registered against a fresh
-    /// registry so the test mirrors the real `from_bootstrap` Arc-clone shape
-    /// (Counter/Gauge constructors are `pub(crate)` to envoy-stats; consumers
-    /// always go through the registry).
+    /// Construct a base per-test `Cluster` bypassing `from_bootstrap`: the 8
+    /// unconditional per-cluster stats are registered against `registry` (so
+    /// the test mirrors the real `from_bootstrap` Arc-clone shape —
+    /// Counter/Gauge constructors are `pub(crate)` to envoy-stats; consumers
+    /// always go through the registry), every optional feature field is
+    /// `None`, and `panic_threshold` is the 50.0 default. Callers override the
+    /// distinctive fields before wrapping the Cluster in a handle.
+    fn mk_test_cluster(
+        name: &str,
+        endpoints: Vec<SocketAddr>,
+        registry: &envoy_stats::StatsRegistry,
+    ) -> Cluster {
+        let counter = |suffix: &str| {
+            registry
+                .register_counter(&format!("cluster.{name}.{suffix}"))
+                .expect("counter registers")
+        };
+        Cluster {
+            name: name.to_string(),
+            endpoints: RwLock::new(Arc::new(endpoints)),
+            cursor: AtomicUsize::new(0),
+            upstream_protocol: UpstreamProtocol::default(),
+            cx_total: counter("upstream_cx_total"),
+            cx_active: registry
+                .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
+                .expect("gauge registers"),
+            upstream_rq_total: counter("upstream_rq_total"),
+            upstream_rq_5xx: counter("upstream_rq_5xx"),
+            upstream_rq_retry: counter("upstream_rq_retry"),
+            upstream_rq_retry_success: counter("upstream_rq_retry_success"),
+            upstream_rq_retry_limit_exceeded: counter("upstream_rq_retry_limit_exceeded"),
+            upstream_rq_retry_overflow: counter("upstream_rq_retry_overflow"),
+            budget: None,
+            endpoint_health: None,
+            panic_threshold: 50.0,
+            outlier_detection: None,
+            hash_lb: None,
+            subset: None,
+            eds_reload: None,
+        }
+    }
+
+    /// Construct a per-test Cluster + ClusterHandle bypassing `from_bootstrap`,
+    /// registering stats against a fresh registry.
     fn mk_handle(name: &str, endpoints: Vec<SocketAddr>) -> ClusterHandle {
         let registry = envoy_stats::StatsRegistry::new();
-        let cx_total = registry
-            .register_counter(&format!("cluster.{name}.upstream_cx_total"))
-            .expect("counter registers");
-        let cx_active = registry
-            .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
-            .expect("gauge registers");
-        let upstream_rq_total = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_total"))
-            .expect("counter registers");
-        let upstream_rq_5xx = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
-            .expect("counter registers");
-        let upstream_rq_retry = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry"))
-            .expect("counter registers");
-        let upstream_rq_retry_success = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_success"))
-            .expect("counter registers");
-        let upstream_rq_retry_limit_exceeded = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
-            .expect("counter registers");
-        let upstream_rq_retry_overflow = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_overflow"))
-            .expect("counter registers");
         ClusterHandle {
-            inner: Arc::new(Cluster {
-                name: name.to_string(),
-                endpoints: RwLock::new(Arc::new(endpoints)),
-                cursor: AtomicUsize::new(0),
-                upstream_protocol: UpstreamProtocol::default(),
-                cx_total,
-                cx_active,
-                upstream_rq_total,
-                upstream_rq_5xx,
-                upstream_rq_retry,
-                upstream_rq_retry_success,
-                upstream_rq_retry_limit_exceeded,
-                upstream_rq_retry_overflow,
-                budget: None,
-                endpoint_health: None,
-                panic_threshold: 50.0,
-                outlier_detection: None,
-                hash_lb: None,
-                subset: None,
-                eds_reload: None,
-            }),
+            inner: Arc::new(mk_test_cluster(name, endpoints, &registry)),
+        }
+    }
+
+    /// 28 Task 5 / 29 Task 7: build a `ClusterHandle` with the given
+    /// pre-built consistent-hash LB installed (the `mk_handle` default is
+    /// RoundRobin/no-LB).
+    fn mk_hash_lb_handle(name: &str, endpoints: Vec<SocketAddr>, hash_lb: HashLb) -> ClusterHandle {
+        let registry = envoy_stats::StatsRegistry::new();
+        let mut cluster = mk_test_cluster(name, endpoints, &registry);
+        cluster.hash_lb = Some(hash_lb);
+        ClusterHandle {
+            inner: Arc::new(cluster),
         }
     }
 
@@ -1656,74 +1606,20 @@ mod tests {
         endpoints: Vec<SocketAddr>,
         min_ring_size: u64,
     ) -> ClusterHandle {
-        let handle = mk_handle(name, endpoints.clone());
         let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
         let ring = crate::ring_hash::HashRing::build(&addrs, min_ring_size);
-        // Rebuild the inner Cluster with RING_HASH policy + the ring (the
-        // `mk_handle` default is RoundRobin/no-ring). Reuse the registered stat
-        // Arcs by deconstructing the handle's inner Cluster.
-        let inner = handle.inner;
-        let new_inner = Cluster {
-            name: inner.name.clone(),
-            endpoints: RwLock::new(inner.current_endpoints()),
-            cursor: AtomicUsize::new(0),
-            upstream_protocol: inner.upstream_protocol,
-            cx_total: Arc::clone(&inner.cx_total),
-            cx_active: Arc::clone(&inner.cx_active),
-            upstream_rq_total: Arc::clone(&inner.upstream_rq_total),
-            upstream_rq_5xx: Arc::clone(&inner.upstream_rq_5xx),
-            upstream_rq_retry: Arc::clone(&inner.upstream_rq_retry),
-            upstream_rq_retry_success: Arc::clone(&inner.upstream_rq_retry_success),
-            upstream_rq_retry_limit_exceeded: Arc::clone(&inner.upstream_rq_retry_limit_exceeded),
-            upstream_rq_retry_overflow: Arc::clone(&inner.upstream_rq_retry_overflow),
-            budget: None,
-            endpoint_health: None,
-            panic_threshold: 50.0,
-            outlier_detection: None,
-            hash_lb: Some(HashLb::Ring(ring)),
-            subset: None,
-            eds_reload: None,
-        };
-        ClusterHandle {
-            inner: Arc::new(new_inner),
-        }
+        mk_hash_lb_handle(name, endpoints, HashLb::Ring(ring))
     }
 
     /// 29 Task 7: build a MAGLEV `ClusterHandle` with the given endpoints and
     /// `table_size`, mirroring `from_bootstrap`'s table build (host index `i` =
     /// `endpoints[i]`, address strings from `SocketAddr` Display — the SAME
     /// derivation `from_bootstrap` uses, so the table is built through the real
-    /// path). Structurally identical to `mk_ring_hash_handle` but installs a
-    /// `HashLb::Maglev` rather than a `HashLb::Ring`.
+    /// path).
     fn mk_maglev_handle(name: &str, endpoints: Vec<SocketAddr>, table_size: u64) -> ClusterHandle {
-        let handle = mk_handle(name, endpoints.clone());
         let addrs: Vec<String> = endpoints.iter().map(|a| a.to_string()).collect();
         let table = crate::maglev::MaglevTable::build(&addrs, table_size);
-        let inner = handle.inner;
-        let new_inner = Cluster {
-            name: inner.name.clone(),
-            endpoints: RwLock::new(inner.current_endpoints()),
-            cursor: AtomicUsize::new(0),
-            upstream_protocol: inner.upstream_protocol,
-            cx_total: Arc::clone(&inner.cx_total),
-            cx_active: Arc::clone(&inner.cx_active),
-            upstream_rq_total: Arc::clone(&inner.upstream_rq_total),
-            upstream_rq_5xx: Arc::clone(&inner.upstream_rq_5xx),
-            upstream_rq_retry: Arc::clone(&inner.upstream_rq_retry),
-            upstream_rq_retry_success: Arc::clone(&inner.upstream_rq_retry_success),
-            upstream_rq_retry_limit_exceeded: Arc::clone(&inner.upstream_rq_retry_limit_exceeded),
-            upstream_rq_retry_overflow: Arc::clone(&inner.upstream_rq_retry_overflow),
-            budget: None,
-            endpoint_health: None,
-            panic_threshold: 50.0,
-            outlier_detection: None,
-            hash_lb: Some(HashLb::Maglev(table)),
-            subset: None,
-            eds_reload: None,
-        };
-        ClusterHandle {
-            inner: Arc::new(new_inner),
-        }
+        mk_hash_lb_handle(name, endpoints, HashLb::Maglev(table))
     }
 
     /// 29 Task 7: build a standalone reference `MaglevTable` over the SAME
@@ -2303,49 +2199,14 @@ admin:
     async fn from_bootstrap_rejects_empty_cluster() {
         // envoy-config rejects zero-endpoint clusters before we get here, so
         // build the Bootstrap by-hand to exercise the cluster-crate edge.
-        use envoy_config::{
-            Address, Admin, Bootstrap, Cluster, ClusterType, LbPolicy, LoadAssignment,
-            SocketAddress, StaticResources,
-        };
-        let bootstrap = Bootstrap {
-            node: None,
-            admin: Some(Admin {
-                address: Address {
-                    socket_address: SocketAddress {
-                        address: "127.0.0.1".into(),
-                        port_value: 9901,
-                    },
-                },
-                access_log_path: None,
-            }),
-            static_resources: StaticResources {
-                listeners: vec![],
-                clusters: vec![Cluster {
-                    name: "backend".into(),
-                    cluster_type: ClusterType::Static,
-                    common_http_protocol_options: None,
-                    lb_policy: LbPolicy::RoundRobin,
-                    load_assignment: Some(LoadAssignment {
-                        cluster_name: "backend".into(),
-                        endpoints: vec![],
-                    }),
-                    eds_cluster_config: None,
-                    transport_socket: None,
-                    dns_lookup_family: None,
-                    typed_extension_protocol_options: None,
-                    health_checks: vec![],
-                    common_lb_config: None,
-                    circuit_breakers: None,
-                    outlier_detection: None,   // 14.1 D1
-                    ring_hash_lb_config: None, // 28 Task 3
-                    maglev_lb_config: None,    // 29 Task 2
-                    lb_subset_config: None,    // 30 Task 2
-                }],
-            },
-            dynamic_resources: None,
-            dynamic_clusters: None,
-            dynamic_listeners: None,
-        };
+        let mut cluster = mk_static_cluster("backend", 10001);
+        cluster
+            .load_assignment
+            .as_mut()
+            .expect("mk_static_cluster sets load_assignment")
+            .endpoints
+            .clear();
+        let bootstrap = mk_bootstrap(vec![cluster], None, None);
         let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect_err("must reject");
@@ -2360,62 +2221,14 @@ admin:
         // envoy-config doesn't reject duplicate cluster names (Vec<Cluster>
         // allows dupes at the serde layer); envoy-cluster is the first
         // enforcement. Build via by-hand Bootstrap to exercise this edge.
-        use envoy_config::{
-            Address, Admin, Bootstrap, Cluster, ClusterType, Endpoint, LbEndpoint, LbPolicy,
-            LoadAssignment, LocalityLbEndpoints, SocketAddress, StaticResources,
-        };
-        let mk_cluster = || Cluster {
-            name: "backend".into(),
-            cluster_type: ClusterType::Static,
-            common_http_protocol_options: None,
-            lb_policy: LbPolicy::RoundRobin,
-            load_assignment: Some(LoadAssignment {
-                cluster_name: "backend".into(),
-                endpoints: vec![LocalityLbEndpoints {
-                    lb_endpoints: vec![LbEndpoint {
-                        endpoint: Endpoint {
-                            address: Address {
-                                socket_address: SocketAddress {
-                                    address: "127.0.0.1".into(),
-                                    port_value: 10001,
-                                },
-                            },
-                        },
-                        metadata: None, // 30 Task 1 (LbEndpoint.metadata)
-                    }],
-                }],
-            }),
-            eds_cluster_config: None,
-            transport_socket: None,
-            dns_lookup_family: None,
-            typed_extension_protocol_options: None,
-            health_checks: vec![],
-            common_lb_config: None,
-            circuit_breakers: None,
-            outlier_detection: None,   // 14.1 D1
-            ring_hash_lb_config: None, // 28 Task 3
-            maglev_lb_config: None,    // 29 Task 2
-            lb_subset_config: None,    // 30 Task 2
-        };
-        let bootstrap = Bootstrap {
-            node: None,
-            admin: Some(Admin {
-                address: Address {
-                    socket_address: SocketAddress {
-                        address: "127.0.0.1".into(),
-                        port_value: 9901,
-                    },
-                },
-                access_log_path: None,
-            }),
-            static_resources: StaticResources {
-                listeners: vec![],
-                clusters: vec![mk_cluster(), mk_cluster()],
-            },
-            dynamic_resources: None,
-            dynamic_clusters: None,
-            dynamic_listeners: None,
-        };
+        let bootstrap = mk_bootstrap(
+            vec![
+                mk_static_cluster("backend", 10001),
+                mk_static_cluster("backend", 10001),
+            ],
+            None,
+            None,
+        );
         let err = crate::from_bootstrap(&bootstrap, Arc::new(envoy_stats::StatsRegistry::new()))
             .await
             .expect_err("must reject");
@@ -2428,43 +2241,7 @@ admin:
     #[test]
     fn cluster_name_returns_configured_name() {
         let registry = envoy_stats::StatsRegistry::new();
-        let c = Cluster {
-            name: "backend".to_string(),
-            endpoints: RwLock::new(Arc::new(mk_endpoints(1))),
-            cursor: AtomicUsize::new(0),
-            upstream_protocol: UpstreamProtocol::default(),
-            cx_total: registry
-                .register_counter("cluster.backend.upstream_cx_total")
-                .expect("counter registers"),
-            cx_active: registry
-                .register_gauge("cluster.backend.upstream_cx_active")
-                .expect("gauge registers"),
-            upstream_rq_total: registry
-                .register_counter("cluster.backend.upstream_rq_total")
-                .expect("counter registers"),
-            upstream_rq_5xx: registry
-                .register_counter("cluster.backend.upstream_rq_5xx")
-                .expect("counter registers"),
-            upstream_rq_retry: registry
-                .register_counter("cluster.backend.upstream_rq_retry")
-                .expect("counter registers"),
-            upstream_rq_retry_success: registry
-                .register_counter("cluster.backend.upstream_rq_retry_success")
-                .expect("counter registers"),
-            upstream_rq_retry_limit_exceeded: registry
-                .register_counter("cluster.backend.upstream_rq_retry_limit_exceeded")
-                .expect("counter registers"),
-            upstream_rq_retry_overflow: registry
-                .register_counter("cluster.backend.upstream_rq_retry_overflow")
-                .expect("counter registers"),
-            budget: None,
-            endpoint_health: None,
-            panic_threshold: 50.0,
-            outlier_detection: None,
-            hash_lb: None,
-            subset: None,
-            eds_reload: None,
-        };
+        let c = mk_test_cluster("backend", mk_endpoints(1), &registry);
         assert_eq!(c.name(), "backend");
     }
 
@@ -3016,30 +2793,6 @@ admin:
         panic_threshold: f64,
     ) -> (ClusterHandle, Vec<Arc<crate::EndpointHealth>>) {
         let registry = envoy_stats::StatsRegistry::new();
-        let cx_total = registry
-            .register_counter(&format!("cluster.{name}.upstream_cx_total"))
-            .unwrap();
-        let cx_active = registry
-            .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
-            .unwrap();
-        let upstream_rq_total = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_total"))
-            .unwrap();
-        let upstream_rq_5xx = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
-            .unwrap();
-        let upstream_rq_retry = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry"))
-            .unwrap();
-        let upstream_rq_retry_success = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_success"))
-            .unwrap();
-        let upstream_rq_retry_limit_exceeded = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
-            .unwrap();
-        let upstream_rq_retry_overflow = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_overflow"))
-            .unwrap();
         let gauge = registry
             .register_gauge(&format!("cluster.{name}.membership_healthy"))
             .unwrap();
@@ -3053,28 +2806,11 @@ admin:
                 ))
             })
             .collect();
+        let mut cluster = mk_test_cluster(name, endpoints, &registry);
+        cluster.endpoint_health = Some(health.clone());
+        cluster.panic_threshold = panic_threshold;
         let handle = ClusterHandle {
-            inner: Arc::new(Cluster {
-                name: name.to_string(),
-                endpoints: RwLock::new(Arc::new(endpoints)),
-                cursor: AtomicUsize::new(0),
-                upstream_protocol: UpstreamProtocol::default(),
-                cx_total,
-                cx_active,
-                upstream_rq_total,
-                upstream_rq_5xx,
-                upstream_rq_retry,
-                upstream_rq_retry_success,
-                upstream_rq_retry_limit_exceeded,
-                upstream_rq_retry_overflow,
-                budget: None,
-                endpoint_health: Some(health.clone()),
-                panic_threshold,
-                outlier_detection: None,
-                hash_lb: None,
-                subset: None,
-                eds_reload: None,
-            }),
+            inner: Arc::new(cluster),
         };
         (handle, health)
     }
@@ -3376,30 +3112,6 @@ admin:
         Vec<Arc<crate::EndpointEjection>>,
     ) {
         let registry = envoy_stats::StatsRegistry::new();
-        let cx_total = registry
-            .register_counter(&format!("cluster.{name}.upstream_cx_total"))
-            .unwrap();
-        let cx_active = registry
-            .register_gauge(&format!("cluster.{name}.upstream_cx_active"))
-            .unwrap();
-        let upstream_rq_total = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_total"))
-            .unwrap();
-        let upstream_rq_5xx = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_5xx"))
-            .unwrap();
-        let upstream_rq_retry = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry"))
-            .unwrap();
-        let upstream_rq_retry_success = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_success"))
-            .unwrap();
-        let upstream_rq_retry_limit_exceeded = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_limit_exceeded"))
-            .unwrap();
-        let upstream_rq_retry_overflow = registry
-            .register_counter(&format!("cluster.{name}.upstream_rq_retry_overflow"))
-            .unwrap();
         let membership = registry
             .register_gauge(&format!("cluster.{name}.membership_healthy"))
             .unwrap();
@@ -3468,28 +3180,12 @@ admin:
             base_ejection_time: std::time::Duration::from_secs(30),
             interval: std::time::Duration::from_secs(10),
         };
+        let mut cluster = mk_test_cluster(name, endpoints, &registry);
+        cluster.endpoint_health = Some(health.clone());
+        cluster.panic_threshold = panic_threshold;
+        cluster.outlier_detection = Some(od_state);
         let handle = ClusterHandle {
-            inner: Arc::new(Cluster {
-                name: name.to_string(),
-                endpoints: RwLock::new(Arc::new(endpoints)),
-                cursor: AtomicUsize::new(0),
-                upstream_protocol: UpstreamProtocol::default(),
-                cx_total,
-                cx_active,
-                upstream_rq_total,
-                upstream_rq_5xx,
-                upstream_rq_retry,
-                upstream_rq_retry_success,
-                upstream_rq_retry_limit_exceeded,
-                upstream_rq_retry_overflow,
-                budget: None,
-                endpoint_health: Some(health.clone()),
-                panic_threshold,
-                outlier_detection: Some(od_state),
-                hash_lb: None,
-                subset: None,
-                eds_reload: None,
-            }),
+            inner: Arc::new(cluster),
         };
         (handle, health, ejection)
     }
@@ -4407,51 +4103,19 @@ admin:
     /// load_assignment got there).
     fn mk_eds_cluster(name: &str, port: u16) -> envoy_config::Cluster {
         use envoy_config::bootstrap::EdsClusterConfig;
-        use envoy_config::{
-            Address, Cluster, ClusterType, ConfigSource, Endpoint, LbEndpoint, LbPolicy,
-            LoadAssignment, LocalityLbEndpoints, PathConfigSource, SocketAddress,
-        };
-        Cluster {
-            name: name.into(),
-            cluster_type: ClusterType::Eds,
-            common_http_protocol_options: None,
-            lb_policy: LbPolicy::RoundRobin,
-            load_assignment: Some(LoadAssignment {
-                cluster_name: name.into(),
-                endpoints: vec![LocalityLbEndpoints {
-                    lb_endpoints: vec![LbEndpoint {
-                        endpoint: Endpoint {
-                            address: Address {
-                                socket_address: SocketAddress {
-                                    address: "127.0.0.1".into(),
-                                    port_value: port,
-                                },
-                            },
-                        },
-                        metadata: None, // 30 Task 1 (LbEndpoint.metadata)
-                    }],
-                }],
-            }),
-            eds_cluster_config: Some(EdsClusterConfig {
-                eds_config: ConfigSource {
-                    path_config_source: PathConfigSource {
-                        path: "/tmp/eds.yaml".into(),
-                    },
-                    resource_api_version: None,
+        use envoy_config::{ClusterType, ConfigSource, PathConfigSource};
+        let mut cluster = mk_static_cluster(name, port);
+        cluster.cluster_type = ClusterType::Eds;
+        cluster.eds_cluster_config = Some(EdsClusterConfig {
+            eds_config: ConfigSource {
+                path_config_source: PathConfigSource {
+                    path: "/tmp/eds.yaml".into(),
                 },
-                service_name: None,
-            }),
-            transport_socket: None,
-            dns_lookup_family: None,
-            typed_extension_protocol_options: None,
-            health_checks: vec![],
-            common_lb_config: None,
-            circuit_breakers: None,
-            outlier_detection: None,
-            ring_hash_lb_config: None, // 28 Task 3
-            maglev_lb_config: None,    // 29 Task 2
-            lb_subset_config: None,    // 30 Task 2
-        }
+                resource_api_version: None,
+            },
+            service_name: None,
+        });
+        cluster
     }
 
     #[tokio::test]

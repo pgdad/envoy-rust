@@ -6,24 +6,15 @@
 //! validator would also catch (defense-in-depth) plus future runtime
 //! errors (e.g., `StopAndSend` invariants).
 
+use std::sync::Arc;
+
+use envoy_stats::{Counter, StatsRegistry};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FilterError {
     #[error("filter chain is empty (must contain at least Router)")]
     EmptyChain,
-
-    #[error(
-        "expected Router at terminus position {expected}, got filter named {actual:?} at position {position}"
-    )]
-    RouterNotTerminal {
-        actual: String,
-        position: usize,
-        expected: usize,
-    },
-
-    #[error("filter chain contains duplicate Router at position {position}")]
-    DuplicateRouter { position: usize },
 
     #[error("filter chain references unsupported filter type at position {position}: {name}")]
     UnsupportedFilterType { position: usize, name: String },
@@ -35,6 +26,20 @@ pub enum FilterError {
     InvalidConfig { message: String },
 }
 
+/// Register a stat counter, mapping a registry rejection to the canonical
+/// `FilterError::InvalidConfig { message: "StatsRegistry: {e}" }` (byte-exact
+/// across every stats-bearing filter's `build_from_config`).
+pub(crate) fn register_counter(
+    registry: &StatsRegistry,
+    name: &str,
+) -> Result<Arc<Counter>, FilterError> {
+    registry
+        .register_counter(name)
+        .map_err(|e| FilterError::InvalidConfig {
+            message: format!("StatsRegistry: {e}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,25 +48,6 @@ mod tests {
     fn display_empty_chain_is_human_readable() {
         let s = format!("{}", FilterError::EmptyChain);
         assert_eq!(s, "filter chain is empty (must contain at least Router)");
-    }
-
-    #[test]
-    fn display_router_not_terminal_includes_position_and_name() {
-        let e = FilterError::RouterNotTerminal {
-            actual: "envoy.filters.http.fault".to_string(),
-            position: 0,
-            expected: 1,
-        };
-        let s = format!("{e}");
-        assert!(s.contains("expected Router at terminus position 1"));
-        assert!(s.contains("envoy.filters.http.fault"));
-        assert!(s.contains("position 0"));
-    }
-
-    #[test]
-    fn display_duplicate_router_includes_position() {
-        let s = format!("{}", FilterError::DuplicateRouter { position: 2 });
-        assert_eq!(s, "filter chain contains duplicate Router at position 2");
     }
 
     #[test]

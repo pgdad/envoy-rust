@@ -31,7 +31,6 @@
 //! Pure function over bytes: no I/O, no `unsafe`, no allocation beyond the
 //! returned `Vec`.
 
-use bytes::Bytes;
 use thiserror::Error;
 
 use crate::pipeline::Decision;
@@ -291,16 +290,17 @@ impl CdnLoopFilter {
     /// Decode-side entry point (ADR-0077 §6.2-LOCKED).
     pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         // Coalesce all cdn-loop values in arrival order (RFC 8586 / RFC 7230).
-        let raw_values: Vec<Vec<u8>> = req
+        // Borrowed slices — the owned `new_value` below severs the borrow
+        // before the `retain_mut` header rewrite.
+        let raw_values: Vec<&[u8]> = req
             .headers
             .iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case(CDN_LOOP_HEADER))
-            .map(|(_, v)| v.as_bytes().to_vec())
+            .map(|(_, v)| v.as_bytes())
             .collect();
-        let value_refs: Vec<&[u8]> = raw_values.iter().map(Vec::as_slice).collect();
 
         // Parse → malformed → 400.
-        let parsed = match parse_cdn_loop(&value_refs) {
+        let parsed = match parse_cdn_loop(&raw_values) {
             Ok(p) => p,
             Err(_) => return Decision::StopAndSend(malformed_response()),
         };
@@ -353,22 +353,12 @@ impl CdnLoopFilter {
 /// `content-length`, `server`(, `connection`) are stamped by the H1/H2 synth
 /// decorators downstream (the csrf/buffer/rbac precedent).
 fn loop_response() -> FilterResponse {
-    FilterResponse {
-        status: 502,
-        reason: Some("Bad Gateway"),
-        headers: Vec::new(),
-        body: Bytes::from_static(LOOP_BODY),
-    }
+    FilterResponse::static_reply(502, Some("Bad Gateway"), LOOP_BODY)
 }
 
 /// The 400 malformed-header local reply (ADR-0077 §6.2).
 fn malformed_response() -> FilterResponse {
-    FilterResponse {
-        status: 400,
-        reason: Some("Bad Request"),
-        headers: Vec::new(),
-        body: Bytes::from_static(MALFORMED_BODY),
-    }
+    FilterResponse::static_reply(400, Some("Bad Request"), MALFORMED_BODY)
 }
 
 #[cfg(test)]
@@ -385,16 +375,7 @@ mod filter_tests {
     }
 
     fn req(headers: &[(&str, &str)]) -> FilterRequest {
-        FilterRequest {
-            method: "GET".into(),
-            path: "/".into(),
-            headers: headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test("GET", "/", headers)
     }
 
     // Extract the (single) cdn-loop header value (case-insensitively) post-decode.
@@ -679,12 +660,7 @@ mod filter_tests {
     fn encode_is_inert() {
         use crate::types::FilterResponse;
         let mut f = filter("mycdn.example", 0);
-        let mut resp = FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = FilterResponse::test_200();
         assert!(matches!(f.encode_headers(&mut resp), Decision::Continue));
     }
 }

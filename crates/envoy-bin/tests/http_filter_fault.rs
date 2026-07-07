@@ -27,40 +27,16 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Reserve a free TCP port on 127.0.0.1 by binding an ephemeral port and
-/// immediately dropping the listener (matching the RBAC backstop precedent's
-/// `StdListener::bind(("127.0.0.1", 0))` style).
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
+mod common;
 
-/// Wait for a TCP listener at `addr` to accept a connection, with exponential
-/// backoff up to `budget`. Returns `Ok(())` on success; `Err` on timeout.
-/// Mirrors the `wait_ready_result` shape from the RBAC backstop precedent.
-async fn wait_ready_result(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
+use common::{reserve_port, wait_ready};
 
 /// Open a fresh TCP connection to `addr`, write an HTTP/1.1 GET for `path` with
 /// `Connection: close` (and optionally `x-fault: <fault_header>`), read-to-end,
@@ -209,7 +185,7 @@ static_resources:
     // envoy-bin startup error surfaces in test output.
     let ready = tokio::time::timeout(
         Duration::from_secs(10),
-        wait_ready_result(listener_addr, Duration::from_secs(10)),
+        wait_ready(listener_addr, Duration::from_secs(10)),
     )
     .await;
     if ready.is_err() || matches!(&ready, Ok(Err(_))) {

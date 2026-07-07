@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use envoy_config::HeaderMatcher;
 use envoy_stats::{Counter, StatsRegistry};
 
@@ -197,16 +196,14 @@ impl RbacFilter {
             })
             .collect::<Result<_, _>>()?;
         // Reuse FilterError::InvalidConfig per local_rate_limit.rs precedent.
-        let allowed_counter = registry
-            .register_counter(&format!("http.{hcm_stat_prefix}.rbac.allowed"))
-            .map_err(|e| FilterError::InvalidConfig {
-                message: format!("StatsRegistry: {e}"),
-            })?;
-        let denied_counter = registry
-            .register_counter(&format!("http.{hcm_stat_prefix}.rbac.denied"))
-            .map_err(|e| FilterError::InvalidConfig {
-                message: format!("StatsRegistry: {e}"),
-            })?;
+        let allowed_counter = crate::error::register_counter(
+            registry,
+            &format!("http.{hcm_stat_prefix}.rbac.allowed"),
+        )?;
+        let denied_counter = crate::error::register_counter(
+            registry,
+            &format!("http.{hcm_stat_prefix}.rbac.denied"),
+        )?;
         Ok(Self {
             action,
             policies: Arc::new(policies),
@@ -238,14 +235,13 @@ impl RbacFilter {
             Decision::Continue
         } else {
             self.denied_counter.inc();
-            Decision::StopAndSend(FilterResponse {
-                status: 403,
-                // reason is Option<&'static str> per crate::types::FilterResponse.
-                reason: Some("Forbidden"),
-                headers: vec![],
-                // ADR-0034: 19 bytes, no trailing newline, per upstream Envoy v1.33 empirical verification.
-                body: Bytes::from_static(b"RBAC: access denied"),
-            })
+            // ADR-0034: 19 bytes, no trailing newline, per upstream Envoy v1.33
+            // empirical verification.
+            Decision::StopAndSend(FilterResponse::static_reply(
+                403,
+                Some("Forbidden"),
+                b"RBAC: access denied",
+            ))
         }
     }
 
@@ -253,6 +249,46 @@ impl RbacFilter {
     pub(crate) fn encode_headers(&mut self, _resp: &mut FilterResponse) -> Decision {
         Decision::Continue
     }
+}
+
+/// Shared `Header` arm body for `lower_permission` / `lower_principal`:
+/// clone the wire-form matcher and compile any `SafeRegex` on the owned copy
+/// so a malformed pattern is boot-fatal (phase 36 M35-1 fix, §A4).
+fn compile_header(m: &HeaderMatcher) -> Result<HeaderMatcher, FilterError> {
+    let mut m = m.clone();
+    m.compile_safe_regexes()
+        .map_err(|e| FilterError::InvalidConfig {
+            message: e.to_string(),
+        })?;
+    Ok(m)
+}
+
+/// Shared `Metadata` arm body: compile the ValueMatcher's `SafeRegex` on the
+/// owned clone (phase 36 M35-1 fix, §A4).
+fn compile_metadata(
+    m: &envoy_config::MetadataMatcher,
+) -> Result<envoy_config::MetadataMatcher, FilterError> {
+    let mut m = m.clone();
+    m.value
+        .compile_safe_regexes()
+        .map_err(|e| FilterError::InvalidConfig {
+            message: e.to_string(),
+        })?;
+    Ok(m)
+}
+
+/// Shared `UrlPath` arm body (phase 37): reuse the phase-36 fallible SafeRegex
+/// compile so a malformed `safe_regex` url_path pattern is boot-fatal, not a
+/// first-request panic.
+fn compile_url_path(
+    pm: &envoy_config::PathMatcher,
+) -> Result<envoy_config::StringMatcher, FilterError> {
+    let mut sm = pm.path.clone();
+    sm.compile_safe_regex()
+        .map_err(|e| FilterError::InvalidConfig {
+            message: e.to_string(),
+        })?;
+    Ok(sm)
 }
 
 /// Recursive lowering of wire-form `envoy_config::Permission` → runtime
@@ -263,14 +299,7 @@ impl RbacFilter {
 fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, FilterError> {
     Ok(match p {
         envoy_config::Permission::Any(b) => RuntimePermission::Any(*b),
-        envoy_config::Permission::Header(m) => {
-            let mut m = m.clone();
-            m.compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: e.to_string(),
-                })?;
-            RuntimePermission::Header(m)
-        }
+        envoy_config::Permission::Header(m) => RuntimePermission::Header(compile_header(m)?),
         envoy_config::Permission::AndRules(set) => RuntimePermission::AndRules(
             set.rules
                 .iter()
@@ -286,25 +315,8 @@ fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, F
         envoy_config::Permission::NotRule(inner) => {
             RuntimePermission::NotRule(Box::new(lower_permission(inner)?))
         }
-        envoy_config::Permission::Metadata(m) => {
-            let mut m = m.clone();
-            m.value
-                .compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: e.to_string(),
-                })?;
-            RuntimePermission::Metadata(m)
-        }
-        envoy_config::Permission::UrlPath(pm) => {
-            // Phase 37: reuse the phase-36 fallible SafeRegex compile so a malformed
-            // `safe_regex` url_path pattern is boot-fatal, not a first-request panic.
-            let mut sm = pm.path.clone();
-            sm.compile_safe_regex()
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: e.to_string(),
-                })?;
-            RuntimePermission::UrlPath(sm)
-        }
+        envoy_config::Permission::Metadata(m) => RuntimePermission::Metadata(compile_metadata(m)?),
+        envoy_config::Permission::UrlPath(pm) => RuntimePermission::UrlPath(compile_url_path(pm)?),
     })
 }
 
@@ -316,14 +328,7 @@ fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, F
 fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimePrincipal, FilterError> {
     Ok(match p {
         envoy_config::Principal::Any(b) => RuntimePrincipal::Any(*b),
-        envoy_config::Principal::Header(m) => {
-            let mut m = m.clone();
-            m.compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: e.to_string(),
-                })?;
-            RuntimePrincipal::Header(m)
-        }
+        envoy_config::Principal::Header(m) => RuntimePrincipal::Header(compile_header(m)?),
         envoy_config::Principal::AndIds(set) => RuntimePrincipal::AndIds(
             set.ids
                 .iter()
@@ -339,57 +344,28 @@ fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimePrincipal, Filt
         envoy_config::Principal::NotId(inner) => {
             RuntimePrincipal::NotId(Box::new(lower_principal(inner)?))
         }
-        envoy_config::Principal::Metadata(m) => {
-            let mut m = m.clone();
-            m.value
-                .compile_safe_regexes()
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: e.to_string(),
-                })?;
-            RuntimePrincipal::Metadata(m)
-        }
-        envoy_config::Principal::UrlPath(pm) => {
-            // Phase 37: symmetric to `lower_permission`'s url_path arm.
-            let mut sm = pm.path.clone();
-            sm.compile_safe_regex()
-                .map_err(|e| FilterError::InvalidConfig {
-                    message: e.to_string(),
-                })?;
-            RuntimePrincipal::UrlPath(sm)
-        }
+        envoy_config::Principal::Metadata(m) => RuntimePrincipal::Metadata(compile_metadata(m)?),
+        // Phase 37: symmetric to `lower_permission`'s url_path arm.
+        envoy_config::Principal::UrlPath(pm) => RuntimePrincipal::UrlPath(compile_url_path(pm)?),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::header_matcher_exact;
     use envoy_config::{
-        HeaderMatcher, HeaderMatcherMode, MetadataMatcher, MetadataPathSegment, StringMatcher,
-        StringMatcherMode, ValueMatcher,
+        HeaderMatcherMode, MetadataMatcher, MetadataPathSegment, StringMatcher, StringMatcherMode,
+        ValueMatcher,
     };
 
     fn req_with(headers: Vec<(&'static str, &'static str)>) -> FilterRequest {
-        FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: headers
-                .into_iter()
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .collect(),
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test("GET", "/", &headers)
     }
 
     // Phase 37: a request whose only varying axis is the request-target `path`.
     fn req_with_path(path: &str) -> FilterRequest {
-        FilterRequest {
-            method: "GET".into(),
-            path: path.into(),
-            headers: vec![],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test("GET", path, &[])
     }
 
     #[test]
@@ -578,17 +554,6 @@ mod tests {
             RbacFilter::build_from_config(&cfg, &registry, "ingress_http"),
             Err(FilterError::InvalidConfig { .. })
         ));
-    }
-
-    fn header_matcher_exact(name: &str, exact: &str) -> HeaderMatcher {
-        HeaderMatcher {
-            name: name.to_string(),
-            mode: HeaderMatcherMode::StringMatch(StringMatcher {
-                mode: StringMatcherMode::Exact(exact.to_string()),
-                ignore_case: false,
-            }),
-            invert_match: false,
-        }
     }
 
     #[test]
@@ -1031,12 +996,7 @@ mod tests {
             },
         };
         let mut filter = RbacFilter::build_from_config(&cfg, &registry, "p").unwrap();
-        let mut resp = crate::types::FilterResponse {
-            status: 200,
-            reason: None,
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
+        let mut resp = crate::types::FilterResponse::test_200();
         assert!(matches!(
             filter.encode_headers(&mut resp),
             crate::pipeline::Decision::Continue

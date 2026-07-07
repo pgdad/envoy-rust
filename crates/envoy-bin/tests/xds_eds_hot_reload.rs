@@ -66,144 +66,16 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
-use std::path::Path;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+mod common;
 
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
-async fn wait_ready(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Single one-shot H1 request over a fresh downstream conn (`Connection: close`):
-/// writes the request, reads the status line + headers + `Content-Length`-bounded
-/// body. Returns `(status, body)`.
-async fn http1_oneshot(hcm: SocketAddr, path: &str) -> (u16, Vec<u8>) {
-    let mut stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(hcm))
-        .await
-        .expect("downstream connect timeout")
-        .expect("downstream connect");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: eds_backend\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("write");
-
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let head_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let mut chunk = [0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .expect("header read timeout")
-            .expect("header read");
-        assert!(n > 0, "EOF before headers complete on {path}");
-        buf.extend_from_slice(&chunk[..n]);
-    };
-
-    let head = std::str::from_utf8(&buf[..head_end - 4]).expect("utf8 head");
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().expect("status");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .expect("status code")
-        .parse()
-        .expect("status numeric");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|l| {
-            let (n, v) = l.split_once(':')?;
-            Some((n.trim().to_string(), v.trim().to_string()))
-        })
-        .collect();
-
-    let cl: usize = headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-        .map(|(_, v)| v.parse().expect("content-length numeric"))
-        .expect("content-length header present");
-
-    let body_start = head_end;
-    while buf.len() < body_start + cl {
-        let mut chunk = [0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .expect("body read timeout")
-            .expect("body read");
-        assert!(n > 0, "EOF before body complete on {path}");
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body = buf[body_start..body_start + cl].to_vec();
-    (status, body)
-}
-
-/// Open a fresh TCP conn to admin, GET `path`, read the whole response, split off
-/// the body. Returns the raw body bytes.
-async fn admin_get_body(admin: SocketAddr, path: &str) -> Vec<u8> {
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(admin))
-        .await
-        .expect("admin connect timeout")
-        .expect("admin connect");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("admin write");
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
-        .await
-        .expect("admin read timeout")
-        .expect("admin read");
-    let head_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("admin head terminator");
-    buf[head_end + 4..].to_vec()
-}
-
-/// GET admin `/stats` and parse `<name>: <value>` numeric rows into a map.
-async fn scrape_admin_stats(admin: SocketAddr) -> HashMap<String, u64> {
-    let body = admin_get_body(admin, "/stats").await;
-    let text = std::str::from_utf8(&body).expect("admin body utf8");
-    let mut out = HashMap::new();
-    for line in text.lines() {
-        if let Some((name, value)) = line.split_once(": ")
-            && let Ok(v) = value.trim().parse::<u64>()
-        {
-            out.insert(name.trim().to_string(), v);
-        }
-    }
-    out
-}
-
-fn assert_stat(stats: &HashMap<String, u64>, name: &str, expected: u64) {
-    let actual = stats
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| panic!("stat {name:?} absent; have {} rows", stats.len()));
-    assert_eq!(
-        actual, expected,
-        "stat {name:?}: expected {expected}, got {actual}"
-    );
-}
+use common::{
+    admin_get_body, assert_stat, atomic_rename_over, eds_cluster_block, http1_oneshot,
+    reserve_port, scrape_admin_stats, spawn_backend, spawn_envoy_bin, spawn_slow_backend,
+    wait_for_stat, wait_ready, write_bootstrap, write_file,
+};
 
 const C_ATTEMPT: &str = "cluster.eds_backend.update_attempt";
 const C_SUCCESS: &str = "cluster.eds_backend.update_success";
@@ -225,77 +97,6 @@ fn assert_eds_counters(
     assert_stat(stats, C_FAILURE, failure);
     assert_stat(stats, C_REJECTED, rejected);
     assert_stat(stats, C_EMPTY, empty);
-}
-
-// ── in-process backend ──────────────────────────────────────────────────────
-
-/// Spawn an in-process H1 backend that replies to every request with a 200 whose
-/// body is the fixed `body` string. Returns the bound port.
-async fn spawn_backend(body: &'static str) -> u16 {
-    spawn_slow_backend(body, Duration::ZERO).await
-}
-
-/// Like `spawn_backend` but sleeps `delay` before responding to each request (the
-/// in-flight-isolation test routes to a SLOW backend so a request is reliably
-/// mid-flight when the concurrent reload lands).
-async fn spawn_slow_backend(body: &'static str, delay: Duration) -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("bind backend");
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        loop {
-            let (sock, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => break,
-            };
-            tokio::spawn(serve_backend_conn(sock, body, delay));
-        }
-    });
-    port
-}
-
-async fn serve_backend_conn(mut sock: TcpStream, body: &'static str, delay: Duration) {
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    loop {
-        let head_end = loop {
-            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-            let mut chunk = [0u8; 512];
-            match sock.read(&mut chunk).await {
-                Ok(0) => return,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(_) => return,
-            }
-        };
-        let head = std::str::from_utf8(&buf[..head_end]).unwrap_or("");
-        let wants_close = head.lines().any(|l| {
-            l.to_ascii_lowercase().starts_with("connection:")
-                && l.to_ascii_lowercase().contains("close")
-        });
-        buf.drain(..head_end);
-
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-
-        let conn = if wants_close { "close" } else { "keep-alive" };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\n\
-             content-length: {len}\r\n\
-             content-type: text/plain\r\n\
-             connection: {conn}\r\n\r\n{body}",
-            len = body.len(),
-        );
-        if sock.write_all(resp.as_bytes()).await.is_err() {
-            return;
-        }
-        let _ = sock.flush().await;
-        if wants_close {
-            return;
-        }
-    }
 }
 
 // ── eds file builders ─────────────────────────────────────────────────────────
@@ -332,22 +133,6 @@ fn eds_file_empty_envelope() -> String {
 fn eds_file_bad_endpoint(cla_name: &str) -> String {
     format!(
         "resources:\n  - \"@type\": type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment\n    cluster_name: {cla_name}\n    endpoints:\n      - lb_endpoints:\n          - endpoint:\n              address:\n                socket_address: {{ address: not-a-numeric-ip, port_value: 8080 }}\n"
-    )
-}
-
-/// A `type: EDS` cluster `eds_backend` whose endpoints arrive from the EDS file at
-/// `eds_path` (NO inline `load_assignment`, NO HC / OD — a PLAIN EDS cluster).
-fn eds_cluster_block(eds_path: &str) -> String {
-    format!(
-        r#"    - name: eds_backend
-      type: EDS
-      lb_policy: ROUND_ROBIN
-      eds_cluster_config:
-        eds_config:
-          resource_api_version: V3
-          path_config_source:
-            path: {eds_path}
-"#
     )
 }
 
@@ -401,72 +186,7 @@ static_resources:
     )
 }
 
-/// Write `contents` to `dir/name` and return the absolute path string.
-fn write_file(dir: &Path, name: &str, contents: &str) -> String {
-    let path = dir.join(name);
-    std::fs::File::create(&path)
-        .unwrap()
-        .write_all(contents.as_bytes())
-        .unwrap();
-    path.to_str().unwrap().to_string()
-}
-
-/// Write `bootstrap` to `dir/envoy-rust.yaml` and return the path.
-fn write_bootstrap(dir: &Path, bootstrap: &str) -> std::path::PathBuf {
-    let cfg = dir.join("envoy-rust.yaml");
-    std::fs::File::create(&cfg)
-        .unwrap()
-        .write_all(bootstrap.as_bytes())
-        .unwrap();
-    cfg
-}
-
-/// Spawn `envoy-bin -c <cfg>` with the established stdio discipline.
-fn spawn_envoy_bin(cfg: &Path) -> tokio::process::Child {
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_envoy-bin"))
-        .arg("-c")
-        .arg(cfg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn envoy-bin")
-}
-
 // ── hot-reload-specific helpers ───────────────────────────────────────────────
-
-/// ATOMICALLY replace the EDS file's contents. Writes a SAME-DIR sibling temp
-/// then `std::fs::rename`s it over `target`. The §6.2 watcher detects the change
-/// by the file's mtime stepping forward; an atomic rename guarantees the watcher
-/// only ever stats a COMPLETE file.
-fn atomic_rename_eds(target: &Path, new_contents: &str) {
-    let tmp = target.with_extension("reload-tmp");
-    std::fs::File::create(&tmp)
-        .unwrap()
-        .write_all(new_contents.as_bytes())
-        .unwrap();
-    std::fs::rename(&tmp, target).expect("atomic rename eds over target");
-}
-
-/// Poll `/stats` at ~150ms until `stats[name] == expected` or `budget` elapses.
-/// The watcher poll cadence is ~1s, so a `budget` of ~8s gives several poll
-/// windows of slack. Panics (with the last observed value) on timeout.
-async fn wait_for_stat(admin: SocketAddr, name: &str, expected: u64, budget: Duration) {
-    let deadline = Instant::now() + budget;
-    loop {
-        let stats = scrape_admin_stats(admin).await;
-        let got = stats.get(name).copied();
-        if got == Some(expected) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "wait_for_stat({name:?}) timed out after {budget:?}: expected {expected}, last saw {got:?}"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-}
 
 /// Shared setup: a bootstrap with a STATIC H1 listener INLINE-routing /probe →
 /// `eds_backend`, plus a PLAIN `type: EDS` cluster whose endpoints arrive from
@@ -522,7 +242,7 @@ async fn happy_reload_flips_endpoint_and_ticks_counters() {
     let h = boot_harness(&eds_file("eds_backend", &[backend_1])).await;
 
     // Initial endpoint set routes /probe → backend_1.
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "initial /probe → 200 via backend_1");
     assert_eq!(body, b"from-backend-1");
 
@@ -532,11 +252,11 @@ async fn happy_reload_flips_endpoint_and_ticks_counters() {
 
     // Atomic-rename the eds file → endpoint backend_2. The watcher (poll cadence
     // ~1s) observes the mtime step and runs the §6.2 reload pipeline.
-    atomic_rename_eds(&h.eds_path, &eds_file("eds_backend", &[backend_2]));
+    atomic_rename_over(&h.eds_path, &eds_file("eds_backend", &[backend_2]));
     wait_for_stat(h.admin, C_SUCCESS, 2, Duration::from_secs(8)).await;
 
     // The live endpoint set now routes /probe → backend_2.
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "post-reload /probe → 200 via backend_2");
     assert_eq!(body, b"from-backend-2");
 
@@ -600,7 +320,7 @@ async fn v4a_malformed_reload_warm_rejects_and_keeps_last_good() {
     let backend_1 = spawn_backend("from-backend-1").await;
     let h = boot_harness(&eds_file("eds_backend", &[backend_1])).await;
 
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "initial /probe → 200 via backend_1");
     assert_eq!(body, b"from-backend-1");
 
@@ -608,14 +328,14 @@ async fn v4a_malformed_reload_warm_rejects_and_keeps_last_good() {
     // (IO/parse class) → WARM-REJECT: keep last-good, tick attempt +
     // update_failure. update_attempt ALWAYS ticks, so == 2 is the convergence
     // signal for this rejected reload.
-    atomic_rename_eds(&h.eds_path, "resources: [unclosed");
+    atomic_rename_over(&h.eds_path, "resources: [unclosed");
     wait_for_stat(h.admin, C_ATTEMPT, 2, Duration::from_secs(8)).await;
 
     let s = scrape_admin_stats(h.admin).await;
     assert_eds_counters(&s, 2, 1, 1, 0, 0);
 
     // Last-good kept: /probe still routes to backend_1.
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(
         status, 200,
         "post-warm-reject /probe → 200 (last-good kept)"
@@ -631,20 +351,20 @@ async fn v4b_no_matching_cla_warm_rejects_and_keeps_last_good() {
     let backend_2 = spawn_backend("from-backend-2").await;
     let h = boot_harness(&eds_file("eds_backend", &[backend_1])).await;
 
-    let (status, _) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, _) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "initial /probe → 200 via backend_1");
 
     // Atomic-rename → a (non-empty) envelope whose only CLA is named `other_cla`
     // (the cluster's selection name is `eds_backend`). No match → WARM-REJECT:
     // keep last-good, tick attempt + update_rejected.
-    atomic_rename_eds(&h.eds_path, &eds_file("other_cla", &[backend_2]));
+    atomic_rename_over(&h.eds_path, &eds_file("other_cla", &[backend_2]));
     wait_for_stat(h.admin, C_ATTEMPT, 2, Duration::from_secs(8)).await;
 
     let s = scrape_admin_stats(h.admin).await;
     assert_eds_counters(&s, 2, 1, 0, 1, 0);
 
     // Last-good kept: /probe still routes to backend_1.
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(
         status, 200,
         "post-warm-reject /probe → 200 (last-good kept)"
@@ -659,20 +379,20 @@ async fn v4c_unparseable_endpoint_warm_rejects_and_keeps_last_good() {
     let backend_1 = spawn_backend("from-backend-1").await;
     let h = boot_harness(&eds_file("eds_backend", &[backend_1])).await;
 
-    let (status, _) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, _) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "initial /probe → 200 via backend_1");
 
     // Atomic-rename → the matched CLA carries a non-numeric endpoint address.
     // EDS rejects hostnames (numeric-IP-only) → revalidation fails → WARM-REJECT:
     // keep last-good, tick attempt + update_rejected.
-    atomic_rename_eds(&h.eds_path, &eds_file_bad_endpoint("eds_backend"));
+    atomic_rename_over(&h.eds_path, &eds_file_bad_endpoint("eds_backend"));
     wait_for_stat(h.admin, C_ATTEMPT, 2, Duration::from_secs(8)).await;
 
     let s = scrape_admin_stats(h.admin).await;
     assert_eds_counters(&s, 2, 1, 0, 1, 0);
 
     // Last-good kept: /probe still routes to backend_1.
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(
         status, 200,
         "post-warm-reject /probe → 200 (last-good kept)"
@@ -687,13 +407,13 @@ async fn v4d_apply_empty_reload_succeeds_and_serves_503() {
     let backend_1 = spawn_backend("from-backend-1").await;
     let h = boot_harness(&eds_file("eds_backend", &[backend_1])).await;
 
-    let (status, _) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, _) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "initial /probe → 200 via backend_1");
 
     // Atomic-rename → the matched CLA carries `endpoints: []`. An empty assignment
     // is a SUCCESSFUL update (MIRRORING Envoy), NOT a reject: APPLY the empty set
     // → update_success ticks. update_success == 2 is the convergence signal.
-    atomic_rename_eds(&h.eds_path, &eds_file_empty_endpoints("eds_backend"));
+    atomic_rename_over(&h.eds_path, &eds_file_empty_endpoints("eds_backend"));
     wait_for_stat(h.admin, C_SUCCESS, 2, Duration::from_secs(8)).await;
 
     let s = scrape_admin_stats(h.admin).await;
@@ -702,7 +422,7 @@ async fn v4d_apply_empty_reload_succeeds_and_serves_503() {
 
     // The empty endpoint set → pick() returns None → the synth-503
     // "no healthy upstream" (19 bytes).
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 503, "apply-empty → 503 (no endpoints to pick)");
     assert_eq!(
         body, b"no healthy upstream",
@@ -717,19 +437,19 @@ async fn v4e_empty_envelope_reload_ticks_update_empty_and_keeps_last_good() {
     let backend_1 = spawn_backend("from-backend-1").await;
     let h = boot_harness(&eds_file("eds_backend", &[backend_1])).await;
 
-    let (status, _) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, _) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "initial /probe → 200 via backend_1");
 
     // Atomic-rename → `resources: []` (zero CLAs). Distinct from V4(d): KEEP
     // last-good, tick attempt + update_empty.
-    atomic_rename_eds(&h.eds_path, &eds_file_empty_envelope());
+    atomic_rename_over(&h.eds_path, &eds_file_empty_envelope());
     wait_for_stat(h.admin, C_ATTEMPT, 2, Duration::from_secs(8)).await;
 
     let s = scrape_admin_stats(h.admin).await;
     assert_eds_counters(&s, 2, 1, 0, 0, 1);
 
     // Last-good kept: /probe still routes to backend_1 (200, not 503).
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(
         status, 200,
         "post-empty-envelope /probe → 200 (last-good kept)"
@@ -748,13 +468,13 @@ async fn in_flight_request_completes_under_old_endpoint_set() {
     let h = boot_harness(&eds_file("eds_backend", &[slow_1])).await;
 
     // Warm the route (and seed update_attempt/success at 1/1).
-    let (warm_status, warm_body) = http1_oneshot(h.hcm, "/probe").await;
+    let (warm_status, _, warm_body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(warm_status, 200, "warm /probe → 200 via slow backend_1");
     assert_eq!(warm_body, b"from-slow-1");
 
     // Start an in-flight /probe request WITHOUT awaiting it.
     let hcm = h.hcm;
-    let inflight = tokio::spawn(async move { http1_oneshot(hcm, "/probe").await });
+    let inflight = tokio::spawn(async move { http1_oneshot(hcm, "/probe", "eds_backend").await });
 
     // Give it a moment to connect + send headers + reach the slow backend, so it
     // has surely PICKED the (old) endpoint before the reload.
@@ -763,11 +483,11 @@ async fn in_flight_request_completes_under_old_endpoint_set() {
     // Atomic-rename → endpoint backend_2. A request entering AFTER this swap would
     // pick backend_2; the in-flight one, having read the endpoint snapshot once at
     // pick, must complete against backend_1 (the OLD set).
-    atomic_rename_eds(&h.eds_path, &eds_file("eds_backend", &[backend_2]));
+    atomic_rename_over(&h.eds_path, &eds_file("eds_backend", &[backend_2]));
     wait_for_stat(h.admin, C_SUCCESS, 2, Duration::from_secs(8)).await;
 
     // The in-flight request completes 200 against backend_1 — no panic.
-    let (status, body) = tokio::time::timeout(Duration::from_secs(10), inflight)
+    let (status, _, body) = tokio::time::timeout(Duration::from_secs(10), inflight)
         .await
         .expect("in-flight request did not finish within 10s")
         .expect("in-flight task panicked");
@@ -778,7 +498,7 @@ async fn in_flight_request_completes_under_old_endpoint_set() {
     assert_eq!(body, b"from-slow-1");
 
     // Sanity: the NEW set is live — the next pick lands on backend_2.
-    let (status, body) = http1_oneshot(h.hcm, "/probe").await;
+    let (status, _, body) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
     assert_eq!(status, 200, "post-reload /probe → 200 (new set live)");
     assert_eq!(body, b"from-backend-2");
 }
@@ -798,7 +518,7 @@ async fn cursor_bounds_on_shrinking_endpoint_set() {
     // Advance the round-robin cursor over the 2-endpoint set (several picks so the
     // cursor lands at an index that WOULD be out-of-bounds for a 1-endpoint set).
     for _ in 0..5 {
-        let (status, _) = http1_oneshot(h.hcm, "/probe").await;
+        let (status, _, _) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
         assert_eq!(
             status, 200,
             "pre-shrink /probe → 200 over the 2-endpoint set"
@@ -808,12 +528,12 @@ async fn cursor_bounds_on_shrinking_endpoint_set() {
     // Atomic-rename → ONE endpoint (drop backend_b). The cursor (an AtomicUsize
     // that has advanced past 1) must re-bound via `i % total` against the new
     // total of 1 — every subsequent pick lands on the surviving endpoint.
-    atomic_rename_eds(&h.eds_path, &eds_file("eds_backend", &[backend_a]));
+    atomic_rename_over(&h.eds_path, &eds_file("eds_backend", &[backend_a]));
     wait_for_stat(h.admin, C_SUCCESS, 2, Duration::from_secs(8)).await;
 
     // Several more picks: all 200, none panic, none index out of bounds.
     for _ in 0..5 {
-        let (status, _) = http1_oneshot(h.hcm, "/probe").await;
+        let (status, _, _) = http1_oneshot(h.hcm, "/probe", "eds_backend").await;
         assert_eq!(
             status, 200,
             "post-shrink /probe → 200 (cursor re-bounded to the 1-endpoint set)"

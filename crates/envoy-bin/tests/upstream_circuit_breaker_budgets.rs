@@ -79,145 +79,25 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+mod common;
+
+use common::{
+    assert_stat, http1_oneshot, poll_stat_until, reserve_port, scrape_admin_stats, wait_ready,
+};
+
 /// The byte-exact Envoy overflow local-reply body (81 bytes, no trailing newline).
 const OVERFLOW_BODY: &[u8] =
     b"upstream connect error or disconnect/reset before headers. reset reason: overflow";
-
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
-async fn wait_ready(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Single one-shot H1 request over a fresh downstream conn (Connection: close):
-/// writes the request, reads the status line + headers + `Content-Length`-bounded
-/// body. Returns `(status, headers, body)`.
-async fn http1_oneshot(hcm: SocketAddr, path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    let mut stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(hcm))
-        .await
-        .expect("downstream connect timeout")
-        .expect("downstream connect");
-    let req = format!("GET {path} HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await.expect("write");
-
-    // Read until we have the full header block (`\r\n\r\n`).
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let head_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let mut chunk = [0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .expect("header read timeout")
-            .expect("header read");
-        assert!(n > 0, "EOF before headers complete on {path}");
-        buf.extend_from_slice(&chunk[..n]);
-    };
-
-    let head = std::str::from_utf8(&buf[..head_end - 4]).expect("utf8 head");
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().expect("status");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .expect("status code")
-        .parse()
-        .expect("status numeric");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|l| {
-            let (n, v) = l.split_once(':')?;
-            Some((n.trim().to_string(), v.trim().to_string()))
-        })
-        .collect();
-
-    let cl: usize = headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-        .map(|(_, v)| v.parse().expect("content-length numeric"))
-        .expect("content-length header present");
-
-    let body_start = head_end;
-    while buf.len() < body_start + cl {
-        let mut chunk = [0u8; 1024];
-        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut chunk))
-            .await
-            .expect("body read timeout")
-            .expect("body read");
-        assert!(n > 0, "EOF before body complete on {path}");
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body = buf[body_start..body_start + cl].to_vec();
-    (status, headers, body)
-}
-
-/// Open a fresh TCP conn to admin, GET `/stats`, parse `<name>: <value>` lines
-/// into a map (only numeric rows retained). Mirrors `upstream_retry.rs`.
-async fn scrape_admin_stats(admin: SocketAddr) -> HashMap<String, u64> {
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(admin))
-        .await
-        .expect("admin connect timeout")
-        .expect("admin connect");
-    let req = "GET /stats HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n";
-    stream.write_all(req.as_bytes()).await.expect("admin write");
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
-        .await
-        .expect("admin read timeout")
-        .expect("admin read");
-    let head_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("admin head terminator");
-    let body = std::str::from_utf8(&buf[head_end + 4..]).expect("admin body utf8");
-    let mut out = HashMap::new();
-    for line in body.lines() {
-        if let Some((name, value)) = line.split_once(": ")
-            && let Ok(v) = value.trim().parse::<u64>()
-        {
-            out.insert(name.trim().to_string(), v);
-        }
-    }
-    out
-}
-
-fn assert_stat(stats: &HashMap<String, u64>, name: &str, expected: u64) {
-    let actual = stats
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| panic!("stat {name:?} absent; have {} rows", stats.len()));
-    assert_eq!(
-        actual, expected,
-        "stat {name:?}: expected {expected}, got {actual}"
-    );
-}
 
 fn assert_header_value(headers: &[(String, String)], name: &str, expected: &str, ctx: &str) {
     let val = headers
@@ -236,21 +116,6 @@ fn assert_header_present(headers: &[(String, String)], name: &str, ctx: &str) {
         headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)),
         "header {name:?} absent on {ctx}\nactual: {headers:?}",
     );
-}
-
-/// Poll admin `/stats` until `name == expected` or the budget elapses; returns
-/// the last observed value. Mirrors the circuit-breaker backstop's bounded-retry
-/// convergence for timing-robustness on loaded CI runners.
-async fn poll_stat_until(admin: SocketAddr, name: &str, expected: u64, budget: Duration) -> u64 {
-    let deadline = Instant::now() + budget;
-    loop {
-        let stats = scrape_admin_stats(admin).await;
-        let last = stats.get(name).copied().unwrap_or(0);
-        if last == expected || Instant::now() >= deadline {
-            return last;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 }
 
 // ── in-process backends ───────────────────────────────────────────────────────
@@ -555,7 +420,7 @@ async fn budget_backstop_four_paths() {
     // (i) budget-blocked retry: /blocked → budget_zero (max_retries:0). The
     // policy's retry is gated away; the attempt-1 503 surfaces verbatim.
     // ─────────────────────────────────────────────────────────────────────────
-    let (status, headers, body) = http1_oneshot(hcm_addr, "/blocked").await;
+    let (status, headers, body) = http1_oneshot(hcm_addr, "/blocked", "backend").await;
     assert_eq!(status, 503, "(i) budget-blocked: expected verbatim 503");
     assert_eq!(
         body, b"service unavailable\n",
@@ -587,7 +452,7 @@ async fn budget_backstop_four_paths() {
     // retry is admitted by the default budget. Post-settle remaining_* gauges
     // read the L5 defaults (3 / 1024) back through the full stack at rest.
     // ─────────────────────────────────────────────────────────────────────────
-    let (status, headers, body) = http1_oneshot(hcm_addr, "/allowed").await;
+    let (status, headers, body) = http1_oneshot(hcm_addr, "/allowed", "backend").await;
     assert_eq!(
         status, 200,
         "(ii) budget-allowed: expected final 200 on retry"
@@ -624,7 +489,7 @@ async fn budget_backstop_four_paths() {
     // x-envoy-overloaded + x-envoy-attempt-count:1; backend never contacted.
     // ─────────────────────────────────────────────────────────────────────────
     let ctr_before = backend_ctr.load(Ordering::Relaxed);
-    let (status, headers, body) = http1_oneshot(hcm_addr, "/rq-blocked").await;
+    let (status, headers, body) = http1_oneshot(hcm_addr, "/rq-blocked", "backend").await;
     assert_eq!(status, 503, "(iii) rq-overflow: expected synth 503");
     assert_eq!(
         body.as_slice(),
@@ -663,8 +528,8 @@ async fn budget_backstop_four_paths() {
     let rq_open_mid_w = rq_open_mid.clone();
     let admin_for_probe = admin_addr;
 
-    let r1 = http1_oneshot(hcm_addr, "/slow-200");
-    let r2 = http1_oneshot(hcm_addr, "/slow-200");
+    let r1 = http1_oneshot(hcm_addr, "/slow-200", "backend");
+    let r2 = http1_oneshot(hcm_addr, "/slow-200", "backend");
     // While the winner holds the single request slot, poll rq_open and expect it
     // to converge to 1 (the at-cap inclusive edge). Poll budget 700ms ≪ 1500ms
     // hold, so the scrape reliably lands mid-flight.
@@ -736,8 +601,8 @@ async fn budget_backstop_four_paths() {
     // reach try_acquire_retry. The single retry slot admits exactly one; the
     // other overflows. Combined: upstream_rq_retry == 1, retry_overflow == 1.
     // ─────────────────────────────────────────────────────────────────────────
-    let r1 = http1_oneshot(hcm_addr, "/slow-503");
-    let r2 = http1_oneshot(hcm_addr, "/slow-503");
+    let r1 = http1_oneshot(hcm_addr, "/slow-503", "backend");
+    let r2 = http1_oneshot(hcm_addr, "/slow-503", "backend");
     let ((s1, h1, _b1), (s2, h2, _b2)) = tokio::join!(r1, r2);
 
     // Both downstream responses are 503 (one exhausted its admitted retry, the

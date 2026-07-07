@@ -53,85 +53,16 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::SocketAddr;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
-/// Reserve a free TCP port on 127.0.0.1 by binding an ephemeral port and
-/// immediately dropping the listener (matching the jwt_authn/rbac/fault
-/// backstop precedent).
-fn reserve_port() -> u16 {
-    let l = StdListener::bind(("127.0.0.1", 0)).unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
+mod common;
 
-/// Wait for a TCP listener at `addr` to accept a connection, with exponential
-/// backoff up to `budget`. Returns `Ok(())` on success; `Err` on timeout.
-async fn wait_ready_result(addr: SocketAddr, budget: Duration) -> std::io::Result<()> {
-    let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_millis(50);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) if Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_millis(500));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Spawn a minimal HTTP/1.1 backend that accepts multiple connections in a
-/// loop and responds with `HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nok\n`
-/// to each request. The task runs until the listener is garbage-collected
-/// (it never panics — failures are silently ignored so the probe-side
-/// assertions surface the real error instead).
-async fn spawn_http1_backend() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                // Drain the request (wait for the blank-line terminator).
-                let mut buf = vec![0u8; 8192];
-                let mut total = 0usize;
-                loop {
-                    let Ok(n) = stream.read(&mut buf[total..]).await else {
-                        return;
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    total += n;
-                    if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                    if total >= buf.len() {
-                        return;
-                    }
-                }
-                let response = b"HTTP/1.1 200 OK\r\n\
-                    content-type: text/plain\r\n\
-                    content-length: 3\r\n\
-                    connection: close\r\n\
-                    \r\n\
-                    ok\n";
-                let _ = stream.write_all(response).await;
-                let _ = stream.shutdown().await;
-            });
-        }
-    });
-    addr
-}
+use common::{dump_stderr_and_kill, reserve_port, spawn_http1_backend, wait_ready};
 
 /// Open a fresh TCP connection to `addr`, write an HTTP/1.1 request with
 /// `Connection: close` and `Host: envoy.test`, read-to-end, split head/body
@@ -198,29 +129,6 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a st
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
-}
-
-/// Dump stderr from the child process (if available) and kill + wait on it.
-/// Used on the failure path so envoy-bin runtime errors surface in test output.
-/// Mirrors the jwt_authn backstop pattern exactly.
-async fn dump_stderr_and_kill(child: &mut tokio::process::Child) {
-    // KILL FIRST: while the child is alive it holds the write end of the stderr
-    // pipe open, so `read_to_end` on a live child blocks forever. Killing first
-    // closes the write end so the buffered stderr drains and EOFs.
-    child.kill().await.ok();
-    if let Some(mut err_pipe) = child.stderr.take() {
-        let mut stderr_buf = Vec::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            err_pipe.read_to_end(&mut stderr_buf),
-        )
-        .await;
-        eprintln!(
-            "envoy-bin stderr:\n{}",
-            String::from_utf8_lossy(&stderr_buf)
-        );
-    }
-    let _ = child.wait().await;
 }
 
 #[tokio::test]
@@ -317,7 +225,7 @@ static_resources:
     // envoy-bin startup error surfaces in test output (jwt_authn + rbac precedent).
     let ready = tokio::time::timeout(
         Duration::from_secs(10),
-        wait_ready_result(listener_addr, Duration::from_secs(10)),
+        wait_ready(listener_addr, Duration::from_secs(10)),
     )
     .await;
     if ready.is_err() || matches!(&ready, Ok(Err(_))) {

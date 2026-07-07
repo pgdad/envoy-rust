@@ -60,9 +60,6 @@ impl FilterPipeline {
         Self { filters }
     }
 
-    /// Phase-23 D2: fan the matched route's per-filter config out to each filter
-    /// instance before the decode pass. Inert for all non-CORS filters → the
-    /// 07.1 foundation-slice property (all pre-existing fixtures unchanged).
     /// True when the chain is exactly one Router terminus. The H1 HCM uses
     /// this to gate its zero-copy proxied-response fast path: Router is a
     /// no-op on both decode and encode, so skipping the owned response-header
@@ -75,6 +72,9 @@ impl FilterPipeline {
             )
     }
 
+    /// Phase-23 D2: fan the matched route's per-filter config out to each filter
+    /// instance before the decode pass. Inert for all non-CORS filters → the
+    /// 07.1 foundation-slice property (all pre-existing fixtures unchanged).
     pub fn apply_route_config(&mut self, route: Option<&envoy_config::Route>) {
         for filter in self.filters.iter_mut() {
             filter.apply_route_config(route);
@@ -203,13 +203,7 @@ mod tests {
         let mut pipeline = FilterPipeline::build_from_config(&filters, &registry, "ingress_http")
             .expect("builds fault + router pipeline");
         // 100% abort with no gate → every request is short-circuited with 503.
-        let mut req = FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
+        let mut req = FilterRequest::test("GET", "/", &[]);
         match pipeline.decode_headers(&mut req) {
             Decision::StopAndSend(resp) => assert_eq!(resp.status, 503),
             Decision::Continue => panic!("expected fault abort, got Continue"),
@@ -217,13 +211,7 @@ mod tests {
     }
 
     fn test_request() -> FilterRequest {
-        FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: vec![("host".to_string(), "localhost".to_string())],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test("GET", "/", &[("host", "localhost")])
     }
 
     fn test_response() -> FilterResponse {
@@ -275,19 +263,14 @@ typed_per_filter_config:
     }
 
     fn preflight_request() -> FilterRequest {
-        FilterRequest {
-            method: "OPTIONS".to_string(),
-            path: "/".to_string(),
-            headers: vec![
-                ("origin".to_string(), "http://a.test".to_string()),
-                (
-                    "access-control-request-method".to_string(),
-                    "GET".to_string(),
-                ),
+        FilterRequest::test(
+            "OPTIONS",
+            "/",
+            &[
+                ("origin", "http://a.test"),
+                ("access-control-request-method", "GET"),
             ],
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        )
     }
 
     #[test]

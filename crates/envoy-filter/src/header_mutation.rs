@@ -160,27 +160,16 @@ mod tests {
     }
 
     fn req_with(headers: Vec<(&str, &str)>) -> FilterRequest {
-        FilterRequest {
-            method: "GET".to_string(),
-            path: "/".to_string(),
-            headers: headers
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            body: None,
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        }
+        FilterRequest::test("GET", "/", &headers)
     }
 
     fn resp_with(headers: Vec<(&str, &str)>) -> FilterResponse {
         FilterResponse {
-            status: 200,
-            reason: None,
             headers: headers
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            body: bytes::Bytes::new(),
+            ..FilterResponse::test_200()
         }
     }
 

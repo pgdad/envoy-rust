@@ -12,6 +12,59 @@ use anyhow::{Context, Result, bail};
 
 use crate::{reserve_port, wait_accept_ready};
 
+/// Shared Drop posture for the helper-binary backends: SIGKILL via tokio's
+/// `start_kill` (same posture as `tests/differential/src/subject.rs` per
+/// phase-01 M1's open-ended `nix`-deferral), then a best-effort exit wait —
+/// `try_wait` in a 50ms-poll/2s-deadline loop because `Drop` cannot await;
+/// the spawned-task pattern would require a runtime handle we don't have
+/// here (phase-02.2 REVIEW M1 carryforward).
+fn kill_and_reap(child: &mut Option<tokio::process::Child>) {
+    if let Some(mut child) = child.take() {
+        let _ = child.start_kill();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+/// Shared spawn skeleton for the helper-binary backends: reserve an ephemeral
+/// 127.0.0.1 port, locate the workspace's `bin_name` binary, and spawn it with
+/// `--port <port>` plus `extra_args` under the standing subprocess posture
+/// (`RUST_LOG=warn`, stdout null, stderr inherit, `kill_on_drop(true)`).
+/// Returns the reserved port, the running child, and the backend's socket
+/// address. Readiness polling stays with each backend type — the budgets and
+/// pollers (TCP accept vs H2 handshake) differ per type.
+///
+/// `spawn_ctx_suffix` is appended after `--port <port>` in the spawn error
+/// context (only `TcpCloseBackend` shows its extra arg there).
+async fn spawn_helper_backend(
+    bin_name: &str,
+    reserve_ctx: &'static str,
+    extra_args: &[&std::ffi::OsStr],
+    spawn_ctx_suffix: &'static str,
+) -> Result<(u16, tokio::process::Child, std::net::SocketAddr)> {
+    let port = reserve_port().context(reserve_ctx)?;
+    let bin = locate_helper_bin(bin_name).with_context(|| format!("locating {bin_name} binary"))?;
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("--port").arg(port.to_string());
+    cmd.args(extra_args);
+    let child = cmd
+        .env("RUST_LOG", "warn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawning {} --port {port}{spawn_ctx_suffix}", bin.display()))?;
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+    Ok((port, child, addr))
+}
+
 /// A running `tcp-echo-server` host subprocess. Drop sends SIGKILL via
 /// tokio's `start_kill` and waits up to 2s for the child to exit (matches
 /// `tests/differential/src/subject.rs`'s SIGKILL posture per phase-01 M1's
@@ -28,19 +81,8 @@ impl TcpProxyBackend {
     /// 1s (matches `wait_accept_ready`'s exponential backoff defaults; see
     /// SPEC §6 signpost 8).
     pub async fn spawn() -> Result<Self> {
-        let port = reserve_port().context("reserving backend port")?;
-        let bin = locate_tcp_echo_server().context("locating tcp-echo-server binary")?;
-        let child = tokio::process::Command::new(&bin)
-            .arg("--port")
-            .arg(port.to_string())
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawning {} --port {port}", bin.display()))?;
-
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        let (port, child, addr) =
+            spawn_helper_backend("tcp-echo-server", "reserving backend port", &[], "").await?;
         wait_accept_ready(addr, Duration::from_secs(1))
             .await
             .with_context(|| format!("tcp-echo-server never became accept-ready on {addr}"))?;
@@ -65,22 +107,7 @@ impl TcpProxyBackend {
 
 impl Drop for TcpProxyBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            // SIGKILL via tokio's start_kill. Same posture as
-            // tests/differential/src/subject.rs.
-            let _ = child.start_kill();
-            // Best-effort exit wait. Using `try_wait` in a 2s polling loop
-            // because `Drop` cannot await; the spawned task pattern would
-            // require a runtime handle we don't have here.
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
+        kill_and_reap(&mut self.child);
     }
 }
 
@@ -96,22 +123,13 @@ pub struct TcpCloseBackend {
 
 impl TcpCloseBackend {
     pub async fn spawn() -> Result<Self> {
-        let port = reserve_port().context("reserving close-backend port")?;
-        let bin = locate_tcp_echo_server().context("locating tcp-echo-server binary")?;
-        let child = tokio::process::Command::new(&bin)
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--close-on-accept")
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!("spawning {} --port {port} --close-on-accept", bin.display())
-            })?;
-
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        let (port, child, addr) = spawn_helper_backend(
+            "tcp-echo-server",
+            "reserving close-backend port",
+            &[std::ffi::OsStr::new("--close-on-accept")],
+            " --close-on-accept",
+        )
+        .await?;
         wait_accept_ready(addr, Duration::from_secs(1))
             .await
             .with_context(|| {
@@ -135,17 +153,7 @@ impl TcpCloseBackend {
 
 impl Drop for TcpCloseBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
+        kill_and_reap(&mut self.child);
     }
 }
 
@@ -175,23 +183,18 @@ impl TlsEchoBackend {
     /// Total readiness budget: 5s (TLS server has more startup work than
     /// plaintext — installing the crypto provider, building `ServerConfig`).
     pub async fn spawn(server_cert: &Path, server_key: &Path) -> Result<Self> {
-        let port = reserve_port().context("reserving tls backend port")?;
-        let bin = locate_tls_echo_server().context("locating tls-echo-server binary")?;
-        let child = tokio::process::Command::new(&bin)
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--cert")
-            .arg(server_cert)
-            .arg("--key")
-            .arg(server_key)
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawning {} --port {port}", bin.display()))?;
-
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        let (port, child, addr) = spawn_helper_backend(
+            "tls-echo-server",
+            "reserving tls backend port",
+            &[
+                std::ffi::OsStr::new("--cert"),
+                server_cert.as_os_str(),
+                std::ffi::OsStr::new("--key"),
+                server_key.as_os_str(),
+            ],
+            "",
+        )
+        .await?;
         wait_accept_ready(addr, Duration::from_secs(5))
             .await
             .with_context(|| format!("tls-echo-server never became accept-ready on {addr}"))?;
@@ -218,17 +221,7 @@ impl TlsEchoBackend {
 
 impl Drop for TlsEchoBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
+        kill_and_reap(&mut self.child);
     }
 }
 
@@ -268,22 +261,18 @@ impl Http1EchoBackend {
     }
 
     async fn spawn_inner(marker: Option<&str>) -> Result<Self> {
-        let port = reserve_port().context("reserving http1 backend port")?;
-        let bin = locate_http1_echo_server().context("locating http1-echo-server binary")?;
-        let mut cmd = tokio::process::Command::new(&bin);
-        cmd.arg("--port").arg(port.to_string());
+        let mut extra_args: Vec<&std::ffi::OsStr> = Vec::new();
         if let Some(marker) = marker {
-            cmd.arg("--body-marker").arg(marker);
+            extra_args.push("--body-marker".as_ref());
+            extra_args.push(marker.as_ref());
         }
-        let child = cmd
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawning {} --port {port}", bin.display()))?;
-
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        let (port, child, addr) = spawn_helper_backend(
+            "http1-echo-server",
+            "reserving http1 backend port",
+            &extra_args,
+            "",
+        )
+        .await?;
         // Backstop 30s readiness deadline (was 1s) — CI cold-build budget per
         // the 12.2 Task 8 follow-up b1cb25c precedent (HealthAwareHttp1Backend
         // 3s → 30s bump for the same flake class; CI run 26361106477 RED on
@@ -313,17 +302,7 @@ impl Http1EchoBackend {
 
 impl Drop for Http1EchoBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
+        kill_and_reap(&mut self.child);
     }
 }
 
@@ -470,19 +449,9 @@ pub struct Http2EchoBackend {
 
 impl Http2EchoBackend {
     pub async fn spawn() -> Result<Self> {
-        let port = reserve_port().context("reserving http2 backend port")?;
-        let bin = locate_http2_echo_server().context("locating http2-echo-server binary")?;
-        let child = tokio::process::Command::new(&bin)
-            .arg("--port")
-            .arg(port.to_string())
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("spawning {} --port {port}", bin.display()))?;
-
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        let (port, child, addr) =
+            spawn_helper_backend("http2-echo-server", "reserving http2 backend port", &[], "")
+                .await?;
         wait_h2_accept_ready(addr, Duration::from_secs(2))
             .await
             .with_context(|| format!("http2-echo-server never became h2-accept-ready on {addr}"))?;
@@ -506,17 +475,7 @@ impl Http2EchoBackend {
 
 impl Drop for Http2EchoBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
+        kill_and_reap(&mut self.child);
     }
 }
 
@@ -623,10 +582,14 @@ async fn wait_h2_accept_ready(addr: std::net::SocketAddr, budget: Duration) -> R
     }
 }
 
-/// Locate the workspace's `http2-echo-server` binary. Mirrors
-/// `locate_http1_echo_server`. `pub(crate)` so the `lib.rs::tests`
-/// cross-module dispatch test can probe binary availability.
-pub(crate) fn locate_http2_echo_server() -> Result<PathBuf> {
+/// Locate a workspace helper binary named `name` at
+/// `<target>/<profile>/<name>`. Cargo's `CARGO_BIN_EXE_<name>` is only set
+/// for tests in the same package as the binary; we're in the cross-package
+/// `differential` crate, so we compute the path by convention. See SPEC §6
+/// signpost 8. Honors `CARGO_TARGET_DIR`; tests/differential → repo root is
+/// two parents up. Returns `Err` if the binary is not at the expected path
+/// (e.g., not built yet, or workspace layout changed).
+fn locate_helper_bin(name: &str) -> Result<PathBuf> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest
         .parent()
@@ -640,109 +603,45 @@ pub(crate) fn locate_http2_echo_server() -> Result<PathBuf> {
     } else {
         "release"
     };
-    let mut bin = target_dir.join(profile).join("http2-echo-server");
+    let mut bin = target_dir.join(profile).join(name);
     if cfg!(windows) {
         bin.set_extension("exe");
     }
     if !bin.exists() {
         bail!(
-            "http2-echo-server not found at {}; run `cargo build -p http2-echo-server` or `cargo test --workspace`",
-            bin.display()
+            "{name} not found at {}; run `cargo build -p {name}` or `cargo test --workspace`",
+            bin.display(),
         );
     }
     Ok(bin)
 }
 
-/// Locate the workspace's `http1-echo-server` binary. Mirrors
-/// `locate_tcp_echo_server` and `locate_tls_echo_server`. `pub(crate)` so the
+/// Locate the workspace's `http2-echo-server` binary. `pub(crate)` so the
 /// `lib.rs::tests` cross-module dispatch test can probe binary availability.
+/// `cfg(test)`: the spawn paths use `locate_helper_bin` directly; these named
+/// wrappers only serve the test modules' skip-if-not-built probes.
+#[cfg(test)]
+pub(crate) fn locate_http2_echo_server() -> Result<PathBuf> {
+    locate_helper_bin("http2-echo-server")
+}
+
+/// Locate the workspace's `http1-echo-server` binary. `pub(crate)` so the
+/// `lib.rs::tests` cross-module dispatch test can probe binary availability.
+#[cfg(test)]
 pub(crate) fn locate_http1_echo_server() -> Result<PathBuf> {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .context("walking up from CARGO_MANIFEST_DIR to workspace root")?;
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("target"));
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let mut bin = target_dir.join(profile).join("http1-echo-server");
-    if cfg!(windows) {
-        bin.set_extension("exe");
-    }
-    if !bin.exists() {
-        bail!(
-            "http1-echo-server not found at {}; run `cargo build -p http1-echo-server` or `cargo test --workspace`",
-            bin.display(),
-        );
-    }
-    Ok(bin)
+    locate_helper_bin("http1-echo-server")
 }
 
-/// Locate the workspace's `tls-echo-server` binary. Mirrors
-/// `locate_tcp_echo_server`. Returns `Err` if the binary is not at the
-/// expected path (e.g., not built yet, or workspace layout changed).
+/// Locate the workspace's `tls-echo-server` binary.
+#[cfg(test)]
 fn locate_tls_echo_server() -> Result<PathBuf> {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .context("walking up from CARGO_MANIFEST_DIR to workspace root")?;
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("target"));
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let mut bin = target_dir.join(profile).join("tls-echo-server");
-    if cfg!(windows) {
-        bin.set_extension("exe");
-    }
-    if !bin.exists() {
-        bail!(
-            "tls-echo-server not found at {}; run `cargo build -p tls-echo-server` or `cargo test --workspace`",
-            bin.display(),
-        );
-    }
-    Ok(bin)
+    locate_helper_bin("tls-echo-server")
 }
 
-/// Locate the workspace's `tcp-echo-server` binary. Cargo's
-/// `CARGO_BIN_EXE_<name>` is only set for tests in the same package as the
-/// binary; we're in the cross-package `differential` crate, so we compute
-/// the path by convention. See SPEC §6 signpost 8.
+/// Locate the workspace's `tcp-echo-server` binary.
+#[cfg(test)]
 fn locate_tcp_echo_server() -> Result<PathBuf> {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // tests/differential → repo root is two parents up.
-    let workspace_root = manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .context("walking up from CARGO_MANIFEST_DIR to workspace root")?;
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join("target"));
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let mut bin = target_dir.join(profile).join("tcp-echo-server");
-    if cfg!(windows) {
-        bin.set_extension("exe");
-    }
-    if !bin.exists() {
-        bail!(
-            "tcp-echo-server not found at {}; run `cargo build -p tcp-echo-server` or `cargo test --workspace`",
-            bin.display(),
-        );
-    }
-    Ok(bin)
+    locate_helper_bin("tcp-echo-server")
 }
 
 #[cfg(test)]
