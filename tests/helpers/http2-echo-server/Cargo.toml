@@ -13,11 +13,10 @@ path = "src/main.rs"
 envoy-http2 = { path = "../../../crates/envoy-http2" }
 anyhow = "1"
 bytes = "1"
+helper-common = { path = "../helper-common" }
 http = "1"
-thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies.h2]
 # Re-exported by envoy_http2::codec::server_handshake; the helper's accept

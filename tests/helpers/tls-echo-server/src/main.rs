@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use thiserror::Error;
+use helper_common::ArgvError;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -27,56 +27,33 @@ struct Args {
     key: PathBuf,
 }
 
-/// argv parse failure modes.
-///
-/// `HelpRequested` and `VersionRequested` are "successful" user intents that
-/// nevertheless short-circuit the parse — `main` translates them to exit 0.
-#[derive(Debug, Error, PartialEq)]
-enum ArgvError {
-    #[error("required flag {0} missing")]
-    MissingFlag(&'static str),
-    #[error("flag expects a value")]
-    MissingValue,
-    #[error("port value must be a u16")]
-    InvalidPort,
-    #[error("trailing arguments after --key <PATH>")]
-    Trailing,
-    #[error("--help")]
-    HelpRequested,
-    #[error("--version")]
-    VersionRequested,
-}
+/// The per-binary phrase in the `ArgvError::Trailing` message.
+const TRAILING_AFTER: &str = "--key <PATH>";
 
-/// Parses argv (excluding argv[0]).
+/// Parses argv (excluding argv[0]). The `--help`/`--version`/`--port`
+/// skeleton lives in `helper_common`; the closure handles this binary's
+/// `--cert`/`--key` flags.
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
-    let mut i = 0;
-    let mut port: Option<u16> = None;
     let mut cert: Option<PathBuf> = None;
     let mut key: Option<PathBuf> = None;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" => return Err(ArgvError::HelpRequested),
-            "--version" => return Err(ArgvError::VersionRequested),
-            "--port" => {
-                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
-                port = Some(v.parse().map_err(|_| ArgvError::InvalidPort)?);
-                i += 2;
-            }
+    let port =
+        helper_common::parse_port_argv(args, TRAILING_AFTER, |args, i| match args[*i].as_str() {
             "--cert" => {
-                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
+                let v = args.get(*i + 1).ok_or(ArgvError::MissingValue)?;
                 cert = Some(PathBuf::from(v));
-                i += 2;
+                *i += 2;
+                Ok(true)
             }
             "--key" => {
-                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
+                let v = args.get(*i + 1).ok_or(ArgvError::MissingValue)?;
                 key = Some(PathBuf::from(v));
-                i += 2;
+                *i += 2;
+                Ok(true)
             }
-            _ => return Err(ArgvError::Trailing),
-        }
-    }
+            _ => Ok(false),
+        })?;
     Ok(Args {
-        port: port.ok_or(ArgvError::MissingFlag("--port"))?,
+        port,
         cert: cert.ok_or(ArgvError::MissingFlag("--cert"))?,
         key: key.ok_or(ArgvError::MissingFlag("--key"))?,
     })
@@ -164,13 +141,7 @@ fn print_help() {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    helper_common::init_tracing("info", true);
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_argv(&argv) {
@@ -189,24 +160,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("failed to build tokio runtime: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    match rt.block_on(run(args)) {
-        Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("runtime error: {e}");
-            ExitCode::from(1)
-        }
-    }
+    helper_common::run_blocking(run(args), "", "runtime error: ")
 }
 
 #[cfg(test)]

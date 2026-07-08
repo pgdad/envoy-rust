@@ -10,6 +10,8 @@
 mod base64url;
 pub mod error;
 mod jwks;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 mod verify;
 
 pub use error::JwtError;

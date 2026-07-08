@@ -9,6 +9,14 @@ license = "Apache-2.0"
 name = "envoy_jwt"
 path = "src/lib.rs"
 
+[features]
+# Exposes `test_support` (real RSA-2048 keypair generation, RS256 signing,
+# base64url encoding, signed-token assembly) so downstream test suites (the
+# envoy-filter jwt_authn tests) can mint verifiable tokens without duplicating
+# the helpers. NOT enabled in production builds. (#[cfg(test)] would not be
+# cross-crate-visible — same precedent as envoy-filter's test-util feature.)
+test-util = []
+
 [dependencies]
 aws-lc-rs = "1.16"          # PublicKeyComponents::verify — default features suffice (ADR-0055/0056 L1)
 serde = { version = "1", features = ["derive"] }

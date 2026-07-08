@@ -24,4 +24,6 @@ envoy-jwt = { path = "../envoy-jwt" }
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync"] }
 serde_yaml = "0.9"
-aws-lc-rs = "1.16"
+# RS256 test-token signing helpers for the jwt_authn tests (re-exports the
+# aws-lc-rs RsaKeyPair, so no direct aws-lc-rs dev-dependency is needed).
+envoy-jwt = { path = "../envoy-jwt", features = ["test-util"] }

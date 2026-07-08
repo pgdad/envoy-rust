@@ -16,9 +16,6 @@ pub enum FilterError {
     #[error("filter chain is empty (must contain at least Router)")]
     EmptyChain,
 
-    #[error("filter chain references unsupported filter type at position {position}: {name}")]
-    UnsupportedFilterType { position: usize, name: String },
-
     /// 09: filter config rejected at `build_from_config` time (defense-in-depth
     /// — the envoy-config validator at `validate_local_rate_limit_config` is
     /// the primary gate).
@@ -48,17 +45,6 @@ mod tests {
     fn display_empty_chain_is_human_readable() {
         let s = format!("{}", FilterError::EmptyChain);
         assert_eq!(s, "filter chain is empty (must contain at least Router)");
-    }
-
-    #[test]
-    fn display_unsupported_filter_type_includes_position_and_name() {
-        let e = FilterError::UnsupportedFilterType {
-            position: 1,
-            name: "envoy.filters.http.cors".to_string(),
-        };
-        let s = format!("{e}");
-        assert!(s.contains("position 1"));
-        assert!(s.contains("envoy.filters.http.cors"));
     }
 
     /// Static assertion that `FilterError` is `Send + Sync + 'static`.

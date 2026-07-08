@@ -148,67 +148,9 @@ pub fn verify_rs256(
 mod tests {
     use super::*;
     use crate::JwkSet;
-    use aws_lc_rs::rsa::{KeySize, PublicKeyComponents};
-    use aws_lc_rs::signature::{KeyPair, RsaKeyPair};
-
-    // Build a real RSA-2048 keypair, return (keypair, jwks_json).
-    fn keypair() -> (RsaKeyPair, String) {
-        let kp = RsaKeyPair::generate(KeySize::Rsa2048).expect("gen");
-        let pk = kp.public_key();
-        let comps: PublicKeyComponents<Vec<u8>> = PublicKeyComponents::from(pk); // n/e big-endian
-        let jwks = format!(
-            r#"{{"keys":[{{"kty":"RSA","kid":"k1","n":"{}","e":"{}"}}]}}"#,
-            base64_test::b64url(&comps.n),
-            base64_test::b64url(&comps.e)
-        );
-        (kp, jwks)
-    }
-
-    fn sign(kp: &RsaKeyPair, header_payload: &str) -> String {
-        let mut sig = vec![0u8; kp.public_modulus_len()];
-        kp.sign(
-            &aws_lc_rs::signature::RSA_PKCS1_SHA256,
-            &aws_lc_rs::rand::SystemRandom::new(),
-            header_payload.as_bytes(),
-            &mut sig,
-        )
-        .expect("sign");
-        base64_test::b64url(&sig)
-    }
-
-    // tiny base64url encoder for tests only
-    mod base64_test {
-        pub fn b64url(b: &[u8]) -> String {
-            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-            let mut out = String::new();
-            for chunk in b.chunks(3) {
-                let n = chunk.len();
-                let b0 = chunk[0] as u32;
-                let b1 = if n > 1 { chunk[1] as u32 } else { 0 };
-                let b2 = if n > 2 { chunk[2] as u32 } else { 0 };
-                let triple = (b0 << 16) | (b1 << 8) | b2;
-                out.push(A[((triple >> 18) & 63) as usize] as char);
-                out.push(A[((triple >> 12) & 63) as usize] as char);
-                if n > 1 {
-                    out.push(A[((triple >> 6) & 63) as usize] as char);
-                }
-                if n > 2 {
-                    out.push(A[(triple & 63) as usize] as char);
-                }
-            }
-            out
-        }
-        pub fn jwt(kid: &str, alg: &str, payload: &str) -> String {
-            let h = format!(r#"{{"alg":"{alg}","kid":"{kid}","typ":"JWT"}}"#);
-            format!("{}.{}", b64url(h.as_bytes()), b64url(payload.as_bytes()))
-        }
-    }
-
-    fn make_token(kp: &RsaKeyPair, alg: &str, payload: &str) -> String {
-        let hp = base64_test::jwt("k1", alg, payload);
-        let sig = sign(kp, &hp);
-        format!("{hp}.{sig}")
-    }
+    use crate::test_support::{b64url, keypair, make_token, sign};
+    use aws_lc_rs::rsa::PublicKeyComponents;
+    use aws_lc_rs::signature::KeyPair;
 
     const ISS: &str = "testing@secure.istio.io";
 
@@ -320,8 +262,8 @@ mod tests {
     fn no_kid_header_matches_any_key() {
         let (kp, _jwks) = keypair();
         let hp = {
-            let h = base64_test::b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
-            let p = base64_test::b64url(br#"{"iss":"testing@secure.istio.io","exp":4102444800}"#);
+            let h = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
+            let p = b64url(br#"{"iss":"testing@secure.istio.io","exp":4102444800}"#);
             format!("{h}.{p}")
         };
         let tok = format!("{}.{}", hp, sign(&kp, &hp));
@@ -330,8 +272,8 @@ mod tests {
         let comps: PublicKeyComponents<Vec<u8>> = PublicKeyComponents::from(pk);
         let jwks = format!(
             r#"{{"keys":[{{"kty":"RSA","n":"{}","e":"{}"}}]}}"#,
-            base64_test::b64url(&comps.n),
-            base64_test::b64url(&comps.e)
+            b64url(&comps.n),
+            b64url(&comps.e)
         );
         let set = JwkSet::parse(&jwks).unwrap();
         let v = verify_rs256(&tok, &set, ISS, &[], 1_700_000_000).unwrap();

@@ -652,6 +652,86 @@ async fn run_attempt(
     }
 }
 
+/// Read the Content-Length-delimited request body: first drain what is
+/// already buffered in `buf`, then read the remainder from `downstream`
+/// (extracted verbatim from `serve_connection`'s per-request loop).
+///
+/// Returns `Ok(Some(body))` on success (`body_len == 0` yields an empty
+/// `Bytes`), `Ok(None)` on an idle-read timeout mid-body (the caller maps
+/// this to `serve_connection`'s graceful `return Ok(())` close), and `Err`
+/// for the `UnexpectedEof` / io-error dispositions — the same three exits
+/// the inlined block had.
+async fn read_request_body(
+    downstream: &mut TcpStream,
+    buf: &mut BytesMut,
+    body_len: usize,
+) -> Result<Option<Bytes>, Http1Error> {
+    if body_len > 0 {
+        let mut body_buf = BytesMut::with_capacity(body_len.min(INITIAL_BODY_BUF_CAP));
+        let from_buf = buf.len().min(body_len);
+        body_buf.extend_from_slice(&buf[..from_buf]);
+        buf.advance(from_buf);
+        let mut remaining = body_len - from_buf;
+        while remaining > 0 {
+            // Read the CL-framed remainder straight into body_buf — no 4 KiB
+            // stack bounce buffer + second memcpy. `take` bounds the read to
+            // the declared body length so a following pipelined request's
+            // bytes are never consumed (identical framing to the old
+            // `chunk[..to_read]` cap). Same pattern as client.rs's response
+            // body read.
+            let mut limited = (&mut *downstream).take(remaining as u64);
+            let n = match tokio::time::timeout(IDLE_READ_TIMEOUT, limited.read_buf(&mut body_buf))
+                .await
+            {
+                Ok(Ok(0)) => return Err(Http1Error::UnexpectedEof),
+                Ok(Ok(n)) => n,
+                Ok(Err(source)) => return Err(Http1Error::Io { source }),
+                Err(_elapsed) => return Ok(None),
+            };
+            remaining -= n;
+        }
+        Ok(Some(body_buf.freeze()))
+    } else {
+        Ok(Some(Bytes::new()))
+    }
+}
+
+/// Decode-side filter invocation with its boundary conversion (extracted
+/// verbatim from `serve_connection`'s per-request loop): construct
+/// `FilterRequest` from the filter-visible subset of `envoy_http1::Request`,
+/// invoke `decode_headers`, write back. The codec-state fields (`version`,
+/// `bytes_consumed`) stay in `req` and are not surfaced to filters.
+///
+/// Returns the pipeline's decode decision plus the per-request dynamic
+/// metadata, captured before `filter_req` is dropped so the access-log
+/// record build can render %DYNAMIC_METADATA% (phase 33 T9).
+fn run_decode_filters(
+    pipeline: &mut envoy_filter::FilterPipeline,
+    req: &mut Request,
+) -> (
+    envoy_filter::Decision,
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+) {
+    let mut filter_req = envoy_filter::FilterRequest {
+        method: std::mem::take(&mut req.method),
+        path: std::mem::take(&mut req.path),
+        headers: std::mem::take(&mut req.headers),
+        body: req.body.take(),
+        dynamic_metadata: std::collections::BTreeMap::new(),
+    };
+    let decode_decision = pipeline.decode_headers(&mut filter_req);
+    // Write back the (possibly mutated) fields.
+    req.method = filter_req.method;
+    req.path = filter_req.path;
+    req.headers = filter_req.headers;
+    req.body = filter_req.body;
+    // Phase 33 T9: capture the pipeline's dynamic metadata before
+    // `filter_req` is dropped (a full move of the remaining field —
+    // `filter_req` is already partially moved by the four write-backs).
+    let dynamic_metadata = filter_req.dynamic_metadata;
+    (decode_decision, dynamic_metadata)
+}
+
 async fn serve_connection(
     config: Arc<HCMConfig>,
     mut downstream: TcpStream,
@@ -802,59 +882,18 @@ async fn serve_connection(
         // former drain loop verbatim.
         let consumed = req.bytes_consumed;
         buf.advance(consumed);
-        let request_body: Bytes = if body_len > 0 {
-            let mut body_buf = BytesMut::with_capacity(body_len.min(INITIAL_BODY_BUF_CAP));
-            let from_buf = buf.len().min(body_len);
-            body_buf.extend_from_slice(&buf[..from_buf]);
-            buf.advance(from_buf);
-            let mut remaining = body_len - from_buf;
-            while remaining > 0 {
-                // Read the CL-framed remainder straight into body_buf — no 4 KiB
-                // stack bounce buffer + second memcpy. `take` bounds the read to
-                // the declared body length so a following pipelined request's
-                // bytes are never consumed (identical framing to the old
-                // `chunk[..to_read]` cap). Same pattern as client.rs's response
-                // body read.
-                let mut limited = (&mut downstream).take(remaining as u64);
-                let n =
-                    match tokio::time::timeout(IDLE_READ_TIMEOUT, limited.read_buf(&mut body_buf))
-                        .await
-                    {
-                        Ok(Ok(0)) => return Err(Http1Error::UnexpectedEof),
-                        Ok(Ok(n)) => n,
-                        Ok(Err(source)) => return Err(Http1Error::Io { source }),
-                        Err(_elapsed) => return Ok(()),
-                    };
-                remaining -= n;
-            }
-            body_buf.freeze()
-        } else {
-            Bytes::new()
-        };
+        let request_body: Bytes =
+            match read_request_body(&mut downstream, &mut buf, body_len).await? {
+                Some(body) => body,
+                // Idle-read timeout mid-body → graceful close (the helper's
+                // `Ok(None)` maps to the former in-line `return Ok(())`).
+                None => return Ok(()),
+            };
         req.body = Some(request_body);
 
-        // Boundary conversion: construct FilterRequest from the
-        // filter-visible subset of envoy_http1::Request, invoke
-        // decode_headers, write back. The codec-state fields (`version`,
-        // `bytes_consumed`) stay in `req` and are not surfaced to filters.
-        let mut filter_req = envoy_filter::FilterRequest {
-            method: std::mem::take(&mut req.method),
-            path: std::mem::take(&mut req.path),
-            headers: std::mem::take(&mut req.headers),
-            body: req.body.take(),
-            dynamic_metadata: std::collections::BTreeMap::new(),
-        };
-        let decode_decision = pipeline.decode_headers(&mut filter_req);
-        // Write back the (possibly mutated) fields.
-        req.method = filter_req.method;
-        req.path = filter_req.path;
-        req.headers = filter_req.headers;
-        req.body = filter_req.body;
-        // Phase 33 T9: capture the pipeline's dynamic metadata before
-        // `filter_req` is dropped, so the access-log record build below can
-        // render %DYNAMIC_METADATA% (a full move of the remaining field —
-        // `filter_req` is already partially moved by the four write-backs).
-        let dynamic_metadata = filter_req.dynamic_metadata;
+        // Boundary conversion + decode pass (see `run_decode_filters`);
+        // `dynamic_metadata` feeds the access-log record build below.
+        let (decode_decision, dynamic_metadata) = run_decode_filters(&mut pipeline, &mut req);
 
         // 5. Build response (handles 400 / 404 / 501 / 200 internally) or
         //    decide to proxy upstream. 07.1 Task 6: dispatch through
@@ -912,9 +951,11 @@ async fn serve_connection(
         // URX (UpstreamRetryLimitExceeded) is the FIRST flag NOT 1:1 with a unique
         // %RESPONSE_CODE_DETAILS% — the retry-limit-exceeded path's rcd is the
         // SHARED "via_upstream" (a real upstream 503, already matching Envoy), so
-        // the :1274 derive cannot key on rcd here. Set true ONLY at the retry-loop
+        // the `build_access_log_record` derive cannot key on rcd here. Set true
+        // ONLY at the retry-loop
         // limit-exceeded exit (the same gate as upstream_rq_retry_limit_exceeded);
-        // read by the %RESPONSE_FLAGS% derive below. `Copy` → no borrow/move
+        // read by the %RESPONSE_FLAGS% derive in `build_access_log_record`.
+        // `Copy` → no borrow/move
         // interaction with the rcd String. Stays false on every other path
         // (default → "-"/no-flags).
         let mut retry_limit_exceeded_for_log = false;
@@ -1017,9 +1058,11 @@ async fn serve_connection(
                         // phase 50 (ADR-0107): the request-budget (max_requests)
                         // overflow is the SAME UO/overflow disposition as the pool
                         // arms — same synth_overflow helper, same 503 wire shape.
-                        // Tag the rcd so the :1277 derive maps it => "UO". This arm
+                        // Tag the rcd so the `build_access_log_record` derive maps it
+                        // => "UO". This arm
                         // BYPASSES the retry loop, so it is tagged HERE (not via the
-                        // :1020 discriminator). In-process-backstopped (M50-C: its
+                        // retry loop's outcome:None discriminator).
+                        // In-process-backstopped (M50-C: its
                         // differential witness is deferred — 0058 exercises only the
                         // pool PendingOverflow arm).
                         response_code_details_for_log =
@@ -1113,7 +1156,8 @@ async fn serve_connection(
                                 // for the access-log `%UPSTREAM_HOST%` token (last
                                 // attempt's endpoint wins). Skipped on pick()->None.
                                 // Only consumed under the `!config.access_log.is_empty()`
-                                // guard below (record build at :1401), so skip the
+                                // guard below (the `build_access_log_record` call at
+                                // the dispatch site), so skip the
                                 // per-request `SocketAddr` Display allocation entirely
                                 // when no access-log sink is configured.
                                 if !config.access_log.is_empty() {
@@ -1128,7 +1172,8 @@ async fn serve_connection(
                                 // Envoy emits %RESPONSE_CODE_DETAILS% =
                                 // "upstream_reset_before_response_started{overflow}"
                                 // / %RESPONSE_FLAGS% = "UO" (state-0 recon); the
-                                // derive at :1277 maps the detail => "UO". Covers BOTH
+                                // derive in `build_access_log_record` maps the detail
+                                // => "UO". Covers BOTH
                                 // pool arms (max_connections :503/:508 +
                                 // max_pending_requests :510/:515). All other
                                 // endpoint:Some outcomes keep "via_upstream"
@@ -1285,7 +1330,8 @@ async fn serve_connection(
                         // here — a FIXED reset-reason enum (deterministic, UNLIKE the
                         // connect-failure rcd's OS-derived brace). This OVERRIDES the shared
                         // "via_upstream" the in-loop result-consumption arm wrote for the
-                        // reset path (:1055), and the %RESPONSE_FLAGS% derive below maps it
+                        // reset path, and the %RESPONSE_FLAGS% derive in
+                        // `build_access_log_record` maps it
                         // => "UC" (the phase-50 {overflow} => "UO" precedent). A reset
                         // retried to success has final_outcome = Some(Response) → not set
                         // (replay-safe, ADR-0044). Guarded `!retry_limit_exceeded_for_log`
@@ -1436,100 +1482,26 @@ async fn serve_connection(
             (req_arrival_instant, req_arrival_systime)
         {
             let duration = req_arrival_instant.elapsed();
-            let record = envoy_accesslog::AccessLogRecord {
-                start_time: req_arrival_systime,
-                method: req.method.clone(),
-                path: x_envoy_original_path_or_path(&req).to_owned(),
-                protocol: "HTTP/1.1".to_owned(),
-                response_code: response_status_for_log,
-                // phase 48 (ADR-0105) / 49 (ADR-0106) / 50 (ADR-0107) / 51
-                // (ADR-0108): %RESPONSE_FLAGS%. Phase 51 prepends a boolean branch
-                // for "URX" (UpstreamRetryLimitExceeded) — the FIRST flag NOT
-                // derivable from %RESPONSE_CODE_DETAILS% (the retry-limit-exceeded
-                // path's rcd is the shared "via_upstream"); it keys on the
-                // `retry_limit_exceeded_for_log` boolean set at the retry-loop
-                // limit-exceeded exit (the same gate as
-                // upstream_rq_retry_limit_exceeded). The else-branch is the
-                // unchanged phase-48/49/50 rcd-match:
-                //   route_not_found     → NR (NoRoute)          — the two no-route
-                //                          synth_404 arms (host-miss :1591 +
-                //                          route-miss :1610).
-                //   no_healthy_upstream → UH (NoHealthyUpstream) — the single
-                //                          pick()->None no-healthy synth-503 arm
-                //                          (:1031-1032).
-                //   upstream_reset_before_response_started{overflow}
-                //                       → UO (UpstreamOverflow) — the overflow
-                //                          synth-503: both pool arms (the
-                //                          outcome:None discriminator at :1020) and
-                //                          the request-budget arm (:932).
-                //   upstream_reset_before_response_started{connection_termination}
-                //                       → UC (UpstreamConnectionTermination) — the
-                //                          pure-reset synth-503 (§A, phase 54).
-                // The boolean is set ONLY on the L9 path (rcd = via_upstream → the
-                // else-match's `_ => "-"` arm), so the NR/UH/UO arms are unreachable
-                // with it set → byte-identical to phase 50. Read by-ref here;
-                // `response_code_details_for_log` is moved into the
-                // `response_code_details:` field below (bool is Copy — no interaction).
-                // phase 52 (ADR-0109): the `connect_failure_for_log => "UF"`
-                // (UpstreamConnectionFailure) branch — the SECOND flag NOT
-                // derivable from %RESPONSE_CODE_DETAILS% (the connect-failure rcd
-                // is the shared "via_upstream", which would otherwise fall to the
-                // else-match's `_ => "-"` arm); it keys on the
-                // `connect_failure_for_log` boolean set post-loop when the FINAL
-                // attempt's AttemptOutcome is ConnectFailure. Ordered after URX
-                // (the un-recon'd retry-exhausted-connect-failure combination, if
-                // it ever sets both, renders URX deterministically — §4).
-                // phase 54 (ADR-0111): "UC" (UpstreamConnectionTermination) is now
-                // derived 1:1 from %RESPONSE_CODE_DETAILS% =
-                // "upstream_reset_before_response_started{connection_termination}"
-                // (the rcd-match arm below — the phase-50 {overflow} => "UO"
-                // precedent), set by §A on the pure-reset final-outcome path. The
-                // phase-53 reset-discriminator boolean was retired (the reset rcd
-                // is no longer the shared "via_upstream"). UNLIKE URX/UF, whose
-                // rcds genuinely STAY "via_upstream" (so they remain
-                // boolean-derived).
-                response_flags: if retry_limit_exceeded_for_log {
-                    "URX"
-                } else if connect_failure_for_log {
-                    "UF"
-                } else {
-                    match response_code_details_for_log.as_deref() {
-                        Some("route_not_found") => "NR",
-                        Some("no_healthy_upstream") => "UH",
-                        Some("upstream_reset_before_response_started{overflow}") => "UO",
-                        Some("upstream_reset_before_response_started{connection_termination}") => {
-                            "UC"
-                        }
-                        _ => "-",
-                    }
-                }
-                .to_owned(),
-                bytes_received: request_body_len,
-                bytes_sent: response_body_len,
-                duration,
-                upstream_service_time: extract_upstream_service_time(&outgoing.headers),
-                forwarded_for: access_log_header_value(&req.headers, "x-forwarded-for"),
-                user_agent: access_log_header_value(&req.headers, "user-agent"),
-                request_id: access_log_header_value(&req.headers, "x-request-id"),
-                authority: access_log_header_value(&req.headers, "host"),
-                upstream_host: upstream_host_for_log,
-                // phase 43 (ADR-0100): %UPSTREAM_CLUSTER% — set at the proxy
-                // arm entry (Some on a routed request, None for direct_response
-                // / synth / error paths).
-                upstream_cluster: upstream_cluster_for_log,
-                // phase 41: the matched route's config `name` (empty = unnamed
-                // → None), rendered by %ROUTE_NAME%. `matched_route` (bound at
-                // resolve_route above) is still live here.
-                route_name: matched_route
-                    .as_ref()
-                    .map(|r| r.route().name.as_str())
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_owned),
-                // phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% backing field,
-                // set per response-path (direct_response / via_upstream).
-                response_code_details: response_code_details_for_log,
-                dynamic_metadata: dynamic_metadata.clone(),
-            };
+            let record = build_access_log_record(
+                AccessLogRequestInfo {
+                    req: &req,
+                    start_time: req_arrival_systime,
+                    bytes_received: request_body_len,
+                    matched_route: matched_route.as_ref(),
+                    dynamic_metadata: &dynamic_metadata,
+                },
+                AccessLogResponseInfo {
+                    status: response_status_for_log,
+                    bytes_sent: response_body_len,
+                    duration,
+                    headers: &outgoing.headers,
+                    upstream_host: upstream_host_for_log,
+                    upstream_cluster: upstream_cluster_for_log,
+                    response_code_details: response_code_details_for_log,
+                    retry_limit_exceeded: retry_limit_exceeded_for_log,
+                    connect_failure: connect_failure_for_log,
+                },
+            );
             // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
             // time (BEFORE the per-sink await), per parent SPEC §6 Rule 4 —
             // fire-and-forget emission's failures do NOT deflate the count.
@@ -1554,6 +1526,157 @@ async fn serve_connection(
         }
         // Loop back; the buffer may contain pipelined bytes already, or
         // may need another read.
+    }
+}
+
+/// Request-side inputs to [`build_access_log_record`], grouped so the record
+/// build does not need a many-argument signature. Borrows of (or copies from)
+/// `serve_connection`'s per-request locals.
+struct AccessLogRequestInfo<'a> {
+    /// The (post-decode-filter) request: supplies method / path and the
+    /// request-header-backed operators (%REQ(...)%).
+    req: &'a Request,
+    /// Wall-clock sample at request arrival (`%START_TIME%`).
+    start_time: std::time::SystemTime,
+    /// Request-side wire-byte count (`%BYTES_RECEIVED%` — body only).
+    bytes_received: u64,
+    /// The up-front resolved route (`%ROUTE_NAME%`); `matched_route` (bound
+    /// at resolve_route in `serve_connection`) is still live at the dispatch
+    /// site.
+    matched_route: Option<&'a ResolvedRoute>,
+    /// Pipeline dynamic metadata captured by `run_decode_filters`
+    /// (`%DYNAMIC_METADATA%`).
+    dynamic_metadata:
+        &'a std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+}
+
+/// Response-side inputs to [`build_access_log_record`]: the values derived
+/// from the wire response plus the per-request `*_for_log` locals populated
+/// by the writer arms. The `Option<String>` fields are moved in (each is
+/// consumed exactly once by the record — no extra clones).
+struct AccessLogResponseInfo<'a> {
+    /// `outgoing.status` (`%RESPONSE_CODE%`).
+    status: u16,
+    /// `outgoing.body.len()` (`%BYTES_SENT%`).
+    bytes_sent: u64,
+    /// Request-arrival → dispatch-site elapsed time (`%DURATION%`).
+    duration: std::time::Duration,
+    /// `outgoing.headers`, borrowed for the upstream-service-time extract.
+    headers: &'a [(String, String)],
+    /// `upstream_host_for_log` (`%UPSTREAM_HOST%`).
+    upstream_host: Option<String>,
+    /// `upstream_cluster_for_log` (`%UPSTREAM_CLUSTER%`).
+    upstream_cluster: Option<String>,
+    /// `response_code_details_for_log` (`%RESPONSE_CODE_DETAILS%`, also keys
+    /// part of the `%RESPONSE_FLAGS%` derive).
+    response_code_details: Option<String>,
+    /// `retry_limit_exceeded_for_log` (phase 51, `%RESPONSE_FLAGS%` = "URX").
+    retry_limit_exceeded: bool,
+    /// `connect_failure_for_log` (phase 52, `%RESPONSE_FLAGS%` = "UF").
+    connect_failure: bool,
+}
+
+/// Build the per-request access-log record (extracted verbatim from
+/// `serve_connection`'s factored access-log dispatch site, including the
+/// `%RESPONSE_FLAGS%` derive block).
+fn build_access_log_record(
+    request: AccessLogRequestInfo<'_>,
+    response: AccessLogResponseInfo<'_>,
+) -> envoy_accesslog::AccessLogRecord {
+    envoy_accesslog::AccessLogRecord {
+        start_time: request.start_time,
+        method: request.req.method.clone(),
+        path: x_envoy_original_path_or_path(request.req).to_owned(),
+        protocol: "HTTP/1.1".to_owned(),
+        response_code: response.status,
+        // phase 48 (ADR-0105) / 49 (ADR-0106) / 50 (ADR-0107) / 51
+        // (ADR-0108): %RESPONSE_FLAGS%. Phase 51 prepends a boolean branch
+        // for "URX" (UpstreamRetryLimitExceeded) — the FIRST flag NOT
+        // derivable from %RESPONSE_CODE_DETAILS% (the retry-limit-exceeded
+        // path's rcd is the shared "via_upstream"); it keys on the
+        // `retry_limit_exceeded_for_log` boolean set at the retry-loop
+        // limit-exceeded exit (the same gate as
+        // upstream_rq_retry_limit_exceeded). The else-branch is the
+        // unchanged phase-48/49/50 rcd-match:
+        //   route_not_found     → NR (NoRoute)          — the two no-route
+        //                          synth_404 arms (host-miss + route-miss in
+        //                          `build_response_in`).
+        //   no_healthy_upstream → UH (NoHealthyUpstream) — the single
+        //                          pick()->None no-healthy synth-503 arm
+        //                          (the `endpoint: None` arm in
+        //                          `serve_connection`'s retry loop).
+        //   upstream_reset_before_response_started{overflow}
+        //                       → UO (UpstreamOverflow) — the overflow
+        //                          synth-503: both pool arms (the
+        //                          outcome:None discriminator in
+        //                          `serve_connection`'s retry loop) and
+        //                          the request-budget arm (the
+        //                          `BudgetAcquisition::Rejected` branch).
+        //   upstream_reset_before_response_started{connection_termination}
+        //                       → UC (UpstreamConnectionTermination) — the
+        //                          pure-reset synth-503 (§A, phase 54).
+        // The boolean is set ONLY on the L9 path (rcd = via_upstream → the
+        // else-match's `_ => "-"` arm), so the NR/UH/UO arms are unreachable
+        // with it set → byte-identical to phase 50. Read by-ref here;
+        // `response_code_details_for_log` is moved into the
+        // `response_code_details:` field below (bool is Copy — no interaction).
+        // phase 52 (ADR-0109): the `connect_failure_for_log => "UF"`
+        // (UpstreamConnectionFailure) branch — the SECOND flag NOT
+        // derivable from %RESPONSE_CODE_DETAILS% (the connect-failure rcd
+        // is the shared "via_upstream", which would otherwise fall to the
+        // else-match's `_ => "-"` arm); it keys on the
+        // `connect_failure_for_log` boolean set post-loop when the FINAL
+        // attempt's AttemptOutcome is ConnectFailure. Ordered after URX
+        // (the un-recon'd retry-exhausted-connect-failure combination, if
+        // it ever sets both, renders URX deterministically — §4).
+        // phase 54 (ADR-0111): "UC" (UpstreamConnectionTermination) is now
+        // derived 1:1 from %RESPONSE_CODE_DETAILS% =
+        // "upstream_reset_before_response_started{connection_termination}"
+        // (the rcd-match arm below — the phase-50 {overflow} => "UO"
+        // precedent), set by §A on the pure-reset final-outcome path. The
+        // phase-53 reset-discriminator boolean was retired (the reset rcd
+        // is no longer the shared "via_upstream"). UNLIKE URX/UF, whose
+        // rcds genuinely STAY "via_upstream" (so they remain
+        // boolean-derived).
+        response_flags: if response.retry_limit_exceeded {
+            "URX"
+        } else if response.connect_failure {
+            "UF"
+        } else {
+            match response.response_code_details.as_deref() {
+                Some("route_not_found") => "NR",
+                Some("no_healthy_upstream") => "UH",
+                Some("upstream_reset_before_response_started{overflow}") => "UO",
+                Some("upstream_reset_before_response_started{connection_termination}") => "UC",
+                _ => "-",
+            }
+        }
+        .to_owned(),
+        bytes_received: request.bytes_received,
+        bytes_sent: response.bytes_sent,
+        duration: response.duration,
+        upstream_service_time: extract_upstream_service_time(response.headers),
+        forwarded_for: access_log_header_value(&request.req.headers, "x-forwarded-for"),
+        user_agent: access_log_header_value(&request.req.headers, "user-agent"),
+        request_id: access_log_header_value(&request.req.headers, "x-request-id"),
+        authority: access_log_header_value(&request.req.headers, "host"),
+        upstream_host: response.upstream_host,
+        // phase 43 (ADR-0100): %UPSTREAM_CLUSTER% — set at the proxy
+        // arm entry (Some on a routed request, None for direct_response
+        // / synth / error paths).
+        upstream_cluster: response.upstream_cluster,
+        // phase 41: the matched route's config `name` (empty = unnamed
+        // → None), rendered by %ROUTE_NAME%. `matched_route` (bound at
+        // resolve_route in `serve_connection`) is still live here.
+        route_name: request
+            .matched_route
+            .map(|r| r.route().name.as_str())
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned),
+        // phase 42 (ADR-0099): %RESPONSE_CODE_DETAILS% backing field,
+        // set per response-path (direct_response / via_upstream).
+        response_code_details: response.response_code_details,
+        dynamic_metadata: request.dynamic_metadata.clone(),
     }
 }
 

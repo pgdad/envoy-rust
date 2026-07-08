@@ -189,86 +189,69 @@ impl TokenBucketState {
     /// Lazy fill: at call time, computes how many fill_intervals have
     /// elapsed since `last_fill_instant` and adds
     /// `intervals_elapsed * tokens_per_fill` to the live count (capped at
-    /// `max_tokens`). Then atomically decrements by 1 via `compare_exchange`;
-    /// on contention retries with re-load. Updates `last_fill_instant` only
-    /// when at least one interval has actually elapsed AND a token was
-    /// successfully consumed.
+    /// `max_tokens`). The `last_fill_instant` guard is acquired ONCE and
+    /// held across the whole refill-compute + token compare-and-store, so
+    /// every mutating access is serialized — no read-then-write window
+    /// between computing `new_last_fill` and storing it. `last_fill_instant`
+    /// advances only when at least one interval has actually elapsed AND a
+    /// token was successfully consumed (`new_last_fill == last_fill`
+    /// otherwise, so the store is a no-op).
     pub(crate) fn try_acquire(
         &self,
         max_tokens: u64,
         tokens_per_fill: u64,
         fill_interval: Duration,
     ) -> bool {
-        loop {
-            let current = self.tokens.load(Ordering::Acquire);
-            // Lazy fill: compute the post-refill count.
-            let (available, new_last_fill) = if tokens_per_fill > 0 {
-                let last_fill = *self
-                    .last_fill_instant
-                    .lock()
-                    .expect("TokenBucketState last_fill_instant Mutex poisoned");
-                let elapsed = last_fill.elapsed();
-                let interval_nanos = fill_interval.as_nanos();
-                let elapsed_nanos = elapsed.as_nanos();
-                // Defensive: validator rejects 0 intervals, but the primitive
-                // should still be sound. `checked_div` returns None on 0
-                // divisor; treat as zero intervals elapsed.
-                match elapsed_nanos.checked_div(interval_nanos) {
-                    None | Some(0) => (current, last_fill),
-                    Some(intervals_u128) => {
-                        let intervals = intervals_u128 as u64;
-                        let refilled =
-                            current.saturating_add(intervals.saturating_mul(tokens_per_fill));
-                        let capped = refilled.min(max_tokens);
-                        let advance =
-                            fill_interval.saturating_mul(intervals.min(u32::MAX as u64) as u32);
-                        (capped, last_fill + advance)
-                    }
-                }
-            } else {
-                // tokens_per_fill == 0 → no refill; carry current.
-                (
-                    current,
-                    *self
-                        .last_fill_instant
-                        .lock()
-                        .expect("TokenBucketState last_fill_instant Mutex poisoned"),
-                )
-            };
-            if available == 0 {
-                return false;
-            }
-            let next = available - 1;
-            // Single CAS — if it succeeds, we own the consumed token AND
-            // the refill computation. Note: we CAS against `current` (the
-            // pre-refill load), NOT `available`. If `available > current`
-            // and CAS succeeds, the additional refilled tokens are
-            // implicitly "credited" by jumping straight from `current` to
-            // `next = available - 1`.
-            match self
-                .tokens
-                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    if tokens_per_fill > 0
-                        && new_last_fill
-                            != *self
-                                .last_fill_instant
-                                .lock()
-                                .expect("TokenBucketState last_fill_instant Mutex poisoned")
-                    {
-                        *self
-                            .last_fill_instant
-                            .lock()
-                            .expect("TokenBucketState last_fill_instant Mutex poisoned") =
-                            new_last_fill;
-                    }
-                    return true;
-                }
-                Err(_) => {
-                    // Concurrent acquire — re-load and retry.
-                    continue;
-                }
+        // Single lock acquisition per call; the guard doubles as the mutual
+        // exclusion for the `tokens` update (all writers go through here),
+        // so a plain store suffices — no CAS retry loop.
+        let mut last_fill = self
+            .last_fill_instant
+            .lock()
+            .expect("TokenBucketState last_fill_instant Mutex poisoned");
+        let current = self.tokens.load(Ordering::Acquire);
+        let (available, new_last_fill) = Self::refill(
+            current,
+            *last_fill,
+            max_tokens,
+            tokens_per_fill,
+            fill_interval,
+        );
+        if available == 0 {
+            return false;
+        }
+        self.tokens.store(available - 1, Ordering::Release);
+        *last_fill = new_last_fill;
+        true
+    }
+
+    /// Pure lazy-fill arithmetic: given the live count and the last-fill
+    /// timestamp, return the post-refill count (capped at `max_tokens`) and
+    /// the advanced last-fill timestamp. Whole intervals only — the
+    /// timestamp advances by `intervals * fill_interval`, not to `now`, so
+    /// the fractional remainder keeps accruing. `tokens_per_fill == 0` (and
+    /// a defensive `fill_interval == 0`: validator rejects it, but the
+    /// primitive should still be sound — `checked_div` returns `None` on a
+    /// 0 divisor) → no refill; carry both inputs through unchanged.
+    fn refill(
+        current: u64,
+        last_fill: Instant,
+        max_tokens: u64,
+        tokens_per_fill: u64,
+        fill_interval: Duration,
+    ) -> (u64, Instant) {
+        if tokens_per_fill == 0 {
+            return (current, last_fill);
+        }
+        let elapsed_nanos = last_fill.elapsed().as_nanos();
+        match elapsed_nanos.checked_div(fill_interval.as_nanos()) {
+            None | Some(0) => (current, last_fill),
+            Some(intervals_u128) => {
+                let intervals = intervals_u128 as u64;
+                let refilled = current.saturating_add(intervals.saturating_mul(tokens_per_fill));
+                let capped = refilled.min(max_tokens);
+                let advance = fill_interval.saturating_mul(intervals.min(u32::MAX as u64) as u32);
+                (capped, last_fill + advance)
             }
         }
     }
@@ -327,11 +310,34 @@ mod tests {
         assert!(!state.try_acquire(1, 5, Duration::from_millis(10)));
     }
 
+    #[test]
+    fn refill_arithmetic_across_simulated_elapsed_intervals() {
+        let interval = Duration::from_secs(10);
+        // Simulate 3 full elapsed intervals by backdating last_fill. The
+        // sub-interval time between here and the `refill` call is ~ns —
+        // far below the 10s interval — so exactly 3 intervals are observed.
+        let last_fill = Instant::now()
+            .checked_sub(interval * 3)
+            .expect("monotonic clock is at least 30s old");
+        // 3 intervals × 2 tokens_per_fill on top of 1 live token = 7;
+        // last_fill advances by WHOLE intervals only (3 × 10s), not to now.
+        let (available, new_last_fill) = TokenBucketState::refill(1, last_fill, 10, 2, interval);
+        assert_eq!(available, 7);
+        assert_eq!(new_last_fill, last_fill + interval * 3);
+        // Cap: 9 + 3×2 = 15 → capped at max_tokens = 10.
+        let (capped, _) = TokenBucketState::refill(9, last_fill, 10, 2, interval);
+        assert_eq!(capped, 10);
+        // tokens_per_fill == 0 → no refill; count AND timestamp carried.
+        let (unchanged, ts) = TokenBucketState::refill(5, last_fill, 10, 0, interval);
+        assert_eq!(unchanged, 5);
+        assert_eq!(ts, last_fill);
+    }
+
     /// REQUIRED per phase-09 SPEC §6.3: 8-thread × 10_000-acquire torture
     /// test. Asserts the sum of `true` returns across all tasks equals
     /// `min(N*M, max_tokens)` (initial fill, `tokens_per_fill = 0`).
-    /// Verifies no token-double-count under `Ordering::AcqRel` concurrent
-    /// CAS retry.
+    /// Verifies no token-double-count under concurrent acquires (serialized
+    /// by the single `last_fill_instant` guard held across compare+store).
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn token_bucket_concurrent_acquire_does_not_double_count() {
         const N_TASKS: u64 = 8;

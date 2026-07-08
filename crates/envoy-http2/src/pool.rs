@@ -32,13 +32,17 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Phase-13 hardcoded H2 pool defaults (parent-13 SPEC §6.2 item-ii +
-/// 13.1 default parity).
-const DEFAULT_MAX_CONNECTIONS: u32 = 1024;
+// Phase-13 hardcoded H2 pool defaults (parent-13 SPEC §6.2 item-ii + 13.1
+// default parity): `DEFAULT_MAX_CONNECTIONS` / `DEFAULT_MAX_PENDING_REQUESTS`
+// (both 1024) now live in `envoy_http1::pool` — applied via the shared
+// `register_pool_cluster_stats` helper. The test-only mirror below keeps the
+// pool tests' 1024 default (15 D3 lock-in #4 semantics).
 /// 15 D3: default `max_pending_requests` for clusters without circuit-breakers
 /// config. Matches Envoy's default + the as-today behavior (the reject gate
 /// never fires unless explicitly set to 0). See lock-in #4. Mirrors the H1
-/// pool's `DEFAULT_MAX_PENDING_REQUESTS`.
+/// pool's `DEFAULT_MAX_PENDING_REQUESTS`. Test-only since the production
+/// default moved into `envoy_http1::pool::register_pool_cluster_stats`.
+#[cfg(test)]
 const DEFAULT_MAX_PENDING_REQUESTS: u32 = 1024;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Sweeper tick interval: `idle_timeout / 4` (15s at the default 60s timeout).
@@ -605,83 +609,42 @@ impl H2PoolManager {
             if handle.upstream_protocol() != envoy_cluster::UpstreamProtocol::Http2 {
                 continue;
             }
-            let max_connections = cfg
-                .circuit_breakers
-                .as_ref()
-                .and_then(|cb| cb.thresholds.first())
-                .and_then(|t| t.max_connections)
-                .unwrap_or(DEFAULT_MAX_CONNECTIONS);
-            let max_pending_requests = cfg
-                .circuit_breakers
-                .as_ref()
-                .and_then(|cb| cb.thresholds.first())
-                .and_then(|t| t.max_pending_requests)
-                .unwrap_or(DEFAULT_MAX_PENDING_REQUESTS);
-            // 15 D3/D4 (lock-in #4): register the three circuit-breaker stats
-            // ONLY when circuit_breakers is configured (inert-when-unconfigured).
-            // Unconfigured clusters get `None` — and never reach the gate
-            // (max_pending_requests defaults to 1024) / the guarded increment
-            // sites. `Counter::new()`/`Gauge::new()` are pub(crate), so a
-            // throwaway unregistered handle can't be built here; `Option` is the
-            // documented fallback (mirrors the H1 pool).
-            let rq_pending_overflow = if cfg.circuit_breakers.is_some() {
-                Some(registry.register_counter(&format!(
-                    "cluster.{}.upstream_rq_pending_overflow",
-                    cfg.name
-                ))?)
-            } else {
-                None
-            };
-            let cx_overflow = if cfg.circuit_breakers.is_some() {
-                Some(
-                    registry
-                        .register_counter(&format!("cluster.{}.upstream_cx_overflow", cfg.name))?,
-                )
-            } else {
-                None
-            };
-            let cx_open = if cfg.circuit_breakers.is_some() {
-                Some(registry.register_gauge(&format!(
-                    "cluster.{}.circuit_breakers.default.cx_open",
-                    cfg.name
-                ))?)
-            } else {
-                None
-            };
-            let cx_destroy =
-                registry.register_counter(&format!("cluster.{}.upstream_cx_destroy", cfg.name))?;
-            let cx_http2_total = registry
-                .register_counter(&format!("cluster.{}.upstream_cx_http2_total", cfg.name))?;
-            // Re-register cx_total + cx_active for the shared Arc
-            // (idempotent same-kind contract — envoy-stats returns the
-            // same Arc on second register).
-            let cx_total =
-                registry.register_counter(&format!("cluster.{}.upstream_cx_total", cfg.name))?;
-            let cx_active =
-                registry.register_gauge(&format!("cluster.{}.upstream_cx_active", cfg.name))?;
+            // Thresholds + the 7 order-sensitive stat registrations are
+            // shared with `H1PoolManager::for_bootstrap` — see
+            // `envoy_http1::pool::register_pool_cluster_stats` (15 D3/D4
+            // lock-in #4 semantics preserved there).
+            let stats = envoy_http1::pool::register_pool_cluster_stats(
+                &registry,
+                cfg,
+                "upstream_cx_http2_total",
+            )?;
             // 13.2 A-M2 closure: assert the gauge handle the pool just
             // got from the registry is the SAME Arc the cluster holds.
             // Holds under the single-bootstrap-per-process invariant
             // (the same `registry` was passed to both `from_bootstrap`
             // and `for_bootstrap`).
             debug_assert!(
-                Arc::ptr_eq(&cx_active, handle.cx_active_arc()),
+                Arc::ptr_eq(&stats.cx_active, handle.cx_active_arc()),
                 "H2PoolManager: cx_active Arc mismatch for cluster '{}' — \
                  single-bootstrap-per-process invariant violated",
                 cfg.name
             );
             let pool = H2Pool::new(
                 cfg.name.clone(),
-                max_connections,
-                max_pending_requests,
+                stats.max_connections,
+                stats.max_pending_requests,
+                // KNOWN, documented behavior gap vs H1 (phase 62/ADR-0119
+                // D1): the H2 pool does NOT source
+                // `common_http_protocol_options.idle_timeout` yet — it
+                // hard-codes the 60s default. Preserved as-is.
                 DEFAULT_IDLE_TIMEOUT,
-                cx_total,
-                cx_destroy,
-                cx_http2_total,
-                cx_active,
-                rq_pending_overflow,
-                cx_overflow,
-                cx_open,
+                stats.cx_total,
+                stats.cx_destroy,
+                stats.cx_proto_total,
+                stats.cx_active,
+                stats.rq_pending_overflow,
+                stats.cx_overflow,
+                stats.cx_open,
             );
             sweepers.push(pool.spawn_idle_sweeper(token.clone()));
             pools.insert(cfg.name.clone(), pool);

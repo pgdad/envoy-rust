@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Result;
-use thiserror::Error;
+use helper_common::ArgvError;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -21,49 +21,25 @@ struct Args {
     close_on_accept: bool,
 }
 
-/// argv parse failure modes.
-///
-/// `HelpRequested` and `VersionRequested` are "successful" user intents that
-/// nevertheless short-circuit the parse — `main` translates them to exit 0.
-#[derive(Debug, Error, PartialEq)]
-enum ArgvError {
-    #[error("required flag {0} missing")]
-    MissingFlag(&'static str),
-    #[error("flag expects a value")]
-    MissingValue,
-    #[error("port value must be a u16")]
-    InvalidPort,
-    #[error("trailing arguments after --port <PORT>")]
-    Trailing,
-    #[error("--help")]
-    HelpRequested,
-    #[error("--version")]
-    VersionRequested,
-}
+/// The per-binary phrase in the `ArgvError::Trailing` message.
+const TRAILING_AFTER: &str = "--port <PORT>";
 
-/// Parses argv (excluding argv[0]).
+/// Parses argv (excluding argv[0]). The `--help`/`--version`/`--port`
+/// skeleton lives in `helper_common`; the closure handles this binary's
+/// `--close-on-accept` flag.
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
-    let mut i = 0;
-    let mut port: Option<u16> = None;
     let mut close_on_accept = false;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" => return Err(ArgvError::HelpRequested),
-            "--version" => return Err(ArgvError::VersionRequested),
-            "--close-on-accept" => {
-                close_on_accept = true;
-                i += 1;
-            }
-            "--port" => {
-                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
-                port = Some(v.parse().map_err(|_| ArgvError::InvalidPort)?);
-                i += 2;
-            }
-            _ => return Err(ArgvError::Trailing),
+    let port = helper_common::parse_port_argv(args, TRAILING_AFTER, |args, i| {
+        if args[*i] == "--close-on-accept" {
+            close_on_accept = true;
+            *i += 1;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-    }
+    })?;
     Ok(Args {
-        port: port.ok_or(ArgvError::MissingFlag("--port"))?,
+        port,
         close_on_accept,
     })
 }
@@ -149,15 +125,13 @@ async fn run(port: u16, close_on_accept: bool) -> Result<()> {
     .await
 }
 
+// NOTE: this helper keeps `#[tokio::main]` rather than adopting
+// `helper_common::run_blocking` — its runtime-build-failure path panics
+// (the `#[tokio::main]` expansion) instead of printing to stderr, and that
+// surface is preserved as-is.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    helper_common::init_tracing("info", true);
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_argv(&argv) {
@@ -242,7 +216,9 @@ mod tests {
     #[test]
     fn argv_rejects_trailing_argument() {
         let err = parse_argv(&argv(&["--port", "10042", "--junk"])).expect_err("trailing");
-        assert_eq!(err, ArgvError::Trailing);
+        assert_eq!(err, ArgvError::Trailing(TRAILING_AFTER));
+        // The emitted message is part of the CLI surface; keep it byte-stable.
+        assert_eq!(err.to_string(), "trailing arguments after --port <PORT>");
     }
 
     #[test]

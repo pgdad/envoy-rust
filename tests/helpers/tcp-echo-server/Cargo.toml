@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-thiserror = "2"
+helper-common = { path = "../helper-common" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time", "sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

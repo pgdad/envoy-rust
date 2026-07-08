@@ -240,65 +240,13 @@ fn error_reply(e: &JwtError, realm: &str) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_lc_rs::rsa::{KeySize, PublicKeyComponents};
-    use aws_lc_rs::signature::{KeyPair, RsaKeyPair};
+    use envoy_jwt::test_support::{self, RsaKeyPair, keypair};
     use envoy_stats::StatsRegistry;
 
-    // ---- real-RS256 signing helpers (copied from envoy-jwt verify.rs tests) ----
-
-    /// tiny base64url encoder for tests only
-    fn b64url(b: &[u8]) -> String {
-        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut out = String::new();
-        for chunk in b.chunks(3) {
-            let n = chunk.len();
-            let b0 = chunk[0] as u32;
-            let b1 = if n > 1 { chunk[1] as u32 } else { 0 };
-            let b2 = if n > 2 { chunk[2] as u32 } else { 0 };
-            let triple = (b0 << 16) | (b1 << 8) | b2;
-            out.push(A[((triple >> 18) & 63) as usize] as char);
-            out.push(A[((triple >> 12) & 63) as usize] as char);
-            if n > 1 {
-                out.push(A[((triple >> 6) & 63) as usize] as char);
-            }
-            if n > 2 {
-                out.push(A[(triple & 63) as usize] as char);
-            }
-        }
-        out
-    }
-
-    /// Build a real RSA-2048 keypair, return (keypair, jwks_json).
-    fn keypair() -> (RsaKeyPair, String) {
-        let kp = RsaKeyPair::generate(KeySize::Rsa2048).expect("gen");
-        let pk = kp.public_key();
-        let comps: PublicKeyComponents<Vec<u8>> = PublicKeyComponents::from(pk); // n/e big-endian
-        let jwks = format!(
-            r#"{{"keys":[{{"kty":"RSA","kid":"k1","n":"{}","e":"{}"}}]}}"#,
-            b64url(&comps.n),
-            b64url(&comps.e)
-        );
-        (kp, jwks)
-    }
-
-    fn sign(kp: &RsaKeyPair, header_payload: &str) -> String {
-        let mut sig = vec![0u8; kp.public_modulus_len()];
-        kp.sign(
-            &aws_lc_rs::signature::RSA_PKCS1_SHA256,
-            &aws_lc_rs::rand::SystemRandom::new(),
-            header_payload.as_bytes(),
-            &mut sig,
-        )
-        .expect("sign");
-        b64url(&sig)
-    }
-
+    // Real-RS256 signing helpers live in envoy_jwt::test_support (behind its
+    // `test-util` feature); this shim just fixes alg to RS256.
     fn make_token(kp: &RsaKeyPair, payload: &str) -> String {
-        let h = b64url(br#"{"alg":"RS256","kid":"k1","typ":"JWT"}"#);
-        let p = b64url(payload.as_bytes());
-        let hp = format!("{h}.{p}");
-        let sig = sign(kp, &hp);
-        format!("{hp}.{sig}")
+        test_support::make_token(kp, "RS256", payload)
     }
 
     const ISS: &str = "testing@secure.istio.io";

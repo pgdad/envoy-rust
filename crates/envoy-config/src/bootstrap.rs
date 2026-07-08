@@ -1472,45 +1472,87 @@ pub enum ValueMatcher {
     PresentMatch(bool),
 }
 
-impl<'de> serde::Deserialize<'de> for ValueMatcher {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{Error, MapAccess, Visitor};
-        use std::fmt;
-
-        const KEYS: &[&str] = &["string_match", "present_match"];
-
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = ValueMatcher;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "a ValueMatcher map with exactly one of {KEYS:?} as key")
-            }
-            fn visit_map<M>(self, mut map: M) -> Result<ValueMatcher, M::Error>
+/// Generates the hand-rolled "map with exactly one key" `Deserialize` impl
+/// shared by the externally-tagged oneof enums below (`ValueMatcher`,
+/// `Permission`, `Principal`). `serde_yaml` 0.9 cannot deserialize
+/// externally-tagged enums from plain YAML maps (`{any: true}` — it expects
+/// YAML `!Tag` syntax), so each enum visits a map, requires exactly one key,
+/// and dispatches on it (the 04.2 `HeaderMatcher` visitor template).
+///
+/// Arguments:
+///   - the enum type;
+///   - the type-name literal spliced verbatim into the two cardinality error
+///     strings (`"<name>: expected one map key, got none"` /
+///     `"<name>: expected exactly one map key, got more"`);
+///   - the WHOLE `expecting` format string as a literal (`{KEYS:?}` names the
+///     generated key slice, bound as an explicit format argument — macro
+///     hygiene keeps a call-site literal from implicitly capturing it);
+///   - the map-binding identifier the construction expressions use (hygiene
+///     again: a binding introduced inside the macro body would be invisible
+///     to call-site expressions);
+///   - the `"key" => construction-expr` dispatch arms; the keys, in order,
+///     also form the `KEYS` slice reported by `unknown_field`/`expecting`.
+///
+/// Every emitted error string is byte-identical to the pre-macro hand-rolled
+/// impls (tests assert on these strings).
+macro_rules! impl_single_key_oneof {
+    (
+        $ty:ident,
+        $name:literal,
+        $expecting:literal,
+        $map:ident: [ $($key:literal => $ctor:expr),+ $(,)? ]
+    ) => {
+        impl<'de> serde::Deserialize<'de> for $ty {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                M: MapAccess<'de>,
+                D: serde::Deserializer<'de>,
             {
-                let key: String = map.next_key()?.ok_or_else(|| {
-                    M::Error::custom("ValueMatcher: expected one map key, got none")
-                })?;
-                let value = match key.as_str() {
-                    "string_match" => ValueMatcher::StringMatch(map.next_value::<StringMatcher>()?),
-                    "present_match" => ValueMatcher::PresentMatch(map.next_value::<bool>()?),
-                    other => return Err(M::Error::unknown_field(other, KEYS)),
-                };
-                if map.next_key::<String>()?.is_some() {
-                    return Err(M::Error::custom(
-                        "ValueMatcher: expected exactly one map key, got more",
-                    ));
+                use serde::de::{Error, MapAccess, Visitor};
+                use std::fmt;
+
+                const KEYS: &[&str] = &[$($key),+];
+
+                struct V;
+                impl<'de> Visitor<'de> for V {
+                    type Value = $ty;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        write!(f, $expecting, KEYS = KEYS)
+                    }
+                    fn visit_map<M>(self, mut $map: M) -> Result<$ty, M::Error>
+                    where
+                        M: MapAccess<'de>,
+                    {
+                        let key: String = $map.next_key()?.ok_or_else(|| {
+                            M::Error::custom(concat!($name, ": expected one map key, got none"))
+                        })?;
+                        let value = match key.as_str() {
+                            $($key => $ctor,)+
+                            other => return Err(M::Error::unknown_field(other, KEYS)),
+                        };
+                        if $map.next_key::<String>()?.is_some() {
+                            return Err(M::Error::custom(concat!(
+                                $name,
+                                ": expected exactly one map key, got more",
+                            )));
+                        }
+                        Ok(value)
+                    }
                 }
-                Ok(value)
+                deserializer.deserialize_map(V)
             }
         }
-        deserializer.deserialize_map(V)
-    }
+    };
 }
+
+impl_single_key_oneof!(
+    ValueMatcher,
+    "ValueMatcher",
+    "a ValueMatcher map with exactly one of {KEYS:?} as key",
+    map: [
+        "string_match" => ValueMatcher::StringMatch(map.next_value::<StringMatcher>()?),
+        "present_match" => ValueMatcher::PresentMatch(map.next_value::<bool>()?),
+    ]
+);
 
 /// RBAC Permission. Only header-based + combinators land at phase 10;
 /// `url_path`, `destination_ip`, `destination_port[_range]`, `metadata`,
@@ -1542,61 +1584,20 @@ pub enum Permission {
     UrlPath(PathMatcher),
 }
 
-impl<'de> serde::Deserialize<'de> for Permission {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{Error, MapAccess, Visitor};
-        use std::fmt;
-
-        const KEYS: &[&str] = &[
-            "any",
-            "header",
-            "and_rules",
-            "or_rules",
-            "not_rule",
-            "metadata",
-            "url_path",
-        ];
-
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Permission;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(
-                    f,
-                    "an RBAC Permission map with exactly one of {KEYS:?} as key"
-                )
-            }
-            fn visit_map<M>(self, mut map: M) -> Result<Permission, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let key: String = map.next_key()?.ok_or_else(|| {
-                    M::Error::custom("Permission: expected one map key, got none")
-                })?;
-                let value = match key.as_str() {
-                    "any" => Permission::Any(map.next_value::<bool>()?),
-                    "header" => Permission::Header(map.next_value::<HeaderMatcher>()?),
-                    "and_rules" => Permission::AndRules(map.next_value::<PermissionSet>()?),
-                    "or_rules" => Permission::OrRules(map.next_value::<PermissionSet>()?),
-                    "not_rule" => Permission::NotRule(Box::new(map.next_value::<Permission>()?)),
-                    "metadata" => Permission::Metadata(map.next_value::<MetadataMatcher>()?),
-                    "url_path" => Permission::UrlPath(map.next_value::<PathMatcher>()?),
-                    other => return Err(M::Error::unknown_field(other, KEYS)),
-                };
-                if map.next_key::<String>()?.is_some() {
-                    return Err(M::Error::custom(
-                        "Permission: expected exactly one map key, got more",
-                    ));
-                }
-                Ok(value)
-            }
-        }
-        deserializer.deserialize_map(V)
-    }
-}
+impl_single_key_oneof!(
+    Permission,
+    "Permission",
+    "an RBAC Permission map with exactly one of {KEYS:?} as key",
+    map: [
+        "any" => Permission::Any(map.next_value::<bool>()?),
+        "header" => Permission::Header(map.next_value::<HeaderMatcher>()?),
+        "and_rules" => Permission::AndRules(map.next_value::<PermissionSet>()?),
+        "or_rules" => Permission::OrRules(map.next_value::<PermissionSet>()?),
+        "not_rule" => Permission::NotRule(Box::new(map.next_value::<Permission>()?)),
+        "metadata" => Permission::Metadata(map.next_value::<MetadataMatcher>()?),
+        "url_path" => Permission::UrlPath(map.next_value::<PathMatcher>()?),
+    ]
+);
 
 /// Wrapper for `Permission::AndRules` / `Permission::OrRules` sub-rule lists.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1631,55 +1632,20 @@ pub enum Principal {
     UrlPath(PathMatcher),
 }
 
-impl<'de> serde::Deserialize<'de> for Principal {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{Error, MapAccess, Visitor};
-        use std::fmt;
-
-        const KEYS: &[&str] = &[
-            "any", "header", "and_ids", "or_ids", "not_id", "metadata", "url_path",
-        ];
-
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Principal;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(
-                    f,
-                    "an RBAC Principal map with exactly one of {KEYS:?} as key"
-                )
-            }
-            fn visit_map<M>(self, mut map: M) -> Result<Principal, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let key: String = map
-                    .next_key()?
-                    .ok_or_else(|| M::Error::custom("Principal: expected one map key, got none"))?;
-                let value = match key.as_str() {
-                    "any" => Principal::Any(map.next_value::<bool>()?),
-                    "header" => Principal::Header(map.next_value::<HeaderMatcher>()?),
-                    "and_ids" => Principal::AndIds(map.next_value::<PrincipalSet>()?),
-                    "or_ids" => Principal::OrIds(map.next_value::<PrincipalSet>()?),
-                    "not_id" => Principal::NotId(Box::new(map.next_value::<Principal>()?)),
-                    "metadata" => Principal::Metadata(map.next_value::<MetadataMatcher>()?),
-                    "url_path" => Principal::UrlPath(map.next_value::<PathMatcher>()?),
-                    other => return Err(M::Error::unknown_field(other, KEYS)),
-                };
-                if map.next_key::<String>()?.is_some() {
-                    return Err(M::Error::custom(
-                        "Principal: expected exactly one map key, got more",
-                    ));
-                }
-                Ok(value)
-            }
-        }
-        deserializer.deserialize_map(V)
-    }
-}
+impl_single_key_oneof!(
+    Principal,
+    "Principal",
+    "an RBAC Principal map with exactly one of {KEYS:?} as key",
+    map: [
+        "any" => Principal::Any(map.next_value::<bool>()?),
+        "header" => Principal::Header(map.next_value::<HeaderMatcher>()?),
+        "and_ids" => Principal::AndIds(map.next_value::<PrincipalSet>()?),
+        "or_ids" => Principal::OrIds(map.next_value::<PrincipalSet>()?),
+        "not_id" => Principal::NotId(Box::new(map.next_value::<Principal>()?)),
+        "metadata" => Principal::Metadata(map.next_value::<MetadataMatcher>()?),
+        "url_path" => Principal::UrlPath(map.next_value::<PathMatcher>()?),
+    ]
+);
 
 /// Wrapper for `Principal::AndIds` / `Principal::OrIds` sub-id lists. Field
 /// name is `ids` (not `rules`) per upstream proto.
@@ -4029,113 +3995,109 @@ fn validate_header_to_metadata_config(
     Ok(())
 }
 
-fn validate_permission_tree(
-    perm: &crate::Permission,
-    listener_name: &str,
-    policy_name: &str,
-    path: &str,
-    depth: u32,
-) -> Result<(), crate::ConfigError> {
-    if depth > RBAC_TREE_MAX_DEPTH {
-        return Err(crate::ConfigError::RbacTreeTooDeep {
-            listener: listener_name.to_string(),
-            policy_name: policy_name.to_string(),
-            depth,
-        });
-    }
-    match perm {
-        crate::Permission::Any(_) => Ok(()),
-        crate::Permission::Header(_) => Ok(()),
-        crate::Permission::AndRules(set) | crate::Permission::OrRules(set) => {
-            if set.rules.is_empty() {
-                return Err(crate::ConfigError::EmptyRbacPermissionSet {
+/// Generates the recursive RBAC condition-tree validator; `Permission` and
+/// `Principal` are structurally symmetric, differing only in the enum type
+/// (with its combinator variant names), the set-field name (`rules` vs `ids`),
+/// the path-segment format strings, and the empty-set error variant — all
+/// passed as arguments. Path-segment literals are passed WHOLE (with explicit
+/// `path =`/`idx =` bindings, since macro hygiene keeps a call-site literal
+/// from implicitly capturing macro-body bindings) so the emitted path strings
+/// stay byte-identical to the pre-macro hand-written pair.
+///
+/// Per-arm semantics (shared by both expansions):
+///   - depth > `RBAC_TREE_MAX_DEPTH` → `RbacTreeTooDeep` (phase-10 SPEC §3 D2);
+///   - `Any`/`Header` are leaves with no semantic check beyond serde;
+///   - empty and/or set → the per-type empty-set error;
+///   - phase 35: real `metadata` matcher validation (non-empty filter +
+///     single-segment path) — `RbacMetadataMatcherInvalid` (a leaf, no recursion);
+///   - phase 37: `url_path` is a leaf (mirroring the `Header(_)` arm). The inner
+///     StringMatcher's SafeRegex compiles at RBAC lowering (`lower_permission`),
+///     not here — this path is an immutable borrow (ADR-0090 §D; the
+///     validate_metadata_matcher note below).
+macro_rules! define_rbac_tree_validator {
+    (
+        $fn_name:ident,
+        $node:ident,
+        $and:ident | $or:ident,
+        $not:ident,
+        $set_field:ident,
+        $set_seg:literal,
+        $not_seg:literal,
+        $empty_err:ident
+    ) => {
+        fn $fn_name(
+            node: &crate::$node,
+            listener_name: &str,
+            policy_name: &str,
+            path: &str,
+            depth: u32,
+        ) -> Result<(), crate::ConfigError> {
+            if depth > RBAC_TREE_MAX_DEPTH {
+                return Err(crate::ConfigError::RbacTreeTooDeep {
                     listener: listener_name.to_string(),
                     policy_name: policy_name.to_string(),
-                    path: path.to_string(),
+                    depth,
                 });
             }
-            for (idx, child) in set.rules.iter().enumerate() {
-                validate_permission_tree(
+            match node {
+                crate::$node::Any(_) => Ok(()),
+                crate::$node::Header(_) => Ok(()),
+                crate::$node::$and(set) | crate::$node::$or(set) => {
+                    if set.$set_field.is_empty() {
+                        return Err(crate::ConfigError::$empty_err {
+                            listener: listener_name.to_string(),
+                            policy_name: policy_name.to_string(),
+                            path: path.to_string(),
+                        });
+                    }
+                    for (idx, child) in set.$set_field.iter().enumerate() {
+                        $fn_name(
+                            child,
+                            listener_name,
+                            policy_name,
+                            &format!($set_seg, path = path, idx = idx),
+                            depth + 1,
+                        )?;
+                    }
+                    Ok(())
+                }
+                crate::$node::$not(child) => $fn_name(
                     child,
                     listener_name,
                     policy_name,
-                    &format!("{path}.rules[{idx}]"),
+                    &format!($not_seg, path = path),
                     depth + 1,
-                )?;
+                ),
+                crate::$node::Metadata(m) => {
+                    validate_metadata_matcher(m, listener_name, policy_name, path)
+                }
+                crate::$node::UrlPath(_) => Ok(()),
             }
-            Ok(())
         }
-        crate::Permission::NotRule(child) => validate_permission_tree(
-            child,
-            listener_name,
-            policy_name,
-            &format!("{path}.not_rule"),
-            depth + 1,
-        ),
-        // phase 35: real `metadata` matcher validation (non-empty filter +
-        // single-segment path) — `RbacMetadataMatcherInvalid` (a leaf, no recursion).
-        crate::Permission::Metadata(m) => {
-            validate_metadata_matcher(m, listener_name, policy_name, path)
-        }
-        // phase 37: `url_path` is a leaf (no semantic check beyond serde, mirroring
-        // the `Header(_)` arm). The inner StringMatcher's SafeRegex compiles at RBAC
-        // lowering (`lower_permission`), not here — this path is an immutable borrow
-        // (ADR-0090 §D; the validate_metadata_matcher note above).
-        crate::Permission::UrlPath(_) => Ok(()),
-    }
+    };
 }
 
-fn validate_principal_tree(
-    prin: &crate::Principal,
-    listener_name: &str,
-    policy_name: &str,
-    path: &str,
-    depth: u32,
-) -> Result<(), crate::ConfigError> {
-    if depth > RBAC_TREE_MAX_DEPTH {
-        return Err(crate::ConfigError::RbacTreeTooDeep {
-            listener: listener_name.to_string(),
-            policy_name: policy_name.to_string(),
-            depth,
-        });
-    }
-    match prin {
-        crate::Principal::Any(_) => Ok(()),
-        crate::Principal::Header(_) => Ok(()),
-        crate::Principal::AndIds(set) | crate::Principal::OrIds(set) => {
-            if set.ids.is_empty() {
-                return Err(crate::ConfigError::EmptyRbacPrincipalSet {
-                    listener: listener_name.to_string(),
-                    policy_name: policy_name.to_string(),
-                    path: path.to_string(),
-                });
-            }
-            for (idx, child) in set.ids.iter().enumerate() {
-                validate_principal_tree(
-                    child,
-                    listener_name,
-                    policy_name,
-                    &format!("{path}.ids[{idx}]"),
-                    depth + 1,
-                )?;
-            }
-            Ok(())
-        }
-        crate::Principal::NotId(child) => validate_principal_tree(
-            child,
-            listener_name,
-            policy_name,
-            &format!("{path}.not_id"),
-            depth + 1,
-        ),
-        // phase 35: see `validate_permission_tree` — symmetric metadata check.
-        crate::Principal::Metadata(m) => {
-            validate_metadata_matcher(m, listener_name, policy_name, path)
-        }
-        // phase 37: see `validate_permission_tree` — symmetric `url_path` leaf.
-        crate::Principal::UrlPath(_) => Ok(()),
-    }
-}
+define_rbac_tree_validator!(
+    validate_permission_tree,
+    Permission,
+    AndRules | OrRules,
+    NotRule,
+    rules,
+    "{path}.rules[{idx}]",
+    "{path}.not_rule",
+    EmptyRbacPermissionSet
+);
+
+define_rbac_tree_validator!(
+    validate_principal_tree,
+    Principal,
+    AndIds | OrIds,
+    NotId,
+    ids,
+    "{path}.ids[{idx}]",
+    "{path}.not_id",
+    EmptyRbacPrincipalSet
+);
 
 /// Phase 35: validate a single RBAC `metadata` matcher (shared by the Permission
 /// and Principal tree validators). Two boot-fatal rules (ADR-0086 §A4/A5):

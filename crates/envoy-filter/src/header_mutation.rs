@@ -89,14 +89,13 @@ fn map_entry(
         envoy_config::AppendAction::OverwriteIfExistsOrAdd => RuntimeAppendAction::Overwrite,
         unsupported @ (envoy_config::AppendAction::AddIfAbsent
         | envoy_config::AppendAction::OverwriteIfExists) => {
-            // `position: 0` is a placeholder — `map_entry` runs inside
-            // `build_from_config` and has no access to the filter-chain
-            // position. The operator-facing position is carried by the
-            // `envoy-config` validator's typed errors (the primary catch);
+            // The operator-facing (position-carrying) diagnostic is the
+            // `envoy-config` validator's typed error (the primary catch);
             // this is the defense-in-depth re-check at the framework boundary.
-            return Err(FilterError::UnsupportedFilterType {
-                position: 0,
-                name: format!("AppendAction::{unsupported:?}"),
+            return Err(FilterError::InvalidConfig {
+                message: format!(
+                    "header_mutation: unsupported append_action AppendAction::{unsupported:?}"
+                ),
             });
         }
     };
@@ -224,7 +223,7 @@ mod tests {
             vec![],
         ))
         .unwrap_err();
-        assert!(matches!(err, FilterError::UnsupportedFilterType { .. }));
+        assert!(matches!(err, FilterError::InvalidConfig { .. }));
     }
 
     #[test]

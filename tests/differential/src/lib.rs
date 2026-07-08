@@ -2788,6 +2788,32 @@ fn decode_chunked(wire: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Shared per-fixture state threaded from `run_fixture`'s setup phase into
+/// the per-`Driver` dispatch-arm fns (`run_*_arm` below). Carries only
+/// borrows and `Copy` scalars; the `upstream`/`subject` proxy handles are
+/// passed to each arm by value instead — every arm consumes them
+/// (`subject.shutdown(..)` + `drop(upstream)` at its tail).
+#[derive(Clone, Copy)]
+struct FixtureCtx<'a> {
+    fixture_dir: &'a Path,
+    expectations: &'a Expectations,
+    upstream_addr: SocketAddr,
+    subject_addr: SocketAddr,
+    /// 06.1 D6.a: reserved host admin port for the subject (only `Some` for
+    /// the AdminScrape / *KeepAlive fixtures whose templates reference
+    /// `{{ADMIN_PORT}}`).
+    admin_host_port: Option<u16>,
+    /// Accept-ready wait budget (shared with the admin-listener waits).
+    budget: Duration,
+    tls_pki: &'a Option<crate::tls::TlsTestPki>,
+    upstream_kvs_refs: &'a [(&'a str, &'a str)],
+    subject_kvs_refs: &'a [(&'a str, &'a str)],
+    upstream_rds_path: &'a Option<PathBuf>,
+    subject_rds_path: &'a Path,
+    upstream_eds_path: &'a Option<PathBuf>,
+    subject_eds_path: &'a Path,
+}
+
 /// End-to-end run of one fixture. Panics-on-failure paths unwind through Drop
 /// guards so the container and envoy-rust subprocess are cleaned up even on
 /// assertion failure.
@@ -3825,106 +3851,41 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         wait_clusters_warm(format!("127.0.0.1:{p}").parse()?, Duration::from_secs(10)).await;
     }
 
+    // Shared borrows + `Copy` scalars threaded into the per-driver arm fns;
+    // `upstream`/`subject` are moved into the selected arm by value.
+    let ctx = FixtureCtx {
+        fixture_dir,
+        expectations: &expectations,
+        upstream_addr,
+        subject_addr,
+        admin_host_port,
+        budget,
+        tls_pki: &tls_pki,
+        upstream_kvs_refs: &upstream_kvs_refs,
+        subject_kvs_refs: &subject_kvs_refs,
+        upstream_rds_path: &upstream_rds_path,
+        subject_rds_path: &subject_rds_path,
+        upstream_eds_path: &upstream_eds_path,
+        subject_eds_path: &subject_eds_path,
+    };
+
     match &expectations.driver {
         Driver::TcpEcho => {
-            let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
-                .context("reading payload.bin")?;
-            let upstream_out = drive_tcp(upstream_addr, &payload)
-                .await
-                .context("upstream envoy drive")?;
-            let subject_out = drive_tcp(subject_addr, &payload)
-                .await
-                .context("envoy-rust drive")?;
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-            assert_equivalence(&expectations, None, None, &upstream_out, &subject_out)?;
+            run_tcp_echo_arm(&ctx, upstream, subject).await?;
         }
         Driver::HttpGet { path, host } => {
-            let upstream_resp = drive_http_get(upstream_addr, path, host)
-                .await
-                .context("upstream envoy http get")?;
-            let subject_resp = drive_http_get(subject_addr, path, host)
-                .await
-                .context("envoy-rust http get")?;
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-            assert_equivalence(
-                &expectations,
-                Some(upstream_resp.status),
-                Some(subject_resp.status),
-                &upstream_resp.body,
-                &subject_resp.body,
-            )?;
+            run_http_get_arm(&ctx, upstream, subject, path, host).await?;
         }
         // (f) Real TLS dispatch arm.
         Driver::TlsTcp { sni, expected_cn } => {
-            let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
-                .context("reading payload.bin")?;
-            // Build a RootCertStore from the test CA. Both sides trust the
-            // same CA — both proxies present a leaf signed by it.
-            let pki = tls_pki
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!(
-                    "Driver::TlsTcp requires a TLS-shaped fixture (template did not reference any *_PATH key)"
-                ))?;
-            let ca_bytes = std::fs::read(&pki.ca_pem_path).context("read ca.pem")?;
-            let mut ca_slice = ca_bytes.as_slice();
-            let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut ca_slice)
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("parse ca.pem certs")?;
-            let mut roots = rustls::RootCertStore::empty();
-            for c in ca_certs {
-                roots.add(c).context("RootCertStore::add")?;
-            }
-
-            let upstream_out = drive_tls(
-                upstream_addr,
-                &payload,
-                sni,
-                roots.clone(),
-                expected_cn.as_deref(),
-            )
-            .await
-            .context("upstream envoy tls drive")?;
-            let subject_out = drive_tls(subject_addr, &payload, sni, roots, expected_cn.as_deref())
-                .await
-                .context("envoy-rust tls drive")?;
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-            assert_equivalence(&expectations, None, None, &upstream_out, &subject_out)?;
+            run_tls_tcp_arm(&ctx, upstream, subject, sni, expected_cn).await?;
         }
         // 03.2 Task 8: per-SNI probe list. Equivalence is enforced inside
         // `drive_tls_probes` per probe (byte-equality + per-probe expected_cn);
         // both sides succeeding ⇒ equivalent cert selection per SNI without a
         // final `assert_equivalence` call.
         Driver::TlsTcpProbeList { probes } => {
-            let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
-                .context("reading payload.bin")?;
-            let pki = tls_pki
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!(
-                    "Driver::TlsTcpProbeList requires a TLS-shaped fixture (template did not reference any *_PATH key)"
-                ))?;
-            let ca_bytes = std::fs::read(&pki.ca_pem_path).context("read ca.pem")?;
-            let mut ca_slice = ca_bytes.as_slice();
-            let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-                rustls_pemfile::certs(&mut ca_slice)
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("parse ca.pem certs")?;
-            let mut roots = rustls::RootCertStore::empty();
-            for c in ca_certs {
-                roots.add(c).context("RootCertStore::add")?;
-            }
-
-            drive_tls_probes(upstream_addr, &payload, probes, roots.clone())
-                .await
-                .context("upstream envoy tls probes")?;
-            drive_tls_probes(subject_addr, &payload, probes, roots)
-                .await
-                .context("envoy-rust tls probes")?;
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
+            run_tls_tcp_probe_list_arm(&ctx, upstream, subject, probes).await?;
         }
         // 04.1 Task 14: real dispatch. Drive both proxies, then apply
         // equivalence rules (envoy ↔ envoy-rust) plus per-driver `expected_*`
@@ -3941,82 +3902,18 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_body,
             expected_headers,
         } => {
-            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[], None)
-                .await
-                .context("upstream envoy http1 drive")?;
-            let subject_resp = drive_http1(subject_addr, method, path, host, &[], None)
-                .await
-                .context("envoy-rust http1 drive")?;
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-
-            // Status: envoy ↔ envoy-rust under `response_status: exact`.
-            if matches!(
-                expectations.equivalence.response_status,
-                Some(StatusRule::Exact)
-            ) && upstream_resp.status != subject_resp.status
-            {
-                bail!(
-                    "response status mismatch under `response_status: exact`\n  \
-                     upstream: {}\n  subject:  {}",
-                    upstream_resp.status,
-                    subject_resp.status,
-                );
-            }
-            // Per-driver `expected_status`: each side independently equals it.
-            if let Some(es) = expected_status {
-                if upstream_resp.status != *es {
-                    bail!(
-                        "upstream status {} != expected {}",
-                        upstream_resp.status,
-                        es,
-                    );
-                }
-                if subject_resp.status != *es {
-                    bail!("subject status {} != expected {}", subject_resp.status, es,);
-                }
-            }
-
-            // Body: envoy ↔ envoy-rust per `equivalence.response_body` rule.
-            // 06.1 Task 13 carryforward: route through `assert_body_rule` so
-            // BodyRule variants (ByteExact / PrometheusExposition) dispatch
-            // through the single centralized helper instead of inline
-            // `matches!`. Behaviorally equivalent for ByteExact; admits
-            // PrometheusExposition without re-touching the arm.
-            if let Some(rule) = &expectations.equivalence.response_body {
-                assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
-            }
-            // Per-driver `expected_body`: each side independently equals bytes.
-            if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
-                let expected = body.as_bytes();
-                if upstream_resp.body != expected {
-                    bail!(
-                        "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
-                        upstream_resp.body,
-                        expected,
-                    );
-                }
-                if subject_resp.body != expected {
-                    bail!(
-                        "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
-                        subject_resp.body,
-                        expected,
-                    );
-                }
-            }
-
-            // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
-            if matches!(
+            run_http1_arm(
+                &ctx,
+                upstream,
+                subject,
+                method,
+                path,
+                host,
+                expected_status,
+                expected_body,
                 expected_headers,
-                Some(Http1HeaderRule::SetEqualModuloAllowList)
-            ) {
-                diff_headers(
-                    &upstream_resp.headers,
-                    &subject_resp.headers,
-                    HEADER_ALLOW_LIST,
-                )
-                .context("diff_headers (set_equal_modulo_allow_list)")?;
-            }
+            )
+            .await?;
         }
         // 12.2 NEW: Driver::Http1AfterSettle — sleep `settle_ms` past
         // active-HC convergence, then drive ONE Http1 request via the same
@@ -4035,79 +3932,19 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_body,
             expected_headers,
         } => {
-            tracing::debug!(
+            run_http1_after_settle_arm(
+                &ctx,
+                upstream,
+                subject,
                 settle_ms,
-                "Driver::Http1AfterSettle: sleeping for active-HC settle"
-            );
-            tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
-
-            let upstream_resp = drive_http1(upstream_addr, method, path, host, &[], None)
-                .await
-                .context("upstream envoy http1 drive (after settle)")?;
-            let subject_resp = drive_http1(subject_addr, method, path, host, &[], None)
-                .await
-                .context("envoy-rust http1 drive (after settle)")?;
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-
-            // Status: envoy ↔ envoy-rust under `response_status: exact`.
-            if matches!(
-                expectations.equivalence.response_status,
-                Some(StatusRule::Exact)
-            ) && upstream_resp.status != subject_resp.status
-            {
-                bail!(
-                    "response status mismatch under `response_status: exact`\n  \
-                     upstream: {}\n  subject:  {}",
-                    upstream_resp.status,
-                    subject_resp.status,
-                );
-            }
-            if let Some(es) = expected_status {
-                if upstream_resp.status != *es {
-                    bail!(
-                        "upstream status {} != expected {}",
-                        upstream_resp.status,
-                        es,
-                    );
-                }
-                if subject_resp.status != *es {
-                    bail!("subject status {} != expected {}", subject_resp.status, es,);
-                }
-            }
-
-            if let Some(rule) = &expectations.equivalence.response_body {
-                assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
-            }
-            if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
-                let expected = body.as_bytes();
-                if upstream_resp.body != expected {
-                    bail!(
-                        "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
-                        upstream_resp.body,
-                        expected,
-                    );
-                }
-                if subject_resp.body != expected {
-                    bail!(
-                        "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
-                        subject_resp.body,
-                        expected,
-                    );
-                }
-            }
-
-            if matches!(
+                method,
+                path,
+                host,
+                expected_status,
+                expected_body,
                 expected_headers,
-                Some(Http1HeaderRule::SetEqualModuloAllowList)
-            ) {
-                diff_headers(
-                    &upstream_resp.headers,
-                    &subject_resp.headers,
-                    HEADER_ALLOW_LIST,
-                )
-                .context("diff_headers (set_equal_modulo_allow_list)")?;
-            }
+            )
+            .await?;
         }
         // 13.1 D10 / Task 7: drive N sequential HTTP/1.1 requests over a
         // SINGLE downstream keep-alive conn against BOTH proxies in turn,
@@ -4136,171 +3973,16 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_stats,
             admin_scrapes,
         } => {
-            use tokio::io::AsyncWriteExt;
-            let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Driver::Http1KeepAlive requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
-                )
-            })?;
-            let subject_admin_port = admin_host_port.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Driver::Http1KeepAlive requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
-                )
-            })?;
-            let upstream_admin_addr: SocketAddr =
-                format!("127.0.0.1:{upstream_admin_port}").parse()?;
-            let subject_admin_addr: SocketAddr =
-                format!("127.0.0.1:{subject_admin_port}").parse()?;
-            wait_accept_ready(upstream_admin_addr, budget)
-                .await
-                .context("upstream admin listener never became accept-ready")?;
-            wait_accept_ready(subject_admin_addr, budget)
-                .await
-                .context("envoy-rust admin listener never became accept-ready")?;
-
-            // For each proxy, open ONE TCP keep-alive conn and issue the
-            // full `requests` sequence on it. Drain each response's
-            // Content-Length body before issuing the next so the stream
-            // starts at a clean boundary; assert the per-request status
-            // matches `expected_status` so a hung response or class
-            // mismatch surfaces at the request boundary (not only at the
-            // post-settle scrape).
-            for (side_name, proxy_addr) in &[("upstream", upstream_addr), ("subject", subject_addr)]
-            {
-                let mut stream = tokio::net::TcpStream::connect(*proxy_addr)
-                    .await
-                    .with_context(|| format!("{side_name}: connecting to proxy {proxy_addr}"))?;
-                for req in requests {
-                    let wire = format!(
-                        "{} {} HTTP/1.1\r\nhost: {}\r\nconnection: keep-alive\r\n\r\n",
-                        req.method, req.path, req.host,
-                    );
-                    stream.write_all(wire.as_bytes()).await.with_context(|| {
-                        format!("{side_name}: writing request {} {}", req.method, req.path)
-                    })?;
-                    stream.flush().await.with_context(|| {
-                        format!("{side_name}: flushing request {} {}", req.method, req.path)
-                    })?;
-                    let (resp_status, resp_headers, resp_body) =
-                        read_h1_response_full(&mut stream).await.with_context(|| {
-                            format!(
-                                "{side_name}: reading response for {} {}",
-                                req.method, req.path
-                            )
-                        })?;
-                    anyhow::ensure!(
-                        resp_status == req.expected_status,
-                        "{side_name}: expected status {} for {} {}, got {}",
-                        req.expected_status,
-                        req.method,
-                        req.path,
-                        resp_status,
-                    );
-                    // 14.2 D8.1a (SPEC correction B-3): optional per-request
-                    // body + header assertions. Each side independently must
-                    // satisfy these (NOT a cross-proxy diff of the values).
-                    if let Some(Http1BodyRule::ByteExact { body }) = &req.expected_body {
-                        anyhow::ensure!(
-                            resp_body == body.as_bytes(),
-                            "{side_name}: body mismatch for {} {} — expected {:?}, got {:?}",
-                            req.method,
-                            req.path,
-                            body.as_bytes(),
-                            resp_body,
-                        );
-                    }
-                    if let Some(h) = &req.require_header_present {
-                        anyhow::ensure!(
-                            resp_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(h)),
-                            "{side_name}: expected header {h} present for {} {}",
-                            req.method,
-                            req.path,
-                        );
-                    }
-                    if let Some(h) = &req.require_header_absent {
-                        anyhow::ensure!(
-                            !resp_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(h)),
-                            "{side_name}: expected header {h} absent for {} {}",
-                            req.method,
-                            req.path,
-                        );
-                    }
-                    if let Some(rule) = &req.require_header_value {
-                        let got = resp_headers
-                            .iter()
-                            .find(|(n, _)| n.eq_ignore_ascii_case(&rule.name))
-                            .map(|(_, v)| v.as_str());
-                        anyhow::ensure!(
-                            got == Some(rule.value.as_str()),
-                            "{side_name}: header {} expected value {:?} for {} {}, got {:?}",
-                            rule.name,
-                            rule.value,
-                            req.method,
-                            req.path,
-                            got,
-                        );
-                    }
-                }
-                drop(stream);
-            }
-
-            // Single post-request settle: covers stat-write visibility on
-            // BOTH sides under the same Relaxed-ordering budget (SPEC §6
-            // signpost 11). A fixture-time bump may be needed if a future
-            // counter site lands behind a longer happens-before chain.
-            tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
-
-            for stat in expected_stats {
-                let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
-                    .await
-                    .with_context(|| format!("upstream scraping stat {}", stat.name))?;
-                let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
-                    .await
-                    .with_context(|| format!("subject scraping stat {}", stat.name))?;
-                anyhow::ensure!(
-                    upstream_value == stat.value,
-                    "upstream stat {} expected {} got {}",
-                    stat.name,
-                    stat.value,
-                    upstream_value,
-                );
-                anyhow::ensure!(
-                    subject_value == stat.value,
-                    "subject stat {} expected {} got {}",
-                    stat.name,
-                    stat.value,
-                    subject_value,
-                );
-            }
-
-            // 18 Task 6 (ADR-0049): after the bilateral stat scrape, run any
-            // `admin_scrapes` sub-cases through the SAME per-case assertion
-            // logic the `Driver::AdminScrape` arm uses (the shared
-            // `assert_admin_scrape_case` fn). Fixture 0026 uses this to assert
-            // `/config_dump`'s `ClustersConfigDump` reflects the file-based CDS
-            // load. Empty for fixtures 0020-0025 (`#[serde(default)]`), so the
-            // loop is skipped and the dispatch shape is unchanged for them.
-            // No HCM pre-requests here — keep-alive already drove the
-            // data-plane requests above, so pass an empty `hcm_addrs` map and
-            // `&[]` pre-requests (drive_admin_scrape then hits the admin
-            // listener directly).
-            let empty_hcm: std::collections::BTreeMap<String, SocketAddr> =
-                std::collections::BTreeMap::new();
-            let no_pre: &[PreRequest] = &[];
-            for case in admin_scrapes {
-                let upstream_resp =
-                    drive_admin_scrape(no_pre, upstream_admin_addr, &empty_hcm, &case.path)
-                        .await
-                        .with_context(|| format!("upstream envoy admin scrape: {}", case.path))?;
-                let subject_resp =
-                    drive_admin_scrape(no_pre, subject_admin_addr, &empty_hcm, &case.path)
-                        .await
-                        .with_context(|| format!("envoy-rust admin scrape: {}", case.path))?;
-                assert_admin_scrape_case(case, &upstream_resp, &subject_resp)?;
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
+            run_http1_keep_alive_arm(
+                &ctx,
+                upstream,
+                subject,
+                requests,
+                settle_ms,
+                expected_stats,
+                admin_scrapes,
+            )
+            .await?;
         }
         // 13.2 Task 5 (ADR-0039): the H2 sibling of `Http1KeepAlive`. Each
         // proxy gets ONE downstream H2 conn (TCP + h2::client::handshake),
@@ -4325,164 +4007,11 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             settle_ms,
             expected_stats,
         } => {
-            let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Driver::Http2KeepAlive requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
-                )
-            })?;
-            let subject_admin_port = admin_host_port.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Driver::Http2KeepAlive requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
-                )
-            })?;
-            let upstream_admin_addr: SocketAddr =
-                format!("127.0.0.1:{upstream_admin_port}").parse()?;
-            let subject_admin_addr: SocketAddr =
-                format!("127.0.0.1:{subject_admin_port}").parse()?;
-            wait_accept_ready(upstream_admin_addr, budget)
-                .await
-                .context("upstream admin listener never became accept-ready")?;
-            wait_accept_ready(subject_admin_addr, budget)
-                .await
-                .context("envoy-rust admin listener never became accept-ready")?;
-
-            for (side_name, proxy_addr) in &[("upstream", upstream_addr), ("subject", subject_addr)]
-            {
-                drive_http2_keep_alive(*proxy_addr, requests, side_name).await?;
-            }
-
-            // Single post-request settle: covers stat-write visibility on
-            // BOTH sides under the same Relaxed-ordering budget (SPEC §6
-            // signpost 11). Mirrors the H1 sibling at `Driver::Http1KeepAlive`.
-            tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
-
-            for stat in expected_stats {
-                let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
-                    .await
-                    .with_context(|| format!("upstream scraping stat {}", stat.name))?;
-                let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
-                    .await
-                    .with_context(|| format!("subject scraping stat {}", stat.name))?;
-                anyhow::ensure!(
-                    upstream_value == stat.value,
-                    "upstream stat {} expected {} got {}",
-                    stat.name,
-                    stat.value,
-                    upstream_value,
-                );
-                anyhow::ensure!(
-                    subject_value == stat.value,
-                    "subject stat {} expected {} got {}",
-                    stat.name,
-                    stat.value,
-                    subject_value,
-                );
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
+            run_http2_keep_alive_arm(&ctx, upstream, subject, requests, settle_ms, expected_stats)
+                .await?;
         }
         Driver::Http1ProbeList { probes } => {
-            // Iterate probes; per-probe equivalence cascade mirrors the
-            // single-probe Driver::Http1 arm. Subject + upstream tear down
-            // AFTER all probes have run.
-            for probe in probes {
-                let upstream_resp = drive_http1(
-                    upstream_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                    probe.body.as_deref().map(str::as_bytes),
-                )
-                .await
-                .with_context(|| format!("upstream envoy http1 drive (probe {})", probe.name))?;
-                let subject_resp = drive_http1(
-                    subject_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                    probe.body.as_deref().map(str::as_bytes),
-                )
-                .await
-                .with_context(|| format!("envoy-rust http1 drive (probe {})", probe.name))?;
-
-                // Status: envoy ↔ envoy-rust under `response_status: exact`.
-                if matches!(
-                    expectations.equivalence.response_status,
-                    Some(StatusRule::Exact)
-                ) && upstream_resp.status != subject_resp.status
-                {
-                    bail!(
-                        "probe {}: response status mismatch under `response_status: exact`\n  \
-                         upstream: {}\n  subject:  {}",
-                        probe.name,
-                        upstream_resp.status,
-                        subject_resp.status,
-                    );
-                }
-                if let Some(es) = probe.expected_status {
-                    if upstream_resp.status != es {
-                        bail!(
-                            "probe {}: upstream status {} != expected {}",
-                            probe.name,
-                            upstream_resp.status,
-                            es,
-                        );
-                    }
-                    if subject_resp.status != es {
-                        bail!(
-                            "probe {}: subject status {} != expected {}",
-                            probe.name,
-                            subject_resp.status,
-                            es,
-                        );
-                    }
-                }
-
-                // Body. 06.1 Task 13 carryforward: route through
-                // `assert_body_rule` so BodyRule variants dispatch through the
-                // single centralized helper instead of inline `matches!`.
-                if let Some(rule) = &expectations.equivalence.response_body {
-                    assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
-                        .with_context(|| format!("probe {}", probe.name))?;
-                }
-                if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
-                    let expected = body.as_bytes();
-                    if upstream_resp.body != expected {
-                        bail!(
-                            "probe {}: upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
-                            probe.name,
-                            upstream_resp.body,
-                            expected,
-                        );
-                    }
-                    if subject_resp.body != expected {
-                        bail!(
-                            "probe {}: subject body != expected\n  subject:  {:?}\n  expected: {:?}",
-                            probe.name,
-                            subject_resp.body,
-                            expected,
-                        );
-                    }
-                }
-
-                // Headers.
-                if matches!(
-                    probe.expected_headers,
-                    Some(Http1HeaderRule::SetEqualModuloAllowList)
-                ) {
-                    diff_headers(
-                        &upstream_resp.headers,
-                        &subject_resp.headers,
-                        HEADER_ALLOW_LIST,
-                    )
-                    .with_context(|| format!("probe {}: diff_headers", probe.name))?;
-                }
-            }
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
+            run_http1_probe_list_arm(&ctx, upstream, subject, probes).await?;
         }
         // 28 Task 7 (ADR-0070): RING_HASH consistent-hashing cross-proxy
         // differential. For each `x-hash-key` value: send GET <path> with that
@@ -4497,123 +4026,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             host,
             expected_status,
         } => {
-            use std::collections::BTreeSet;
-
-            if keys.is_empty() {
-                bail!("Driver::Http1HashSweep requires a non-empty `keys:` sweep");
-            }
-
-            // Extract the selected-backend marker from an echo response body's
-            // leading `backend: <marker>\n` line. The two backends are spawned
-            // `--body-marker backend_1`/`backend_2`, so this line names WHICH
-            // backend the RING_HASH ring selected for the request hash.
-            fn extract_marker(body: &[u8], side: &str, key: &str) -> Result<String> {
-                let text = std::str::from_utf8(body)
-                    .with_context(|| format!("{side} response body for key `{key}` is not utf8"))?;
-                let first = text.lines().next().unwrap_or("");
-                let marker = first.strip_prefix("backend: ").ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{side} response body for key `{key}` does not begin with \
-                         `backend: <marker>`; got first line `{first}`"
-                    )
-                })?;
-                Ok(marker.trim().to_string())
-            }
-
-            // Probe one key once on one proxy; return the selected marker.
-            async fn probe_marker(
-                addr: SocketAddr,
-                path: &str,
-                host: &str,
-                key: &str,
-                expected_status: u16,
-                side: &str,
-            ) -> Result<String> {
-                let extra = vec![("x-hash-key".to_string(), key.to_string())];
-                let resp = drive_http1(addr, &Http1Method::Get, path, host, &extra, None)
-                    .await
-                    .with_context(|| format!("{side} http1 drive (key `{key}`)"))?;
-                if resp.status != expected_status {
-                    bail!(
-                        "{side} status {} != expected {} (key `{key}`)",
-                        resp.status,
-                        expected_status,
-                    );
-                }
-                extract_marker(&resp.body, side, key)
-            }
-
-            let mut upstream_markers: BTreeSet<String> = BTreeSet::new();
-            let mut subject_markers: BTreeSet<String> = BTreeSet::new();
-
-            for key in keys {
-                // First selection on each side.
-                let up1 =
-                    probe_marker(upstream_addr, path, host, key, *expected_status, "upstream")
-                        .await?;
-                let su1 = probe_marker(subject_addr, path, host, key, *expected_status, "subject")
-                    .await?;
-
-                // STRONG (the core differential): cross-proxy identical
-                // RING_HASH selection for this key.
-                if up1 != su1 {
-                    bail!(
-                        "RING_HASH cross-proxy selection mismatch for x-hash-key `{key}`:\n  \
-                         upstream Envoy -> `{up1}`\n  envoy-rust      -> `{su1}`\n\
-                         (the locked xxHash64 ring — ADR-0070 — must select the SAME backend)"
-                    );
-                }
-
-                // STABILITY: the SAME key must select the SAME backend on a
-                // repeat request, on each proxy independently.
-                let up2 =
-                    probe_marker(upstream_addr, path, host, key, *expected_status, "upstream")
-                        .await?;
-                let su2 = probe_marker(subject_addr, path, host, key, *expected_status, "subject")
-                    .await?;
-                if up2 != up1 {
-                    bail!(
-                        "RING_HASH instability on upstream Envoy for key `{key}`: \
-                         first=`{up1}` repeat=`{up2}` (same key must hit same backend)"
-                    );
-                }
-                if su2 != su1 {
-                    bail!(
-                        "RING_HASH instability on envoy-rust for key `{key}`: \
-                         first=`{su1}` repeat=`{su2}` (same key must hit same backend)"
-                    );
-                }
-
-                upstream_markers.insert(up1);
-                subject_markers.insert(su1);
-            }
-
-            // SPREAD: over the full sweep BOTH backends must be selected on EACH
-            // side. A sweep that collapses to a single backend does not exercise
-            // ring distribution and is treated as a failure.
-            let expected_spread: BTreeSet<String> =
-                ["backend_1".to_string(), "backend_2".to_string()]
-                    .into_iter()
-                    .collect();
-            if upstream_markers != expected_spread {
-                bail!(
-                    "RING_HASH spread failure on upstream Envoy: the {}-key sweep selected only \
-                     {:?} (expected BOTH backend_1 and backend_2)",
-                    keys.len(),
-                    upstream_markers,
-                );
-            }
-            if subject_markers != expected_spread {
-                bail!(
-                    "RING_HASH spread failure on envoy-rust: the {}-key sweep selected only \
-                     {:?} (expected BOTH backend_1 and backend_2)",
-                    keys.len(),
-                    subject_markers,
-                );
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
+            run_http1_hash_sweep_arm(&ctx, upstream, subject, keys, path, host, expected_status)
+                .await?;
         }
         // 30 Task 7 (ADR-0074): subset LB route-selection cross-proxy
         // differential. For each probe: GET <path> against BOTH proxies, assert
@@ -4623,127 +4037,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // side's body is the fixed `no healthy upstream` NO_FALLBACK local reply.
         // Locally observable — a plain request/response with no reload trigger.
         Driver::Http1RouteSelect { probes } => {
-            if probes.is_empty() {
-                bail!("Driver::Http1RouteSelect requires a non-empty `probes:` list");
-            }
-
-            // Extract the selected-backend marker from an echo response body's
-            // leading `backend: <marker>\n` line. The two backends are spawned
-            // `--body-marker backend_1`/`backend_2`, so this line names WHICH
-            // backend the subset selected.
-            fn extract_marker(body: &[u8], side: &str, name: &str) -> Result<String> {
-                let text = std::str::from_utf8(body).with_context(|| {
-                    format!("{side} response body for probe `{name}` is not utf8")
-                })?;
-                let first = text.lines().next().unwrap_or("");
-                let marker = first.strip_prefix("backend: ").ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{side} response body for probe `{name}` does not begin with \
-                         `backend: <marker>`; got first line `{first}`"
-                    )
-                })?;
-                Ok(marker.trim().to_string())
-            }
-
-            // Drive one probe on one proxy; return the full response (status +
-            // body) after asserting the status matches.
-            async fn drive_probe(
-                addr: SocketAddr,
-                path: &str,
-                expected_status: u16,
-                side: &str,
-                name: &str,
-            ) -> Result<DriveHttp1Result> {
-                let resp = drive_http1(addr, &Http1Method::Get, path, "localhost", &[], None)
-                    .await
-                    .with_context(|| {
-                        format!("{side} http1 drive (probe `{name}` path `{path}`)")
-                    })?;
-                if resp.status != expected_status {
-                    bail!(
-                        "{side} status {} != expected {} (probe `{name}` path `{path}`)",
-                        resp.status,
-                        expected_status,
-                    );
-                }
-                Ok(resp)
-            }
-
-            for probe in probes {
-                let up = drive_probe(
-                    upstream_addr,
-                    &probe.path,
-                    probe.expected_status,
-                    "upstream",
-                    &probe.name,
-                )
-                .await?;
-                let su = drive_probe(
-                    subject_addr,
-                    &probe.path,
-                    probe.expected_status,
-                    "subject",
-                    &probe.name,
-                )
-                .await?;
-
-                match &probe.expected_marker {
-                    // 200 probe: STRONG cross-proxy identical subset selection,
-                    // AND agreement with the §A oracle marker.
-                    Some(expected) => {
-                        let up_marker = extract_marker(&up.body, "upstream", &probe.name)?;
-                        let su_marker = extract_marker(&su.body, "subject", &probe.name)?;
-                        if up_marker != su_marker {
-                            bail!(
-                                "subset LB cross-proxy selection mismatch for probe `{}` (path `{}`):\n  \
-                                 upstream Envoy -> `{up_marker}`\n  envoy-rust      -> `{su_marker}`\n\
-                                 (the §6.2-LOCKED subset resolution — ADR-0074 — must select the SAME backend)",
-                                probe.name,
-                                probe.path,
-                            );
-                        }
-                        if &up_marker != expected {
-                            bail!(
-                                "subset LB §A oracle mismatch for probe `{}` (path `{}`): \
-                                 selected `{up_marker}` but oracle expects `{expected}`",
-                                probe.name,
-                                probe.path,
-                            );
-                        }
-                    }
-                    // 503 (NO_FALLBACK) probe: each side's body is the fixed
-                    // 19-byte `no healthy upstream` local reply (byte-equal
-                    // cross-proxy).
-                    None => {
-                        const NO_HEALTHY: &str = "no healthy upstream";
-                        let up_body = std::str::from_utf8(&up.body).with_context(|| {
-                            format!("upstream body for probe `{}` is not utf8", probe.name)
-                        })?;
-                        let su_body = std::str::from_utf8(&su.body).with_context(|| {
-                            format!("subject body for probe `{}` is not utf8", probe.name)
-                        })?;
-                        if up_body != NO_HEALTHY {
-                            bail!(
-                                "upstream Envoy NO_FALLBACK body mismatch for probe `{}` (path `{}`): \
-                                 expected `{NO_HEALTHY}`, got `{up_body}`",
-                                probe.name,
-                                probe.path,
-                            );
-                        }
-                        if su_body != NO_HEALTHY {
-                            bail!(
-                                "envoy-rust NO_FALLBACK body mismatch for probe `{}` (path `{}`): \
-                                 expected `{NO_HEALTHY}`, got `{su_body}`",
-                                probe.name,
-                                probe.path,
-                            );
-                        }
-                    }
-                }
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
+            run_http1_route_select_arm(&ctx, upstream, subject, probes).await?;
         }
         // 26 Task 7: file-based RDS hot-reload differential step. Runs
         // `pre_probes` bilaterally, atomic-renames the post-reload RDS content
@@ -4760,76 +4054,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             reload,
             post_probes,
         } => {
-            // An RDS-reload fixture MUST carry an `rds.yaml` (the reload swaps
-            // the file-based RouteConfiguration). `subject_rds_path` is always
-            // bound, but its file only exists when the fixture is RDS-based.
-            if upstream_rds_path.is_none() {
-                bail!(
-                    "Driver::Http1RdsReload requires a file-based RDS fixture \
-                     (no {{{{RDS_PATH}}}} marker / rds.yaml found)"
-                );
-            }
-
-            // 1. pre_probes — bilateral equivalence on the ORIGINAL table.
-            for probe in pre_probes {
-                run_http1_probe_bilateral(
-                    upstream_addr,
-                    subject_addr,
-                    &expectations.equivalence,
-                    probe,
-                    "pre",
-                )
+            run_http1_rds_reload_arm(&ctx, upstream, subject, pre_probes, reload, post_probes)
                 .await?;
-            }
-
-            // 2. Read + render the POST-reload RDS template per-side, exactly
-            //    like rds.yaml (same kv ref slices, same residual-marker guard).
-            let reload_tpl = std::fs::read_to_string(fixture_dir.join(&reload.reload_file))
-                .with_context(|| format!("reading RDS reload file {}", reload.reload_file))?;
-            let upstream_reload = render_yaml(&reload_tpl, &upstream_kvs_refs);
-            let subject_reload = render_yaml(&reload_tpl, &subject_kvs_refs);
-            if let Some(marker) = residual_marker(&upstream_reload) {
-                bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream reload RDS");
-            }
-            if let Some(marker) = residual_marker(&subject_reload) {
-                bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject reload RDS");
-            }
-
-            // 3. Reload BOTH sides via atomic-rename (the ONLY rewrite Envoy's
-            //    default file-watch observes — §6.2/ADR-0066). Subject = host
-            //    file; upstream = in-container file via docker exec.
-            atomic_rename_over(&subject_rds_path, &subject_reload)
-                .context("atomic-rename of reloaded subject RDS file")?;
-            upstream
-                .reload_rds_atomic(&upstream_reload)
-                .await
-                .context("atomic-rename of reloaded upstream container RDS file")?;
-
-            // 4. Wait — bounded — for BOTH sides to converge on the new table,
-            //    polling the discriminator (its expected_status/body define
-            //    "converged"). NOT a fixed sleep.
-            let budget = Duration::from_millis(reload.settle_budget_ms);
-            wait_for_reload_convergence(upstream_addr, &reload.discriminator, budget)
-                .await
-                .context("upstream Envoy never converged on reloaded RDS table")?;
-            wait_for_reload_convergence(subject_addr, &reload.discriminator, budget)
-                .await
-                .context("envoy-rust never converged on reloaded RDS table")?;
-
-            // 5. post_probes — bilateral equivalence on the RELOADED table.
-            for probe in post_probes {
-                run_http1_probe_bilateral(
-                    upstream_addr,
-                    subject_addr,
-                    &expectations.equivalence,
-                    probe,
-                    "post",
-                )
-                .await?;
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
         }
         // 27 Task 6 (D6 / §6.2-LOCKED V2 / ADR-0068): file-based EDS hot-reload
         // differential step — the EDS sibling of `Http1RdsReload`. Runs
@@ -4848,96 +4074,8 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             reload,
             post_probes,
         } => {
-            // M26-2 GUARD (folds the phase-26 fix the RDS arm omitted): a
-            // discriminator with NEITHER expected_status NOR expected_body would
-            // make `wait_for_reload_convergence` return Ok on the FIRST poll
-            // (`status_ok && body_ok == true` with both absent), reporting
-            // spurious instant "convergence" before the reload took effect. Bail
-            // BEFORE driving anything.
-            if !eds_reload_discriminator_is_load_bearing(&reload.discriminator) {
-                bail!(
-                    "Driver::Http1EdsReload discriminator {} carries neither \
-                     expected_status nor expected_body — it would report spurious \
-                     instant convergence (M26-2); the EDS-reload discriminator MUST \
-                     be load-bearing",
-                    reload.discriminator.name,
-                );
-            }
-
-            // An EDS-reload fixture MUST carry an `eds.yaml` (the reload swaps the
-            // file-based ClusterLoadAssignment endpoint). `subject_eds_path` is
-            // always bound, but its file only exists when the fixture is EDS-based.
-            if upstream_eds_path.is_none() {
-                bail!(
-                    "Driver::Http1EdsReload requires a file-based EDS fixture \
-                     (no {{{{EDS_PATH}}}} marker / eds.yaml found)"
-                );
-            }
-
-            // 1. pre_probes — bilateral equivalence on the ORIGINAL endpoint (backend_1).
-            for probe in pre_probes {
-                run_http1_probe_bilateral(
-                    upstream_addr,
-                    subject_addr,
-                    &expectations.equivalence,
-                    probe,
-                    "pre",
-                )
+            run_http1_eds_reload_arm(&ctx, upstream, subject, pre_probes, reload, post_probes)
                 .await?;
-            }
-
-            // 2. Read + render the POST-reload EDS template per-side, exactly
-            //    like eds.yaml (same kv ref slices, same residual-marker guard).
-            //    The per-side `{{EDS_BACKEND_IP}}` resolves to the numeric
-            //    host-gateway IP (upstream) vs `127.0.0.1` (subject) — EDS rejects
-            //    hostnames (L1), so the two renditions carry DIFFERENT numeric
-            //    endpoint addresses.
-            let reload_tpl = std::fs::read_to_string(fixture_dir.join(&reload.reload_file))
-                .with_context(|| format!("reading EDS reload file {}", reload.reload_file))?;
-            let upstream_reload = render_yaml(&reload_tpl, &upstream_kvs_refs);
-            let subject_reload = render_yaml(&reload_tpl, &subject_kvs_refs);
-            if let Some(marker) = residual_marker(&upstream_reload) {
-                bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream reload EDS");
-            }
-            if let Some(marker) = residual_marker(&subject_reload) {
-                bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject reload EDS");
-            }
-
-            // 3. Reload BOTH sides via atomic-rename (the ONLY rewrite Envoy's
-            //    default file-watch observes — §6.2/ADR-0066). Subject = host
-            //    file; upstream = in-container file via docker exec.
-            atomic_rename_over(&subject_eds_path, &subject_reload)
-                .context("atomic-rename of reloaded subject EDS file")?;
-            upstream
-                .reload_eds_atomic(&upstream_reload)
-                .await
-                .context("atomic-rename of reloaded upstream container EDS file")?;
-
-            // 4. Wait — bounded — for BOTH sides to converge on the new endpoint
-            //    set, polling the discriminator (its expected_status/body define
-            //    "converged"). NOT a fixed sleep.
-            let budget = Duration::from_millis(reload.settle_budget_ms);
-            wait_for_reload_convergence(upstream_addr, &reload.discriminator, budget)
-                .await
-                .context("upstream Envoy never converged on reloaded EDS endpoint set")?;
-            wait_for_reload_convergence(subject_addr, &reload.discriminator, budget)
-                .await
-                .context("envoy-rust never converged on reloaded EDS endpoint set")?;
-
-            // 5. post_probes — bilateral equivalence on the SWAPPED endpoint (backend_2).
-            for probe in post_probes {
-                run_http1_probe_bilateral(
-                    upstream_addr,
-                    subject_addr,
-                    &expectations.equivalence,
-                    probe,
-                    "post",
-                )
-                .await?;
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
         }
         // 11 NEW: HTTP/2 probe-list driver. Mirrors Driver::Http1ProbeList
         // verbatim, swapping drive_http1 → drive_http2 (H2 cleartext
@@ -4947,100 +4085,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // exercising the phase-11 D6 decorate_filter_synth_response_h2 helper
         // bilaterally (closes 09 REVIEW M2). Per phase-11 SPEC §3 D8.1.
         Driver::Http2ProbeList { probes } => {
-            for probe in probes {
-                let upstream_resp = drive_http2(
-                    upstream_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                )
-                .await
-                .with_context(|| format!("upstream envoy http2 drive (probe {})", probe.name))?;
-                let subject_resp = drive_http2(
-                    subject_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                )
-                .await
-                .with_context(|| format!("envoy-rust http2 drive (probe {})", probe.name))?;
-
-                // Status: envoy ↔ envoy-rust under `response_status: exact`.
-                if matches!(
-                    expectations.equivalence.response_status,
-                    Some(StatusRule::Exact)
-                ) && upstream_resp.status != subject_resp.status
-                {
-                    bail!(
-                        "probe {}: response status mismatch under `response_status: exact`\n  \
-                         upstream: {}\n  subject:  {}",
-                        probe.name,
-                        upstream_resp.status,
-                        subject_resp.status,
-                    );
-                }
-                if let Some(es) = probe.expected_status {
-                    if upstream_resp.status != es {
-                        bail!(
-                            "probe {}: upstream status {} != expected {}",
-                            probe.name,
-                            upstream_resp.status,
-                            es,
-                        );
-                    }
-                    if subject_resp.status != es {
-                        bail!(
-                            "probe {}: subject status {} != expected {}",
-                            probe.name,
-                            subject_resp.status,
-                            es,
-                        );
-                    }
-                }
-
-                // Body. Route through `assert_body_rule` (mirrors the
-                // Http1ProbeList arm).
-                if let Some(rule) = &expectations.equivalence.response_body {
-                    assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
-                        .with_context(|| format!("probe {}", probe.name))?;
-                }
-                if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
-                    let expected = body.as_bytes();
-                    if upstream_resp.body != expected {
-                        bail!(
-                            "probe {}: upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
-                            probe.name,
-                            upstream_resp.body,
-                            expected,
-                        );
-                    }
-                    if subject_resp.body != expected {
-                        bail!(
-                            "probe {}: subject body != expected\n  subject:  {:?}\n  expected: {:?}",
-                            probe.name,
-                            subject_resp.body,
-                            expected,
-                        );
-                    }
-                }
-
-                // Headers.
-                if matches!(
-                    probe.expected_headers,
-                    Some(Http1HeaderRule::SetEqualModuloAllowList)
-                ) {
-                    diff_headers(
-                        &upstream_resp.headers,
-                        &subject_resp.headers,
-                        HEADER_ALLOW_LIST,
-                    )
-                    .with_context(|| format!("probe {}: diff_headers", probe.name))?;
-                }
-            }
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
+            run_http2_probe_list_arm(&ctx, upstream, subject, probes).await?;
         }
         // 06.2 NEW: HTTP/1.1 driver with post-request access-log line
         // assertion. Wire-protocol leg reuses `drive_http1` (04.1); after the
@@ -5058,124 +4103,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_access_log_paths,
             expected_access_log_lines,
         } => {
-            // Wire-protocol leg: reuse drive_http1 unchanged from 04.1.
-            // `Http1Method` is the harness's narrow GET-only enum today;
-            // mirror the conversion shape used by `drive_admin_scrape`.
-            let http1_method = match method.as_str() {
-                "GET" => Http1Method::Get,
-                other => bail!("Driver::Http1WithAccessLog: unsupported method {:?}", other),
-            };
-            let upstream_resp = drive_http1(
-                upstream_addr,
-                &http1_method,
+            run_http1_with_access_log_arm(
+                &ctx,
+                upstream,
+                subject,
+                method,
                 path,
                 host,
+                expected_status,
+                expected_body,
+                expected_headers,
                 extra_headers,
-                None,
-            )
-            .await
-            .context("upstream envoy http1 drive (Http1WithAccessLog)")?;
-            let subject_resp =
-                drive_http1(subject_addr, &http1_method, path, host, extra_headers, None)
-                    .await
-                    .context("envoy-rust http1 drive (Http1WithAccessLog)")?;
-
-            // envoy-rust's access-log emit is a fire-and-forget task that runs after the
-            // response completes; subject.shutdown() is SIGKILL (subject.rs TODO on
-            // graceful drain). Wait for the line to land BEFORE killing the process —
-            // CI run 27059869720 lost the race (`envoy=1 envoy-rust=0`) because the old
-            // post-shutdown poll could never observe a write from a dead process.
-            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
-            if !wait_file_nonempty(&envoy_rust_path, std::time::Duration::from_secs(5)).await {
-                tracing::warn!(
-                    "differential: envoy-rust access-log file {} still empty after 5s (pre-shutdown wait)",
-                    envoy_rust_path.display()
-                );
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-
-            // Status: per-driver `expected_status` — each side independently
-            // equals the value (the Http1WithAccessLog variant requires it,
-            // unlike Http1's Option<u16>).
-            if upstream_resp.status != *expected_status {
-                bail!(
-                    "upstream status {} != expected {}",
-                    upstream_resp.status,
-                    expected_status,
-                );
-            }
-            if subject_resp.status != *expected_status {
-                bail!(
-                    "subject status {} != expected {}",
-                    subject_resp.status,
-                    expected_status,
-                );
-            }
-
-            // Body: envoy ↔ envoy-rust via `assert_body_rule` (mirrors the
-            // Http1 arm). The `expected_body: BodyRule` is required (not
-            // Option), so dispatch unconditionally.
-            assert_body_rule(expected_body, &upstream_resp.body, &subject_resp.body)?;
-
-            // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
-            // `expected_headers: HeaderRule` is required; the only variant
-            // today is `SetEqualModuloAllowList` (matches Http1HeaderRule's
-            // sole variant).
-            match expected_headers {
-                HeaderRule::SetEqualModuloAllowList => {
-                    diff_headers(
-                        &upstream_resp.headers,
-                        &subject_resp.headers,
-                        HEADER_ALLOW_LIST,
-                    )
-                    .context("diff_headers (set_equal_modulo_allow_list)")?;
-                }
-            }
-
-            // Envoy-side flush is driven by container stop (SIGTERM) above. The
-            // non-empty poll (rather than an exists check) preserves the fix for CI run
-            // 26375100437: the FileSink creates the file at open time, so existence
-            // alone does not imply the line landed.
-            let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
-            if !wait_file_nonempty(&envoy_path, std::time::Duration::from_secs(5)).await {
-                tracing::warn!(
-                    "differential: envoy access-log file {} still empty after 5s (post container-stop wait)",
-                    envoy_path.display()
-                );
-            }
-            // One final yield to let the OS flush any in-flight bytes that crossed the
-            // metadata-len threshold but haven't fully landed.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
-                format!("read envoy access-log file at {}", envoy_path.display())
-            })?;
-            let envoy_rust_contents =
-                std::fs::read_to_string(&envoy_rust_path).with_context(|| {
-                    format!(
-                        "read envoy-rust access-log file at {}",
-                        envoy_rust_path.display()
-                    )
-                })?;
-            let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
-            let envoy_rust_lines: Vec<String> =
-                envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
-
-            crate::access_log::assert_access_log_lines_equivalent(
-                &envoy_lines,
-                &envoy_rust_lines,
+                expected_access_log_paths,
                 expected_access_log_lines,
             )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "access log mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
-                    e,
-                    envoy_lines,
-                    envoy_rust_lines,
-                )
-            })?;
+            .await?;
         }
         // Phase 32 Task 6 (ADR-0079): whole-line byte-exact access-log
         // differential. Drives a SEQUENCE of H1 probes (reusing `drive_http1`
@@ -5188,137 +4130,14 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             probes,
             expected_access_log_paths,
         } => {
-            let expected_lines = probes.len();
-
-            // Drive each probe in order against BOTH proxies. Reuse the exact
-            // request build (`drive_http1`) the `Http1WithAccessLog` arm uses;
-            // assert each side's status matches the probe's `expected_status`.
-            for (idx, probe) in probes.iter().enumerate() {
-                let body: Option<&[u8]> = probe.body.as_deref().map(|s| s.as_bytes());
-                let upstream_resp = drive_http1(
-                    upstream_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                    body,
-                )
-                .await
-                .with_context(|| {
-                    format!("upstream envoy http1 drive (Http1AccessLogByteExact probe {idx})")
-                })?;
-                let subject_resp = drive_http1(
-                    subject_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                    body,
-                )
-                .await
-                .with_context(|| {
-                    format!("envoy-rust http1 drive (Http1AccessLogByteExact probe {idx})")
-                })?;
-                if upstream_resp.status != probe.expected_status {
-                    bail!(
-                        "probe {idx}: upstream status {} != expected {}",
-                        upstream_resp.status,
-                        probe.expected_status,
-                    );
-                }
-                if subject_resp.status != probe.expected_status {
-                    bail!(
-                        "probe {idx}: subject status {} != expected {}",
-                        subject_resp.status,
-                        probe.expected_status,
-                    );
-                }
-            }
-
-            // envoy-rust's access-log emit is fire-and-forget; wait for all N
-            // lines to land BEFORE shutdown (SIGKILL) — mirrors the
-            // `Http1WithAccessLog` pre-shutdown wait, generalised to N lines.
-            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
-            // Budget generously: Envoy's FileAccessLog flushes on a periodic
-            // timer (~10s default) rather than per-record, so a multi-probe
-            // scrape must outlast one flush cycle (a 5s budget saw only the
-            // first, already-flushed line — CI/local observed).
-            if !wait_file_lines(&envoy_rust_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
-                tracing::warn!(
-                    "differential: envoy-rust access-log file {} still has < {} lines after {:?} (pre-shutdown wait)",
-                    envoy_rust_path.display(),
-                    expected_lines,
-                    ACCESS_LOG_FLUSH_WAIT,
-                );
-            }
-
-            // Wait for the upstream-Envoy file to reach all N lines BEFORE
-            // stopping the container. Envoy's FileAccessLog buffers and flushes
-            // on a periodic timer; testcontainers tears the container down with
-            // `docker rm -f` (SIGKILL, no graceful drain), so any line still
-            // buffered at stop is LOST. Polling while the container is alive
-            // lets the flush timer fire and land all N lines (CI-observed: a
-            // post-stop wait saw only the first, already-flushed line).
-            let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
-            if !wait_file_lines(&envoy_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
-                tracing::warn!(
-                    "differential: envoy access-log file {} still has < {} lines after {:?} (pre-stop wait)",
-                    envoy_path.display(),
-                    expected_lines,
-                    ACCESS_LOG_FLUSH_WAIT,
-                );
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-
-            // One final yield to let the OS flush any in-flight bytes.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
-                format!("read envoy access-log file at {}", envoy_path.display())
-            })?;
-            let envoy_rust_contents =
-                std::fs::read_to_string(&envoy_rust_path).with_context(|| {
-                    format!(
-                        "read envoy-rust access-log file at {}",
-                        envoy_rust_path.display()
-                    )
-                })?;
-            let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
-            let envoy_rust_lines: Vec<String> =
-                envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
-
-            // Each probe emits exactly one access-log line.
-            if envoy_lines.len() != expected_lines {
-                bail!(
-                    "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
-                    envoy_lines.len(),
-                    expected_lines,
-                    envoy_lines,
-                );
-            }
-            if envoy_rust_lines.len() != expected_lines {
-                bail!(
-                    "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
-                    envoy_rust_lines.len(),
-                    expected_lines,
-                    envoy_rust_lines,
-                );
-            }
-
-            crate::access_log::assert_access_log_lines_byte_identical(
-                &envoy_lines,
-                &envoy_rust_lines,
+            run_http1_access_log_byte_exact_arm(
+                &ctx,
+                upstream,
+                subject,
+                probes,
+                expected_access_log_paths,
             )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "access log byte-exact mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
-                    e,
-                    envoy_lines,
-                    envoy_rust_lines,
-                )
-            })?;
+            .await?;
         }
         // Phase 56 (ADR-0113): the H2 sibling of the byte-exact access-log
         // driver above. Drives a SEQUENCE of H2 probes (via `drive_http2`),
@@ -5328,115 +4147,14 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             probes,
             expected_access_log_paths,
         } => {
-            let expected_lines = probes.len();
-
-            for (idx, probe) in probes.iter().enumerate() {
-                let upstream_resp = drive_http2(
-                    upstream_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                )
-                .await
-                .with_context(|| {
-                    format!("upstream envoy http2 drive (Http2AccessLogByteExact probe {idx})")
-                })?;
-                let subject_resp = drive_http2(
-                    subject_addr,
-                    &probe.method,
-                    &probe.path,
-                    &probe.host,
-                    &probe.extra_headers,
-                )
-                .await
-                .with_context(|| {
-                    format!("envoy-rust http2 drive (Http2AccessLogByteExact probe {idx})")
-                })?;
-                if upstream_resp.status != probe.expected_status {
-                    bail!(
-                        "probe {idx}: upstream status {} != expected {}",
-                        upstream_resp.status,
-                        probe.expected_status,
-                    );
-                }
-                if subject_resp.status != probe.expected_status {
-                    bail!(
-                        "probe {idx}: subject status {} != expected {}",
-                        subject_resp.status,
-                        probe.expected_status,
-                    );
-                }
-            }
-
-            let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
-            if !wait_file_lines(&envoy_rust_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
-                tracing::warn!(
-                    "differential: envoy-rust access-log file {} still has < {} lines after {:?} (pre-shutdown wait)",
-                    envoy_rust_path.display(),
-                    expected_lines,
-                    ACCESS_LOG_FLUSH_WAIT,
-                );
-            }
-
-            let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
-            if !wait_file_lines(&envoy_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
-                tracing::warn!(
-                    "differential: envoy access-log file {} still has < {} lines after {:?} (pre-stop wait)",
-                    envoy_path.display(),
-                    expected_lines,
-                    ACCESS_LOG_FLUSH_WAIT,
-                );
-            }
-
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-            let envoy_contents = std::fs::read_to_string(&envoy_path).with_context(|| {
-                format!("read envoy access-log file at {}", envoy_path.display())
-            })?;
-            let envoy_rust_contents =
-                std::fs::read_to_string(&envoy_rust_path).with_context(|| {
-                    format!(
-                        "read envoy-rust access-log file at {}",
-                        envoy_rust_path.display()
-                    )
-                })?;
-            let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
-            let envoy_rust_lines: Vec<String> =
-                envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
-
-            if envoy_lines.len() != expected_lines {
-                bail!(
-                    "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
-                    envoy_lines.len(),
-                    expected_lines,
-                    envoy_lines,
-                );
-            }
-            if envoy_rust_lines.len() != expected_lines {
-                bail!(
-                    "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
-                    envoy_rust_lines.len(),
-                    expected_lines,
-                    envoy_rust_lines,
-                );
-            }
-
-            crate::access_log::assert_access_log_lines_byte_identical(
-                &envoy_lines,
-                &envoy_rust_lines,
+            run_http2_access_log_byte_exact_arm(
+                &ctx,
+                upstream,
+                subject,
+                probes,
+                expected_access_log_paths,
             )
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "access log byte-exact mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
-                    e,
-                    envoy_lines,
-                    envoy_rust_lines,
-                )
-            })?;
+            .await?;
         }
         // 05.2 Task 11: real H2 dispatch. Mirrors Driver::Http1 in shape; the
         // only delta is `drive_http2` instead of `drive_http1`. Per SPEC §3 D5.
@@ -5448,79 +4166,18 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             expected_body,
             expected_headers,
         } => {
-            let upstream_resp = drive_http2(upstream_addr, method, path, host, &[])
-                .await
-                .context("upstream envoy http2 drive")?;
-            let subject_resp = drive_http2(subject_addr, method, path, host, &[])
-                .await
-                .context("envoy-rust http2 drive")?;
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
-
-            // Status: envoy ↔ envoy-rust under `response_status: exact`.
-            if matches!(
-                expectations.equivalence.response_status,
-                Some(StatusRule::Exact)
-            ) && upstream_resp.status != subject_resp.status
-            {
-                bail!(
-                    "response status mismatch under `response_status: exact`\n  \
-                     upstream: {}\n  subject:  {}",
-                    upstream_resp.status,
-                    subject_resp.status,
-                );
-            }
-            // Per-driver `expected_status`: each side independently equals it.
-            if let Some(es) = expected_status {
-                if upstream_resp.status != *es {
-                    bail!(
-                        "upstream status {} != expected {}",
-                        upstream_resp.status,
-                        es,
-                    );
-                }
-                if subject_resp.status != *es {
-                    bail!("subject status {} != expected {}", subject_resp.status, es,);
-                }
-            }
-
-            // Body: envoy ↔ envoy-rust per `equivalence.response_body` rule.
-            // 06.1 Task 13 carryforward: route through `assert_body_rule` (see
-            // Driver::Http1 arm above for rationale).
-            if let Some(rule) = &expectations.equivalence.response_body {
-                assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
-            }
-            // Per-driver `expected_body`: each side independently equals bytes.
-            if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
-                let expected = body.as_bytes();
-                if upstream_resp.body != expected {
-                    bail!(
-                        "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
-                        upstream_resp.body,
-                        expected,
-                    );
-                }
-                if subject_resp.body != expected {
-                    bail!(
-                        "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
-                        subject_resp.body,
-                        expected,
-                    );
-                }
-            }
-
-            // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
-            if matches!(
+            run_http2_arm(
+                &ctx,
+                upstream,
+                subject,
+                method,
+                path,
+                host,
+                expected_status,
+                expected_body,
                 expected_headers,
-                Some(Http1HeaderRule::SetEqualModuloAllowList)
-            ) {
-                diff_headers(
-                    &upstream_resp.headers,
-                    &subject_resp.headers,
-                    HEADER_ALLOW_LIST,
-                )
-                .context("diff_headers (set_equal_modulo_allow_list)")?;
-            }
+            )
+            .await?;
         }
         // 06.1 D6.a / 08.1 Task 11: HCM pre-requests then 1..N admin
         // scrapes. Drives both proxies, applies per-sub-case
@@ -5533,270 +4190,2113 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             scrapes,
             post_admin_assertions,
         } => {
-            if scrapes.is_empty() {
-                bail!(
-                    "Driver::AdminScrape requires at least one sub-case (`scrapes:` must be non-empty)"
+            run_admin_scrape_arm(
+                &ctx,
+                upstream,
+                subject,
+                pre_admin_actions,
+                pre_requests,
+                scrapes,
+                post_admin_assertions,
+            )
+            .await?;
+        }
+    }
+
+    // _backend Drop fires here.
+    Ok(())
+}
+
+/// `Driver::TcpEcho` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_tcp_echo_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+) -> Result<()> {
+    let FixtureCtx {
+        fixture_dir,
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    let payload =
+        std::fs::read(fixture_dir.join("inputs/payload.bin")).context("reading payload.bin")?;
+    let upstream_out = drive_tcp(upstream_addr, &payload)
+        .await
+        .context("upstream envoy drive")?;
+    let subject_out = drive_tcp(subject_addr, &payload)
+        .await
+        .context("envoy-rust drive")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    assert_equivalence(expectations, None, None, &upstream_out, &subject_out)?;
+    Ok(())
+}
+
+/// `Driver::HttpGet` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http_get_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    path: &str,
+    host: &str,
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    let upstream_resp = drive_http_get(upstream_addr, path, host)
+        .await
+        .context("upstream envoy http get")?;
+    let subject_resp = drive_http_get(subject_addr, path, host)
+        .await
+        .context("envoy-rust http get")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    assert_equivalence(
+        expectations,
+        Some(upstream_resp.status),
+        Some(subject_resp.status),
+        &upstream_resp.body,
+        &subject_resp.body,
+    )?;
+    Ok(())
+}
+
+/// `Driver::TlsTcp` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_tls_tcp_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    sni: &str,
+    expected_cn: &Option<String>,
+) -> Result<()> {
+    let FixtureCtx {
+        fixture_dir,
+        expectations,
+        upstream_addr,
+        subject_addr,
+        tls_pki,
+        ..
+    } = *ctx;
+    let payload =
+        std::fs::read(fixture_dir.join("inputs/payload.bin")).context("reading payload.bin")?;
+    // Build a RootCertStore from the test CA. Both sides trust the
+    // same CA — both proxies present a leaf signed by it.
+    let pki = tls_pki
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Driver::TlsTcp requires a TLS-shaped fixture (template did not reference any *_PATH key)"
+                ))?;
+    let ca_bytes = std::fs::read(&pki.ca_pem_path).context("read ca.pem")?;
+    let mut ca_slice = ca_bytes.as_slice();
+    let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut ca_slice)
+            .collect::<Result<Vec<_>, _>>()
+            .context("parse ca.pem certs")?;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in ca_certs {
+        roots.add(c).context("RootCertStore::add")?;
+    }
+
+    let upstream_out = drive_tls(
+        upstream_addr,
+        &payload,
+        sni,
+        roots.clone(),
+        expected_cn.as_deref(),
+    )
+    .await
+    .context("upstream envoy tls drive")?;
+    let subject_out = drive_tls(subject_addr, &payload, sni, roots, expected_cn.as_deref())
+        .await
+        .context("envoy-rust tls drive")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    assert_equivalence(expectations, None, None, &upstream_out, &subject_out)?;
+    Ok(())
+}
+
+/// `Driver::TlsTcpProbeList` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_tls_tcp_probe_list_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    probes: &[TlsTcpProbe],
+) -> Result<()> {
+    let FixtureCtx {
+        fixture_dir,
+        upstream_addr,
+        subject_addr,
+        tls_pki,
+        ..
+    } = *ctx;
+    let payload =
+        std::fs::read(fixture_dir.join("inputs/payload.bin")).context("reading payload.bin")?;
+    let pki = tls_pki
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "Driver::TlsTcpProbeList requires a TLS-shaped fixture (template did not reference any *_PATH key)"
+                ))?;
+    let ca_bytes = std::fs::read(&pki.ca_pem_path).context("read ca.pem")?;
+    let mut ca_slice = ca_bytes.as_slice();
+    let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut ca_slice)
+            .collect::<Result<Vec<_>, _>>()
+            .context("parse ca.pem certs")?;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in ca_certs {
+        roots.add(c).context("RootCertStore::add")?;
+    }
+
+    drive_tls_probes(upstream_addr, &payload, probes, roots.clone())
+        .await
+        .context("upstream envoy tls probes")?;
+    drive_tls_probes(subject_addr, &payload, probes, roots)
+        .await
+        .context("envoy-rust tls probes")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http1` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+// The parameter list mirrors the `Driver` variant's fields, threaded straight
+// from the `run_fixture` dispatcher; bundling them into a struct would add
+// indirection without clarifying the dispatch (same disposition as
+// `upstream::start`).
+#[allow(clippy::too_many_arguments)]
+async fn run_http1_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    method: &Http1Method,
+    path: &str,
+    host: &str,
+    expected_status: &Option<u16>,
+    expected_body: &Option<Http1BodyRule>,
+    expected_headers: &Option<Http1HeaderRule>,
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    let upstream_resp = drive_http1(upstream_addr, method, path, host, &[], None)
+        .await
+        .context("upstream envoy http1 drive")?;
+    let subject_resp = drive_http1(subject_addr, method, path, host, &[], None)
+        .await
+        .context("envoy-rust http1 drive")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    // Status: envoy ↔ envoy-rust under `response_status: exact`.
+    if matches!(
+        expectations.equivalence.response_status,
+        Some(StatusRule::Exact)
+    ) && upstream_resp.status != subject_resp.status
+    {
+        bail!(
+            "response status mismatch under `response_status: exact`\n  \
+                     upstream: {}\n  subject:  {}",
+            upstream_resp.status,
+            subject_resp.status,
+        );
+    }
+    // Per-driver `expected_status`: each side independently equals it.
+    if let Some(es) = expected_status {
+        if upstream_resp.status != *es {
+            bail!(
+                "upstream status {} != expected {}",
+                upstream_resp.status,
+                es,
+            );
+        }
+        if subject_resp.status != *es {
+            bail!("subject status {} != expected {}", subject_resp.status, es,);
+        }
+    }
+
+    // Body: envoy ↔ envoy-rust per `equivalence.response_body` rule.
+    // 06.1 Task 13 carryforward: route through `assert_body_rule` so
+    // BodyRule variants (ByteExact / PrometheusExposition) dispatch
+    // through the single centralized helper instead of inline
+    // `matches!`. Behaviorally equivalent for ByteExact; admits
+    // PrometheusExposition without re-touching the arm.
+    if let Some(rule) = &expectations.equivalence.response_body {
+        assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
+    }
+    // Per-driver `expected_body`: each side independently equals bytes.
+    if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
+        let expected = body.as_bytes();
+        if upstream_resp.body != expected {
+            bail!(
+                "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                upstream_resp.body,
+                expected,
+            );
+        }
+        if subject_resp.body != expected {
+            bail!(
+                "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                subject_resp.body,
+                expected,
+            );
+        }
+    }
+
+    // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
+    if matches!(
+        expected_headers,
+        Some(Http1HeaderRule::SetEqualModuloAllowList)
+    ) {
+        diff_headers(
+            &upstream_resp.headers,
+            &subject_resp.headers,
+            HEADER_ALLOW_LIST,
+        )
+        .context("diff_headers (set_equal_modulo_allow_list)")?;
+    }
+    Ok(())
+}
+
+/// `Driver::Http1AfterSettle` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+// The parameter list mirrors the `Driver` variant's fields, threaded straight
+// from the `run_fixture` dispatcher; bundling them into a struct would add
+// indirection without clarifying the dispatch (same disposition as
+// `upstream::start`).
+#[allow(clippy::too_many_arguments)]
+async fn run_http1_after_settle_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    settle_ms: &u64,
+    method: &Http1Method,
+    path: &str,
+    host: &str,
+    expected_status: &Option<u16>,
+    expected_body: &Option<Http1BodyRule>,
+    expected_headers: &Option<Http1HeaderRule>,
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    tracing::debug!(
+        settle_ms,
+        "Driver::Http1AfterSettle: sleeping for active-HC settle"
+    );
+    tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+
+    let upstream_resp = drive_http1(upstream_addr, method, path, host, &[], None)
+        .await
+        .context("upstream envoy http1 drive (after settle)")?;
+    let subject_resp = drive_http1(subject_addr, method, path, host, &[], None)
+        .await
+        .context("envoy-rust http1 drive (after settle)")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    // Status: envoy ↔ envoy-rust under `response_status: exact`.
+    if matches!(
+        expectations.equivalence.response_status,
+        Some(StatusRule::Exact)
+    ) && upstream_resp.status != subject_resp.status
+    {
+        bail!(
+            "response status mismatch under `response_status: exact`\n  \
+                     upstream: {}\n  subject:  {}",
+            upstream_resp.status,
+            subject_resp.status,
+        );
+    }
+    if let Some(es) = expected_status {
+        if upstream_resp.status != *es {
+            bail!(
+                "upstream status {} != expected {}",
+                upstream_resp.status,
+                es,
+            );
+        }
+        if subject_resp.status != *es {
+            bail!("subject status {} != expected {}", subject_resp.status, es,);
+        }
+    }
+
+    if let Some(rule) = &expectations.equivalence.response_body {
+        assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
+    }
+    if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
+        let expected = body.as_bytes();
+        if upstream_resp.body != expected {
+            bail!(
+                "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                upstream_resp.body,
+                expected,
+            );
+        }
+        if subject_resp.body != expected {
+            bail!(
+                "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                subject_resp.body,
+                expected,
+            );
+        }
+    }
+
+    if matches!(
+        expected_headers,
+        Some(Http1HeaderRule::SetEqualModuloAllowList)
+    ) {
+        diff_headers(
+            &upstream_resp.headers,
+            &subject_resp.headers,
+            HEADER_ALLOW_LIST,
+        )
+        .context("diff_headers (set_equal_modulo_allow_list)")?;
+    }
+    Ok(())
+}
+
+/// `Driver::Http1KeepAlive` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http1_keep_alive_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    requests: &[Http1KeepAliveRequest],
+    settle_ms: &u64,
+    expected_stats: &[KeepAliveExpectedStat],
+    admin_scrapes: &[AdminScrapeCase],
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        admin_host_port,
+        budget,
+        ..
+    } = *ctx;
+    use tokio::io::AsyncWriteExt;
+    let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http1KeepAlive requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
+                )
+            })?;
+    let subject_admin_port = admin_host_port.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http1KeepAlive requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
+                )
+            })?;
+    let upstream_admin_addr: SocketAddr = format!("127.0.0.1:{upstream_admin_port}").parse()?;
+    let subject_admin_addr: SocketAddr = format!("127.0.0.1:{subject_admin_port}").parse()?;
+    wait_accept_ready(upstream_admin_addr, budget)
+        .await
+        .context("upstream admin listener never became accept-ready")?;
+    wait_accept_ready(subject_admin_addr, budget)
+        .await
+        .context("envoy-rust admin listener never became accept-ready")?;
+
+    // For each proxy, open ONE TCP keep-alive conn and issue the
+    // full `requests` sequence on it. Drain each response's
+    // Content-Length body before issuing the next so the stream
+    // starts at a clean boundary; assert the per-request status
+    // matches `expected_status` so a hung response or class
+    // mismatch surfaces at the request boundary (not only at the
+    // post-settle scrape).
+    for (side_name, proxy_addr) in &[("upstream", upstream_addr), ("subject", subject_addr)] {
+        let mut stream = tokio::net::TcpStream::connect(*proxy_addr)
+            .await
+            .with_context(|| format!("{side_name}: connecting to proxy {proxy_addr}"))?;
+        for req in requests {
+            let wire = format!(
+                "{} {} HTTP/1.1\r\nhost: {}\r\nconnection: keep-alive\r\n\r\n",
+                req.method, req.path, req.host,
+            );
+            stream.write_all(wire.as_bytes()).await.with_context(|| {
+                format!("{side_name}: writing request {} {}", req.method, req.path)
+            })?;
+            stream.flush().await.with_context(|| {
+                format!("{side_name}: flushing request {} {}", req.method, req.path)
+            })?;
+            let (resp_status, resp_headers, resp_body) =
+                read_h1_response_full(&mut stream).await.with_context(|| {
+                    format!(
+                        "{side_name}: reading response for {} {}",
+                        req.method, req.path
+                    )
+                })?;
+            anyhow::ensure!(
+                resp_status == req.expected_status,
+                "{side_name}: expected status {} for {} {}, got {}",
+                req.expected_status,
+                req.method,
+                req.path,
+                resp_status,
+            );
+            // 14.2 D8.1a (SPEC correction B-3): optional per-request
+            // body + header assertions. Each side independently must
+            // satisfy these (NOT a cross-proxy diff of the values).
+            if let Some(Http1BodyRule::ByteExact { body }) = &req.expected_body {
+                anyhow::ensure!(
+                    resp_body == body.as_bytes(),
+                    "{side_name}: body mismatch for {} {} — expected {:?}, got {:?}",
+                    req.method,
+                    req.path,
+                    body.as_bytes(),
+                    resp_body,
                 );
             }
-            let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
+            if let Some(h) = &req.require_header_present {
+                anyhow::ensure!(
+                    resp_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(h)),
+                    "{side_name}: expected header {h} present for {} {}",
+                    req.method,
+                    req.path,
+                );
+            }
+            if let Some(h) = &req.require_header_absent {
+                anyhow::ensure!(
+                    !resp_headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(h)),
+                    "{side_name}: expected header {h} absent for {} {}",
+                    req.method,
+                    req.path,
+                );
+            }
+            if let Some(rule) = &req.require_header_value {
+                let got = resp_headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&rule.name))
+                    .map(|(_, v)| v.as_str());
+                anyhow::ensure!(
+                    got == Some(rule.value.as_str()),
+                    "{side_name}: header {} expected value {:?} for {} {}, got {:?}",
+                    rule.name,
+                    rule.value,
+                    req.method,
+                    req.path,
+                    got,
+                );
+            }
+        }
+        drop(stream);
+    }
+
+    // Single post-request settle: covers stat-write visibility on
+    // BOTH sides under the same Relaxed-ordering budget (SPEC §6
+    // signpost 11). A fixture-time bump may be needed if a future
+    // counter site lands behind a longer happens-before chain.
+    tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+
+    for stat in expected_stats {
+        let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("upstream scraping stat {}", stat.name))?;
+        let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("subject scraping stat {}", stat.name))?;
+        anyhow::ensure!(
+            upstream_value == stat.value,
+            "upstream stat {} expected {} got {}",
+            stat.name,
+            stat.value,
+            upstream_value,
+        );
+        anyhow::ensure!(
+            subject_value == stat.value,
+            "subject stat {} expected {} got {}",
+            stat.name,
+            stat.value,
+            subject_value,
+        );
+    }
+
+    // 18 Task 6 (ADR-0049): after the bilateral stat scrape, run any
+    // `admin_scrapes` sub-cases through the SAME per-case assertion
+    // logic the `Driver::AdminScrape` arm uses (the shared
+    // `assert_admin_scrape_case` fn). Fixture 0026 uses this to assert
+    // `/config_dump`'s `ClustersConfigDump` reflects the file-based CDS
+    // load. Empty for fixtures 0020-0025 (`#[serde(default)]`), so the
+    // loop is skipped and the dispatch shape is unchanged for them.
+    // No HCM pre-requests here — keep-alive already drove the
+    // data-plane requests above, so pass an empty `hcm_addrs` map and
+    // `&[]` pre-requests (drive_admin_scrape then hits the admin
+    // listener directly).
+    let empty_hcm: std::collections::BTreeMap<String, SocketAddr> =
+        std::collections::BTreeMap::new();
+    let no_pre: &[PreRequest] = &[];
+    for case in admin_scrapes {
+        let upstream_resp = drive_admin_scrape(no_pre, upstream_admin_addr, &empty_hcm, &case.path)
+            .await
+            .with_context(|| format!("upstream envoy admin scrape: {}", case.path))?;
+        let subject_resp = drive_admin_scrape(no_pre, subject_admin_addr, &empty_hcm, &case.path)
+            .await
+            .with_context(|| format!("envoy-rust admin scrape: {}", case.path))?;
+        assert_admin_scrape_case(case, &upstream_resp, &subject_resp)?;
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http2KeepAlive` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http2_keep_alive_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    requests: &[Http1KeepAliveRequest],
+    settle_ms: &u64,
+    expected_stats: &[KeepAliveExpectedStat],
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        admin_host_port,
+        budget,
+        ..
+    } = *ctx;
+    let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http2KeepAlive requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
+                )
+            })?;
+    let subject_admin_port = admin_host_port.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Driver::Http2KeepAlive requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
+                )
+            })?;
+    let upstream_admin_addr: SocketAddr = format!("127.0.0.1:{upstream_admin_port}").parse()?;
+    let subject_admin_addr: SocketAddr = format!("127.0.0.1:{subject_admin_port}").parse()?;
+    wait_accept_ready(upstream_admin_addr, budget)
+        .await
+        .context("upstream admin listener never became accept-ready")?;
+    wait_accept_ready(subject_admin_addr, budget)
+        .await
+        .context("envoy-rust admin listener never became accept-ready")?;
+
+    for (side_name, proxy_addr) in &[("upstream", upstream_addr), ("subject", subject_addr)] {
+        drive_http2_keep_alive(*proxy_addr, requests, side_name).await?;
+    }
+
+    // Single post-request settle: covers stat-write visibility on
+    // BOTH sides under the same Relaxed-ordering budget (SPEC §6
+    // signpost 11). Mirrors the H1 sibling at `Driver::Http1KeepAlive`.
+    tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+
+    for stat in expected_stats {
+        let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("upstream scraping stat {}", stat.name))?;
+        let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("subject scraping stat {}", stat.name))?;
+        anyhow::ensure!(
+            upstream_value == stat.value,
+            "upstream stat {} expected {} got {}",
+            stat.name,
+            stat.value,
+            upstream_value,
+        );
+        anyhow::ensure!(
+            subject_value == stat.value,
+            "subject stat {} expected {} got {}",
+            stat.name,
+            stat.value,
+            subject_value,
+        );
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http1ProbeList` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http1_probe_list_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    probes: &[Http1Probe],
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    // Iterate probes; per-probe equivalence cascade mirrors the
+    // single-probe Driver::Http1 arm. Subject + upstream tear down
+    // AFTER all probes have run.
+    for probe in probes {
+        let upstream_resp = drive_http1(
+            upstream_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+            probe.body.as_deref().map(str::as_bytes),
+        )
+        .await
+        .with_context(|| format!("upstream envoy http1 drive (probe {})", probe.name))?;
+        let subject_resp = drive_http1(
+            subject_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+            probe.body.as_deref().map(str::as_bytes),
+        )
+        .await
+        .with_context(|| format!("envoy-rust http1 drive (probe {})", probe.name))?;
+
+        // Status: envoy ↔ envoy-rust under `response_status: exact`.
+        if matches!(
+            expectations.equivalence.response_status,
+            Some(StatusRule::Exact)
+        ) && upstream_resp.status != subject_resp.status
+        {
+            bail!(
+                "probe {}: response status mismatch under `response_status: exact`\n  \
+                         upstream: {}\n  subject:  {}",
+                probe.name,
+                upstream_resp.status,
+                subject_resp.status,
+            );
+        }
+        if let Some(es) = probe.expected_status {
+            if upstream_resp.status != es {
+                bail!(
+                    "probe {}: upstream status {} != expected {}",
+                    probe.name,
+                    upstream_resp.status,
+                    es,
+                );
+            }
+            if subject_resp.status != es {
+                bail!(
+                    "probe {}: subject status {} != expected {}",
+                    probe.name,
+                    subject_resp.status,
+                    es,
+                );
+            }
+        }
+
+        // Body. 06.1 Task 13 carryforward: route through
+        // `assert_body_rule` so BodyRule variants dispatch through the
+        // single centralized helper instead of inline `matches!`.
+        if let Some(rule) = &expectations.equivalence.response_body {
+            assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
+                .with_context(|| format!("probe {}", probe.name))?;
+        }
+        if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
+            let expected = body.as_bytes();
+            if upstream_resp.body != expected {
+                bail!(
+                    "probe {}: upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                    probe.name,
+                    upstream_resp.body,
+                    expected,
+                );
+            }
+            if subject_resp.body != expected {
+                bail!(
+                    "probe {}: subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                    probe.name,
+                    subject_resp.body,
+                    expected,
+                );
+            }
+        }
+
+        // Headers.
+        if matches!(
+            probe.expected_headers,
+            Some(Http1HeaderRule::SetEqualModuloAllowList)
+        ) {
+            diff_headers(
+                &upstream_resp.headers,
+                &subject_resp.headers,
+                HEADER_ALLOW_LIST,
+            )
+            .with_context(|| format!("probe {}: diff_headers", probe.name))?;
+        }
+    }
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http1HashSweep` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http1_hash_sweep_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    keys: &[String],
+    path: &str,
+    host: &str,
+    expected_status: &u16,
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    use std::collections::BTreeSet;
+
+    if keys.is_empty() {
+        bail!("Driver::Http1HashSweep requires a non-empty `keys:` sweep");
+    }
+
+    // Extract the selected-backend marker from an echo response body's
+    // leading `backend: <marker>\n` line. The two backends are spawned
+    // `--body-marker backend_1`/`backend_2`, so this line names WHICH
+    // backend the RING_HASH ring selected for the request hash.
+    fn extract_marker(body: &[u8], side: &str, key: &str) -> Result<String> {
+        let text = std::str::from_utf8(body)
+            .with_context(|| format!("{side} response body for key `{key}` is not utf8"))?;
+        let first = text.lines().next().unwrap_or("");
+        let marker = first.strip_prefix("backend: ").ok_or_else(|| {
+            anyhow::anyhow!(
+                "{side} response body for key `{key}` does not begin with \
+                         `backend: <marker>`; got first line `{first}`"
+            )
+        })?;
+        Ok(marker.trim().to_string())
+    }
+
+    // Probe one key once on one proxy; return the selected marker.
+    async fn probe_marker(
+        addr: SocketAddr,
+        path: &str,
+        host: &str,
+        key: &str,
+        expected_status: u16,
+        side: &str,
+    ) -> Result<String> {
+        let extra = vec![("x-hash-key".to_string(), key.to_string())];
+        let resp = drive_http1(addr, &Http1Method::Get, path, host, &extra, None)
+            .await
+            .with_context(|| format!("{side} http1 drive (key `{key}`)"))?;
+        if resp.status != expected_status {
+            bail!(
+                "{side} status {} != expected {} (key `{key}`)",
+                resp.status,
+                expected_status,
+            );
+        }
+        extract_marker(&resp.body, side, key)
+    }
+
+    let mut upstream_markers: BTreeSet<String> = BTreeSet::new();
+    let mut subject_markers: BTreeSet<String> = BTreeSet::new();
+
+    for key in keys {
+        // First selection on each side.
+        let up1 =
+            probe_marker(upstream_addr, path, host, key, *expected_status, "upstream").await?;
+        let su1 = probe_marker(subject_addr, path, host, key, *expected_status, "subject").await?;
+
+        // STRONG (the core differential): cross-proxy identical
+        // RING_HASH selection for this key.
+        if up1 != su1 {
+            bail!(
+                "RING_HASH cross-proxy selection mismatch for x-hash-key `{key}`:\n  \
+                         upstream Envoy -> `{up1}`\n  envoy-rust      -> `{su1}`\n\
+                         (the locked xxHash64 ring — ADR-0070 — must select the SAME backend)"
+            );
+        }
+
+        // STABILITY: the SAME key must select the SAME backend on a
+        // repeat request, on each proxy independently.
+        let up2 =
+            probe_marker(upstream_addr, path, host, key, *expected_status, "upstream").await?;
+        let su2 = probe_marker(subject_addr, path, host, key, *expected_status, "subject").await?;
+        if up2 != up1 {
+            bail!(
+                "RING_HASH instability on upstream Envoy for key `{key}`: \
+                         first=`{up1}` repeat=`{up2}` (same key must hit same backend)"
+            );
+        }
+        if su2 != su1 {
+            bail!(
+                "RING_HASH instability on envoy-rust for key `{key}`: \
+                         first=`{su1}` repeat=`{su2}` (same key must hit same backend)"
+            );
+        }
+
+        upstream_markers.insert(up1);
+        subject_markers.insert(su1);
+    }
+
+    // SPREAD: over the full sweep BOTH backends must be selected on EACH
+    // side. A sweep that collapses to a single backend does not exercise
+    // ring distribution and is treated as a failure.
+    let expected_spread: BTreeSet<String> = ["backend_1".to_string(), "backend_2".to_string()]
+        .into_iter()
+        .collect();
+    if upstream_markers != expected_spread {
+        bail!(
+            "RING_HASH spread failure on upstream Envoy: the {}-key sweep selected only \
+                     {:?} (expected BOTH backend_1 and backend_2)",
+            keys.len(),
+            upstream_markers,
+        );
+    }
+    if subject_markers != expected_spread {
+        bail!(
+            "RING_HASH spread failure on envoy-rust: the {}-key sweep selected only \
+                     {:?} (expected BOTH backend_1 and backend_2)",
+            keys.len(),
+            subject_markers,
+        );
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http1RouteSelect` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http1_route_select_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    probes: &[RouteSelectProbe],
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    if probes.is_empty() {
+        bail!("Driver::Http1RouteSelect requires a non-empty `probes:` list");
+    }
+
+    // Extract the selected-backend marker from an echo response body's
+    // leading `backend: <marker>\n` line. The two backends are spawned
+    // `--body-marker backend_1`/`backend_2`, so this line names WHICH
+    // backend the subset selected.
+    fn extract_marker(body: &[u8], side: &str, name: &str) -> Result<String> {
+        let text = std::str::from_utf8(body)
+            .with_context(|| format!("{side} response body for probe `{name}` is not utf8"))?;
+        let first = text.lines().next().unwrap_or("");
+        let marker = first.strip_prefix("backend: ").ok_or_else(|| {
+            anyhow::anyhow!(
+                "{side} response body for probe `{name}` does not begin with \
+                         `backend: <marker>`; got first line `{first}`"
+            )
+        })?;
+        Ok(marker.trim().to_string())
+    }
+
+    // Drive one probe on one proxy; return the full response (status +
+    // body) after asserting the status matches.
+    async fn drive_probe(
+        addr: SocketAddr,
+        path: &str,
+        expected_status: u16,
+        side: &str,
+        name: &str,
+    ) -> Result<DriveHttp1Result> {
+        let resp = drive_http1(addr, &Http1Method::Get, path, "localhost", &[], None)
+            .await
+            .with_context(|| format!("{side} http1 drive (probe `{name}` path `{path}`)"))?;
+        if resp.status != expected_status {
+            bail!(
+                "{side} status {} != expected {} (probe `{name}` path `{path}`)",
+                resp.status,
+                expected_status,
+            );
+        }
+        Ok(resp)
+    }
+
+    for probe in probes {
+        let up = drive_probe(
+            upstream_addr,
+            &probe.path,
+            probe.expected_status,
+            "upstream",
+            &probe.name,
+        )
+        .await?;
+        let su = drive_probe(
+            subject_addr,
+            &probe.path,
+            probe.expected_status,
+            "subject",
+            &probe.name,
+        )
+        .await?;
+
+        match &probe.expected_marker {
+            // 200 probe: STRONG cross-proxy identical subset selection,
+            // AND agreement with the §A oracle marker.
+            Some(expected) => {
+                let up_marker = extract_marker(&up.body, "upstream", &probe.name)?;
+                let su_marker = extract_marker(&su.body, "subject", &probe.name)?;
+                if up_marker != su_marker {
+                    bail!(
+                        "subset LB cross-proxy selection mismatch for probe `{}` (path `{}`):\n  \
+                                 upstream Envoy -> `{up_marker}`\n  envoy-rust      -> `{su_marker}`\n\
+                                 (the §6.2-LOCKED subset resolution — ADR-0074 — must select the SAME backend)",
+                        probe.name,
+                        probe.path,
+                    );
+                }
+                if &up_marker != expected {
+                    bail!(
+                        "subset LB §A oracle mismatch for probe `{}` (path `{}`): \
+                                 selected `{up_marker}` but oracle expects `{expected}`",
+                        probe.name,
+                        probe.path,
+                    );
+                }
+            }
+            // 503 (NO_FALLBACK) probe: each side's body is the fixed
+            // 19-byte `no healthy upstream` local reply (byte-equal
+            // cross-proxy).
+            None => {
+                const NO_HEALTHY: &str = "no healthy upstream";
+                let up_body = std::str::from_utf8(&up.body).with_context(|| {
+                    format!("upstream body for probe `{}` is not utf8", probe.name)
+                })?;
+                let su_body = std::str::from_utf8(&su.body).with_context(|| {
+                    format!("subject body for probe `{}` is not utf8", probe.name)
+                })?;
+                if up_body != NO_HEALTHY {
+                    bail!(
+                        "upstream Envoy NO_FALLBACK body mismatch for probe `{}` (path `{}`): \
+                                 expected `{NO_HEALTHY}`, got `{up_body}`",
+                        probe.name,
+                        probe.path,
+                    );
+                }
+                if su_body != NO_HEALTHY {
+                    bail!(
+                        "envoy-rust NO_FALLBACK body mismatch for probe `{}` (path `{}`): \
+                                 expected `{NO_HEALTHY}`, got `{su_body}`",
+                        probe.name,
+                        probe.path,
+                    );
+                }
+            }
+        }
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http1RdsReload` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http1_rds_reload_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    pre_probes: &[Http1Probe],
+    reload: &RdsReloadStep,
+    post_probes: &[Http1Probe],
+) -> Result<()> {
+    let FixtureCtx {
+        fixture_dir,
+        expectations,
+        upstream_addr,
+        subject_addr,
+        upstream_kvs_refs,
+        subject_kvs_refs,
+        upstream_rds_path,
+        subject_rds_path,
+        ..
+    } = *ctx;
+    // An RDS-reload fixture MUST carry an `rds.yaml` (the reload swaps
+    // the file-based RouteConfiguration). `subject_rds_path` is always
+    // bound, but its file only exists when the fixture is RDS-based.
+    if upstream_rds_path.is_none() {
+        bail!(
+            "Driver::Http1RdsReload requires a file-based RDS fixture \
+                     (no {{{{RDS_PATH}}}} marker / rds.yaml found)"
+        );
+    }
+
+    // 1. pre_probes — bilateral equivalence on the ORIGINAL table.
+    for probe in pre_probes {
+        run_http1_probe_bilateral(
+            upstream_addr,
+            subject_addr,
+            &expectations.equivalence,
+            probe,
+            "pre",
+        )
+        .await?;
+    }
+
+    // 2. Read + render the POST-reload RDS template per-side, exactly
+    //    like rds.yaml (same kv ref slices, same residual-marker guard).
+    let reload_tpl = std::fs::read_to_string(fixture_dir.join(&reload.reload_file))
+        .with_context(|| format!("reading RDS reload file {}", reload.reload_file))?;
+    let upstream_reload = render_yaml(&reload_tpl, upstream_kvs_refs);
+    let subject_reload = render_yaml(&reload_tpl, subject_kvs_refs);
+    if let Some(marker) = residual_marker(&upstream_reload) {
+        bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream reload RDS");
+    }
+    if let Some(marker) = residual_marker(&subject_reload) {
+        bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject reload RDS");
+    }
+
+    // 3. Reload BOTH sides via atomic-rename (the ONLY rewrite Envoy's
+    //    default file-watch observes — §6.2/ADR-0066). Subject = host
+    //    file; upstream = in-container file via docker exec.
+    atomic_rename_over(subject_rds_path, &subject_reload)
+        .context("atomic-rename of reloaded subject RDS file")?;
+    upstream
+        .reload_rds_atomic(&upstream_reload)
+        .await
+        .context("atomic-rename of reloaded upstream container RDS file")?;
+
+    // 4. Wait — bounded — for BOTH sides to converge on the new table,
+    //    polling the discriminator (its expected_status/body define
+    //    "converged"). NOT a fixed sleep.
+    let budget = Duration::from_millis(reload.settle_budget_ms);
+    wait_for_reload_convergence(upstream_addr, &reload.discriminator, budget)
+        .await
+        .context("upstream Envoy never converged on reloaded RDS table")?;
+    wait_for_reload_convergence(subject_addr, &reload.discriminator, budget)
+        .await
+        .context("envoy-rust never converged on reloaded RDS table")?;
+
+    // 5. post_probes — bilateral equivalence on the RELOADED table.
+    for probe in post_probes {
+        run_http1_probe_bilateral(
+            upstream_addr,
+            subject_addr,
+            &expectations.equivalence,
+            probe,
+            "post",
+        )
+        .await?;
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http1EdsReload` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http1_eds_reload_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    pre_probes: &[Http1Probe],
+    reload: &EdsReloadStep,
+    post_probes: &[Http1Probe],
+) -> Result<()> {
+    let FixtureCtx {
+        fixture_dir,
+        expectations,
+        upstream_addr,
+        subject_addr,
+        upstream_kvs_refs,
+        subject_kvs_refs,
+        upstream_eds_path,
+        subject_eds_path,
+        ..
+    } = *ctx;
+    // M26-2 GUARD (folds the phase-26 fix the RDS arm omitted): a
+    // discriminator with NEITHER expected_status NOR expected_body would
+    // make `wait_for_reload_convergence` return Ok on the FIRST poll
+    // (`status_ok && body_ok == true` with both absent), reporting
+    // spurious instant "convergence" before the reload took effect. Bail
+    // BEFORE driving anything.
+    if !eds_reload_discriminator_is_load_bearing(&reload.discriminator) {
+        bail!(
+            "Driver::Http1EdsReload discriminator {} carries neither \
+                     expected_status nor expected_body — it would report spurious \
+                     instant convergence (M26-2); the EDS-reload discriminator MUST \
+                     be load-bearing",
+            reload.discriminator.name,
+        );
+    }
+
+    // An EDS-reload fixture MUST carry an `eds.yaml` (the reload swaps the
+    // file-based ClusterLoadAssignment endpoint). `subject_eds_path` is
+    // always bound, but its file only exists when the fixture is EDS-based.
+    if upstream_eds_path.is_none() {
+        bail!(
+            "Driver::Http1EdsReload requires a file-based EDS fixture \
+                     (no {{{{EDS_PATH}}}} marker / eds.yaml found)"
+        );
+    }
+
+    // 1. pre_probes — bilateral equivalence on the ORIGINAL endpoint (backend_1).
+    for probe in pre_probes {
+        run_http1_probe_bilateral(
+            upstream_addr,
+            subject_addr,
+            &expectations.equivalence,
+            probe,
+            "pre",
+        )
+        .await?;
+    }
+
+    // 2. Read + render the POST-reload EDS template per-side, exactly
+    //    like eds.yaml (same kv ref slices, same residual-marker guard).
+    //    The per-side `{{EDS_BACKEND_IP}}` resolves to the numeric
+    //    host-gateway IP (upstream) vs `127.0.0.1` (subject) — EDS rejects
+    //    hostnames (L1), so the two renditions carry DIFFERENT numeric
+    //    endpoint addresses.
+    let reload_tpl = std::fs::read_to_string(fixture_dir.join(&reload.reload_file))
+        .with_context(|| format!("reading EDS reload file {}", reload.reload_file))?;
+    let upstream_reload = render_yaml(&reload_tpl, upstream_kvs_refs);
+    let subject_reload = render_yaml(&reload_tpl, subject_kvs_refs);
+    if let Some(marker) = residual_marker(&upstream_reload) {
+        bail!("unsubstituted marker {{{{{marker}}}}} in rendered upstream reload EDS");
+    }
+    if let Some(marker) = residual_marker(&subject_reload) {
+        bail!("unsubstituted marker {{{{{marker}}}}} in rendered subject reload EDS");
+    }
+
+    // 3. Reload BOTH sides via atomic-rename (the ONLY rewrite Envoy's
+    //    default file-watch observes — §6.2/ADR-0066). Subject = host
+    //    file; upstream = in-container file via docker exec.
+    atomic_rename_over(subject_eds_path, &subject_reload)
+        .context("atomic-rename of reloaded subject EDS file")?;
+    upstream
+        .reload_eds_atomic(&upstream_reload)
+        .await
+        .context("atomic-rename of reloaded upstream container EDS file")?;
+
+    // 4. Wait — bounded — for BOTH sides to converge on the new endpoint
+    //    set, polling the discriminator (its expected_status/body define
+    //    "converged"). NOT a fixed sleep.
+    let budget = Duration::from_millis(reload.settle_budget_ms);
+    wait_for_reload_convergence(upstream_addr, &reload.discriminator, budget)
+        .await
+        .context("upstream Envoy never converged on reloaded EDS endpoint set")?;
+    wait_for_reload_convergence(subject_addr, &reload.discriminator, budget)
+        .await
+        .context("envoy-rust never converged on reloaded EDS endpoint set")?;
+
+    // 5. post_probes — bilateral equivalence on the SWAPPED endpoint (backend_2).
+    for probe in post_probes {
+        run_http1_probe_bilateral(
+            upstream_addr,
+            subject_addr,
+            &expectations.equivalence,
+            probe,
+            "post",
+        )
+        .await?;
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http2ProbeList` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http2_probe_list_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    probes: &[Http1Probe],
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    for probe in probes {
+        let upstream_resp = drive_http2(
+            upstream_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+        )
+        .await
+        .with_context(|| format!("upstream envoy http2 drive (probe {})", probe.name))?;
+        let subject_resp = drive_http2(
+            subject_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+        )
+        .await
+        .with_context(|| format!("envoy-rust http2 drive (probe {})", probe.name))?;
+
+        // Status: envoy ↔ envoy-rust under `response_status: exact`.
+        if matches!(
+            expectations.equivalence.response_status,
+            Some(StatusRule::Exact)
+        ) && upstream_resp.status != subject_resp.status
+        {
+            bail!(
+                "probe {}: response status mismatch under `response_status: exact`\n  \
+                         upstream: {}\n  subject:  {}",
+                probe.name,
+                upstream_resp.status,
+                subject_resp.status,
+            );
+        }
+        if let Some(es) = probe.expected_status {
+            if upstream_resp.status != es {
+                bail!(
+                    "probe {}: upstream status {} != expected {}",
+                    probe.name,
+                    upstream_resp.status,
+                    es,
+                );
+            }
+            if subject_resp.status != es {
+                bail!(
+                    "probe {}: subject status {} != expected {}",
+                    probe.name,
+                    subject_resp.status,
+                    es,
+                );
+            }
+        }
+
+        // Body. Route through `assert_body_rule` (mirrors the
+        // Http1ProbeList arm).
+        if let Some(rule) = &expectations.equivalence.response_body {
+            assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)
+                .with_context(|| format!("probe {}", probe.name))?;
+        }
+        if let Some(Http1BodyRule::ByteExact { body }) = &probe.expected_body {
+            let expected = body.as_bytes();
+            if upstream_resp.body != expected {
+                bail!(
+                    "probe {}: upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                    probe.name,
+                    upstream_resp.body,
+                    expected,
+                );
+            }
+            if subject_resp.body != expected {
+                bail!(
+                    "probe {}: subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                    probe.name,
+                    subject_resp.body,
+                    expected,
+                );
+            }
+        }
+
+        // Headers.
+        if matches!(
+            probe.expected_headers,
+            Some(Http1HeaderRule::SetEqualModuloAllowList)
+        ) {
+            diff_headers(
+                &upstream_resp.headers,
+                &subject_resp.headers,
+                HEADER_ALLOW_LIST,
+            )
+            .with_context(|| format!("probe {}: diff_headers", probe.name))?;
+        }
+    }
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    Ok(())
+}
+
+/// `Driver::Http1WithAccessLog` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+// The parameter list mirrors the `Driver` variant's fields, threaded straight
+// from the `run_fixture` dispatcher; bundling them into a struct would add
+// indirection without clarifying the dispatch (same disposition as
+// `upstream::start`).
+#[allow(clippy::too_many_arguments)]
+async fn run_http1_with_access_log_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    method: &str,
+    path: &str,
+    host: &str,
+    expected_status: &u16,
+    expected_body: &BodyRule,
+    expected_headers: &HeaderRule,
+    extra_headers: &[(String, String)],
+    expected_access_log_paths: &AccessLogPaths,
+    expected_access_log_lines: &[Vec<crate::access_log::AccessLogLineRule>],
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    // Wire-protocol leg: reuse drive_http1 unchanged from 04.1.
+    // `Http1Method` is the harness's narrow GET-only enum today;
+    // mirror the conversion shape used by `drive_admin_scrape`.
+    let http1_method = match method {
+        "GET" => Http1Method::Get,
+        other => bail!("Driver::Http1WithAccessLog: unsupported method {:?}", other),
+    };
+    let upstream_resp = drive_http1(
+        upstream_addr,
+        &http1_method,
+        path,
+        host,
+        extra_headers,
+        None,
+    )
+    .await
+    .context("upstream envoy http1 drive (Http1WithAccessLog)")?;
+    let subject_resp = drive_http1(subject_addr, &http1_method, path, host, extra_headers, None)
+        .await
+        .context("envoy-rust http1 drive (Http1WithAccessLog)")?;
+
+    // envoy-rust's access-log emit is a fire-and-forget task that runs after the
+    // response completes; subject.shutdown() is SIGKILL (subject.rs TODO on
+    // graceful drain). Wait for the line to land BEFORE killing the process —
+    // CI run 27059869720 lost the race (`envoy=1 envoy-rust=0`) because the old
+    // post-shutdown poll could never observe a write from a dead process.
+    let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+    if !wait_file_nonempty(&envoy_rust_path, std::time::Duration::from_secs(5)).await {
+        tracing::warn!(
+            "differential: envoy-rust access-log file {} still empty after 5s (pre-shutdown wait)",
+            envoy_rust_path.display()
+        );
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    // Status: per-driver `expected_status` — each side independently
+    // equals the value (the Http1WithAccessLog variant requires it,
+    // unlike Http1's Option<u16>).
+    if upstream_resp.status != *expected_status {
+        bail!(
+            "upstream status {} != expected {}",
+            upstream_resp.status,
+            expected_status,
+        );
+    }
+    if subject_resp.status != *expected_status {
+        bail!(
+            "subject status {} != expected {}",
+            subject_resp.status,
+            expected_status,
+        );
+    }
+
+    // Body: envoy ↔ envoy-rust via `assert_body_rule` (mirrors the
+    // Http1 arm). The `expected_body: BodyRule` is required (not
+    // Option), so dispatch unconditionally.
+    assert_body_rule(expected_body, &upstream_resp.body, &subject_resp.body)?;
+
+    // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
+    // `expected_headers: HeaderRule` is required; the only variant
+    // today is `SetEqualModuloAllowList` (matches Http1HeaderRule's
+    // sole variant).
+    match expected_headers {
+        HeaderRule::SetEqualModuloAllowList => {
+            diff_headers(
+                &upstream_resp.headers,
+                &subject_resp.headers,
+                HEADER_ALLOW_LIST,
+            )
+            .context("diff_headers (set_equal_modulo_allow_list)")?;
+        }
+    }
+
+    // Envoy-side flush is driven by container stop (SIGTERM) above. The
+    // non-empty poll (rather than an exists check) preserves the fix for CI run
+    // 26375100437: the FileSink creates the file at open time, so existence
+    // alone does not imply the line landed.
+    let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
+    if !wait_file_nonempty(&envoy_path, std::time::Duration::from_secs(5)).await {
+        tracing::warn!(
+            "differential: envoy access-log file {} still empty after 5s (post container-stop wait)",
+            envoy_path.display()
+        );
+    }
+    // One final yield to let the OS flush any in-flight bytes that crossed the
+    // metadata-len threshold but haven't fully landed.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let envoy_contents = std::fs::read_to_string(&envoy_path)
+        .with_context(|| format!("read envoy access-log file at {}", envoy_path.display()))?;
+    let envoy_rust_contents = std::fs::read_to_string(&envoy_rust_path).with_context(|| {
+        format!(
+            "read envoy-rust access-log file at {}",
+            envoy_rust_path.display()
+        )
+    })?;
+    let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
+    let envoy_rust_lines: Vec<String> = envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
+
+    crate::access_log::assert_access_log_lines_equivalent(
+        &envoy_lines,
+        &envoy_rust_lines,
+        expected_access_log_lines,
+    )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "access log mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
+            e,
+            envoy_lines,
+            envoy_rust_lines,
+        )
+    })?;
+    Ok(())
+}
+
+/// `Driver::Http1AccessLogByteExact` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http1_access_log_byte_exact_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    probes: &[AccessLogByteExactProbe],
+    expected_access_log_paths: &AccessLogPaths,
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    let expected_lines = probes.len();
+
+    // Drive each probe in order against BOTH proxies. Reuse the exact
+    // request build (`drive_http1`) the `Http1WithAccessLog` arm uses;
+    // assert each side's status matches the probe's `expected_status`.
+    for (idx, probe) in probes.iter().enumerate() {
+        let body: Option<&[u8]> = probe.body.as_deref().map(|s| s.as_bytes());
+        let upstream_resp = drive_http1(
+            upstream_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+            body,
+        )
+        .await
+        .with_context(|| {
+            format!("upstream envoy http1 drive (Http1AccessLogByteExact probe {idx})")
+        })?;
+        let subject_resp = drive_http1(
+            subject_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+            body,
+        )
+        .await
+        .with_context(|| format!("envoy-rust http1 drive (Http1AccessLogByteExact probe {idx})"))?;
+        if upstream_resp.status != probe.expected_status {
+            bail!(
+                "probe {idx}: upstream status {} != expected {}",
+                upstream_resp.status,
+                probe.expected_status,
+            );
+        }
+        if subject_resp.status != probe.expected_status {
+            bail!(
+                "probe {idx}: subject status {} != expected {}",
+                subject_resp.status,
+                probe.expected_status,
+            );
+        }
+    }
+
+    // envoy-rust's access-log emit is fire-and-forget; wait for all N
+    // lines to land BEFORE shutdown (SIGKILL) — mirrors the
+    // `Http1WithAccessLog` pre-shutdown wait, generalised to N lines.
+    let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+    // Budget generously: Envoy's FileAccessLog flushes on a periodic
+    // timer (~10s default) rather than per-record, so a multi-probe
+    // scrape must outlast one flush cycle (a 5s budget saw only the
+    // first, already-flushed line — CI/local observed).
+    if !wait_file_lines(&envoy_rust_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+        tracing::warn!(
+            "differential: envoy-rust access-log file {} still has < {} lines after {:?} (pre-shutdown wait)",
+            envoy_rust_path.display(),
+            expected_lines,
+            ACCESS_LOG_FLUSH_WAIT,
+        );
+    }
+
+    // Wait for the upstream-Envoy file to reach all N lines BEFORE
+    // stopping the container. Envoy's FileAccessLog buffers and flushes
+    // on a periodic timer; testcontainers tears the container down with
+    // `docker rm -f` (SIGKILL, no graceful drain), so any line still
+    // buffered at stop is LOST. Polling while the container is alive
+    // lets the flush timer fire and land all N lines (CI-observed: a
+    // post-stop wait saw only the first, already-flushed line).
+    let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
+    if !wait_file_lines(&envoy_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+        tracing::warn!(
+            "differential: envoy access-log file {} still has < {} lines after {:?} (pre-stop wait)",
+            envoy_path.display(),
+            expected_lines,
+            ACCESS_LOG_FLUSH_WAIT,
+        );
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    // One final yield to let the OS flush any in-flight bytes.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let envoy_contents = std::fs::read_to_string(&envoy_path)
+        .with_context(|| format!("read envoy access-log file at {}", envoy_path.display()))?;
+    let envoy_rust_contents = std::fs::read_to_string(&envoy_rust_path).with_context(|| {
+        format!(
+            "read envoy-rust access-log file at {}",
+            envoy_rust_path.display()
+        )
+    })?;
+    let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
+    let envoy_rust_lines: Vec<String> = envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
+
+    // Each probe emits exactly one access-log line.
+    if envoy_lines.len() != expected_lines {
+        bail!(
+            "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            envoy_lines.len(),
+            expected_lines,
+            envoy_lines,
+        );
+    }
+    if envoy_rust_lines.len() != expected_lines {
+        bail!(
+            "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            envoy_rust_lines.len(),
+            expected_lines,
+            envoy_rust_lines,
+        );
+    }
+
+    crate::access_log::assert_access_log_lines_byte_identical(&envoy_lines, &envoy_rust_lines)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "access log byte-exact mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
+                e,
+                envoy_lines,
+                envoy_rust_lines,
+            )
+        })?;
+    Ok(())
+}
+
+/// `Driver::Http2AccessLogByteExact` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_http2_access_log_byte_exact_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    probes: &[AccessLogByteExactProbe],
+    expected_access_log_paths: &AccessLogPaths,
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    let expected_lines = probes.len();
+
+    for (idx, probe) in probes.iter().enumerate() {
+        let upstream_resp = drive_http2(
+            upstream_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+        )
+        .await
+        .with_context(|| {
+            format!("upstream envoy http2 drive (Http2AccessLogByteExact probe {idx})")
+        })?;
+        let subject_resp = drive_http2(
+            subject_addr,
+            &probe.method,
+            &probe.path,
+            &probe.host,
+            &probe.extra_headers,
+        )
+        .await
+        .with_context(|| format!("envoy-rust http2 drive (Http2AccessLogByteExact probe {idx})"))?;
+        if upstream_resp.status != probe.expected_status {
+            bail!(
+                "probe {idx}: upstream status {} != expected {}",
+                upstream_resp.status,
+                probe.expected_status,
+            );
+        }
+        if subject_resp.status != probe.expected_status {
+            bail!(
+                "probe {idx}: subject status {} != expected {}",
+                subject_resp.status,
+                probe.expected_status,
+            );
+        }
+    }
+
+    let envoy_rust_path = std::path::PathBuf::from(&expected_access_log_paths.envoy_rust);
+    if !wait_file_lines(&envoy_rust_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+        tracing::warn!(
+            "differential: envoy-rust access-log file {} still has < {} lines after {:?} (pre-shutdown wait)",
+            envoy_rust_path.display(),
+            expected_lines,
+            ACCESS_LOG_FLUSH_WAIT,
+        );
+    }
+
+    let envoy_path = std::path::PathBuf::from(&expected_access_log_paths.envoy);
+    if !wait_file_lines(&envoy_path, expected_lines, ACCESS_LOG_FLUSH_WAIT).await {
+        tracing::warn!(
+            "differential: envoy access-log file {} still has < {} lines after {:?} (pre-stop wait)",
+            envoy_path.display(),
+            expected_lines,
+            ACCESS_LOG_FLUSH_WAIT,
+        );
+    }
+
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let envoy_contents = std::fs::read_to_string(&envoy_path)
+        .with_context(|| format!("read envoy access-log file at {}", envoy_path.display()))?;
+    let envoy_rust_contents = std::fs::read_to_string(&envoy_rust_path).with_context(|| {
+        format!(
+            "read envoy-rust access-log file at {}",
+            envoy_rust_path.display()
+        )
+    })?;
+    let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
+    let envoy_rust_lines: Vec<String> = envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
+
+    if envoy_lines.len() != expected_lines {
+        bail!(
+            "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            envoy_lines.len(),
+            expected_lines,
+            envoy_lines,
+        );
+    }
+    if envoy_rust_lines.len() != expected_lines {
+        bail!(
+            "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            envoy_rust_lines.len(),
+            expected_lines,
+            envoy_rust_lines,
+        );
+    }
+
+    crate::access_log::assert_access_log_lines_byte_identical(&envoy_lines, &envoy_rust_lines)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "access log byte-exact mismatch: {}\nenvoy lines: {:?}\nenvoy-rust lines: {:?}",
+                e,
+                envoy_lines,
+                envoy_rust_lines,
+            )
+        })?;
+    Ok(())
+}
+
+/// `Driver::Http2` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+// The parameter list mirrors the `Driver` variant's fields, threaded straight
+// from the `run_fixture` dispatcher; bundling them into a struct would add
+// indirection without clarifying the dispatch (same disposition as
+// `upstream::start`).
+#[allow(clippy::too_many_arguments)]
+async fn run_http2_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    method: &Http1Method,
+    path: &str,
+    host: &str,
+    expected_status: &Option<u16>,
+    expected_body: &Option<Http1BodyRule>,
+    expected_headers: &Option<Http1HeaderRule>,
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    let upstream_resp = drive_http2(upstream_addr, method, path, host, &[])
+        .await
+        .context("upstream envoy http2 drive")?;
+    let subject_resp = drive_http2(subject_addr, method, path, host, &[])
+        .await
+        .context("envoy-rust http2 drive")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    // Status: envoy ↔ envoy-rust under `response_status: exact`.
+    if matches!(
+        expectations.equivalence.response_status,
+        Some(StatusRule::Exact)
+    ) && upstream_resp.status != subject_resp.status
+    {
+        bail!(
+            "response status mismatch under `response_status: exact`\n  \
+                     upstream: {}\n  subject:  {}",
+            upstream_resp.status,
+            subject_resp.status,
+        );
+    }
+    // Per-driver `expected_status`: each side independently equals it.
+    if let Some(es) = expected_status {
+        if upstream_resp.status != *es {
+            bail!(
+                "upstream status {} != expected {}",
+                upstream_resp.status,
+                es,
+            );
+        }
+        if subject_resp.status != *es {
+            bail!("subject status {} != expected {}", subject_resp.status, es,);
+        }
+    }
+
+    // Body: envoy ↔ envoy-rust per `equivalence.response_body` rule.
+    // 06.1 Task 13 carryforward: route through `assert_body_rule` (see
+    // Driver::Http1 arm above for rationale).
+    if let Some(rule) = &expectations.equivalence.response_body {
+        assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
+    }
+    // Per-driver `expected_body`: each side independently equals bytes.
+    if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
+        let expected = body.as_bytes();
+        if upstream_resp.body != expected {
+            bail!(
+                "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                upstream_resp.body,
+                expected,
+            );
+        }
+        if subject_resp.body != expected {
+            bail!(
+                "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                subject_resp.body,
+                expected,
+            );
+        }
+    }
+
+    // Headers: per-driver allow-list diff between envoy ↔ envoy-rust.
+    if matches!(
+        expected_headers,
+        Some(Http1HeaderRule::SetEqualModuloAllowList)
+    ) {
+        diff_headers(
+            &upstream_resp.headers,
+            &subject_resp.headers,
+            HEADER_ALLOW_LIST,
+        )
+        .context("diff_headers (set_equal_modulo_allow_list)")?;
+    }
+    Ok(())
+}
+
+/// `Driver::AdminScrape` arm of `run_fixture` — extracted verbatim (pure code
+/// motion; the arm-level rationale comments remain at the dispatch site).
+async fn run_admin_scrape_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    pre_admin_actions: &[AdminAction],
+    pre_requests: &[PreRequest],
+    scrapes: &[AdminScrapeCase],
+    post_admin_assertions: &[AdminAssertion],
+) -> Result<()> {
+    let FixtureCtx {
+        upstream_addr,
+        subject_addr,
+        admin_host_port,
+        budget,
+        ..
+    } = *ctx;
+    if scrapes.is_empty() {
+        bail!("Driver::AdminScrape requires at least one sub-case (`scrapes:` must be non-empty)");
+    }
+    let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Driver::AdminScrape requires the upstream container to expose its admin port; either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness failed to wire `expose_admin_port = true`",
                 )
             })?;
-            let subject_admin_port = admin_host_port.ok_or_else(|| {
+    let subject_admin_port = admin_host_port.ok_or_else(|| {
                 anyhow::anyhow!(
                     "Driver::AdminScrape requires the subject's envoy-rust.yaml to reference {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the templates contains the marker",
                 )
             })?;
-            let upstream_admin_addr: SocketAddr =
-                format!("127.0.0.1:{upstream_admin_port}").parse()?;
-            let subject_admin_addr: SocketAddr =
-                format!("127.0.0.1:{subject_admin_port}").parse()?;
-            wait_accept_ready(upstream_admin_addr, budget)
-                .await
-                .context("upstream admin listener never became accept-ready")?;
-            wait_accept_ready(subject_admin_addr, budget)
-                .await
-                .context("envoy-rust admin listener never became accept-ready")?;
+    let upstream_admin_addr: SocketAddr = format!("127.0.0.1:{upstream_admin_port}").parse()?;
+    let subject_admin_addr: SocketAddr = format!("127.0.0.1:{subject_admin_port}").parse()?;
+    wait_accept_ready(upstream_admin_addr, budget)
+        .await
+        .context("upstream admin listener never became accept-ready")?;
+    wait_accept_ready(subject_admin_addr, budget)
+        .await
+        .context("envoy-rust admin listener never became accept-ready")?;
 
-            // Per-side HCM port maps. Today only `"PORT"` is populated; the
-            // map shape matches the existing template-marker discipline so
-            // future fixtures with multiple HCM listeners slot in without
-            // harness churn.
-            let mut upstream_hcm = std::collections::BTreeMap::new();
-            upstream_hcm.insert("PORT".to_string(), upstream_addr);
-            let mut subject_hcm = std::collections::BTreeMap::new();
-            subject_hcm.insert("PORT".to_string(), subject_addr);
+    // Per-side HCM port maps. Today only `"PORT"` is populated; the
+    // map shape matches the existing template-marker discipline so
+    // future fixtures with multiple HCM listeners slot in without
+    // harness churn.
+    let mut upstream_hcm = std::collections::BTreeMap::new();
+    upstream_hcm.insert("PORT".to_string(), upstream_addr);
+    let mut subject_hcm = std::collections::BTreeMap::new();
+    subject_hcm.insert("PORT".to_string(), subject_addr);
 
-            // 08.2 Task 7 (D16) temporal dispatch sequence per PLAN
-            // architecture-decision lock-in #18:
-            //
-            //   1. pre_requests          — HCM-side traffic so the
-            //                              registry has counters
-            //                              incremented (pre-drain
-            //                              baseline).
-            //   2. pre_admin_actions     — POSTs against the admin
-            //                              listener (e.g. fixture
-            //                              0015's `/drain_listeners`
-            //                              trigger).
-            //   3. scrapes               — GETs against the admin
-            //                              listener (post-drain state
-            //                              assertions).
-            //   4. post_admin_assertions — wire-level invariants (e.g.
-            //                              fixture 0015's
-            //                              `data_plane_connection_refused`).
-            //
-            // The YAML field order (`pre_admin_actions` declared
-            // BEFORE `pre_requests` in the struct definition) is
-            // independent of this temporal order. The YAML shape is
-            // for reader ergonomics (drain trigger at the top of the
-            // block); the temporal order is for fixture-semantic
-            // correctness ("verify baseline → drain → verify
-            // post-drain state → wire-level assertion").
-            //
-            // STEP 1: pre_requests. Drive each HCM-side pre-request
-            // against BOTH proxies, then sleep ~50ms (SPEC §6
-            // signpost 11) to let the registry's Relaxed-ordered
-            // counter writes become visible to subsequent scrapes.
-            // Extracted out of the scrape loop so it precedes
-            // pre_admin_actions; the per-side dispatch shape mirrors
-            // `drive_admin_scrape`'s internal pre-request handling
-            // verbatim. (When `pre_requests.is_empty()`, both the
-            // dispatch loop and the visibility sleep are skipped.)
-            for pre in pre_requests {
-                let method = match pre.method.to_ascii_uppercase().as_str() {
-                    "GET" => Http1Method::Get,
-                    other => bail!(
-                        "PreRequest.method {other:?} not supported (only GET); widen drive_admin_scrape to add more"
-                    ),
-                };
-                let upstream_pre_addr = *upstream_hcm.get(&pre.port_key).ok_or_else(|| {
-                    anyhow::anyhow!("unknown PreRequest.port_key on upstream: {}", pre.port_key)
-                })?;
-                let subject_pre_addr = *subject_hcm.get(&pre.port_key).ok_or_else(|| {
-                    anyhow::anyhow!("unknown PreRequest.port_key on subject: {}", pre.port_key)
-                })?;
-                drive_http1(upstream_pre_addr, &method, &pre.path, &pre.host, &[], None)
+    // 08.2 Task 7 (D16) temporal dispatch sequence per PLAN
+    // architecture-decision lock-in #18:
+    //
+    //   1. pre_requests          — HCM-side traffic so the
+    //                              registry has counters
+    //                              incremented (pre-drain
+    //                              baseline).
+    //   2. pre_admin_actions     — POSTs against the admin
+    //                              listener (e.g. fixture
+    //                              0015's `/drain_listeners`
+    //                              trigger).
+    //   3. scrapes               — GETs against the admin
+    //                              listener (post-drain state
+    //                              assertions).
+    //   4. post_admin_assertions — wire-level invariants (e.g.
+    //                              fixture 0015's
+    //                              `data_plane_connection_refused`).
+    //
+    // The YAML field order (`pre_admin_actions` declared
+    // BEFORE `pre_requests` in the struct definition) is
+    // independent of this temporal order. The YAML shape is
+    // for reader ergonomics (drain trigger at the top of the
+    // block); the temporal order is for fixture-semantic
+    // correctness ("verify baseline → drain → verify
+    // post-drain state → wire-level assertion").
+    //
+    // STEP 1: pre_requests. Drive each HCM-side pre-request
+    // against BOTH proxies, then sleep ~50ms (SPEC §6
+    // signpost 11) to let the registry's Relaxed-ordered
+    // counter writes become visible to subsequent scrapes.
+    // Extracted out of the scrape loop so it precedes
+    // pre_admin_actions; the per-side dispatch shape mirrors
+    // `drive_admin_scrape`'s internal pre-request handling
+    // verbatim. (When `pre_requests.is_empty()`, both the
+    // dispatch loop and the visibility sleep are skipped.)
+    for pre in pre_requests {
+        let method = match pre.method.to_ascii_uppercase().as_str() {
+            "GET" => Http1Method::Get,
+            other => bail!(
+                "PreRequest.method {other:?} not supported (only GET); widen drive_admin_scrape to add more"
+            ),
+        };
+        let upstream_pre_addr = *upstream_hcm.get(&pre.port_key).ok_or_else(|| {
+            anyhow::anyhow!("unknown PreRequest.port_key on upstream: {}", pre.port_key)
+        })?;
+        let subject_pre_addr = *subject_hcm.get(&pre.port_key).ok_or_else(|| {
+            anyhow::anyhow!("unknown PreRequest.port_key on subject: {}", pre.port_key)
+        })?;
+        drive_http1(upstream_pre_addr, &method, &pre.path, &pre.host, &[], None)
+            .await
+            .with_context(|| {
+                format!(
+                    "upstream envoy pre-request {} {} (host={}, port_key={})",
+                    pre.method, pre.path, pre.host, pre.port_key,
+                )
+            })?;
+        drive_http1(subject_pre_addr, &method, &pre.path, &pre.host, &[], None)
+            .await
+            .with_context(|| {
+                format!(
+                    "envoy-rust pre-request {} {} (host={}, port_key={})",
+                    pre.method, pre.path, pre.host, pre.port_key,
+                )
+            })?;
+    }
+    if !pre_requests.is_empty() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // STEP 2: pre_admin_actions — POSTs against BOTH proxies'
+    // admin listeners. Each action is dispatched serially per
+    // proxy with anyhow context tags naming the side and the
+    // action path.
+    for action in pre_admin_actions {
+        match action {
+            AdminAction::Post {
+                path,
+                expected_status,
+            } => {
+                drive_admin_post(upstream_admin_addr, path, *expected_status)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "upstream envoy pre-request {} {} (host={}, port_key={})",
-                            pre.method, pre.path, pre.host, pre.port_key,
-                        )
-                    })?;
-                drive_http1(subject_pre_addr, &method, &pre.path, &pre.host, &[], None)
+                    .with_context(|| format!("upstream envoy pre_admin_action POST {path}"))?;
+                drive_admin_post(subject_admin_addr, path, *expected_status)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "envoy-rust pre-request {} {} (host={}, port_key={})",
-                            pre.method, pre.path, pre.host, pre.port_key,
-                        )
-                    })?;
+                    .with_context(|| format!("envoy-rust pre_admin_action POST {path}"))?;
             }
-            if !pre_requests.is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+        }
+    }
 
-            // STEP 2: pre_admin_actions — POSTs against BOTH proxies'
-            // admin listeners. Each action is dispatched serially per
-            // proxy with anyhow context tags naming the side and the
-            // action path.
-            for action in pre_admin_actions {
-                match action {
-                    AdminAction::Post {
-                        path,
-                        expected_status,
-                    } => {
-                        drive_admin_post(upstream_admin_addr, path, *expected_status)
-                            .await
-                            .with_context(|| {
-                                format!("upstream envoy pre_admin_action POST {path}")
-                            })?;
-                        drive_admin_post(subject_admin_addr, path, *expected_status)
-                            .await
-                            .with_context(|| format!("envoy-rust pre_admin_action POST {path}"))?;
-                    }
-                }
-            }
+    // STEP 3: the scrape loop. pre_requests already fired in
+    // STEP 1; pass `&[]` so drive_admin_scrape skips its
+    // bundled pre-request + visibility-sleep path.
+    let pre: &[PreRequest] = &[];
+    let mut results = Vec::with_capacity(scrapes.len());
+    for case in scrapes {
+        let upstream_resp = drive_admin_scrape(pre, upstream_admin_addr, &upstream_hcm, &case.path)
+            .await
+            .with_context(|| format!("upstream envoy admin scrape: {}", case.path))?;
+        let subject_resp = drive_admin_scrape(pre, subject_admin_addr, &subject_hcm, &case.path)
+            .await
+            .with_context(|| format!("envoy-rust admin scrape: {}", case.path))?;
+        results.push((case, upstream_resp, subject_resp));
+    }
 
-            // STEP 3: the scrape loop. pre_requests already fired in
-            // STEP 1; pass `&[]` so drive_admin_scrape skips its
-            // bundled pre-request + visibility-sleep path.
-            let pre: &[PreRequest] = &[];
-            let mut results = Vec::with_capacity(scrapes.len());
-            for case in scrapes {
-                let upstream_resp =
-                    drive_admin_scrape(pre, upstream_admin_addr, &upstream_hcm, &case.path)
-                        .await
-                        .with_context(|| format!("upstream envoy admin scrape: {}", case.path))?;
-                let subject_resp =
-                    drive_admin_scrape(pre, subject_admin_addr, &subject_hcm, &case.path)
-                        .await
-                        .with_context(|| format!("envoy-rust admin scrape: {}", case.path))?;
-                results.push((case, upstream_resp, subject_resp));
-            }
+    // 08.1 Task 11 diagnostic: set `DIFFERENTIAL_DUMP_ADMIN=1`
+    // to dump ALL sub-cases' bodies (both sides + content-type)
+    // BEFORE any assertion fires. Used during empirical allow-list
+    // seeding (SPEC §6 signpost 12) to capture both proxies'
+    // outputs in a single failing run rather than iterating
+    // assertion-by-assertion. Leave-on disposition matches the
+    // dispatch-level diagnostics established by 04.x's
+    // RUST_LOG-controlled tracing layer.
+    if std::env::var("DIFFERENTIAL_DUMP_ADMIN").is_ok() {
+        for (case, upstream_resp, subject_resp) in &results {
+            eprintln!(
+                "=== {} ===\n--- ENVOY ({}, ct={:?}) ---\n{}\n--- ENVOY-RUST ({}, ct={:?}) ---\n{}\n=== /{} ===",
+                case.path,
+                upstream_resp.status,
+                upstream_resp
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or(""),
+                String::from_utf8_lossy(&upstream_resp.body),
+                subject_resp.status,
+                subject_resp
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or(""),
+                String::from_utf8_lossy(&subject_resp.body),
+                case.path,
+            );
+        }
+    }
+    for (case, upstream_resp, subject_resp) in &results {
+        assert_admin_scrape_case(case, upstream_resp, subject_resp)?;
+    }
 
-            // 08.1 Task 11 diagnostic: set `DIFFERENTIAL_DUMP_ADMIN=1`
-            // to dump ALL sub-cases' bodies (both sides + content-type)
-            // BEFORE any assertion fires. Used during empirical allow-list
-            // seeding (SPEC §6 signpost 12) to capture both proxies'
-            // outputs in a single failing run rather than iterating
-            // assertion-by-assertion. Leave-on disposition matches the
-            // dispatch-level diagnostics established by 04.x's
-            // RUST_LOG-controlled tracing layer.
-            if std::env::var("DIFFERENTIAL_DUMP_ADMIN").is_ok() {
-                for (case, upstream_resp, subject_resp) in &results {
-                    eprintln!(
-                        "=== {} ===\n--- ENVOY ({}, ct={:?}) ---\n{}\n--- ENVOY-RUST ({}, ct={:?}) ---\n{}\n=== /{} ===",
-                        case.path,
-                        upstream_resp.status,
-                        upstream_resp
-                            .headers
-                            .iter()
-                            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                            .map(|(_, v)| v.as_str())
-                            .unwrap_or(""),
-                        String::from_utf8_lossy(&upstream_resp.body),
-                        subject_resp.status,
-                        subject_resp
-                            .headers
-                            .iter()
-                            .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-                            .map(|(_, v)| v.as_str())
-                            .unwrap_or(""),
-                        String::from_utf8_lossy(&subject_resp.body),
-                        case.path,
-                    );
-                }
-            }
-            for (case, upstream_resp, subject_resp) in &results {
-                assert_admin_scrape_case(case, upstream_resp, subject_resp)?;
-            }
-
-            // STEP 4: post_admin_assertions — wire-level invariants
-            // verified AFTER the scrape loop. Today's only variant
-            // (`DataPlaneConnectionRefused`) probes a data-plane
-            // listener address with a poll loop and accepts either
-            // ECONNREFUSED or an immediate-EOF connect as evidence the
-            // listener is drained. Per architecture-decision lock-in
-            // #18, this is the final step in the temporal sequence —
-            // fired BEFORE the subject/upstream teardown so the
-            // data-plane addresses are still live (drained-but-live;
-            // post-drain "kernel-refused" is the success signal).
-            //
-            // Per-side dispatch (08.2 Task 8 extension): the YAML
-            // `listener_address` is template-rendered per-side via the
-            // `{{PORT}}` + `{{ADMIN_PORT}}` markers — `{{PORT}}` resolves
-            // to the side's HCM data-plane port (from
-            // `upstream_hcm` / `subject_hcm`), `{{ADMIN_PORT}}` resolves
-            // to the side's admin port (`upstream_admin_port` /
-            // `subject_admin_port`). Both sides are probed; the
-            // assertion succeeds only if BOTH proxies refuse the
-            // connection within `within_ms`. A YAML address with no
-            // markers (a fully-formed `host:port` literal) is probed
-            // verbatim on BOTH sides — useful for fixtures where
-            // upstream + subject share an address shape, and the
-            // backward-compatible shape for Task 7's existing literal-
-            // address tests at the parsing layer. The template-render
-            // mirrors the existing `render_yaml` mechanism used to
-            // substitute `{{PORT}}` / `{{ADMIN_PORT}}` in the fixture
-            // YAMLs at config-load time; we re-use the same marker
-            // grammar here so a fixture author writes one address
-            // template and gets per-side resolution for free.
-            for assertion in post_admin_assertions {
-                match assertion {
-                    AdminAssertion::DataPlaneConnectionRefused {
-                        listener_address,
-                        within_ms,
-                    } => {
-                        let upstream_addr_s = listener_address
-                            .replace("{{PORT}}", &upstream_addr.port().to_string())
-                            .replace("{{ADMIN_PORT}}", &upstream_admin_port.to_string());
-                        let subject_addr_s = listener_address
-                            .replace("{{PORT}}", &subject_addr.port().to_string())
-                            .replace("{{ADMIN_PORT}}", &subject_admin_port.to_string());
-                        let upstream_parsed: SocketAddr = upstream_addr_s
+    // STEP 4: post_admin_assertions — wire-level invariants
+    // verified AFTER the scrape loop. Today's only variant
+    // (`DataPlaneConnectionRefused`) probes a data-plane
+    // listener address with a poll loop and accepts either
+    // ECONNREFUSED or an immediate-EOF connect as evidence the
+    // listener is drained. Per architecture-decision lock-in
+    // #18, this is the final step in the temporal sequence —
+    // fired BEFORE the subject/upstream teardown so the
+    // data-plane addresses are still live (drained-but-live;
+    // post-drain "kernel-refused" is the success signal).
+    //
+    // Per-side dispatch (08.2 Task 8 extension): the YAML
+    // `listener_address` is template-rendered per-side via the
+    // `{{PORT}}` + `{{ADMIN_PORT}}` markers — `{{PORT}}` resolves
+    // to the side's HCM data-plane port (from
+    // `upstream_hcm` / `subject_hcm`), `{{ADMIN_PORT}}` resolves
+    // to the side's admin port (`upstream_admin_port` /
+    // `subject_admin_port`). Both sides are probed; the
+    // assertion succeeds only if BOTH proxies refuse the
+    // connection within `within_ms`. A YAML address with no
+    // markers (a fully-formed `host:port` literal) is probed
+    // verbatim on BOTH sides — useful for fixtures where
+    // upstream + subject share an address shape, and the
+    // backward-compatible shape for Task 7's existing literal-
+    // address tests at the parsing layer. The template-render
+    // mirrors the existing `render_yaml` mechanism used to
+    // substitute `{{PORT}}` / `{{ADMIN_PORT}}` in the fixture
+    // YAMLs at config-load time; we re-use the same marker
+    // grammar here so a fixture author writes one address
+    // template and gets per-side resolution for free.
+    for assertion in post_admin_assertions {
+        match assertion {
+            AdminAssertion::DataPlaneConnectionRefused {
+                listener_address,
+                within_ms,
+            } => {
+                let upstream_addr_s = listener_address
+                    .replace("{{PORT}}", &upstream_addr.port().to_string())
+                    .replace("{{ADMIN_PORT}}", &upstream_admin_port.to_string());
+                let subject_addr_s = listener_address
+                    .replace("{{PORT}}", &subject_addr.port().to_string())
+                    .replace("{{ADMIN_PORT}}", &subject_admin_port.to_string());
+                let upstream_parsed: SocketAddr = upstream_addr_s
                             .parse()
                             .with_context(|| {
                                 format!(
                                     "parsing post_admin_assertion upstream listener_address {upstream_addr_s:?} (template {listener_address:?})",
                                 )
                             })?;
-                        let subject_parsed: SocketAddr = subject_addr_s
+                let subject_parsed: SocketAddr = subject_addr_s
                             .parse()
                             .with_context(|| {
                                 format!(
                                     "parsing post_admin_assertion subject listener_address {subject_addr_s:?} (template {listener_address:?})",
                                 )
                             })?;
-                        let within = Duration::from_millis(*within_ms);
-                        assert_data_plane_connection_refused(upstream_parsed, within)
+                let within = Duration::from_millis(*within_ms);
+                assert_data_plane_connection_refused(upstream_parsed, within)
                             .await
                             .with_context(|| {
                                 format!(
                                     "post_admin_assertion: upstream data_plane_connection_refused {upstream_addr_s} (template {listener_address})",
                                 )
                             })?;
-                        assert_data_plane_connection_refused(subject_parsed, within)
+                assert_data_plane_connection_refused(subject_parsed, within)
                             .await
                             .with_context(|| {
                                 format!(
                                     "post_admin_assertion: subject data_plane_connection_refused {subject_addr_s} (template {listener_address})",
                                 )
                             })?;
-                    }
-                }
             }
-
-            // Teardown LAST so post_admin_assertions observe the
-            // post-drain state against a still-running subject /
-            // upstream.
-            subject.shutdown(Duration::from_secs(5)).await.ok();
-            drop(upstream);
         }
     }
 
-    // _backend Drop fires here.
+    // Teardown LAST so post_admin_assertions observe the
+    // post-drain state against a still-running subject /
+    // upstream.
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
     Ok(())
 }
 

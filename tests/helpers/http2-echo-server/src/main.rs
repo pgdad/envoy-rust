@@ -34,7 +34,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use bytes::Bytes;
-use thiserror::Error;
+use helper_common::ArgvError;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
@@ -45,46 +45,26 @@ struct Args {
     close_before_response: bool,
 }
 
-#[derive(Debug, Error, PartialEq)]
-enum ArgvError {
-    #[error("required flag {0} missing")]
-    MissingFlag(&'static str),
-    #[error("flag expects a value")]
-    MissingValue,
-    #[error("port value must be a u16")]
-    InvalidPort,
-    #[error("trailing arguments after --port <u16>")]
-    Trailing,
-    #[error("--help")]
-    HelpRequested,
-    #[error("--version")]
-    VersionRequested,
-}
+/// The per-binary phrase in the `ArgvError::Trailing` message.
+const TRAILING_AFTER: &str = "--port <u16>";
 
 /// Argv parser. Identical shape to `http1-echo-server::parse_argv` per parent
-/// §6 signpost 7's "mirror the established helper posture verbatim".
+/// §6 signpost 7's "mirror the established helper posture verbatim". The
+/// `--help`/`--version`/`--port` skeleton lives in `helper_common`; the
+/// closure handles this binary's `--close-before-response` flag.
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
-    let mut i = 0;
-    let mut port: Option<u16> = None;
     let mut close_before_response = false;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" => return Err(ArgvError::HelpRequested),
-            "--version" => return Err(ArgvError::VersionRequested),
-            "--close-before-response" => {
-                close_before_response = true;
-                i += 1;
-            }
-            "--port" => {
-                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
-                port = Some(v.parse().map_err(|_| ArgvError::InvalidPort)?);
-                i += 2;
-            }
-            _ => return Err(ArgvError::Trailing),
+    let port = helper_common::parse_port_argv(args, TRAILING_AFTER, |args, i| {
+        if args[*i] == "--close-before-response" {
+            close_before_response = true;
+            *i += 1;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-    }
+    })?;
     Ok(Args {
-        port: port.ok_or(ArgvError::MissingFlag("--port"))?,
+        port,
         close_before_response,
     })
 }
@@ -269,12 +249,9 @@ fn make_response_body(parts: &http::request::Parts, body_bytes: &[u8]) -> Vec<u8
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+    // Historical divergence, preserved: default filter "warn" (not "info")
+    // and the default stdout writer (not stderr).
+    helper_common::init_tracing("warn", false);
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_argv(&argv) {
@@ -293,23 +270,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: failed to build tokio runtime: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match runtime.block_on(run(args)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
+    helper_common::run_blocking(run(args), "error: ", "error: ")
 }
 
 #[cfg(test)]

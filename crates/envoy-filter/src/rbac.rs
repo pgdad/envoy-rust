@@ -13,29 +13,33 @@ use crate::error::FilterError;
 use crate::pipeline::Decision;
 use crate::types::{FilterRequest, FilterResponse};
 
-/// Build-time-lowered runtime representation of an Envoy RBAC `Permission`.
+/// Build-time-lowered runtime representation of an Envoy RBAC `Permission`
+/// or `Principal`.
 ///
-/// Mirrors the upstream `envoy.config.rbac.v3.Permission` discriminated union
-/// at the runtime layer, flattened per PLAN lock-in #6: the wire-format
-/// `PermissionSet { rules: Vec<Permission> }` wrapper is collapsed into a
-/// direct `Vec<RuntimePermission>` payload on the `AndRules` / `OrRules`
-/// variants. The `Box` indirection appears only on `NotRule` (single-child
-/// negation); `AndRules` / `OrRules` already hold their children behind the
-/// `Vec`'s allocation so no per-variant `Box` is needed.
+/// The two wire-format discriminated unions (`envoy.config.rbac.v3.Permission`
+/// / `.Principal`) are structurally symmetric at the runtime layer (PLAN
+/// lock-ins #6 + #7), so a single runtime enum serves both; only the
+/// wire-lowering entry points (`lower_permission` / `lower_principal`) stay
+/// distinct. Flattening per PLAN lock-in #6: the wire-format
+/// `PermissionSet { rules }` / `PrincipalSet { ids }` wrappers are collapsed
+/// into a direct `Vec<RuntimeMatcher>` payload on the `And` / `Or` variants.
+/// The `Box` indirection appears only on `Not` (single-child negation);
+/// `And` / `Or` already hold their children behind the `Vec`'s allocation so
+/// no per-variant `Box` is needed.
 #[derive(Debug)]
-pub(crate) enum RuntimePermission {
+pub(crate) enum RuntimeMatcher {
     /// Constant truth value. Wire-form `{ any: true }` / `{ any: false }`.
     Any(bool),
     /// Per-header predicate; delegates to `HeaderMatcher::matches`.
     Header(HeaderMatcher),
-    /// Conjunction: matches iff every child rule matches. Short-circuits on
-    /// first `false` via `Iterator::all`.
-    AndRules(Vec<RuntimePermission>),
-    /// Disjunction: matches iff any child rule matches. Short-circuits on
-    /// first `true` via `Iterator::any`.
-    OrRules(Vec<RuntimePermission>),
-    /// Negation of a single inner rule.
-    NotRule(Box<RuntimePermission>),
+    /// Conjunction (wire `and_rules` / `and_ids`): matches iff every child
+    /// matches. Short-circuits on first `false` via `Iterator::all`.
+    And(Vec<RuntimeMatcher>),
+    /// Disjunction (wire `or_rules` / `or_ids`): matches iff any child
+    /// matches. Short-circuits on first `true` via `Iterator::any`.
+    Or(Vec<RuntimeMatcher>),
+    /// Negation (wire `not_rule` / `not_id`) of a single inner matcher.
+    Not(Box<RuntimeMatcher>),
     /// Phase 35: dynamic-metadata condition. Holds the config matcher directly
     /// (the `Header(HeaderMatcher)` precedent). Reads a single-segment metadata
     /// path; absent namespace/key → no match.
@@ -45,46 +49,20 @@ pub(crate) enum RuntimePermission {
     UrlPath(envoy_config::StringMatcher),
 }
 
-/// Build-time-lowered runtime representation of an Envoy RBAC `Principal`.
-///
-/// Structurally symmetric to `RuntimePermission` per PLAN lock-in #7. The
-/// wire-format `PrincipalSet { ids: Vec<Principal> }` wrapper is flattened
-/// into a direct `Vec<RuntimePrincipal>` on `AndIds` / `OrIds`; `Box` appears
-/// only on `NotId`.
-#[derive(Debug)]
-pub(crate) enum RuntimePrincipal {
-    /// Constant truth value. Wire-form `{ any: true }` / `{ any: false }`.
-    Any(bool),
-    /// Per-header predicate; delegates to `HeaderMatcher::matches`.
-    Header(HeaderMatcher),
-    /// Conjunction: matches iff every child id matches.
-    AndIds(Vec<RuntimePrincipal>),
-    /// Disjunction: matches iff any child id matches.
-    OrIds(Vec<RuntimePrincipal>),
-    /// Negation of a single inner id.
-    NotId(Box<RuntimePrincipal>),
-    /// Phase 35: dynamic-metadata condition. Holds the config matcher directly
-    /// (the `Header(HeaderMatcher)` precedent). Reads a single-segment metadata
-    /// path; absent namespace/key → no match.
-    Metadata(envoy_config::MetadataMatcher),
-    /// Phase 37: `url_path` condition. Symmetric to `RuntimePermission::UrlPath`;
-    /// holds the inner `StringMatcher`, matches the query-stripped req.path.
-    UrlPath(envoy_config::StringMatcher),
-}
-
-/// Recursive tree-walk evaluator for `RuntimePermission`. Synchronous,
-/// pure-compute, no I/O. Returns `true` iff the permission tree matches the
-/// request. Short-circuits via `Iterator::all` (AndRules) and `Iterator::any`
-/// (OrRules); `NotRule` negates its inner result. Per PLAN lock-ins #8 + #9.
-pub(crate) fn eval_permission(p: &RuntimePermission, req: &FilterRequest) -> bool {
-    match p {
-        RuntimePermission::Any(b) => *b,
-        RuntimePermission::Header(m) => m.matches(&req.headers),
-        RuntimePermission::AndRules(set) => set.iter().all(|p| eval_permission(p, req)),
-        RuntimePermission::OrRules(set) => set.iter().any(|p| eval_permission(p, req)),
-        RuntimePermission::NotRule(inner) => !eval_permission(inner, req),
-        RuntimePermission::Metadata(m) => eval_metadata(m, req),
-        RuntimePermission::UrlPath(sm) => sm.matches(strip_query(&req.path)),
+/// Recursive tree-walk evaluator for `RuntimeMatcher` (serves both the
+/// Permission and the Principal side). Synchronous, pure-compute, no I/O.
+/// Returns `true` iff the matcher tree matches the request. Short-circuits
+/// via `Iterator::all` (And) and `Iterator::any` (Or); `Not` negates its
+/// inner result. Per PLAN lock-ins #8 + #9.
+pub(crate) fn eval(m: &RuntimeMatcher, req: &FilterRequest) -> bool {
+    match m {
+        RuntimeMatcher::Any(b) => *b,
+        RuntimeMatcher::Header(hm) => hm.matches(&req.headers),
+        RuntimeMatcher::And(set) => set.iter().all(|m| eval(m, req)),
+        RuntimeMatcher::Or(set) => set.iter().any(|m| eval(m, req)),
+        RuntimeMatcher::Not(inner) => !eval(inner, req),
+        RuntimeMatcher::Metadata(mm) => eval_metadata(mm, req),
+        RuntimeMatcher::UrlPath(sm) => sm.matches(strip_query(&req.path)),
     }
 }
 
@@ -107,21 +85,6 @@ fn eval_metadata(m: &envoy_config::MetadataMatcher, req: &FilterRequest) -> bool
         .and_then(|ns| ns.get(&m.path[0].key))
         .map(String::as_str);
     m.value.matches_resolved(resolved)
-}
-
-/// Recursive tree-walk evaluator for `RuntimePrincipal`. Structurally
-/// symmetric to `eval_permission` per PLAN lock-in #7. Short-circuits via
-/// `Iterator::all` (AndIds) and `Iterator::any` (OrIds); `NotId` negates.
-pub(crate) fn eval_principal(p: &RuntimePrincipal, req: &FilterRequest) -> bool {
-    match p {
-        RuntimePrincipal::Any(b) => *b,
-        RuntimePrincipal::Header(m) => m.matches(&req.headers),
-        RuntimePrincipal::AndIds(set) => set.iter().all(|p| eval_principal(p, req)),
-        RuntimePrincipal::OrIds(set) => set.iter().any(|p| eval_principal(p, req)),
-        RuntimePrincipal::NotId(inner) => !eval_principal(inner, req),
-        RuntimePrincipal::Metadata(m) => eval_metadata(m, req),
-        RuntimePrincipal::UrlPath(sm) => sm.matches(strip_query(&req.path)),
-    }
 }
 
 /// The `envoy.filters.http.rbac` runtime filter (phase 10).
@@ -152,8 +115,8 @@ enum RuntimeAction {
 struct RuntimePolicy {
     #[allow(dead_code)] // retained for future tracing::debug! diagnostics
     name: String,
-    permissions: Vec<RuntimePermission>,
-    principals: Vec<RuntimePrincipal>,
+    permissions: Vec<RuntimeMatcher>,
+    principals: Vec<RuntimeMatcher>,
 }
 
 impl RbacFilter {
@@ -222,8 +185,8 @@ impl RbacFilter {
     /// - `(Allow, false)` or `(Deny, true)` → `Decision::StopAndSend(403)` + increment `denied`.
     pub(crate) fn decode_headers(&mut self, req: &mut FilterRequest) -> Decision {
         let any_policy_matches = self.policies.iter().any(|p| {
-            let perm_match = p.permissions.iter().any(|x| eval_permission(x, req));
-            let prin_match = p.principals.iter().any(|x| eval_principal(x, req));
+            let perm_match = p.permissions.iter().any(|x| eval(x, req));
+            let prin_match = p.principals.iter().any(|x| eval(x, req));
             perm_match && prin_match
         });
         let allow = matches!(
@@ -292,61 +255,61 @@ fn compile_url_path(
 }
 
 /// Recursive lowering of wire-form `envoy_config::Permission` → runtime
-/// `RuntimePermission`. Flattens the `PermissionSet { rules }` wrapper on
-/// `AndRules`/`OrRules` into the runtime enum's direct `Vec<RuntimePermission>`
-/// payload per PLAN lock-in #6. Now fallible: `Header` and `Metadata` arms
+/// `RuntimeMatcher`. Flattens the `PermissionSet { rules }` wrapper on
+/// `and_rules`/`or_rules` into the runtime enum's direct `Vec<RuntimeMatcher>`
+/// payload per PLAN lock-in #6. Fallible: `Header` and `Metadata` arms
 /// compile any `SafeRegex` on the owned clone (phase 36 M35-1 fix, §A4).
-fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimePermission, FilterError> {
+fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimeMatcher, FilterError> {
     Ok(match p {
-        envoy_config::Permission::Any(b) => RuntimePermission::Any(*b),
-        envoy_config::Permission::Header(m) => RuntimePermission::Header(compile_header(m)?),
-        envoy_config::Permission::AndRules(set) => RuntimePermission::AndRules(
+        envoy_config::Permission::Any(b) => RuntimeMatcher::Any(*b),
+        envoy_config::Permission::Header(m) => RuntimeMatcher::Header(compile_header(m)?),
+        envoy_config::Permission::AndRules(set) => RuntimeMatcher::And(
             set.rules
                 .iter()
                 .map(lower_permission)
                 .collect::<Result<_, _>>()?,
         ),
-        envoy_config::Permission::OrRules(set) => RuntimePermission::OrRules(
+        envoy_config::Permission::OrRules(set) => RuntimeMatcher::Or(
             set.rules
                 .iter()
                 .map(lower_permission)
                 .collect::<Result<_, _>>()?,
         ),
         envoy_config::Permission::NotRule(inner) => {
-            RuntimePermission::NotRule(Box::new(lower_permission(inner)?))
+            RuntimeMatcher::Not(Box::new(lower_permission(inner)?))
         }
-        envoy_config::Permission::Metadata(m) => RuntimePermission::Metadata(compile_metadata(m)?),
-        envoy_config::Permission::UrlPath(pm) => RuntimePermission::UrlPath(compile_url_path(pm)?),
+        envoy_config::Permission::Metadata(m) => RuntimeMatcher::Metadata(compile_metadata(m)?),
+        envoy_config::Permission::UrlPath(pm) => RuntimeMatcher::UrlPath(compile_url_path(pm)?),
     })
 }
 
 /// Recursive lowering of wire-form `envoy_config::Principal` → runtime
-/// `RuntimePrincipal`. Symmetric to `lower_permission` per PLAN lock-in #7;
-/// `PrincipalSet { ids }` wrapper flattened on `AndIds`/`OrIds`. Now fallible:
+/// `RuntimeMatcher`. Symmetric to `lower_permission` per PLAN lock-in #7;
+/// `PrincipalSet { ids }` wrapper flattened on `and_ids`/`or_ids`. Fallible:
 /// `Header` and `Metadata` arms compile any `SafeRegex` on the owned clone
 /// (phase 36 M35-1 fix, §A4).
-fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimePrincipal, FilterError> {
+fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimeMatcher, FilterError> {
     Ok(match p {
-        envoy_config::Principal::Any(b) => RuntimePrincipal::Any(*b),
-        envoy_config::Principal::Header(m) => RuntimePrincipal::Header(compile_header(m)?),
-        envoy_config::Principal::AndIds(set) => RuntimePrincipal::AndIds(
+        envoy_config::Principal::Any(b) => RuntimeMatcher::Any(*b),
+        envoy_config::Principal::Header(m) => RuntimeMatcher::Header(compile_header(m)?),
+        envoy_config::Principal::AndIds(set) => RuntimeMatcher::And(
             set.ids
                 .iter()
                 .map(lower_principal)
                 .collect::<Result<_, _>>()?,
         ),
-        envoy_config::Principal::OrIds(set) => RuntimePrincipal::OrIds(
+        envoy_config::Principal::OrIds(set) => RuntimeMatcher::Or(
             set.ids
                 .iter()
                 .map(lower_principal)
                 .collect::<Result<_, _>>()?,
         ),
         envoy_config::Principal::NotId(inner) => {
-            RuntimePrincipal::NotId(Box::new(lower_principal(inner)?))
+            RuntimeMatcher::Not(Box::new(lower_principal(inner)?))
         }
-        envoy_config::Principal::Metadata(m) => RuntimePrincipal::Metadata(compile_metadata(m)?),
+        envoy_config::Principal::Metadata(m) => RuntimeMatcher::Metadata(compile_metadata(m)?),
         // Phase 37: symmetric to `lower_permission`'s url_path arm.
-        envoy_config::Principal::UrlPath(pm) => RuntimePrincipal::UrlPath(compile_url_path(pm)?),
+        envoy_config::Principal::UrlPath(pm) => RuntimeMatcher::UrlPath(compile_url_path(pm)?),
     })
 }
 
@@ -374,12 +337,12 @@ mod tests {
             mode: StringMatcherMode::Exact("/allowed".into()),
             ignore_case: false,
         };
-        let p = RuntimePermission::UrlPath(sm);
-        assert!(eval_permission(&p, &req_with_path("/allowed"))); // match
-        assert!(eval_permission(&p, &req_with_path("/allowed?x=1"))); // query stripped (ADR-0090 §B)
-        assert!(eval_permission(&p, &req_with_path("/allowed?"))); // empty query stripped
-        assert!(!eval_permission(&p, &req_with_path("/denied"))); // miss
-        assert!(!eval_permission(&p, &req_with_path("/allowed/"))); // trailing slash significant
+        let p = RuntimeMatcher::UrlPath(sm);
+        assert!(eval(&p, &req_with_path("/allowed"))); // match
+        assert!(eval(&p, &req_with_path("/allowed?x=1"))); // query stripped (ADR-0090 §B)
+        assert!(eval(&p, &req_with_path("/allowed?"))); // empty query stripped
+        assert!(!eval(&p, &req_with_path("/denied"))); // miss
+        assert!(!eval(&p, &req_with_path("/allowed/"))); // trailing slash significant
     }
 
     #[test]
@@ -388,9 +351,9 @@ mod tests {
             mode: StringMatcherMode::Exact("/allowed".into()),
             ignore_case: false,
         };
-        let p = RuntimePrincipal::UrlPath(sm);
-        assert!(eval_principal(&p, &req_with_path("/allowed?x=1")));
-        assert!(!eval_principal(&p, &req_with_path("/denied")));
+        let p = RuntimeMatcher::UrlPath(sm);
+        assert!(eval(&p, &req_with_path("/allowed?x=1")));
+        assert!(!eval(&p, &req_with_path("/denied")));
     }
 
     // ---- Phase 37: url_path backstop (Task 4) ----
@@ -407,15 +370,11 @@ mod tests {
             (Contains("admin".into()), "/x/admin/y", true),
             (Contains("admin".into()), "/x/user/y", false),
         ] {
-            let p = RuntimePermission::UrlPath(StringMatcher {
+            let p = RuntimeMatcher::UrlPath(StringMatcher {
                 mode,
                 ignore_case: false,
             });
-            assert_eq!(
-                eval_permission(&p, &req_with_path(path)),
-                want,
-                "path={path}"
-            );
+            assert_eq!(eval(&p, &req_with_path(path)), want, "path={path}");
         }
     }
 
@@ -463,19 +422,19 @@ mod tests {
     fn url_path_composes_in_and_or_rules() {
         // SPEC §2.1.5: url_path composes inside and_rules / or_rules.
         let url = |p: &str| {
-            RuntimePermission::UrlPath(StringMatcher {
+            RuntimeMatcher::UrlPath(StringMatcher {
                 mode: StringMatcherMode::Prefix(p.into()),
                 ignore_case: false,
             })
         };
         // and_rules: BOTH prefixes must match.
-        let and = RuntimePermission::AndRules(vec![url("/api"), url("/api/v2")]);
-        assert!(eval_permission(&and, &req_with_path("/api/v2/users")));
-        assert!(!eval_permission(&and, &req_with_path("/api/v1/users")));
+        let and = RuntimeMatcher::And(vec![url("/api"), url("/api/v2")]);
+        assert!(eval(&and, &req_with_path("/api/v2/users")));
+        assert!(!eval(&and, &req_with_path("/api/v1/users")));
         // or_rules: EITHER prefix matches.
-        let or = RuntimePermission::OrRules(vec![url("/api"), url("/admin")]);
-        assert!(eval_permission(&or, &req_with_path("/admin/x")));
-        assert!(!eval_permission(&or, &req_with_path("/public/x")));
+        let or = RuntimeMatcher::Or(vec![url("/api"), url("/admin")]);
+        assert!(eval(&or, &req_with_path("/admin/x")));
+        assert!(!eval(&or, &req_with_path("/public/x")));
     }
 
     #[test]
@@ -559,98 +518,92 @@ mod tests {
     #[test]
     fn any_true_permission_matches() {
         let req = req_with(vec![]);
-        assert!(eval_permission(&RuntimePermission::Any(true), &req));
+        assert!(eval(&RuntimeMatcher::Any(true), &req));
     }
 
     #[test]
     fn any_false_permission_does_not_match() {
         let req = req_with(vec![]);
-        assert!(!eval_permission(&RuntimePermission::Any(false), &req));
+        assert!(!eval(&RuntimeMatcher::Any(false), &req));
     }
 
     #[test]
     fn header_permission_matches_when_value_equals() {
         let req = req_with(vec![("x-rbac-pass", "yes")]);
-        let perm = RuntimePermission::Header(header_matcher_exact("x-rbac-pass", "yes"));
-        assert!(eval_permission(&perm, &req));
+        let perm = RuntimeMatcher::Header(header_matcher_exact("x-rbac-pass", "yes"));
+        assert!(eval(&perm, &req));
     }
 
     #[test]
     fn header_permission_does_not_match_when_value_differs() {
         let req = req_with(vec![("x-rbac-pass", "no")]);
-        let perm = RuntimePermission::Header(header_matcher_exact("x-rbac-pass", "yes"));
-        assert!(!eval_permission(&perm, &req));
+        let perm = RuntimeMatcher::Header(header_matcher_exact("x-rbac-pass", "yes"));
+        assert!(!eval(&perm, &req));
     }
 
     #[test]
     fn header_permission_does_not_match_when_header_absent() {
         let req = req_with(vec![("x-other", "yes")]);
-        let perm = RuntimePermission::Header(header_matcher_exact("x-rbac-pass", "yes"));
-        assert!(!eval_permission(&perm, &req));
+        let perm = RuntimeMatcher::Header(header_matcher_exact("x-rbac-pass", "yes"));
+        assert!(!eval(&perm, &req));
     }
 
     #[test]
     fn and_rules_short_circuits_on_first_false() {
         let req = req_with(vec![]);
-        let perm = RuntimePermission::AndRules(vec![
-            RuntimePermission::Any(true),
-            RuntimePermission::Any(false),
-            RuntimePermission::Any(true),
+        let perm = RuntimeMatcher::And(vec![
+            RuntimeMatcher::Any(true),
+            RuntimeMatcher::Any(false),
+            RuntimeMatcher::Any(true),
         ]);
-        assert!(!eval_permission(&perm, &req));
+        assert!(!eval(&perm, &req));
     }
 
     #[test]
     fn and_rules_all_true_matches() {
         let req = req_with(vec![]);
-        let perm = RuntimePermission::AndRules(vec![
-            RuntimePermission::Any(true),
-            RuntimePermission::Any(true),
-        ]);
-        assert!(eval_permission(&perm, &req));
+        let perm = RuntimeMatcher::And(vec![RuntimeMatcher::Any(true), RuntimeMatcher::Any(true)]);
+        assert!(eval(&perm, &req));
     }
 
     #[test]
     fn or_rules_short_circuits_on_first_true() {
         let req = req_with(vec![]);
-        let perm = RuntimePermission::OrRules(vec![
-            RuntimePermission::Any(false),
-            RuntimePermission::Any(true),
-            RuntimePermission::Any(false),
+        let perm = RuntimeMatcher::Or(vec![
+            RuntimeMatcher::Any(false),
+            RuntimeMatcher::Any(true),
+            RuntimeMatcher::Any(false),
         ]);
-        assert!(eval_permission(&perm, &req));
+        assert!(eval(&perm, &req));
     }
 
     #[test]
     fn or_rules_all_false_does_not_match() {
         let req = req_with(vec![]);
-        let perm = RuntimePermission::OrRules(vec![
-            RuntimePermission::Any(false),
-            RuntimePermission::Any(false),
-        ]);
-        assert!(!eval_permission(&perm, &req));
+        let perm = RuntimeMatcher::Or(vec![RuntimeMatcher::Any(false), RuntimeMatcher::Any(false)]);
+        assert!(!eval(&perm, &req));
     }
 
     #[test]
     fn not_rule_negates_inner() {
         let req = req_with(vec![]);
-        let perm_t = RuntimePermission::NotRule(Box::new(RuntimePermission::Any(false)));
-        let perm_f = RuntimePermission::NotRule(Box::new(RuntimePermission::Any(true)));
-        assert!(eval_permission(&perm_t, &req));
-        assert!(!eval_permission(&perm_f, &req));
+        let perm_t = RuntimeMatcher::Not(Box::new(RuntimeMatcher::Any(false)));
+        let perm_f = RuntimeMatcher::Not(Box::new(RuntimeMatcher::Any(true)));
+        assert!(eval(&perm_t, &req));
+        assert!(!eval(&perm_f, &req));
     }
 
     #[test]
     fn nested_and_or_not_evaluates_correctly() {
         let req = req_with(vec![("x-a", "1"), ("x-b", "2")]);
         // (header x-a == "1") AND NOT(header x-b == "3")
-        let perm = RuntimePermission::AndRules(vec![
-            RuntimePermission::Header(header_matcher_exact("x-a", "1")),
-            RuntimePermission::NotRule(Box::new(RuntimePermission::Header(header_matcher_exact(
+        let perm = RuntimeMatcher::And(vec![
+            RuntimeMatcher::Header(header_matcher_exact("x-a", "1")),
+            RuntimeMatcher::Not(Box::new(RuntimeMatcher::Header(header_matcher_exact(
                 "x-b", "3",
             )))),
         ]);
-        assert!(eval_permission(&perm, &req));
+        assert!(eval(&perm, &req));
     }
 
     fn metadata_matcher(filter: &str, key: &str, exact: &str) -> MetadataMatcher {
@@ -678,60 +631,60 @@ mod tests {
     #[test]
     fn metadata_permission_matches_present_value() {
         let req = req_with_md("envoy.filters.http.header_to_metadata", "tier", "prod");
-        let perm = RuntimePermission::Metadata(metadata_matcher(
+        let perm = RuntimeMatcher::Metadata(metadata_matcher(
             "envoy.filters.http.header_to_metadata",
             "tier",
             "prod",
         ));
-        assert!(eval_permission(&perm, &req));
+        assert!(eval(&perm, &req));
     }
 
     #[test]
     fn metadata_permission_no_match_on_value_mismatch() {
         // tier=dev present but matcher wants exact "prod" → false
         let req = req_with_md("envoy.filters.http.header_to_metadata", "tier", "dev");
-        let perm = RuntimePermission::Metadata(metadata_matcher(
+        let perm = RuntimeMatcher::Metadata(metadata_matcher(
             "envoy.filters.http.header_to_metadata",
             "tier",
             "prod",
         ));
-        assert!(!eval_permission(&perm, &req));
+        assert!(!eval(&perm, &req));
     }
 
     #[test]
     fn metadata_permission_no_match_on_absent_namespace() {
         // req has a DIFFERENT namespace → false
         let req = req_with_md("some.other.ns", "tier", "prod");
-        let perm = RuntimePermission::Metadata(metadata_matcher(
+        let perm = RuntimeMatcher::Metadata(metadata_matcher(
             "envoy.filters.http.header_to_metadata",
             "tier",
             "prod",
         ));
-        assert!(!eval_permission(&perm, &req));
+        assert!(!eval(&perm, &req));
     }
 
     #[test]
     fn metadata_permission_no_match_on_absent_key() {
         // namespace present, but a different key → false
         let req = req_with_md("envoy.filters.http.header_to_metadata", "other_key", "prod");
-        let perm = RuntimePermission::Metadata(metadata_matcher(
+        let perm = RuntimeMatcher::Metadata(metadata_matcher(
             "envoy.filters.http.header_to_metadata",
             "tier",
             "prod",
         ));
-        assert!(!eval_permission(&perm, &req));
+        assert!(!eval(&perm, &req));
     }
 
     #[test]
     fn metadata_principal_mirrors_permission() {
-        // RuntimePrincipal::Metadata, same present-value match
+        // RuntimeMatcher::Metadata, same present-value match
         let req = req_with_md("envoy.filters.http.header_to_metadata", "tier", "prod");
-        let prin = RuntimePrincipal::Metadata(metadata_matcher(
+        let prin = RuntimeMatcher::Metadata(metadata_matcher(
             "envoy.filters.http.header_to_metadata",
             "tier",
             "prod",
         ));
-        assert!(eval_principal(&prin, &req));
+        assert!(eval(&prin, &req));
     }
 
     fn present_matcher(filter: &str, key: &str, want: bool) -> MetadataMatcher {
@@ -746,8 +699,8 @@ mod tests {
     fn metadata_present_match_true_matches_present_key() {
         let ns = "envoy.filters.http.header_to_metadata";
         let req = req_with_md(ns, "tier", "staging"); // any value
-        assert!(eval_permission(
-            &RuntimePermission::Metadata(present_matcher(ns, "tier", true)),
+        assert!(eval(
+            &RuntimeMatcher::Metadata(present_matcher(ns, "tier", true)),
             &req
         ));
     }
@@ -756,8 +709,8 @@ mod tests {
     fn metadata_present_match_true_no_match_when_absent() {
         let ns = "envoy.filters.http.header_to_metadata";
         let req = req_with_md(ns, "other", "x"); // key tier absent
-        assert!(!eval_permission(
-            &RuntimePermission::Metadata(present_matcher(ns, "tier", true)),
+        assert!(!eval(
+            &RuntimeMatcher::Metadata(present_matcher(ns, "tier", true)),
             &req
         ));
     }
@@ -768,12 +721,12 @@ mod tests {
         let ns = "envoy.filters.http.header_to_metadata";
         let present = req_with_md(ns, "tier", "staging");
         let absent = req_with(vec![]);
-        assert!(!eval_permission(
-            &RuntimePermission::Metadata(present_matcher(ns, "tier", false)),
+        assert!(!eval(
+            &RuntimeMatcher::Metadata(present_matcher(ns, "tier", false)),
             &present
         ));
-        assert!(!eval_permission(
-            &RuntimePermission::Metadata(present_matcher(ns, "tier", false)),
+        assert!(!eval(
+            &RuntimeMatcher::Metadata(present_matcher(ns, "tier", false)),
             &absent
         ));
     }
@@ -781,11 +734,11 @@ mod tests {
     #[test]
     fn principal_evaluator_mirrors_permission_evaluator() {
         let req = req_with(vec![("x-user", "alice")]);
-        let prin = RuntimePrincipal::OrIds(vec![
-            RuntimePrincipal::Header(header_matcher_exact("x-user", "bob")),
-            RuntimePrincipal::Header(header_matcher_exact("x-user", "alice")),
+        let prin = RuntimeMatcher::Or(vec![
+            RuntimeMatcher::Header(header_matcher_exact("x-user", "bob")),
+            RuntimeMatcher::Header(header_matcher_exact("x-user", "alice")),
         ]);
-        assert!(eval_principal(&prin, &req));
+        assert!(eval(&prin, &req));
     }
 
     // --- Task 3: RbacFilter runtime tests -----------------------------------

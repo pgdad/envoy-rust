@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Result;
-use thiserror::Error;
+use helper_common::ArgvError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -50,52 +50,25 @@ struct Args {
     body_marker: Option<String>,
 }
 
-/// argv parse failure modes.
-///
-/// `HelpRequested` and `VersionRequested` are "successful" user intents that
-/// nevertheless short-circuit the parse — `main` translates them to exit 0.
-#[derive(Debug, Error, PartialEq)]
-enum ArgvError {
-    #[error("required flag {0} missing")]
-    MissingFlag(&'static str),
-    #[error("flag expects a value")]
-    MissingValue,
-    #[error("port value must be a u16")]
-    InvalidPort,
-    #[error("trailing arguments after --port <u16>")]
-    Trailing,
-    #[error("--help")]
-    HelpRequested,
-    #[error("--version")]
-    VersionRequested,
-}
+/// The per-binary phrase in the `ArgvError::Trailing` message.
+const TRAILING_AFTER: &str = "--port <u16>";
 
-/// Parses argv (excluding argv[0]).
+/// Parses argv (excluding argv[0]). The `--help`/`--version`/`--port`
+/// skeleton lives in `helper_common`; the closure handles this binary's
+/// `--body-marker` flag.
 fn parse_argv(args: &[String]) -> Result<Args, ArgvError> {
-    let mut i = 0;
-    let mut port: Option<u16> = None;
     let mut body_marker: Option<String> = None;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" => return Err(ArgvError::HelpRequested),
-            "--version" => return Err(ArgvError::VersionRequested),
-            "--port" => {
-                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
-                port = Some(v.parse().map_err(|_| ArgvError::InvalidPort)?);
-                i += 2;
-            }
-            "--body-marker" => {
-                let v = args.get(i + 1).ok_or(ArgvError::MissingValue)?;
-                body_marker = Some(v.clone());
-                i += 2;
-            }
-            _ => return Err(ArgvError::Trailing),
+    let port = helper_common::parse_port_argv(args, TRAILING_AFTER, |args, i| {
+        if args[*i] == "--body-marker" {
+            let v = args.get(*i + 1).ok_or(ArgvError::MissingValue)?;
+            body_marker = Some(v.clone());
+            *i += 2;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-    }
-    Ok(Args {
-        port: port.ok_or(ArgvError::MissingFlag("--port"))?,
-        body_marker,
-    })
+    })?;
+    Ok(Args { port, body_marker })
 }
 
 fn print_help() {
@@ -275,13 +248,7 @@ fn build_echo_body(req: &envoy_http1::Request, body: &[u8], body_marker: Option<
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    helper_common::init_tracing("info", true);
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match parse_argv(&argv) {
@@ -300,24 +267,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("failed to build tokio runtime: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    match rt.block_on(run(args)) {
-        Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("runtime error: {e}");
-            ExitCode::from(1)
-        }
-    }
+    helper_common::run_blocking(run(args), "", "runtime error: ")
 }
 
 #[cfg(test)]

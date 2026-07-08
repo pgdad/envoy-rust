@@ -194,35 +194,8 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let outlier_mgr = envoy_cluster::OutlierManager::for_bootstrap(&cluster_mgr, token.clone());
 
     // 03.2: per-cluster Arc<UpstreamTls> construction. Build once at startup
-    // and reuse across all per-connection invocations of `handle`. The
-    // validator already rejected DownstreamTlsContext on a cluster's
-    // transport_socket (MismatchedTransportSocketDirection { side: "cluster" }),
-    // so the Downstream(_) match arm below is unreachable in practice but
-    // kept defensively (parity with the listener-side fallthrough).
-    let mut upstream_tls_by_cluster: std::collections::HashMap<
-        String,
-        std::sync::Arc<envoy_tls::UpstreamTls>,
-    > = std::collections::HashMap::new();
-    for cluster in bootstrap.all_clusters() {
-        let Some(socket) = cluster.transport_socket.as_ref() else {
-            continue;
-        };
-        match &socket.typed_config {
-            envoy_config::TransportSocketTypedConfig::Upstream(ctx) => {
-                let upstream_tls =
-                    std::sync::Arc::new(envoy_tls::UpstreamTls::from_context(ctx).with_context(
-                        || format!("building UpstreamTls for cluster {:?}", cluster.name),
-                    )?);
-                upstream_tls_by_cluster.insert(cluster.name.clone(), upstream_tls);
-            }
-            envoy_config::TransportSocketTypedConfig::Downstream(_) => {
-                anyhow::bail!(
-                    "cluster {:?} has DownstreamTlsContext (validator should have rejected)",
-                    cluster.name
-                );
-            }
-        }
-    }
+    // and reuse across all per-connection invocations of `handle`.
+    let upstream_tls_by_cluster = build_upstream_tls_map(&bootstrap)?;
 
     // 26 Task 3: the 5th periodic-background primitive — the `RdsWatcher`.
     // Built by walking the listeners for HCMs with `rds` configured (the §5.2
@@ -320,26 +293,19 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         None => proxy,
                     };
 
-                let listener = envoy_listener::Listener::bind_with_concurrency(
+                bind_and_spawn_listener(
                     listener_cfg,
                     handler,
-                    std::sync::Arc::clone(&registry),
+                    &registry,
                     listener_concurrency,
+                    "tcp_proxy",
+                    bind_addr,
+                    || tracing::info!(addr = %bind_addr, cluster = %tp_cfg.cluster, "envoy-rust listening (tcp_proxy)"),
+                    &token,
+                    &drain,
+                    &mut set,
                 )
-                .await
-                .with_context(|| format!("binding tcp_proxy listener to {bind_addr}"))?;
-                tracing::info!(addr = %bind_addr, cluster = %tp_cfg.cluster, "envoy-rust listening (tcp_proxy)");
-                let shutdown = token.clone();
-                let drain_for_listener = std::sync::Arc::clone(&drain);
-                set.spawn(async move {
-                    listener
-                        .serve(
-                            async move { shutdown.cancelled().await },
-                            drain_for_listener,
-                        )
-                        .await
-                        .map_err(|e| anyhow::anyhow!(e))
-                });
+                .await?;
             }
             envoy_config::HCM_FILTER => {
                 let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm_cfg)) =
@@ -396,8 +362,6 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 };
 
                 if tpc_workers >= 2 {
-                    // Per-worker handler stack: each worker gets its OWN
-                    // H1PoolManager (upstream connections stay on the thread
                     // EXPERIMENTAL io_uring data plane (see envoy_http1::uring):
                     // compiled behind `--features uring`, engaged only with
                     // ENVOY_RUST_URING=1. Each worker thread runs a monoio
@@ -465,6 +429,8 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                             );
                         }
                     } else {
+                        // Per-worker handler stack: each worker gets its OWN
+                        // H1PoolManager (upstream connections stay on the thread
                         // that created them) and its own HCMConfig. All stats
                         // registrations are idempotent by name, so the N workers
                         // share one set of counters/gauges — per-worker pools,
@@ -671,31 +637,26 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     }
                     let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = hcm;
 
-                    let listener = envoy_listener::Listener::bind_with_concurrency(
+                    bind_and_spawn_listener(
                         listener_cfg,
                         handler,
-                        std::sync::Arc::clone(&registry),
+                        &registry,
                         listener_concurrency,
-                    )
-                    .await
-                    .with_context(|| format!("binding HCM listener to {bind_addr}"))?;
-                    tracing::info!(
-                        addr = %bind_addr,
-                        stat_prefix = %hcm_cfg.stat_prefix,
-                        codec_type = ?hcm_cfg.codec_type,
-                        "envoy-rust listening (http_connection_manager)",
-                    );
-                    let shutdown = token.clone();
-                    let drain_for_listener = std::sync::Arc::clone(&drain);
-                    set.spawn(async move {
-                        listener
-                            .serve(
-                                async move { shutdown.cancelled().await },
-                                drain_for_listener,
+                        "HCM",
+                        bind_addr,
+                        || {
+                            tracing::info!(
+                                addr = %bind_addr,
+                                stat_prefix = %hcm_cfg.stat_prefix,
+                                codec_type = ?hcm_cfg.codec_type,
+                                "envoy-rust listening (http_connection_manager)",
                             )
-                            .await
-                            .map_err(|e| anyhow::anyhow!(e))
-                    });
+                        },
+                        &token,
+                        &drain,
+                        &mut set,
+                    )
+                    .await?;
                 }
             }
             other => {
@@ -815,6 +776,86 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         return Err(e);
     }
     tracing::info!("envoy-rust exited cleanly");
+    Ok(())
+}
+
+/// 03.2: per-cluster `Arc<UpstreamTls>` map, keyed by cluster name. The
+/// validator already rejected DownstreamTlsContext on a cluster's
+/// transport_socket (MismatchedTransportSocketDirection { side: "cluster" }),
+/// so the Downstream(_) match arm below is unreachable in practice but
+/// kept defensively (parity with the listener-side fallthrough).
+fn build_upstream_tls_map(
+    bootstrap: &envoy_config::Bootstrap,
+) -> Result<std::collections::HashMap<String, std::sync::Arc<envoy_tls::UpstreamTls>>> {
+    let mut upstream_tls_by_cluster: std::collections::HashMap<
+        String,
+        std::sync::Arc<envoy_tls::UpstreamTls>,
+    > = std::collections::HashMap::new();
+    for cluster in bootstrap.all_clusters() {
+        let Some(socket) = cluster.transport_socket.as_ref() else {
+            continue;
+        };
+        match &socket.typed_config {
+            envoy_config::TransportSocketTypedConfig::Upstream(ctx) => {
+                let upstream_tls =
+                    std::sync::Arc::new(envoy_tls::UpstreamTls::from_context(ctx).with_context(
+                        || format!("building UpstreamTls for cluster {:?}", cluster.name),
+                    )?);
+                upstream_tls_by_cluster.insert(cluster.name.clone(), upstream_tls);
+            }
+            envoy_config::TransportSocketTypedConfig::Downstream(_) => {
+                anyhow::bail!(
+                    "cluster {:?} has DownstreamTlsContext (validator should have rejected)",
+                    cluster.name
+                );
+            }
+        }
+    }
+    Ok(upstream_tls_by_cluster)
+}
+
+/// Shared bind→log→spawn tail of the tcp_proxy and (shared-runtime) HCM
+/// dispatch arms: bind the listener with SO_REUSEPORT concurrency, emit the
+/// per-arm "listening" log line, and spawn `listener.serve(...)` onto the
+/// main JoinSet wired to the signal token + drain state.
+///
+/// `kind` is the per-arm label in the bind error context ("tcp_proxy" /
+/// "HCM"); `log_listening` is a per-arm closure so each arm's
+/// `tracing::info!` call — with its own fields — stays byte-identical to the
+/// pre-extraction messages.
+#[allow(clippy::too_many_arguments)] // mechanical extraction of a duplicated block; all args were in-scope locals
+async fn bind_and_spawn_listener(
+    listener_cfg: &envoy_config::Listener,
+    handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler>,
+    registry: &std::sync::Arc<envoy_stats::StatsRegistry>,
+    listener_concurrency: usize,
+    kind: &str,
+    bind_addr: SocketAddr,
+    log_listening: impl FnOnce(),
+    token: &tokio_util::sync::CancellationToken,
+    drain: &std::sync::Arc<envoy_listener::DrainState>,
+    set: &mut tokio::task::JoinSet<Result<()>>,
+) -> Result<()> {
+    let listener = envoy_listener::Listener::bind_with_concurrency(
+        listener_cfg,
+        handler,
+        std::sync::Arc::clone(registry),
+        listener_concurrency,
+    )
+    .await
+    .with_context(|| format!("binding {kind} listener to {bind_addr}"))?;
+    log_listening();
+    let shutdown = token.clone();
+    let drain_for_listener = std::sync::Arc::clone(drain);
+    set.spawn(async move {
+        listener
+            .serve(
+                async move { shutdown.cancelled().await },
+                drain_for_listener,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    });
     Ok(())
 }
 

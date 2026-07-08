@@ -18,6 +18,7 @@ members = [
     "tests/conformance/h2spec",
     "tests/differential",
     "tests/helpers/health-aware-http1-backend",
+    "tests/helpers/helper-common",
     "tests/helpers/http1-echo-server",
     "tests/helpers/http2-echo-server",
     "tests/helpers/tcp-echo-server",
