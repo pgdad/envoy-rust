@@ -482,10 +482,10 @@ impl Drop for Http2EchoBackend {
 /// A running `http2-echo-server --close-before-response` host subprocess —
 /// completes a genuine H2 handshake, accepts the first request stream, then
 /// resets it without responding. Phase 64 (ADR-0121): the H2-aware sibling
-/// of `TcpCloseBackend` (`:92`) — a raw TCP accept-then-close backend would
+/// of `TcpCloseBackend` — a raw TCP accept-then-close backend would
 /// be misclassified by envoy-rust's own H2 client as a connect failure
 /// (`UF`), not the post-connect reset (`UC`) this backend drives. Reuses
-/// `wait_h2_accept_ready` (`:526`) for readiness — its handshake-only probe
+/// `wait_h2_accept_ready` for readiness — its handshake-only probe
 /// never opens a stream, so it cannot race with this backend's
 /// stream-level reset.
 pub struct Http2CloseBackend {
@@ -495,25 +495,13 @@ pub struct Http2CloseBackend {
 
 impl Http2CloseBackend {
     pub async fn spawn() -> Result<Self> {
-        let port = reserve_port().context("reserving h2 close-backend port")?;
-        let bin = locate_http2_echo_server().context("locating http2-echo-server binary")?;
-        let child = tokio::process::Command::new(&bin)
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--close-before-response")
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "spawning {} --port {port} --close-before-response",
-                    bin.display()
-                )
-            })?;
-
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        let (port, child, addr) = spawn_helper_backend(
+            "http2-echo-server",
+            "reserving h2 close-backend port",
+            &[std::ffi::OsStr::new("--close-before-response")],
+            " --close-before-response",
+        )
+        .await?;
         wait_h2_accept_ready(addr, Duration::from_secs(2))
             .await
             .with_context(|| {
@@ -540,17 +528,7 @@ impl Http2CloseBackend {
 
 impl Drop for Http2CloseBackend {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let deadline = std::time::Instant::now() + Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => return,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => return,
-                }
-            }
-        }
+        kill_and_reap(&mut self.child);
     }
 }
 
