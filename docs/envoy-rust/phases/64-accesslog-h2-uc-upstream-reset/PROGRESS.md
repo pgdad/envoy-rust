@@ -88,3 +88,38 @@
 - **ADR-0122 unfired** (stays reserved-lapsed for the next phase pick per the standing convention).
 - Carry-forwards: **M56-1 CLOSED** + **M63-1 CONSUMED** (pending the phase's own state-6 close-out formalizing both); **M64-1** (H2-side deterministic `UC` rcd) opened at state-1, unchanged.
 - **NEXT: the §5 state-4 verification session** — the full §7.5 gate (build/clippy/fmt/test/deny + differential suite + conformance + the AUTHORITATIVE CI run confirming fixture `0069` green on native Linux), quoting all command outputs into this file.
+
+## State-4 verification (2026-07-08)
+
+> `superpowers:verification-before-completion` — the full §7.5 phase-done gate, re-run fresh this session. Cold-started per `BOOTSTRAP_PROMPT.md` §1; confirmed `git status --porcelain` clean, branch `main`, `HEAD` at `6b3625e02ecfa76d59dbfad7be9eac07dc27bc92` (the post-state-3 maintenance-workstream tip), `git fetch origin --prune` showed `origin/main` unmoved (no sibling drift; `STATE.md`/ROADMAP row `64` still `in-progress`, no `REVIEW.md` present).
+
+**(e) `cargo build --workspace --all-targets`** → `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 0.08s` (clean; already built by the prior maintenance sessions, re-confirmed clean this session).
+
+**`cargo clippy --workspace --all-targets --all-features -- -D warnings`** → `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 0.12s` (clean, zero warnings).
+
+**`cargo fmt --all -- --check`** → exit 0 (clean, no diffs).
+
+**`cargo test --workspace --no-fail-fast`** → 140 test-binary result blocks `ok`, 4 `FAILED` — all four are documented pre-existing LOCAL-ONLY host flakes, none a regression:
+- `access_log_h2_uc_upstream_reset` (fixture `0069`, THIS phase's own fixture): `envoy="...\"rf\":\"UF\""` vs `envoy-rust="...\"rf\":\"UC\""` — memory `tcpclosebackend-ipv6-unreachable-host-flake`: the containerized reference Envoy cannot reach the host-spawned `Http2CloseBackend` on this dev host and reports `UF` (connect failure) where native-Linux CI sees the true `UC`; the envoy-rust subject side correctly emitted the exact expected witness line `{"method":"GET","proto":"HTTP/2","rc":503,"rf":"UC"}`.
+- `access_log_rcd_upstream_reset` (fixture `0062`): `envoy` rcd carries the IPv6-ULA signature `remote_address:[fdc4:f303:9324::254]:...` — same memory, same signature as documented.
+- `access_log_rf_upstream_reset` (fixture `0061`): `envoy="...\"rf\":\"UF\""` vs `envoy-rust="...\"rf\":\"UC\""` — same memory.
+- `admin_config_dump_server_info` (differential): `envoy-only` lines carry `backend::192.168.65.2:...` — memory `differential-host-bridge-ip-192-168-65-2`.
+
+None of the OTHER memory-documented intermittent flakes (`tls_sni`, `xds_file_based_rds`, `access_log_h2_urx_retry_exhausted`) fired this run. All `0001`-`0068` differential fixtures other than the three listed above passed locally; the full pass/fail accounting was captured to a scratch log and cross-checked target-by-target.
+
+**`cargo deny check`** → `advisories ok, bans ok, licenses ok, sources ok` (five pre-existing `license-not-encountered` advisory-only warnings for allow-listed-but-unused licenses — `0BSD`, `BSD-2-Clause`, `MPL-2.0`, `Unicode-DFS-2016`, `Zlib` — unrelated to this phase, not a gate failure).
+
+**h2spec conformance (≥95% gate)** — `h2spec_pass_rate_gate` passed locally via its designed local-skip path (`h2spec` binary absent on this dev host per SPEC §3 D7 / the test's own `eprintln!`-skip: `h2spec_runner: h2spec not found — skipping locally`); confirmed genuinely exercised (not merely skipped) on CI — see below. No H2 codec/framing change this phase, so the score is expected unchanged from phase 63's baseline. Per memory `h2spec-3-5-2-preface-host-sensitive`, `tests/conformance/h2spec/known-failures.txt` is left untrimmed.
+
+**(d) no new fuzz target** — SPEC §J confirmed vacuous; `.github/workflows/ci.yml`'s fuzz job untouched this phase (re-confirmed via `git diff` across phase 64's own 8 commits — no `ci.yml` line touched).
+
+**(a)+(b)+(c) — the AUTHORITATIVE CI run.** The current HEAD (`6b3625e02ecfa76d59dbfad7be9eac07dc27bc92`) already has a green CI run from the prior maintenance-workstream session, confirmed exact-SHA-matched and re-verified fresh this session (not merely trusted from `STATE.md`'s prior citation):
+- `gh run view 28941571666 --json headSha,conclusion,status` → `headSha` exact-matches `git rev-parse HEAD`; `conclusion: success`, `status: completed`.
+- Both CI jobs green: `fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)` and `build + test + lint`.
+- `gh run view 28941571666 --log` grepped for `access_log_h2_uc_upstream_reset`: `test access_log_h2_uc_upstream_reset ... ok` — fixture `0069`'s differential passes GREEN on native-Linux CI, confirming the full marker-scan → `Http2CloseBackend` spawn → genuine H2 handshake → stream reset → synth-503 → `UC` chain end-to-end against a REAL containerized upstream Envoy (the local host-bridge-IP flake above does not reproduce in CI's network namespace).
+- Same log grepped for `FAILED`/`error: test failed`/`error: N targets failed` inside the `test (includes differential harness → Docker)` step: zero matches — every differential fixture `0001`-`0069` (including `admin_config_dump_server_info`, `access_log_rf_upstream_reset`, `access_log_rcd_upstream_reset` — all three of this session's local-only flakes) passed on CI.
+- `h2spec_pass_rate_gate ... ok` appears in the same CI log, confirming the h2spec binary IS provisioned on CI (Task 14 of the phase-05.2 harness) and the ≥95% gate was genuinely exercised and passed, not skipped.
+
+**Gate summary (§7.5):** (a) fixture `0069` green on CI ✓ — (b) all pre-existing `0001`-`0068` fixtures still green on CI ✓ — (c) h2spec ≥95% passed on CI ✓ — (d) no new fuzz target, vacuously met ✓ — (e) build/clippy/fmt/test/deny all clean (test: clean modulo the 4 documented local-only host flakes, CI-green) ✓ — (f) `REVIEW.md` NOT written this session, per §5.1 one-state-per-session; the state-5 code-review is the next session.
+
+**Verdict: PHASE 64 STATE-4 VERIFICATION COMPLETE.** No regressions found, no new ADR needed (ADR-0121 governs; ADR-0122 stays reserved-lapsed). The state-5 code-review (`superpowers:requesting-code-review`) is the next session.
