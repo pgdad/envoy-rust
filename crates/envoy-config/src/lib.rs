@@ -16,7 +16,8 @@ pub use bootstrap::{
     Bootstrap, Buffer, BufferPerRoute, CdnLoopConfig, CertificateValidationContext,
     CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig, CommonTlsContext,
     ConfigSource, CorsConfig, CorsPolicy, CsrfPolicy, DataSource, DataSourceInline,
-    DenominatorType, DirectResponse, DnsLookupFamily, DownstreamTlsContext, DynamicResources,
+    DenominatorType, DirectResponse, DirectResponseConfig, DnsLookupFamily, DownstreamTlsContext,
+    DynamicResources,
     EdsClusterConfig, Endpoint, ExplicitHttpConfig, FaultAbort, FaultConfig, FileAccessLog,
     FilterChain, FilterChainMatch, FractionalPercent, HashPolicy, HashPolicyHeader, HeaderMatcher,
     HeaderMatcherMode, HeaderMutationConfig, HeaderMutationEntry, HeaderToMetadataConfig,
@@ -51,6 +52,11 @@ pub const TCP_PROXY_FILTER: &str = "envoy.filters.network.tcp_proxy";
 /// The HTTP connection manager network filter name. envoy-rust accepts it as
 /// of phase 04.1; runtime dispatch lands in tasks 10–11. See ADR-0020.
 pub const HCM_FILTER: &str = "envoy.filters.network.http_connection_manager";
+
+/// The direct-response network filter name. envoy-rust accepts it as of phase
+/// 66 — the Network-filters family opener. A TERMINAL filter (see
+/// `is_terminal_network_filter`). See ADR-0123.
+pub const DIRECT_RESPONSE_FILTER: &str = "envoy.filters.network.direct_response";
 
 /// The only transport-socket name envoy-rust accepts in phase 03. Future phases
 /// may add `envoy.transport_sockets.raw_buffer` / `envoy.transport_sockets.quic`.

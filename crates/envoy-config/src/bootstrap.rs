@@ -678,6 +678,11 @@ pub enum TypedConfig {
         rename = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager"
     )]
     HttpConnectionManager(HttpConnectionManagerConfig),
+    /// 66 (ADR-0123): the Network-filters family opener.
+    #[serde(
+        rename = "type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config"
+    )]
+    DirectResponse(DirectResponseConfig),
 }
 
 // 06.2 Task 5 — access-log schema additions per SPEC §3 D2.2.
@@ -789,6 +794,24 @@ pub enum JsonFormatValue {
 #[serde(deny_unknown_fields)]
 pub struct DataSourceInline {
     pub inline_string: String,
+}
+
+/// Models `envoy.extensions.filters.network.direct_response.v3.Config`.
+///
+/// `response` is OPTIONAL: upstream Envoy validates a `direct_response` filter
+/// with the field omitted (`rc=0`) and then writes zero bytes before closing.
+/// `None` therefore means "empty payload", not "invalid config" (phase-66 SPEC
+/// §0 R-0.7).
+///
+/// Only the `inline_string` DataSource arm is modeled. Upstream Envoy also
+/// accepts `inline_bytes` and `filename`; envoy-rust rejects both LOUDLY via
+/// `DataSourceInline`'s `deny_unknown_fields` — the ADR-0049 decision-2 (b)
+/// fail-loud posture. Recorded divergence, carry-forward CF-66-1 (ADR-0123).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DirectResponseConfig {
+    #[serde(default)]
+    pub response: Option<DataSourceInline>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -4827,6 +4850,90 @@ admin:
             matches!(err, crate::ConfigError::UnsupportedFilter(_, _)),
             "got {err:?}"
         );
+    }
+
+    // --- 66 (ADR-0123): `envoy.filters.network.direct_response` schema ---
+
+    #[test]
+    fn direct_response_filter_parses_inline_string() {
+        // Pure schema test: `parse_bootstrap` also validates, and the validate
+        // arm does not exist until Task 2.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config
+                response:
+                  inline_string: "hi\n"
+"#;
+        let bs: Bootstrap = serde_yaml::from_str(yaml).expect("deserializes");
+        let f = &bs.static_resources.listeners[0].filter_chains[0].filters[0];
+        assert_eq!(f.name, crate::DIRECT_RESPONSE_FILTER);
+        let Some(TypedConfig::DirectResponse(dr)) = &f.typed_config else {
+            panic!("expected DirectResponse typed_config");
+        };
+        assert_eq!(dr.response.as_ref().unwrap().inline_string, "hi\n");
+    }
+
+    #[test]
+    fn direct_response_response_field_is_optional() {
+        // Upstream Envoy validates `rc=0` with `response` omitted, and writes
+        // zero bytes then closes. Phase-66 SPEC §0 R-0.7.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config
+"#;
+        let bs: Bootstrap = serde_yaml::from_str(yaml).expect("deserializes");
+        let f = &bs.static_resources.listeners[0].filter_chains[0].filters[0];
+        let Some(TypedConfig::DirectResponse(dr)) = &f.typed_config else {
+            panic!("expected DirectResponse typed_config");
+        };
+        assert!(dr.response.is_none());
+    }
+
+    #[test]
+    fn direct_response_rejects_inline_bytes_and_filename() {
+        // CF-66-1 (ADR-0123 §2.2): envoy-rust supports only the `inline_string`
+        // DataSource arm and rejects the others LOUDLY. `DataSourceInline` is
+        // `deny_unknown_fields`, so serde raises "unknown field" at deserialize
+        // time — before validation runs at all.
+        for arm in [r#"inline_bytes: "aGVsbG8=""#, r#"filename: "/tmp/x""#] {
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: 10000 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config
+                response: {{ {arm} }}
+"#
+            );
+            let err = serde_yaml::from_str::<Bootstrap>(&yaml)
+                .expect_err("must reject non-inline_string DataSource arm");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected an unknown-field rejection, got: {err}"
+            );
+        }
     }
 
     #[test]
