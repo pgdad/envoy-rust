@@ -3045,6 +3045,19 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                             defer_cluster_refs,
                         )?;
                     }
+                    crate::DIRECT_RESPONSE_FILTER => {
+                        // 66 (ADR-0123): the payload lives in typed_config; the
+                        // filter is meaningless without it. `response` inside it
+                        // is optional (empty payload) per SPEC §0 R-0.7.
+                        let typed = filter.typed_config.as_ref().ok_or(
+                            crate::ConfigError::MissingTypedConfig(crate::DIRECT_RESPONSE_FILTER),
+                        )?;
+                        let TypedConfig::DirectResponse(_) = typed else {
+                            return Err(crate::ConfigError::MissingTypedConfig(
+                                crate::DIRECT_RESPONSE_FILTER,
+                            ));
+                        };
+                    }
                     _ => {
                         return Err(crate::ConfigError::UnsupportedFilter(
                             filter.name.clone(),
@@ -4934,6 +4947,73 @@ static_resources:
                 "expected an unknown-field rejection, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn direct_response_filter_validates() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config
+                response:
+                  inline_string: "hi\n"
+"#;
+        crate::parse_bootstrap(yaml).expect("direct_response must validate");
+    }
+
+    #[test]
+    fn direct_response_without_typed_config_is_rejected() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.direct_response
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must require typed_config");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MissingTypedConfig(crate::DIRECT_RESPONSE_FILTER)
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn direct_response_with_wrong_typed_config_variant_is_rejected() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: x
+                cluster: nope
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("wrong variant must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MissingTypedConfig(crate::DIRECT_RESPONSE_FILTER)
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
