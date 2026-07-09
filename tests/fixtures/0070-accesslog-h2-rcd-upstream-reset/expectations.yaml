@@ -1,0 +1,31 @@
+driver:
+  kind: http2_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0070-envoy-mount/access.log
+    envoy_rust: /tmp/0070-envoy-rust-mount/access.log
+  probes:
+    # Probe 1: bare GET / routed to `backend_cluster`, a STRICT_DNS H2-upstream
+    # cluster with NO circuit_breakers and NO retry_policy whose single endpoint
+    # is the SPAWNED Http2CloseBackend ({{H2_CLOSE_BACKEND_PORT}} ->
+    # http2-echo-server --close-before-response, built at phase 64). Both proxies
+    # DIAL it, the H2 handshake completes, the backend accepts the stream then
+    # resets it without responding -> the reset synth-503.
+    #
+    # Phase 65 (ADR-0122) witnesses the DETERMINISTIC reset
+    # %RESPONSE_CODE_DETAILS% on the H2 side -- CONSUMING carry-forward M64-1.
+    # `UC` now derives 1:1 FROM that rcd (the phase-64 boolean discriminator
+    # was RETIRED), exactly as H1 does post-phase-54.
+    #
+    # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static literal.
+    # The response body is NOT compared. The rcd's brace content
+    # `connection_termination` is a FIXED reset-reason enum (NOT OS-derived,
+    # unlike the connect-failure rcd -- M45-2), hence witnessable byte-exact;
+    # the identical string is already witnessed on H1 by fixture 0062 (phase 54).
+    #
+    # Keys sort by UTF-8 byte order (ADR-0094 §A): method, proto, rc, rcd, rf.
+    # The emitted line is:
+    #   {"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}
+    - method: get
+      path: /
+      host: envoy-rust.test
+      expected_status: 503

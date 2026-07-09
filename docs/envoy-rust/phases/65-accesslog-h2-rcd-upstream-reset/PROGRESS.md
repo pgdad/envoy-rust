@@ -267,3 +267,84 @@ Clippy clean — no `unused_variables`/`unused_mut` left behind by the deletion
 
 **Task 3: COMPLETE.** The `reset_for_log_h2` boolean is fully retired; H2's `UC`
 is rcd-derived, matching H1's post-phase-54 derivation split exactly.
+
+---
+
+## Task 4 — §C + §D: fixture `0070` + the differential test
+
+**Files created:** `tests/fixtures/0070-accesslog-h2-rcd-upstream-reset/{envoy.yaml,envoy-rust.yaml,expectations.yaml,README.md}`,
+`tests/differential/tests/access_log_h2_rcd_upstream_reset.rs`.
+
+**ZERO harness / `ci.yml` / allowlist change** — the `{{H2_CLOSE_BACKEND_PORT}}`
+marker auto-spawns `Http2CloseBackend` via the existing launch arm in
+`tests/differential/src/lib.rs`; `tests/differential/tests/*.rs` are
+cargo-auto-discovered (no `[[test]]` entries in its `Cargo.toml`).
+
+### Steps 1-5 — the four fixture files + the thin test wrapper
+
+A structural clone of `0069`, the ONLY change being the added
+`rcd: "%RESPONSE_CODE_DETAILS%"` json_format key. Per-side deltas are exactly the
+documented ones `0069` already uses (bind address, `admin:` block,
+`{{BACKEND_HOST}}`).
+
+### Step 6 — rebuild the DEBUG binary, then run the fixture
+
+`cargo build -p envoy-bin` was re-run FIRST (memory
+`differential-harness-uses-debug-envoy-bin` — the harness runs
+`target/debug/envoy-bin`, so a stale binary would RED with `unknown field`).
+
+`cargo test -p differential --test access_log_h2_rcd_upstream_reset -- --nocapture`
+
+**LOCAL: RED — the DOCUMENTED host flake, NOT a phase regression.** Verbatim:
+
+```
+fixture green: access log byte-exact mismatch: line 0 not byte-identical:
+ envoy     ="{"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{remote_connection_failure|immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:35329}","rf":"UF"}"
+ envoy-rust="{"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}"
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.14s
+```
+
+**Diagnosis — this is memory `tcpclosebackend-ipv6-unreachable-host-flake`
+exactly, and it is maximally informative:**
+
+- **The SUBJECT (envoy-rust) side emits the TARGET LINE EXACTLY:**
+  `{"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}`
+  — byte-for-byte the string this phase set out to produce, with keys in UTF-8
+  byte order per ADR-0094 §A (confirming PLAN-VERIFY §3.7's key-order correction).
+  **The §A/§B implementation is therefore demonstrably correct.**
+- **The REFERENCE (real Envoy v1.33.0, in-container) side NEVER REACHED the
+  backend at all:** its rcd is
+  `{remote_connection_failure|immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:35329}`
+  with `rf:"UF"` — an IPv6 (`fdc4:…`) **"Network is unreachable"** connect
+  failure. It never completed a handshake, so it never observed a reset. This is
+  the host's Docker bridge/IPv6 routing defect, not a behavioral divergence.
+  Note the reference rcd here carries the OS-derived text of the connect-failure
+  family (M45-2) — further proof this is the connect-failure path, not the reset
+  path the fixture intends to exercise.
+
+**CI is AUTHORITATIVE.** The fixture is NOT weakened.
+
+### Step 7 — additivity spot-check: fixture `0069` still byte-identical ✅
+
+`cargo test -p differential --test access_log_h2_uc_upstream_reset -- --nocapture`
+
+```
+ envoy     ="{"method":"GET","proto":"HTTP/2","rc":503,"rf":"UF"}"
+ envoy-rust="{"method":"GET","proto":"HTTP/2","rc":503,"rf":"UC"}"
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.77s
+```
+
+RED for the **identical** host reason (reference side reports `UF` — it never
+reached the backend). `0069` landed **CI-green at phase 64** on this exact code
+path, so this local RED is **pre-existing and NOT caused by phase 65**.
+
+**The load-bearing additivity check PASSES:** `0069`'s SUBJECT-side line is
+`{"method":"GET","proto":"HTTP/2","rc":503,"rf":"UC"}` — **byte-identical to its
+pre-phase-65 value.** `rf:"UC"` now arrives via the rcd-match instead of the
+retired boolean, and the emitted bytes are unchanged. This is exactly the
+output-equivalence PLAN-VERIFY §3.1 predicted.
+
+**Task 4: COMPLETE** (local RED on both fixtures = one documented host flake,
+diagnosed on the reference side; CI adjudicates at Task 6 Step 4 / state-4).
