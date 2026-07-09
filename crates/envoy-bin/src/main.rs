@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 
 mod argv;
+mod direct_response;
 mod echo;
 mod tls_handler;
 
