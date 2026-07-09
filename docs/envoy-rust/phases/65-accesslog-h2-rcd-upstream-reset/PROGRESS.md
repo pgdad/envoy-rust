@@ -467,9 +467,14 @@ All 5 failures are Docker **differential** targets:
 | 2 | `access_log_h2_uc_upstream_reset` | `0069` | Same flake; **landed CI-green at phase 64** ⇒ pre-existing. Subject line byte-identical to pre-phase (Task 4 Step 7). |
 | 3 | `access_log_rcd_upstream_reset` | `0062` (H1) | Same flake, named explicitly in memory `tcpclosebackend-ipv6-unreachable-host-flake` (fixtures 0061/0062/0069). **Untouched by this phase** (H1 code path). |
 | 4 | `access_log_rf_upstream_reset` | `0061` (H1) | Same flake, likewise named in that memory. **Untouched by this phase.** |
-| 5 | `admin_config_dump_server_info` | `0014` | **Documented flake** `differential-host-bridge-ip-192-168-65-2` — this host routes the backend via `192.168.65.2` rather than the allow-listed address, so envoy's `config_dump` carries `backend::192.168.65.2:<port>::*` host entries the subject lacks. **NOT on any by-name flake list, so it was verified rather than assumed** — see below. |
+| 5 | `admin_config_dump_server_info` | `0014` | **Documented flake** `differential-host-bridge-ip-192-168-65-2` — this host routes the backend via `192.168.65.2` rather than the allow-listed `192.168.65.254`/`172.17.0.1`, so envoy's `/clusters` output carries `backend::192.168.65.2:<port>::*` per-endpoint counters the subject lacks. That memory names **this exact test**, from phase-32 state-4. It was independently re-verified anyway — see below. |
 
-**Failure 5 was proven pre-existing, not assumed.** It (a) fails in ISOLATION as
+**Failure 5 was proven pre-existing, not assumed.** (It is in fact named by the
+`differential-host-bridge-ip-192-168-65-2` memory, which records the identical
+`0014` / `/clusters` signature from phase-32 state-4 — but it was the one failure
+whose adjudication rested on a *host-networking* claim rather than on this phase's
+own surface, so it was re-verified from scratch rather than taken on trust.)
+It (a) fails in ISOLATION as
 well as under parallel load, ruling out
 `differential-fixtures-flake-under-parallel-load`; (b) is untouched by every
 phase-65 commit (`git log d5b6dd4..HEAD -- <test> <fixture> crates/envoy-admin/`
@@ -536,3 +541,34 @@ precision issue resolved by SPEC §F + doctrine D-3.4/D-3.5, documented at Task 
 **Next session = §5 state-4 verification** (`superpowers:verification-before-completion`,
 the full §7.5 (a)-(f) gate, CI-authoritative). Per §5.1, one state per session —
 the state-4 gate was deliberately NOT run this session.
+
+---
+
+## State-3 push — CI adjudication (AUTHORITATIVE)
+
+The state-3 commits were pushed to `origin/main` (`d5b6dd4..8407ffa`, 7 commits).
+**CI run `28985774369` — GREEN on the first attempt, no rerun needed.** Every job
+step passed: `fmt`, `clippy`, `build`, `test (includes differential harness →
+Docker)`, `cargo deny check`.
+
+**All three local-RED adjudications are VINDICATED by CI:**
+
+```
+test access_log_h2_rcd_upstream_reset ... ok      <-- fixture 0070 (NEW, this phase)
+test access_log_h2_uc_upstream_reset ... ok       <-- fixture 0069 (additivity)
+test admin_config_dump_server_info ... ok         <-- the bridge-IP flake
+```
+
+- **Fixture `0070` is GREEN on CI** — the deterministic H2 upstream-reset
+  `%RESPONSE_CODE_DETAILS%` `upstream_reset_before_response_started{connection_termination}`
+  is now **differentially witnessed byte-exact against real upstream Envoy
+  v1.33.0**. This is the phase's core claim, and it is proven, not asserted.
+  **Carry-forward M64-1 is CONSUMED.**
+- **Fixture `0069` is GREEN on CI** — the load-bearing additivity invariant holds
+  across the `UC` derive migration, on the authoritative runner.
+- **`admin_config_dump_server_info` is GREEN on CI** — confirming the local RED was
+  purely the host bridge-IP artifact, exactly as the pre-phase worktree bisect showed.
+
+This CI evidence is a strong leading indicator for the state-4 §7.5 gate, but it
+does **not** discharge it: state-4 must still run the gate itself and quote its
+own outputs (h2spec ≥95% in particular was not separately extracted here).
