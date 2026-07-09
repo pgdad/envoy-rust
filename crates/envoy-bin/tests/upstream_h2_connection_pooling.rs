@@ -64,6 +64,7 @@ use std::net::SocketAddr;
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 mod common;
@@ -204,13 +205,35 @@ async fn upstream_h2_connection_pooling() {
     let admin_addr: SocketAddr = format!("127.0.0.1:{admin_port}").parse().unwrap();
     let backend_addr: SocketAddr = format!("127.0.0.1:{backend_port}").parse().unwrap();
 
-    let _backend = spawn_backend(backend_port).await;
+    let mut _backend = spawn_backend(backend_port).await;
     // 30s budget matches the H1 sibling's backend readiness budget
     // (the `cargo run --manifest-path` step compiles on first hit;
     // subsequent runs reuse the cached artifact and return in <1s).
-    wait_ready(backend_addr, Duration::from_secs(30))
+    if wait_ready(backend_addr, Duration::from_secs(30))
         .await
-        .expect("backend ready");
+        .is_err()
+    {
+        // ADR-0125 diagnostic. `spawn_backend` pipes the helper's stderr and
+        // the original `.expect("backend ready")` discarded it, so a CI-only
+        // readiness failure carried NO evidence of its cause. Surface the
+        // child's exit status and stderr. This does NOT weaken the test — the
+        // readiness timeout is still fatal, on the same 30s budget.
+        //
+        // The read MUST be bounded: a live-but-not-listening child keeps its
+        // stderr open forever, so an unbounded `read_to_string` would hang the
+        // test rather than fail it.
+        let status = _backend.try_wait().ok().flatten();
+        let mut buf = Vec::new();
+        if let Some(mut err) = _backend.stderr.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), err.read_to_end(&mut buf)).await;
+        }
+        panic!(
+            "backend ready timed out after 30s at {backend_addr}\n\
+             http2-echo-server exit status: {status:?} (None = still running)\n\
+             http2-echo-server stderr:\n{}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
 
     let _envoy = spawn_envoy_bin(hcm_port, admin_port, backend_port).await;
     wait_ready(hcm_addr, Duration::from_secs(10))

@@ -268,6 +268,99 @@ past ~10 items on contact with reality. **None did.** Every task ran to its plan
 
 ---
 
+## CI adjudication of the state-3 push (`0201bf6`) — read this FIRST at state-4 [ADR-0125]
+
+The state-3 push went red on CI. A full `superpowers:systematic-debugging` pass separated **two
+distinct failures** that the tooling conflated. **Phase 66's own code is green on CI.**
+
+### (1) Attempt 1 was runner starvation — the commit never executed
+
+Run `29018695033` attempt 1 reported top-level `conclusion=failure` while both jobs reported
+`conclusion=cancelled` after exactly 15m07s. Decisive fields:
+
+| | attempt 1 (`0201bf6`) | control: run `29016561942` (`5e3afb9`) |
+|---|---|---|
+| `runner_name` | `""` — none assigned | `GitHub Actions 1000003159/60` |
+| `steps` | `0` / `0` | `15` / `12` |
+| logs | none (`gh run view --log` empty) | full |
+
+No runner was ever assigned, so the workflow never checked out the repo, never compiled, never ran a
+test. **Refuted:** the `fuzz` job's `timeout-minutes: 15` (a step timeout requires steps; there were
+zero); `concurrency.cancel-in-progress` (an API query over the 12:30–13:00Z window returned exactly
+ONE run); a sibling push (`origin/main` had not moved). `gh run watch --exit-status` surfaces this as
+a plain "failure" — which is how an unattended loop is misled into debugging a diff that never ran.
+
+### (2) Attempts 2–4 exposed a REAL, DETERMINISTIC failure — `upstream_h2_connection_pooling`
+
+Once a runner attached, one test failed: `upstream_h2_connection_pooling`, at
+`wait_ready(backend_addr, Duration::from_secs(30)).expect("backend ready")` with
+`Os { code: 111, kind: ConnectionRefused }`, at **30.35s / 30.35s / 30.37s** across three reruns.
+(The constant duration is just the timeout expiring — not, by itself, evidence of a deterministic
+*cause*.)
+
+**Phase 66 did not cause it:**
+- The file is untouched by all 11 phase-66 commits.
+- On attempt 2 — which actually executed — **every phase-66 surface passed**:
+  `network_filter_direct_response_fixture ... ok` (fixture `0071` against the pinned
+  `envoyproxy/envoy:v1.33.0`), `post_eof_client_write_is_accepted_not_reset ... ok` (the ADR-0124
+  drain), all three in-process backstops, `parses_tcp_direct_response_driver ... ok`.
+  `fmt` / `clippy` / `build` all green.
+- The test passes locally standalone (3.83s) **and** under the full 36-binary `cargo test -p envoy-bin`
+  suite (0 failures) on this exact tree.
+
+**"Just rerun" is refuted, not assumed.** Three reruns → three identical failures.
+`Swatinem/rust-cache` saves only on job success, so every rerun restores the same stale cache and
+repeats the same work (`Post cargo cache` takes 0s on every attempt). The standing project memory's
+"documented flake → `gh run rerun --failed` → green" prescription is **wrong for this signature**.
+
+### (3) A second finding that changes how CI runs must be read
+
+CI runs a bare `cargo test --workspace`, which **stops at the first failing test binary**. When this
+test trips, everything after it never runs — the failing run contained **no `548 passed` line for the
+`envoy-config` lib suite and no h2spec output at all**. A run reporting "only this one failure" has
+therefore **NOT exercised the gate**. Never read it as "everything else passed."
+
+### (4) Why the root cause could not be reached — and what was done about it
+
+`spawn_backend` pipes the helper's stderr, and `.expect("backend ready")` then drops the child,
+**discarding both its stderr and its exit status**. The decisive evidence is thrown away by the test
+itself. Hypotheses the available evidence cannot separate: (a) the helper crashed or failed to bind
+(a dead peer yields `ConnectionRefused` for the whole 30s, exactly as observed); (b) the nested
+`cargo run --manifest-path` blocked — whose classic signature `Blocking waiting for file lock on
+build directory` goes to the *child's* stderr and is therefore invisible in the CI log, so its
+absence there proves nothing. A **"first-hit compile" explanation was actively REFUTED**: after a
+`cargo build --workspace --all-targets`, an identical nested `cargo run` emits zero stderr and
+recompiles nothing, and the CI log shows no `Compiling` during the test step.
+
+Per **ADR-0125**, phase 66 therefore adds **bounded diagnostics** to that test — `try_wait()` for the
+exit status (`None` = still running, separating "crashed" from "alive but not listening") plus up to
+5 s of stderr via a `tokio::time::timeout`-bounded `read_to_end` — and panics with both. The 30s
+budget and the fatality of the timeout are **unchanged**. The read must be bounded: a
+live-but-not-listening child never closes stderr, so an unbounded `read_to_string` would hang the
+test instead of failing it. Rejected: widening the budget (treats a symptom on the one theory the
+evidence refutes), and weakening/`#[ignore]`-ing the test (forbidden).
+
+Green locally after the change: `cargo test -p envoy-bin --test upstream_h2_connection_pooling`
+1 passed (0.62s); `cargo clippy -p envoy-bin --all-targets -- -D warnings` clean;
+`cargo fmt --all -- --check` clean.
+
+### BLOCK-66-1 — §7.5 gate (e) is BLOCKED until this test passes
+
+**The next CI run is expected to STILL FAIL — that is the point.** It will now print the helper's exit
+status and stderr. **The state-4 session must read that output FIRST** and root-cause from it via
+`superpowers:systematic-debugging` before touching anything else:
+
+- stderr shows a bind failure → the fix is in `reserve_port()`'s TOCTOU window;
+- stderr shows `Blocking waiting for file lock` → the fix is to stop nesting `cargo run` inside
+  `cargo test`;
+- child exited cleanly with empty stderr → hypothesis (a) is dead; move to the runner's networking.
+
+Gate items **(a)/(c)/(d)** already have positive evidence from CI attempt 2 and the state-3 fuzz run.
+Gate **(b)** is unproven because the suite aborted early. Gate **(e)** is blocked. No phase-66
+production code is implicated — ADR-0123 and ADR-0124 stand unmodified.
+
+---
+
 ## What the state-4 verification session must do
 
 Run the full §7.5 (a)-(f) gate via `superpowers:verification-before-completion` and quote every
