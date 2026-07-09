@@ -564,17 +564,6 @@ async fn handle_one_stream(
     // `connect_failure_for_log` local (crates/envoy-http1/src/hcm.rs:854)
     // exactly.
     let mut connect_failure_for_log_h2: bool = false;
-    // 64 (ADR-0121): per-stream %RESPONSE_FLAGS% = "UC" (UpstreamConnection-
-    // Termination) discriminator. Set true POST-LOOP when the FINAL attempt's
-    // outcome was AttemptOutcome::Reset (a reset RETRIED to success must NOT
-    // flag UC — so this reads the final outcome, not a per-attempt set). Like
-    // URX/UF, UC is NOT 1:1 with a unique %RESPONSE_CODE_DETAILS% (the reset
-    // rcd stays the shared "via_upstream" — the H2-side deterministic rcd is
-    // deferred, M64-1), so it keys on this boolean. Reuses the EXISTING
-    // final_outcome_h2 capture from phase 63 — no new loop-scoped state.
-    // Mirrors the H1 phase-53 `reset_for_log` local
-    // (crates/envoy-http1/src/hcm.rs:865) exactly.
-    let mut reset_for_log_h2: bool = false;
 
     let resp: Response = match request_path {
         H2RequestPath::Match(outcome) => match outcome {
@@ -886,23 +875,23 @@ async fn handle_one_stream(
                         final_outcome_h2,
                         Some(envoy_config::AttemptOutcome::ConnectFailure)
                     );
-                    // 64 (ADR-0121): flag UC when the FINAL attempt was a
-                    // reset — independent of the retry split. A reset
-                    // retried to success has final_outcome_h2 =
-                    // Some(Response) → not flagged.
-                    reset_for_log_h2 =
-                        matches!(final_outcome_h2, Some(envoy_config::AttemptOutcome::Reset));
                     // 65 (ADR-0122) §A: on the PURE-reset final outcome, set the
                     // DETERMINISTIC reset %RESPONSE_CODE_DETAILS%, OVERRIDING the
                     // shared "via_upstream" written in-loop at hcm.rs:757 (a reset
                     // has endpoint:Some + outcome:Some(Reset), so the phase-58
                     // `outcome.is_none()` overflow discriminator leaves it
                     // "via_upstream"). Guarded on !retry_limit_exceeded_for_log_h2
-                    // (computed just above, hcm.rs:869): a retry-exhausted reset
-                    // KEEPS "via_upstream" and renders URX — preserving today's
-                    // behavior exactly (the un-recon'd combination of SPEC §4).
+                    // (computed just above): a retry-exhausted reset KEEPS
+                    // "via_upstream" and renders URX (the un-recon'd combination
+                    // of SPEC §4) — pinned by the backstop
+                    // `h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx`.
+                    // §B: `UC` then derives 1:1 from this rcd — the phase-64
+                    // boolean discriminator was RETIRED. A reset RETRIED to
+                    // success has final_outcome_h2 = Some(Response) → not set.
                     // Mirrors the H1 phase-54 set-site (ADR-0111) exactly.
-                    if reset_for_log_h2 && !retry_limit_exceeded_for_log_h2 {
+                    if matches!(final_outcome_h2, Some(envoy_config::AttemptOutcome::Reset))
+                        && !retry_limit_exceeded_for_log_h2
+                    {
                         response_code_details_for_log_h2 = Some(
                             "upstream_reset_before_response_started{connection_termination}"
                                 .to_owned(),
@@ -954,7 +943,6 @@ async fn handle_one_stream(
         dynamic_metadata,
         retry_limit_exceeded_for_log_h2,
         connect_failure_for_log_h2,
-        reset_for_log_h2,
     )
     .await
 }
@@ -1007,10 +995,6 @@ async fn finalize_h2_stream(
     // (§E), consumed by the %RESPONSE_FLAGS% derive wrapper (§G). A `Copy`
     // primitive, same shape as retry_limit_exceeded_for_log_h2 above.
     connect_failure_for_log_h2: bool,
-    // Phase 64 (ADR-0121): the reset final-outcome discriminator (§B),
-    // consumed by the %RESPONSE_FLAGS% derive wrapper (§D). A `Copy`
-    // primitive, same shape as connect_failure_for_log_h2 above.
-    reset_for_log_h2: bool,
 ) -> Result<(), Http2Error> {
     // 07.1 Task 7: encode-side filter invocation. Boundary conversion
     // `envoy_http1::codec::Response` ↔ `envoy_filter::FilterResponse`
@@ -1101,20 +1085,20 @@ async fn finalize_h2_stream(
             "URX"
         } else if connect_failure_for_log_h2 {
             "UF"
-        } else if reset_for_log_h2 {
-            // Phase 64 (ADR-0121): "UC" (UpstreamConnectionTermination) is
-            // likewise NOT derivable from %RESPONSE_CODE_DETAILS% (the reset
-            // rcd stays the shared "via_upstream" on the H2 side — M64-1) —
-            // checked THIRD via the boolean, ORDERED AFTER UF, mirroring the
-            // H1 phase-52/53 wrapper ordering exactly. This CLOSES
-            // carry-forward M56-1 — all six H2 %RESPONSE_FLAGS% values are
-            // now witnessed.
-            "UC"
         } else {
+            // 65 (ADR-0122) §B: `UC` now derives 1:1 from the DETERMINISTIC
+            // reset rcd (set post-loop in §A), exactly like `UO` keys off
+            // `{overflow}` — so the phase-64 boolean discriminator is
+            // redundant and was RETIRED. `URX`/`UF` keep their booleans: the
+            // retry-limit-exceeded path's rcd is a real completing 503
+            // (`via_upstream`) and the connect-failure rcd carries
+            // non-deterministic OS text (M45-2). Mirrors H1's post-phase-54
+            // derivation split exactly.
             match response_code_details_for_log_h2.as_deref() {
                 Some("route_not_found") => "NR",
                 Some("no_healthy_upstream") => "UH",
                 Some("upstream_reset_before_response_started{overflow}") => "UO",
+                Some("upstream_reset_before_response_started{connection_termination}") => "UC",
                 _ => "-",
             }
         };

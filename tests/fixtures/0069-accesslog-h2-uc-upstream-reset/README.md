@@ -93,3 +93,15 @@ observes the new `rf:"UC"` witness.
   deferred to keep this witness minimum-viable (mirrors H1's own deferred
   rcd at phase 53, later consumed by phase 54's M53-1 — M64-1 is the H2-side
   analogue, distinct and still open).
+
+> **Update — phase 65 (ADR-0122): M64-1 is now CONSUMED.** Fixture `0070`
+> witnesses the deterministic H2 reset `%RESPONSE_CODE_DETAILS%`
+> (`upstream_reset_before_response_started{connection_termination}`) byte-exact
+> on this same path, and H2's `UC` now derives **1:1 from that rcd** — the
+> phase-64 boolean discriminator described under "What this proves" above was
+> RETIRED. That prose is left verbatim as the historical record of phase 64
+> (doctrine D-3.4/D-3.5: backward-looking narrative is never retroactively
+> rewritten); it describes the phase-64 mechanism, not today's. **This
+> fixture's own emitted line is UNCHANGED** — `rf:"UC"` is output-equivalent
+> under the new rcd-derivation, which is exactly the byte-preservation the
+> phase-65 additivity invariant requires.

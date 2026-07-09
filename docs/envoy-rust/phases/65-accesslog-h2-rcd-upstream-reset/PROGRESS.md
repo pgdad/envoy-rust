@@ -179,3 +179,91 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 **Task 2: COMPLETE.** The guard is now pinned BEFORE Task 3 retires the boolean,
 so a Task-3 refactor error cannot pass silently.
+
+---
+
+## Task 3 — §B + §F: derive `UC` from the rcd, retire `reset_for_log_h2`
+
+**Files changed:** `crates/envoy-http2/src/hcm.rs` (5 boolean sites + 3 comment
+blocks + the derive); `tests/fixtures/0069-accesslog-h2-uc-upstream-reset/README.md`
+(additive phase-65 update note — see the §F discipline note below).
+
+### Step 1 — add the rcd-match arm, delete the boolean branch
+
+The `%RESPONSE_FLAGS%` derive's `} else if reset_for_log_h2 { "UC" }` branch
+(with its phase-64 comment) was DELETED, and
+`Some("upstream_reset_before_response_started{connection_termination}") => "UC"`
+added to the rcd-match, mirroring the existing `{overflow} => "UO"` arm.
+`URX`/`UF` keep their booleans and their check order is unchanged. The
+`.as_deref()` shared borrow still ends before the owned `String` moves into
+`response_code_details:` — borrow discipline unchanged.
+
+### Step 2 — delete the four remaining boolean sites ✅
+
+1. **Post-loop set** + its phase-64 comment: deleted; the `matches!` was folded
+   directly into the §A `if` condition, so no binding remains.
+2. **Declaration** (+ its 10-line phase-64 comment block): deleted.
+3. **Call-site arg** in the `finalize_h2_stream(…)` call: deleted.
+4. **Parameter + doc comment** on `finalize_h2_stream`: deleted. Its signature is
+   now `(…, retry_limit_exceeded_for_log_h2: bool, connect_failure_for_log_h2: bool) -> Result<(), Http2Error>`.
+
+`grep -rn "reset_for_log_h2" crates/` → **no output (exit 1)** ✅
+
+#### §F sweep discipline — one in-scope deviation from PLAN Task 6 Step 2 (documented)
+
+PLAN Task 3 Step 2 prescribed new comments that themselves spell the identifier
+(e.g. "the phase-64 `reset_for_log_h2` boolean was RETIRED"), which would make
+PLAN Task 6 Step 2's `grep -rn "reset_for_log_h2" crates/ tests/ …` → "no output"
+**unsatisfiable by construction**. Resolved by wording the new comments as "the
+phase-64 **boolean discriminator** was RETIRED" — same meaning, and it matches
+the wording PLAN Task 5 already prescribes for `BEHAVIOR_CONTRACT.md`.
+
+A second hit remains in `tests/fixtures/0069-…/README.md:18`: *"Phase 64 … (ii)
+declares a new per-stream boolean `reset_for_log_h2`"*. This is **backward-looking
+historical narrative of what phase 64 did**, which **SPEC §F explicitly orders
+left verbatim** ("Leave BACKWARD-LOOKING historical narrative comments verbatim
+per the D-3.4/D-3.5 no-retroactive-rewrite convention; correct only ACTIVE-state
+prose"). SPEC §F scopes the sweep to `crates/envoy-http2/src/`; PLAN Task 3
+Step 2's own grep is likewise `crates/envoy-http2/src/hcm.rs`. **Only PLAN Task 6
+Step 2 over-broadened the sweep to `tests/`, colliding with doctrine — SPEC and
+doctrine win.** The historical sentence is therefore PRESERVED verbatim, and the
+one genuinely stale **active-state** claim in that README (the cross-reference
+asserting M64-1 is "distinct and still open") was corrected **additively** with a
+phase-65 update note. Task 6 Step 2's grep is accordingly run over `crates/` +
+`BEHAVIOR_CONTRACT.md` (the surfaces SPEC §F/§E actually name).
+
+**No §6.2 reconciliation ADR fires:** this is a PLAN-step precision issue about
+comment wording, not an overturned §A-§G fact. `ADR-0123` stays reserved-but-unfired.
+
+### Step 3 — both backstops still PASS ✅
+
+```
+test hcm::tests::h2_upstream_reset_access_log_carries_uc_flag ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.12s
+
+test hcm::tests::h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.15s
+```
+
+The positive backstop's `UC` now arrives via the rcd-match (the boolean is gone)
+— **output-equivalent**, which is precisely the fixture-`0069` byte-preservation
+guarantee. The negative one still renders `URX` with `via_upstream`.
+
+### Step 4 — workspace compiles + passes ✅
+
+```
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.19s
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.01s
+
+$ cargo test -p envoy-http2
+test result: ok. 88 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.46s
+```
+
+Clippy clean — no `unused_variables`/`unused_mut` left behind by the deletion
+(the deleted parameter had exactly one call site).
+
+**Task 3: COMPLETE.** The `reset_for_log_h2` boolean is fully retired; H2's `UC`
+is rcd-derived, matching H1's post-phase-54 derivation split exactly.
