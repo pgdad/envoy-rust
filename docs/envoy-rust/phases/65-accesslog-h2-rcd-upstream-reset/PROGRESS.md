@@ -572,3 +572,293 @@ test admin_config_dump_server_info ... ok         <-- the bridge-IP flake
 This CI evidence is a strong leading indicator for the state-4 §7.5 gate, but it
 does **not** discharge it: state-4 must still run the gate itself and quote its
 own outputs (h2spec ≥95% in particular was not separately extracted here).
+
+---
+
+# State-4 verification — the §7.5 (a)-(f) gate
+
+> Run by the §5 **state-4 verification** session (`superpowers:verification-before-completion`),
+> 2026-07-09. `PLAN.md` + `PROGRESS.md` present, `REVIEW.md` absent → the §5
+> state-4 detection rule. Per `BOOTSTRAP_PROMPT.md` §5.1 (one state per session)
+> the state-5 code-review was deliberately NOT run.
+>
+> **STEP 0 (disk is authoritative):** `git status --porcelain` clean; branch
+> `main`; `HEAD` = `origin/main` = `f66fe9c` (the phase-65 state-3 CI-adjudication
+> commit). `git fetch origin --prune` confirmed no sibling autonomous-loop session
+> had advanced phase 65 (no `REVIEW.md` in the phase dir; ROADMAP row `65` still
+> `in-progress`). Cold-start read of `MISSION.md` / `STATE.md` / `ROADMAP.md` /
+> `DECISIONS.md` / `BEHAVIOR_CONTRACT.md` / `SKILL_ROUTING.md` + the phase's
+> `SPEC.md`/`PLAN.md`/`PROGRESS.md` completed in full.
+>
+> **`CI IS AUTHORITATIVE`** for gates (a)/(b)/(c) (memory
+> `envoy-rust-state4-ci-first-execution`). The authoritative run is
+> **`28986078817`**, whose `headSha` is **`f66fe9c` — the exact tree under gate**
+> (working tree clean, so CI ran precisely these bytes). Conclusion: **success**.
+
+## Gate (e) — build / clippy / fmt / test / deny
+
+All five run locally against the tree under gate.
+
+```
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s        # exit 0
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.72s
+clippy exit=0
+
+$ cargo fmt --all -- --check
+fmt exit=0                                                                     # no output
+
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
+deny exit=0
+```
+
+`cargo deny` emits three **non-fatal** `warning[license-not-encountered]`
+`unmatched license allowance` lines (`deny.toml:48` `Unicode-DFS-2016`,
+`:50` `Zlib`, `:52` `MPL-2.0`) — pre-existing, unrelated to this phase, **exit 0**.
+No freshly-published advisory fired, so no `cargo update -p <dep> --precise` bump
+was needed (memory `cargo-deny-reds-on-unrelated-advisory` did not apply).
+
+### `cargo test --workspace` — LOCAL, and the flake adjudication
+
+**On CI (authoritative, run `28986078817` @ `f66fe9c`): 145 `test result:` lines,
+ZERO of them non-`ok`; zero `... FAILED` anywhere in the log.**
+
+Locally the workspace suite REDs on Docker-differential targets. Because a prior
+session's adjudication is not evidence, the suite was run **three times** and the
+failing SET was compared:
+
+| Run | Failing targets | `-p envoy-http2 --lib` |
+|---|---|---|
+| 1 | `0070`, `0069`, `0062`, `0061`, `admin_config_dump_server_info` + `-p envoy-http2 --lib` | **FAILED** |
+| 2 | the same 5, **plus** `access_log_h2_urx_retry_exhausted`, `access_log_json_nested`, `access_log_response_code_details`, `http_filter_jwt_authn`, `rbac_url_path`, `upstream_active_health_check`, `upstream_outlier_detection_consecutive_5xx` (12 total) | passed (88/0) |
+| 3 | the same 5, **plus** `access_log_rf_no_route` (6 total) | passed (88/0) |
+
+Two facts fall out, and both are load-bearing:
+
+1. **An INVARIANT CORE of exactly 5 targets fails in every run** —
+   `access_log_h2_rcd_upstream_reset` (`0070`), `access_log_h2_uc_upstream_reset`
+   (`0069`), `access_log_rcd_upstream_reset` (`0062`), `access_log_rf_upstream_reset`
+   (`0061`), and `admin_config_dump_server_info` (`0014`). These are precisely the
+   five adjudicated at the state-3 pre-flight.
+2. **The TAIL varies run-to-run** (12 targets, then 6, with different membership,
+   incl. `access_log_rf_no_route` in run 3 but not runs 1-2). A failing set whose
+   membership changes across identical invocations of an unchanged tree is
+   **non-deterministic by construction** — memory
+   `differential-fixtures-flake-under-parallel-load`. Every one of these varying
+   targets is `... ok` on CI.
+
+The four close-backend fixtures were re-run **in isolation** (after
+`cargo build -p envoy-bin` — memory `differential-harness-uses-debug-envoy-bin`),
+and the divergence is **entirely reference-side**:
+
+```
+$ cargo test -p differential --test access_log_h2_rcd_upstream_reset -- --nocapture
+access log byte-exact mismatch: line 0 not byte-identical:
+ envoy     ="{"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{remote_connection_failure|immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:43067}","rf":"UF"}"
+ envoy-rust="{"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.71s
+```
+
+The **SUBJECT (envoy-rust) side emits the exact target line**, keys in UTF-8 byte
+order per ADR-0094 §A. The **REFERENCE** Envoy container never reached the
+host-spawned backend: its rcd is an **IPv6 (`fdc4:…`) "Network is unreachable"**
+connect-failure with `rf:"UF"` — it never completed a handshake, so it never
+observed a reset. That is memory `tcpclosebackend-ipv6-unreachable-host-flake`
+verbatim, and the OS-derived rcd text proves it is the connect-failure family
+(M45-2), NOT the reset path the fixture drives. Fixture `0069` fails identically
+(`envoy="…rf":"UF"}"` vs `envoy-rust="…rf":"UC"}"`), and its subject-side line is
+**byte-identical to its pre-phase-65 value** — the load-bearing additivity proof.
+`admin_config_dump_server_info` fails with the `backend::192.168.65.2:38767::*`
+signature of memory `differential-host-bridge-ip-192-168-65-2` (proven pre-existing
+at `d5b6dd4` by a detached-worktree bisect at state-3). **NO fixture was weakened.**
+
+### The sixth run-1 target — `-p envoy-http2 --lib` — reported HONESTLY
+
+Run 1 additionally failed `-p envoy-http2 --lib`. This is **NOT** in the state-3
+adjudicated set, so it was investigated rather than waved through. **Its test name
+was not captured** (run 1's output was piped through `tail`, which truncated the
+`failures:` block before it was read) — this is stated plainly rather than guessed.
+It did **not** reproduce in **54 subsequent executions**:
+
+- 8× `cargo test -p envoy-http2 --lib` in isolation → `88 passed; 0 failed` every time;
+- 40× the only network-dependent test in the crate,
+  `send_request_maps_h2_handshake_failure_to_typed_error` (the documented
+  `envoyrust-h2-handshake-test-host-flake`) → **0 / 40** failures;
+- 8× `cargo test -p envoy-http2 --lib` **while a full `cargo test -p differential`
+  Docker run saturated the host** (reproducing run 1's exact load conditions) → clean;
+- workspace runs 2 and 3 → `88 passed; 0 failed`;
+- CI run `28986078817` → the `envoy-http2` suite is `ok`.
+
+**Adjudication:** a load-induced, non-deterministic failure of the `envoy-http2`
+unit suite; unreproducible under 54 attempts including the exact concurrent-Docker
+condition, and green on the authoritative runner. It is **not** a phase-65
+regression — every phase-65-authored test in that crate
+(`h2_upstream_reset_access_log_carries_uc_flag`,
+`h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx`) passes in all
+54 runs and on CI. `superpowers:systematic-debugging` was **not** escalated to,
+per the standing rule that escalation requires a rerun to re-fail the SAME test
+deterministically — no rerun failed at all.
+
+## Gate (a) — fixture `0070` green
+
+From the authoritative CI log (run `28986078817`, `headSha f66fe9c`):
+
+```
+test access_log_h2_rcd_upstream_reset ... ok      <-- fixture 0070 (NEW, this phase)
+```
+
+The cross-proxy-equal status `503` + byte-identical whole line
+`{"method":"GET","proto":"HTTP/2","rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}`
+is therefore **differentially witnessed byte-exact against real upstream Envoy
+v1.33.0**. The driver asserts pure cross-proxy whole-line equality (no static
+literal), so a green fixture IS the witness. **Gate (a): MET.**
+
+## Gate (b) — all `0001`-`0069` still green SIMULTANEOUSLY (additivity)
+
+`ls tests/fixtures/ | wc -l` → **70**; `ls tests/differential/tests/*.rs | wc -l` →
+**70** (one auto-discovered test binary per fixture). On CI at `f66fe9c`:
+
+```
+$ grep -c "test result:"                 -> 145
+$ grep "test result:" | grep -vc "ok\."  ->   0
+$ grep -cE "\.\.\. FAILED|test result: FAILED" -> 0
+```
+
+Zero failures anywhere in the run — so all 70 fixtures (`0001`-`0070`) are green
+**in the same run**, which is exactly the simultaneity the invariant demands. The
+two load-bearing witnesses:
+
+```
+test access_log_h2_uc_upstream_reset ... ok       <-- fixture 0069 (additivity)
+test admin_config_dump_server_info ... ok         <-- the bridge-IP flake, green on CI
+```
+
+`0069` logs `{method,proto,rc,rf}` and no `rcd`; its `rf:"UC"` now arrives via the
+rcd-match rather than the retired boolean, and its emitted line is byte-identical.
+**Gate (b): MET.**
+
+### Independent re-verification of the `!retry_limit_exceeded_for_log_h2` guard
+
+The guard is the single most error-prone line in the phase, and fixture `0070`
+**cannot** exercise the retry-exhausted-reset path. `PROGRESS.md` Task 2 reports a
+mutation check; a report is not evidence, so **the mutation check was re-run from
+scratch this session**. Guard clause deleted:
+
+```
+test hcm::tests::h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx ... FAILED
+  left: "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"URX\"}\n"
+ right: "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.15s
+```
+
+Guard restored (`git diff --stat crates/envoy-http2/src/hcm.rs` → empty, tree
+byte-identical):
+
+```
+test hcm::tests::h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.15s
+```
+
+**Red-green confirmed independently.** The negative backstop genuinely pins the
+guard; it is not vacuous. The retired boolean is likewise gone:
+
+```
+$ grep -rn "reset_for_log_h2" crates/ docs/envoy-rust/BEHAVIOR_CONTRACT.md
+(no output — exit 1)
+```
+
+## Gate (c) — h2spec ≥95%
+
+The h2spec binary is **absent on this dev host**, so the runner takes its
+documented `eprintln!`-skip path (`tests/conformance/h2spec/tests/h2spec_runner.rs`:
+*"When `which h2spec` fails locally the test eprintln!-skips per phase 05.2 SPEC §3
+D7. CI provisions the binary"*). Gate (c) is therefore **CI-only by construction**.
+On CI at `f66fe9c`:
+
+```
+test h2spec_pass_rate_gate ... ok
+```
+
+That test IS the gate: `const PASS_RATE_GATE: f64 = 0.95;` with
+`assert!(pass_rate >= PASS_RATE_GATE, …)`, plus the lockstep known-failure check
+(a listed-but-now-passing test also REDs it). Its passing therefore establishes
+**≥95% AND** an exact known-failures match. `known-failures.txt` was **NOT trimmed**
+(`git diff d5b6dd4..HEAD -- tests/conformance/h2spec/known-failures.txt` → 0 lines),
+honoring memory `h2spec-3-5-2-preface-host-sensitive`. NO H2 codec/framing change
+landed this phase. **Gate (c): MET.**
+
+## Gate (d) — no new fuzz target
+
+SPEC §H declares no new fuzz target (the phase adds a new VALUE on an existing
+operator, not a new operator/grammar).
+
+```
+$ git log --oneline d5b6dd4..HEAD -- .github/workflows/ci.yml | wc -l   -> 0
+$ git diff d5b6dd4..HEAD -- .github/workflows/ci.yml | wc -l            -> 0
+$ git diff --stat d5b6dd4..HEAD -- '*fuzz*' | wc -l                     -> 0
+```
+
+The four pre-existing targets are unchanged (`accesslog_format_parse`,
+`parse_bootstrap`, `cdn_loop_parse`, `jwt_parse`), and CI's fuzz job —
+`fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)`
+— concluded **success**. Memory `new-fuzz-target-needs-a-ci-yml-step` does not
+apply (nothing to wire). **Gate (d): MET.**
+
+## Gate (f) — `REVIEW.md` approved
+
+**NOT this session.** Gate (f) is the §5 **state-5** code-review
+(`superpowers:requesting-code-review`), per `BOOTSTRAP_PROMPT.md` §5.1's
+one-state-per-session rule.
+
+## Finding for the state-5 code-review (doc precision, NON-blocking)
+
+Surfaced while verifying the §E contract edits; **not** a gate-(a)-(e) failure, and
+deliberately NOT fixed here (§5.2: fixes re-enter at state-3, and §5.1 forbids
+chaining states).
+
+`BEHAVIOR_CONTRACT.md`'s two touched rows now **disagree about when carry-forward
+M56-1 closed**:
+
+- the `%RESPONSE_FLAGS%` row (`:1020`) ends the phase-64/65 narrative with
+  *"…the boolean discriminator + its `finalize_h2_stream` parameter were RETIRED —
+  **CLOSING carry-forward M56-1**"* — attaching the closure to **phase 65**;
+- the `%RESPONSE_CODE_DETAILS%` row (`:1031`) states *"`M56-1` was already fully
+  closed at **phase 64**"* — as do `STATE.md` and the phase-64 close-out.
+
+Provenance: the `— **CLOSING carry-forward M56-1**` clause is **pre-existing
+phase-64 text** (confirmed present at `d5b6dd4`), where it attached to phase 64's
+`UC` witness. Phase 65's Task 5 inserted its own sentence *between* that narrative
+and the clause, so the em-dash now binds to the phase-65 retirement. It is a
+grammatical re-attachment, not a new claim — cosmetic, zero behavioral impact, and
+no `%RESPONSE_FLAGS%`/`%RESPONSE_CODE_DETAILS%` value is affected. But the contract
+is the canonical reference for **today's** rules (layout-invariant 5), and phase 65's
+own Task 5 discipline was explicitly about not leaving a row self-contradictory —
+so this belongs in `REVIEW.md` as a Minor for the state-5 session to fold in.
+
+## State-4 verification — SUMMARY
+
+| Gate | Verdict | Evidence |
+|---|---|---|
+| (a) fixture `0070` green | **MET** | CI `28986078817` @ `f66fe9c`: `test access_log_h2_rcd_upstream_reset ... ok` |
+| (b) `0001`-`0069` green simultaneously | **MET** | same run: 145 `test result:` lines, 0 non-`ok`, 0 `FAILED`; 70/70 fixtures; `0069` byte-identical |
+| (c) h2spec ≥95% | **MET** | same run: `test h2spec_pass_rate_gate ... ok` (the test asserts `>= 0.95` + known-failures lockstep); `known-failures.txt` untrimmed |
+| (d) no new fuzz target | **MET** | `ci.yml` + `*fuzz*` diffs empty across `d5b6dd4..HEAD`; CI fuzz job success |
+| (e) build/clippy/fmt/test/deny clean | **MET** | build/clippy/fmt/deny exit 0 locally; `cargo test --workspace` green on CI (0 failures); local REDs are a 5-target environmental invariant core + a varying flake tail, each adjudicated above |
+| (f) `REVIEW.md` approved | **state-5** | next session (`superpowers:requesting-code-review`) |
+
+**§7.5 (a)-(e) are MET; (f) is the next session's gate.** The deterministic H2
+upstream-reset `%RESPONSE_CODE_DETAILS%`
+`upstream_reset_before_response_started{connection_termination}` is differentially
+witnessed byte-exact against real upstream Envoy v1.33.0, and the H2 `UC`
+`%RESPONSE_FLAGS%` now derives 1:1 from it with the `reset_for_log_h2` boolean
+retired at all 5 sites. **Carry-forward M64-1 is CONSUMED.** `#![forbid(unsafe_code)]`
+holds. **NO new ADR fired this session** — no §6.2 reconciliation, no §A-§G fact
+overturned; **ADR-0123 remains reserved-but-UNFIRED**. **DECISIONS.md ledger head:
+ADR-0122.** ADR-0014 in force; ADR-0028 open; ADR-0049 governs config-validity.
+
+**Next session = §5 state-5 code-review** (`superpowers:requesting-code-review`,
+producing `REVIEW.md`). Per §5.1, one state per session — the code-review was
+deliberately NOT run here.
