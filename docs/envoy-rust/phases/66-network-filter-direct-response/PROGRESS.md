@@ -393,3 +393,64 @@ carries documented startup-race flakes → `gh run rerun <id> --failed`. Escalat
 `superpowers:systematic-debugging` only if a rerun re-fails the SAME test deterministically.
 
 **Confirming CI:** `gh run list --commit <short-sha>` silently returns `[]`. Use the full 40-char SHA.
+
+---
+
+## BLOCK-66-1 root-caused and FIXED [ADR-0126]
+
+ADR-0125's bounded diagnostics fired on CI run `29023995517` and printed:
+
+```
+backend ready timed out after 30s at 127.0.0.1:44785
+http2-echo-server exit status: None (None = still running)
+http2-echo-server stderr:
+                                    <-- empty
+```
+
+A **live** child, an **empty** stderr, a port that never opens. This matched **none** of ADR-0125's
+three predicted readings (bind failure / file-lock message / clean exit) — the triage table was
+wrong, so the root-cause pass started from the observation, not the table.
+
+**Root cause (measured).** `spawn_backend` ran `cargo run --quiet --manifest-path <helper>`.
+
+1. Under resolver v2, feature unification is computed over the **packages selected on the command
+   line**. `--manifest-path <helper>` selects ONE package; CI's `cargo build --workspace
+   --all-targets` selects all 22. Shared deps therefore resolve **different feature sets** —
+   workspace `tokio` carries `process`/`test-util`/`fs` the helper's does not; `aws-lc-rs`/
+   `aws-lc-sys` differ on `prebuilt-nasm`; so do `futures-util`, `rustix`, `serde_core`, `smallvec`,
+   `syn`, `bitflags`.
+2. Diffing the two `cargo build -Z unstable-options --unit-graph` outputs under a **recursive**
+   fingerprint (each unit hashed over its own features *and* its dependencies' hashes — a flat
+   per-unit feature comparison is unsound and first gave a false "nothing to rebuild"):
+   **46 of the helper's 116 units have no counterpart in the workspace build**, and **7 are warmed
+   by no sibling test**: `futures-util`, `tokio-util`, `h2`, `envoy-cluster`, `envoy-http1`,
+   `envoy-http2`, and the bin.
+3. `.spawn()` returns immediately, so that compile runs **inside `wait_ready`'s 30s budget**. The
+   port opens only once it finishes.
+4. `--quiet` suppresses `Compiling …` **and** `Blocking waiting for file lock on artifact directory`
+   (verified by holding the lock and diffing quiet vs loud stderr). Those are the only two things a
+   silent, live cargo can do — which fully explains `exit status: None` + empty stderr + no listener.
+5. `Swatinem/rust-cache` saves **only on job success**, so once these units missed the cache the
+   test timed out, the job failed, the cache was not saved, and the next run was cold again —
+   turning an occasional flake into a **deterministic** failure that reruns provably cannot recover.
+
+**Corrected.** The earlier hypothesis in this session — *"a nested `cargo run` after a workspace
+build emits zero stderr and recompiles nothing"* — was **asserted, not measured, and is REFUTED**.
+The absence of `Compiling`/`Blocking` in the CI log is explained by (4), and is not evidence that no
+compile occurred. The pre-existing "port-reuse startup race" note is also wrong: no port is reused;
+the port is never bound.
+
+**Fix.** In `spawn_backend`: build the helper to completion **before** the readiness clock starts,
+under its own bounded `PREBUILD_TIMEOUT = 240s` (loud on non-zero exit or elapse); then `cargo run`
+the warm artifact. `--quiet` is passed **nowhere**, so a future stall describes itself. **The 30s
+readiness budget and every assertion are unchanged** — the budget now covers only the helper's
+startup, which is what it always claimed to mean.
+
+**Verified.** `cargo fmt --all -- --check` clean; `cargo clippy -p envoy-bin --all-targets -D
+warnings` zero; test passes warm (0.69s). With the chain cold, the pre-build emits **7** `Compiling`
+lines and the subsequent `cargo run` emits **0** (`Finished in 0.04s`), port listening immediately —
+the compile has left the readiness budget, which was the entire defect.
+
+**Latent in four siblings** (warm chains only, none failing; NOT touched here — state-3 scope):
+`upstream_connection_pooling`, `upstream_active_health_check`, `upstream_outlier_detection`, and
+`tests/differential/src/backend.rs`. Recorded as carry-forward **M66-2**.

@@ -75,21 +75,56 @@ use common::{assert_stat, reserve_port, scrape_admin_stats, wait_ready};
 /// Matches fixture 0021's `settle_ms: 500` (Task 5 ADR-0039 pivot).
 const SETTLE_MS: u64 = 500;
 
-/// Spawn the `http2-echo-server` helper. Mirrors the H1 sibling's
-/// `cargo run --manifest-path` pattern (the helper isn't pre-built;
-/// `cargo run` compiles-on-demand on first hit and then re-uses the
-/// artifact across subsequent runs). The helper has no `--per-path`
-/// flag — it always returns 200 — so the workload simplifies to 5
-/// GETs to `/`.
+/// Budget for the helper pre-build in `spawn_backend`. Generous: a cold
+/// artifact cache has to compile the helper's whole dependency chain.
+const PREBUILD_TIMEOUT: Duration = Duration::from_secs(240);
+
+/// Spawn the `http2-echo-server` helper. The helper has no `--per-path`
+/// flag — it always returns 200 — so the workload simplifies to 5 GETs
+/// to `/`.
+///
+/// The helper is **built before it is spawned**, and the build is not run
+/// under the caller's readiness budget. See ADR-0126: `cargo run
+/// --manifest-path <helper>` is a *single-package* selection, and its
+/// resolver-v2 feature unification differs from the workspace-wide one
+/// that CI's `cargo build --workspace --all-targets` resolves (workspace
+/// `tokio` adds `process`/`test-util`/`fs`). 46 of the helper's 116 build
+/// units therefore have no counterpart in the workspace build, and ~11 —
+/// `futures-util`, `tokio-util`, `h2`, `envoy-cluster`, `envoy-http1`,
+/// `envoy-http2`, the bin — are warmed by no sibling test either. On a
+/// cold cache `cargo run` compiled that chain *inside* the 30s
+/// backend-readiness budget below and blew it.
+///
+/// `--quiet` is deliberately passed nowhere in this function: it
+/// suppresses `Compiling …` *and* `Blocking waiting for file lock`, which
+/// is why the original failure surfaced as a live, silent child with an
+/// empty stderr. A future stall must describe itself.
 async fn spawn_backend(port: u16) -> tokio::process::Child {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("workspace root")
         .join("tests/helpers/http2-echo-server/Cargo.toml");
+
+    let build = tokio::process::Command::new(env!("CARGO"))
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status();
+    match tokio::time::timeout(PREBUILD_TIMEOUT, build).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => panic!("pre-building http2-echo-server failed: {status}"),
+        Ok(Err(e)) => panic!("pre-building http2-echo-server: {e}"),
+        Err(_) => panic!(
+            "pre-building http2-echo-server exceeded {PREBUILD_TIMEOUT:?} \
+             (still compiling, or blocked on the cargo artifact-directory lock)"
+        ),
+    }
+
     tokio::process::Command::new(env!("CARGO"))
         .arg("run")
-        .arg("--quiet")
         .arg("--manifest-path")
         .arg(&manifest)
         .arg("--")
@@ -206,9 +241,9 @@ async fn upstream_h2_connection_pooling() {
     let backend_addr: SocketAddr = format!("127.0.0.1:{backend_port}").parse().unwrap();
 
     let mut _backend = spawn_backend(backend_port).await;
-    // 30s budget matches the H1 sibling's backend readiness budget
-    // (the `cargo run --manifest-path` step compiles on first hit;
-    // subsequent runs reuse the cached artifact and return in <1s).
+    // 30s budget matches the H1 sibling's backend readiness budget. Per
+    // ADR-0126 this budget now covers *only* the helper's startup: the
+    // compile is hoisted out of it, into `spawn_backend`'s pre-build.
     if wait_ready(backend_addr, Duration::from_secs(30))
         .await
         .is_err()

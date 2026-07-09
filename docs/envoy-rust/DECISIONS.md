@@ -2402,6 +2402,43 @@ The state-3 PLAN MAY enrich fixture `0047` with a `bool`/`null` literal leaf to 
 
 ---
 
+## ADR-0126: BLOCK-66-1 root-caused — a nested `cargo run --manifest-path <helper>` is a SINGLE-PACKAGE selection whose resolver-v2 feature unification differs from `cargo build --workspace`'s, so it COMPILES a ~11-unit chain *inside* the test's 30s backend-readiness budget, and `--quiet` suppresses both `Compiling …` and `Blocking waiting for file lock`; hoist the build out of the readiness budget and stop silencing cargo — do NOT widen the budget, `#[ignore]` the test, or keep rerunning
+
+- Date: 2026-07-09
+- Status: accepted (phase-66 state-3 CI adjudication; `superpowers:systematic-debugging` Phase 1–4)
+- Supersedes the *diagnosis* deferred by [ADR-0125]; ADR-0125's diagnostic instrumentation is RETAINED.
+
+**Context.** ADR-0125 landed bounded diagnostics on `crates/envoy-bin/tests/upstream_h2_connection_pooling.rs` and predicted the next CI run would still fail but name its cause. Run `29023995517` failed as predicted and printed:
+
+```
+backend ready timed out after 30s at 127.0.0.1:44785
+http2-echo-server exit status: None (None = still running)
+http2-echo-server stderr:
+                                    <-- empty
+```
+
+A **live** child with an **empty** stderr that never opens its port. ADR-0125's triage table offered three readings (bind failure / file-lock / clean-exit); the observed output matched **none** of them, so the table itself was wrong. Root-causing proceeded from the observation rather than the table.
+
+**Root cause (measured, not inferred).**
+
+1. `spawn_backend` ran `cargo run --quiet --manifest-path tests/helpers/http2-echo-server/Cargo.toml`. Under resolver v2, feature unification is computed over the **packages selected on the command line**. `--manifest-path <helper>` selects exactly ONE package; CI's build step (`cargo build --workspace --all-targets`) selects all 22. The two selections resolve **different feature sets** for shared dependencies — workspace `tokio` carries `process`/`test-util`/`fs` that the helper's does not; `aws-lc-rs`/`aws-lc-sys` differ on `prebuilt-nasm`; `futures-util`, `rustix`, `serde_core`, `smallvec`, `syn`, `bitflags` all differ.
+2. Comparing the two `cargo build -Z unstable-options --unit-graph` outputs under a **recursive** fingerprint (each unit hashed over its own features *and* its dependencies' hashes — a flat per-unit feature comparison is unsound here and initially gave a false "nothing to rebuild"): **46 of the helper's 116 build units have no counterpart in the workspace build.** After the units that sibling tests warm (`upstream_connection_pooling` → `http1-echo-server`; `upstream_active_health_check` → `health-aware-http1-backend`), **7 remain exclusive** to this test.
+3. Reproduced: with those units cold, `cargo build --manifest-path <helper>` emits 7 `Compiling` lines — `futures-util`, `tokio-util`, `h2`, `envoy-cluster`, `envoy-http1`, `envoy-http2`, and the bin. `.spawn()` returns immediately, so **that compile runs after `spawn_backend` returns — i.e. inside `wait_ready`'s 30s window.** The port opens only once the compile finishes and the bin execs.
+4. Reproduced: `--quiet` suppresses `Compiling …` **and** `Blocking waiting for file lock on artifact directory` (verified by holding the lock and diffing quiet vs loud stderr). Those are the only two things a silent, live cargo can be doing. **This fully explains `exit status: None` + empty stderr + no listener.**
+5. Self-perpetuating on CI: `Swatinem/rust-cache` saves the cache **only on job success**. Once these units miss the cache, the test times out, the job fails, the cache is not saved, and the next run is cold again. That is why the failure moved from *occasionally flaky* (rerun → green, while an older cache still held the artifacts) to **deterministic across attempts 2/3/4** — and why rerunning could not recover it.
+
+**Explicitly corrected.** An earlier hypothesis in this same session — *"a nested `cargo run` after a workspace build emits zero stderr and recompiles nothing"* — is **REFUTED** by (1)–(3). It was asserted, not measured. The absence of `Compiling`/`Blocking` in the CI test-step log is fully accounted for by (4) and is **not** evidence that no compile occurred. The pre-existing note calling this a "port-reuse startup race" is likewise wrong: no port is reused; the port is never bound.
+
+**Decision.** In `spawn_backend`: build the helper to completion **before** the readiness clock starts, under its own generous, bounded budget (`PREBUILD_TIMEOUT = 240s`, failing loudly on non-zero exit or elapse); then `cargo run` the now-warm artifact. Pass `--quiet` **nowhere** in that function, so any future stall describes itself. The 30s readiness budget and every assertion are left EXACTLY as they were — the budget now covers only the helper's startup, which is what it was always documented to mean.
+
+**Rejected.** *Widen the 30s budget* — treats a compile as if it were startup latency, and the compile is unbounded on a cold cache. *`#[ignore]` or weaken the assertion* — destroys the H2-pool-reuse backstop to silence a harness defect. *Keep rerunning* — refuted by (5): reruns cannot repopulate a cache that only a green run writes. *Exec `target/debug/http2-echo-server` directly* — fastest, but breaks the bare `cargo test -p envoy-bin --test upstream_h2_connection_pooling` path for local devs, since that invocation never builds another package's bin; the pre-build preserves compile-on-demand.
+
+**Verified.** `cargo fmt --all -- --check` clean; `cargo clippy -p envoy-bin --all-targets -- -D warnings` zero; the test passes warm (0.69s). With the chain cold: the pre-build emits 7 `Compiling` lines and the subsequent `cargo run` emits **0**, reporting `Finished in 0.04s` with the port listening immediately — the compile has moved out of the readiness budget, which was the whole defect.
+
+**Consequences.** BLOCK-66-1 is expected to clear; §7.5 gate (e) becomes assessable at state-4. The compile-inside-a-readiness-budget hazard is **latent in four siblings** that survive only because their chains are warmed earlier in the run: `upstream_connection_pooling`, `upstream_active_health_check`, `upstream_outlier_detection`, and `tests/differential/src/backend.rs`. They are NOT touched here (state-3 scope discipline, and none is failing); recorded as carry-forward **M66-2** for a later harness sweep. Phase 66's own surfaces remain untouched and exonerated. `#![forbid(unsafe_code)]` holds; no new crate/dependency/fuzz-target/`ConfigError` variant. **DECISIONS.md ledger head: ADR-0126** (project-cumulative count 126; next-available **ADR-0127**). ADR-0125 remains in force (its instrumentation is what produced the evidence above); **ADR-0014 REMAINS IN FORCE; ADR-0028 REMAINS OPEN; ADR-0049 governs** the config-validity all-fatal posture.
+
+---
+
 ## ADR-0125: Phase-66 state-3 CI adjudication — the `upstream_h2_connection_pooling` backstop fails DETERMINISTICALLY on CI (3 reruns) for reasons phase 66 did not cause, and its `.expect("backend ready")` DISCARDS the only evidence; add bounded stderr + exit-status diagnostics to that test rather than weakening it, widening its budget, or declaring CI green
 
 - Date: 2026-07-09
