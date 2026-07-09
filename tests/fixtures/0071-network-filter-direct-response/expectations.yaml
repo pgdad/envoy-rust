@@ -1,0 +1,5 @@
+driver:
+  kind: tcp_direct_response
+equivalence:
+  response_body:
+    kind: byte_exact
