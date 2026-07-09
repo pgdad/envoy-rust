@@ -226,6 +226,60 @@ no-op clause below).
 
 ---
 
+## Network filters
+
+> Opened by phase 66 (the Network-filters family's first row). Scope today:
+> `echo`, `tcp_proxy`, `http_connection_manager`, `direct_response`.
+>
+> **Do not conflate** `envoy.filters.network.direct_response` (this network filter, which
+> writes a payload on connection accept) with the HCM **route-level** `direct_response`
+> action (phase 04, which returns an HTTP response for a matched route). They are
+> different features with the same name; every `direct_response` row elsewhere in this
+> document refers to the route-level action.
+
+### `envoy.filters.network.direct_response` (phase 66, ADR-0123 / ADR-0124)
+
+1. **Response semantics.** On each accepted downstream connection the filter writes the configured
+   `response` payload immediately — without reading or waiting for any client bytes — then closes
+   the connection with a clean EOF (no RST). A missing or empty `response` yields a zero-byte write
+   followed by a clean close. Output is byte-identical across connections and independent of client
+   input and of client read timing. *(Witnessed against `envoyproxy/envoy:v1.33.0`; SPEC §0 R-0.5, R-0.7.)*
+   Differentially witnessed byte-exact by fixture **`0071-network-filter-direct-response`** via
+   `Driver::TcpDirectResponse` (the harness's first read-to-EOF raw-TCP driver).
+
+2. **Read-half drain (ADR-0124).** After sending FIN, both proxies continue to drain (read and
+   discard) the downstream read half until the client closes. A client write issued AFTER it
+   observes EOF is therefore **accepted, not reset** — measured on upstream Envoy at 0, 21, and
+   200 000 unread bytes (`post_write=writes_ok`). envoy-rust matches. A server that closed without
+   draining would RST the client, which upstream Envoy does not do. **This clause has no
+   differential observable** (fixture `0071`'s driver never writes after EOF); it is pinned
+   in-process by `post_eof_client_write_is_accepted_not_reset`
+   (`crates/envoy-bin/src/direct_response.rs`), whose doc comment carries a mutation-check
+   instruction: delete the drain loop and that test must fail.
+
+3. **Network-filter terminal rule (bilateral).** All four network filters envoy-rust supports —
+   `echo`, `tcp_proxy`, `http_connection_manager`, `direct_response` — are TERMINAL: each must be
+   the last filter in its chain, and upstream Envoy rejects a config that places any of them before
+   another network filter (`terminal filter named <X> ... must be the last filter in a network
+   filter chain`). envoy-rust enforces the identical rule via
+   `ConfigError::NetworkFilterNotTerminal`, where previously it silently ignored every filter after
+   the first. *(SPEC §0 R-0.6.)* Implemented as a per-name `is_terminal_network_filter` predicate,
+   not a `chain.filters.len() <= 1` check, so the first non-terminal network filter (`sni_cluster`,
+   network `rbac`) drops in without re-litigating the rule.
+
+4. **Recorded divergence — `DataSource` arms (CF-66-1).** Upstream Envoy accepts
+   `response.inline_bytes` and `response.filename`; envoy-rust accepts only `response.inline_string`
+   and rejects the other arms loudly at config load (serde `deny_unknown_fields`). Deliberate, per
+   the ADR-0049 decision-2 (b) fail-loud posture. No differential observable — fixture `0071` uses
+   `inline_string`.
+
+5. **Scope note — `echo` `typed_config` asymmetry (pre-existing, unchanged).** Upstream Envoy
+   REQUIRES `typed_config` on `envoy.filters.network.echo`; envoy-rust forbids it
+   (`UnexpectedTypedConfig`). Fixture `0001`'s two sides differ accordingly (ADR-0014 YAML shim).
+   `direct_response` introduces no such asymmetry — both sides of fixture `0071` are identical.
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**
