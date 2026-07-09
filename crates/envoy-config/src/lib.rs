@@ -78,6 +78,18 @@ pub enum ConfigError {
     MissingTypedConfig(&'static str),
     #[error("filter '{0}' must not carry typed_config")]
     UnexpectedTypedConfig(&'static str),
+    /// 66 (ADR-0123): a TERMINAL network filter appeared before the end of its
+    /// filter chain. Mirrors upstream Envoy, which rejects the same shape with
+    /// "terminal filter named <X> of type <X> must be the last filter in a
+    /// network filter chain." `position` is 1-based.
+    #[error(
+        "terminal network filter '{name}' at position {position} of {chain_len} must be the last filter in its network filter chain"
+    )]
+    NetworkFilterNotTerminal {
+        name: String,
+        position: usize,
+        chain_len: usize,
+    },
     #[error("unknown cluster '{0}'")]
     UnknownCluster(String),
     /// 18 D1 (L8, ADR-0049): `dynamic_resources.cds_config.resource_api_version`

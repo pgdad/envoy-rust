@@ -814,6 +814,24 @@ pub struct DirectResponseConfig {
     pub response: Option<DataSourceInline>,
 }
 
+/// Is `name` a TERMINAL network filter — one that must be the LAST filter in
+/// its chain?
+///
+/// Every network filter envoy-rust supports today is terminal, empirically
+/// confirmed against `envoyproxy/envoy:v1.33.0` (phase-66 SPEC §0 R-0.6). This
+/// is written as a per-name predicate rather than a `chain.filters.len() <= 1`
+/// check so that the first NON-terminal network filter (`sni_cluster`, network
+/// `rbac`) drops in without re-litigating the rule. See ADR-0123.
+fn is_terminal_network_filter(name: &str) -> bool {
+    matches!(
+        name,
+        crate::ECHO_FILTER
+            | crate::TCP_PROXY_FILTER
+            | crate::HCM_FILTER
+            | crate::DIRECT_RESPONSE_FILTER
+    )
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TcpProxyConfig {
@@ -2993,6 +3011,22 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                     }
                 }
             }
+            // 66 (ADR-0123): terminal-filter pre-pass. Runs BEFORE the mutating
+            // per-filter loop for two reasons: (a) that loop borrows
+            // `chain.filters` mutably (the HCM arm calls `as_mut()`), and we
+            // need the length + index here; (b) it reproduces upstream Envoy's
+            // error precedence — a chain of [direct_response, echo] reports the
+            // TERMINAL error even when the trailing filter is itself malformed.
+            let chain_len = chain.filters.len();
+            for (idx, filter) in chain.filters.iter().enumerate() {
+                if is_terminal_network_filter(&filter.name) && idx + 1 != chain_len {
+                    return Err(crate::ConfigError::NetworkFilterNotTerminal {
+                        name: filter.name.clone(),
+                        position: idx + 1,
+                        chain_len,
+                    });
+                }
+            }
             for filter in &mut chain.filters {
                 match filter.name.as_str() {
                     crate::ECHO_FILTER => {
@@ -5014,6 +5048,95 @@ static_resources:
             ),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn terminal_network_filter_must_be_last() {
+        // SPEC §0 R-0.6: upstream Envoy rejects this exact shape.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config
+                response:
+                  inline_string: "x"
+            - name: envoy.filters.network.echo
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("terminal filter not last");
+        match err {
+            crate::ConfigError::NetworkFilterNotTerminal {
+                name,
+                position,
+                chain_len,
+            } => {
+                assert_eq!(name, crate::DIRECT_RESPONSE_FILTER);
+                assert_eq!(position, 1);
+                assert_eq!(chain_len, 2);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn echo_is_also_terminal() {
+        // All four supported network filters are terminal upstream (R-0.6).
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.echo
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config
+                response:
+                  inline_string: "x"
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("echo must be terminal too");
+        assert!(
+            matches!(err, crate::ConfigError::NetworkFilterNotTerminal { ref name, .. } if name == crate::ECHO_FILTER),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn single_terminal_filter_chain_is_accepted() {
+        // Regression guard for R-0.8: every existing config is single-filter.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.echo
+"#;
+        crate::parse_bootstrap(yaml).expect("single-filter chain must still validate");
+    }
+
+    #[test]
+    fn is_terminal_network_filter_covers_all_four_supported_names() {
+        for n in [
+            crate::ECHO_FILTER,
+            crate::TCP_PROXY_FILTER,
+            crate::HCM_FILTER,
+            crate::DIRECT_RESPONSE_FILTER,
+        ] {
+            assert!(is_terminal_network_filter(n), "{n} must be terminal");
+        }
+        assert!(!is_terminal_network_filter(
+            "envoy.filters.network.sni_cluster"
+        ));
     }
 
     #[test]
