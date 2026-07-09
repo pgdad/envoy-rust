@@ -454,3 +454,36 @@ the compile has left the readiness budget, which was the entire defect.
 **Latent in four siblings** (warm chains only, none failing; NOT touched here — state-3 scope):
 `upstream_connection_pooling`, `upstream_active_health_check`, `upstream_outlier_detection`, and
 `tests/differential/src/backend.rs`. Recorded as carry-forward **M66-2**.
+
+### CI confirmation of the ADR-0126 fix — BLOCK-66-1 CLEARED
+
+Run `29025781624` (`b9f8f6ed87fc689d3cd5df4cfdf4bedfc9a5a9b9`): **green on attempt 1, no rerun.**
+Both jobs got real runners (`fuzz` 12 steps, `build + test + lint` 15 steps).
+
+The `test` step contains the quantitative confirmation. The new pre-build compiled exactly the
+chain predicted above and reported:
+
+```
+Compiling envoy-config … envoy-filter … envoy-listener … envoy-cluster … envoy-http1 …
+Compiling envoy-http2 … Compiling http2-echo-server v0.0.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 33.63s
+test upstream_h2_connection_pooling ... ok
+test result: ok. 1 passed; 0 failed; … finished in 34.38s
+```
+
+**33.63s of compiling, against a 30s readiness budget.** That compile used to run *inside* the
+budget, overshooting it by ~3.6s — matching the observed timeouts to within a second
+(30.35 / 30.35 / 30.37s). The root cause is therefore **measured, not merely argued**. And because
+this run went green, `Swatinem/rust-cache` finally saved those units, breaking the self-perpetuating
+cold-cache loop.
+
+Side-evidence that the gate was finally exercised: `cargo test --workspace` no longer aborts early,
+so `envoy-config`'s `548 passed` line and the h2spec conformance step appear for the first time in
+four attempts, with **zero** `panicked at` / `test result: FAILED` lines across 29 413 log lines.
+
+**Log-reading trap:** CI interleaves ANSI escapes between `Compiling` and the crate name, so
+`grep "Compiling h2 "` silently returns nothing and reads as "no compile happened." Grep the crate
+name alone.
+
+**Status:** BLOCK-66-1 is CLEARED. §7.5 gate (e) is now assessable; (b) has positive CI evidence for
+the first time. The state-4 verification session runs the full (a)-(f) gate.
