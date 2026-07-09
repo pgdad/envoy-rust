@@ -249,6 +249,32 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     echo::serve(lst, async move { shutdown.cancelled().await }).await
                 });
             }
+            envoy_config::DIRECT_RESPONSE_FILTER => {
+                let Some(envoy_config::TypedConfig::DirectResponse(dr_cfg)) =
+                    filter.typed_config.as_ref()
+                else {
+                    anyhow::bail!(
+                        "validator guarantees a DirectResponse typed_config on {}",
+                        envoy_config::DIRECT_RESPONSE_FILTER
+                    );
+                };
+                // `response` omitted => empty payload (SPEC §0 R-0.7).
+                let payload: std::sync::Arc<[u8]> = dr_cfg
+                    .response
+                    .as_ref()
+                    .map(|d| d.inline_string.as_bytes())
+                    .unwrap_or(&[])
+                    .into();
+                let lst = TcpListener::bind(bind_addr)
+                    .await
+                    .with_context(|| format!("binding direct_response listener to {bind_addr}"))?;
+                tracing::info!(addr = %bind_addr, payload_len = payload.len(), "envoy-rust listening (direct_response)");
+                let shutdown = token.clone();
+                set.spawn(async move {
+                    direct_response::serve(lst, payload, async move { shutdown.cancelled().await })
+                        .await
+                });
+            }
             envoy_config::TCP_PROXY_FILTER => {
                 let Some(envoy_config::TypedConfig::TcpProxy(tp_cfg)) =
                     filter.typed_config.as_ref()
