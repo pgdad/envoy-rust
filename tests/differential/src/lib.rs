@@ -38,6 +38,14 @@ pub struct Expectations {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Driver {
     TcpEcho,
+    /// 66 NEW (ADR-0123): raw-TCP connect -> send NOTHING -> read to EOF.
+    ///
+    /// The harness's first read-to-EOF raw-TCP driver. `TcpEcho`/`drive_tcp`
+    /// cannot express `direct_response`: it writes a payload and reads exactly
+    /// `payload.len()` bytes back (ADR-0006/ADR-0007), whereas
+    /// `direct_response` ignores client input and writes a payload of its own
+    /// length before closing.
+    TcpDirectResponse,
     HttpGet {
         path: String,
         host: String,
@@ -1691,6 +1699,26 @@ pub async fn drive_tcp(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Connect to `addr`, send NOTHING, and read until the peer closes.
+///
+/// `envoy.filters.network.direct_response` writes its configured payload the
+/// moment a connection is accepted and then half-closes, so the whole response
+/// is "everything until EOF". A missing EOF within the deadline is a contract
+/// violation (the peer must close, not linger). Phase 66, SPEC §0 R-0.5.
+pub async fn drive_tcp_direct_response(addr: SocketAddr) -> Result<Vec<u8>> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    let mut out = Vec::new();
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => bail!("{addr} read error before EOF (reset?): {e}"),
+        Err(_) => bail!("{addr} did not close within 5s; direct_response must half-close"),
+    }
+    drop(stream);
+    Ok(out)
+}
+
 /// Drive a payload through `addr` over a TLS connection terminated by the
 /// peer (downstream-TLS scenario). The peer's leaf cert is verified against
 /// `root_store`; the SNI is `sni`; if `expected_cn` is `Some`, the
@@ -2832,6 +2860,9 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     let subject_port_str = host_port.to_string();
     let port_key = match &expectations.driver {
         Driver::TcpEcho
+        // Phase 66 (ADR-0123): the direct_response listener uses the same
+        // {{PORT}} convention as the other raw-TCP drivers.
+        | Driver::TcpDirectResponse
         | Driver::TlsTcp { .. }
         | Driver::TlsTcpProbeList { .. }
         | Driver::Http1 { .. }
@@ -3873,6 +3904,9 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         Driver::TcpEcho => {
             run_tcp_echo_arm(&ctx, upstream, subject).await?;
         }
+        Driver::TcpDirectResponse => {
+            run_tcp_direct_response_arm(&ctx, upstream, subject).await?;
+        }
         Driver::HttpGet { path, host } => {
             run_http_get_arm(&ctx, upstream, subject, path, host).await?;
         }
@@ -4227,6 +4261,32 @@ async fn run_tcp_echo_arm(
         .await
         .context("upstream envoy drive")?;
     let subject_out = drive_tcp(subject_addr, &payload)
+        .await
+        .context("envoy-rust drive")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    assert_equivalence(expectations, None, None, &upstream_out, &subject_out)?;
+    Ok(())
+}
+
+/// `Driver::TcpDirectResponse` arm of `run_fixture`. No `inputs/` payload: the
+/// probe sends nothing and reads to EOF on both proxies, then asserts the two
+/// response bodies are byte-equal.
+async fn run_tcp_direct_response_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    let upstream_out = drive_tcp_direct_response(upstream_addr)
+        .await
+        .context("upstream envoy drive")?;
+    let subject_out = drive_tcp_direct_response(subject_addr)
         .await
         .context("envoy-rust drive")?;
     subject.shutdown(Duration::from_secs(5)).await.ok();
@@ -6745,6 +6805,14 @@ mod tests {
         let yaml = "driver:\n  kind: tcp_echo\nequivalence:\n  response_body: sorta_equal\n";
         let r = serde_yaml::from_str::<Expectations>(yaml);
         assert!(r.is_err());
+    }
+
+    /// 66 (ADR-0123): the fixture-`0071` driver tag.
+    #[test]
+    fn parses_tcp_direct_response_driver() {
+        let y = "driver:\n  kind: tcp_direct_response\nequivalence:\n  response_body:\n    kind: byte_exact\n";
+        let e: Expectations = serde_yaml::from_str(y).expect("parses");
+        assert!(matches!(e.driver, Driver::TcpDirectResponse));
     }
 
     // Regression for REVIEW.md M3: `#[serde(deny_unknown_fields)]` must reject
