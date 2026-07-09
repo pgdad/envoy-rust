@@ -487,3 +487,291 @@ name alone.
 
 **Status:** BLOCK-66-1 is CLEARED. §7.5 gate (e) is now assessable; (b) has positive CI evidence for
 the first time. The state-4 verification session runs the full (a)-(f) gate.
+
+---
+
+# §5 state-4 VERIFICATION — the full §7.5 (a)-(f) gate
+
+> Run via `superpowers:verification-before-completion`. Every command below was executed **this
+> session** against `HEAD` = `origin/main` = `36db7e3d8bf7cc749d39fcb1c3acfa47ba1689fc`, working tree
+> clean. Output is quoted verbatim. Per §5.1 the state-5 code-review was **NOT** run.
+>
+> **Headline: the gate PASSES.** Its authority is CI (memory `envoy-rust-state4-ci-first-execution`),
+> and CI run **`29026523684`** at that exact SHA is **green on attempt 1**: **147/147 test binaries
+> `ok`, 1828 passed, 0 failed, 0 `panicked at`**. Five differential fixtures are RED *on this
+> development host only*, for two independently documented host-network defects; each is green on CI.
+> The arithmetic closes exactly (below), which is what makes the local REDs adjudicable rather than
+> merely asserted.
+
+## Session preconditions (verified at cold-start)
+
+- `git status --porcelain` → empty. Branch `main`. `HEAD` = `origin/main` = `36db7e3` (no sibling had
+  advanced the state; `git fetch origin --prune` showed `0 0` ahead/behind).
+- §5 state-4 detection rule confirmed: `SPEC.md` + `PLAN.md` + `PROGRESS.md` present, **`REVIEW.md`
+  absent**. ROADMAP row `66` = `in-progress`.
+- Docker 28.1.1 up; the local `envoyproxy/envoy:v1.33.0` digest is
+  `sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2` — **byte-identical to the
+  `ENVOY_TARGET.md` pin** (D-3.7). 71 fixtures present (`0001`…`0071`).
+- `cargo build -p envoy-bin` was run **first**, before any differential (memory
+  `differential-harness-uses-debug-envoy-bin`): the harness executes `target/debug/envoy-bin`, and
+  this phase added both a new config key and a new filter name.
+
+---
+
+## Gate (e) — the five commands
+
+| Command | Exit | Evidence |
+|---|---|---|
+| `cargo build --workspace --all-targets` | **0** | `Finished` dev profile … `in 11.57s`; **0** `^warning`/`^error` lines |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **0** | `Finished` … `in 4.65s`; **0** warnings |
+| `cargo fmt --all -- --check` | **0** | **0 bytes** of output |
+| `cargo test --workspace` | **101** locally / **0 on CI** | see the adjudication below — the five REDs are environmental |
+| `cargo deny check` | **0** | `advisories ok, bans ok, licenses ok, sources ok` |
+
+`cargo deny check` also emits five `warning[license-not-encountered]` lines (`0BSD`, `BSD-2-Clause`,
+`MPL-2.0`, `Unicode-DFS-2016`, `Zlib` — unmatched *allowances* in `deny.toml`, not violations). They
+are pre-existing, are warnings not errors, and the command exits 0. No freshly-published advisory
+fired this session (contrast memory `cargo-deny-reds-on-unrelated-advisory`).
+
+### `cargo test --workspace` — the bare form aborts early, exactly as ADR-0126 warns
+
+The literal gate command was run first, verbatim:
+
+```
+$ cargo test --workspace            # exit 101
+...
+test result: FAILED. 0 passed; 1 failed; ... finished in 2.72s
+error: test failed, to rerun pass `-p differential --test access_log_h2_rcd_upstream_reset`
+```
+
+That run produced only **209 log lines and 4 `test result:` lines**. It stopped at the first failing
+test *binary*, so `envoy-config`'s 548 tests, h2spec, and fixture `0071` **never executed**. This is
+the load-bearing reading trap ADR-0125 §(3) / ADR-0126 record: *a run reporting one failure has not
+exercised the gate.* The gate was therefore re-run with `--no-fail-fast` to enumerate the complete
+failing SET.
+
+### Adjudicating the local REDs — invariant core vs varying tail
+
+Per memory `local-red-set-varies-run-to-run`, the suite was run **twice** with `--no-fail-fast` and
+the failing SETs diffed; then every member of both sets was re-run **in isolation**.
+
+```
+RUN A  cargo test --workspace --no-fail-fast   exit=101   1823 passed, 5 failed, 147 binaries
+RUN B  cargo test --workspace --no-fail-fast   exit=101   1818 passed, 10 failed, 147 binaries
+```
+
+| | Run A | Run B | In isolation |
+|---|---|---|---|
+| `access_log_rf_upstream_reset` (fixture `0061`) | FAIL | FAIL | **FAIL** (deterministic) |
+| `access_log_rcd_upstream_reset` (`0062`) | FAIL | FAIL | **FAIL** (deterministic) |
+| `access_log_h2_uc_upstream_reset` (`0069`) | FAIL | FAIL | **FAIL** (deterministic) |
+| `access_log_h2_rcd_upstream_reset` (`0070`) | FAIL | FAIL | **FAIL** (deterministic) |
+| `admin_config_dump_server_info` | FAIL | FAIL | **FAIL** (deterministic) |
+| `http_filter_fault` | pass | FAIL | **pass** |
+| `lb_ring_hash` | pass | FAIL | **pass** |
+| `upstream_circuit_breaker` | pass | FAIL | **pass** |
+| `upstream_connection_pooling_and_per_class_counters` | pass | FAIL | **pass** |
+| `xds_file_based_cds` | pass | FAIL | **pass** |
+
+The separation is clean and matches the documented model exactly:
+
+- **Invariant core (5)** — fails in *both* runs *and* deterministically in isolation ⇒ environmental,
+  load-independent. Precisely the set `STATE.md` and `PLAN.md` predict.
+- **Varying tail (5)** — fails only under full-workspace parallel load, **passes in isolation** ⇒
+  parallel-load flake (memory `differential-fixtures-flake-under-parallel-load`, which names
+  `http_filter_fault` explicitly and warns the set is "not just the bridge-IP set"). Not regressions.
+
+**None of the ten is a phase-66 surface**, and fixture `0071` is green in run A, run B, and in
+isolation.
+
+### Root cause of the invariant core — measured from the failure text, not assumed
+
+Four of the five are the **close-backend** fixtures. Their panic text shows **upstream Envoy**, the
+*reference* proxy, failing to reach the host-spawned backend over IPv6:
+
+```
+envoy="{"rc":503,"rcd":"upstream_reset_before_response_started{remote_connection_failure|
+        immediate_connect_error:_Network_is_unreachable|
+        remote_address:[fdc4:f303:9324::254]:40217}","rf":"UF"}"
+envoy-rust="{"rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}"
+```
+
+Envoy reports a **connect failure** (`UF`, `Network_is_unreachable`) where envoy-rust correctly
+reports a **reset** (`UC`). This is memory `tcpclosebackend-ipv6-unreachable-host-flake`, verbatim.
+It is a property of *this host's container networking*, not of envoy-rust: phase 66 cannot have
+changed how the reference Envoy container routes IPv6.
+
+The fifth, `admin_config_dump_server_info`, diverges on `/clusters` with cluster stats present only
+on the Envoy side, keyed on the host bridge address:
+
+```
+envoy-only:      ["backend::192.168.65.2:46133::canary::false",
+                  "backend::192.168.65.2:46133::cx_active::0", ...]
+envoy-rust-only: []
+```
+
+That is memory `differential-host-bridge-ip-192-168-65-2` (this host routes the backend via
+`192.168.65.2`, outside the allow-listed `192.168.65.254`/`172.17.0.1`).
+
+### The arithmetic closes — this is what makes the adjudication sound
+
+```
+local RUN A : 1823 passed +  5 failed = 1828   across 147 binaries
+CI  29026523684: 1828 passed +  0 failed = 1828   across 147 binaries
+```
+
+The local tree and CI run the **same 1828 tests across the same 147 binaries**. The *only* delta is
+the five environmental REDs, every one of which is `ok` on CI (quoted under gate (b)). Nothing is
+hidden behind the early abort, and no test is missing on either side.
+
+---
+
+## Gate (a) — fixture `0071-network-filter-direct-response` is GREEN
+
+Confirmed **four** times: run A, run B, standalone locally, and on CI.
+
+```
+$ cargo build -p envoy-bin && cargo test -p differential --test network_filter_direct_response
+test network_filter_direct_response_fixture ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+```
+
+CI (`29026523684`, ANSI-stripped): `test network_filter_direct_response_fixture ... ok`.
+
+Every other phase-66 surface is green locally (run A) **and** on CI:
+
+```
+test direct_response::tests::writes_payload_then_clean_eof ... ok
+test direct_response::tests::empty_payload_writes_zero_bytes_then_closes ... ok
+test direct_response::tests::client_that_writes_first_still_receives_payload ... ok
+test direct_response::tests::post_eof_client_write_is_accepted_not_reset ... ok   <-- the ADR-0124 drain
+test direct_response::tests::shutdown_signal_stops_the_accept_loop ... ok
+test direct_response_writes_payload_then_clean_eof ... ok
+test direct_response_ignores_client_input ... ok
+test direct_response_with_omitted_response_writes_zero_bytes ... ok
+test bootstrap::tests::terminal_network_filter_must_be_last ... ok
+test bootstrap::tests::echo_is_also_terminal ... ok
+test bootstrap::tests::single_terminal_filter_chain_is_accepted ... ok
+test bootstrap::tests::is_terminal_network_filter_covers_all_four_supported_names ... ok
+test parses_tcp_direct_response_driver ... ok
+```
+
+The ADR-0124 drain was **not re-litigated** and its mutation check was left untouched, per the
+standing instruction. Also green: `upstream_h2_connection_pooling ... ok` and
+`upstream_h2_connection_pooling_fixture ... ok` — the ADR-0126 fix holds on this tree.
+
+## Gate (b) — all pre-existing fixtures `0001`-`0070` still green (additivity invariant)
+
+**CI is authoritative and says yes**: 147/147 binaries `ok`, `0` occurrences of `panicked at`,
+`test result: FAILED`, or `error: test failed` across 28 758 log lines. The five targets that are RED
+on this host are explicitly `ok` there:
+
+```
+test access_log_rf_upstream_reset ... ok
+test access_log_rcd_upstream_reset ... ok
+test access_log_h2_uc_upstream_reset ... ok
+test access_log_h2_rcd_upstream_reset ... ok
+test admin_config_dump_server_info ... ok
+```
+
+`test result: ok. 548 passed; 0 failed` for the `envoy-config` lib suite confirms the CI run reached
+past the point where the old BLOCK-66-1 failure used to abort it.
+
+Terminal validation touches no existing config (SPEC §0 R-0.8), re-confirmed empirically at state-3
+and now re-confirmed by the untouched pre-existing fixture set.
+
+## Gate (c) — h2spec pass-rate gate unchanged
+
+**Recorded honestly: h2spec did NOT run locally.** `which h2spec` → not found, and
+`tests/conformance/h2spec/tests/h2spec_runner.rs:20-31` `eprintln!`-skips (returning `ok`) when the
+binary is absent — which is why the local line reads `test h2spec_pass_rate_gate ... ok` in **0.00s**.
+A local `ok` here is a **skip, not a pass**, and must not be quoted as evidence.
+
+It was deliberately **not** installed locally: this host scores invalid-preface 3.5/2 as PASS while CI
+fails it, so a local run would mis-adjudicate the known-failures list (memory
+`h2spec-3-5-2-preface-host-sensitive`).
+
+**CI provisions the binary** (`.github/workflows/ci.yml:43-49`) and reports:
+
+```
+test h2spec_pass_rate_gate ... ok
+```
+
+Supporting evidence that the gate is *unchanged* rather than merely passing:
+
+- `git diff --name-only 5e3afb9..HEAD -- tests/conformance/` → **empty**. `known-failures.txt` is
+  **untouched** (21 lines) and `git status` on `tests/conformance/` is clean. **Nothing was trimmed.**
+- Phase 66 changed **no H2 codec or framing code**. The full phase-66 file list contains no
+  `crates/envoy-http2/src/**` entry; the only H2-adjacent file is
+  `crates/envoy-bin/tests/upstream_h2_connection_pooling.rs`, a *test harness* changed by ADR-0125 /
+  ADR-0126, which cannot move an h2spec score.
+
+## Gate (d) — fuzz: NO new target; satisfied by the pre-existing `parse_bootstrap` (RECORDED, not skipped)
+
+Per ADR-0123 §2.3, `direct_response` **parses nothing** — it never reads a byte from the downstream
+socket — so its only untrusted-input surface is the bootstrap parser. Gate (d) is satisfied by the
+pre-existing `parse_bootstrap` target. **This is recorded explicitly here, as PLAN.md, SPEC.md and
+STATE.md all instruct, rather than passed over in silence.**
+
+Mechanically verified this session:
+
+```
+$ git diff --name-only 5e3afb9..HEAD -- '*fuzz_targets*' '.github/workflows/ci.yml'
+                          <-- empty: no new fuzz target, and ci.yml needs no new step
+```
+
+The four targets in the tree (`parse_bootstrap`, `jwt_parse`, `cdn_loop_parse`,
+`accesslog_format_parse`) are all pre-existing and all already wired into the CI `fuzz` job
+(`ci.yml:77-124`). Memory `new-fuzz-target-needs-a-ci-yml-step` therefore does not bite.
+
+The corpus **seed** phase 66 added is proven tracked (memory `fuzz-corpus-seed-gitignored-by-default`
+— a `*`-ignored seed is invisible to CI and the gate is silently unmet):
+
+```
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/network_filter_direct_response.yaml
+crates/envoy-config/fuzz/corpus/parse_bootstrap/network_filter_direct_response.yaml
+$ git check-ignore -v <same path>          → not ignored
+```
+
+Fresh short-budget run this session (mirrors `ci.yml:106`):
+
+```
+$ cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30      # exit 0
+Done 29063 runs in 92 second(s)
+```
+
+No crash, no panic. CI's `fuzz` job ran all four targets clean on this SHA
+(`Done 196492 / 2338291 / 4148411 / 4539953 runs`, each in 31 s).
+
+## Gate (f) — `REVIEW.md` approved
+
+**NOT this session.** Gate (f) is §5 state-5 (`superpowers:requesting-code-review`), the next session,
+per §5.1 (one state per session). `REVIEW.md` does not exist.
+
+---
+
+## Gate verdict
+
+| Gate | Verdict | Authority |
+|---|---|---|
+| (a) fixture `0071` green | **PASS** | local ×3 + CI |
+| (b) `0001`-`0070` still green | **PASS** | CI (147/147 `ok`); local REDs adjudicated environmental |
+| (c) h2spec pass-rate unchanged | **PASS** | CI (skipped locally — recorded, not claimed) |
+| (d) fuzz short-budget clean | **PASS** | no new target (ADR-0123 §2.3) + `parse_bootstrap` clean, local + CI |
+| (e) five commands clean | **PASS** | 4/5 clean locally; `cargo test --workspace` clean on CI |
+| (f) `REVIEW.md` approved | **state-5** | next session |
+
+**No fixture was weakened. `tests/conformance/h2spec/known-failures.txt` was not touched. The
+ADR-0124 drain and its mutation check were not re-litigated. The `echo` `typed_config` asymmetry was
+not "fixed". No production code changed this session — the state-4 verification is read-only over the
+tree.** `#![forbid(unsafe_code)]` holds (D-3.8). No escalation to `superpowers:systematic-debugging`
+was required: every local RED resolved to an already-documented environmental cause under the
+prescribed 2×-run + isolation adjudication, and none re-failed deterministically on CI.
+
+**Carry-forwards unchanged.** Phase 66 CONSUMES none. **CF-66-1**, **CF-66-2** and **M66-2** (the
+ADR-0126 compile-inside-a-readiness-budget hazard, latent in `upstream_connection_pooling`,
+`upstream_active_health_check`, `upstream_outlier_detection`, `tests/differential/src/backend.rs`)
+stay OPEN. **DECISIONS.md ledger head remains ADR-0126**; next-available **ADR-0127**, unreserved. **No
+ADR was written this session** — none was needed; the gate ran to a verdict without an ambiguity.
+
+**Next session: §5 state-5 code-review (`superpowers:requesting-code-review`) → `REVIEW.md`.**
