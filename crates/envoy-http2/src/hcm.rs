@@ -4957,6 +4957,37 @@ static_resources:
         (addr, handle)
     }
 
+    /// 65 (ADR-0122) §G: like `spawn_upstream_h2_reset_server` but accepts an
+    /// UNBOUNDED number of connections and resets EVERY stream on each. The
+    /// one-shot helper above closes its listener as soon as its single
+    /// connection's task returns, so a RETRIED attempt would hit
+    /// ConnectionRefused (→ ConnectFailure/UF) instead of a second reset
+    /// (→ Reset/URX). The retry-exhausted-reset backstop needs this shape.
+    async fn spawn_upstream_h2_reset_server_multi() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (tcp, _peer) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let mut conn = match h2::server::handshake(tcp).await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    // Reset every stream: accept it, then drop the responder
+                    // without ever calling send_response (an implicit RST_STREAM).
+                    while let Some(Ok((_req, send_response))) = conn.accept().await {
+                        drop(send_response);
+                    }
+                });
+            }
+        });
+        (addr, handle)
+    }
+
     /// 64 (ADR-0121) §B/§C/§D/§H backstop: drive a single H2 request against
     /// a backend that completes the handshake then resets the stream (NO
     /// retry_policy), wired to a {rc,rcd,rf} FILE json access-log. Asserts the
@@ -5050,6 +5081,96 @@ static_resources:
             logged,
             "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"UC\"}\n",
             "upstream-reset access-log line carries the deterministic rcd + rf:UC: {logged:?}"
+        );
+    }
+
+    /// 65 (ADR-0122) §G (negative case, REQUIRED): a RETRY-EXHAUSTED reset
+    /// (`retry_on: "reset"`, `num_retries: 1`, against an always-reset
+    /// upstream) must NOT take the §A rcd-set — the `!retry_limit_exceeded_for_log_h2`
+    /// guard keeps the shared `via_upstream`, and the derive's URX-before-UC
+    /// ordering renders `URX`. This is the one path fixture `0070` cannot
+    /// exercise. Mirrors the H1 phase-54 guard backstop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "rc".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
+        );
+        map.insert(
+            "rf".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_FLAGS%".to_string()),
+        );
+        let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+                .await
+                .expect("open FileSink"),
+        );
+
+        let (upstream_addr, _upstream_handle) = spawn_upstream_h2_reset_server_multi().await;
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
+                .await;
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "test-retry-exhausted-reset".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: Some(envoy_config::RetryPolicy {
+                                retry_on: "reset".into(),
+                                num_retries: Some(1),
+                                retriable_status_codes: vec![],
+                            }),
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let config = Arc::new(built);
+
+        let (status, _headers) = drive_h2_once(config).await;
+        assert_eq!(status, 503, "retry-exhausted reset still surfaces a 503");
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged,
+            "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
+            "retry-exhausted reset keeps via_upstream rcd and renders URX: {logged:?}"
         );
     }
 

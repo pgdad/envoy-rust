@@ -101,3 +101,81 @@ their rcd untouched. (The documented host-flake
 memory `envoyrust-h2-handshake-test-host-flake`, did not fire this run.)
 
 **Task 1: COMPLETE.**
+
+---
+
+## Task 2 — §G-negative: lock the `!retry_limit_exceeded_for_log_h2` guard (REQUIRED)
+
+The guard added in Task 1 is the single most error-prone line in this phase, and
+the differential fixture `0070` **cannot** exercise the retry-exhausted-reset
+path. SPEC §G marks this test REQUIRED, not optional.
+
+**Files changed:** `crates/envoy-http2/src/hcm.rs` (new multi-accept helper
+`spawn_upstream_h2_reset_server_multi()` + new backstop
+`h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx`, both in
+`mod tests`).
+
+### Step 1 — write the test
+
+Added `spawn_upstream_h2_reset_server_multi()`: an unbounded-accept reset
+upstream. **This helper is why PLAN-VERIFY §3.5 was a correction:** the existing
+one-shot `spawn_upstream_h2_reset_server()` drops its `TcpListener` as soon as
+its single connection task returns, so the RETRIED attempt would hit
+`ConnectionRefused` → `ConnectFailure`/`UF`, never a second `Reset`/`URX`.
+
+Added the negative backstop: `retry_on: "reset"`, `num_retries: Some(1)`, driven
+against that always-reset upstream, asserting the whole logged line is
+`{"rc":503,"rcd":"via_upstream","rf":"URX"}`.
+
+### Step 2 — RUN the test, observe it PASS immediately ✅
+
+`cargo test -p envoy-http2 h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx -- --nocapture`
+
+```
+running 1 test
+test hcm::tests::h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.15s
+```
+
+This is a *characterization/guard* test: it asserts behavior Task 1's guard
+already preserves. It did NOT fail with `rf:"UC"` (guard correct) and did NOT
+fail with `rf:"UF"` (the multi-accept helper does serve the retry's second
+connection).
+
+### Step 3 — MUTATION CHECK: prove the guard is load-bearing ✅
+
+Temporarily deleted ` && !retry_limit_exceeded_for_log_h2` from the Task-1 `if`
+condition and re-ran:
+
+```
+thread 'hcm::tests::h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx' (2964689) panicked at crates/envoy-http2/src/hcm.rs:5170:9:
+assertion `left == right` failed: retry-exhausted reset keeps via_upstream rcd and renders URX: "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"URX\"}\n"
+  left: "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"URX\"}\n"
+ right: "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n"
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.15s
+```
+
+**FAILED exactly as PLAN Step 3 predicted** — the rcd is wrongly overridden on
+the retry-exhausted path. The test is therefore NOT vacuous: it genuinely pins
+the guard. **The guard was then RESTORED** and the test re-run:
+
+```
+test hcm::tests::h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 88 filtered out; finished in 0.15s
+```
+
+### Step 4 — full crate suite ✅
+
+`cargo test -p envoy-http2`
+
+```
+test result: ok. 88 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.45s
+   Doc-tests envoy_http2
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+**Task 2: COMPLETE.** The guard is now pinned BEFORE Task 3 retires the boolean,
+so a Task-3 refactor error cannot pass silently.
