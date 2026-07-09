@@ -889,12 +889,25 @@ async fn handle_one_stream(
                     // 64 (ADR-0121): flag UC when the FINAL attempt was a
                     // reset — independent of the retry split. A reset
                     // retried to success has final_outcome_h2 =
-                    // Some(Response) → not flagged. If BOTH this and
-                    // retry_limit_exceeded_for_log_h2 are set (un-recon'd
-                    // combination, SPEC §4), the derive's URX-before-UC
-                    // ordering renders URX deterministically.
+                    // Some(Response) → not flagged.
                     reset_for_log_h2 =
                         matches!(final_outcome_h2, Some(envoy_config::AttemptOutcome::Reset));
+                    // 65 (ADR-0122) §A: on the PURE-reset final outcome, set the
+                    // DETERMINISTIC reset %RESPONSE_CODE_DETAILS%, OVERRIDING the
+                    // shared "via_upstream" written in-loop at hcm.rs:757 (a reset
+                    // has endpoint:Some + outcome:Some(Reset), so the phase-58
+                    // `outcome.is_none()` overflow discriminator leaves it
+                    // "via_upstream"). Guarded on !retry_limit_exceeded_for_log_h2
+                    // (computed just above, hcm.rs:869): a retry-exhausted reset
+                    // KEEPS "via_upstream" and renders URX — preserving today's
+                    // behavior exactly (the un-recon'd combination of SPEC §4).
+                    // Mirrors the H1 phase-54 set-site (ADR-0111) exactly.
+                    if reset_for_log_h2 && !retry_limit_exceeded_for_log_h2 {
+                        response_code_details_for_log_h2 = Some(
+                            "upstream_reset_before_response_started{connection_termination}"
+                                .to_owned(),
+                        );
+                    }
                     // Release the retry-budget slot now, before building the outgoing response,
                     // so the slot (and its gauges) reflect completion rather than lingering
                     // until this stack frame unwinds.
@@ -4946,19 +4959,17 @@ static_resources:
 
     /// 64 (ADR-0121) §B/§C/§D/§H backstop: drive a single H2 request against
     /// a backend that completes the handshake then resets the stream (NO
-    /// retry_policy), wired to a {rc,rf} FILE json access-log. Asserts the
+    /// retry_policy), wired to a {rc,rcd,rf} FILE json access-log. Asserts the
     /// downstream response is the synth-503 (§A) AND the logged line carries
-    /// the DERIVED rf:"UC" (set post-loop from the reset final-outcome
-    /// boolean, reading the EXISTING `final_outcome_h2` capture a second
-    /// time — NOT rcd-derived, since the H2-side reset rcd stays the shared
-    /// "via_upstream", deferred as M64-1). H2 mirror of the H1 backstop
+    /// the DERIVED rf:"UC" — rcd-derived as of phase 65 (ADR-0122): the
+    /// pure-reset path now sets the deterministic
+    /// "upstream_reset_before_response_started{connection_termination}",
+    /// consuming M64-1. H2 mirror of the H1 backstop
     /// `h1_upstream_reset_access_log_carries_uc_flag`
-    /// (`crates/envoy-http1/src/hcm.rs:7734`), adapted to H2's
-    /// boolean-not-rcd derive mechanism (matching the H2
-    /// `h2_connect_failure_access_log_carries_uf_flag` shape exactly, one
-    /// arm over). Fail-first: pre-change this observes status 502 and a
-    /// logged line of `{"rc":502,"rf":"-"}` (the rcd-match's `_ => "-"` arm,
-    /// since `response_code_details_for_log_h2` stays `via_upstream`).
+    /// (`crates/envoy-http1/src/hcm.rs:7734`), now sharing H1's rcd-derived
+    /// mechanism exactly. The retry-exhausted-reset negative edge (the
+    /// `!retry_limit_exceeded_for_log_h2` guard on the rcd-set) is pinned by
+    /// the sibling `h2_retry_exhausted_reset_keeps_via_upstream_rcd_and_renders_urx`.
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_upstream_reset_access_log_carries_uc_flag() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4967,6 +4978,10 @@ static_resources:
         map.insert(
             "rc".to_string(),
             envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
+        );
+        map.insert(
+            "rcd".to_string(),
+            envoy_accesslog::JsonValueInput::Format("%RESPONSE_CODE_DETAILS%".to_string()),
         );
         map.insert(
             "rf".to_string(),
@@ -5032,8 +5047,9 @@ static_resources:
         );
         let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
         assert_eq!(
-            logged, "{\"rc\":503,\"rf\":\"UC\"}\n",
-            "upstream-reset access-log line carries rf:UC: {logged:?}"
+            logged,
+            "{\"rc\":503,\"rcd\":\"upstream_reset_before_response_started{connection_termination}\",\"rf\":\"UC\"}\n",
+            "upstream-reset access-log line carries the deterministic rcd + rf:UC: {logged:?}"
         );
     }
 
