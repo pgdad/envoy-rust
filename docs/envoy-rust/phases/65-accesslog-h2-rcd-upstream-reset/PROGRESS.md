@@ -348,3 +348,78 @@ output-equivalence PLAN-VERIFY §3.1 predicted.
 
 **Task 4: COMPLETE** (local RED on both fixtures = one documented host flake,
 diagnosed on the reference side; CI adjudicates at Task 6 Step 4 / state-4).
+
+---
+
+## Task 5 — §E: BEHAVIOR_CONTRACT updates
+
+**Files changed:** `docs/envoy-rust/BEHAVIOR_CONTRACT.md` (the `%RESPONSE_FLAGS%`
+row + the `%RESPONSE_CODE_DETAILS%` row).
+
+Applied as byte-exact literal replacements via a checked script (each pattern
+asserted to match **exactly once** before substitution) — the rows are
+single, multi-kilobyte table lines, so an unanchored edit would be unsafe.
+
+### Step 1 — INVERT the H2-`UC` clause in the `%RESPONSE_FLAGS%` row ✅
+
+The clause reading *"**On H2, `UC` is witnessed differently** … so H2's `UC` is
+derived from a `reset_for_log_h2` boolean … **NOT 1:1 from rcd**, exactly like
+H2's own `URX`/`UF` siblings and UNLIKE H1's rcd-derived `UC`"* was **INVERTED,
+not appended to** (phase-54 spec-review M2 discipline — appending would leave the
+row self-contradictory). It now reads *"**On H2, `UC` is now derived EXACTLY as on
+H1** (fixture **0070**, phase 65, ADR-0122) … `UC` derives **1:1 from that rcd** …
+The phase-64 boolean discriminator was RETIRED — **CONSUMING carry-forward
+M64-1** … both protocols now share the identical derivation split: `{NR, UH, UO,
+UC}` rcd-derived, `{URX, UF}` boolean-derived."* The stale `hcm.rs:1091` derive-site
+anchor was refreshed to `crates/envoy-http2/src/hcm.rs` (phase-54 spec-review M1
+discipline — a file-level anchor, immune to future line drift).
+
+The row's **evidence column** gained the phase-65 witness sentence after the
+phase-64/fixture-0069 one, explicitly noting **no `%RESPONSE_FLAGS%` value
+changed** (0069's line is byte-identical; `UC` merely arrives via the rcd-match).
+
+A **third** edit was required beyond the PLAN's two: the evidence column's
+phase-64 sentence asserted, in the present tense, that H2's `UC` *is* "set via …
+a `reset_for_log_h2` boolean … NOT derivable from `%RESPONSE_CODE_DETAILS%`".
+Unlike fixture 0069's README (phase *history* — left verbatim, see Task 3), the
+BEHAVIOR_CONTRACT is by layout-invariant 5 "the canonical reference" for
+**today's** equivalence rules, so a false active-state claim there is a genuine
+defect. It was corrected to attribute the boolean to phase 64 explicitly and to
+record that **phase 65 has since CONSUMED M64-1** and retired the boolean + its
+`finalize_h2_stream` parameter. This also makes PLAN Task 5 Step 3's grep
+satisfiable.
+
+### Step 2 — add the H2 reset rcd to the `%RESPONSE_CODE_DETAILS%` row ✅
+
+**Definition column:** after the phase-54 H1 pure-reset clause, added the H2
+pure-reset clause (final-outcome `AttemptOutcome::Reset`, guarded
+`!retry_limit_exceeded_for_log_h2`, at the post-loop reconciliation region of
+`crates/envoy-http2/src/hcm.rs`) → `Some("upstream_reset_before_response_started{connection_termination}")`,
+phase 65 / ADR-0122, overriding the in-loop `via_upstream`.
+
+**Evidence column:** the stale trailing sentence *"The remaining H2 failure-path
+details … remain deferred as the continuing carry-forward **M56-1**"* was replaced
+by the phase-65 witness sentence (fixture `0070`; **M64-1 CONSUMED**; `M56-1` was
+already fully closed at phase 64; the connect-failure rcd remains the sole
+non-deterministic reset-reason, M45-2). The trailing **default-absent fixture list**
+was extended to `0063-0069`, explicitly noting that `0069` drives the same H2 reset
+path as `0070` but logs no `rcd`, so it stays byte-identical across the migration.
+
+### Step 3 — no self-contradiction left ✅
+
+```
+$ grep -c "reset_for_log_h2" docs/envoy-rust/BEHAVIOR_CONTRACT.md
+0
+```
+
+```
+$ grep -o ".\{80\}NOT 1:1 from rcd.\{40\}" docs/envoy-rust/BEHAVIOR_CONTRACT.md
+(no output)
+```
+
+All four remaining `M64-1` mentions describe it as **CONSUMED**. The single
+surviving "deferred as carry-forward **M64-1**" phrase sits inside the past-tense
+phase-64 narrative and is superseded **within the same sentence** by "**phase 65
+(ADR-0122) has since CONSUMED M64-1**" — so no mention leaves it standing as open.
+
+**Task 5: COMPLETE.**
