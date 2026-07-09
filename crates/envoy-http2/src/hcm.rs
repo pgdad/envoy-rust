@@ -5152,8 +5152,7 @@ static_resources:
         assert_eq!(status, 503, "retry-exhausted reset still surfaces a 503");
         let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
         assert_eq!(
-            logged,
-            "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
+            logged, "{\"rc\":503,\"rcd\":\"via_upstream\",\"rf\":\"URX\"}\n",
             "retry-exhausted reset keeps via_upstream rcd and renders URX: {logged:?}"
         );
     }

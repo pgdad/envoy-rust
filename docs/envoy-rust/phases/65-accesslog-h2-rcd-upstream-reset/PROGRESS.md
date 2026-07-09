@@ -423,3 +423,116 @@ phase-64 narrative and is superseded **within the same sentence** by "**phase 65
 (ADR-0122) has since CONSUMED M64-1**" — so no mention leaves it standing as open.
 
 **Task 5: COMPLETE.**
+
+---
+
+## Task 6 — Workspace-green pre-flight
+
+This is a **pre-flight**, not the §7.5 gate. The authoritative gate runs at
+**state-4** (`superpowers:verification-before-completion`), where the Docker
+differential + h2spec + fuzz surface is CI-authoritative (memory
+`envoy-rust-state4-ci-first-execution`).
+
+### Step 1 — the five local gates
+
+| Gate | Result |
+|---|---|
+| `cargo build --workspace --all-targets` | **clean** |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **clean** |
+| `cargo fmt --all -- --check` | **clean** (after one reformat — see below) |
+| `cargo test --workspace --no-fail-fast` | 5 failing targets, **all documented host flakes** — see below |
+| `cargo deny check` | **clean** — `advisories ok, bans ok, licenses ok, sources ok` (exit 0) |
+
+**`cargo fmt` note:** the first `--check` run RED'd on the Task-2 backstop's
+`assert_eq!` (rustfmt collapses the 2-line form the PLAN prescribed onto one
+line). `cargo fmt --all` applied it; re-check exits 0. This is exactly the
+mid-phase fmt trap recorded in memory `envoy-rust-state4-ci-first-execution` —
+caught here rather than at the state-4 CI gate.
+
+**`cargo deny` note:** emits a non-fatal `unmatched license allowance` warning for
+`"Zlib"` in `deny.toml:50` (pre-existing, unrelated to this phase). Exit code 0.
+No freshly-published advisory fired, so no `cargo update -p <dep> --precise` bump
+was needed.
+
+### Step 1a — the 5 failing `cargo test --workspace` targets, adjudicated
+
+**Every crate unit-test suite is GREEN** (`envoy-http2`: 88 passed / 0 failed;
+`envoy-config` 538; `envoy-filter` 206; `envoy-http1` 157; `envoy-cluster` 160; …).
+The documented `envoyrust-h2-handshake-test-host-flake` did NOT fire this run.
+All 5 failures are Docker **differential** targets:
+
+| # | Target | Fixture | Adjudication |
+|---|---|---|---|
+| 1 | `access_log_h2_rcd_upstream_reset` | `0070` (NEW, this phase) | **Documented flake** `tcpclosebackend-ipv6-unreachable-host-flake`. The SUBJECT side emits the exact target line; the REFERENCE Envoy container cannot reach the host-spawned backend (IPv6 `fdc4:…` "Network is unreachable") and reports a connect-failure `UF`. See Task 4 Step 6. |
+| 2 | `access_log_h2_uc_upstream_reset` | `0069` | Same flake; **landed CI-green at phase 64** ⇒ pre-existing. Subject line byte-identical to pre-phase (Task 4 Step 7). |
+| 3 | `access_log_rcd_upstream_reset` | `0062` (H1) | Same flake, named explicitly in memory `tcpclosebackend-ipv6-unreachable-host-flake` (fixtures 0061/0062/0069). **Untouched by this phase** (H1 code path). |
+| 4 | `access_log_rf_upstream_reset` | `0061` (H1) | Same flake, likewise named in that memory. **Untouched by this phase.** |
+| 5 | `admin_config_dump_server_info` | `0014` | **Documented flake** `differential-host-bridge-ip-192-168-65-2` — this host routes the backend via `192.168.65.2` rather than the allow-listed address, so envoy's `config_dump` carries `backend::192.168.65.2:<port>::*` host entries the subject lacks. **NOT on any by-name flake list, so it was verified rather than assumed** — see below. |
+
+**Failure 5 was proven pre-existing, not assumed.** It (a) fails in ISOLATION as
+well as under parallel load, ruling out
+`differential-fixtures-flake-under-parallel-load`; (b) is untouched by every
+phase-65 commit (`git log d5b6dd4..HEAD -- <test> <fixture> crates/envoy-admin/`
+→ **0 commits**); (c) exercises no H2/reset path (fixture `0014` carries no
+`H2_CLOSE_BACKEND` marker); and (d) — decisively — **fails identically at the
+PRE-PHASE commit `d5b6dd4`**, reproduced in a detached `git worktree`:
+
+```
+$ git worktree add --detach <tmp> d5b6dd4 && cargo build -p http1-echo-server -p envoy-bin
+$ cargo test -p differential --test admin_config_dump_server_info
+  envoy-only: ["backend::192.168.65.2:36899::canary::false", "backend::192.168.65.2:36899::cx_active::0", …]
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.72s
+```
+
+Same `192.168.65.2` bridge-IP signature as on the phase-65 tree. **Confirmed
+environmental; NOT a phase-65 regression.** (Worktree removed afterwards.)
+
+**No fixture was weakened to make any local run green. CI is AUTHORITATIVE.**
+
+### Step 2 — the retired boolean is gone ✅
+
+```
+$ grep -rn "reset_for_log_h2" crates/ docs/envoy-rust/BEHAVIOR_CONTRACT.md
+(no output — exit 1)
+```
+
+The one surviving repo-wide hit is
+`tests/fixtures/0069-accesslog-h2-uc-upstream-reset/README.md:18`, which is
+**backward-looking phase-64 historical narrative** that SPEC §F explicitly orders
+left verbatim (D-3.4/D-3.5 no-retroactive-rewrite). Its stale *active-state*
+carry-forward claim was corrected additively in Task 3. See the §F sweep
+discipline note under Task 3 Step 2 for the full rationale.
+
+**Task 6: COMPLETE.**
+
+---
+
+## State-3 implementation — SUMMARY
+
+All 6 PLAN tasks are complete, in the load-bearing order. The `crates/` change is
+a **net simplification**: one guarded rcd-set added, one boolean (declaration,
+set, call-site arg, parameter, derive branch — 5 sites) and its 3 comment blocks
+removed, one rcd-match arm added.
+
+- **§A** rcd-set → Task 1 (fail-first observed, then green).
+- **§G** backstops → Task 1 (positive, extended in place) + Task 2 (the REQUIRED
+  negative case, **with a mutation check proving it is not vacuous**).
+- **§B/§F** derive migration + boolean retirement → Task 3.
+- **§C/§D** fixture `0070` + differential test → Task 4 (ZERO harness/`ci.yml` change).
+- **§E** BEHAVIOR_CONTRACT (H2-`UC` clause INVERTED, M64-1 → CONSUMED) → Task 5.
+- **§H** no new fuzz target → n/a by SPEC.
+
+`#![forbid(unsafe_code)]` holds. NO new crate/dependency/`Op`/`AccessLogRecord`
+field/`ConfigError` variant/test-harness code. **NO `%RESPONSE_FLAGS%` value
+changed** — the witnessed H2 flag stays `UC`; only its DERIVATION moved from the
+boolean to the rcd, and fixture `0069`'s emitted line is byte-identical
+(empirically confirmed at Task 4 Step 7).
+
+**ADR-0123 remains reserved-but-UNFIRED** — no §6.2 reconciliation fired: no
+§A-§G fact was overturned. The single execution-time deviation (the §F sweep's
+comment wording vs. PLAN Task 6 Step 2's over-broad grep) is a PLAN-step
+precision issue resolved by SPEC §F + doctrine D-3.4/D-3.5, documented at Task 3.
+
+**Next session = §5 state-4 verification** (`superpowers:verification-before-completion`,
+the full §7.5 (a)-(f) gate, CI-authoritative). Per §5.1, one state per session —
+the state-4 gate was deliberately NOT run this session.
