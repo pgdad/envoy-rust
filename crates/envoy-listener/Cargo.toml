@@ -14,7 +14,9 @@ envoy-config = { path = "../envoy-config" }
 envoy-stats = { path = "../envoy-stats" }
 socket2 = { version = "0.6", features = ["all"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "net", "macros", "time", "sync"] }
+# 67.1 D4: `io-util` supplies AsyncReadExt/AsyncWriteExt for `close_with_drain`.
+# A feature of an already-permitted dependency (D-3.2), not a new dependency.
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "sync", "io-util"] }
 tracing = "0.1"
 
 [dev-dependencies]

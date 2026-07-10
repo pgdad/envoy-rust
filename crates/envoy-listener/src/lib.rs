@@ -42,6 +42,75 @@ pub trait ConnectionHandler: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 }
 
+/// 67.1 D4 (CONSUMES carry-forward CF-66-2, on exactly the trigger ADR-0123 §2.2
+/// named): the network-filter chain iteration protocol.
+///
+/// `Continue` hands the connection to the next filter, and ultimately to the
+/// chain's TERMINAL filter. `StopIteration` closes the connection — via
+/// [`close_with_drain`] — and the terminal filter never runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkFilterStatus {
+    Continue,
+    StopIteration,
+}
+
+/// The downstream connection facts a network filter may inspect at connection
+/// establishment. Carries everything network `rbac`'s matcher arms need —
+/// including phase `67.2`'s `direct_remote_ip` / `remote_ip` / `source_ip` /
+/// `destination_port` / `destination_ip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
+
+/// A NON-TERMINAL network filter: it inspects an accepted connection and either
+/// yields to the rest of the chain or stops it.
+///
+/// **There is deliberately NO `on_data` hook.** Every filter in phase 67.1
+/// decides once per connection, before any downstream byte is read (phase-67
+/// SPEC R-2, measured against `envoyproxy/envoy:v1.33.0`). Adding a mid-stream
+/// hook with no filter to exercise it is the `BOOTSTRAP_PROMPT.md` §6.3
+/// anti-pattern; it is carried forward as **CF-67-3** to the first
+/// payload-parsing network filter (`mongo_proxy` / `zookeeper_proxy` /
+/// `kafka_broker`).
+///
+/// TERMINAL network filters (`echo`, `tcp_proxy`, `http_connection_manager`,
+/// `direct_response`) implement [`ConnectionHandler`] instead. The config
+/// validator's `NetworkFilterChainNotTerminated` rule guarantees every non-empty
+/// chain ends in exactly one of them, so a chain of `NetworkFilter`s always
+/// terminates in a `ConnectionHandler`.
+pub trait NetworkFilter: Send + Sync + 'static {
+    fn on_new_connection(&self, conn: &ConnectionInfo) -> NetworkFilterStatus;
+}
+
+/// Close `stream` the way upstream Envoy closes a connection it refuses to
+/// forward: write NOTHING, half-close (the client sees a clean EOF, never an
+/// RST), then drain and discard the read half until the client closes.
+///
+/// The drain is ADR-0124's, and it is not optional. Closing a socket while
+/// unread bytes sit in the receive queue makes the kernel send an RST, so a
+/// client that writes after our FIN would see `BrokenPipe`/`ConnectionReset`.
+/// Upstream Envoy ACCEPTS such a write — measured at 0 / 21 / 200 000 unread
+/// bytes (`post_write=writes_ok`), and again on the network-`rbac` DENY path
+/// (phase-67 SPEC R-2). envoy-rust drains to match.
+///
+/// Bounded by the caller: `Listener::serve`'s [`DRAIN_BUDGET`] aborts stragglers.
+pub async fn close_with_drain(mut stream: tokio::net::TcpStream) -> Result<(), std::io::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut reader, mut writer) = stream.split();
+    writer.shutdown().await?;
+    let mut sink = [0u8; 8192];
+    loop {
+        match reader.read(&mut sink).await {
+            Ok(0) => break,    // client closed — done
+            Ok(_) => continue, // discard and keep draining
+            Err(_) => break,   // peer reset/error — nothing left to do
+        }
+    }
+    Ok(())
+}
+
 /// Errors returned by `Listener::bind` and `Listener::serve`.
 #[derive(Debug, thiserror::Error)]
 pub enum ListenerError {
@@ -2059,6 +2128,75 @@ filter_chains:
             counter_value(&registry, "http.b.rds.r1.update_attempt"),
             None
         );
+    }
+
+    // --- 67.1 D4 (CF-66-2): the network-filter chain iteration protocol ---
+
+    /// 67.1 D4 (CF-66-2): a filter returning `Continue` does not close the
+    /// connection; the status enum is `Copy` and comparable.
+    #[test]
+    fn network_filter_status_is_copy_and_eq() {
+        let a = NetworkFilterStatus::Continue;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(
+            NetworkFilterStatus::Continue,
+            NetworkFilterStatus::StopIteration
+        );
+    }
+
+    /// 67.1 D4: `NetworkFilter` is object-safe — it must be storable as
+    /// `Arc<dyn NetworkFilter>` for `ChainHandler`'s filter list (Task 6).
+    #[test]
+    fn network_filter_is_object_safe() {
+        struct AlwaysStop;
+        impl NetworkFilter for AlwaysStop {
+            fn on_new_connection(&self, _conn: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::StopIteration
+            }
+        }
+        let f: Arc<dyn NetworkFilter> = Arc::new(AlwaysStop);
+        let info = ConnectionInfo {
+            peer_addr: "127.0.0.1:1".parse().unwrap(),
+            local_addr: "127.0.0.1:2".parse().unwrap(),
+        };
+        assert_eq!(
+            f.on_new_connection(&info),
+            NetworkFilterStatus::StopIteration
+        );
+    }
+
+    /// 67.1 D4 / phase-67 SPEC R-2 (ADR-0124's drain, shared): `close_with_drain`
+    /// sends a FIN with ZERO bytes written, and a client write issued AFTER it
+    /// observes EOF is ACCEPTED, not reset. A server that closed without
+    /// draining its read half would make the kernel send an RST and the second
+    /// write would fail.
+    ///
+    /// DELETE THE DRAIN LOOP IN `close_with_drain` AND THIS TEST MUST FAIL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn close_with_drain_sends_clean_eof_and_accepts_post_eof_writes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            close_with_drain(stream).await.unwrap();
+        });
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Bytes sent before the close are discarded, not echoed.
+        c.write_all(b"PING-RBAC\n").await.unwrap();
+
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.expect("clean EOF, not RST");
+        assert!(out.is_empty(), "DENY writes zero bytes, got {out:?}");
+
+        // Two writes: the first may be absorbed locally; a returning RST
+        // surfaces on the second. Sleep between them so an RST can land.
+        c.write_all(b"y").await.expect("first post-EOF write");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        c.write_all(b"y")
+            .await
+            .expect("second post-EOF write must not be reset");
     }
 }
 
