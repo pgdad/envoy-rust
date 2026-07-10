@@ -425,4 +425,73 @@ mod tests {
         assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue);
         assert_eq!(stat(&reg, "dp.rbac.allowed"), 1);
     }
+
+    /// A connection whose peer is NOT in 10.0.0.0/8 and whose local port is 9999.
+    fn conn2() -> ConnectionInfo {
+        ConnectionInfo {
+            peer_addr: "192.0.2.5:40000".parse().unwrap(),
+            local_addr: "127.0.0.1:9999".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn direct_remote_ip_no_match_denies() {
+        let reg = envoy_stats::StatsRegistry::new();
+        let f = NetworkRbacFilter::new(
+            &cfg("drn", Some("  action: ALLOW\n  policies:\n    p0:\n      permissions: [{ any: true }]\n      principals: [{ direct_remote_ip: { address_prefix: 10.0.0.0, prefix_len: 8 } }]")),
+            &reg,
+        ).unwrap();
+        // conn2's peer 192.0.2.5 is NOT in 10.0.0.0/8 ⇒ no policy match ⇒ inverse of ALLOW.
+        assert_eq!(f.on_new_connection(&conn2()), NetworkFilterStatus::StopIteration);
+        assert_eq!(stat(&reg, "drn.rbac.denied"), 1);
+    }
+
+    #[test]
+    fn remote_ip_and_source_ip_evaluate_peer_like_direct_remote_ip() {
+        for arm in ["remote_ip", "source_ip"] {
+            let reg = envoy_stats::StatsRegistry::new();
+            let f = NetworkRbacFilter::new(
+                &cfg("ali", Some(&format!("  action: ALLOW\n  policies:\n    p0:\n      permissions: [{{ any: true }}]\n      principals: [{{ {arm}: {{ address_prefix: 10.0.0.0, prefix_len: 8 }} }}]"))),
+                &reg,
+            ).unwrap();
+            // conn()'s peer 10.0.0.1 IS in 10.0.0.0/8.
+            assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue, "{arm} matches peer");
+            assert_eq!(f.on_new_connection(&conn2()), NetworkFilterStatus::StopIteration, "{arm} no-match");
+        }
+    }
+
+    #[test]
+    fn destination_port_no_match_denies() {
+        let reg = envoy_stats::StatsRegistry::new();
+        let f = NetworkRbacFilter::new(
+            &cfg("dpn", Some("  action: ALLOW\n  policies:\n    p0:\n      permissions: [{ destination_port: 10000 }]\n      principals: [{ any: true }]")),
+            &reg,
+        ).unwrap();
+        assert_eq!(f.on_new_connection(&conn2()), NetworkFilterStatus::StopIteration); // local port 9999 != 10000
+    }
+
+    #[test]
+    fn destination_ip_matches_local_ip() {
+        let reg = envoy_stats::StatsRegistry::new();
+        let f = NetworkRbacFilter::new(
+            &cfg("di", Some("  action: ALLOW\n  policies:\n    p0:\n      permissions: [{ destination_ip: { address_prefix: 127.0.0.0, prefix_len: 8 } }]\n      principals: [{ any: true }]")),
+            &reg,
+        ).unwrap();
+        assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue); // local 127.0.0.1
+        assert_eq!(stat(&reg, "di.rbac.allowed"), 1);
+    }
+
+    #[test]
+    fn combinators_over_new_leaves() {
+        // not_id over a non-matching direct_remote_ip ⇒ matches; and_rules of two
+        // destination predicates.
+        let reg = envoy_stats::StatsRegistry::new();
+        let f = NetworkRbacFilter::new(
+            &cfg("cmb", Some(
+                "  action: ALLOW\n  policies:\n    p0:\n      permissions:\n        - and_rules:\n            rules:\n              - destination_port: 10000\n              - destination_ip: { address_prefix: 127.0.0.0, prefix_len: 8 }\n      principals:\n        - not_id: { direct_remote_ip: { address_prefix: 192.0.2.0, prefix_len: 24 } }")),
+            &reg,
+        ).unwrap();
+        // conn(): local 127.0.0.1:10000 (both perms match); peer 10.0.0.1 NOT in 192.0.2.0/24 ⇒ not_id true.
+        assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue);
+    }
 }

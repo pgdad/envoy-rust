@@ -81,3 +81,19 @@ variants, then GREEN once every site was classified).
 **Result:** `cargo build --workspace --all-targets` GREEN; `cargo clippy -p envoy-bin --all-targets
 -- -D warnings` clean; envoy-config network_rbac (16), envoy-filter http_rbac_rejects (2), envoy-bin
 network_rbac (13) all pass.
+
+---
+
+## Task 3 — exhaustive engine backstops (synthetic `ConnectionInfo`) — ✅ DONE
+
+**Commit:** (see `phase 67.2 task 3`). Tests only (`crates/envoy-bin/src/network_rbac.rs`), no impl change.
+
+- Added a `conn2()` helper (peer `192.0.2.5:40000` NOT in 10.0.0.0/8; local port 9999) so no-match
+  cases are meaningful.
+- `direct_remote_ip_no_match_denies` (peer outside range ⇒ inverse of ALLOW, `denied` ticks);
+  `remote_ip_and_source_ip_evaluate_peer_like_direct_remote_ip` (both aliases match/no-match on peer);
+  `destination_port_no_match_denies` (local 9999 ≠ 10000); `destination_ip_matches_local_ip`
+  (local 127.0.0.1 ∈ 127.0.0.0/8); `combinators_over_new_leaves` (`and_rules` of two destination
+  predicates + `not_id` over a non-matching `direct_remote_ip`).
+
+**Result:** `cargo test -p envoy-bin --bins network_rbac` → **18 passed**.
