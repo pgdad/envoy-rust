@@ -1620,6 +1620,85 @@ impl_single_key_oneof!(
     ]
 );
 
+/// Envoy `config.core.v3.CidrRange` — an IP prefix. `address_prefix` is a bare
+/// IP string (`"10.0.0.0"`) parsed to `IpAddr`; `prefix_len` is the mask width.
+///
+/// WIRE-SHAPE (67.2 PLAN-VERIFY X-1, ADR-0133; measured against
+/// `envoyproxy/envoy:v1.33.0` with `--mode validate`): `prefix_len` is Envoy's
+/// `UInt32Value`, which upstream accepts as EITHER a bare integer
+/// (`prefix_len: 24`) OR the wrapper (`prefix_len: {value: 24}`). envoy-rust
+/// models it as a bare `u8` and REJECTS the wrapper — matching the codebase's
+/// established UInt32Value posture (`Buffer::max_request_bytes`, ADR-0063) and
+/// the ADR-0049 fail-loud stance. `prefix_len` is REQUIRED (absent → serde
+/// missing-field → fatal); upstream defaults an absent `prefix_len` to 0, a
+/// documented divergence with no differential observable (67.2 ships no fixture).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CidrRange {
+    pub address_prefix: std::net::IpAddr,
+    pub prefix_len: u8,
+}
+
+impl CidrRange {
+    /// Validate the prefix width against the address family: ≤ 32 for IPv4,
+    /// ≤ 128 for IPv6. `Err(detail)` is mapped to `ConfigError::InvalidCidrRange`
+    /// by the L4 allow-list walk (`validate_l4_permission` / `_principal`).
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let (max, family) = match self.address_prefix {
+            std::net::IpAddr::V4(_) => (32u8, "IPv4"),
+            std::net::IpAddr::V6(_) => (128u8, "IPv6"),
+        };
+        if self.prefix_len > max {
+            return Err(format!(
+                "prefix_len {} exceeds {} for {}",
+                self.prefix_len, max, family
+            ));
+        }
+        Ok(())
+    }
+
+    /// Does `addr` fall inside this prefix? IPv4-mapped-IPv6 addresses are
+    /// canonicalised to IPv4 first (ADR-0133), so `::ffff:127.0.0.1` matches an
+    /// IPv4 `127.0.0.0/8` range — upstream Envoy's behavior. After
+    /// canonicalisation, a cross-family comparison never matches.
+    pub fn contains(&self, addr: &std::net::IpAddr) -> bool {
+        fn canonical(ip: std::net::IpAddr) -> std::net::IpAddr {
+            match ip {
+                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => std::net::IpAddr::V4(v4),
+                    None => std::net::IpAddr::V6(v6),
+                },
+                v4 => v4,
+            }
+        }
+        match (canonical(self.address_prefix), canonical(*addr)) {
+            (std::net::IpAddr::V4(net), std::net::IpAddr::V4(a)) => {
+                prefix_match(&net.octets(), &a.octets(), self.prefix_len)
+            }
+            (std::net::IpAddr::V6(net), std::net::IpAddr::V6(a)) => {
+                prefix_match(&net.octets(), &a.octets(), self.prefix_len)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Compare the leading `prefix_len` bits of two same-length octet slices.
+/// `prefix_len == 0` matches everything; a full-byte boundary skips the mask.
+fn prefix_match(net: &[u8], addr: &[u8], prefix_len: u8) -> bool {
+    let bits = prefix_len as usize;
+    let full = bits / 8;
+    if net[..full] != addr[..full] {
+        return false;
+    }
+    let rem = bits % 8;
+    if rem == 0 {
+        return true;
+    }
+    let mask = 0xff_u8 << (8 - rem);
+    (net[full] & mask) == (addr[full] & mask)
+}
+
 /// RBAC Permission. Only header-based + combinators land at phase 10;
 /// `url_path`, `destination_ip`, `destination_port[_range]`, `metadata`,
 /// `requested_server_name[_matcher]`, `uri_template` defer per phase-10 SPEC §4.
@@ -5896,6 +5975,84 @@ static_resources:
             "stat_prefix: sp\n                rules:\n                  action: DENY\n                  policies:\n                    p0:\n                      permissions:\n                        - and_rules:\n                            rules:\n                              - any: true\n                              - not_rule: { any: false }\n                      principals:\n                        - or_ids:\n                            ids:\n                              - any: true\n                              - not_id: { any: false }",
         );
         validate(&mut b).expect("any + combinators are the 67.1 surface");
+    }
+
+    #[test]
+    fn cidr_range_contains_ipv4() {
+        let c: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: 10.1.2.0\nprefix_len: 24").unwrap();
+        assert!(c.contains(&"10.1.2.5".parse().unwrap()));
+        assert!(c.contains(&"10.1.2.255".parse().unwrap()));
+        assert!(!c.contains(&"10.1.3.0".parse().unwrap()));
+        assert!(!c.contains(&"11.1.2.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_range_boundary_prefix_lengths_v4() {
+        // /0 matches everything; /32 is an exact host match.
+        let all: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: 0.0.0.0\nprefix_len: 0").unwrap();
+        assert!(all.contains(&"203.0.113.9".parse().unwrap()));
+        let host: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: 192.0.2.7\nprefix_len: 32").unwrap();
+        assert!(host.contains(&"192.0.2.7".parse().unwrap()));
+        assert!(!host.contains(&"192.0.2.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_range_ipv6_and_128() {
+        // IPv6 literals ending in `::` must be QUOTED in YAML: an unquoted plain
+        // scalar ending in a colon-before-newline is scanned as a mapping key.
+        let c: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: \"2001:db8::\"\nprefix_len: 32").unwrap();
+        assert!(c.contains(&"2001:db8:1234::1".parse().unwrap()));
+        assert!(!c.contains(&"2001:db9::1".parse().unwrap()));
+        let host: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: \"::1\"\nprefix_len: 128").unwrap();
+        assert!(host.contains(&"::1".parse().unwrap()));
+        assert!(!host.contains(&"::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_range_ipv4_mapped_ipv6_peer_matches_ipv4_range() {
+        // ADR-0133: a v4-mapped-v6 peer is canonicalised to IPv4 before matching.
+        let c: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: 127.0.0.0\nprefix_len: 8").unwrap();
+        assert!(c.contains(&"::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_range_cross_family_never_matches() {
+        let v4: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: 10.0.0.0\nprefix_len: 8").unwrap();
+        assert!(!v4.contains(&"2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_range_validate_rejects_over_wide_prefix() {
+        let bad_v4: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: 10.0.0.0\nprefix_len: 33").unwrap();
+        assert!(bad_v4.validate().is_err());
+        let bad_v6: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: \"2001:db8::\"\nprefix_len: 129").unwrap();
+        assert!(bad_v6.validate().is_err());
+        let ok: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: 10.0.0.0\nprefix_len: 32").unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn cidr_range_rejects_unknown_field_and_wrapper_prefix_len() {
+        // deny_unknown_fields + bare-u8 prefix_len (ADR-0133 divergence: Envoy also
+        // accepts `prefix_len: {value: N}`, envoy-rust rejects it fail-loud).
+        assert!(serde_yaml::from_str::<crate::CidrRange>(
+            "address_prefix: 10.0.0.0\nprefix_len: 8\nextra: 1"
+        )
+        .is_err());
+        assert!(serde_yaml::from_str::<crate::CidrRange>(
+            "address_prefix: 10.0.0.0\nprefix_len: {value: 8}"
+        )
+        .is_err());
     }
 
     /// 67.1 D3: the `67.2` arms do NOT exist — they are rejected as UNKNOWN KEYS

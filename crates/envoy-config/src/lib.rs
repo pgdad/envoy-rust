@@ -14,7 +14,7 @@ pub mod rds;
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, AttemptOutcome,
     Bootstrap, Buffer, BufferPerRoute, CdnLoopConfig, CertificateValidationContext,
-    CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig, CommonTlsContext,
+    CidrRange, CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig, CommonTlsContext,
     ConfigSource, CorsConfig, CorsPolicy, CsrfPolicy, DataSource, DataSourceInline,
     DenominatorType, DirectResponse, DirectResponseConfig, DnsLookupFamily, DownstreamTlsContext,
     DynamicResources, EdsClusterConfig, Endpoint, ExplicitHttpConfig, FaultAbort, FaultConfig,
@@ -540,6 +540,20 @@ pub enum ConfigError {
         policy_name: String,
         arm: &'static str,
         path: String,
+    },
+
+    /// 67.2 (ADR-0133): a `CidrRange` in a NETWORK rbac policy has an invalid
+    /// prefix width for its address family (`prefix_len > 32` on IPv4 /
+    /// `> 128` on IPv6). Config-load-time fatal (ADR-0049). Scope-neutral
+    /// `listener {listener:?}` per the 67.1 W-1 generalization (ADR-0130).
+    #[error(
+        "listener {listener:?}: network rbac policy {policy_name:?} has an invalid CidrRange at {path}: {detail}"
+    )]
+    InvalidCidrRange {
+        listener: String,
+        policy_name: String,
+        path: String,
+        detail: String,
     },
 
     // The SEVEN RBAC tree/empty-set/leaf variants below are raised by BOTH
