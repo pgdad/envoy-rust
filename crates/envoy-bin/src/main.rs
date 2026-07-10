@@ -209,72 +209,92 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // drain path, mirroring the 12.2 health scheduler / 14.2 outlier manager.
     let mut rds_targets: Vec<envoy_http1::WatchTarget> = Vec::new();
 
+    // 67.1 D5: the chain is split into its NON-TERMINAL prefix and its TERMINAL
+    // last filter. Before 67.1 this read `filters.first()` and ignored the rest,
+    // safe ONLY because phase 66's terminal validation made every ≥2-filter chain
+    // invalid. `envoy.filters.network.rbac` is the first non-terminal filter, so
+    // that interlock is gone.
+    //
+    // ADR-0130 §2: an EMPTY `filters: []` chain is ACCEPTED by the config
+    // validator — measured parity with upstream Envoy, which accepts and STARTS
+    // on the same config (phase-67 SPEC R-7, the finding that closed M66-5).
+    // envoy-rust used to PANIC here (`validator guarantees ≥1 filter`). It now
+    // binds no data listener and warns; the admin listener, spawned independently
+    // below, still serves.
+    //
+    // What upstream Envoy does with a CONNECTION to such a listener has not been
+    // probed, so envoy-rust asserts nothing about it. Carried forward as CF-67-5.
+    // Recorded in BEHAVIOR_CONTRACT.md as a divergence with no differential
+    // observable — no fixture configures an empty chain.
     if let Some(listener_cfg) = bootstrap.all_listeners().next() {
-        // The validator guarantees `filter_chains.len() ≥ 1` and at least one
-        // filter; we read the single first filter (phase 02.2 supports one
-        // filter per chain). Phase 07's filter chain framework will iterate.
-        let filter = listener_cfg
-            .filter_chains
-            .first()
-            .and_then(|c| c.filters.first())
-            .expect("validator guarantees ≥1 filter");
+        let Some(chain) = listener_cfg.filter_chains.first() else {
+            anyhow::bail!("listener {:?} has no filter_chains", listener_cfg.name);
+        };
+        if let Some((prefix, terminal)) = split_chain(chain) {
+            let sock = &listener_cfg.address.socket_address;
+            let bind_addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
+                .parse()
+                .with_context(|| {
+                    format!(
+                        "parsing listener address {}:{}",
+                        sock.address, sock.port_value
+                    )
+                })?;
 
-        let sock = &listener_cfg.address.socket_address;
-        let bind_addr: SocketAddr = format!("{}:{}", sock.address, sock.port_value)
-            .parse()
-            .with_context(|| {
-                format!(
-                    "parsing listener address {}:{}",
-                    sock.address, sock.port_value
-                )
-            })?;
+            // Number of SO_REUSEPORT accept sockets to request when the listener has
+            // `enable_reuse_port` (the default) — one per logical CPU, matching the
+            // tokio runtime's default worker-thread count so each worker drives its
+            // own kernel accept queue. `Listener::bind_with_concurrency` clamps this
+            // to a single plain socket when reuse_port is off, the platform is not
+            // Linux, or the value is 1 — so non-Linux/dev runs are unchanged.
+            let listener_concurrency = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
 
-        // Number of SO_REUSEPORT accept sockets to request when the listener has
-        // `enable_reuse_port` (the default) — one per logical CPU, matching the
-        // tokio runtime's default worker-thread count so each worker drives its
-        // own kernel accept queue. `Listener::bind_with_concurrency` clamps this
-        // to a single plain socket when reuse_port is off, the platform is not
-        // Linux, or the value is 1 — so non-Linux/dev runs are unchanged.
-        let listener_concurrency = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+            // 67.1 D5: the non-terminal prefix, built once at startup and shared by
+            // every accepted connection. Its counters are `Arc<Counter>`s, so even
+            // the thread-per-core path's N shards tick ONE counter set.
+            let chain_filters = build_network_filter_chain(&prefix, &registry)?;
 
-        match filter.name.as_str() {
-            envoy_config::ECHO_FILTER => {
-                bind_and_spawn_listener(
+            match terminal.name.as_str() {
+                envoy_config::ECHO_FILTER => {
+                    bind_and_spawn_listener(
+                        listener_cfg,
+                        wrap_in_chain(chain_filters, std::sync::Arc::new(echo::EchoHandler)),
+                        &registry,
+                        listener_concurrency,
+                        "echo",
+                        bind_addr,
+                        || tracing::info!(addr = %bind_addr, "envoy-rust listening (echo)"),
+                        &token,
+                        &drain,
+                        &mut set,
+                    )
+                    .await?;
+                }
+                envoy_config::DIRECT_RESPONSE_FILTER => {
+                    let Some(envoy_config::TypedConfig::DirectResponse(dr_cfg)) =
+                        terminal.typed_config.as_ref()
+                    else {
+                        anyhow::bail!(
+                            "validator guarantees a DirectResponse typed_config on {}",
+                            envoy_config::DIRECT_RESPONSE_FILTER
+                        );
+                    };
+                    // `response` omitted => empty payload (SPEC §0 R-0.7).
+                    let payload: std::sync::Arc<[u8]> = dr_cfg
+                        .response
+                        .as_ref()
+                        .map(|d| d.inline_string.as_bytes())
+                        .unwrap_or(&[])
+                        .into();
+                    let payload_len = payload.len();
+                    bind_and_spawn_listener(
                     listener_cfg,
-                    std::sync::Arc::new(echo::EchoHandler),
-                    &registry,
-                    listener_concurrency,
-                    "echo",
-                    bind_addr,
-                    || tracing::info!(addr = %bind_addr, "envoy-rust listening (echo)"),
-                    &token,
-                    &drain,
-                    &mut set,
-                )
-                .await?;
-            }
-            envoy_config::DIRECT_RESPONSE_FILTER => {
-                let Some(envoy_config::TypedConfig::DirectResponse(dr_cfg)) =
-                    filter.typed_config.as_ref()
-                else {
-                    anyhow::bail!(
-                        "validator guarantees a DirectResponse typed_config on {}",
-                        envoy_config::DIRECT_RESPONSE_FILTER
-                    );
-                };
-                // `response` omitted => empty payload (SPEC §0 R-0.7).
-                let payload: std::sync::Arc<[u8]> = dr_cfg
-                    .response
-                    .as_ref()
-                    .map(|d| d.inline_string.as_bytes())
-                    .unwrap_or(&[])
-                    .into();
-                let payload_len = payload.len();
-                bind_and_spawn_listener(
-                    listener_cfg,
-                    std::sync::Arc::new(direct_response::DirectResponseHandler::new(payload)),
+                    wrap_in_chain(
+                        chain_filters,
+                        std::sync::Arc::new(direct_response::DirectResponseHandler::new(payload)),
+                    ),
                     &registry,
                     listener_concurrency,
                     "direct_response",
@@ -285,53 +305,58 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     &mut set,
                 )
                 .await?;
-            }
-            envoy_config::TCP_PROXY_FILTER => {
-                let Some(envoy_config::TypedConfig::TcpProxy(tp_cfg)) =
-                    filter.typed_config.as_ref()
-                else {
-                    anyhow::bail!(
-                        "filter '{}' missing typed_config; envoy-config validator should have rejected at parse time",
-                        envoy_config::TCP_PROXY_FILTER,
-                    );
-                };
-                let cluster = cluster_mgr
-                    .get(&tp_cfg.cluster)
-                    .expect("validator guarantees cluster present");
-                // 03.2: per-cluster upstream-TLS dispatch per SPEC §D5 step 2.
-                // If this cluster carried `transport_socket: UpstreamTlsContext`
-                // we built an `Arc<UpstreamTls>` at startup and select the
-                // TLS-upstream constructor; otherwise the plaintext-upstream
-                // constructor (03.1 path).
-                let proxy: std::sync::Arc<envoy_tcp::TcpProxy> =
-                    match upstream_tls_by_cluster.get(&tp_cfg.cluster) {
-                        Some(upstream_tls) => {
-                            std::sync::Arc::new(envoy_tcp::TcpProxy::with_upstream_tls(
-                                cluster,
-                                tp_cfg,
-                                upstream_tls.clone(),
-                            ))
-                        }
-                        None => std::sync::Arc::new(envoy_tcp::TcpProxy::new(cluster, tp_cfg)),
+                }
+                envoy_config::TCP_PROXY_FILTER => {
+                    let Some(envoy_config::TypedConfig::TcpProxy(tp_cfg)) =
+                        terminal.typed_config.as_ref()
+                    else {
+                        anyhow::bail!(
+                            "filter '{}' missing typed_config; envoy-config validator should have rejected at parse time",
+                            envoy_config::TCP_PROXY_FILTER,
+                        );
                     };
+                    let cluster = cluster_mgr
+                        .get(&tp_cfg.cluster)
+                        .expect("validator guarantees cluster present");
+                    // 03.2: per-cluster upstream-TLS dispatch per SPEC §D5 step 2.
+                    // If this cluster carried `transport_socket: UpstreamTlsContext`
+                    // we built an `Arc<UpstreamTls>` at startup and select the
+                    // TLS-upstream constructor; otherwise the plaintext-upstream
+                    // constructor (03.1 path).
+                    let proxy: std::sync::Arc<envoy_tcp::TcpProxy> =
+                        match upstream_tls_by_cluster.get(&tp_cfg.cluster) {
+                            Some(upstream_tls) => {
+                                std::sync::Arc::new(envoy_tcp::TcpProxy::with_upstream_tls(
+                                    cluster,
+                                    tp_cfg,
+                                    upstream_tls.clone(),
+                                ))
+                            }
+                            None => std::sync::Arc::new(envoy_tcp::TcpProxy::new(cluster, tp_cfg)),
+                        };
 
-                // 03.2: three-way TLS dispatch per SPEC §D5 step 1, factored
-                // through `build_downstream_tls_for_listener` (04.1 task 11)
-                // so the new HCM arm below shares the same per-listener
-                // logic. See the helper for the plaintext / single-cert /
-                // multi-cert branching.
-                let downstream_tls = build_downstream_tls_for_listener(listener_cfg)?;
+                    // 03.2: three-way TLS dispatch per SPEC §D5 step 1, factored
+                    // through `build_downstream_tls_for_listener` (04.1 task 11)
+                    // so the new HCM arm below shares the same per-listener
+                    // logic. See the helper for the plaintext / single-cert /
+                    // multi-cert branching.
+                    let downstream_tls = build_downstream_tls_for_listener(listener_cfg)?;
 
-                let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
-                    match downstream_tls {
-                        Some(tls) => std::sync::Arc::new(tls_handler::TlsAcceptingHandler {
-                            tls,
-                            inner: proxy,
-                        }),
-                        None => proxy,
-                    };
+                    let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
+                        match downstream_tls {
+                            Some(tls) => std::sync::Arc::new(tls_handler::TlsAcceptingHandler {
+                                tls,
+                                inner: proxy,
+                            }),
+                            None => proxy,
+                        };
+                    // 67.1: the chain runs on the raw TcpStream, BEFORE the TLS
+                    // handshake. For `any` (67.1) and the peer/local-address arms
+                    // (67.2) the verdict is identical either way — TLS alters neither
+                    // address.
+                    let handler = wrap_in_chain(chain_filters, handler);
 
-                bind_and_spawn_listener(
+                    bind_and_spawn_listener(
                     listener_cfg,
                     handler,
                     &registry,
@@ -344,113 +369,115 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     &mut set,
                 )
                 .await?;
-            }
-            envoy_config::HCM_FILTER => {
-                let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm_cfg)) =
-                    filter.typed_config.as_ref()
-                else {
-                    anyhow::bail!(
-                        "filter '{}' missing typed_config; envoy-config validator should have rejected at parse time",
-                        envoy_config::HCM_FILTER,
-                    );
-                };
-
-                // Thread-per-core dispatch: when eligible, serve this HCM
-                // listener with one single-threaded runtime per worker, each
-                // owning its own SO_REUSEPORT accept socket and its own
-                // upstream connection pools — upstream Envoy's per-worker-
-                // dispatcher architecture. Every connection's downstream and
-                // upstream I/O is then registered with, and polled by, the
-                // same thread, so the cross-thread wakeups of the shared
-                // multi-threaded runtime (scheduler unparks, work stealing,
-                // pooled sockets owned by another worker's driver) disappear.
-                //
-                // Gated to: Linux + enable_reuse_port (SO_REUSEPORT load-
-                // balancing), >= 2 workers, H1 codec, no rds (per-worker
-                // route tables would not observe hot reloads), no downstream
-                // TLS (falls through to the existing detect-and-bail).
-                //
-                // Opt-in via `ENVOY_RUST_TPC=1`, NOT opt-out: each worker
-                // builds its own HCMConfig (fresh filter-chain instances), so
-                // any filter or resource limit whose state must be shared
-                // across the whole listener — the local_ratelimit token
-                // bucket, the max_connections circuit-breaker counter — is
-                // silently fragmented into N independent per-worker copies
-                // instead of one. Confirmed regressions: the differential
-                // `http_filter_local_rate_limit` fixture, the envoy-bin
-                // backstops `local_rate_limit_enforces_429_after_token_exhaustion`
-                // and `cx_overflow_yields_200_503_multiset_and_cx_open_both_edges`.
-                // Default off until per-worker state sharing is fixed.
-                let tpc_workers = if cfg!(target_os = "linux")
-                    && listener_cfg.enable_reuse_port
-                    && listener_concurrency > 1
-                    && matches!(
-                        hcm_cfg.codec_type,
-                        envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1
-                    )
-                    && hcm_cfg.rds.is_none()
-                    && build_downstream_tls_for_listener(listener_cfg)?.is_none()
-                    && std::env::var("ENVOY_RUST_TPC")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                {
-                    listener_concurrency
-                } else {
-                    0
-                };
-
-                if tpc_workers >= 2 {
-                    // EXPERIMENTAL io_uring data plane (see envoy_http1::uring):
-                    // compiled behind `--features uring`, engaged only with
-                    // ENVOY_RUST_URING=1. Each worker thread runs a monoio
-                    // io_uring runtime and binds its own SO_REUSEPORT socket;
-                    // envoy-listener is bypassed for this listener.
-                    #[cfg(all(feature = "uring", target_os = "linux"))]
-                    let uring_enabled = std::env::var("ENVOY_RUST_URING")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
-                    #[cfg(not(all(feature = "uring", target_os = "linux")))]
-                    let uring_enabled = false;
-                    #[cfg(not(all(feature = "uring", target_os = "linux")))]
-                    if std::env::var("ENVOY_RUST_URING")
-                        .map(|v| v == "1")
-                        .unwrap_or(false)
-                    {
-                        tracing::warn!(
-                            "ENVOY_RUST_URING=1 ignored: binary built without the 'uring' feature"
+                }
+                envoy_config::HCM_FILTER => {
+                    let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm_cfg)) =
+                        terminal.typed_config.as_ref()
+                    else {
+                        anyhow::bail!(
+                            "filter '{}' missing typed_config; envoy-config validator should have rejected at parse time",
+                            envoy_config::HCM_FILTER,
                         );
-                    }
+                    };
 
-                    if uring_enabled {
+                    // Thread-per-core dispatch: when eligible, serve this HCM
+                    // listener with one single-threaded runtime per worker, each
+                    // owning its own SO_REUSEPORT accept socket and its own
+                    // upstream connection pools — upstream Envoy's per-worker-
+                    // dispatcher architecture. Every connection's downstream and
+                    // upstream I/O is then registered with, and polled by, the
+                    // same thread, so the cross-thread wakeups of the shared
+                    // multi-threaded runtime (scheduler unparks, work stealing,
+                    // pooled sockets owned by another worker's driver) disappear.
+                    //
+                    // Gated to: Linux + enable_reuse_port (SO_REUSEPORT load-
+                    // balancing), >= 2 workers, H1 codec, no rds (per-worker
+                    // route tables would not observe hot reloads), no downstream
+                    // TLS (falls through to the existing detect-and-bail).
+                    //
+                    // Opt-in via `ENVOY_RUST_TPC=1`, NOT opt-out: each worker
+                    // builds its own HCMConfig (fresh filter-chain instances), so
+                    // any filter or resource limit whose state must be shared
+                    // across the whole listener — the local_ratelimit token
+                    // bucket, the max_connections circuit-breaker counter — is
+                    // silently fragmented into N independent per-worker copies
+                    // instead of one. Confirmed regressions: the differential
+                    // `http_filter_local_rate_limit` fixture, the envoy-bin
+                    // backstops `local_rate_limit_enforces_429_after_token_exhaustion`
+                    // and `cx_overflow_yields_200_503_multiset_and_cx_open_both_edges`.
+                    // Default off until per-worker state sharing is fixed.
+                    let tpc_workers = if cfg!(target_os = "linux")
+                        && listener_cfg.enable_reuse_port
+                        && listener_concurrency > 1
+                        && matches!(
+                            hcm_cfg.codec_type,
+                            envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1
+                        )
+                        && hcm_cfg.rds.is_none()
+                        && build_downstream_tls_for_listener(listener_cfg)?.is_none()
+                        && std::env::var("ENVOY_RUST_TPC")
+                            .map(|v| v == "1")
+                            .unwrap_or(false)
+                    {
+                        listener_concurrency
+                    } else {
+                        0
+                    };
+
+                    if tpc_workers >= 2 {
+                        // EXPERIMENTAL io_uring data plane (see envoy_http1::uring):
+                        // compiled behind `--features uring`, engaged only with
+                        // ENVOY_RUST_URING=1. Each worker thread runs a monoio
+                        // io_uring runtime and binds its own SO_REUSEPORT socket;
+                        // envoy-listener is bypassed for this listener.
                         #[cfg(all(feature = "uring", target_os = "linux"))]
+                        let uring_enabled = std::env::var("ENVOY_RUST_URING")
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        #[cfg(not(all(feature = "uring", target_os = "linux")))]
+                        let uring_enabled = false;
+                        #[cfg(not(all(feature = "uring", target_os = "linux")))]
+                        if std::env::var("ENVOY_RUST_URING")
+                            .map(|v| v == "1")
+                            .unwrap_or(false)
                         {
-                            for i in 0..tpc_workers {
-                                let worker_config = std::sync::Arc::new(
-                                    envoy_http1::HCMConfig::from_config(
-                                        hcm_cfg,
-                                        std::sync::Arc::clone(&cluster_mgr),
-                                        std::sync::Arc::clone(&registry),
-                                        None, // the uring worker keeps its own per-worker pool
-                                    )
-                                    .await?,
-                                );
-                                let worker = envoy_http1::uring::UringWorker {
-                                    addr: bind_addr,
-                                    listener_name: listener_cfg.name.clone(),
-                                    config: worker_config,
-                                    registry: std::sync::Arc::clone(&registry),
-                                    token: token.clone(),
-                                };
-                                let (done_tx, done_rx) =
-                                    tokio::sync::oneshot::channel::<std::io::Result<()>>();
-                                std::thread::Builder::new()
-                                    .name(format!("envoy-uring-{i}"))
-                                    .spawn(move || {
-                                        let _ =
-                                            done_tx.send(envoy_http1::uring::run_worker(worker));
-                                    })
-                                    .with_context(|| format!("spawning uring worker thread {i}"))?;
-                                set.spawn(async move {
+                            tracing::warn!(
+                                "ENVOY_RUST_URING=1 ignored: binary built without the 'uring' feature"
+                            );
+                        }
+
+                        if uring_enabled {
+                            #[cfg(all(feature = "uring", target_os = "linux"))]
+                            {
+                                for i in 0..tpc_workers {
+                                    let worker_config = std::sync::Arc::new(
+                                        envoy_http1::HCMConfig::from_config(
+                                            hcm_cfg,
+                                            std::sync::Arc::clone(&cluster_mgr),
+                                            std::sync::Arc::clone(&registry),
+                                            None, // the uring worker keeps its own per-worker pool
+                                        )
+                                        .await?,
+                                    );
+                                    let worker = envoy_http1::uring::UringWorker {
+                                        addr: bind_addr,
+                                        listener_name: listener_cfg.name.clone(),
+                                        config: worker_config,
+                                        registry: std::sync::Arc::clone(&registry),
+                                        token: token.clone(),
+                                    };
+                                    let (done_tx, done_rx) =
+                                        tokio::sync::oneshot::channel::<std::io::Result<()>>();
+                                    std::thread::Builder::new()
+                                        .name(format!("envoy-uring-{i}"))
+                                        .spawn(move || {
+                                            let _ = done_tx
+                                                .send(envoy_http1::uring::run_worker(worker));
+                                        })
+                                        .with_context(|| {
+                                            format!("spawning uring worker thread {i}")
+                                        })?;
+                                    set.spawn(async move {
                                     match done_rx.await {
                                         Ok(res) => res.map_err(anyhow::Error::from),
                                         Err(_) => Err(anyhow::anyhow!(
@@ -458,250 +485,276 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                                         )),
                                     }
                                 });
+                                }
+                                tracing::info!(
+                                    addr = %bind_addr,
+                                    workers = tpc_workers,
+                                    stat_prefix = %hcm_cfg.stat_prefix,
+                                    "envoy-rust listening (http_connection_manager, thread-per-core, io_uring)",
+                                );
                             }
+                        } else {
+                            // Per-worker handler stack: each worker gets its OWN
+                            // H1PoolManager (upstream connections stay on the thread
+                            // that created them) and its own HCMConfig. All stats
+                            // registrations are idempotent by name, so the N workers
+                            // share one set of counters/gauges — per-worker pools,
+                            // process-wide aggregated stats, exactly like Envoy.
+                            let mut handlers: Vec<
+                                std::sync::Arc<dyn envoy_listener::ConnectionHandler>,
+                            > = Vec::with_capacity(tpc_workers);
+                            for _ in 0..tpc_workers {
+                                let worker_pool_mgr = envoy_http1::H1PoolManager::for_bootstrap(
+                                    &bootstrap,
+                                    &cluster_mgr,
+                                    std::sync::Arc::clone(&registry),
+                                    token.clone(),
+                                )
+                                .context("building per-worker H1 pool manager")?;
+                                let worker_config = std::sync::Arc::new(
+                                    envoy_http1::HCMConfig::from_config(
+                                        hcm_cfg,
+                                        std::sync::Arc::clone(&cluster_mgr),
+                                        std::sync::Arc::clone(&registry),
+                                        Some(worker_pool_mgr),
+                                    )
+                                    .await?,
+                                );
+                                // 67.1 D5: wrap each shard's handler. The chain's
+                                // `Arc<dyn NetworkFilter>`s are cheap to clone and the
+                                // counters inside are shared `Arc<Counter>`s, so N
+                                // shards tick ONE counter set — which is correct.
+                                handlers.push(wrap_in_chain(
+                                    chain_filters.clone(),
+                                    std::sync::Arc::new(envoy_http1::HCM {
+                                        config: worker_config,
+                                    }),
+                                ));
+                            }
+                            let shards = envoy_listener::Listener::bind_per_worker(
+                                listener_cfg,
+                                handlers,
+                                std::sync::Arc::clone(&registry),
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("binding sharded HCM listener to {bind_addr}")
+                            })?;
                             tracing::info!(
                                 addr = %bind_addr,
                                 workers = tpc_workers,
                                 stat_prefix = %hcm_cfg.stat_prefix,
-                                "envoy-rust listening (http_connection_manager, thread-per-core, io_uring)",
+                                "envoy-rust listening (http_connection_manager, thread-per-core)",
                             );
+                            for (i, shard) in shards.into_iter().enumerate() {
+                                let shutdown = token.clone().cancelled_owned();
+                                let drain_for_worker = std::sync::Arc::clone(&drain);
+                                let (done_tx, done_rx) = tokio::sync::oneshot::channel::<
+                                    Result<(), envoy_listener::ListenerError>,
+                                >();
+                                std::thread::Builder::new()
+                                    .name(format!("envoy-worker-{i}"))
+                                    .spawn(move || {
+                                        let result =
+                                            match tokio::runtime::Builder::new_current_thread()
+                                                .enable_all()
+                                                .build()
+                                            {
+                                                Ok(rt) => rt.block_on(
+                                                    shard.serve(shutdown, drain_for_worker),
+                                                ),
+                                                Err(e) => {
+                                                    Err(envoy_listener::ListenerError::Accept(e))
+                                                }
+                                            };
+                                        let _ = done_tx.send(result);
+                                    })
+                                    .with_context(|| format!("spawning worker thread {i}"))?;
+                                // Bridge the worker thread's exit back into the main
+                                // JoinSet so shutdown/error handling below treats it
+                                // like any other listener task. A dropped sender means
+                                // the worker thread died without reporting (panic).
+                                set.spawn(async move {
+                                    match done_rx.await {
+                                        Ok(res) => res.map_err(|e| anyhow::anyhow!(e)),
+                                        Err(_) => Err(anyhow::anyhow!(
+                                            "worker thread {i} exited without reporting a result"
+                                        )),
+                                    }
+                                });
+                            }
+                            // The TPC path serves this listener; skip the shared-
+                            // runtime construction below. (No rds by the gate above,
+                            // so no watch-target wiring is skipped.)
                         }
                     } else {
-                        // Per-worker handler stack: each worker gets its OWN
-                        // H1PoolManager (upstream connections stay on the thread
-                        // that created them) and its own HCMConfig. All stats
-                        // registrations are idempotent by name, so the N workers
-                        // share one set of counters/gauges — per-worker pools,
-                        // process-wide aggregated stats, exactly like Envoy.
-                        let mut handlers: Vec<
-                            std::sync::Arc<dyn envoy_listener::ConnectionHandler>,
-                        > = Vec::with_capacity(tpc_workers);
-                        for _ in 0..tpc_workers {
-                            let worker_pool_mgr = envoy_http1::H1PoolManager::for_bootstrap(
-                                &bootstrap,
-                                &cluster_mgr,
+                        let hcm_config = std::sync::Arc::new(
+                            envoy_http1::HCMConfig::from_config(
+                                hcm_cfg,
+                                std::sync::Arc::clone(&cluster_mgr),
                                 std::sync::Arc::clone(&registry),
-                                token.clone(),
+                                Some(std::sync::Arc::clone(&pool_mgr)),
                             )
-                            .context("building per-worker H1 pool manager")?;
-                            let worker_config = std::sync::Arc::new(
-                                envoy_http1::HCMConfig::from_config(
-                                    hcm_cfg,
-                                    std::sync::Arc::clone(&cluster_mgr),
-                                    std::sync::Arc::clone(&registry),
-                                    Some(worker_pool_mgr),
-                                )
-                                .await?,
-                            );
-                            handlers.push(std::sync::Arc::new(envoy_http1::HCM {
-                                config: worker_config,
-                            }));
-                        }
-                        let shards = envoy_listener::Listener::bind_per_worker(
-                            listener_cfg,
-                            handlers,
-                            std::sync::Arc::clone(&registry),
-                        )
-                        .await
-                        .with_context(|| format!("binding sharded HCM listener to {bind_addr}"))?;
-                        tracing::info!(
-                            addr = %bind_addr,
-                            workers = tpc_workers,
-                            stat_prefix = %hcm_cfg.stat_prefix,
-                            "envoy-rust listening (http_connection_manager, thread-per-core)",
+                            .await?,
                         );
-                        for (i, shard) in shards.into_iter().enumerate() {
-                            let shutdown = token.clone().cancelled_owned();
-                            let drain_for_worker = std::sync::Arc::clone(&drain);
-                            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<
-                                Result<(), envoy_listener::ListenerError>,
-                            >();
-                            std::thread::Builder::new()
-                                .name(format!("envoy-worker-{i}"))
-                                .spawn(move || {
-                                    let result = match tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                    {
-                                        Ok(rt) => {
-                                            rt.block_on(shard.serve(shutdown, drain_for_worker))
-                                        }
-                                        Err(e) => Err(envoy_listener::ListenerError::Accept(e)),
-                                    };
-                                    let _ = done_tx.send(result);
-                                })
-                                .with_context(|| format!("spawning worker thread {i}"))?;
-                            // Bridge the worker thread's exit back into the main
-                            // JoinSet so shutdown/error handling below treats it
-                            // like any other listener task. A dropped sender means
-                            // the worker thread died without reporting (panic).
-                            set.spawn(async move {
-                                match done_rx.await {
-                                    Ok(res) => res.map_err(|e| anyhow::anyhow!(e)),
-                                    Err(_) => Err(anyhow::anyhow!(
-                                        "worker thread {i} exited without reporting a result"
-                                    )),
-                                }
+
+                        // 26 Task 3: if this HCM is rds-configured, register a watch
+                        // target. `hcm_config` (the h1 `Arc<HCMConfig>`) is the
+                        // swappable route-table owner — for the H2 path below it is
+                        // wrapped as the `.inner` of `envoy_http2::HCMConfig`, so this
+                        // SAME h1 handle is the one both dispatch paths read; the
+                        // watcher's `store` must be it (NOT the H2 wrapper, which
+                        // holds no swappable cell). Path/name come from the parsed
+                        // `rds` block (`rds.config_source.path_config_source.path` +
+                        // `rds.route_config_name`). §5.2: HCMs WITHOUT rds add nothing.
+                        if let Some(rds) = hcm_cfg.rds.as_ref() {
+                            // 26 Task 4 (Task 5 folded in): re-resolve the 5 `rds.*`
+                            // counters the initial-load `register_rds_stats` already
+                            // registered (line ~116). `register_counter` is idempotent
+                            // by name, so this returns the SAME underlying handles —
+                            // the watcher continues the series initial load seeded at
+                            // `1/1/0/0/1`, ticking it per the §6.2 taxonomy on reload.
+                            // Shared base-name helper: MUST stay byte-identical to the
+                            // initial-load `register_rds_stats` (idempotent register-by-name
+                            // returns the SAME handles); see `envoy_listener::rds_counter_base`.
+                            let base = envoy_listener::rds_counter_base(
+                                &hcm_cfg.stat_prefix,
+                                &rds.route_config_name,
+                            );
+                            let mk = |suffix: &str| {
+                                registry
+                                    .register_counter(&format!("{base}.{suffix}"))
+                                    .map_err(|e| anyhow::anyhow!(e))
+                            };
+                            let counters = envoy_http1::RdsCounters {
+                                update_attempt: mk("update_attempt")?,
+                                update_success: mk("update_success")?,
+                                update_failure: mk("update_failure")?,
+                                update_rejected: mk("update_rejected")?,
+                                config_reload: mk("config_reload")?,
+                            };
+                            rds_targets.push(envoy_http1::WatchTarget {
+                                path: std::path::PathBuf::from(
+                                    &rds.config_source.path_config_source.path,
+                                ),
+                                route_config_name: rds.route_config_name.clone(),
+                                store: std::sync::Arc::clone(&hcm_config),
+                                counters,
                             });
                         }
-                        // The TPC path serves this listener; skip the shared-
-                        // runtime construction below. (No rds by the gate above,
-                        // so no watch-target wiring is skipped.)
-                    }
-                } else {
-                    let hcm_config = std::sync::Arc::new(
-                        envoy_http1::HCMConfig::from_config(
-                            hcm_cfg,
-                            std::sync::Arc::clone(&cluster_mgr),
-                            std::sync::Arc::clone(&registry),
-                            Some(std::sync::Arc::clone(&pool_mgr)),
-                        )
-                        .await?,
-                    );
 
-                    // 26 Task 3: if this HCM is rds-configured, register a watch
-                    // target. `hcm_config` (the h1 `Arc<HCMConfig>`) is the
-                    // swappable route-table owner — for the H2 path below it is
-                    // wrapped as the `.inner` of `envoy_http2::HCMConfig`, so this
-                    // SAME h1 handle is the one both dispatch paths read; the
-                    // watcher's `store` must be it (NOT the H2 wrapper, which
-                    // holds no swappable cell). Path/name come from the parsed
-                    // `rds` block (`rds.config_source.path_config_source.path` +
-                    // `rds.route_config_name`). §5.2: HCMs WITHOUT rds add nothing.
-                    if let Some(rds) = hcm_cfg.rds.as_ref() {
-                        // 26 Task 4 (Task 5 folded in): re-resolve the 5 `rds.*`
-                        // counters the initial-load `register_rds_stats` already
-                        // registered (line ~116). `register_counter` is idempotent
-                        // by name, so this returns the SAME underlying handles —
-                        // the watcher continues the series initial load seeded at
-                        // `1/1/0/0/1`, ticking it per the §6.2 taxonomy on reload.
-                        // Shared base-name helper: MUST stay byte-identical to the
-                        // initial-load `register_rds_stats` (idempotent register-by-name
-                        // returns the SAME handles); see `envoy_listener::rds_counter_base`.
-                        let base = envoy_listener::rds_counter_base(
-                            &hcm_cfg.stat_prefix,
-                            &rds.route_config_name,
-                        );
-                        let mk = |suffix: &str| {
-                            registry
-                                .register_counter(&format!("{base}.{suffix}"))
-                                .map_err(|e| anyhow::anyhow!(e))
-                        };
-                        let counters = envoy_http1::RdsCounters {
-                            update_attempt: mk("update_attempt")?,
-                            update_success: mk("update_success")?,
-                            update_failure: mk("update_failure")?,
-                            update_rejected: mk("update_rejected")?,
-                            config_reload: mk("config_reload")?,
-                        };
-                        rds_targets.push(envoy_http1::WatchTarget {
-                            path: std::path::PathBuf::from(
-                                &rds.config_source.path_config_source.path,
-                            ),
-                            route_config_name: rds.route_config_name.clone(),
-                            store: std::sync::Arc::clone(&hcm_config),
-                            counters,
-                        });
-                    }
-
-                    // 05.2 NEW: H1-vs-H2 dispatch on hcm_cfg.codec_type.
-                    // - AUTO / HTTP1 → envoy_http1::HCM (existing 04.x path)
-                    // - HTTP2       → envoy_http2::HCM (new in 05.2)
-                    // - HTTP3       → bail (validator rejected at parse time)
-                    let hcm: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = match hcm_cfg
-                        .codec_type
-                    {
-                        envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1 => {
-                            std::sync::Arc::new(envoy_http1::HCM { config: hcm_config })
-                        }
-                        envoy_config::CodecType::HTTP2 => {
-                            // 13.2 Task 2 (D6, lock-in #2): wrap the H1
-                            // HCMConfig in the new `envoy_http2::HCMConfig`
-                            // struct, threading the H2 pool manager. The
-                            // H2 HCM's dispatch arm uses
-                            // `config.h2_pool_mgr` for proxy upstream
-                            // dispatch; H1 inner fields are accessed via
-                            // `config.inner.<field>`.
-                            std::sync::Arc::new(envoy_http2::HCM::new(std::sync::Arc::new(
-                                envoy_http2::HCMConfig::wrap(
-                                    std::sync::Arc::clone(&hcm_config),
-                                    Some(std::sync::Arc::clone(&h2_pool_mgr)),
-                                ),
-                            )))
-                        }
-                        envoy_config::CodecType::HTTP3 => {
-                            anyhow::bail!(
-                                "CodecType::HTTP3 should have been rejected by the envoy-config \
+                        // 05.2 NEW: H1-vs-H2 dispatch on hcm_cfg.codec_type.
+                        // - AUTO / HTTP1 → envoy_http1::HCM (existing 04.x path)
+                        // - HTTP2       → envoy_http2::HCM (new in 05.2)
+                        // - HTTP3       → bail (validator rejected at parse time)
+                        let hcm: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
+                            match hcm_cfg.codec_type {
+                                envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1 => {
+                                    std::sync::Arc::new(envoy_http1::HCM { config: hcm_config })
+                                }
+                                envoy_config::CodecType::HTTP2 => {
+                                    // 13.2 Task 2 (D6, lock-in #2): wrap the H1
+                                    // HCMConfig in the new `envoy_http2::HCMConfig`
+                                    // struct, threading the H2 pool manager. The
+                                    // H2 HCM's dispatch arm uses
+                                    // `config.h2_pool_mgr` for proxy upstream
+                                    // dispatch; H1 inner fields are accessed via
+                                    // `config.inner.<field>`.
+                                    std::sync::Arc::new(envoy_http2::HCM::new(std::sync::Arc::new(
+                                        envoy_http2::HCMConfig::wrap(
+                                            std::sync::Arc::clone(&hcm_config),
+                                            Some(std::sync::Arc::clone(&h2_pool_mgr)),
+                                        ),
+                                    )))
+                                }
+                                envoy_config::CodecType::HTTP3 => {
+                                    anyhow::bail!(
+                                        "CodecType::HTTP3 should have been rejected by the envoy-config \
                              validator at parse time; this is a validator bug",
-                            );
-                        }
-                    };
+                                    );
+                                }
+                            };
 
-                    // TLS-detect-and-bail: only meaningful for the H1 path.
-                    // For H2 the validator already rejected TLS+HTTP2 at parse
-                    // time (Http2OverTlsNotSupported) so this branch is
-                    // unreachable for H2. The H1 branch retains the 04.x
-                    // detect-and-bail: TlsAcceptingHandler is hard-coded to
-                    // `Arc<TcpProxy>` (per the inherent-generic `handle::<S>`
-                    // design in `tls_handler.rs`), so wrapping HCM in TLS
-                    // requires generalizing the adapter, which is deliberately
-                    // deferred to phase 05+ per SPEC §3 D4.
-                    if matches!(
-                        hcm_cfg.codec_type,
-                        envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1
-                    ) && build_downstream_tls_for_listener(listener_cfg)?.is_some()
-                    {
-                        anyhow::bail!(
-                            "HCM listener with downstream TLS is not supported in phase 04.x; \
+                        // TLS-detect-and-bail: only meaningful for the H1 path.
+                        // For H2 the validator already rejected TLS+HTTP2 at parse
+                        // time (Http2OverTlsNotSupported) so this branch is
+                        // unreachable for H2. The H1 branch retains the 04.x
+                        // detect-and-bail: TlsAcceptingHandler is hard-coded to
+                        // `Arc<TcpProxy>` (per the inherent-generic `handle::<S>`
+                        // design in `tls_handler.rs`), so wrapping HCM in TLS
+                        // requires generalizing the adapter, which is deliberately
+                        // deferred to phase 05+ per SPEC §3 D4.
+                        if matches!(
+                            hcm_cfg.codec_type,
+                            envoy_config::CodecType::AUTO | envoy_config::CodecType::HTTP1
+                        ) && build_downstream_tls_for_listener(listener_cfg)?.is_some()
+                        {
+                            anyhow::bail!(
+                                "HCM listener with downstream TLS is not supported in phase 04.x; \
                          TlsAcceptingHandler is currently TcpProxy-only and will be \
                          generalized in phase 05+ (SPEC §3 D4)",
-                        );
-                    }
-                    // Defensive symmetric bail for H2+TLS. The envoy-config validator
-                    // (Http2OverTlsNotSupported, Task 2) rejects this combination at
-                    // parse time, so this branch is unreachable from any well-formed
-                    // config. Keep the runtime check anyway so a validator regression
-                    // surfaces as a clean config-load error rather than a silently-
-                    // non-functional plaintext listener on a port the operator
-                    // expected to be TLS-protected.
-                    if matches!(hcm_cfg.codec_type, envoy_config::CodecType::HTTP2)
-                        && build_downstream_tls_for_listener(listener_cfg)?.is_some()
-                    {
-                        anyhow::bail!(
-                            "TLS+HTTP2 listener is unsupported in phase 05.2; the \
+                            );
+                        }
+                        // Defensive symmetric bail for H2+TLS. The envoy-config validator
+                        // (Http2OverTlsNotSupported, Task 2) rejects this combination at
+                        // parse time, so this branch is unreachable from any well-formed
+                        // config. Keep the runtime check anyway so a validator regression
+                        // surfaces as a clean config-load error rather than a silently-
+                        // non-functional plaintext listener on a port the operator
+                        // expected to be TLS-protected.
+                        if matches!(hcm_cfg.codec_type, envoy_config::CodecType::HTTP2)
+                            && build_downstream_tls_for_listener(listener_cfg)?.is_some()
+                        {
+                            anyhow::bail!(
+                                "TLS+HTTP2 listener is unsupported in phase 05.2; the \
                          envoy-config validator's Http2OverTlsNotSupported should \
                          have rejected this combination at parse time"
-                        );
-                    }
-                    let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> = hcm;
+                            );
+                        }
+                        // 67.1 D5: the chain runs on the raw TcpStream before any
+                        // codec is selected; HCM is just another terminal handler.
+                        let handler: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
+                            wrap_in_chain(chain_filters, hcm);
 
-                    bind_and_spawn_listener(
-                        listener_cfg,
-                        handler,
-                        &registry,
-                        listener_concurrency,
-                        "HCM",
-                        bind_addr,
-                        || {
-                            tracing::info!(
-                                addr = %bind_addr,
-                                stat_prefix = %hcm_cfg.stat_prefix,
-                                codec_type = ?hcm_cfg.codec_type,
-                                "envoy-rust listening (http_connection_manager)",
-                            )
-                        },
-                        &token,
-                        &drain,
-                        &mut set,
-                    )
-                    .await?;
+                        bind_and_spawn_listener(
+                            listener_cfg,
+                            handler,
+                            &registry,
+                            listener_concurrency,
+                            "HCM",
+                            bind_addr,
+                            || {
+                                tracing::info!(
+                                    addr = %bind_addr,
+                                    stat_prefix = %hcm_cfg.stat_prefix,
+                                    codec_type = ?hcm_cfg.codec_type,
+                                    "envoy-rust listening (http_connection_manager)",
+                                )
+                            },
+                            &token,
+                            &drain,
+                            &mut set,
+                        )
+                        .await?;
+                    }
+                }
+                other => {
+                    anyhow::bail!(
+                        "unsupported terminal network filter '{other}'; envoy-config should have rejected at parse time"
+                    );
                 }
             }
-            other => {
-                anyhow::bail!(
-                    "filter '{other}' is not dispatchable; envoy-config should have rejected at parse time"
-                );
-            }
+        } else {
+            // ADR-0130 §2 / SPEC R-7: `filters: []`. Upstream Envoy accepts this
+            // config and starts; envoy-rust used to panic on it. Bind no data
+            // listener, warn, and let the admin listener (spawned below) serve.
+            // What upstream does with a CONNECTION to such a listener was never
+            // probed, so envoy-rust asserts nothing about it — CF-67-5.
+            tracing::warn!(
+                listener = %listener_cfg.name,
+                "filter chain is empty; binding no data listener (upstream Envoy accepts \
+                 this config and starts — see CF-67-5)",
+            );
         }
     }
 
@@ -861,6 +914,86 @@ fn build_upstream_tls_map(
 /// "HCM"); `log_listening` is a per-arm closure so each arm's
 /// `tracing::info!` call — with its own fields — stays byte-identical to the
 /// pre-extraction messages.
+/// 67.1 D5: split a network filter chain into its NON-TERMINAL prefix and its
+/// TERMINAL last filter.
+///
+/// Before 67.1, `main` read `filters.first()` and ignored the rest — safe ONLY
+/// because phase 66's terminal validation made every ≥2-filter chain invalid.
+/// `envoy.filters.network.rbac` is the first NON-terminal filter, so that
+/// interlock is gone: the terminal filter is the LAST one, and everything before
+/// it is a filter to run per-connection.
+///
+/// `envoy-config`'s `NetworkFilterChainNotTerminated` rule (67.1 D2) guarantees
+/// a NON-EMPTY chain ends in a terminal filter. An EMPTY `filters: []` chain is
+/// ACCEPTED (SPEC R-7, upstream parity, closes M66-5) and has no terminal filter
+/// at all — hence the `Option`. Returning `None` is NOT an error; see the caller.
+fn split_chain(
+    chain: &envoy_config::FilterChain,
+) -> Option<(
+    Vec<&envoy_config::NetworkFilter>,
+    &envoy_config::NetworkFilter,
+)> {
+    let (terminal, prefix) = chain.filters.split_last()?;
+    Some((prefix.iter().collect(), terminal))
+}
+
+/// 67.1 D5: construct one `envoy_listener::NetworkFilter` per non-terminal
+/// filter, in configured order, registering its stats.
+///
+/// `envoy.filters.network.rbac` is the only non-terminal filter envoy-rust
+/// supports today. The fallback arm is unreachable: the config validator's
+/// per-filter match rejects every unknown name with
+/// `ConfigError::UnsupportedFilter`, and every OTHER known name is terminal (so
+/// it would be the chain's last filter and never appear in the prefix).
+///
+/// NOTE the two `NetworkFilter`s: `envoy_config::NetworkFilter` is the config
+/// STRUCT; `envoy_listener::NetworkFilter` is the runtime TRAIT. Both appear
+/// here. Always fully qualify.
+fn build_network_filter_chain(
+    prefix: &[&envoy_config::NetworkFilter],
+    registry: &envoy_stats::StatsRegistry,
+) -> Result<Vec<std::sync::Arc<dyn envoy_listener::NetworkFilter>>> {
+    let mut out: Vec<std::sync::Arc<dyn envoy_listener::NetworkFilter>> =
+        Vec::with_capacity(prefix.len());
+    for filter in prefix {
+        match filter.name.as_str() {
+            envoy_config::NETWORK_RBAC_FILTER => {
+                let Some(envoy_config::TypedConfig::NetworkRbac(cfg)) =
+                    filter.typed_config.as_ref()
+                else {
+                    anyhow::bail!(
+                        "validator guarantees a NetworkRbac typed_config on {}",
+                        envoy_config::NETWORK_RBAC_FILTER
+                    );
+                };
+                out.push(std::sync::Arc::new(
+                    network_rbac::NetworkRbacFilter::new(cfg, registry)
+                        .with_context(|| format!("registering stats for {}", cfg.stat_prefix))?,
+                ));
+            }
+            other => anyhow::bail!(
+                "non-terminal network filter '{other}' is not supported; \
+                 the envoy-config validator should have rejected it at parse time",
+            ),
+        }
+    }
+    Ok(out)
+}
+
+/// 67.1 D5: wrap `inner` in the chain's non-terminal filters, if any. An empty
+/// prefix returns `inner` untouched, so a lone-terminal-filter chain pays no
+/// per-connection cost (no `peer_addr()`/`local_addr()` syscalls).
+fn wrap_in_chain(
+    filters: Vec<std::sync::Arc<dyn envoy_listener::NetworkFilter>>,
+    inner: std::sync::Arc<dyn envoy_listener::ConnectionHandler>,
+) -> std::sync::Arc<dyn envoy_listener::ConnectionHandler> {
+    if filters.is_empty() {
+        inner
+    } else {
+        std::sync::Arc::new(envoy_listener::ChainHandler::new(filters, inner))
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // mechanical extraction of a duplicated block; all args were in-scope locals
 async fn bind_and_spawn_listener(
     listener_cfg: &envoy_config::Listener,
@@ -952,5 +1085,87 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => tracing::info!("SIGTERM received"),
         _ = intr.recv() => tracing::info!("SIGINT received"),
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn chain_from(yaml: &str) -> envoy_config::FilterChain {
+        serde_yaml::from_str(yaml).expect("FilterChain parses")
+    }
+
+    const RBAC_ECHO: &str = "filters:\n  - name: envoy.filters.network.rbac\n    typed_config:\n      \"@type\": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC\n      stat_prefix: sp\n  - name: envoy.filters.network.echo\n";
+
+    /// 67.1 D5: `[rbac, echo]` splits into one non-terminal filter + a terminal
+    /// `echo`. The terminal filter is the LAST one — never `filters.first()`.
+    #[test]
+    fn splits_chain_into_non_terminal_prefix_and_terminal_last() {
+        let chain = chain_from(RBAC_ECHO);
+        let (prefix, terminal) = split_chain(&chain).expect("non-empty chain has a terminal");
+        assert_eq!(prefix.len(), 1);
+        assert_eq!(prefix[0].name, envoy_config::NETWORK_RBAC_FILTER);
+        assert_eq!(terminal.name, envoy_config::ECHO_FILTER);
+    }
+
+    /// 67.1 D5: a lone terminal filter yields an EMPTY prefix — the pre-67.1 shape.
+    #[test]
+    fn lone_terminal_filter_yields_empty_prefix() {
+        let chain = chain_from("filters:\n  - name: envoy.filters.network.echo\n");
+        let (prefix, terminal) = split_chain(&chain).expect("terminal present");
+        assert!(prefix.is_empty());
+        assert_eq!(terminal.name, envoy_config::ECHO_FILTER);
+    }
+
+    /// 67.1 D5 / SPEC R-7 / ADR-0130 §2: an EMPTY chain has no terminal filter.
+    /// `split_chain` returns None; the caller must NOT panic. envoy-rust used to
+    /// crash here (`main.rs:220`, `validator guarantees ≥1 filter`) on a config
+    /// upstream Envoy ACCEPTS and STARTS.
+    #[test]
+    fn empty_chain_has_no_terminal_and_does_not_panic() {
+        let chain = chain_from("filters: []\n");
+        assert!(split_chain(&chain).is_none());
+    }
+
+    /// 67.1 D5: `build_network_filter_chain` constructs one `NetworkFilter` per
+    /// non-terminal filter and registers its counters.
+    #[test]
+    fn builds_a_network_rbac_filter_from_the_prefix() {
+        let chain = chain_from(
+            "filters:\n  - name: envoy.filters.network.rbac\n    typed_config:\n      \"@type\": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC\n      stat_prefix: built\n      rules:\n        action: DENY\n        policies:\n          p0:\n            permissions: [{ any: true }]\n            principals: [{ any: true }]\n  - name: envoy.filters.network.echo\n",
+        );
+        let registry = envoy_stats::StatsRegistry::new();
+        let (prefix, _) = split_chain(&chain).unwrap();
+        let filters = build_network_filter_chain(&prefix, &registry).expect("builds");
+        assert_eq!(filters.len(), 1);
+        // Counters registered at construction, at 0.
+        assert_eq!(
+            registry
+                .register_counter("built.rbac.denied")
+                .unwrap()
+                .value(),
+            0
+        );
+        assert_eq!(
+            registry
+                .register_counter("built.rbac.shadow_allowed")
+                .unwrap()
+                .value(),
+            0
+        );
+    }
+
+    /// 67.1 D5: an empty prefix returns `inner` untouched — a lone-terminal-filter
+    /// chain pays no per-connection cost (no peer_addr()/local_addr() syscalls).
+    #[test]
+    fn wrap_in_chain_with_no_filters_returns_inner_unchanged() {
+        let inner: std::sync::Arc<dyn envoy_listener::ConnectionHandler> =
+            std::sync::Arc::new(echo::EchoHandler);
+        let same = wrap_in_chain(vec![], std::sync::Arc::clone(&inner));
+        assert!(
+            std::sync::Arc::ptr_eq(&inner, &same),
+            "empty prefix must not allocate a ChainHandler"
+        );
     }
 }

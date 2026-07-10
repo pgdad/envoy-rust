@@ -104,6 +104,12 @@ fn engine_allows(rules: &Rules, conn: &ConnectionInfo) -> bool {
 /// `validate_l4_permission` (67.1 D3, CF-67-4) rejects them at config load. They
 /// return `false` rather than panicking — a data-plane path must never panic —
 /// with a `debug_assert!` to catch a validator regression in test builds.
+///
+/// `conn` is threaded through but not read by any arm 67.1 ships: `any` and the
+/// combinators ignore the connection. `67.2`'s `destination_port` /
+/// `destination_ip` arms read it. Keeping it in the signature now is what lets
+/// `67.2` add those arms without touching every call site.
+#[allow(clippy::only_used_in_recursion)]
 fn permission_matches(p: &Permission, conn: &ConnectionInfo) -> bool {
     match p {
         Permission::Any(b) => *b,
@@ -121,7 +127,9 @@ fn permission_matches(p: &Permission, conn: &ConnectionInfo) -> bool {
 }
 
 /// The `Principal` twin of [`permission_matches`]. EXHAUSTIVE, no catch-all:
-/// `67.2` adds `DirectRemoteIp` / `RemoteIp` / `SourceIp`.
+/// `67.2` adds `DirectRemoteIp` / `RemoteIp` / `SourceIp`, which are what will
+/// read `conn` (see [`permission_matches`] on why it is threaded through now).
+#[allow(clippy::only_used_in_recursion)]
 fn principal_matches(p: &Principal, conn: &ConnectionInfo) -> bool {
     match p {
         Principal::Any(b) => *b,
