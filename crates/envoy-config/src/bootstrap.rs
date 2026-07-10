@@ -2993,7 +2993,7 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
         .iter_mut()
         .chain(dynamic_listeners.iter_mut().flatten())
     {
-        for chain in &mut listener.filter_chains {
+        for (chain_index, chain) in listener.filter_chains.iter_mut().enumerate() {
             // Snapshot per-chain TLS state for `validate_hcm`'s D2.a check
             // (phase 05.2 SPEC §3 — reject `codec_type: HTTP2` on TLS chains).
             // Mirrors the predicate just below: a chain is "TLS" iff its
@@ -3051,6 +3051,21 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                         chain_len,
                     });
                 }
+            }
+            // 67.1 D2 (SPEC R-1): the BILATERAL dual — a non-empty chain must
+            // END in a terminal filter. Placed AFTER the scan above so the
+            // terminal-not-last error WINS when a chain violates both rules at
+            // once (`[echo, rbac]`) — measured upstream precedence, SPEC R-5.
+            // An empty `filters: []` chain is ACCEPTED (SPEC R-7, upstream
+            // parity, closes M66-5): `last()` is None and this check no-ops.
+            if let Some(last) = chain.filters.last()
+                && !is_terminal_network_filter(&last.name)
+            {
+                return Err(crate::ConfigError::NetworkFilterChainNotTerminated {
+                    listener: listener.name.clone(),
+                    chain_index,
+                    last_filter: last.name.clone(),
+                });
             }
             for filter in &mut chain.filters {
                 match filter.name.as_str() {
@@ -5421,6 +5436,150 @@ static_resources:
             "got {err:?}",
         );
         assert!(!err.to_string().contains("HCM"), "got {err}");
+    }
+
+    // --- 67.1 D2: the BILATERAL chain-termination rule ---
+
+    /// 67.1 D2 / SPEC R-1: a chain whose LAST filter is non-terminal is
+    /// REJECTED. The bilateral dual of `NetworkFilterNotTerminal`.
+    #[test]
+    fn rejects_chain_whose_last_filter_is_non_terminal() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: sp
+"#;
+        let mut b: crate::Bootstrap = serde_yaml::from_str(yaml).expect("parses");
+        let err = validate(&mut b).expect_err("[rbac] alone must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::NetworkFilterChainNotTerminated {
+                    ref listener,
+                    chain_index: 0,
+                    ref last_filter,
+                } if listener == "l0" && last_filter == crate::NETWORK_RBAC_FILTER
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// 67.1 D2 / SPEC R-5: ERROR PRECEDENCE. `[echo, rbac]` violates BOTH rules
+    /// (echo is terminal-but-not-last; rbac is non-terminal-but-last). Upstream
+    /// reports the TERMINAL error. An in-order scan reproduces that naturally.
+    /// If a future edit moves the chain-termination check BEFORE the terminal
+    /// scan, this test catches it.
+    #[test]
+    fn terminal_not_last_error_wins_over_chain_not_terminated() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.echo
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: sp
+"#;
+        let mut b: crate::Bootstrap = serde_yaml::from_str(yaml).expect("parses");
+        let err = validate(&mut b).expect_err("rejected");
+        assert!(
+            matches!(err, crate::ConfigError::NetworkFilterNotTerminal { ref name, .. }
+                     if name == crate::ECHO_FILTER),
+            "terminal-not-last must WIN; got {err:?}",
+        );
+    }
+
+    /// 67.1 D2 / SPEC R-7: an EMPTY `filters: []` chain is ACCEPTED — measured
+    /// parity with upstream Envoy (`configuration OK`). This CLOSES M66-5. The
+    /// chain-termination rule applies only to NON-EMPTY chains.
+    #[test]
+    fn empty_filter_chain_is_accepted() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters: []
+"#;
+        let mut b: crate::Bootstrap = serde_yaml::from_str(yaml).expect("parses");
+        validate(&mut b).expect("empty chain is upstream parity (SPEC R-7)");
+    }
+
+    /// 67.1 D2 / SPEC R-1: `[rbac, echo]` — the happy chain — validates.
+    #[test]
+    fn accepts_non_terminal_rbac_before_terminal_echo() {
+        let mut b = network_rbac_bootstrap("stat_prefix: sp");
+        validate(&mut b).expect("[rbac, echo] is valid (SPEC R-1)");
+    }
+
+    /// 67.1 D2: every existing single-terminal-filter chain still validates.
+    #[test]
+    fn single_terminal_filter_chains_still_validate() {
+        for name in [crate::ECHO_FILTER, crate::DIRECT_RESPONSE_FILTER] {
+            let typed = if name == crate::DIRECT_RESPONSE_FILTER {
+                "\n              typed_config:\n                \"@type\": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config\n                response: { inline_string: \"x\" }"
+            } else {
+                ""
+            };
+            let yaml = format!(
+                r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: 10000 }}
+      filter_chains:
+        - filters:
+            - name: {name}{typed}
+"#
+            );
+            let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
+            validate(&mut b).unwrap_or_else(|e| panic!("{name} chain must validate: {e}"));
+        }
+    }
+
+    /// 67.1 D2 — closes M66-6. The pre-pass iterates
+    /// `static_listeners.chain(dynamic_listeners)`, so BOTH terminal rules apply
+    /// to LDS-loaded dynamic listeners. Phase 66 landed the terminal rule with
+    /// no dynamic-listener test; this is it.
+    #[test]
+    fn network_filter_terminal_rules_apply_to_dynamic_lds_listeners() {
+        let listener_yaml = r#"
+name: dyn0
+address:
+  socket_address: { address: 127.0.0.1, port_value: 10000 }
+filter_chains:
+  - filters:
+      - name: envoy.filters.network.rbac
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+          stat_prefix: sp
+"#;
+        let dynamic: crate::Listener = serde_yaml::from_str(listener_yaml).expect("parses");
+        let mut b: crate::Bootstrap =
+            serde_yaml::from_str("static_resources: { listeners: [] }").expect("parses");
+        b.dynamic_listeners = Some(vec![dynamic]);
+        let err = validate(&mut b).expect_err("a dynamic listener's [rbac]-only chain is rejected");
+        assert!(
+            matches!(err, crate::ConfigError::NetworkFilterChainNotTerminated { ref listener, .. }
+                     if listener == "dyn0"),
+            "got {err:?}",
+        );
     }
 
     #[test]

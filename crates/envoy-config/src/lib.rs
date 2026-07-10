@@ -95,6 +95,22 @@ pub enum ConfigError {
         position: usize,
         chain_len: usize,
     },
+    /// 67.1 D2 (ADR-0128 / ADR-0129): a NON-EMPTY network filter chain whose
+    /// LAST filter is non-terminal. The bilateral dual of
+    /// `NetworkFilterNotTerminal`. Upstream Envoy: `non-terminal filter named
+    /// <X> of type <X> is the last filter in a network filter chain.` (SPEC R-1)
+    ///
+    /// An EMPTY `filters: []` chain stays ACCEPTED — measured upstream parity
+    /// (SPEC R-7), which is what closed carry-forward M66-5. This variant is
+    /// unreachable for an empty chain by construction (`filters.last()` is None).
+    #[error(
+        "listener {listener:?} filter_chains[{chain_index}]: non-terminal filter {last_filter:?} is the last filter in a network filter chain"
+    )]
+    NetworkFilterChainNotTerminated {
+        listener: String,
+        chain_index: usize,
+        last_filter: String,
+    },
     #[error("unknown cluster '{0}'")]
     UnknownCluster(String),
     /// 18 D1 (L8, ADR-0049): `dynamic_resources.cds_config.resource_api_version`
