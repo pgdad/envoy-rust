@@ -180,6 +180,61 @@ static_resources:
     )
 }
 
+/// REVIEW.md I-5: `[rbac, http_connection_manager]`. `hcm` does NO
+/// establishment-time work (measured, ADR-0132), so it is one of the two terminal
+/// filters the chain's first-byte gate models correctly. The HCM routes to a
+/// `direct_response` route, so this needs no backend.
+fn rbac_hcm_cfg_with_admin(
+    port: u16,
+    admin_port: u16,
+    stat_prefix: &str,
+    rules_block: &str,
+) -> String {
+    format!(
+        r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: {admin_port}
+static_resources:
+  listeners:
+    - name: rbac_hcm_listener
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: {port}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: {stat_prefix}
+{rules_block}
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: default
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response:
+                            status: 200
+                            body: {{ inline_string: "ok\n" }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#
+    )
+}
+
 const DENY_ALL: &str = r#"                rules:
                   action: DENY
                   policies:
@@ -462,6 +517,99 @@ async fn deny_does_not_suppress_the_direct_response_payload() {
             .unwrap_or_else(|| panic!("counter {name} must be REGISTERED (stat tree parity)"));
         assert_eq!(got, 0, "the chain is bypassed; {name} must never tick");
     }
+}
+
+/// REVIEW.md I-5 + ADR-0132 decision 1 — the `[rbac, hcm]` composition, ALLOW.
+///
+/// `http_connection_manager` does no establishment-time work, so the chain's
+/// first-byte gate is observationally identical to upstream's model: the verdict
+/// is taken on the first request byte, the HCM then serves the request, and
+/// `allowed` ticks exactly once.
+///
+/// This is one of the three compositions that had ZERO coverage when C-1 shipped
+/// (`rbac` was paired with `echo` in every fixture and every backstop, and with
+/// nothing else, anywhere).
+#[tokio::test]
+async fn rbac_before_hcm_evaluates_on_the_first_request() {
+    let port = reserve_port();
+    let admin_port = reserve_port();
+    let (_child, _dir) =
+        spawn_envoy_bin(&rbac_hcm_cfg_with_admin(port, admin_port, "ha", ALLOW_ALL));
+    let data_addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("admin up");
+    wait_ready(data_addr, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+
+    let mut s = TcpStream::connect(data_addr).await.unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .expect("ALLOW must yield to the terminal HCM within 5s")
+        .expect("clean EOF");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.starts_with("HTTP/1.1 200"), "got {text:?}");
+    assert!(text.ends_with("ok\n"), "got {text:?}");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stats = scrape_admin_stats(admin_addr).await;
+    assert_eq!(
+        stats.get("ha.rbac.allowed").copied(),
+        Some(1),
+        "ALLOW ticks `allowed` exactly once per connection",
+    );
+    assert_eq!(stats.get("ha.rbac.denied").copied(), Some(0));
+}
+
+/// REVIEW.md I-5 (composition) **and M-3** (the missing in-process `denied == 1`
+/// witness — in-process `denied` was previously asserted `== 0` twice and never
+/// `== 1`, so the positive tick rode entirely on the Docker-gated fixture `0072`).
+///
+/// `[rbac(DENY), hcm]`: the HCM never runs, zero bytes are written, the connection
+/// closes with a clean EOF, and `denied` reaches exactly 1.
+#[tokio::test]
+async fn deny_before_hcm_writes_nothing_and_ticks_denied_once() {
+    let port = reserve_port();
+    let admin_port = reserve_port();
+    let (_child, _dir) =
+        spawn_envoy_bin(&rbac_hcm_cfg_with_admin(port, admin_port, "hd", DENY_ALL));
+    let data_addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("admin up");
+    wait_ready(data_addr, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+
+    let mut s = TcpStream::connect(data_addr).await.unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .expect("DENY must half-close within 5s")
+        .expect("clean EOF, not RST");
+    assert!(
+        out.is_empty(),
+        "DENY writes zero bytes; the terminal HCM must NOT run — not even a 403. got {out:?}",
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stats = scrape_admin_stats(admin_addr).await;
+    assert_eq!(
+        stats.get("hd.rbac.denied").copied(),
+        Some(1),
+        "M-3: the DENY tick needs a Docker-independent witness",
+    );
+    assert_eq!(stats.get("hd.rbac.allowed").copied(), Some(0));
 }
 
 /// SPEC R-1: a chain whose LAST filter is non-terminal is REJECTED at startup.
