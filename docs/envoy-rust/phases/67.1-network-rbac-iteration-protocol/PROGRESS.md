@@ -466,3 +466,114 @@ Both jobs genuinely executed — **not runner starvation** (`steps > 0` and a no
   `CF-67-2`, `CF-67-3` and the long tail remain live.
 - §6.1's mid-execution valve stays armed for a §5.2 re-entry at step 3 if `REVIEW.md` finds issues.
 - **Ledger head: `ADR-0131`.** Next available: **`ADR-0132`**, unreserved.
+
+---
+
+# Phase 67.1 — §5.2 state-3 RE-ENTRY (session 1 of N): recon + ADR-0132 + the §6.1 split
+
+> Written by the §5.2 **state-3 re-entry** session (`superpowers:executing-plans`). `REVIEW.md`'s verdict
+> was **NOT APPROVED**, so per §5.2 the phase resumed **implementation**, not verification.
+> This section is APPENDED; the state-3 and state-4 logs above are unmodified.
+>
+> **Result: NO code changed. §6.1's MID-EXECUTION VALVE FIRED on the C-1 fix, and §6.2 carved the
+> oversize task into a NEW sub-phase `67.3`.** `ADR-0132` lands with the measurement, the corrected
+> model, and the split. **`67.1`'s remaining state-3 work is now tractable and is scoped below.**
+> **Ledger head: `ADR-0132`.** Next available: **`ADR-0133`**, unreserved.
+
+## What this session did, and why it changed no code
+
+`REVIEW.md` C-1 required: *"Probe upstream before choosing a model, and probe ALL FOUR terminal
+filters."* That recon is the first task of the re-entry, because the design is not decidable without it.
+It was performed. **What it found made the fix larger than a task.**
+
+## The recon — all four terminal filters, measured
+
+Against the pinned image `envoyproxy/envoy:v1.33.0` @ `sha256:56da5afd…` (D-3.7), booted under
+`docker run -p`; the `tcp_proxy` backend ran as a **sibling container** on a shared docker network,
+speaking a banner **before** any client byte. `/stats` was scraped **mid-flight** — while the client
+connection was still open — so the counter's trigger is disambiguated, not inferred.
+
+`[rbac(any), <terminal>]`:
+
+| terminal | connect, send nothing, stay open | connect + FIN, no data | connect + first byte | establishment work |
+|---|---|---|---|---|
+| `echo` | no tick; stays open | **no tick**; clean EOF | tick | **none** |
+| `http_connection_manager` | no tick; stays open | **no tick**; clean EOF | tick (on the request) | **none** |
+| `direct_response` | **payload written, clean EOF, NO tick** | same | same | **writes payload, closes** |
+| `tcp_proxy` | no tick; **banner delivered; `upstream_cx_total: 1`** | **TICKS** | tick | **connects upstream** |
+
+Plus: `[rbac(DENY), direct_response]` delivers the payload and closes cleanly with **all four counters at
+`0`** — a DENY policy does **not** suppress the payload, because the terminal filter writes and closes
+before any `onData` fires.
+
+**Conclusion.** Upstream runs **every** filter's `onNewConnection` at establishment — the terminal
+filter's included — and defers **only the RBAC verdict** to the first downstream byte. The `peek` belongs
+to the **filter's decision point**, not the **chain's hand-off point**.
+
+**Two further findings the state-5 review had not established:**
+1. **`echo` and `hcm` are already exactly correct.** Their establishment work is nil, so `67.1`'s gate is
+   observationally identical to the correct model — including the data-less-FIN no-tick. **No change.**
+   `ADR-0131` stands and is re-confirmed; fixtures `0072`/`0073` are valid witnesses.
+2. **A data-less FIN evaluates for `tcp_proxy` but NOT for `echo`/`hcm`.** The FIN semantic is a
+   **per-terminal property** (half-close propagation), not a chain property. Nobody knew this.
+
+## Why §6.1's mid-execution valve fired
+
+`direct_response` is a trivial repair (bypass the chain; exact measured parity). **`tcp_proxy` is not.**
+Faithful behavior needs the upstream connected at establishment, the server-first bytes flowing
+immediately, the chain evaluated on the first downstream byte *or* a data-less FIN, and — on DENY — that
+byte **never forwarded upstream**.
+
+`ConnectionHandler::handle(&self, downstream: TcpStream)` **fuses establishment and data into one future
+that owns the socket.** There is no seam. And `envoy_tcp::TcpProxy::handle::<S>` is **generic over the
+stream type** (for upstream TLS), so it cannot `peek` at all; its connect / tick / bidirectional-copy body
+must be split. The work reaches `envoy-listener` (the trait + `ChainHandler`), `envoy-tcp`, `envoy-bin`
+(`TlsAcceptingHandler`, whose pre-handshake chain placement is itself **unmeasured**), plus the FIN
+semantics and their tests.
+
+**That is well past §6.1's "any single task's sub-steps blow up past ~10 items once contact with reality
+reveals complexity."** Per **§6.2 step 1**: *"Stop. Do not continue … implementing the oversize task."*
+
+## The split (§6.2, ADR-0132)
+
+- **NEW `docs/envoy-rust/phases/67.3-network-filter-establishment-phase/SPEC.md`** — the
+  establishment/data-phase split + the correct `[rbac, tcp_proxy]` composition. ~690 net LoC / ~8-10 tasks.
+- **ROADMAP:** row `67.3` enters `planned` (depends-on `67.1`); parent row `67`'s `sub-phases` cell
+  becomes `67.1, 67.2, 67.3`. Verified with an escape-aware split (6 cells). Parent `67` flips `done`
+  only when **all three** sub-phases are `done`.
+- **Until `67.3` lands, `[rbac, tcp_proxy]` is REJECTED AT CONFIG LOAD, fail-loud** (`ADR-0049`
+  decision-2 (b)). A recorded divergence — upstream accepts it — and **strictly better than the shipped
+  behavior, which is a runtime deadlock.** `67.3` deletes the rejection. This is **not** a §6.3 stub: it is
+  a loud rejection plus a follow-on with its own ROADMAP row.
+
+## `REVIEW.md` I-3, resolved by ADR-0132 decision 5
+
+**`M66-3` is recorded as PARTIALLY consumed.** `67.1` fixed the `JoinSet` non-reaping half (witnessed by
+`Listener::pending_tasks()`). It did **not** bound the drain: `close_with_drain` reads to client EOF with
+no steady-state timeout, bounded only at shutdown by `DRAIN_BUDGET`. **That half becomes `CF-67-6`.**
+`ADR-0124` is untouched; both post-EOF-write tests stay unweakened.
+
+## `67.1`'s REMAINING state-3 scope (the next session — all normal-sized tasks)
+
+1. **ADR-0132 decision 2** — `direct_response` **bypasses** the chain (exact measured parity, incl. DENY).
+2. **ADR-0132 decision 4** — the `[rbac, tcp_proxy]` **fail-loud config-load rejection** + `BEHAVIOR_CONTRACT.md` row naming `67.3` as owner.
+3. **`REVIEW.md` I-2** — `RbacMetadataMatcherInvalid` still renders `"HCM listener …"` for a network `rbac` filter (reproduced); its guarding comment has the validation order **backwards**. Generalize the message; fix the comment. **Do NOT reorder the L4 walk ahead of `validate_rbac_rules`** — the current order bounds tree depth first.
+4. **`REVIEW.md` I-4** — `Listener::pending_tasks()` is last-writer-wins under the SO_REUSEPORT fan-out.
+5. **`REVIEW.md` I-5** — composition tests: `[rbac, direct_response]` (cheapest) and `[rbac, hcm]`.
+6. **The eight Minors** (M-1 … M-8).
+
+Then a **separate** state-4 verification session, then a **separate** state-5 code-review. `REVIEW.md` is
+superseded only by that later review — **never edited** (D-3.5).
+
+## §6.1 valve — FIRED (contrast the original state-3, where it did not)
+
+The original state-3 log above records *"No task's sub-steps blew past ~10 items."* That was true of the
+plan as written. It stopped being true the moment C-1's measurement revealed that the terminal filter has
+an establishment phase. **The valve exists for exactly this.**
+
+## The methodological lesson (recorded in ADR-0132, repeated here on purpose)
+
+`ADR-0131` fired because every probe in the `SPEC.md` R-2 recon happened to **send a payload first**.
+**C-1 fired because every probe in the `ADR-0131` recon happened to use `echo`** — the one terminal filter
+with no establishment-time behavior. **When a measurement generalizes over a population of one, it has not
+been measured.** The §7.5 (a)-(e) gate was green and truthful throughout and could not have caught it.
