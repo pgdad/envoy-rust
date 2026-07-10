@@ -683,6 +683,10 @@ pub enum TypedConfig {
         rename = "type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config"
     )]
     DirectResponse(DirectResponseConfig),
+    /// 67.1 (ADR-0128 / ADR-0129): the Network-filters family's first
+    /// NON-TERMINAL filter.
+    #[serde(rename = "type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC")]
+    NetworkRbac(NetworkRbacConfig),
 }
 
 // 06.2 Task 5 — access-log schema additions per SPEC §3 D2.2.
@@ -1435,6 +1439,27 @@ fn default_status() -> HttpStatus {
 #[serde(deny_unknown_fields)]
 pub struct RbacConfig {
     pub rules: Rules,
+}
+
+/// 67.1 D1: `envoy.extensions.filters.network.rbac.v3.RBAC` — the NETWORK (L4)
+/// RBAC filter. Distinct from `RbacConfig` above, which is the HTTP filter's
+/// config (`envoy.filters.http.rbac`); the two share the `Rules` / `Policy` /
+/// `Permission` / `Principal` trees but nothing else.
+///
+/// `stat_prefix` is REQUIRED and non-empty (upstream proto constraint; SPEC
+/// R-3). `rules` is OPTIONAL, and `None` means the filter is **INERT** — the
+/// connection is allowed and NEITHER counter increments (SPEC R-4, measured).
+/// Do NOT materialise a default `Rules { action: ALLOW }`: that would tick
+/// `allowed` and produce a stat divergence with no body divergence.
+///
+/// `deny_unknown_fields` is what rejects `shadow_rules` /
+/// `shadow_rules_stat_prefix` loudly (CF-67-1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkRbacConfig {
+    pub stat_prefix: String,
+    #[serde(default)]
+    pub rules: Option<Rules>,
 }
 
 /// The RBAC policy tree at the filter-config level.
@@ -3092,6 +3117,19 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                             ));
                         };
                     }
+                    crate::NETWORK_RBAC_FILTER => {
+                        // 67.1 D1: read-only — the rbac arm does not mutate
+                        // typed_config, so `as_ref()` (not `as_mut()`).
+                        let typed = filter.typed_config.as_ref().ok_or(
+                            crate::ConfigError::MissingTypedConfig(crate::NETWORK_RBAC_FILTER),
+                        )?;
+                        let TypedConfig::NetworkRbac(cfg) = typed else {
+                            return Err(crate::ConfigError::MissingTypedConfig(
+                                crate::NETWORK_RBAC_FILTER,
+                            ));
+                        };
+                        validate_network_rbac_config(cfg, &listener.name)?;
+                    }
                     _ => {
                         return Err(crate::ConfigError::UnsupportedFilter(
                             filter.name.clone(),
@@ -3838,6 +3876,30 @@ fn validate_rbac_config(
         }
     }
     Ok(())
+}
+
+/// 67.1 D1: validate one NETWORK `rbac` filter config.
+///   - `stat_prefix` non-empty (SPEC R-3);
+///   - `rules: None` ⇒ INERT, nothing more to check (SPEC R-4);
+///   - `rules: Some(_)` ⇒ the shared RBAC tree validations (empty sets, depth).
+fn validate_network_rbac_config(
+    cfg: &crate::NetworkRbacConfig,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if cfg.stat_prefix.is_empty() {
+        return Err(crate::ConfigError::EmptyNetworkRbacStatPrefix {
+            listener: listener_name.to_string(),
+        });
+    }
+    let Some(rules) = cfg.rules.as_ref() else {
+        return Ok(()); // SPEC R-4: rules omitted ⇒ INERT.
+    };
+    validate_rbac_config(
+        &crate::RbacConfig {
+            rules: rules.clone(),
+        },
+        listener_name,
+    )
 }
 
 /// Phase 22: validate a jwt_authn filter config (minimum-viable). All errors
@@ -4889,10 +4951,28 @@ admin:
     #[test]
     fn rejects_unknown_filter_name() {
         // Phase 02.1 widens the validator allow-list from {echo} to
-        // {echo, tcp_proxy}. Pick a filter name that sits outside this
-        // allow-list (rbac lands in phase 09's network-filter family).
-        let yaml = MINIMAL.replace("envoy.filters.network.echo", "envoy.filters.network.rbac");
-        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
+        // {echo, tcp_proxy}. Pick a filter name that sits outside the
+        // allow-list.
+        //
+        // 67.1: this test used to use `envoy.filters.network.rbac` as its
+        // "unknown" name. That name is now KNOWN (D1), so `sni_cluster` — still
+        // unsupported — takes its place. It sits BEFORE a terminal `echo`
+        // because every unknown name is by definition non-terminal, and a chain
+        // ENDING in a non-terminal filter is rejected by the bilateral
+        // chain-termination rule (D2) before the per-filter allow-list is ever
+        // consulted. The assertion itself is unchanged.
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.sni_cluster
+            - name: envoy.filters.network.echo
+"#;
+        let err = crate::parse_bootstrap(yaml).expect_err("must reject");
         assert!(
             matches!(err, crate::ConfigError::UnsupportedFilter(_, _)),
             "got {err:?}"
@@ -5137,6 +5217,136 @@ static_resources:
         assert!(!is_terminal_network_filter(
             "envoy.filters.network.sni_cluster"
         ));
+    }
+
+    // --- 67.1 D1 (ADR-0128 / ADR-0129): `envoy.filters.network.rbac` schema ---
+
+    /// Build a bootstrap whose first filter is `rbac` with the given
+    /// typed_config body (subsequent lines already indented to 16 spaces),
+    /// followed by a terminal `echo`.
+    fn network_rbac_yaml(typed_body: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: 10000 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                {typed_body}
+            - name: envoy.filters.network.echo
+"#
+        )
+    }
+
+    fn network_rbac_bootstrap(typed_body: &str) -> crate::Bootstrap {
+        serde_yaml::from_str(&network_rbac_yaml(typed_body)).expect("parses")
+    }
+
+    /// 67.1 D1: a `[rbac, echo]` chain parses, and the rbac filter's
+    /// typed_config deserializes into `TypedConfig::NetworkRbac` with `rules`
+    /// present.
+    #[test]
+    fn parses_network_rbac_filter_with_any_matcher() {
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: rbac_probe\n                rules:\n                  action: DENY\n                  policies:\n                    p0:\n                      permissions: [{ any: true }]\n                      principals: [{ any: true }]",
+        );
+        validate(&mut b).expect("validates");
+        let f = &b.static_resources.listeners[0].filter_chains[0].filters[0];
+        assert_eq!(f.name, crate::NETWORK_RBAC_FILTER);
+        let Some(crate::TypedConfig::NetworkRbac(cfg)) = f.typed_config.as_ref() else {
+            panic!(
+                "expected TypedConfig::NetworkRbac, got {:?}",
+                f.typed_config
+            );
+        };
+        assert_eq!(cfg.stat_prefix, "rbac_probe");
+        let rules = cfg.rules.as_ref().expect("rules present");
+        assert_eq!(rules.action, crate::Action::Deny);
+        assert_eq!(rules.policies.len(), 1);
+    }
+
+    /// 67.1 D1 / SPEC R-3: `rules` is OPTIONAL. `stat_prefix` alone validates.
+    #[test]
+    fn parses_network_rbac_filter_with_rules_omitted() {
+        let mut b = network_rbac_bootstrap("stat_prefix: norules");
+        validate(&mut b).expect("rules is optional (SPEC R-3)");
+        let f = &b.static_resources.listeners[0].filter_chains[0].filters[0];
+        let Some(crate::TypedConfig::NetworkRbac(cfg)) = f.typed_config.as_ref() else {
+            panic!("expected NetworkRbac");
+        };
+        assert!(cfg.rules.is_none(), "rules: None => INERT (SPEC R-4)");
+    }
+
+    /// 67.1 D1 / SPEC R-3: an EMPTY `stat_prefix` is rejected (upstream PGV
+    /// `min_len 1`). Note upstream accepts `" "`, so the check is `.is_empty()`,
+    /// not `.trim().is_empty()`.
+    #[test]
+    fn rejects_network_rbac_with_empty_stat_prefix() {
+        let mut b = network_rbac_bootstrap(r#"stat_prefix: """#);
+        let err = validate(&mut b).expect_err("empty stat_prefix rejected");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyNetworkRbacStatPrefix { ref listener } if listener == "l0"),
+            "got {err:?}",
+        );
+    }
+
+    /// 67.1 D1: a MISSING `stat_prefix` is a serde missing-field error.
+    #[test]
+    fn rejects_network_rbac_with_missing_stat_prefix() {
+        let yaml = network_rbac_yaml("rules: { policies: {} }");
+        let err =
+            serde_yaml::from_str::<crate::Bootstrap>(&yaml).expect_err("stat_prefix is required");
+        assert!(err.to_string().contains("stat_prefix"), "got {err}");
+    }
+
+    /// 67.1 D1 / CF-67-1: `shadow_rules` is rejected LOUDLY by
+    /// `deny_unknown_fields`.
+    #[test]
+    fn rejects_network_rbac_shadow_rules_field() {
+        let yaml =
+            network_rbac_yaml("stat_prefix: sp\n                shadow_rules: { policies: {} }");
+        let err = serde_yaml::from_str::<crate::Bootstrap>(&yaml)
+            .expect_err("shadow_rules is not modeled (CF-67-1)");
+        assert!(err.to_string().contains("shadow_rules"), "got {err}");
+    }
+
+    /// 67.1 D1: the rbac filter without a typed_config is rejected.
+    #[test]
+    fn rejects_network_rbac_without_typed_config() {
+        let yaml = r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+            - name: envoy.filters.network.echo
+"#;
+        let mut b: crate::Bootstrap = serde_yaml::from_str(yaml).expect("parses");
+        let err = validate(&mut b).expect_err("typed_config required");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::MissingTypedConfig(crate::NETWORK_RBAC_FILTER)
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// 67.1 D1 / SPEC R-10: `rbac` is NON-TERMINAL — it must NOT be in
+    /// `is_terminal_network_filter`. Its ABSENCE from that predicate IS its
+    /// non-terminality. If a future edit adds it, `[rbac, echo]` starts failing
+    /// with `NetworkFilterNotTerminal` and this test catches it.
+    #[test]
+    fn network_rbac_is_not_a_terminal_filter() {
+        assert!(!is_terminal_network_filter(crate::NETWORK_RBAC_FILTER));
     }
 
     #[test]

@@ -26,15 +26,15 @@ pub use bootstrap::{
     HttpProtocolOptions, HttpStatus, Int64Range, JsonFormatValue, JwtAuthnConfig, JwtProvider,
     JwtRequirement, LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig, LbSubsetFallbackPolicy,
     LbSubsetSelector, Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints,
-    MetadataEntry, MetadataMatcher, MetadataPathSegment, Mutations, NetworkFilter, Node,
-    OutlierDetection, PathConfigSource, PathMatcher, PerFilterConfig, Percent, Permission,
-    PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig,
-    RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch,
-    RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent, SafeRegex, SetMetadataConfig,
-    SocketAddress, StaticResources, StringMatcher, StringMatcherMode, SubstitutionFormatString,
-    TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket, TransportSocket,
-    TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext,
-    ValueMatcher, VirtualHost, parse_duration,
+    MetadataEntry, MetadataMatcher, MetadataPathSegment, Mutations, NetworkFilter,
+    NetworkRbacConfig, Node, OutlierDetection, PathConfigSource, PathMatcher, PerFilterConfig,
+    Percent, Permission, PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds,
+    RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
+    RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent,
+    SafeRegex, SetMetadataConfig, SocketAddress, StaticResources, StringMatcher, StringMatcherMode,
+    SubstitutionFormatString, TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket,
+    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
+    UpstreamTlsContext, ValueMatcher, VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;
 pub use eds::parse_eds_file;
@@ -56,6 +56,12 @@ pub const HCM_FILTER: &str = "envoy.filters.network.http_connection_manager";
 /// 66 — the Network-filters family opener. A TERMINAL filter (see
 /// `is_terminal_network_filter`). See ADR-0123.
 pub const DIRECT_RESPONSE_FILTER: &str = "envoy.filters.network.direct_response";
+
+/// 67.1 (ADR-0128 / ADR-0129): the Network-filters family's FIRST NON-TERMINAL
+/// filter. Deliberately ABSENT from `is_terminal_network_filter` — that absence
+/// IS its non-terminality. NOT to be confused with `envoy.filters.http.rbac`
+/// (`crates/envoy-filter/src/rbac.rs`), a different feature sharing the name.
+pub const NETWORK_RBAC_FILTER: &str = "envoy.filters.network.rbac";
 
 /// The only transport-socket name envoy-rust accepts in phase 03. Future phases
 /// may add `envoy.transport_sockets.raw_buffer` / `envoy.transport_sockets.quic`.
@@ -453,6 +459,13 @@ pub enum ConfigError {
         "HCM listener {listener:?}: LocalRateLimit filter status.code {code} is unsupported (phase 09 accepts 429 only)"
     )]
     UnsupportedLocalRateLimitStatusCode { listener: String, code: u16 },
+
+    /// 67.1: a network `rbac` filter's `stat_prefix` is present but empty.
+    /// Upstream enforces `min_len 1` via a proto constraint
+    /// (`RBACValidationError.StatPrefix`). An ABSENT `stat_prefix` is a serde
+    /// missing-field error, not this variant.
+    #[error("listener {listener:?}: network rbac filter stat_prefix must be non-empty")]
+    EmptyNetworkRbacStatPrefix { listener: String },
 
     /// 10: RBAC filter has no policies (rules.policies is empty).
     #[error("HCM listener {listener:?}: RBAC filter has no policies (rules.policies is empty)")]
