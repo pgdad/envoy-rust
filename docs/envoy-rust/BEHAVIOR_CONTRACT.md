@@ -229,13 +229,23 @@ no-op clause below).
 ## Network filters
 
 > Opened by phase 66 (the Network-filters family's first row). Scope today:
-> `echo`, `tcp_proxy`, `http_connection_manager`, `direct_response`.
+> `echo`, `tcp_proxy`, `http_connection_manager`, `direct_response`, `rbac`.
 >
 > **Do not conflate** `envoy.filters.network.direct_response` (this network filter, which
 > writes a payload on connection accept) with the HCM **route-level** `direct_response`
 > action (phase 04, which returns an HTTP response for a matched route). They are
 > different features with the same name; every `direct_response` row elsewhere in this
 > document refers to the route-level action.
+>
+> **Do not conflate** `envoy.filters.network.rbac` (phase 67.1 — an L4 filter that permits or
+> denies a whole **connection**) with `envoy.filters.http.rbac` (phase 10,
+> `crates/envoy-filter/src/rbac.rs` — an HTTP filter that permits or denies a **request**).
+> They are different features with the same name. They share the `Rules` / `Policy` /
+> `Permission` / `Principal` config trees and nothing else. Every `rbac` row elsewhere in this
+> document refers to the HTTP filter unless it says "network".
+>
+> **Terminal vs non-terminal.** `echo`, `tcp_proxy`, `http_connection_manager` and
+> `direct_response` are TERMINAL; `rbac` is the family's first NON-TERMINAL filter.
 
 ### `envoy.filters.network.direct_response` (phase 66, ADR-0123 / ADR-0124)
 
@@ -277,6 +287,88 @@ no-op clause below).
    REQUIRES `typed_config` on `envoy.filters.network.echo`; envoy-rust forbids it
    (`UnexpectedTypedConfig`). Fixture `0001`'s two sides differ accordingly (ADR-0014 YAML shim).
    `direct_response` introduces no such asymmetry — both sides of fixture `0071` are identical.
+
+### `envoy.filters.network.rbac` (phase 67.1, ADR-0128 / ADR-0129 / ADR-0130 / ADR-0131)
+
+1. **Decision timing — ONE_TIME_ON_FIRST_BYTE.** The policy is evaluated exactly ONCE per
+   connection, **when the first downstream byte arrives** — not at connection establishment.
+   Measured against `envoyproxy/envoy:v1.33.0` (**ADR-0131**, which corrects phase-67 SPEC R-2's
+   "before any downstream byte is read" reading):
+
+   | client behavior | both proxies |
+   |---|---|
+   | connect, send nothing | connection stays **open**; no counter ticks |
+   | connect, half-close (FIN) without sending | **clean EOF**; no counter ticks |
+   | first byte, immediately or after a delay | decision taken; a counter ticks |
+
+   The wait is unbounded — a client idling 2 s before its first byte is still evaluated then.
+   envoy-rust implements this by peeking (not consuming) the first byte in
+   `envoy_listener::ChainHandler`. **No differential observable** for the two byte-less rows (no
+   fixture drives them); they are pinned in-process by
+   `chain_handler_skips_filters_when_client_closes_without_sending` and
+   `connection_that_sends_nothing_is_never_evaluated`.
+
+2. **DENY semantics.** Zero bytes written; clean EOF, **never an RST**; the client's already-sent
+   bytes are discarded; a post-EOF client write is **accepted**. The terminal filter never runs.
+   Differentially witnessed by fixture **`0072-network-filter-rbac-deny`** (body byte-exact **AND**
+   `rbac_deny.rbac.denied` delta `== 1`). The post-EOF-write clause has **no differential
+   observable** and is pinned in-process by `deny_post_eof_client_write_is_accepted_not_reset`.
+
+3. **ALLOW semantics.** The connection proceeds to the terminal filter and the payload round-trips.
+   Differentially witnessed by fixture **`0073-network-filter-rbac-allow`** — the family's first
+   differential proof that a **non-terminal filter runs and then yields**, i.e. of the chain
+   iteration protocol itself.
+
+4. **Stats.** `<stat_prefix>.rbac.{allowed,denied,shadow_allowed,shadow_denied}`. `stat_prefix` is
+   **required and non-empty** (upstream proto constraint `RBACValidationError.StatPrefix`);
+   `rules` is **optional**. *(SPEC R-3.)*
+
+5. **`rules` omitted ⇒ the filter is INERT.** The connection is allowed and **NEITHER counter
+   increments** — `allowed` stays `0`, not `1`. All four counters are still registered at `0`, so
+   the stat tree matches. *(SPEC R-4, measured.)* A default `Rules { action: ALLOW }` that ticked
+   `allowed` would be a **stat divergence with no body divergence**, invisible to a body-only
+   fixture. Pinned by `rules_omitted_is_inert_neither_counter_ticks`.
+
+6. **Bilateral chain-termination rule.** Upstream Envoy rejects a chain whose **last** filter is
+   non-terminal (`non-terminal filter named <X> ... is the last filter in a network filter chain`),
+   the dual of phase 66's "a terminal filter must be last". envoy-rust enforces the identical rule
+   via `ConfigError::NetworkFilterChainNotTerminated`, on static **and** LDS-loaded listeners.
+   *(SPEC R-1.)*
+
+7. **Error precedence.** A chain violating **both** rules (`[echo, rbac]`) reports the
+   **terminal-not-last** error on both proxies. *(SPEC R-5, measured.)*
+
+8. **Empty chain — measured parity (closes M66-5), with a recorded runtime divergence.**
+   `filters: []` is **accepted** by upstream Envoy (`configuration OK`) and by envoy-rust; the
+   phase-66 review's intuition that Envoy rejects it was wrong, which is exactly why that review
+   recorded envoy-rust's behavior and declined to assert Envoy's (D-3.3). **Runtime divergence
+   (ADR-0130 §2):** envoy-rust binds **no data listener** for an empty chain and logs a warning;
+   upstream Envoy binds one. envoy-rust previously *panicked* here. What upstream does with a
+   *connection* to such a listener was never probed — carried forward as **CF-67-5**. **No
+   differential observable**: no fixture configures an empty chain.
+
+9. **Recorded divergence — L4 matcher leaves (CF-67-4).** envoy-rust rejects `header` in **parity**
+   with upstream Envoy, which rejects it at config load (`Found header(name: ":path"...`).
+   envoy-rust **also** rejects `url_path` and `metadata`, which upstream **accepts** even though
+   they can never match at L4 — a deliberate **fail-loud** divergence per the ADR-0049 decision-2
+   (b) posture. **No differential observable** — neither fixture uses them. *(SPEC R-6, measured.)*
+
+10. **Recorded divergence — `shadow_rules` (CF-67-1).** Upstream accepts `shadow_rules` /
+    `shadow_rules_stat_prefix`; envoy-rust rejects them loudly at config load (serde
+    `deny_unknown_fields`) and emits `shadow_allowed` / `shadow_denied` as constant `0` so the stat
+    tree matches. **No differential observable.**
+
+11. **Scope — matcher arms.** Phase 67.1 ships `any` plus the `and`/`or`/`not` combinators only.
+    The connection-level arms (`direct_remote_ip`, `remote_ip`, `source_ip`, `destination_port`,
+    `destination_ip`) land in phase **67.2** and are **not stubbed** — they do not exist, and the
+    parser rejects them as unknown keys. `Action::LOG` is deferred (**CF-67-2**); payload-visible
+    (`on_data`-time) filter iteration is deferred (**CF-67-3**).
+
+12. **Scope — per-listener stats (ADR-0130).** `echo` and `direct_response` listeners now emit
+    `listener.<name>.downstream_cx_{total,active,accept_failed}` and count in
+    `listener_manager.total_listeners_active`, because phase 67.1 routed them through the shared
+    `envoy_listener::Listener` accept loop. This is **toward** upstream parity (Envoy counts every
+    listener). No fixture asserts set-equality over those names on a raw-TCP listener.
 
 ---
 

@@ -1,0 +1,28 @@
+static_resources:
+  listeners:
+    - name: rbac_listener
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: rbac_probe
+                rules:
+                  action: DENY
+                  policies:
+                    p0:
+                      permissions:
+                        - and_rules:
+                            rules:
+                              - any: true
+                              - not_rule: { any: false }
+                      principals:
+                        - or_ids:
+                            ids:
+                              - any: true
+                              - not_id: { any: false }
+            - name: envoy.filters.network.echo
