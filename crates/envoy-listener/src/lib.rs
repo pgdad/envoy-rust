@@ -67,10 +67,17 @@ pub struct ConnectionInfo {
 /// A NON-TERMINAL network filter: it inspects an accepted connection and either
 /// yields to the rest of the chain or stops it.
 ///
-/// **There is deliberately NO `on_data` hook.** Every filter in phase 67.1
-/// decides once per connection, before any downstream byte is read (phase-67
-/// SPEC R-2, measured against `envoyproxy/envoy:v1.33.0`). Adding a mid-stream
-/// hook with no filter to exercise it is the `BOOTSTRAP_PROMPT.md` §6.3
+/// **There is deliberately NO `on_data` hook.** A filter decides ONCE per
+/// connection and never inspects the payload. [`ChainHandler`] invokes this hook
+/// when the FIRST DOWNSTREAM BYTE becomes readable — upstream Envoy's
+/// `ONE_TIME_ON_FIRST_BYTE` enforcement, measured against
+/// `envoyproxy/envoy:v1.33.0` (ADR-0131, which corrects phase-67 SPEC R-2's
+/// "at establishment" reading). The byte is peeked, never consumed, so the
+/// filter still sees only [`ConnectionInfo`].
+///
+/// Exposing payload to filters — mid-stream `Continue`/`StopIteration`,
+/// buffering, `injectReadDataToFilterChain` — is a different feature, and adding
+/// it with no filter to exercise it is the `BOOTSTRAP_PROMPT.md` §6.3
 /// anti-pattern; it is carried forward as **CF-67-3** to the first
 /// payload-parsing network filter (`mongo_proxy` / `zookeeper_proxy` /
 /// `kafka_broker`).
@@ -114,7 +121,20 @@ pub async fn close_with_drain(mut stream: tokio::net::TcpStream) -> Result<(), s
 /// 67.1 D4/D5: the network-filter chain, expressed as a [`ConnectionHandler`]
 /// that wraps another [`ConnectionHandler`].
 ///
-/// On each accepted connection it runs every non-terminal filter's
+/// **The chain runs when the FIRST DOWNSTREAM BYTE arrives, not at accept.**
+/// This mirrors upstream Envoy's `ONE_TIME_ON_FIRST_BYTE` enforcement, measured
+/// against `envoyproxy/envoy:v1.33.0` (ADR-0131):
+///
+/// | client does | upstream Envoy | envoy-rust |
+/// |---|---|---|
+/// | connect, send nothing | connection stays open; no counter ticks | same |
+/// | connect, half-close without sending | clean EOF; no counter ticks | same |
+/// | sends a first byte (now or later) | decision taken; counters tick | same |
+///
+/// The wait uses [`tokio::net::TcpStream::peek`], which does **not** consume the
+/// byte, so the terminal handler still receives the entire stream.
+///
+/// Once a byte is readable it runs every non-terminal filter's
 /// `on_new_connection` in configured order. The first `StopIteration` closes the
 /// connection via [`close_with_drain`] — zero bytes, clean EOF, no RST — and the
 /// TERMINAL handler never runs. When every filter returns `Continue`, the
@@ -159,10 +179,26 @@ impl ConnectionHandler for ChainHandler {
                 peer_addr: downstream.peer_addr()?,
                 local_addr: downstream.local_addr()?,
             };
+
+            // ADR-0131: wait for the first downstream byte before evaluating —
+            // upstream Envoy's ONE_TIME_ON_FIRST_BYTE enforcement. `peek` does
+            // not consume, so `inner` still receives the whole stream.
+            //
+            // `Ok(0)` means the client closed or half-closed WITHOUT sending
+            // anything. Upstream Envoy takes no decision in that case (neither
+            // counter ticks) and closes with a clean EOF. Match it: skip the
+            // filters entirely.
+            let mut first_byte = [0u8; 1];
+            if downstream.peek(&mut first_byte).await? == 0 {
+                close_with_drain(downstream).await?;
+                return Ok(());
+            }
+
             for filter in filters.iter() {
                 if filter.on_new_connection(&conn) == NetworkFilterStatus::StopIteration {
-                    // SPEC R-2: zero bytes, clean EOF, never an RST; the
-                    // terminal filter never runs.
+                    // ADR-0131 / SPEC R-2: zero bytes, clean EOF, never an RST;
+                    // the terminal filter never runs, and the client's already-
+                    // sent bytes are discarded by `close_with_drain`.
                     close_with_drain(downstream).await?;
                     return Ok(());
                 }
@@ -2408,6 +2444,9 @@ filter_chains:
             chain.handle(s).await.unwrap();
         });
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // ADR-0131: the chain runs on the FIRST DOWNSTREAM BYTE, so the client
+        // must send one for any filter to be invoked at all.
+        c.write_all(b"go").await.unwrap();
         let mut out = Vec::new();
         c.read_to_end(&mut out).await.unwrap();
         assert!(
@@ -2440,16 +2479,56 @@ filter_chains:
             let (s, _) = listener.accept().await.unwrap();
             chain.handle(s).await.unwrap();
         });
-        let c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         let client_addr = c.local_addr().unwrap();
-        drop(c);
+        // ADR-0131: a byte is required before the chain is evaluated.
+        c.write_all(b"x").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(c);
 
         let info = seen.lock().unwrap().expect("filter saw the connection");
         assert_eq!(info.local_addr, addr, "local_addr is the listener address");
         assert_eq!(
             info.peer_addr, client_addr,
             "peer_addr is the client address"
+        );
+    }
+
+    /// 67.1 / ADR-0131: a client that half-closes WITHOUT sending any byte is
+    /// never evaluated — no filter runs, no counter ticks — and receives a clean
+    /// EOF. Measured against upstream Envoy `v1.33.0`: on a DENY-all chain, a
+    /// connect + FIN with no data leaves `rbac.denied` at 0 and yields a clean
+    /// EOF. envoy-rust's ONE_TIME_ON_FIRST_BYTE wait reproduces it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_handler_skips_filters_when_client_closes_without_sending() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Tripwire(Arc<AtomicBool>);
+        impl NetworkFilter for Tripwire {
+            fn on_new_connection(&self, _c: &ConnectionInfo) -> NetworkFilterStatus {
+                self.0.store(true, Ordering::SeqCst);
+                NetworkFilterStatus::StopIteration
+            }
+        }
+        let ran = Arc::new(AtomicBool::new(false));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(Tripwire(Arc::clone(&ran)))],
+            Arc::new(EchoHandler),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            chain.handle(s).await.unwrap();
+        });
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.shutdown().await.unwrap(); // FIN, no data
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.expect("clean EOF, not RST");
+        assert!(out.is_empty(), "no bytes are written, got {out:?}");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "no decision is taken for a connection that never sends a byte",
         );
     }
 

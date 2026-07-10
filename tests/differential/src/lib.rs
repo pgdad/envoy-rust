@@ -59,8 +59,14 @@ pub enum Driver {
     /// `probe` selects the wire shape; both reuse the existing raw-TCP drivers:
     /// - `echo` -> `drive_tcp` (write `inputs/payload.bin`, read-exact, then the
     ///   ADR-0007 trailing-byte poll). Fixture `0073`.
-    /// - `read_to_eof` -> `drive_tcp_direct_response` (send nothing, read to
-    ///   EOF). Fixture `0072`.
+    /// - `read_to_eof` -> `drive_tcp_direct_response` (send nothing, read to EOF).
+    /// - `write_then_read_to_eof` -> `drive_tcp_write_then_read_to_eof` (send the
+    ///   payload, read to EOF). Fixture `0072` — the DENY shape (ADR-0131).
+    ///
+    /// `expected_stats` are the DELTAS the probe must move each named counter by,
+    /// not absolute values (ADR-0131) — `run_fixture`'s readiness connect
+    /// perturbs per-connection counters on the data listener asymmetrically
+    /// between the local subject and the containerized upstream.
     ///
     /// Requires `{{ADMIN_PORT}}` on BOTH sides (see `driver_needs_admin_port`).
     TcpWithStats {
@@ -621,9 +627,13 @@ pub enum TcpProbeKind {
     /// Write `inputs/payload.bin`, read exactly that many bytes back, then poll
     /// for trailing bytes (ADR-0006 / ADR-0007). The ALLOW shape.
     Echo,
-    /// Send nothing; read to EOF. The DENY shape — a compliant peer writes zero
-    /// bytes and half-closes.
+    /// Send nothing; read to EOF. Used where the peer speaks first.
     ReadToEof,
+    /// Write `inputs/payload.bin`, then read to EOF. The DENY shape (ADR-0131):
+    /// upstream Envoy evaluates network RBAC on the FIRST DOWNSTREAM BYTE, so
+    /// the probe must send one; on DENY the peer answers with zero bytes and a
+    /// clean EOF, discarding what was sent. Fixture `0072`.
+    WriteThenReadToEof,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1751,6 +1761,34 @@ pub async fn drive_tcp_direct_response(addr: SocketAddr) -> Result<Vec<u8>> {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => bail!("{addr} read error before EOF (reset?): {e}"),
         Err(_) => bail!("{addr} did not close within 5s; direct_response must half-close"),
+    }
+    drop(stream);
+    Ok(out)
+}
+
+/// 67.1 D7 (ADR-0131): connect to `addr`, WRITE `payload`, then read until the
+/// peer closes.
+///
+/// This is the DENY shape for `envoy.filters.network.rbac`. Upstream Envoy
+/// evaluates network RBAC on the FIRST DOWNSTREAM BYTE (`ONE_TIME_ON_FIRST_BYTE`),
+/// so a probe that sends nothing is never evaluated and the connection simply
+/// stays open — measured. The probe must therefore send at least one byte, and
+/// on DENY the peer answers with ZERO bytes and a clean EOF, discarding what was
+/// sent. `drive_tcp` cannot express this: it `read_exact`s `payload.len()` bytes
+/// back, which never arrive.
+pub async fn drive_tcp_write_then_read_to_eof(addr: SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("connecting to {addr}"))?;
+    stream
+        .write_all(payload)
+        .await
+        .with_context(|| format!("writing probe payload to {addr}"))?;
+    let mut out = Vec::new();
+    match tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut out)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => bail!("{addr} read error before EOF (reset?): {e}"),
+        Err(_) => bail!("{addr} did not close within 5s after the first byte"),
     }
     drop(stream);
     Ok(out)
@@ -4428,6 +4466,16 @@ async fn run_tcp_with_stats_arm(
         .await
         .context("envoy-rust admin listener never became accept-ready")?;
 
+    // ADR-0131: settle, THEN baseline. `run_fixture` already opened a readiness
+    // `TcpStream::connect` to each proxy's data port. The settle lets any such
+    // pre-probe connection land before the baseline is taken, so the delta below
+    // isolates the probe's own effect on each counter.
+    tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+    let upstream_baseline =
+        scrape_stat_snapshot(upstream_admin_addr, expected_stats, "upstream").await?;
+    let subject_baseline =
+        scrape_stat_snapshot(subject_admin_addr, expected_stats, "subject").await?;
+
     let (upstream_out, subject_out) = match probe {
         TcpProbeKind::Echo => {
             let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
@@ -4449,17 +4497,127 @@ async fn run_tcp_with_stats_arm(
                 .await
                 .context("envoy-rust drive")?,
         ),
+        TcpProbeKind::WriteThenReadToEof => {
+            let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
+                .context("reading payload.bin")?;
+            (
+                drive_tcp_write_then_read_to_eof(upstream_addr, &payload)
+                    .await
+                    .context("upstream envoy drive")?,
+                drive_tcp_write_then_read_to_eof(subject_addr, &payload)
+                    .await
+                    .context("envoy-rust drive")?,
+            )
+        }
     };
 
     // Single post-probe settle, covering stat-write visibility on BOTH sides
     // under the same Relaxed-ordering budget.
     tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
-    assert_expected_stats_bilaterally(upstream_admin_addr, subject_admin_addr, expected_stats)
-        .await?;
+    assert_expected_stat_deltas_bilaterally(
+        upstream_admin_addr,
+        subject_admin_addr,
+        &upstream_baseline,
+        &subject_baseline,
+        expected_stats,
+    )
+    .await?;
 
     subject.shutdown(Duration::from_secs(5)).await.ok();
     drop(upstream);
     assert_equivalence(expectations, None, None, &upstream_out, &subject_out)?;
+    Ok(())
+}
+
+/// 67.1 D7 (ADR-0131): snapshot the current value of each named stat from ONE
+/// admin listener, in `expected`'s order. `scrape_admin_stat` returns `Ok(0)`
+/// for a name the proxy never registered, so an absent counter snapshots as 0.
+async fn scrape_stat_snapshot(
+    admin_addr: SocketAddr,
+    expected: &[KeepAliveExpectedStat],
+    side: &str,
+) -> Result<Vec<u64>> {
+    let mut out = Vec::with_capacity(expected.len());
+    for stat in expected {
+        out.push(
+            scrape_admin_stat(admin_addr, &stat.name)
+                .await
+                .with_context(|| format!("{side} baseline-scraping stat {}", stat.name))?,
+        );
+    }
+    Ok(out)
+}
+
+/// 67.1 D7 (ADR-0131): assert the DELTA each named stat moved by, on BOTH sides.
+///
+/// `run_fixture` opens a readiness `TcpStream::connect` to each proxy's data port
+/// before the probe runs, and a fixture cannot know what else may touch the
+/// listener. Asserting absolute values on a per-connection counter therefore
+/// couples the fixture to harness incidentals. Baselining after a settle and
+/// asserting the delta isolates the probe's own effect.
+///
+/// (Under ADR-0131's first-byte semantics neither proxy counts a data-less
+/// readiness connect, so absolute values would happen to work today. Deltas keep
+/// the fixture correct regardless — this was found the hard way: the absolute
+/// form failed with `subject allowed expected 1 got 2` before the first-byte
+/// divergence was diagnosed.)
+///
+/// The witness property is PRESERVED: `scrape_admin_stat` yields 0 for a stat
+/// name the proxy never registered, so an unimplemented filter snapshots 0 and
+/// finishes at 0 — a delta of 0, which fails any non-zero expectation.
+async fn assert_expected_stat_deltas_bilaterally(
+    upstream_admin_addr: SocketAddr,
+    subject_admin_addr: SocketAddr,
+    upstream_baseline: &[u64],
+    subject_baseline: &[u64],
+    expected_stats: &[KeepAliveExpectedStat],
+) -> Result<()> {
+    for (idx, stat) in expected_stats.iter().enumerate() {
+        let upstream_final = scrape_admin_stat(upstream_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("upstream scraping stat {}", stat.name))?;
+        let subject_final = scrape_admin_stat(subject_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("subject scraping stat {}", stat.name))?;
+        let upstream_delta = upstream_final
+            .checked_sub(upstream_baseline[idx])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "upstream stat {} went backwards: baseline {} final {}",
+                    stat.name,
+                    upstream_baseline[idx],
+                    upstream_final,
+                )
+            })?;
+        let subject_delta = subject_final
+            .checked_sub(subject_baseline[idx])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "subject stat {} went backwards: baseline {} final {}",
+                    stat.name,
+                    subject_baseline[idx],
+                    subject_final,
+                )
+            })?;
+        anyhow::ensure!(
+            upstream_delta == stat.value,
+            "upstream stat {} delta expected {} got {} (baseline {}, final {})",
+            stat.name,
+            stat.value,
+            upstream_delta,
+            upstream_baseline[idx],
+            upstream_final,
+        );
+        anyhow::ensure!(
+            subject_delta == stat.value,
+            "subject stat {} delta expected {} got {} (baseline {}, final {})",
+            stat.name,
+            stat.value,
+            subject_delta,
+            subject_baseline[idx],
+            subject_final,
+        );
+    }
     Ok(())
 }
 

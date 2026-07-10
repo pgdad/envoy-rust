@@ -1,0 +1,35 @@
+# Phase 67.1 fixture 0072 — network RBAC, action: DENY.
+#
+# `expected_stats` are the DELTAS this probe must move each counter by, not
+# absolute values (ADR-0131). run_fixture opens a readiness TCP connect to each
+# proxy's data port before the probe; baselining after a settle and asserting the
+# delta isolates the probe's own effect from any such harness incidental.
+#
+# THE STATS ASSERTION IS THE WITNESS. `equivalence.response_body.byte_exact` is a
+# bare `envoy_body != rust_body` check, so "both proxies returned zero bytes"
+# passes VACUOUSLY even against an envoy-rust that never implemented RBAC and
+# simply failed to write. `rbac_deny.rbac.denied == 1` is the assertion that
+# cannot pass without a working filter: `scrape_admin_stat` returns 0 for a stat
+# name the proxy never registered.
+#
+# The `value: 0` entries (`allowed`, and the two shadow counters) are CONSISTENCY
+# checks, not witnesses — a delta of 0 is what an ABSENT name also yields.
+#
+# `probe: write_then_read_to_eof` writes inputs/payload.bin and then reads to EOF.
+# The write is REQUIRED (ADR-0131): upstream Envoy evaluates network RBAC on the
+# FIRST DOWNSTREAM BYTE (ONE_TIME_ON_FIRST_BYTE), so a probe that sends nothing is
+# never evaluated and the connection simply stays open. Once a byte arrives, both
+# proxies write ZERO bytes and close with a clean EOF, never an RST, discarding
+# what the client sent (measured against envoyproxy/envoy:v1.33.0).
+driver:
+  kind: tcp_with_stats
+  probe: write_then_read_to_eof
+  settle_ms: 500
+  expected_stats:
+    - { name: rbac_deny.rbac.denied, value: 1 }
+    - { name: rbac_deny.rbac.allowed, value: 0 }
+    - { name: rbac_deny.rbac.shadow_allowed, value: 0 }
+    - { name: rbac_deny.rbac.shadow_denied, value: 0 }
+equivalence:
+  response_body:
+    kind: byte_exact

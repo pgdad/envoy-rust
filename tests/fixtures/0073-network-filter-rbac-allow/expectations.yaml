@@ -1,0 +1,26 @@
+# Phase 67.1 fixture 0073 — network RBAC, action: ALLOW.
+#
+# The family's FIRST differential proof that a NON-TERMINAL network filter runs
+# and then YIELDS to the terminal filter — i.e. of the chain iteration protocol.
+# The payload round-trips byte-exact through the terminal `echo`.
+#
+# `expected_stats` are the DELTAS this probe must move each counter by, not
+# absolute values (ADR-0131) — see fixture 0072's expectations.yaml.
+#
+# Unlike 0072, the body assertion here is NOT vacuity-prone: a non-empty payload
+# must come back byte-for-byte. `rbac_allow.rbac.allowed == 1` additionally
+# proves the filter RAN rather than being skipped, which the body alone cannot
+# distinguish from a chain that ignored the rbac filter entirely (the pre-67.1
+# `filters.first()` dispatch would have passed a body-only assertion).
+driver:
+  kind: tcp_with_stats
+  probe: echo
+  settle_ms: 500
+  expected_stats:
+    - { name: rbac_allow.rbac.allowed, value: 1 }
+    - { name: rbac_allow.rbac.denied, value: 0 }
+    - { name: rbac_allow.rbac.shadow_allowed, value: 0 }
+    - { name: rbac_allow.rbac.shadow_denied, value: 0 }
+equivalence:
+  response_body:
+    kind: byte_exact

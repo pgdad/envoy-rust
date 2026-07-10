@@ -6,9 +6,14 @@
 //! name, operating on HTTP requests rather than L4 connections. The two share
 //! only the `Rules` / `Policy` / `Permission` / `Principal` config trees.
 //!
-//! The filter decides ONCE per connection, at establishment, before any
-//! downstream byte is read (phase-67 SPEC R-2, measured against
-//! `envoyproxy/envoy:v1.33.0`). It inspects `peer_addr` / `local_addr` only, and
+//! The filter decides ONCE per connection, when the FIRST DOWNSTREAM BYTE
+//! arrives — upstream Envoy's `ONE_TIME_ON_FIRST_BYTE` enforcement, measured
+//! against `envoyproxy/envoy:v1.33.0` (**ADR-0131**, which corrects phase-67
+//! SPEC R-2's "at establishment" reading). A connection that never sends a byte
+//! is never evaluated and ticks NO counter, on either proxy.
+//!
+//! `envoy_listener::ChainHandler` owns that timing (it peeks, without consuming,
+//! for the first byte). This filter inspects `peer_addr` / `local_addr` only and
 //! never reads the payload — which is why the iteration protocol needs only
 //! `on_new_connection` and no `on_data` hook (deferred as CF-67-3).
 //!
