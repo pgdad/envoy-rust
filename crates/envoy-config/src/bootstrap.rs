@@ -3829,21 +3829,36 @@ fn validate_local_rate_limit_config(
     Ok(())
 }
 
-/// Validate one RBAC filter config. Phase 10 (SPEC §3 D2):
-///   - rules.policies non-empty
-///   - per-policy permissions + principals non-empty
-///   - recursive: empty AndRules/OrRules/AndIds/OrIds rejected
-///   - recursive: depth ≤ RBAC_TREE_MAX_DEPTH
+/// Validate one HTTP RBAC filter config (`envoy.filters.http.rbac`, phase 10).
+/// The tree walk itself lives in [`validate_rbac_rules`], shared with the
+/// network filter (67.1 D1).
 fn validate_rbac_config(
     cfg: &crate::RbacConfig,
     listener_name: &str,
 ) -> Result<(), crate::ConfigError> {
-    if cfg.rules.policies.is_empty() {
+    validate_rbac_rules(&cfg.rules, listener_name)
+}
+
+/// Validate an RBAC policy tree. SHARED by the HTTP filter
+/// (`validate_rbac_config`) and the NETWORK filter
+/// (`validate_network_rbac_config`, 67.1 D1). Phase 10 (SPEC §3 D2):
+///   - rules.policies non-empty
+///   - per-policy permissions + principals non-empty
+///   - recursive: empty AndRules/OrRules/AndIds/OrIds rejected
+///   - recursive: depth ≤ RBAC_TREE_MAX_DEPTH
+///
+/// Its six `ConfigError` variants are scope-neutral (`listener {listener:?}`,
+/// not `HCM listener`) precisely because both filters raise them — ADR-0130.
+fn validate_rbac_rules(
+    rules: &crate::Rules,
+    listener_name: &str,
+) -> Result<(), crate::ConfigError> {
+    if rules.policies.is_empty() {
         return Err(crate::ConfigError::EmptyRbacPolicies {
             listener: listener_name.to_string(),
         });
     }
-    for (policy_name, policy) in cfg.rules.policies.iter() {
+    for (policy_name, policy) in rules.policies.iter() {
         if policy.permissions.is_empty() {
             return Err(crate::ConfigError::EmptyRbacPolicyPermissions {
                 listener: listener_name.to_string(),
@@ -3894,12 +3909,7 @@ fn validate_network_rbac_config(
     let Some(rules) = cfg.rules.as_ref() else {
         return Ok(()); // SPEC R-4: rules omitted ⇒ INERT.
     };
-    validate_rbac_config(
-        &crate::RbacConfig {
-            rules: rules.clone(),
-        },
-        listener_name,
-    )
+    validate_rbac_rules(rules, listener_name)
 }
 
 /// Phase 22: validate a jwt_authn filter config (minimum-viable). All errors
@@ -5347,6 +5357,70 @@ static_resources:
     #[test]
     fn network_rbac_is_not_a_terminal_filter() {
         assert!(!is_terminal_network_filter(crate::NETWORK_RBAC_FILTER));
+    }
+
+    /// 67.1 W-1 (ADR-0130): the six RBAC tree/empty-set errors are shared
+    /// between the HTTP filter and the NETWORK filter, so their message must NOT
+    /// claim "HCM listener" — a network `rbac` filter has no HCM. §7.4 permits
+    /// differing error text between the proxies, so this is an internal-quality
+    /// guarantee, not a parity one.
+    #[test]
+    fn shared_rbac_errors_do_not_claim_hcm_scope() {
+        let rendered = [
+            crate::ConfigError::EmptyRbacPolicies {
+                listener: "l0".into(),
+            }
+            .to_string(),
+            crate::ConfigError::EmptyRbacPolicyPermissions {
+                listener: "l0".into(),
+                policy_name: "p".into(),
+            }
+            .to_string(),
+            crate::ConfigError::EmptyRbacPolicyPrincipals {
+                listener: "l0".into(),
+                policy_name: "p".into(),
+            }
+            .to_string(),
+            crate::ConfigError::EmptyRbacPermissionSet {
+                listener: "l0".into(),
+                policy_name: "p".into(),
+                path: "permissions[0]".into(),
+            }
+            .to_string(),
+            crate::ConfigError::EmptyRbacPrincipalSet {
+                listener: "l0".into(),
+                policy_name: "p".into(),
+                path: "principals[0]".into(),
+            }
+            .to_string(),
+            crate::ConfigError::RbacTreeTooDeep {
+                listener: "l0".into(),
+                policy_name: "p".into(),
+                depth: 17,
+            }
+            .to_string(),
+        ];
+        for msg in rendered {
+            assert!(!msg.contains("HCM listener"), "leaked HCM scope: {msg}");
+            assert!(
+                msg.starts_with(r#"listener "l0""#),
+                "unexpected prefix: {msg}"
+            );
+        }
+    }
+
+    /// 67.1 W-1: a network rbac filter with an empty `policies` map surfaces the
+    /// SHARED `EmptyRbacPolicies` error, now correctly scoped.
+    #[test]
+    fn network_rbac_empty_policies_uses_shared_error() {
+        let mut b =
+            network_rbac_bootstrap("stat_prefix: sp\n                rules: { policies: {} }");
+        let err = validate(&mut b).expect_err("empty policies rejected");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyRbacPolicies { ref listener } if listener == "l0"),
+            "got {err:?}",
+        );
+        assert!(!err.to_string().contains("HCM"), "got {err}");
     }
 
     #[test]

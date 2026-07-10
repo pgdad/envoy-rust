@@ -467,19 +467,27 @@ pub enum ConfigError {
     #[error("listener {listener:?}: network rbac filter stat_prefix must be non-empty")]
     EmptyNetworkRbacStatPrefix { listener: String },
 
+    // The six RBAC tree/empty-set variants below are raised by BOTH
+    // `envoy.filters.http.rbac` (phase 10) and `envoy.filters.network.rbac`
+    // (phase 67.1), which has no HCM. Their messages are therefore scope-neutral
+    // (`listener {listener:?}`, never `HCM listener`) — 67.1 W-1, ADR-0130. The
+    // other `"HCM listener"` variants in this enum are genuinely HCM-scoped.
+    // `RbacMetadataMatcherInvalid` stays among them: a network rbac filter's
+    // `metadata` leaf is rejected outright by `validate_l4_permission` (67.1 D3)
+    // before that error can be reached.
     /// 10: RBAC filter has no policies (rules.policies is empty).
-    #[error("HCM listener {listener:?}: RBAC filter has no policies (rules.policies is empty)")]
+    #[error("listener {listener:?}: RBAC filter has no policies (rules.policies is empty)")]
     EmptyRbacPolicies { listener: String },
 
     /// 10: RBAC policy has no permissions.
-    #[error("HCM listener {listener:?}: RBAC policy {policy_name:?} has no permissions")]
+    #[error("listener {listener:?}: RBAC policy {policy_name:?} has no permissions")]
     EmptyRbacPolicyPermissions {
         listener: String,
         policy_name: String,
     },
 
     /// 10: RBAC policy has no principals.
-    #[error("HCM listener {listener:?}: RBAC policy {policy_name:?} has no principals")]
+    #[error("listener {listener:?}: RBAC policy {policy_name:?} has no principals")]
     EmptyRbacPolicyPrincipals {
         listener: String,
         policy_name: String,
@@ -488,7 +496,7 @@ pub enum ConfigError {
     /// 10: RBAC policy has an empty Permission set
     /// (`Permission::AndRules` or `Permission::OrRules` with empty `rules`).
     #[error(
-        "HCM listener {listener:?}: RBAC policy {policy_name:?} has an empty Permission set at {path}"
+        "listener {listener:?}: RBAC policy {policy_name:?} has an empty Permission set at {path}"
     )]
     EmptyRbacPermissionSet {
         listener: String,
@@ -499,7 +507,7 @@ pub enum ConfigError {
     /// 10: RBAC policy has an empty Principal set
     /// (`Principal::AndIds` or `Principal::OrIds` with empty `ids`).
     #[error(
-        "HCM listener {listener:?}: RBAC policy {policy_name:?} has an empty Principal set at {path}"
+        "listener {listener:?}: RBAC policy {policy_name:?} has an empty Principal set at {path}"
     )]
     EmptyRbacPrincipalSet {
         listener: String,
@@ -510,7 +518,7 @@ pub enum ConfigError {
     /// 10: RBAC policy Permission/Principal tree exceeds RBAC_TREE_MAX_DEPTH.
     /// Defense-in-depth bound at parse time; the runtime evaluator inherits it.
     #[error(
-        "HCM listener {listener:?}: RBAC policy {policy_name:?} Permission/Principal tree exceeds RBAC_TREE_MAX_DEPTH ({depth} > 16)"
+        "listener {listener:?}: RBAC policy {policy_name:?} Permission/Principal tree exceeds RBAC_TREE_MAX_DEPTH ({depth} > 16)"
     )]
     RbacTreeTooDeep {
         listener: String,
