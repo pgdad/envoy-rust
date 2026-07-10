@@ -577,3 +577,265 @@ an establishment phase. **The valve exists for exactly this.**
 **C-1 fired because every probe in the `ADR-0131` recon happened to use `echo`** — the one terminal filter
 with no establishment-time behavior. **When a measurement generalizes over a population of one, it has not
 been measured.** The §7.5 (a)-(e) gate was green and truthful throughout and could not have caught it.
+
+---
+
+# Phase 67.1 — §5.2 state-3 RE-ENTRY (session 2 of N): the C-1 repair lands
+
+> Written by the §5.2 **state-3 re-entry** session (`superpowers:executing-plans`, with
+> `superpowers:test-driven-development` on every task). `REVIEW.md`'s verdict is **NOT APPROVED**,
+> so per §5.2 the phase is still in **implementation**, not verification.
+> This section is APPENDED; the state-3, state-4 and re-entry-session-1 logs above are unmodified.
+>
+> **`REVIEW.md` was NOT edited** — a review is superseded only by a LATER review (D-3.5).
+> **`DECISIONS.md` ledger head is still `ADR-0132`.** No new ADR was needed: every decision this
+> session implements was already made and recorded by `ADR-0132`. **Next available: `ADR-0133`,
+> unreserved.**
+>
+> **Per §5.1 this session did NOT chain into state-4.** `superpowers:verification-before-completion`
+> was deliberately not run; the §7.5 (a)-(f) gate is a **separate, later** session.
+
+## What this session did
+
+`ADR-0132` (session 1) performed the C-1 recon, fired §6.1's mid-execution valve on the `tcp_proxy`
+establishment/data-phase split, and carved that into sub-phase `67.3`. It changed **no code**, and
+left `67.1` a scope of six normal-sized tasks. **All six are now implemented, TDD, one commit each.**
+
+| # | commit | scope | source |
+|---|---|---|---|
+| 15 | `d066f72` | `direct_response` BYPASSES the chain | `ADR-0132` decision 2 + `REVIEW.md` I-5 |
+| 16 | `62849e7` | `[rbac, tcp_proxy]` rejected at config load, fail-loud | `ADR-0132` decision 4 |
+| 17 | `ab22231` | `RbacMetadataMatcherInvalid` is scope-neutral | `REVIEW.md` I-2 |
+| 18 | `62ea186` | `pending_tasks()` is a TOTAL, not last-writer-wins | `REVIEW.md` I-4 |
+| 19 | `4e43038` | the `[rbac, hcm]` composition tests | `REVIEW.md` I-5 + M-3 |
+| 20 | `641ce42` | the eight Minors M-1 … M-8 | `REVIEW.md` §2 |
+
+`REVIEW.md` **I-3 needed no code** — `ADR-0132` decision 5 already resolved it on the ledger
+(`M66-3` recorded **PARTIALLY** consumed; the unbounded steady-state drain became **`CF-67-6`**).
+
+## Task 15 — `direct_response` bypasses the chain (ADR-0132 decision 2)
+
+**RED first, and the RED is the bug.** Two new in-process backstops failed against the pre-fix tree
+with exactly the hang `REVIEW.md`'s R1/R2/R3 measured against `target/debug/envoy-bin`:
+
+```
+---- direct_response_delivers_payload_to_a_client_that_sends_nothing stdout ----
+panicked at crates/envoy-bin/tests/network_filter_rbac.rs:362:10:
+direct_response must write its payload without any client byte: Elapsed(())
+
+---- deny_does_not_suppress_the_direct_response_payload stdout ----
+panicked at crates/envoy-bin/tests/network_filter_rbac.rs:407:33:
+DENY must still deliver (send_first_byte=false)
+```
+
+**The fix.** `crates/envoy-bin/src/main.rs`'s `DIRECT_RESPONSE_FILTER` arm no longer calls
+`wrap_in_chain`; it hands the connection straight to `DirectResponseHandler`.
+`build_network_filter_chain` still runs — that is what **REGISTERS** the four `<stat_prefix>.rbac.*`
+counters at `0` so the stat tree matches — and the filters are then dropped, unused. That is the
+point: with `direct_response` terminal, upstream never evaluates RBAC at all, because the terminal
+filter writes and closes before any `onData` can fire. **A DENY policy does not suppress the
+payload.** Exact measured parity, and a simplification rather than a special case.
+
+Both tests are mutation checks: restore `wrap_in_chain` on that arm and they fail again.
+
+**Two docs stated the now-falsified uniformity claim and were corrected alongside:**
+`ChainHandler`'s rustdoc (which now carries the per-terminal wrappability table and names
+`ADR-0130` Decision 2 as superseded) and `direct_response.rs`'s module doc (whose "writes its
+payload IMMEDIATELY — without reading or waiting for any client bytes" contract was **false** under
+the chain; the bypass makes it true again).
+
+**`echo` and `http_connection_manager` were NOT touched.** Measured already correct. `ADR-0131` is
+not reverted: the first-byte *verdict* stands.
+
+## Task 16 — `[rbac, tcp_proxy]` rejected at config load, fail-loud (ADR-0132 decision 4)
+
+New `ConfigError::UnsupportedNetworkFilterChainComposition { listener, chain_index, non_terminal,
+terminal }`, raised in `validate()`'s network-filter chain pre-pass.
+
+**Placed AFTER both terminal-position checks**, so their errors keep winning — `[echo, rbac,
+tcp_proxy]` still reports terminal-not-last. Pinned by the new
+`terminal_not_last_error_wins_over_unsupported_composition`.
+
+**Only `tcp_proxy` is rejected.** `echo`/`hcm` do no establishment-time work; `direct_response`
+bypasses the chain (task 15). Over-rejection guards land alongside so fixture `0003` cannot regress:
+`lone_tcp_proxy_chain_is_still_accepted` (config layer) and `tcp_proxy_alone_is_still_accepted`
+(against the real binary).
+
+**The error message names phase `67.3`.** Never silent (ADR-0132 decision 4). `67.3` deletes both the
+rejection and the variant.
+
+**A methodological note, because it repeated the M-2 lesson before M-2 was fixed.** The RED run for
+this task did not fail — **it hung.** `validate_config` ran an ACCEPTED config to completion, and a
+valid config makes `envoy-bin` serve forever. That is precisely `REVIEW.md` M-2's failure mode, one
+task early. The helper is now bounded (`VALIDATE_BUDGET`, `kill_on_drop`): past the budget it reports
+"did not reject", and the caller's `assert!(!ok, …)` fails with a useful message. The RED then read:
+
+```
+---- rbac_before_tcp_proxy_is_rejected_at_config_load stdout ----
+panicked at crates/envoy-bin/tests/network_filter_rbac.rs:601:5:
+[rbac, tcp_proxy] must be rejected until 67.3
+```
+
+`BEHAVIOR_CONTRACT.md` gains **item 13**, the full measured per-terminal composition table, and its
+**item 1** is corrected: the first-byte rule is a property of the RBAC **verdict**, not of the
+chain's hand-off, and the data-less-FIN semantic is **per-terminal** (it evaluates for `tcp_proxy`,
+not for `echo`/`hcm`) — owned by `67.3`.
+
+## Task 17 — `RbacMetadataMatcherInvalid` is scope-neutral (REVIEW.md I-2)
+
+**Reproduced first**, verbatim as the review described:
+
+```
+---- structurally_invalid_metadata_leaf_is_not_reported_as_an_hcm_error stdout ----
+panicked: a network rbac filter has NO HCM; the message must be scope-neutral. got
+error=HCM listener "rbac_listener": RBAC policy "p0" metadata matcher at permissions[0]
+is invalid: metadata matcher `filter` must not be empty
+```
+
+The guarding comment claimed the variant was unreachable from a network `rbac` filter "because a
+network rbac filter's `metadata` leaf is rejected outright by `validate_l4_permission` (67.1 D3)
+before that error can be reached." **The validation order is the reverse.** `validate_rbac_rules`
+runs FIRST and validates `Metadata` leaves structurally, so a malformed leaf (empty `filter`,
+multi-segment `path`) raises this variant before the L4 walk ever sees it.
+
+Fixed by generalizing the message to `"listener {listener:?}: …"` — a **seventh** shared
+scope-neutral variant; it stays accurate for the HTTP filter, whose listener *is* an HCM listener.
+**Zero test blast radius**: no test asserted the old text (the four phase-35 tests match on the
+variant, not the string).
+
+**The L4 walk was deliberately NOT reordered ahead of `validate_rbac_rules`.** That order is what
+bounds tree depth before the L4 recursion descends the same tree — a stack-safety guarantee pinned by
+`network_rbac_depth_bound_precedes_the_l4_walk`. The comment now says so, at both sites.
+
+Two config-layer tests pin which validator owns which input:
+`structurally_invalid_metadata_leaf_reports_a_scope_neutral_listener_error` (a mutation check:
+restore `"HCM listener"` and it fails) and `well_formed_metadata_leaf_is_rejected_by_the_l4_walk_instead`.
+
+## Task 18 — `pending_tasks()` is a TOTAL (REVIEW.md I-4)
+
+`Listener::serve`'s SO_REUSEPORT fan-out `.clone()`d **one** `watch::Sender` per accept loop, and each
+loop called `send_replace(join_set.len())` with **its own socket's** count. `watch::Sender` clones
+share one channel, so the published value was neither a total nor stable — it flapped to whichever
+loop wrote last — while the `pub` accessor documented it as "in-flight connection tasks."
+
+Replaced by a `PendingTasks` aggregator: **one slot per accept loop**, each loop publishing only into
+its own slot, the total recomputed and broadcast **under the lock**. A `std::sync::Mutex` (held across
+no `.await`; taken once per accept and once per reap) rather than lock-free atomics, because the
+publish is a read-modify-broadcast: two loops summing lock-free could each observe a stale peer and
+the later `send_replace` would clobber the correct total.
+
+**Mutation-checked, with the rebuild confirmed** (memory `mutation-check-needs-forced-rebuild`):
+`Compiling envoy-listener` appears in the run, so the PASS is not a stale binary. Reverting `publish`
+to write its own count instead of the sum fails with `left: 4, right: 7` — exactly the old
+last-writer-wins reading.
+
+The **M66-3 reaping witness is unaffected**: it uses the single-socket `Listener::bind` path, where
+one slot is the identity. Pinned by `pending_tasks_single_slot_is_the_identity`. `bind_shards` keeps
+its per-shard aggregator (one socket ⇒ one slot), which is what made the old inconsistency a smell.
+
+**A latent panic surfaced while doing this, and it is worth recording.** The in-crate
+`mk_multi_socket_listener` test helper hard-coded ONE slot while taking N sockets, so
+`reuseport_fanout_serves_and_drains` panicked `index out of bounds: the len is 1 but the index is 1`
+on a `tokio-rt-worker` — **but only when the kernel happened to steer the connection to socket #2.**
+The first full run passed; the next failed. Sized from `listeners.len()`, and `PendingTasks::slot`
+now `debug_assert`s the bound **at the seam where the slot is minted**, rather than leaving it to fire
+nondeterministically deep inside a spawned accept loop. Re-run 5× green, and the fan-out test alone
+5× green.
+
+## Task 19 — the `[rbac, hcm]` composition tests (REVIEW.md I-5, and M-3)
+
+I-5 named the process defect that let C-1 ship: `main.rs` wrapped all four terminal arms; the suite
+exercised exactly one. `rbac` was composed with `echo` in **every fixture and every backstop, and with
+nothing else, anywhere** — so the three untested combinations were exactly the three broken ones.
+
+`[rbac, direct_response]` is covered by task 15. This adds the other composition `67.1` owns —
+`[rbac, http_connection_manager]` — for both verdicts. The HCM routes to a `direct_response` route, so
+it needs **no backend**:
+
+- `rbac_before_hcm_evaluates_on_the_first_request` — ALLOW yields to the terminal HCM, the request is
+  served `200`, `allowed` ticks exactly once.
+- `deny_before_hcm_writes_nothing_and_ticks_denied_once` — DENY writes **zero bytes**, not even a
+  `403`; clean EOF; `denied == 1`.
+
+The second also **closes M-3**: in-process, `denied` was asserted `== 0` twice and never `== 1`, so
+the positive tick rode entirely on the Docker-gated fixture `0072`. It now has a Docker-independent
+witness.
+
+**`[rbac, tcp_proxy]`'s POSITIVE test belongs to `67.3`.** `67.1` tests only that it is *rejected*.
+
+## Task 20 — the eight Minors
+
+- **M-1** — `shadow_counters_register_at_zero_and_never_tick` was **vacuous at the registration
+  half**: its `stat()` helper called `register_counter`, which is **get-or-create**, so it would have
+  minted each counter and read `0` even had `NetworkRbacFilter::new` registered nothing. A new
+  non-creating `registered_stat()` reads `StatsRegistry::snapshot()` instead, and the test now also
+  pins `allowed`. **Mutation-checked with the rebuild confirmed**: deleting the `shadow_allowed`
+  registration fails with `counter s.rbac.shadow_allowed must be REGISTERED by NetworkRbacFilter::new`.
+- **M-2** — three backstops called `read_to_end` with no timeout. Every read in the file is now bounded
+  by a named `READ_BUDGET`. (See task 16: this failure mode bit this very session, in `validate_config`.)
+- **M-3** — closed by task 19.
+- **M-4** — documented at the site: because the chain-termination check precedes the per-filter
+  allow-list loop, a chain ending in an **unknown** filter name reports
+  `NetworkFilterChainNotTerminated` rather than `UnsupportedFilter` (an unknown name is by definition
+  not terminal). Both fail loudly; only diagnostic precision is lost.
+- **M-5** — `rules: { policies: {} }` is rejected (`EmptyRbacPolicies`), but **upstream's behavior for
+  the NETWORK filter on that input was never measured** (SPEC R-3 measured only `rules` *omitted*).
+  Recorded as `BEHAVIOR_CONTRACT.md` **item 9b** rather than left as an implied parity claim.
+- **M-6** — `ChainHandler::handle` propagated a `peek` error as a task failure, so a client resetting
+  before its first byte was logged by `accept_loop` as `connection task failed`. A reset-before-data is
+  the `Ok(0)` case arriving rudely: no decision, no counter, and nothing to drain. Now `debug!` +
+  `Ok(())`.
+- **M-7** — nothing pinned that `action: LOG` — a real upstream RBAC action — is rejected rather than
+  silently treated as ALLOW or DENY. New `log_action_and_unmodeled_rbac_fields_are_rejected` covers
+  `LOG`, `enforcement_type` and `delay_deny`, locking **CF-67-2**'s boundary.
+- **M-8** — only the first listener is served. **Pre-existing, not introduced by `67.1`.** Noted at
+  `main.rs` so no future session reads `.next()` as new.
+
+## Evidence (per-task; the §7.5 gate is state-4's, and was NOT run)
+
+Every command below was run to completion with full output captured — **never piped through `tail`**
+(memory `never-pipe-verification-runs-through-tail`), and always with `--no-fail-fast` (the bare
+`cargo test --workspace` aborts at the first failing BINARY).
+
+```
+cargo test -p envoy-bin --test network_filter_rbac  → 18 passed; 0 failed
+cargo test -p envoy-bin --bins                      → 30 passed; 0 failed
+cargo test -p envoy-listener                        → 52 passed; 0 failed   (x5 runs, green each)
+cargo test -p envoy-config                          → 575 passed; 0 failed
+cargo test -p envoy-filter                          → 206 passed; 0 failed
+cargo fmt --all -- --check                          → clean
+cargo build --workspace --all-targets               → clean
+cargo clippy --workspace --all-targets --all-features -- -D warnings → clean
+```
+
+The workspace `clippy` and `fmt --check` were run **as a guard against a red-at-fmt CI**, not as a
+state-4 claim (memory `envoy-rust-state4-ci-first-execution`). **§7.5 (a)-(f) has NOT been executed
+this session** — no Docker differential, no conformance suites, no `cargo deny`, no
+`cargo test --workspace`. That is the next session's job.
+
+## Scope discipline
+
+**§6.1's mid-execution valve stayed ARMED all session and did NOT need to fire again.** No task's
+sub-steps blew past ~10 items. The largest, task 18, touched one crate and one type.
+
+**Nothing forbidden was done.** `ADR-0131` not reverted. `echo`/`hcm` untouched. No attempt to fix
+`[rbac, tcp_proxy]` (that is `67.3`). No `_ =>` catch-all added to the four exhaustive RBAC match
+sites. `rbac` not added to `is_terminal_network_filter`. `filters: []` still accepted. `ADR-0124`'s
+drain untouched and **both** post-EOF-write tests unweakened. `crates/envoy-filter/src/rbac.rs` (the
+HTTP filter sharing the name) never edited. No ROADMAP row changed. `REVIEW.md` never edited.
+
+## Where `67.1` stands
+
+**All of `REVIEW.md`'s blocking findings are addressed**: C-1 (tasks 15 + 16), I-2 (17), I-3
+(`ADR-0132` decision 5, ledger-only), I-4 (18), I-5 (15 + 19), and M-1 … M-8 (19 + 20).
+
+**§7.5 (f) is still UNMET** — a review is superseded only by a LATER review (D-3.5), and `REVIEW.md`
+is untouched. **The next session runs state-4** (`superpowers:verification-before-completion`, full
+§7.5 (a)-(f)), and a **separate** session after it runs the state-5 code-review. **Do not chain**
+(§5.1; `ADR-0127` names 3→4 explicitly as un-chainable).
+
+**Carry-forward ledger — unchanged by this session.** `CF-67-6` (bound `close_with_drain`'s
+steady-state drain) stays open, as `ADR-0132` decision 5 recorded; this session did not touch the
+drain. `CF-67-5` stays open. `CF-67-1`/`CF-67-2`/`CF-67-3` unchanged in scope — M-7 *pins* CF-67-2's
+boundary, it does not consume it. `M66-3` remains **PARTIALLY** consumed. `M66-1` was never allocated;
+the ledger does not backfill.
