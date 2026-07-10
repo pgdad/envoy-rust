@@ -839,3 +839,186 @@ steady-state drain) stays open, as `ADR-0132` decision 5 recorded; this session 
 drain. `CF-67-5` stays open. `CF-67-1`/`CF-67-2`/`CF-67-3` unchanged in scope — M-7 *pins* CF-67-2's
 boundary, it does not consume it. `M66-3` remains **PARTIALLY** consumed. `M66-1` was never allocated;
 the ledger does not backfill.
+
+---
+
+# Phase 67.1 — §5 STATE-4 (verification-before-completion) — the FULL §7.5 (a)-(f) gate
+
+> Written by the §5 **state-4 verification** session (`superpowers:verification-before-completion`),
+> per `BOOTSTRAP_PROMPT.md` §5 state 4 + `SKILL_ROUTING.md`. This section is standalone (D-3.4).
+> **No code changed this session.** Cold-started clean at `HEAD` = `origin/main` = `a21c983` on
+> branch `main` (`git status --porcelain` empty; `git fetch origin --prune` showed no sibling ahead —
+> `origin/main` still `a21c983`). `67.1` is IMPLEMENTATION-COMPLETE; every `REVIEW.md` blocking finding
+> landed across `d066f72`..`641ce42` (handoff `a21c983`). This session re-ran the **entire** §7.5 gate
+> against the current tree, because the ORIGINAL state-4's (a)-(e) evidence is now STALE (six commits of
+> new code landed after it). Every command was run to completion, full output captured, **never piped
+> through `tail`**, and `cargo test` **always with `--no-fail-fast`**.
+
+## Gate result summary
+
+| Gate | Command | Result |
+|---|---|---|
+| (a) build | `cargo build --workspace --all-targets` | **PASS** (exit 0) |
+| (e) clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **PASS** (exit 0) |
+| (e) fmt | `cargo fmt --all -- --check` | **PASS** (exit 0) |
+| (e) deny | `cargo deny check` | **PASS** (exit 0) |
+| (e) test | `cargo test --workspace --no-fail-fast` | **1901 passed**; 6 environmental REDs (run 1) / 8 (run 2), all adjudicated below; phase surface GREEN |
+| (b) differential | (part of the workspace test run; `target/debug/envoy-bin` fresh at `a21c983`) | phase fixtures `0072`/`0073`/`0071`/`0003` GREEN; only the documented environmental core REDs |
+| (c) conformance | `h2spec` runner (part of the workspace test run) | **locally eprintln-SKIPPED** (h2spec binary absent on this host); CI-authoritative; `known-failures.txt` **NOT trimmed** |
+| (d) fuzz | — | **NO new fuzz target** (SPEC §5); the new `ConfigError` variant is reached through the pre-existing `parse_bootstrap` target. Recorded, not skipped in silence. |
+| (f) review | `REVIEW.md` approved | **UNMET, and stays unmet.** A review is superseded only by a LATER review (D-3.5). State-4 does not satisfy it; the SEPARATE state-5 code-review session does. |
+
+## (a) `cargo build --workspace --all-targets`
+
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+EXIT_CODE=0
+```
+
+(No-op finish: the tree is clean at `a21c983` and `target/` was warm; cargo's freshness check confirms
+the current source compiles — exit 0.)
+
+## (e) `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+EXIT_CODE=0
+```
+
+## (e) `cargo fmt --all -- --check`
+
+```
+EXIT_CODE=0
+```
+
+(No output — every file already formatted.)
+
+## (e) `cargo deny check`
+
+```
+advisories ok, bans ok, licenses ok, sources ok
+EXIT_CODE=0
+```
+
+No freshly-published advisory this session; no dep patch-bump needed (memory
+`cargo-deny-reds-on-unrelated-advisory`).
+
+## (e) `cargo test --workspace --no-fail-fast`
+
+Run **twice** for set-stability (memory `local-red-set-varies-run-to-run`):
+
+```
+Run 1:  1901 passed;  6 failed   (passed+failed = 1907)
+Run 2:  1899 passed;  8 failed   (passed+failed = 1907)
+```
+
+The **total (1907) is identical** across runs; only *which* subset flips red under full-workspace
+parallel load varies. The passing count of the deterministic-pass set is stable.
+
+### Phase-67.1 surface — GREEN in both runs (this is what state-4 must witness)
+
+```
+network_filter_rbac_allow  (fixture 0073) → ok. 1 passed; 0 failed
+network_filter_rbac_deny   (fixture 0072) → ok. 1 passed; 0 failed
+network_filter_direct_response (0071 diff)→ ok. 1 passed; 0 failed   (+ envoy-bin side: 3 passed)
+tcp_proxy                  (fixture 0003) → ok. 1 passed; 0 failed
+network_filter_rbac  (18 in-process backstops) → ok. 18 passed; 0 failed
+```
+
+`0071` (`direct_response` alone) and `0003` (`tcp_proxy` alone) were flagged as the two most plausibly
+broken by last session's C-1 changes (the `direct_response` chain-bypass + the `[rbac, tcp_proxy]`
+rejection). **Both are GREEN**, as are the phase's own `0072`/`0073` and all 18 backstops.
+
+### Failing-set adjudication (`--no-fail-fast`, 2 runs, then each member re-run in ISOLATION)
+
+**Deterministic environmental CORE (5) — fails in isolation, invariant across both runs, CI-authoritative:**
+
+| Test | Signature | Memory |
+|---|---|---|
+| `access_log_h2_rcd_upstream_reset` | upstream `remote_connection_failure\|…Network_is_unreachable\|remote_address:[fdc4:…]:… rf:UF` vs rust `connection_termination rf:UC` | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_h2_uc_upstream_reset` | same IPv6-close-backend-unreachable shape | ″ |
+| `access_log_rcd_upstream_reset` | same | ″ |
+| `access_log_rf_upstream_reset` | same | ″ |
+| `admin_config_dump_server_info` (fixture `0014`) | `/clusters` diverges: envoy-only `backend::192.168.65.2:…` — backend routed via the non-allow-listed bridge IP | `differential-host-bridge-ip-192-168-65-2` |
+
+Isolation (each fails deterministically):
+
+```
+access_log_h2_rcd_upstream_reset  => FAILED. 0 passed; 1 failed
+access_log_h2_uc_upstream_reset   => FAILED. 0 passed; 1 failed
+access_log_rcd_upstream_reset     => FAILED. 0 passed; 1 failed
+access_log_rf_upstream_reset      => FAILED. 0 passed; 1 failed
+admin_config_dump_server_info     => FAILED. 0 passed; 1 failed
+```
+
+**Parallel-load flakes — PASS in isolation (tail), come and go between runs:**
+
+```
+client::tests::send_request_maps_h2_handshake_failure_to_typed_error (envoy-http2)  [run 1]
+  → isolation: ok. 1 passed; 0 failed         (memory envoyrust-h2-handshake-test-host-flake)
+admin_ready_returns_200_post_migration (admin_ready)                                [run 2 only]
+  → isolation: ok. 1 passed; 0 failed         (port-reuse startup race)
+upstream_outlier_detection_consecutive_5xx_fixture (upstream_outlier_detection)     [run 2 only]
+  → isolation: ok. 1 passed; 0 failed         ("…not accept-ready within 10s: Connection refused"
+                                                 port-reuse startup race)
+```
+
+**None of the 5 core REDs, nor any of the 3 flakes, touches the phase surface** (network `rbac`,
+`direct_response`, `tcp_proxy`, or the new `ConfigError::UnsupportedNetworkFilterChainComposition`).
+The 5-member core is exactly the invariant set the handoff predicted (`0061`/`0062`/`0069`/`0070`
+upstream-reset witnesses + `0014`). **CI is authoritative; these are not "fixed."**
+
+## (b) Pre-existing differential fixtures still green (§7.5 b)
+
+The workspace test build recompiled `target/debug/envoy-bin` fresh at `a21c983` (memory
+`differential-harness-uses-debug-envoy-bin`), so the differential fixtures ran against the current
+binary — no stale-`unknown field` RED. Docker is UP; the pinned image
+`envoyproxy/envoy:v1.33.0` (digest `56da5afd7df3…`) is cached (D-3.7). Every differential fixture is
+green except the 5-member environmental core above, and `67.1` changed **no existing config** (the new
+chain-composition rejection fires only on `[<non-terminal>, tcp_proxy]`, which no existing fixture uses;
+`0003`'s lone `tcp_proxy` is guarded and GREEN).
+
+## (c) Conformance (§7.5 c)
+
+`h2spec` is the only §7.3 suite. Its runner (`tests/conformance/h2spec/tests/h2spec_runner.rs`) is a
+workspace member and ran inside the test workspace run:
+
+```
+test h2spec_pass_rate_gate ... ok            (finished in 0.00s → eprintln-SKIP path)
+test tests::parse_h2spec_output_extracts_section_failure_ids ... ok
+test tests::parse_summary_line_extracts_pass_fail_counts ... ok
+test result: ok. 3 passed; 0 failed
+```
+
+`which h2spec` fails on this host, so the gate **eprintln-skips locally per phase-05.2 SPEC §3 D7**
+(CI provisions the binary and runs the real ≥95% gate). `known-failures.txt` was **NOT trimmed** — this
+host scores invalid-preface `3.5/2` as PASS while CI fails it, so a locally-"fixed" list breaks CI
+(memory `h2spec-3-5-2-preface-host-sensitive`).
+
+## (d) Fuzz (§7.5 d) — NO new target, recorded explicitly
+
+Per SPEC §5 and ADR-0128 §2.3: network `rbac` **parses nothing** (it inspects `peer_addr`/`local_addr`
+only, never a downstream byte — R-2), so it ships **no new `cargo fuzz` target**. Its sole
+untrusted-input surface is the bootstrap config parser, already covered by the pre-existing
+`parse_bootstrap` target (`crates/envoy-config/fuzz/fuzz_targets/parse_bootstrap.rs`, wired at
+`.github/workflows/ci.yml`), which reaches the new `TypedConfig::NetworkRbac` variant **and** the new
+`ConfigError::UnsupportedNetworkFilterChainComposition` path the moment they land. **Gate (d) is
+SATISFIED by the pre-existing target**, recorded here rather than passed over in silence.
+
+## (f) `REVIEW.md` approved (§7.5 f) — UNMET, by design
+
+The current `REVIEW.md` verdict is **NOT APPROVED** (its C-1 and I-2/I-4/I-5/M-1…M-8 were the state-3
+re-entry's charter, now all landed). A review is superseded only by a **LATER** review (D-3.5);
+`REVIEW.md` is **not edited** by this session. **(f) is therefore the one unmet gate**, and satisfying
+it is the job of the SEPARATE state-5 code-review session — **NOT this one** (§5.1; `ADR-0127` names
+3→4 and 4→5 explicitly as un-chainable).
+
+## State-4 disposition
+
+**(a)-(e) are GREEN on this host** (modulo the fully-adjudicated environmental REDs, which are
+CI-authoritative). **(d) is satisfied** by the pre-existing fuzz target. **(f) is UNMET** and is the
+next session's job. `67.1` is therefore **VERIFIED, NOT REVIEWED → §5 state 5.** No code, no fixture,
+no `known-failures.txt`, no ROADMAP row, and no `REVIEW.md` was changed this session. §6.1's
+mid-execution valve stayed ARMED and did not fire (state-4 writes no code). The next session runs
+`superpowers:requesting-code-review` (a NEW review that supersedes `REVIEW.md`) — and, per the STATE.md
+guidance, it should **probe the now-closed composition matrix**, not just re-read the code.
