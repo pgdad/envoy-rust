@@ -957,3 +957,119 @@ async fn l4_unevaluable_matcher_leaves_are_rejected() {
         );
     }
 }
+
+// --- 67.2 Task 5: end-to-end loopback backstops for the L4 matcher arms --------
+//
+// A client connecting over loopback has `peer_addr.ip() == 127.0.0.1`, and the
+// listener binds `127.0.0.1:{port}`, so `local_addr.{ip(),port()}` are EXACT.
+// This is the in-process witness the SPEC's §2 rationale requires (the IP/port
+// arms are not host-deterministic under the Docker differential harness, so 67.2
+// ships NO new differential fixture). Rules blocks mirror `ALLOW_ALL`'s exact
+// 16-space indentation, spliced into `rbac_echo_cfg`.
+
+/// Build an `action: ALLOW` rules block with the given `permissions`/`principals`
+/// flow-lists, at `rbac_echo_cfg`'s required indentation.
+fn allow_rules(permissions: &str, principals: &str) -> String {
+    format!(
+        "                rules:\n                  action: ALLOW\n                  policies:\n                    p0:\n                      permissions: {permissions}\n                      principals: {principals}"
+    )
+}
+
+/// 67.2 D6: `direct_remote_ip: 127.0.0.0/8` matches a loopback client ⇒ ALLOW,
+/// the echo terminal round-trips the payload.
+#[tokio::test]
+async fn direct_remote_ip_loopback_allows_end_to_end() {
+    let port = reserve_port();
+    let rules = allow_rules(
+        "[{ any: true }]",
+        "[{ direct_remote_ip: { address_prefix: 127.0.0.0, prefix_len: 8 } }]",
+    );
+    let (_child, _dir) = spawn_envoy_bin(&rbac_echo_cfg(port, "dr", &rules));
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    wait_ready(addr, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"ping").await.unwrap();
+    s.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
+        .await
+        .expect("ALLOW must yield to the terminal echo within the read budget")
+        .expect("echo round-trip");
+    assert_eq!(out, b"ping", "loopback peer ∈ 127.0.0.0/8 ⇒ ALLOW ⇒ echo");
+}
+
+/// 67.2 D6: a `direct_remote_ip` range that EXCLUDES loopback ⇒ no policy match ⇒
+/// inverse of ALLOW = DENY: zero bytes, clean EOF (the 67.1 DENY wire shape).
+#[tokio::test]
+async fn direct_remote_ip_non_loopback_denies_end_to_end() {
+    let port = reserve_port();
+    let rules = allow_rules(
+        "[{ any: true }]",
+        "[{ direct_remote_ip: { address_prefix: 10.0.0.0, prefix_len: 8 } }]",
+    );
+    let (_child, _dir) = spawn_envoy_bin(&rbac_echo_cfg(port, "dr2", &rules));
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    wait_ready(addr, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    // ADR-0131: the decision fires on the first downstream byte.
+    s.write_all(b"ping").await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
+        .await
+        .expect("DENY must half-close within the read budget")
+        .expect("clean EOF, not RST");
+    assert!(
+        out.is_empty(),
+        "loopback peer ∉ 10.0.0.0/8 ⇒ DENY ⇒ zero bytes. got {out:?}",
+    );
+}
+
+/// 67.2 D6: `destination_port` bound to the listener port ⇒ ALLOW; a rule naming a
+/// DIFFERENT port ⇒ DENY. `local_addr.port()` is exactly the bound listener port.
+#[tokio::test]
+async fn destination_port_end_to_end() {
+    // ALLOW: the rule names the listener's own port.
+    let port = reserve_port();
+    let allow = allow_rules(&format!("[{{ destination_port: {port} }}]"), "[{ any: true }]");
+    let (_child, _dir) = spawn_envoy_bin(&rbac_echo_cfg(port, "dp", &allow));
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    wait_ready(addr, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"ping").await.unwrap();
+    s.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
+        .await
+        .expect("ALLOW must yield to the terminal echo")
+        .expect("echo round-trip");
+    assert_eq!(out, b"ping", "local port matches ⇒ ALLOW ⇒ echo");
+
+    // DENY: listener binds `port2`, but the rule names a DIFFERENT reserved port.
+    let port2 = reserve_port();
+    let wrong = reserve_port();
+    let deny = allow_rules(&format!("[{{ destination_port: {wrong} }}]"), "[{ any: true }]");
+    let (_child2, _dir2) = spawn_envoy_bin(&rbac_echo_cfg(port2, "dp2", &deny));
+    let addr2 = format!("127.0.0.1:{port2}").parse().unwrap();
+    wait_ready(addr2, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+    let mut s2 = TcpStream::connect(addr2).await.unwrap();
+    s2.write_all(b"ping").await.unwrap();
+    let mut out2 = Vec::new();
+    tokio::time::timeout(READ_BUDGET, s2.read_to_end(&mut out2))
+        .await
+        .expect("DENY must half-close within the read budget")
+        .expect("clean EOF, not RST");
+    assert!(
+        out2.is_empty(),
+        "local port {port2} ≠ rule port {wrong} ⇒ DENY ⇒ zero bytes. got {out2:?}",
+    );
+}

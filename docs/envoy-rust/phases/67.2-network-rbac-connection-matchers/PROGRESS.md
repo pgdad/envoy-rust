@@ -112,3 +112,27 @@ network_rbac (13) all pass.
   STARTUP-FATAL (propagates through `RbacFilter::build_from_config`, not just the private `lower_*`).
 
 **Result:** `cargo test -p envoy-filter http_rbac` → **5 passed**.
+
+---
+
+## Task 5 — end-to-end loopback backstops (real socket, 127.0.0.1) — ✅ DONE
+
+**Commit:** (see `phase 67.2 task 5`). Tests only (`crates/envoy-bin/tests/network_filter_rbac.rs`).
+Boots the real `target/debug/envoy-bin` and connects over loopback so `peer_addr`/`local_addr`
+are EXACT.
+
+- Added an `allow_rules(permissions, principals)` helper at `rbac_echo_cfg`'s required 16-space
+  indentation, and three tests: `direct_remote_ip_loopback_allows_end_to_end` (peer 127.0.0.1 ∈
+  127.0.0.0/8 ⇒ ALLOW, echo round-trips `ping`), `direct_remote_ip_non_loopback_denies_end_to_end`
+  (peer ∉ 10.0.0.0/8 ⇒ DENY, zero bytes clean EOF), and `destination_port_end_to_end` (rule naming
+  the listener's own port ⇒ ALLOW; rule naming a different port ⇒ DENY, zero bytes). All follow the
+  ADR-0131 first-byte / 67.1 DENY-wire-shape mechanics of the two named 67.1 tests.
+
+**Two corrections vs the PLAN's Task-5 skeleton (found on contact with reality):**
+1. The harness helper is `reserve_port()` (from `mod common`), not the plan's `free_port()`.
+2. The plan's skeleton `rules` strings used the engine `cfg()` indentation (`"  action: …"`); the
+   integration `rbac_echo_cfg` splices a FULL `rules:` block at 16-space indent (mirroring the
+   file's `ALLOW_ALL`/`DENY_ALL` consts). Used the `allow_rules` helper to get it exactly right.
+
+**Result:** `cargo build -p envoy-bin` then `cargo test -p envoy-bin --test network_filter_rbac`
+→ **21 passed** (18 pre-existing 67.1 + 3 new).
