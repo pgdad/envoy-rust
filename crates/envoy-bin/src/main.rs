@@ -270,15 +270,20 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                     .map(|d| d.inline_string.as_bytes())
                     .unwrap_or(&[])
                     .into();
-                let lst = TcpListener::bind(bind_addr)
-                    .await
-                    .with_context(|| format!("binding direct_response listener to {bind_addr}"))?;
-                tracing::info!(addr = %bind_addr, payload_len = payload.len(), "envoy-rust listening (direct_response)");
-                let shutdown = token.clone();
-                set.spawn(async move {
-                    direct_response::serve(lst, payload, async move { shutdown.cancelled().await })
-                        .await
-                });
+                let payload_len = payload.len();
+                bind_and_spawn_listener(
+                    listener_cfg,
+                    std::sync::Arc::new(direct_response::DirectResponseHandler::new(payload)),
+                    &registry,
+                    listener_concurrency,
+                    "direct_response",
+                    bind_addr,
+                    || tracing::info!(addr = %bind_addr, payload_len, "envoy-rust listening (direct_response)"),
+                    &token,
+                    &drain,
+                    &mut set,
+                )
+                .await?;
             }
             envoy_config::TCP_PROXY_FILTER => {
                 let Some(envoy_config::TypedConfig::TcpProxy(tp_cfg)) =

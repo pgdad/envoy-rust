@@ -1,130 +1,105 @@
 //! `envoy.filters.network.direct_response` — the Network-filters family opener
-//! (phase 66, ADR-0123).
+//! (phase 66, ADR-0123), a TERMINAL network filter.
 //!
 //! On each accepted downstream connection the filter writes its configured
 //! payload IMMEDIATELY — without reading or waiting for any client bytes — then
 //! half-closes (FIN) and drains the read half until the client closes.
-//! Empirically matched against `envoyproxy/envoy:v1.33.0` (SPEC §0 R-0.5/R-0.7).
+//! Empirically matched against `envoyproxy/envoy:v1.33.0` (phase-66 SPEC §0
+//! R-0.5/R-0.7).
 //!
-//! Shaped after `echo.rs`: a standalone accept loop, NOT a
-//! `envoy_listener::ConnectionHandler` impl (that trait serves the tcp_proxy
-//! and HCM arms).
+//! 67.1 (ADR-0130): the standalone accept loop this module used to own was
+//! DELETED, in the same sub-phase as `echo.rs`'s — preserving the "echo is the
+//! structural model" invariant the phase-66 review required, and consuming
+//! carry-forward **M66-3** by removal. `direct_response` is now a plain
+//! `envoy_listener::ConnectionHandler` served by the ONE shared
+//! `envoy_listener::Listener` accept loop.
 
-use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::task::JoinSet;
-use tokio::time::timeout;
+use envoy_listener::{BoxFuture, ConnectionHandler, close_with_drain};
+use tokio::io::AsyncWriteExt;
 
-/// Graceful drain budget on shutdown, mirroring `echo::DRAIN_TIMEOUT`.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Accept loop. Each accepted connection gets the configured payload, then a
-/// FIN, then a read-half drain.
-///
-/// Returns `Ok(())` after a clean drain on shutdown. Individual connection
-/// errors are logged via `tracing::warn!` and never propagate.
-pub async fn serve(
-    listener: TcpListener,
+/// The terminal `direct_response` network filter, as a per-connection handler.
+pub struct DirectResponseHandler {
     payload: Arc<[u8]>,
-    shutdown: impl Future<Output = ()>,
-) -> Result<()> {
-    let mut set: JoinSet<()> = JoinSet::new();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            () = &mut shutdown => {
-                tracing::info!("shutdown signal received; closing listener");
-                drop(listener);
-                break;
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, peer)) => {
-                        tracing::debug!(%peer, "accepted connection");
-                        let payload = Arc::clone(&payload);
-                        set.spawn(async move {
-                            if let Err(err) = direct_response_once(stream, &payload).await {
-                                tracing::warn!(%peer, error = %err, "direct_response connection failed");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "accept failed; continuing");
-                    }
-                }
-            }
-        }
-    }
-
-    let in_flight = set.len();
-    tracing::info!(in_flight, "draining in-flight connections");
-    let drained = timeout(DRAIN_TIMEOUT, async {
-        while set.join_next().await.is_some() {}
-    })
-    .await;
-    if drained.is_err() {
-        tracing::warn!("drain timeout; aborting remaining tasks");
-        set.shutdown().await;
-    }
-    Ok(())
 }
 
-async fn direct_response_once(mut stream: tokio::net::TcpStream, payload: &[u8]) -> Result<()> {
-    let (mut reader, mut writer) = stream.split();
-
-    // Write the payload immediately; never read first. An empty payload is a
-    // legal config (SPEC §0 R-0.7) and yields a zero-byte write.
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-
-    // Half-close: the client observes a clean EOF here.
-    writer.shutdown().await?;
-
-    // ADR-0124 (SPEC V-3): drain the read half until the client closes.
-    //
-    // Closing the socket while unread bytes sit in the receive queue makes the
-    // kernel send an RST, so a client that writes after our FIN would see
-    // BrokenPipe/ConnectionReset. Upstream Envoy accepts such a write (measured
-    // at 0 / 21 / 200_000 unread bytes), so envoy-rust drains to match. Bounded
-    // by the caller's shutdown drain (DRAIN_TIMEOUT), exactly as `echo.rs` is.
-    let mut sink = [0u8; 8192];
-    loop {
-        match reader.read(&mut sink).await {
-            Ok(0) => break,    // client closed — done
-            Ok(_) => continue, // discard and keep draining
-            Err(_) => break,   // peer reset/error — nothing left to do
-        }
+impl DirectResponseHandler {
+    /// `payload` may be empty — `response` omitted is a legal config
+    /// (phase-66 SPEC §0 R-0.7) and yields a zero-byte write plus a clean close.
+    pub fn new(payload: Arc<[u8]>) -> Self {
+        Self { payload }
     }
-    Ok(())
+}
+
+impl ConnectionHandler for DirectResponseHandler {
+    fn handle(
+        &self,
+        mut downstream: tokio::net::TcpStream,
+    ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let payload = Arc::clone(&self.payload);
+        Box::pin(async move {
+            // Write the payload immediately; never read first.
+            downstream.write_all(&payload).await?;
+            downstream.flush().await?;
+
+            // ADR-0124 (phase-66 SPEC V-3): half-close, then drain the read half
+            // until the client closes. Closing the socket while unread bytes sit
+            // in the receive queue makes the kernel send an RST, so a client that
+            // writes after our FIN would see BrokenPipe/ConnectionReset. Upstream
+            // Envoy accepts such a write (measured at 0 / 21 / 200_000 unread
+            // bytes), so envoy-rust drains to match.
+            //
+            // 67.1 (consumes M66-4 — the stale doc-precision line this replaces):
+            // the drain is bounded by `envoy_listener::DRAIN_BUDGET`. When
+            // `Listener::serve` drains, a connection still parked in this loop
+            // past the budget is aborted by the accept loop's
+            // `JoinSet::abort_all()`. The previous wording named a module-local
+            // `DRAIN_TIMEOUT` and `echo.rs`'s accept loop; neither exists now.
+            close_with_drain(downstream).await?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envoy_listener::{ConnectionHandler, DrainState, Listener};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::oneshot;
 
+    fn listener_cfg(port: u16) -> envoy_config::Listener {
+        serde_yaml::from_str(&format!(
+            "name: dr_listener\naddress:\n  socket_address:\n    address: 127.0.0.1\n    port_value: {port}\nfilter_chains:\n  - filters: []\n"
+        ))
+        .expect("hand-constructed listener YAML parses")
+    }
+
+    /// 67.1: served by the SHARED `envoy_listener::Listener` accept loop. The
+    /// standalone loop this module used to own was deleted (M66-3).
     async fn spawn(payload: &'static [u8]) -> (std::net::SocketAddr, oneshot::Sender<()>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind :0");
-        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let handler: Arc<dyn ConnectionHandler> =
+            Arc::new(DirectResponseHandler::new(Arc::from(payload)));
+        let listener = Listener::bind(&listener_cfg(0), handler, Arc::clone(&registry))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let drain = Arc::new(DrainState::new(&registry));
         let (tx, rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let _ = serve(listener, Arc::from(payload), async move {
+        tokio::spawn(listener.serve(
+            async move {
                 let _ = rx.await;
-            })
-            .await;
-        });
+            },
+            drain,
+        ));
         (addr, tx)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn writes_payload_then_clean_eof() {
         let (addr, _tx) = spawn(b"hello-from-direct-response\n").await;
         let mut s = TcpStream::connect(addr).await.unwrap();
@@ -133,9 +108,9 @@ mod tests {
         assert_eq!(out, b"hello-from-direct-response\n");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn empty_payload_writes_zero_bytes_then_closes() {
-        // SPEC §0 R-0.7: Envoy with `response` omitted writes 0 bytes + closes.
+        // Phase-66 SPEC §0 R-0.7: Envoy with `response` omitted writes 0 bytes + closes.
         let (addr, _tx) = spawn(b"").await;
         let mut s = TcpStream::connect(addr).await.unwrap();
         let mut out = Vec::new();
@@ -143,9 +118,9 @@ mod tests {
         assert!(out.is_empty(), "expected zero bytes, got {out:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn client_that_writes_first_still_receives_payload() {
-        // SPEC §0 R-0.5: Envoy ignores client input and still delivers.
+        // Phase-66 SPEC §0 R-0.5: Envoy ignores client input and still delivers.
         let (addr, _tx) = spawn(b"PAYLOAD\n").await;
         let mut s = TcpStream::connect(addr).await.unwrap();
         s.write_all(b"PING-NEVER-READ\n").await.unwrap();
@@ -154,15 +129,16 @@ mod tests {
         assert_eq!(out, b"PAYLOAD\n");
     }
 
-    /// MUTATION CHECK for the drain (ADR-0124 / SPEC V-3).
+    /// MUTATION CHECK for the drain (ADR-0124 / phase-66 SPEC V-3).
     ///
     /// Upstream Envoy accepts a client write issued AFTER the client observes
     /// EOF (measured: `post_write=writes_ok` at 0 / 21 / 200_000 unread bytes).
     /// A server that closes without draining its read half sends an RST, and
     /// this write fails with BrokenPipe/ConnectionReset.
     ///
-    /// DELETE THE DRAIN LOOP IN `direct_response_once` AND THIS TEST MUST FAIL.
-    #[tokio::test]
+    /// 67.1 re-plumbed the drain into `envoy_listener::close_with_drain`.
+    /// DELETE THAT DRAIN LOOP AND THIS TEST MUST FAIL.
+    #[tokio::test(flavor = "multi_thread")]
     async fn post_eof_client_write_is_accepted_not_reset() {
         let (addr, _tx) = spawn(b"PAYLOAD\n").await;
         let mut s = TcpStream::connect(addr).await.unwrap();
@@ -179,15 +155,22 @@ mod tests {
             .expect("second post-EOF write must not be reset");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_signal_stops_the_accept_loop() {
         let (addr, tx) = spawn(b"x").await;
         let _ = TcpStream::connect(addr).await.unwrap();
         tx.send(()).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
             TcpStream::connect(addr).await.is_err(),
             "listener must be closed"
         );
+    }
+
+    /// 67.1: composes under `ChainHandler` like every other terminal filter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_response_handler_is_a_connection_handler() {
+        let _: Arc<dyn ConnectionHandler> =
+            Arc::new(DirectResponseHandler::new(Arc::from(&b"x"[..])));
     }
 }
