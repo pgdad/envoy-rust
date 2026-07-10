@@ -46,6 +46,30 @@ pub enum Driver {
     /// `direct_response` ignores client input and writes a payload of its own
     /// length before closing.
     TcpDirectResponse,
+    /// 67.1 D7 (phase-67 SPEC R-8): a raw-TCP probe WITH a post-settle bilateral
+    /// admin-stat scrape — the first `expected_stats` on any non-HTTP driver.
+    ///
+    /// **This variant exists because `ByteExact` cannot witness a DENY.**
+    /// `assert_body_rule`'s `ByteExact` is a bare `envoy_body != rust_body`
+    /// check, so a fixture asserting "both proxies returned zero bytes" passes
+    /// vacuously even if envoy-rust never implemented the filter and simply
+    /// failed to write. The stats assertion is what makes fixture `0072` a
+    /// witness rather than a vacuous pass.
+    ///
+    /// `probe` selects the wire shape; both reuse the existing raw-TCP drivers:
+    /// - `echo` -> `drive_tcp` (write `inputs/payload.bin`, read-exact, then the
+    ///   ADR-0007 trailing-byte poll). Fixture `0073`.
+    /// - `read_to_eof` -> `drive_tcp_direct_response` (send nothing, read to
+    ///   EOF). Fixture `0072`.
+    ///
+    /// Requires `{{ADMIN_PORT}}` on BOTH sides (see `driver_needs_admin_port`).
+    TcpWithStats {
+        probe: TcpProbeKind,
+        #[serde(default)]
+        settle_ms: u64,
+        #[serde(default)]
+        expected_stats: Vec<KeepAliveExpectedStat>,
+    },
     HttpGet {
         path: String,
         host: String,
@@ -589,6 +613,19 @@ pub struct Http1HeaderValueRule {
 /// harness scrapes both `/stats` endpoints after the post-request
 /// `settle_ms` and asserts each side's value equals `value` independently
 /// — cross-side consistency follows from transitivity.
+/// 67.1 D7: which raw-TCP wire shape `Driver::TcpWithStats` drives. Both arms
+/// delegate to a pre-existing driver function; no new wire driver is written.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpProbeKind {
+    /// Write `inputs/payload.bin`, read exactly that many bytes back, then poll
+    /// for trailing bytes (ADR-0006 / ADR-0007). The ALLOW shape.
+    Echo,
+    /// Send nothing; read to EOF. The DENY shape — a compliant peer writes zero
+    /// bytes and half-closes.
+    ReadToEof,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct KeepAliveExpectedStat {
@@ -2845,24 +2882,18 @@ struct FixtureCtx<'a> {
 /// End-to-end run of one fixture. Panics-on-failure paths unwind through Drop
 /// guards so the container and envoy-rust subprocess are cleaned up even on
 /// assertion failure.
-pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
-    let expectations = load_expectations(&fixture_dir.join("expectations.yaml"))?;
-
-    let host_port = reserve_port()?;
-
-    let tmp = tempfile::tempdir().context("creating fixture temp dir")?;
-    let upstream_template = std::fs::read_to_string(fixture_dir.join("envoy.yaml"))
-        .context("reading upstream envoy.yaml")?;
-    let subject_template = std::fs::read_to_string(fixture_dir.join("envoy-rust.yaml"))
-        .context("reading envoy-rust.yaml")?;
-
-    let upstream_port_str = upstream::CONTAINER_PORT.to_string();
-    let subject_port_str = host_port.to_string();
-    let port_key = match &expectations.driver {
+/// Which `{{…}}` token the fixture's data listener port substitutes into.
+/// Extracted from `run_fixture` at 67.1 D7 so it is unit-testable.
+fn port_key_for(driver: &Driver) -> &'static str {
+    match driver {
         Driver::TcpEcho
         // Phase 66 (ADR-0123): the direct_response listener uses the same
         // {{PORT}} convention as the other raw-TCP drivers.
         | Driver::TcpDirectResponse
+        // 67.1 D7: TcpWithStats drives a `{{PORT}}` data listener like the
+        // other raw-TCP drivers; its admin listener is separately wired via
+        // `{{ADMIN_PORT}}` (see `driver_needs_admin_port`).
+        | Driver::TcpWithStats { .. }
         | Driver::TlsTcp { .. }
         | Driver::TlsTcpProbeList { .. }
         | Driver::Http1 { .. }
@@ -2906,7 +2937,42 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         // EDS endpoint set out from under that listener's cluster.
         | Driver::Http1EdsReload { .. } => "PORT",
         Driver::HttpGet { .. } => "ADMIN_PORT",
-    };
+    }
+}
+
+/// Does this driver need an admin listener exposed on BOTH proxies?
+///
+/// Gates three things at once: the subject's host admin-port reservation, the
+/// upstream container's `expose_admin_port`, and the `ADMIN_PORT` kv injected
+/// into the upstream template. `run_fixture` ALSO requires `{{ADMIN_PORT}}` to
+/// appear in one of the templates.
+///
+/// 67.1 D7: `TcpWithStats` joins the three HTTP keep-alive/scrape drivers here —
+/// its post-settle bilateral stat scrape is the whole reason it exists.
+fn driver_needs_admin_port(driver: &Driver) -> bool {
+    matches!(
+        driver,
+        Driver::AdminScrape { .. }
+            | Driver::Http1KeepAlive { .. }
+            | Driver::Http2KeepAlive { .. }
+            | Driver::TcpWithStats { .. }
+    )
+}
+
+pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
+    let expectations = load_expectations(&fixture_dir.join("expectations.yaml"))?;
+
+    let host_port = reserve_port()?;
+
+    let tmp = tempfile::tempdir().context("creating fixture temp dir")?;
+    let upstream_template = std::fs::read_to_string(fixture_dir.join("envoy.yaml"))
+        .context("reading upstream envoy.yaml")?;
+    let subject_template = std::fs::read_to_string(fixture_dir.join("envoy-rust.yaml"))
+        .context("reading envoy-rust.yaml")?;
+
+    let upstream_port_str = upstream::CONTAINER_PORT.to_string();
+    let subject_port_str = host_port.to_string();
+    let port_key = port_key_for(&expectations.driver);
 
     // 06.1 D6.a: reserve a kernel-ephemeral admin port whenever either
     // template references `{{ADMIN_PORT}}` AND the driver is AdminScrape
@@ -2919,11 +2985,9 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     // per-class counter assertion territory). Same template-marker discipline
     // — only reserve the host admin port when one of the YAMLs references
     // `{{ADMIN_PORT}}`.
-    let needs_admin_port = matches!(
-        &expectations.driver,
-        Driver::AdminScrape { .. } | Driver::Http1KeepAlive { .. } | Driver::Http2KeepAlive { .. }
-    ) && (upstream_template.contains("{{ADMIN_PORT}}")
-        || subject_template.contains("{{ADMIN_PORT}}"));
+    let needs_admin_port = driver_needs_admin_port(&expectations.driver)
+        && (upstream_template.contains("{{ADMIN_PORT}}")
+            || subject_template.contains("{{ADMIN_PORT}}"));
     let admin_host_port: Option<u16> = if needs_admin_port {
         Some(reserve_port().context("reserving admin host port for Driver::AdminScrape")?)
     } else {
@@ -3907,6 +3971,14 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         Driver::TcpDirectResponse => {
             run_tcp_direct_response_arm(&ctx, upstream, subject).await?;
         }
+        Driver::TcpWithStats {
+            probe,
+            settle_ms,
+            expected_stats,
+        } => {
+            run_tcp_with_stats_arm(&ctx, upstream, subject, probe, settle_ms, expected_stats)
+                .await?;
+        }
         Driver::HttpGet { path, host } => {
             run_http_get_arm(&ctx, upstream, subject, path, host).await?;
         }
@@ -4263,6 +4335,128 @@ async fn run_tcp_echo_arm(
     let subject_out = drive_tcp(subject_addr, &payload)
         .await
         .context("envoy-rust drive")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+    assert_equivalence(expectations, None, None, &upstream_out, &subject_out)?;
+    Ok(())
+}
+
+/// 13.1 D10, hoisted at 67.1 D7: scrape each named stat from BOTH admin
+/// listeners and assert each side's value equals `stat.value` independently.
+/// Cross-side consistency follows by transitivity.
+///
+/// `scrape_admin_stat` returns `Ok(0)` for a stat name the proxy never
+/// registered. A `value: 0` assertion therefore passes vacuously when the name
+/// is ABSENT; only a non-zero assertion is a real witness. Fixture READMEs must
+/// say which of their assertions is the witness.
+async fn assert_expected_stats_bilaterally(
+    upstream_admin_addr: SocketAddr,
+    subject_admin_addr: SocketAddr,
+    expected_stats: &[KeepAliveExpectedStat],
+) -> Result<()> {
+    for stat in expected_stats {
+        let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("upstream scraping stat {}", stat.name))?;
+        let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
+            .await
+            .with_context(|| format!("subject scraping stat {}", stat.name))?;
+        anyhow::ensure!(
+            upstream_value == stat.value,
+            "upstream stat {} expected {} got {}",
+            stat.name,
+            stat.value,
+            upstream_value,
+        );
+        anyhow::ensure!(
+            subject_value == stat.value,
+            "subject stat {} expected {} got {}",
+            stat.name,
+            stat.value,
+            subject_value,
+        );
+    }
+    Ok(())
+}
+
+/// `Driver::TcpWithStats` arm of `run_fixture` (67.1 D7). Drives ONE raw-TCP
+/// probe against each proxy via a pre-existing driver, then settles and scrapes
+/// both admin listeners, and finally asserts body equivalence.
+///
+/// The scrape MUST happen BEFORE `subject.shutdown()`, which kills the
+/// envoy-rust process and its admin listener with it. `run_tcp_direct_response_arm`
+/// shuts down before `assert_equivalence` because it needs no admin access; this
+/// arm must not copy that order.
+async fn run_tcp_with_stats_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    probe: &TcpProbeKind,
+    settle_ms: &u64,
+    expected_stats: &[KeepAliveExpectedStat],
+) -> Result<()> {
+    let FixtureCtx {
+        fixture_dir,
+        expectations,
+        upstream_addr,
+        subject_addr,
+        admin_host_port,
+        budget,
+        ..
+    } = *ctx;
+
+    let upstream_admin_port = upstream.host_admin_port().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Driver::TcpWithStats requires the upstream container to expose its admin port; \
+             either the fixture's envoy.yaml does not reference {{ADMIN_PORT}} or the harness \
+             failed to wire `expose_admin_port = true`",
+        )
+    })?;
+    let subject_admin_port = admin_host_port.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Driver::TcpWithStats requires the subject's envoy-rust.yaml to reference \
+             {{ADMIN_PORT}}; the harness only reserves a host admin port when one of the \
+             templates contains the marker",
+        )
+    })?;
+    let upstream_admin_addr: SocketAddr = format!("127.0.0.1:{upstream_admin_port}").parse()?;
+    let subject_admin_addr: SocketAddr = format!("127.0.0.1:{subject_admin_port}").parse()?;
+    wait_accept_ready(upstream_admin_addr, budget)
+        .await
+        .context("upstream admin listener never became accept-ready")?;
+    wait_accept_ready(subject_admin_addr, budget)
+        .await
+        .context("envoy-rust admin listener never became accept-ready")?;
+
+    let (upstream_out, subject_out) = match probe {
+        TcpProbeKind::Echo => {
+            let payload = std::fs::read(fixture_dir.join("inputs/payload.bin"))
+                .context("reading payload.bin")?;
+            (
+                drive_tcp(upstream_addr, &payload)
+                    .await
+                    .context("upstream envoy drive")?,
+                drive_tcp(subject_addr, &payload)
+                    .await
+                    .context("envoy-rust drive")?,
+            )
+        }
+        TcpProbeKind::ReadToEof => (
+            drive_tcp_direct_response(upstream_addr)
+                .await
+                .context("upstream envoy drive")?,
+            drive_tcp_direct_response(subject_addr)
+                .await
+                .context("envoy-rust drive")?,
+        ),
+    };
+
+    // Single post-probe settle, covering stat-write visibility on BOTH sides
+    // under the same Relaxed-ordering budget.
+    tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+    assert_expected_stats_bilaterally(upstream_admin_addr, subject_admin_addr, expected_stats)
+        .await?;
+
     subject.shutdown(Duration::from_secs(5)).await.ok();
     drop(upstream);
     assert_equivalence(expectations, None, None, &upstream_out, &subject_out)?;
@@ -4760,28 +4954,8 @@ async fn run_http1_keep_alive_arm(
     // counter site lands behind a longer happens-before chain.
     tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
 
-    for stat in expected_stats {
-        let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
-            .await
-            .with_context(|| format!("upstream scraping stat {}", stat.name))?;
-        let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
-            .await
-            .with_context(|| format!("subject scraping stat {}", stat.name))?;
-        anyhow::ensure!(
-            upstream_value == stat.value,
-            "upstream stat {} expected {} got {}",
-            stat.name,
-            stat.value,
-            upstream_value,
-        );
-        anyhow::ensure!(
-            subject_value == stat.value,
-            "subject stat {} expected {} got {}",
-            stat.name,
-            stat.value,
-            subject_value,
-        );
-    }
+    assert_expected_stats_bilaterally(upstream_admin_addr, subject_admin_addr, expected_stats)
+        .await?;
 
     // 18 Task 6 (ADR-0049): after the bilateral stat scrape, run any
     // `admin_scrapes` sub-cases through the SAME per-case assertion
@@ -4857,28 +5031,8 @@ async fn run_http2_keep_alive_arm(
     // signpost 11). Mirrors the H1 sibling at `Driver::Http1KeepAlive`.
     tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
 
-    for stat in expected_stats {
-        let upstream_value = scrape_admin_stat(upstream_admin_addr, &stat.name)
-            .await
-            .with_context(|| format!("upstream scraping stat {}", stat.name))?;
-        let subject_value = scrape_admin_stat(subject_admin_addr, &stat.name)
-            .await
-            .with_context(|| format!("subject scraping stat {}", stat.name))?;
-        anyhow::ensure!(
-            upstream_value == stat.value,
-            "upstream stat {} expected {} got {}",
-            stat.name,
-            stat.value,
-            upstream_value,
-        );
-        anyhow::ensure!(
-            subject_value == stat.value,
-            "subject stat {} expected {} got {}",
-            stat.name,
-            stat.value,
-            subject_value,
-        );
-    }
+    assert_expected_stats_bilaterally(upstream_admin_addr, subject_admin_addr, expected_stats)
+        .await?;
 
     subject.shutdown(Duration::from_secs(5)).await.ok();
     drop(upstream);
@@ -6812,6 +6966,88 @@ mod tests {
     fn parses_tcp_direct_response_driver() {
         let y = "driver:\n  kind: tcp_direct_response\nequivalence:\n  response_body:\n    kind: byte_exact\n";
         let e: Expectations = serde_yaml::from_str(y).expect("parses");
+        assert!(matches!(e.driver, Driver::TcpDirectResponse));
+    }
+
+    // --- 67.1 D7: `expected_stats` on the raw-TCP driver family (SPEC R-8) ---
+
+    /// 67.1 D7: the raw-TCP driver family gains `expected_stats`. Echo probe.
+    #[test]
+    fn parses_tcp_with_stats_echo_driver() {
+        let yaml = r#"
+driver:
+  kind: tcp_with_stats
+  probe: echo
+  settle_ms: 500
+  expected_stats:
+    - { name: rbac_allow.rbac.allowed, value: 1 }
+    - { name: rbac_allow.rbac.denied, value: 0 }
+equivalence:
+  response_body:
+    kind: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::TcpWithStats {
+            probe,
+            settle_ms,
+            expected_stats,
+        } = &e.driver
+        else {
+            panic!("expected TcpWithStats, got {:?}", e.driver);
+        };
+        assert_eq!(*probe, TcpProbeKind::Echo);
+        assert_eq!(*settle_ms, 500);
+        assert_eq!(expected_stats.len(), 2);
+        assert_eq!(expected_stats[0].name, "rbac_allow.rbac.allowed");
+        assert_eq!(expected_stats[0].value, 1);
+    }
+
+    /// 67.1 D7: read-to-EOF probe — the DENY shape (send nothing, read to EOF).
+    #[test]
+    fn parses_tcp_with_stats_read_to_eof_driver() {
+        let yaml = r#"
+driver:
+  kind: tcp_with_stats
+  probe: read_to_eof
+  settle_ms: 500
+  expected_stats:
+    - { name: rbac_deny.rbac.denied, value: 1 }
+equivalence:
+  response_body:
+    kind: byte_exact
+"#;
+        let e: Expectations = serde_yaml::from_str(yaml).expect("parses");
+        let Driver::TcpWithStats { probe, .. } = &e.driver else {
+            panic!("expected TcpWithStats")
+        };
+        assert_eq!(*probe, TcpProbeKind::ReadToEof);
+    }
+
+    /// 67.1 D7: `TcpWithStats` needs an admin port on BOTH sides — the whole
+    /// point of the variant. It uses the `{{PORT}}` data-listener convention.
+    #[test]
+    fn tcp_with_stats_needs_admin_port_and_uses_port_key() {
+        let driver = Driver::TcpWithStats {
+            probe: TcpProbeKind::ReadToEof,
+            settle_ms: 0,
+            expected_stats: vec![],
+        };
+        assert_eq!(port_key_for(&driver), "PORT");
+        assert!(driver_needs_admin_port(&driver));
+        // The pre-existing raw-TCP drivers still do NOT.
+        assert!(!driver_needs_admin_port(&Driver::TcpEcho));
+        assert!(!driver_needs_admin_port(&Driver::TcpDirectResponse));
+    }
+
+    /// 67.1 D7: the pre-existing UNIT variants still deserialize from a bare
+    /// `kind:` with no fields. Adding fields to them would have broken every
+    /// landed expectations.yaml.
+    #[test]
+    fn unit_raw_tcp_drivers_still_parse_without_fields() {
+        let e: Expectations = serde_yaml::from_str("driver:\n  kind: tcp_echo\n").expect("parses");
+        assert!(matches!(e.driver, Driver::TcpEcho));
+        let e: Expectations =
+            serde_yaml::from_str("driver:\n  kind: tcp_direct_response\n").expect("parses");
         assert!(matches!(e.driver, Driver::TcpDirectResponse));
     }
 
