@@ -221,3 +221,248 @@ LoC are unchanged from `PLAN.md` §0's re-derivation.
 - **`ADR-0130`** (the PLAN-write reconciliation) and **`ADR-0129`/`ADR-0128`** govern.
 - **`ADR-0124` is UNTOUCHED** and survived the accept-loop hoist, as required.
 - **Ledger head: `ADR-0131`.** Next available: **`ADR-0132`**, unreserved.
+
+---
+
+# Phase 67.1 — state-4 verification
+
+> Written by the §5 **state-4 verification** session (`superpowers:verification-before-completion`).
+> This section is APPENDED; the state-3 log above is unmodified. Every command below was run fresh
+> in this session at `HEAD = cd874f607489260e606fe8e576326188e2d9c46b` (working tree clean, branch
+> `main`, `origin/main` at the same SHA). **No code changed in this session** — state-4 verifies, it
+> does not implement.
+>
+> **Result: §7.5 (a)-(e) are SATISFIED. (f) is not — `REVIEW.md` is the state-5 session's output.**
+> **No new ADR was needed.** Ledger head remains **ADR-0131**; next available **ADR-0132**.
+
+## Gate (e) — build, clippy, fmt, test, deny
+
+### `cargo build --workspace --all-targets` — exit **0**
+
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+```
+
+### `cargo clippy --workspace --all-targets --all-features -- -D warnings` — exit **0**
+
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+```
+
+**A cached `Finished` is weak evidence, so the lint was re-run against a forced recompile.** The
+state-3 session's own hard-won lesson (Task 8: a mutation check reported a FALSE PASS from a stale
+test binary) applies verbatim to a verification gate: an "exit 0" from a fully-cached invocation
+proves only that cargo's fingerprints matched. After `touch`ing the four crate roots this phase
+modified (`envoy-config/src/lib.rs`, `envoy-listener/src/lib.rs`, `envoy-bin/src/main.rs`,
+`tests/differential/src/lib.rs`), clippy re-checked **14 units** and still exited **0** with zero
+warnings:
+
+```
+    Checking envoy-config v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-config)
+    Checking differential v0.0.0 (/home/esa/git/envoy-rust/tests/differential)
+    Checking envoy-listener v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-listener)
+    Checking envoy-cluster v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-cluster)
+    Checking envoy-filter v0.1.0 (/home/esa/git/envoy-rust/crates/envoy-filter)
+    Checking envoy-tls v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tls)
+    Checking envoy-http1 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http1)
+    Checking envoy-tcp v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-http2 v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-http2)
+    Checking envoy-health v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-health)
+    Checking envoy-admin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-admin)
+    Checking http1-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http1-echo-server)
+    Checking envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Checking http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.78s
+```
+
+> Note for future sessions: `cargo clippy` emits `Checking`, not `Compiling`, for lib targets. Grep
+> for **both** when auditing whether a lint or a mutation check actually re-ran.
+
+### `cargo fmt --all -- --check` — exit **0**, zero bytes of output
+
+### `cargo deny check` — exit **0**
+
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+Plus 5 pre-existing `warning[license-not-encountered]` advisories (`0BSD`, `BSD-2-Clause`,
+`MPL-2.0`, `Unicode-DFS-2016`, `Zlib` — allow-listed in `deny.toml` but unmatched by the current
+dependency set). Warnings, not errors; the check passes. **No freshly-published advisory fired this
+session** (contrast RUSTSEC-2026-0190 / `anyhow`, which reddened an earlier phase's push).
+
+### `cargo test --workspace --no-fail-fast` — exit **101** locally; **1886 passed, 6 failed, 9 ignored**
+
+`--no-fail-fast` is mandatory: the bare form aborts at the first failing test *binary* and never
+reaches the rest of the gate. Full output was redirected to a file, never piped through `tail`.
+
+**All 6 REDs are adjudicated below. None is a phase-67.1 regression.** Each was re-run **in
+isolation** to classify it per the standing rule (environmental ⇒ fails deterministically alone;
+parallel-load flake ⇒ passes alone):
+
+| # | Test | Fixture | Isolated re-run | Verdict |
+|---|---|---|---|---|
+| 1 | `access_log_rf_upstream_reset` | `0061` | **FAILED** (deterministic) | environmental |
+| 2 | `access_log_rcd_upstream_reset` | `0062` | **FAILED** (deterministic) | environmental |
+| 3 | `access_log_h2_uc_upstream_reset` | `0069` | **FAILED** (deterministic) | environmental |
+| 4 | `access_log_h2_rcd_upstream_reset` | `0070` | **FAILED** (deterministic) | environmental |
+| 5 | `admin_config_dump_server_info` | `0014` | **FAILED** (deterministic) | environmental |
+| 6 | `xds_file_based_eds_fixture` | — | **PASSED** (`ok. 1 passed`) | parallel-load flake |
+
+This is exactly the documented "invariant core of ~5 + a varying tail" shape.
+
+**Why 1-4 are environmental, from the failure text itself:** it is **upstream Envoy**, not
+envoy-rust, that produces the unexpected value. Envoy cannot reach the host-spawned close backend
+and reports a connect failure against an IPv6 address:
+
+```
+envoy=     {"rc":503,"rcd":"upstream_reset_before_response_started{remote_connection_failure|
+           immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:37791}","rf":"UF"}
+envoy-rust={"rc":503,"rcd":"upstream_reset_before_response_started{connection_termination}","rf":"UC"}
+```
+
+envoy-rust emits the **correct** `UC` / `{connection_termination}`; the reference proxy never
+reached the backend to observe a reset. Host limitation, not a divergence.
+
+**Why 5 is environmental:** the diff is entirely host-bridge endpoint identity —
+`backend::192.168.65.2:40673::…` appears `envoy-only`. This dev host routes the backend via
+`192.168.65.2`.
+
+**Why 6 is a flake:** `upstream Envoy never became accept-ready … 127.0.0.1:55082 not accept-ready
+within 10s: Connection refused` — the known ephemeral-port-reuse startup race under parallel `cargo
+test` load. It passes cleanly on its own.
+
+### The decisive cross-check: **CI passed = local passed + local failed**
+
+CI's `cargo test --workspace` on this exact SHA reports **1892 passed, 0 failed**. Locally:
+**1886 passed + 6 failed = 1892**. The six local REDs are precisely the six tests CI passes — the
+set is fully accounted for, with **no test silently missing from either side**. CI is authoritative
+(doctrine D-3.3 + D-3.6), and CI is green.
+
+## Gate (a) — all new/changed differential fixtures are green
+
+Run locally against the pinned reference image (`envoyproxy/envoy:v1.33.0`, digest verified in this
+session as `sha256:56da5afd7df364350ff92de4fb49a9b09957c17295f2899f0a31cd12c28770c2`, D-3.7), after
+`cargo build -p envoy-bin` (the harness executes `target/debug/envoy-bin`, not release):
+
+```
+Running tests/network_filter_rbac_deny.rs        test result: ok. 1 passed; 0 failed   (fixture 0072, NEW)
+Running tests/network_filter_rbac_allow.rs       test result: ok. 1 passed; 0 failed   (fixture 0073, NEW)
+Running tests/echo.rs                            test result: ok. 1 passed; 0 failed   (fixture 0001, echo restructured)
+Running tests/network_filter_direct_response.rs  test result: ok. 1 passed; 0 failed   (fixture 0071, direct_response restructured)
+```
+
+And in CI on this SHA: `test network_filter_rbac_deny_fixture ... ok`,
+`test network_filter_rbac_allow_fixture ... ok`.
+
+In-process backstops for the same surface, all green:
+
+```
+Running crates/envoy-bin/tests/network_filter_rbac.rs           10 passed; 0 failed
+Running crates/envoy-bin/tests/network_filter_direct_response.rs 3 passed; 0 failed
+Running unittests crates/envoy-config/src/lib.rs               570 passed; 0 failed
+Running unittests crates/envoy-listener/src/lib.rs               50 passed; 0 failed
+Running unittests crates/envoy-bin/src/main.rs                   30 passed; 0 failed
+Running unittests tests/differential/src/lib.rs                 156 passed; 0 failed; 2 ignored
+```
+
+## Gate (b) — all pre-existing differential fixtures are still green
+
+Every pre-existing fixture passes except the five environmental REDs adjudicated above
+(`0061`/`0062`/`0069`/`0070`/`0014`) and the one startup-race flake, **all six of which CI passes on
+this SHA**. The `echo` (`0001`) and `direct_response` (`0071`) fixtures deserve explicit mention:
+Tasks 7 and 8 rewrote both filters onto the new `ConnectionHandler` trait, so they are the
+regression witnesses for the accept-loop hoist — and both are green.
+
+## Gate (c) — conformance suites
+
+**`h2spec` is the project's only §7.3 conformance suite.**
+
+- **Locally it SKIPPED — it is not a local pass.** The `h2spec` binary is absent from this host and
+  `h2spec_runner` `eprintln!`-skips by design (`tests/conformance/h2spec/tests/h2spec_runner.rs:24`).
+  The binary reports `3 passed`, but the gate test `h2spec_pass_rate_gate` did no protocol work.
+  Recording this honestly: **local h2spec evidence is worthless; CI is authoritative.**
+- **In CI on this SHA it RAN and PASSED**: the `install h2spec` step fetches pinned h2spec `2.6.0`,
+  and `test h2spec_pass_rate_gate ... ok`.
+- **`tests/conformance/h2spec/known-failures.txt` is UNTOUCHED by phase 67.1** — verified:
+  `git log --oneline f40a41e..HEAD -- tests/conformance/h2spec/known-failures.txt` returns **0
+  commits**. It still carries its single active entry (`3.5/2`, the h2-codec invalid-preface
+  foundation limitation). It was never trimmed. (This host scores `3.5/2` as a PASS while CI fails
+  it, so trimming it from local evidence would break CI.)
+
+Phase 67.1 adds no HTTP/2, HTTP/3, gRPC or WASM surface, so no other conformance suite is in scope.
+
+## Gate (d) — fuzz — **RECORDED EXPLICITLY, not skipped in silence**
+
+**§7.5 (d) is satisfied by the pre-existing `parse_bootstrap` fuzz target; NO new fuzz target was
+added — see ADR-0128 §2.3.**
+
+The rationale, restated so this stands alone: **network `rbac` parses nothing.** It peeks a single
+byte that it never reads, and inspects `peer_addr` / `local_addr`. Its only untrusted-input surface
+is the bootstrap config parser, which the `parse_bootstrap` target has covered since phase 01. §7.4
+requires a new target only for a phase that "introduces a parser, codec, or filter" with a new
+untrusted-input surface; this phase introduces none.
+
+What phase 67.1 *did* add is a **corpus seed** exercising the new config keys through the deepest
+parse path (`action: DENY`, nested `and_rules`/`or_ids`/`not_rule`/`not_id` combinators). It is
+explicitly un-ignored and **proven tracked** — the fuzz corpus directory is `*`-ignored by default,
+so a seed without an explicit `!` line is silently invisible to CI:
+
+```
+$ grep -n network_filter_rbac crates/envoy-config/fuzz/.gitignore
+56:!corpus/parse_bootstrap/network_filter_rbac.yaml
+
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/network_filter_rbac.yaml
+crates/envoy-config/fuzz/corpus/parse_bootstrap/network_filter_rbac.yaml
+```
+
+CI's short-budget fuzz job ran clean on this SHA — all four targets, **zero crashes, zero leak or
+`ERROR: libFuzzer` artifacts**:
+
+```
+fuzz parse_bootstrap          Done 180438 runs in 31 second(s)
+fuzz jwt_parse                Done 4457438 runs in 31 second(s)
+fuzz cdn_loop_parse           Done 4679313 runs in 31 second(s)
+fuzz accesslog_format_parse   Done 2604836 runs in 31 second(s)
+```
+
+No `ci.yml` step was needed (memory `new-fuzz-target-needs-a-ci-yml-step` applies only to a NEW
+target); the existing `fuzz` job already covers `parse_bootstrap` and picked the seed up.
+
+## Gate (f) — `REVIEW.md` approved — **NOT SATISFIED, and must not be**
+
+`REVIEW.md` does not exist. It is the output of the §5 **state-5** code-review session
+(`superpowers:requesting-code-review`), which per §5.1 is a **separate session**. This session did
+not chain into it. ADR-0127's one-off human-authorized override applies only to 5→6 and explicitly
+names 4→5 as un-chainable.
+
+## CI on the exact SHA
+
+Confirmed with the **full 40-char SHA** (`gh run list --commit <short-sha>` silently returns `[]`):
+
+```
+$ gh run list --commit cd874f607489260e606fe8e576326188e2d9c46b --json databaseId,status,conclusion,headSha,workflowName
+[{"conclusion":"success","databaseId":29093604633,"headSha":"cd874f607489260e606fe8e576326188e2d9c46b",
+  "status":"completed","workflowName":"ci"}]
+```
+
+Both jobs genuinely executed — **not runner starvation** (`steps > 0` and a non-empty log; note
+`runnerName` reads empty even on healthy runs, so it is not the discriminator):
+
+| job | conclusion | steps |
+|---|---|---|
+| `build + test + lint` | success | 15 |
+| `fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse, 30s each)` | success | 12 |
+
+`gh run view 29093604633 --log` → **6,741,648 bytes**. `test result: FAILED` appears **zero** times.
+
+## Verdict
+
+**§7.5 (a), (b), (c), (d), (e) are satisfied.** (f) awaits the state-5 code-review.
+
+- No code changed in this session. No fixture was weakened. `known-failures.txt` was not trimmed.
+- No new ADR was required: nothing this session measured contradicts a landed decision.
+- No carry-forward opened or closed. `CF-67-5` remains open and blocks nothing; `CF-67-1`,
+  `CF-67-2`, `CF-67-3` and the long tail remain live.
+- §6.1's mid-execution valve stays armed for a §5.2 re-entry at step 3 if `REVIEW.md` finds issues.
+- **Ledger head: `ADR-0131`.** Next available: **`ADR-0132`**, unreserved.
