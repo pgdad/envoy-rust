@@ -178,3 +178,135 @@ pre-existing `parse_bootstrap` + the new `network_filter_rbac_cidr.yaml` seed); 
 regression-only differential surface (`0001`–`0073` green) after `cargo build -p envoy-bin`; confirm
 CI green on the FULL 40-char SHA. **Command note:** `envoy-bin` is a BINARY crate — use `--bins`, not
 `--lib`, for its lib-style tests (`cargo test -p envoy-bin` also works).
+
+---
+
+# Phase 67.2 — §5 STATE-4 (verification) — the FULL §7.5 (a)-(f) gate
+
+> `superpowers:verification-before-completion`. This is a SEPARATE session from the state-3
+> implementation (§5.1). It ran the whole §7.5 gate against the current tree and quotes every
+> command's output below. **NO code, no fixture, no `known-failures.txt`, no ROADMAP row, and no
+> new `REVIEW.md` was created.** Cold-started clean: `git status --porcelain` empty; branch `main`;
+> `HEAD` = `origin/main` = `42ce89c` (the state-3 STATE-advance commit); `git fetch origin --prune`
+> showed no sibling ahead → §5 state 4.
+
+## STEP 0.5 — CI on the state-3 push (FULL 40-char SHA)
+
+```
+$ gh run list --commit 42ce89c65cf366f8addae91d6f704db00794c9f8
+completed  success  phase 67.2: §5 state-3 implementation COMPLETE — STATE advanced to st…  ci  main  push  29129557480  6m20s
+```
+
+CI run `29129557480` GREEN on the full SHA. No rerun needed.
+
+## §7.5 gate (a) — `cargo build --workspace --all-targets`
+
+```
+$ cargo build --workspace --all-targets
+EXIT=0
+```
+
+Clean. The debug `target/debug/envoy-bin` the differential harness runs is now fresh (no stale
+`unknown field`/`unknown filter`).
+
+## §7.5 gate (e) — clippy / fmt / deny
+
+```
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+CLIPPY_EXIT=0        # Checking envoy-config / envoy-filter / envoy-bin all present in the run
+```
+
+Clean — the two REMOVED `#[allow(clippy::only_used_in_recursion)]` attrs on
+`network_rbac.rs::permission_matches`/`principal_matches` produce NO warning (the new arms read
+`conn`, so the recursion is no longer the only use).
+
+```
+$ cargo fmt --all -- --check
+FMT_EXIT=0           # (empty output)
+```
+
+Clean (the state-3 `cargo fmt --all` cleanup commit `494043f` holds).
+
+```
+$ cargo deny check
+DENY_EXIT=0
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+Clean (only benign `license-not-encountered` warnings — no advisory against any dep; no patch-bump
+needed this session).
+
+## §7.5 gate — `cargo test --workspace --no-fail-fast`
+
+Full output redirected to a file (NEVER piped through `tail`). Aggregate:
+
+```
+$ cargo test --workspace --no-fail-fast     # TEST_EXIT=101
+TOTAL passed=1925 failed=5
+```
+
+`passed + failed = 1925 + 5 = 1930`. **Cross-check: `local passed+failed == CI passed = 1930`**
+(CI run `29129557480` GREEN — those 5 pass on CI's networking).
+
+**All 5 REDs are the documented environmental core — NONE in the RBAC surface:**
+
+| Failing test | Cause (memory) |
+|---|---|
+| `access_log_h2_rcd_upstream_reset` | envoy `UF`/`Network_is_unreachable`/`[fdc4:f303:9324::254]` (IPv6 close-backend unreachable) vs rust `UC` — `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_h2_uc_upstream_reset` | same — envoy `UF`, rust `UC` |
+| `access_log_rcd_upstream_reset` | same — envoy `UF`/`Network_is_unreachable`, rust `UC` |
+| `access_log_rf_upstream_reset` | same — envoy `UF`, rust `UC` |
+| `admin_config_dump_server_info` | envoy routes backend via `192.168.65.2` (non-allow-listed host bridge IP) — `differential-host-bridge-ip-192-168-65-2` |
+
+**The phase's own RBAC surface is GREEN:** `envoy_config` unittests **583 passed** (incl. `cidr_range` 7
++ `network_rbac` 16); `envoy_filter` unittests **211 passed** (incl. `http_rbac` 5); `envoy_bin`
+unittests **37 passed** (incl. `network_rbac` 18); the `network_filter_rbac.rs` integration binary
+**21 passed** (18 pre-existing 67.1 + 3 new loopback backstops). Zero failures anywhere in `rbac`/`cidr`.
+
+## §7.5 gate (d) — fuzz — RECORDED EXPLICITLY
+
+**NO new fuzz target** (SPEC §D7). The pre-existing `parse_bootstrap` target is the only one
+(`ls crates/envoy-config/fuzz/fuzz_targets/` → `parse_bootstrap.rs`). It reaches the new `CidrRange`
+parser via the NEW, tracked corpus seed:
+
+```
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap | grep rbac_cidr
+crates/envoy-config/fuzz/corpus/parse_bootstrap/network_filter_rbac_cidr.yaml
+```
+
+Exercised short-budget (toolchain present — `cargo-fuzz 0.13.2`):
+
+```
+$ cargo +nightly fuzz run parse_bootstrap -- -runs=20000 -max_total_time=100    # FUZZ_EXIT=0
+#20000  DONE   cov: 15035 ft: 30435 corp: 2579/1675Kb ... exec/s: 10000
+Done 20000 runs in 2 second(s)
+```
+
+20000 runs, no crash / no panic / no leak. **Gate (d) is SATISFIED by the corpus seed** (not passed
+over in silence).
+
+## §7.5 gate (b) — differential surface (regression-only)
+
+**NO new fixture** (`0001`–`0073` unchanged). The differential crate ran as part of the workspace
+test run above; the ONLY differential REDs are the 5 environmental ones tabulated above — all
+pre-existing, CI-authoritative. The RBAC arms are covered in-process + at loopback (no differential
+fixture — the IP/port arms are structurally host-dependent, parent V-4). Regression surface holds.
+
+## §7.5 gate (c) — conformance
+
+Unchanged this phase; `tests/conformance/h2spec/known-failures.txt` untouched (never trimmed —
+`h2spec-3-5-2-preface-host-sensitive`). CI-authoritative.
+
+## §7.5 gate (f)
+
+`REVIEW.md` does not exist yet. (f) is UNMET by design — it is satisfied only by the SEPARATE state-5
+code-review (`superpowers:requesting-code-review`), which this session does NOT chain into (§5.1;
+ADR-0127 names 4→5 as un-chainable).
+
+## Verdict
+
+§7.5 (a), (b), (c), (d), (e) all satisfied (modulo the fully-adjudicated, CI-authoritative
+environmental REDs); (f) is the one unmet gate and is the state-5 review's job. `67.2` is
+IMPLEMENTATION-COMPLETE and VERIFIED → §5 state 5. **NO new ADR** (ledger head `ADR-0133`, next
+`ADR-0134` unreserved). `#![forbid(unsafe_code)]` holds. Per §5.1 this session did NOT chain into
+state-5.
