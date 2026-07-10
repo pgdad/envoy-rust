@@ -288,12 +288,13 @@ no-op clause below).
    (`UnexpectedTypedConfig`). Fixture `0001`'s two sides differ accordingly (ADR-0014 YAML shim).
    `direct_response` introduces no such asymmetry — both sides of fixture `0071` are identical.
 
-### `envoy.filters.network.rbac` (phase 67.1, ADR-0128 / ADR-0129 / ADR-0130 / ADR-0131)
+### `envoy.filters.network.rbac` (phase 67.1, ADR-0128 / ADR-0129 / ADR-0130 / ADR-0131 / ADR-0132)
 
-1. **Decision timing — ONE_TIME_ON_FIRST_BYTE.** The policy is evaluated exactly ONCE per
+1. **Decision timing — ONE_TIME_ON_FIRST_BYTE. This is a property of the RBAC *verdict*, NOT of the
+   chain's hand-off to the terminal filter (ADR-0132).** The policy is evaluated exactly ONCE per
    connection, **when the first downstream byte arrives** — not at connection establishment.
    Measured against `envoyproxy/envoy:v1.33.0` (**ADR-0131**, which corrects phase-67 SPEC R-2's
-   "before any downstream byte is read" reading):
+   "before any downstream byte is read" reading), on a `[rbac, echo]` chain:
 
    | client behavior | both proxies |
    |---|---|
@@ -302,11 +303,21 @@ no-op clause below).
    | first byte, immediately or after a delay | decision taken; a counter ticks |
 
    The wait is unbounded — a client idling 2 s before its first byte is still evaluated then.
-   envoy-rust implements this by peeking (not consuming) the first byte in
-   `envoy_listener::ChainHandler`. **No differential observable** for the two byte-less rows (no
-   fixture drives them); they are pinned in-process by
-   `chain_handler_skips_filters_when_client_closes_without_sending` and
+
+   **Upstream runs EVERY filter's `onNewConnection` at connection establishment — the TERMINAL
+   filter's included — and defers only the verdict to the first byte.** envoy-rust's
+   `envoy_listener::ChainHandler` instead peeks (without consuming) the first byte before delegating
+   to the terminal handler at all, which gates the *whole chain*. Those two models are
+   observationally identical **only** for a terminal filter with no establishment-time work. See
+   item **13** for the per-terminal consequences, which is where envoy-rust diverges.
+
+   **No differential observable** for the two byte-less rows (no fixture drives them); they are
+   pinned in-process by `chain_handler_skips_filters_when_client_closes_without_sending` and
    `connection_that_sends_nothing_is_never_evaluated`.
+
+   The data-less-FIN row is **per-terminal, not a chain property** (ADR-0132, measured): upstream
+   ticks no counter for `echo` / `http_connection_manager`, but **does** evaluate for `tcp_proxy`
+   (downstream half-close propagation). Owned by phase **`67.3`**.
 
 2. **DENY semantics.** Zero bytes written; clean EOF, **never an RST**; the client's already-sent
    bytes are discarded; a post-EOF client write is **accepted**. The terminal filter never runs.
@@ -369,6 +380,50 @@ no-op clause below).
     `listener_manager.total_listeners_active`, because phase 67.1 routed them through the shared
     `envoy_listener::Listener` accept loop. This is **toward** upstream parity (Envoy counts every
     listener). No fixture asserts set-equality over those names on a raw-TCP listener.
+
+13. **COMPOSITION with each terminal filter (ADR-0132, measured).** Upstream Envoy runs every
+    filter's `onNewConnection` at connection establishment, **including the terminal filter's** —
+    that is where `direct_response` writes its payload and where `tcp_proxy` connects upstream — and
+    defers only the RBAC verdict to the first downstream byte. Measured on `[rbac(any), <terminal>]`
+    against `envoyproxy/envoy:v1.33.0`, with `/stats` scraped **mid-flight** (client connection still
+    open) so each counter's *trigger* is disambiguated rather than inferred:
+
+    | terminal | connect, send nothing, stay open | connect + FIN, no data | connect + first byte | establishment-time work |
+    |---|---|---|---|---|
+    | `echo` | no tick; stays open | no tick; clean EOF | tick | **none** |
+    | `http_connection_manager` | no tick; stays open | no tick; clean EOF | tick | **none** |
+    | `direct_response` | **payload written, clean EOF, NO tick** | same | same | **writes payload, closes** |
+    | `tcp_proxy` | no tick; **banner delivered; `upstream_cx_total: 1`** | **TICKS** | tick | **connects upstream** |
+
+    envoy-rust's status, per terminal:
+
+    - **`echo`, `http_connection_manager` — full parity.** No establishment-time work, so
+      `ChainHandler`'s first-byte gate is observationally identical to upstream's model. Witnessed by
+      fixtures `0072`/`0073` and by `rbac_before_hcm_evaluates_on_the_first_request`.
+    - **`direct_response` — full parity, by BYPASSING the chain.** `envoy-bin` hands the connection
+      straight to `DirectResponseHandler` and never builds a `ChainHandler`. The `NetworkRbacFilter`
+      is still constructed, so all four `<stat_prefix>.rbac.*` counters **register at `0`** and the
+      stat tree matches; **no counter ever ticks**, and the payload is delivered and the connection
+      closed **including under `action: DENY`** — a DENY policy does *not* suppress the payload,
+      because the terminal filter writes and closes before any `onData` fires. Pinned by
+      `direct_response_delivers_payload_to_a_client_that_sends_nothing` and
+      `deny_does_not_suppress_the_direct_response_payload`. **No differential observable** — no
+      fixture composes `rbac` with `direct_response`.
+    - **`tcp_proxy` — RECORDED DIVERGENCE: REJECTED AT CONFIG LOAD, fail-loud, owner phase `67.3`.**
+      Upstream **accepts** `[rbac, tcp_proxy]`; envoy-rust rejects it with
+      `ConfigError::UnsupportedNetworkFilterChainComposition`, whose message names phase `67.3`.
+      Faithful behavior requires connecting upstream at establishment, relaying the server-first
+      banner immediately, and evaluating the chain on the first downstream byte *or* a data-less FIN
+      — which needs an establishment/data-phase split of `envoy_listener::ConnectionHandler`. That
+      split **fired `BOOTSTRAP_PROMPT.md` §6.1's mid-execution valve** and was carved into phase
+      `67.3` (§6.2). The rejection is a deliberate **fail-loud** divergence (ADR-0049 decision-2 (b))
+      and is strictly better than the alternative, which is a **runtime deadlock**: the client waits
+      forever for a banner while envoy-rust waits for a byte the client will never send. It is **not**
+      a §6.3 stub — it is a loud refusal with a named owner and its own ROADMAP row. **`67.3` DELETES
+      this rejection and its `ConfigError` variant.** **No differential observable** — no fixture
+      composes `rbac` with `tcp_proxy`. Pinned by `rejects_rbac_composed_with_tcp_proxy` and
+      `rbac_before_tcp_proxy_is_rejected_at_config_load`; the over-rejection guard is
+      `lone_tcp_proxy_chain_is_still_accepted` / `tcp_proxy_alone_is_still_accepted`.
 
 ---
 

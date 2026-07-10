@@ -49,31 +49,55 @@ fn spawn_envoy_bin(yaml: &str) -> (tokio::process::Child, tempfile::TempDir) {
     (child, dir)
 }
 
-/// Run `envoy-bin -c <yaml>` to completion and return (exit-ok, combined output).
+/// How long a config REJECTION may take before we conclude the config was in fact
+/// ACCEPTED. A rejected config exits non-zero within milliseconds; this bound only
+/// has to beat process startup.
+const VALIDATE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Run `envoy-bin -c <yaml>` and return (exit-ok, combined output).
 ///
 /// Both streams are captured: `install_tracing`'s `fmt()` subscriber writes the
 /// `envoy-rust exited with error` line — which carries the `ConfigError` — to
 /// STDOUT, while `main`'s argv/runtime-build failures `eprintln!` to STDERR.
 ///
-/// Used only by the negative-config tests: a rejected config exits non-zero fast.
-/// **Never call this on a valid config** — the binary would serve forever.
-fn validate_config(yaml: &str) -> (bool, String) {
+/// **Bounded.** A config envoy-bin ACCEPTS makes the binary serve forever, so an
+/// unbounded wait here turns "the rejection I asserted is missing" into a hung
+/// test rather than a failing one — the exact M-2 failure mode. Past
+/// [`VALIDATE_BUDGET`] the child is killed (`kill_on_drop`) and we report
+/// `ok = true`: it did not reject. The caller's `assert!(!ok, …)` then fails with
+/// a useful message instead of hanging CI.
+async fn validate_config(yaml: &str) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("envoy-rust.yaml");
     std::fs::File::create(&cfg)
         .unwrap()
         .write_all(yaml.as_bytes())
         .unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_envoy-bin"))
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_envoy-bin"))
         .arg("-c")
         .arg(&cfg)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .expect("run envoy-bin");
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&out.stderr));
-    (out.status.success(), combined)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn envoy-bin");
+    // On elapse the `wait_with_output` future — which owns `child` — is dropped,
+    // and `kill_on_drop` reaps the process.
+    match tokio::time::timeout(VALIDATE_BUDGET, child.wait_with_output()).await {
+        Ok(out) => {
+            let out = out.expect("run envoy-bin");
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            (out.status.success(), combined)
+        }
+        Err(_) => (
+            true,
+            format!(
+                "<envoy-bin did not exit within {VALIDATE_BUDGET:?}: the config was ACCEPTED \
+                 and the binary is serving>"
+            ),
+        ),
+    }
 }
 
 fn rbac_echo_cfg(port: u16, stat_prefix: &str, rules_block: &str) -> String {
@@ -459,7 +483,7 @@ static_resources:
                 stat_prefix: sp
 "#
     );
-    let (ok, output) = validate_config(&yaml);
+    let (ok, output) = validate_config(&yaml).await;
     assert!(!ok, "[rbac] alone must be rejected");
     assert!(output.contains("non-terminal filter"), "got {output}");
 }
@@ -485,7 +509,7 @@ static_resources:
                 stat_prefix: sp
 "#
     );
-    let (ok, output) = validate_config(&yaml);
+    let (ok, output) = validate_config(&yaml).await;
     assert!(!ok, "[echo, rbac] must be rejected");
     assert!(
         output.contains("must be the last filter"),
@@ -529,10 +553,115 @@ static_resources:
     child.kill().await.ok();
 }
 
+/// ADR-0132 decision 4: `[rbac, tcp_proxy]` is REJECTED AT CONFIG LOAD, fail-loud,
+/// until phase `67.3` lands the establishment/data-phase split.
+///
+/// `tcp_proxy` connects upstream at connection establishment and relays a
+/// server-first banner before any downstream byte. Under `ChainHandler`'s
+/// first-byte `peek` that composition is a **runtime deadlock** — the client waits
+/// for a banner while envoy-rust waits for a byte. Upstream Envoy ACCEPTS this
+/// config, so the rejection is a deliberate divergence in the fail-loud direction
+/// (`ADR-0049` decision-2 (b)), recorded in `BEHAVIOR_CONTRACT.md` and strictly
+/// better than shipping the hang. **`67.3` DELETES this rejection.**
+#[tokio::test]
+async fn rbac_before_tcp_proxy_is_rejected_at_config_load() {
+    let port = reserve_port();
+    let yaml = format!(
+        r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: {port} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: sp
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 1 }}
+"#
+    );
+    let (ok, output) = validate_config(&yaml).await;
+    assert!(!ok, "[rbac, tcp_proxy] must be rejected until 67.3");
+    assert!(
+        output.contains("envoy.filters.network.tcp_proxy")
+            && output.contains("envoy.filters.network.rbac"),
+        "the error must name BOTH filters; got {output}",
+    );
+    assert!(
+        output.contains("67.3"),
+        "the error must name its owning phase, never be silent (ADR-0132 D4); got {output}",
+    );
+}
+
+/// ADR-0132 decision 4, the NEGATIVE half: `tcp_proxy` ALONE is still accepted.
+/// The rejection is about the COMPOSITION, not about `tcp_proxy`. Guards against
+/// a fix that over-rejects and breaks fixture `0003`.
+#[tokio::test]
+async fn tcp_proxy_alone_is_still_accepted() {
+    let admin_port = reserve_port();
+    let yaml = format!(
+        r#"
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: {admin_port} }}
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: 0 }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 1 }}
+"#
+    );
+    let (mut child, _dir) = spawn_envoy_bin(&yaml);
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("a lone tcp_proxy chain must still start");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "process must still be alive"
+    );
+    child.kill().await.ok();
+}
+
 /// D1 / SPEC R-3: an EMPTY `stat_prefix` is rejected at startup.
 #[tokio::test]
 async fn empty_stat_prefix_is_rejected() {
-    let (ok, output) = validate_config(&rbac_echo_cfg(reserve_port(), r#""""#, ""));
+    let (ok, output) = validate_config(&rbac_echo_cfg(reserve_port(), r#""""#, "")).await;
     assert!(!ok, "empty stat_prefix must be rejected");
     assert!(output.contains("stat_prefix"), "got {output}");
 }
@@ -557,7 +686,7 @@ async fn l4_unevaluable_matcher_leaves_are_rejected() {
         let rules = format!(
             "                rules:\n                  action: ALLOW\n                  policies:\n                    p0:\n                      permissions: {perms}\n                      principals: [{{ any: true }}]"
         );
-        let (ok, output) = validate_config(&rbac_echo_cfg(reserve_port(), "sp", &rules));
+        let (ok, output) = validate_config(&rbac_echo_cfg(reserve_port(), "sp", &rules)).await;
         assert!(!ok, "{arm} must be rejected at L4");
         assert!(
             output.contains(arm),

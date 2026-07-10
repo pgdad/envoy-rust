@@ -3067,6 +3067,39 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                     last_filter: last.name.clone(),
                 });
             }
+            // 67.1 (ADR-0132 decision 4): reject a NON-TERMINAL prefix in front of
+            // `tcp_proxy`, fail-loud, until phase `67.3` lands the establishment/
+            // data-phase split.
+            //
+            // `tcp_proxy` connects upstream at connection ESTABLISHMENT and relays
+            // a server-first banner before any downstream byte. `ChainHandler`
+            // gates the whole chain — terminal handler included — on that first
+            // byte, so this composition DEADLOCKS at runtime. Upstream Envoy
+            // accepts the config, so this is a recorded divergence (ADR-0049
+            // decision-2 (b)), and it is strictly better than the hang.
+            //
+            // Only `tcp_proxy` needs this. `echo` / `http_connection_manager` do no
+            // establishment-time work (measured), and `direct_response` bypasses the
+            // chain in `envoy-bin` (ADR-0132 decision 2).
+            //
+            // Placed AFTER both terminal-position checks above so their errors keep
+            // winning: `[echo, rbac, tcp_proxy]` still reports terminal-not-last.
+            //
+            // **`67.3` DELETES this block and its `ConfigError` variant.**
+            if chain_len >= 2
+                && let Some(last) = chain.filters.last()
+                && last.name == crate::TCP_PROXY_FILTER
+            {
+                let non_terminal = &chain.filters[chain_len - 2];
+                return Err(
+                    crate::ConfigError::UnsupportedNetworkFilterChainComposition {
+                        listener: listener.name.clone(),
+                        chain_index,
+                        non_terminal: non_terminal.name.clone(),
+                        terminal: last.name.clone(),
+                    },
+                );
+            }
             for filter in &mut chain.filters {
                 match filter.name.as_str() {
                     crate::ECHO_FILTER => {
@@ -5582,6 +5615,107 @@ static_resources:
                 } if listener == "l0" && last_filter == crate::NETWORK_RBAC_FILTER
             ),
             "got {err:?}",
+        );
+    }
+
+    /// Builds `[<prefix filters>, tcp_proxy(cluster=backend)]` plus a `backend`
+    /// cluster, for the ADR-0132 decision-4 composition tests below.
+    fn chain_before_tcp_proxy_yaml(prefix_filters: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners:
+    - name: l0
+      address:
+        socket_address: {{ address: 127.0.0.1, port_value: 10000 }}
+      filter_chains:
+        - filters:
+{prefix_filters}
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: 1 }}
+"#
+        )
+    }
+
+    const RBAC_FILTER_YAML: &str = r#"            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: sp"#;
+
+    /// 67.1 (ADR-0132 decision 4): `[rbac, tcp_proxy]` is REJECTED at config load,
+    /// fail-loud, until phase `67.3`.
+    ///
+    /// `tcp_proxy` connects upstream at connection establishment and relays a
+    /// server-first banner before any downstream byte; `ChainHandler` gates the
+    /// whole chain on that byte, so the composition DEADLOCKS at runtime. Upstream
+    /// Envoy ACCEPTS this config — a recorded, deliberate divergence (ADR-0049
+    /// decision-2 (b)) that is strictly better than the hang.
+    ///
+    /// **`67.3` DELETES the rejection and this test.**
+    #[test]
+    fn rejects_rbac_composed_with_tcp_proxy() {
+        let yaml = chain_before_tcp_proxy_yaml(RBAC_FILTER_YAML);
+        let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
+        let err = validate(&mut b).expect_err("[rbac, tcp_proxy] must be rejected until 67.3");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedNetworkFilterChainComposition {
+                    ref listener,
+                    chain_index: 0,
+                    ref non_terminal,
+                    ref terminal,
+                } if listener == "l0"
+                    && non_terminal == crate::NETWORK_RBAC_FILTER
+                    && terminal == crate::TCP_PROXY_FILTER
+            ),
+            "got {err:?}",
+        );
+        // Never silent: the message names its owning phase.
+        assert!(err.to_string().contains("67.3"), "got {err}");
+    }
+
+    /// ADR-0132 decision 4 does NOT reject `tcp_proxy` — only the COMPOSITION.
+    /// A lone `tcp_proxy` chain (fixture `0003`) must still validate.
+    #[test]
+    fn lone_tcp_proxy_chain_is_still_accepted() {
+        let yaml = chain_before_tcp_proxy_yaml("");
+        let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
+        validate(&mut b).expect("a lone tcp_proxy chain stays valid");
+    }
+
+    /// ERROR PRECEDENCE, extended for ADR-0132 decision 4. `[echo, rbac, tcp_proxy]`
+    /// violates BOTH the terminal-not-last rule AND the composition rule. The
+    /// terminal-not-last error must still WIN — the composition check is placed
+    /// after it deliberately. If a future edit hoists the composition check ahead
+    /// of the terminal scan, this test catches it.
+    #[test]
+    fn terminal_not_last_error_wins_over_unsupported_composition() {
+        let prefix = format!("            - name: envoy.filters.network.echo\n{RBAC_FILTER_YAML}");
+        let yaml = chain_before_tcp_proxy_yaml(&prefix);
+        let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
+        let err = validate(&mut b).expect_err("[echo, rbac, tcp_proxy] must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::NetworkFilterNotTerminal { ref name, .. }
+                    if name == crate::ECHO_FILTER
+            ),
+            "terminal-not-last must WIN over the composition rejection; got {err:?}",
         );
     }
 

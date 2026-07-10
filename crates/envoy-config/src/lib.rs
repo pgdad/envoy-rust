@@ -111,6 +111,44 @@ pub enum ConfigError {
         chain_index: usize,
         last_filter: String,
     },
+
+    /// 67.1 (ADR-0132 decision 4): a network filter chain composing a NON-TERMINAL
+    /// filter with a terminal filter that does **establishment-time work**.
+    ///
+    /// Upstream Envoy runs every filter's `onNewConnection` at connection
+    /// establishment — the terminal filter's included — and defers only the RBAC
+    /// verdict to the first downstream byte (measured, `envoyproxy/envoy:v1.33.0`).
+    /// envoy-rust's `envoy_listener::ChainHandler` instead gates the whole chain,
+    /// terminal handler included, on that first byte. For `echo` and
+    /// `http_connection_manager` — which have NO establishment-time work — the two
+    /// models are observationally identical. For `tcp_proxy`, which connects
+    /// upstream and relays a server-first banner before any downstream byte, the
+    /// composition is a **runtime DEADLOCK**: the client waits for the banner while
+    /// envoy-rust waits for a byte the client will never send.
+    ///
+    /// (`direct_response`, the other establishment-time terminal, needs no rejection
+    /// — `envoy-bin` bypasses the chain for it entirely, which is exact measured
+    /// parity. See ADR-0132 decision 2.)
+    ///
+    /// This rejection is a **deliberate FAIL-LOUD divergence** (`ADR-0049`
+    /// decision-2 (b)): upstream Envoy ACCEPTS this config. It is strictly better
+    /// than shipping the hang, and it is not a `BOOTSTRAP_PROMPT.md` §6.3 stub — the
+    /// correct behavior is chartered to phase **`67.3`**, which owns the
+    /// establishment/data-phase split of `envoy_listener::ConnectionHandler` and
+    /// **DELETES this variant**. Recorded in `BEHAVIOR_CONTRACT.md`, never silent.
+    #[error(
+        "listener {listener:?} filter_chains[{chain_index}]: non-terminal filter {non_terminal:?} \
+         before terminal filter {terminal:?} is not yet supported — {terminal:?} does \
+         establishment-time work before the first downstream byte, which envoy-rust's network \
+         filter chain cannot yet express (phase 67.3 owns this; upstream Envoy accepts this config)"
+    )]
+    UnsupportedNetworkFilterChainComposition {
+        listener: String,
+        chain_index: usize,
+        non_terminal: String,
+        terminal: String,
+    },
+
     #[error("unknown cluster '{0}'")]
     UnknownCluster(String),
     /// 18 D1 (L8, ADR-0049): `dynamic_resources.cds_config.resource_api_version`
