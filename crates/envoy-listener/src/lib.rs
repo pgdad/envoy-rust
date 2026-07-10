@@ -111,6 +111,67 @@ pub async fn close_with_drain(mut stream: tokio::net::TcpStream) -> Result<(), s
     Ok(())
 }
 
+/// 67.1 D4/D5: the network-filter chain, expressed as a [`ConnectionHandler`]
+/// that wraps another [`ConnectionHandler`].
+///
+/// On each accepted connection it runs every non-terminal filter's
+/// `on_new_connection` in configured order. The first `StopIteration` closes the
+/// connection via [`close_with_drain`] — zero bytes, clean EOF, no RST — and the
+/// TERMINAL handler never runs. When every filter returns `Continue`, the
+/// connection is handed to `inner`.
+///
+/// Because it wraps an arbitrary `Arc<dyn ConnectionHandler>`, ONE implementation
+/// covers every terminal filter — `echo`, `direct_response`, `tcp_proxy` and
+/// `http_connection_manager` — with no per-filter special-casing. The config
+/// validator's `NetworkFilterChainNotTerminated` rule (67.1 D2) guarantees a
+/// terminal handler always exists, so the iteration always terminates.
+///
+/// On a TLS listener this runs on the raw `TcpStream` BEFORE the TLS handshake
+/// (`ChainHandler` wraps `TlsAcceptingHandler`). For the matcher arms that exist
+/// — `any` + combinators here, peer/local addresses in `67.2` — the verdict is
+/// identical either way, because TLS alters neither address.
+pub struct ChainHandler {
+    filters: Arc<[Arc<dyn NetworkFilter>]>,
+    inner: Arc<dyn ConnectionHandler>,
+}
+
+impl ChainHandler {
+    /// `filters` must contain only NON-terminal filters, in configured order.
+    /// An empty `filters` list makes this handler transparent; callers should
+    /// skip the wrapper entirely in that case (see `envoy-bin::main`).
+    pub fn new(filters: Vec<Arc<dyn NetworkFilter>>, inner: Arc<dyn ConnectionHandler>) -> Self {
+        Self {
+            filters: filters.into(),
+            inner,
+        }
+    }
+}
+
+impl ConnectionHandler for ChainHandler {
+    fn handle(
+        &self,
+        downstream: tokio::net::TcpStream,
+    ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        let filters = Arc::clone(&self.filters);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let conn = ConnectionInfo {
+                peer_addr: downstream.peer_addr()?,
+                local_addr: downstream.local_addr()?,
+            };
+            for filter in filters.iter() {
+                if filter.on_new_connection(&conn) == NetworkFilterStatus::StopIteration {
+                    // SPEC R-2: zero bytes, clean EOF, never an RST; the
+                    // terminal filter never runs.
+                    close_with_drain(downstream).await?;
+                    return Ok(());
+                }
+            }
+            inner.handle(downstream).await
+        })
+    }
+}
+
 /// Errors returned by `Listener::bind` and `Listener::serve`.
 #[derive(Debug, thiserror::Error)]
 pub enum ListenerError {
@@ -196,6 +257,12 @@ pub struct Listener {
     /// — the gauge stays at 1 per configured listener regardless of the
     /// worker count.
     count_listener_active: bool,
+    /// 67.1: publishes `accept_loop`'s in-flight `JoinSet` length after every
+    /// select iteration. The M66-3 reaping witness reads it; production code may
+    /// use it for introspection. Distinct from `cx_active`, which is decremented
+    /// INSIDE each connection task and therefore cannot observe an unreaped
+    /// completed task.
+    pending_tasks: tokio::sync::watch::Sender<usize>,
 }
 
 /// 08.2 Task 6 (D12): RAII guard that increments
@@ -297,6 +364,7 @@ impl Listener {
             cx_accept_failed,
             listener_manager_active,
             count_listener_active: true,
+            pending_tasks: tokio::sync::watch::channel(0usize).0,
         })
     }
 
@@ -343,6 +411,9 @@ impl Listener {
                 cx_accept_failed: Arc::clone(&cx_accept_failed),
                 listener_manager_active: Arc::clone(&listener_manager_active),
                 count_listener_active: i == 0,
+                // 67.1: one watch per shard — each shard runs its own accept
+                // loop over its own SO_REUSEPORT socket, hence its own JoinSet.
+                pending_tasks: tokio::sync::watch::channel(0usize).0,
             })
             .collect())
     }
@@ -361,6 +432,21 @@ impl Listener {
     /// wiring is internal to `Listener::serve`.
     pub(crate) fn listener_manager_active(&self) -> &Arc<envoy_stats::Gauge> {
         &self.listener_manager_active
+    }
+
+    /// 67.1: in-flight connection tasks currently held by the accept loop's
+    /// `JoinSet`. Callable only before [`Listener::serve`] consumes `self`; use
+    /// [`Listener::pending_tasks_watch`] to keep observing afterwards.
+    pub fn pending_tasks(&self) -> usize {
+        *self.pending_tasks.borrow()
+    }
+
+    /// 67.1: a receiver that keeps observing `pending_tasks` after
+    /// [`Listener::serve`] consumes `self`. Used by the M66-3 reaping witness —
+    /// `cx_active` cannot serve that role, being decremented inside the spawned
+    /// task while its `JoinSet` entry still lingers.
+    pub fn pending_tasks_watch(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.pending_tasks.subscribe()
     }
 
     /// Accept loop with shutdown-gated graceful drain. On either `shutdown`
@@ -409,6 +495,7 @@ impl Listener {
         let cx_total = self.cx_total;
         let cx_active = self.cx_active;
         let cx_accept_failed = self.cx_accept_failed;
+        let pending_tasks = self.pending_tasks;
 
         // Single-socket path (the default): run the original inline accept loop
         // directly, so behavior is byte-for-byte the pre-SO_REUSEPORT code.
@@ -422,6 +509,7 @@ impl Listener {
                 cx_accept_failed,
                 shutdown,
                 drain,
+                pending_tasks,
             )
             .await;
         }
@@ -447,6 +535,9 @@ impl Listener {
             let cx_accept_failed = Arc::clone(&cx_accept_failed);
             let drain = Arc::clone(&drain);
             let mut sd_rx = sd_rx.clone();
+            // 67.1: every fan-out loop publishes its own socket's in-flight
+            // count onto the one shared watch.
+            let pending_tasks = pending_tasks.clone();
             loops.spawn(async move {
                 // Per-loop shutdown: resolve once the broadcast flag is true.
                 // `wait_for` checks the current value first, so an already-fired
@@ -462,6 +553,7 @@ impl Listener {
                     cx_accept_failed,
                     shutdown,
                     drain,
+                    pending_tasks,
                 )
                 .await
             });
@@ -573,6 +665,7 @@ async fn accept_loop(
     cx_accept_failed: Arc<envoy_stats::Counter>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: Arc<DrainState>,
+    pending_tasks: tokio::sync::watch::Sender<usize>,
 ) -> Result<(), ListenerError> {
     let mut join_set: tokio::task::JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>> =
         tokio::task::JoinSet::new();
@@ -639,6 +732,13 @@ async fn accept_loop(
                 }
             }
         }
+        // 67.1 (the M66-3 witness): republish the in-flight task count after
+        // every select iteration — including the `join_next()` arm just above,
+        // which REAPS a completed task. A loop without that arm would see this
+        // climb without bound across sequential connections. `send_replace`
+        // rather than `send` so the value is updated even when nothing has
+        // subscribed (the production case).
+        pending_tasks.send_replace(join_set.len());
     }
 
     // Drain.
@@ -883,6 +983,7 @@ mod tests {
                 .register_gauge("listener_manager.total_listeners_active")
                 .unwrap(),
             count_listener_active: true,
+            pending_tasks: tokio::sync::watch::channel(0usize).0,
         }
     }
 
@@ -2197,6 +2298,215 @@ filter_chains:
         c.write_all(b"y")
             .await
             .expect("second post-EOF write must not be reset");
+    }
+
+    /// 67.1 D4: `ChainHandler` runs each filter's `on_new_connection` in order
+    /// and, when all return `Continue`, delegates to the terminal handler.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_handler_continue_delegates_to_terminal_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>);
+        impl NetworkFilter for Counting {
+            fn on_new_connection(&self, _c: &ConnectionInfo) -> NetworkFilterStatus {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                NetworkFilterStatus::Continue
+            }
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![
+                Arc::new(Counting(Arc::clone(&hits))),
+                Arc::new(Counting(Arc::clone(&hits))),
+            ],
+            Arc::new(EchoHandler),
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            chain.handle(s).await.unwrap();
+        });
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"payload").await.unwrap();
+        let mut buf = [0u8; 7];
+        c.read_exact(&mut buf).await.expect("terminal echo ran");
+        assert_eq!(&buf, b"payload");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "both filters ran, in order");
+    }
+
+    /// 67.1 D4 / phase-67 SPEC R-2: `StopIteration` closes the connection with
+    /// ZERO bytes and a clean EOF, and THE TERMINAL FILTER NEVER RUNS.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_handler_stop_iteration_closes_and_skips_terminal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Stop;
+        impl NetworkFilter for Stop {
+            fn on_new_connection(&self, _c: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::StopIteration
+            }
+        }
+        struct Tripwire(Arc<AtomicBool>);
+        impl ConnectionHandler for Tripwire {
+            fn handle(
+                &self,
+                _d: tokio::net::TcpStream,
+            ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>
+            {
+                self.0.store(true, Ordering::SeqCst);
+                Box::pin(async move { Ok(()) })
+            }
+        }
+        let ran = Arc::new(AtomicBool::new(false));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(Stop)],
+            Arc::new(Tripwire(Arc::clone(&ran))),
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            chain.handle(s).await.unwrap();
+        });
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        c.write_all(b"discarded").await.unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.expect("clean EOF, not RST");
+        assert!(out.is_empty(), "DENY writes zero bytes, got {out:?}");
+        assert!(!ran.load(Ordering::SeqCst), "terminal handler must NOT run");
+    }
+
+    /// 67.1 D4: a filter that STOPS short-circuits — later filters do not run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_handler_stop_short_circuits_later_filters() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Stop;
+        impl NetworkFilter for Stop {
+            fn on_new_connection(&self, _c: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::StopIteration
+            }
+        }
+        struct Tripwire(Arc<AtomicBool>);
+        impl NetworkFilter for Tripwire {
+            fn on_new_connection(&self, _c: &ConnectionInfo) -> NetworkFilterStatus {
+                self.0.store(true, Ordering::SeqCst);
+                NetworkFilterStatus::Continue
+            }
+        }
+        let ran = Arc::new(AtomicBool::new(false));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(Stop), Arc::new(Tripwire(Arc::clone(&ran)))],
+            Arc::new(EchoHandler),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            chain.handle(s).await.unwrap();
+        });
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut out = Vec::new();
+        c.read_to_end(&mut out).await.unwrap();
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "filters after a Stop must not run"
+        );
+    }
+
+    /// 67.1 D4: `ChainHandler` hands the filter the connection's REAL peer and
+    /// local addresses, read from the accepted socket. `67.2`'s IP/port matcher
+    /// arms depend on this being exact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chain_handler_populates_connection_info_from_the_socket() {
+        use std::sync::Mutex;
+        struct Capture(Arc<Mutex<Option<ConnectionInfo>>>);
+        impl NetworkFilter for Capture {
+            fn on_new_connection(&self, c: &ConnectionInfo) -> NetworkFilterStatus {
+                *self.0.lock().unwrap() = Some(*c);
+                NetworkFilterStatus::Continue
+            }
+        }
+        let seen = Arc::new(Mutex::new(None));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(Capture(Arc::clone(&seen)))],
+            Arc::new(EchoHandler),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            chain.handle(s).await.unwrap();
+        });
+        let c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_addr = c.local_addr().unwrap();
+        drop(c);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let info = seen.lock().unwrap().expect("filter saw the connection");
+        assert_eq!(info.local_addr, addr, "local_addr is the listener address");
+        assert_eq!(
+            info.peer_addr, client_addr,
+            "peer_addr is the client address"
+        );
+    }
+
+    /// 67.1 — the M66-3 REGRESSION WITNESS.
+    ///
+    /// M66-3: "`serve()` never reaps completed `JoinSet` tasks", shared verbatim
+    /// by the two standalone accept loops phase 67.1 DELETES (`echo.rs`,
+    /// `direct_response.rs`). The surviving loop — `accept_loop` — reaps via its
+    /// `join_next()` select arm. This test proves it: after N sequential
+    /// connections have completed, the `JoinSet` is empty.
+    ///
+    /// `cx_active` cannot witness this: it is decremented INSIDE the spawned
+    /// task, so it reads 0 while the JoinSet entry still lingers. Only
+    /// `pending_tasks()` (which publishes `join_set.len()`) sees the difference.
+    ///
+    /// DELETE THE `join_next()` SELECT ARM IN `accept_loop` AND THIS TEST MUST
+    /// FAIL (the count would climb to N).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sequential_connections_do_not_accumulate_joinset_tasks() {
+        const N: usize = 50;
+        let cfg = mk_listener_cfg("127.0.0.1", 0);
+        let registry = mk_registry();
+        let listener = Listener::bind(&cfg, Arc::new(NullHandler), Arc::clone(&registry))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let pending = listener.pending_tasks_watch();
+
+        let drain = Arc::new(DrainState::new(&registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(listener.serve(
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
+
+        for _ in 0..N {
+            let c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            drop(c);
+            tokio::task::yield_now().await;
+        }
+        // Give the accept loop time to observe every completion.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let leaked = *pending.borrow();
+        assert!(
+            leaked <= 1,
+            "JoinSet leaked {leaked} completed tasks across {N} sequential connections \
+             (non-reaping regression — see M66-3)",
+        );
+
+        tx.send(()).expect("shutdown");
+        tokio::time::timeout(std::time::Duration::from_secs(7), server)
+            .await
+            .expect("serve resolves")
+            .expect("join")
+            .expect("serve ok");
     }
 }
 
