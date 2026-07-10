@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 mod argv;
 mod direct_response;
 mod echo;
+mod network_rbac;
 mod tls_handler;
 
 fn main() -> std::process::ExitCode {
