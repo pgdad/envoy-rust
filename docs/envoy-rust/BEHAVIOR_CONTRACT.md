@@ -288,7 +288,7 @@ no-op clause below).
    (`UnexpectedTypedConfig`). Fixture `0001`'s two sides differ accordingly (ADR-0014 YAML shim).
    `direct_response` introduces no such asymmetry — both sides of fixture `0071` are identical.
 
-### `envoy.filters.network.rbac` (phase 67.1, ADR-0128 / ADR-0129 / ADR-0130 / ADR-0131 / ADR-0132)
+### `envoy.filters.network.rbac` (phase 67.1, ADR-0128 / ADR-0129 / ADR-0130 / ADR-0131 / ADR-0132; connection-level matcher arms phase 67.2, ADR-0133)
 
 1. **Decision timing — ONE_TIME_ON_FIRST_BYTE. This is a property of the RBAC *verdict*, NOT of the
    chain's hand-off to the terminal filter (ADR-0132).** The policy is evaluated exactly ONCE per
@@ -378,11 +378,11 @@ no-op clause below).
     `deny_unknown_fields`) and emits `shadow_allowed` / `shadow_denied` as constant `0` so the stat
     tree matches. **No differential observable.**
 
-11. **Scope — matcher arms.** Phase 67.1 ships `any` plus the `and`/`or`/`not` combinators only.
+11. **Scope — matcher arms.** Phase 67.1 shipped `any` plus the `and`/`or`/`not` combinators only.
     The connection-level arms (`direct_remote_ip`, `remote_ip`, `source_ip`, `destination_port`,
-    `destination_ip`) land in phase **67.2** and are **not stubbed** — they do not exist, and the
-    parser rejects them as unknown keys. `Action::LOG` is deferred (**CF-67-2**); payload-visible
-    (`on_data`-time) filter iteration is deferred (**CF-67-3**).
+    `destination_ip`) landed in phase **67.2** (ADR-0133) and now exist — see item **14**.
+    `Action::LOG` is deferred (**CF-67-2**); payload-visible (`on_data`-time) filter iteration is
+    deferred (**CF-67-3**).
 
 12. **Scope — per-listener stats (ADR-0130).** `echo` and `direct_response` listeners now emit
     `listener.<name>.downstream_cx_{total,active,accept_failed}` and count in
@@ -433,6 +433,57 @@ no-op clause below).
       composes `rbac` with `tcp_proxy`. Pinned by `rejects_rbac_composed_with_tcp_proxy` and
       `rbac_before_tcp_proxy_is_rejected_at_config_load`; the over-rejection guard is
       `lone_tcp_proxy_chain_is_still_accepted` / `tcp_proxy_alone_is_still_accepted`.
+
+14. **Connection-level matcher arms (phase 67.2, ADR-0133; wire shapes MEASURED against
+    `envoyproxy/envoy:v1.33.0` with `--mode validate`).** The network `rbac` filter evaluates five
+    connection-level arms in addition to `any` + the `and`/`or`/`not` combinators:
+
+    | arm | kind | evaluates against |
+    |---|---|---|
+    | `direct_remote_ip` | Principal | `peer_addr.ip()` (downstream connection source) |
+    | `remote_ip` | Principal | `peer_addr.ip()` |
+    | `source_ip` | Principal | `peer_addr.ip()` |
+    | `destination_ip` | Permission | `local_addr.ip()` (listener/local address) |
+    | `destination_port` | Permission | `local_addr.port()` |
+
+    - **`remote_ip` ≡ `direct_remote_ip` ≡ `source_ip` today.** Upstream distinguishes
+      `direct_remote_ip` (the immediate peer) from `remote_ip` (after a PROXY-protocol / XFF
+      **listener filter** rewrites the remote address); envoy-rust has **no listener filters**, so
+      all three evaluate `peer_addr.ip()` — modeled as three enum variants sharing ONE evaluation
+      expression, not silently aliased. `source_ip` is a **deprecated** upstream alias of
+      `direct_remote_ip` that upstream accepts with a deprecation warning; envoy-rust does **not**
+      replicate the warning (**no differential observable**).
+
+    - **`CidrRange` wire shape (X-1).** `address_prefix` is a bare IP string parsed to `IpAddr`;
+      `prefix_len` is Envoy's `UInt32Value`, which upstream accepts as EITHER a bare integer
+      (`prefix_len: 24`) OR the wrapper (`prefix_len: {value: 24}`). **envoy-rust models it as a bare
+      `u8` and REJECTS the wrapper**, fail-loud — matching the codebase's `Buffer::max_request_bytes`
+      UInt32Value posture (ADR-0063) and the ADR-0049 stance. An IPv4-mapped-IPv6 peer
+      (`::ffff:127.0.0.1`) is **canonicalised to IPv4** before matching, so it matches an IPv4
+      range — upstream's behavior. An absent `prefix_len` is a fatal serde missing-field error
+      (upstream defaults it to 0). **No differential observable** for any of these — 67.2 ships no
+      new fixture.
+
+    - **`destination_port` is a `u16`.** Upstream models it as a plain `uint32` with PGV `lte: 65535`
+      that itself rejects the `{value:N}` wrapper AND values > 65535 (both measured), so a bare `u16`
+      is exactly faithful (serde rejects the wrapper and > 65535 for free).
+
+    - **RECORDED DIVERGENCE — the HTTP RBAC filter REJECTS these L4 arms, fail-loud.** `Permission`
+      and `Principal` are shared with `envoy.filters.http.rbac`. Upstream Envoy **ACCEPTS**
+      `destination_port` / `direct_remote_ip` etc. in an HTTP rbac filter (measured `configuration
+      OK`); envoy-rust rejects them at filter construction (`FilterError::InvalidConfig`,
+      startup-fatal). This is a deliberate **fail-loud divergence** (ADR-0049 decision-2 (b)), **not
+      symmetric parity** — it corrects the `67.2/SPEC.md` §D3 "parity" framing. **No differential
+      observable** — no HTTP rbac fixture uses an L4 arm.
+
+    - **Why no differential fixture (parent PLAN-VERIFY V-4, measured).** The IP arms would see this
+      host's Docker bridge address and `destination_port` a per-proxy `{{PORT}}` that differs between
+      the two proxies, so the arms are not host-deterministic under the Docker harness. They are
+      witnessed **in-process** bound to `127.0.0.1` with a known port (engine unit tests +
+      `direct_remote_ip_loopback_allows_end_to_end` / `direct_remote_ip_non_loopback_denies_end_to_end`
+      / `destination_port_end_to_end`), where peer and local addresses are exact — the phase-25.1
+      foundation-slice precedent. The differential surface for 67.2 is **regression-only** (`0001`–`0073`
+      stay green).
 
 ---
 

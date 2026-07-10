@@ -136,3 +136,45 @@ are EXACT.
 
 **Result:** `cargo build -p envoy-bin` then `cargo test -p envoy-bin --test network_filter_rbac`
 → **21 passed** (18 pre-existing 67.1 + 3 new).
+
+---
+
+## Task 6 — `BEHAVIOR_CONTRACT.md` rows + fuzz corpus seed — ✅ DONE
+
+**Commit:** (see `phase 67.2 task 6`). Docs + fuzz seed.
+
+- `docs/envoy-rust/BEHAVIOR_CONTRACT.md`: added item **14** to the `envoy.filters.network.rbac`
+  section — the five arms and what each evaluates against; the `remote_ip` ≡ `direct_remote_ip` ≡
+  `source_ip` equivalence (no listener filters) and `source_ip` deprecation (warning not replicated);
+  the `CidrRange` bare-`u8` `prefix_len` vs wrapper divergence + IPv4-mapped-IPv6 canonicalisation;
+  `destination_port` as `u16`; the CORRECTED framing that the HTTP RBAC filter rejecting these L4
+  arms is a deliberate FAIL-LOUD divergence (upstream ACCEPTS them, measured), NOT parity; and the
+  no-differential-fixture rationale. Updated item **11** (arms now exist as of 67.2) and the section
+  header (adds "connection-level matcher arms phase 67.2, ADR-0133").
+- **Fuzz corpus seed:** `crates/envoy-config/fuzz/corpus/parse_bootstrap/network_filter_rbac_cidr.yaml`
+  — a `[rbac, echo]` bootstrap whose network rbac policy exercises `destination_ip`,
+  `destination_port`, and all three source-IP arms with `CidrRange`s. Added its `!`-un-ignore line to
+  `crates/envoy-config/fuzz/.gitignore`. **NO new fuzz target** — the pre-existing `parse_bootstrap`
+  target reaches the new `CidrRange` parser (§7.5 gate (d) satisfied by the seed; state-4 records it
+  explicitly). Proven tracked: `git ls-files …/corpus | grep rbac_cidr` lists it. The seed config is
+  ACCEPTED by `target/debug/envoy-bin` (parses + validates + binds), so it is a valid CidrRange seed.
+
+---
+
+## State-3 implementation COMPLETE — handoff to state-4
+
+All 6 PLAN tasks landed on `main` (commits `f31b21c` → task-6). Per §5.1 this session STOPS here and
+does NOT run the §7.5 verification gate — that is the state-4 session's job.
+
+**§6.1 mid-execution valve:** never fired. No single task's sub-steps blew past ~10 items. The plan's
+~695 LoC / 6-task estimate held.
+
+**State-4 session must (per PLAN "State-4 verification checklist"):** run + quote into a state-4
+record `cargo build --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features
+-- -D warnings` (watch the two removed `#[allow(clippy::only_used_in_recursion)]`), `cargo fmt --all
+-- --check`, `cargo test --workspace --no-fail-fast` (the ~5 environmental REDs are CI-authoritative;
+never pipe through `tail`), `cargo deny check`; RECORD §7.5 gate (d) EXPLICITLY (no new fuzz target;
+pre-existing `parse_bootstrap` + the new `network_filter_rbac_cidr.yaml` seed); confirm the
+regression-only differential surface (`0001`–`0073` green) after `cargo build -p envoy-bin`; confirm
+CI green on the FULL 40-char SHA. **Command note:** `envoy-bin` is a BINARY crate — use `--bins`, not
+`--lib`, for its lib-style tests (`cargo test -p envoy-bin` also works).

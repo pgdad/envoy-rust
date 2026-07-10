@@ -54,5 +54,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/upstream_cluster.yaml
 !corpus/parse_bootstrap/network_filter_direct_response.yaml
 !corpus/parse_bootstrap/network_filter_rbac.yaml
+!corpus/parse_bootstrap/network_filter_rbac_cidr.yaml
 artifacts/
 target/
