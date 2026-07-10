@@ -240,14 +240,19 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
         match filter.name.as_str() {
             envoy_config::ECHO_FILTER => {
-                let lst = TcpListener::bind(bind_addr)
-                    .await
-                    .with_context(|| format!("binding echo listener to {bind_addr}"))?;
-                tracing::info!(addr = %bind_addr, "envoy-rust listening (echo)");
-                let shutdown = token.clone();
-                set.spawn(async move {
-                    echo::serve(lst, async move { shutdown.cancelled().await }).await
-                });
+                bind_and_spawn_listener(
+                    listener_cfg,
+                    std::sync::Arc::new(echo::EchoHandler),
+                    &registry,
+                    listener_concurrency,
+                    "echo",
+                    bind_addr,
+                    || tracing::info!(addr = %bind_addr, "envoy-rust listening (echo)"),
+                    &token,
+                    &drain,
+                    &mut set,
+                )
+                .await?;
             }
             envoy_config::DIRECT_RESPONSE_FILTER => {
                 let Some(envoy_config::TypedConfig::DirectResponse(dr_cfg)) =

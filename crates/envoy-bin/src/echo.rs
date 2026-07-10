@@ -1,65 +1,43 @@
-use std::future::Future;
-use std::time::Duration;
+//! `envoy.filters.network.echo` — a TERMINAL network filter.
+//!
+//! Each accepted connection copies bytes from the read half to the write half
+//! until the client half-closes, mirroring upstream Envoy's
+//! `envoy.filters.network.echo`.
+//!
+//! 67.1 (ADR-0130): the standalone accept loop this module used to own was
+//! DELETED. `echo` is now a plain `envoy_listener::ConnectionHandler`, served by
+//! the ONE shared `envoy_listener::Listener` accept loop that `tcp_proxy` and
+//! HCM already used — which reaps its completed `JoinSet` tasks and bounds
+//! in-flight connections by `DRAIN_BUDGET`. That deletion is how carry-forward
+//! **M66-3** is consumed. `direct_response.rs` was converted in the same
+//! sub-phase, preserving the "echo is the structural model" invariant the
+//! phase-66 review required.
 
-use anyhow::Result;
+use envoy_listener::{BoxFuture, ConnectionHandler};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::task::JoinSet;
-use tokio::time::timeout;
 
-/// Graceful drain budget per D3 step 5 of the SPEC (5 seconds).
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// The terminal `echo` network filter, as a per-connection handler.
+pub struct EchoHandler;
 
-/// Accept loop. Each accepted connection copies bytes from the read half to the
-/// write half until the client half-closes, mirroring Envoy's
-/// `envoy.filters.network.echo` filter.
-///
-/// Returns `Ok(())` after a clean drain on shutdown. Individual connection
-/// errors are logged via `tracing::warn!` and do not propagate; a connection
-/// failure never takes down the server.
-pub async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) -> Result<()> {
-    let mut set: JoinSet<()> = JoinSet::new();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            () = &mut shutdown => {
-                tracing::info!("shutdown signal received; closing listener");
-                drop(listener);
-                break;
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, peer)) => {
-                        tracing::debug!(%peer, "accepted connection");
-                        set.spawn(async move {
-                            if let Err(err) = echo_once(stream).await {
-                                tracing::warn!(%peer, error = %err, "echo connection failed");
-                            }
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "accept failed; continuing");
-                    }
-                }
-            }
-        }
+impl ConnectionHandler for EchoHandler {
+    fn handle(
+        &self,
+        downstream: tokio::net::TcpStream,
+    ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        Box::pin(async move {
+            echo_once(downstream).await?;
+            Ok(())
+        })
     }
-
-    // Drain: wait up to DRAIN_TIMEOUT for all in-flight echoes to finish.
-    let in_flight = set.len();
-    tracing::info!(in_flight, "draining in-flight connections");
-    let drained = timeout(DRAIN_TIMEOUT, async {
-        while set.join_next().await.is_some() {}
-    })
-    .await;
-    if drained.is_err() {
-        tracing::warn!("drain timeout; aborting remaining tasks");
-        set.shutdown().await;
-    }
-    Ok(())
 }
 
-async fn echo_once(mut stream: tokio::net::TcpStream) -> Result<()> {
+/// Copy bytes back until the client half-closes, then half-close in turn.
+///
+/// Fixture `0001` asserts this byte-exact against upstream Envoy. Do NOT swap it
+/// for `tokio::io::copy`: that would not issue the trailing `shutdown()`, and
+/// the differential harness's ADR-0007 trailing-byte poll depends on the peer
+/// either closing or staying silent.
+async fn echo_once(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.split();
     let mut buf = [0u8; 8192];
     loop {
@@ -75,27 +53,53 @@ async fn echo_once(mut stream: tokio::net::TcpStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envoy_listener::{ConnectionHandler, DrainState, Listener};
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio::sync::oneshot;
 
-    async fn bind_random_local() -> TcpListener {
-        TcpListener::bind(("127.0.0.1", 0)).await.expect("bind :0")
+    fn listener_cfg(port: u16) -> envoy_config::Listener {
+        serde_yaml::from_str(&format!(
+            r#"
+name: echo_listener
+address:
+  socket_address:
+    address: 127.0.0.1
+    port_value: {port}
+filter_chains:
+  - filters:
+      - name: envoy.filters.network.echo
+"#
+        ))
+        .expect("hand-constructed listener YAML parses")
     }
 
-    #[tokio::test]
-    async fn echoes_single_payload_and_drains_on_shutdown() {
-        let listener = bind_random_local().await;
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            serve(listener, async move {
-                let _ = rx.await;
-            })
+    /// Spawn `EchoHandler` behind the SHARED `envoy_listener::Listener` accept
+    /// loop — the same loop `tcp_proxy` and HCM use. 67.1 deleted `echo::serve`'s
+    /// standalone, non-reaping loop (M66-3).
+    async fn spawn() -> (std::net::SocketAddr, oneshot::Sender<()>) {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let handler: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
+        let listener = Listener::bind(&listener_cfg(0), handler, Arc::clone(&registry))
             .await
-            .unwrap();
-        });
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let drain = Arc::new(DrainState::new(&registry));
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(listener.serve(
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
+        (addr, tx)
+    }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn echoes_single_payload_and_drains_on_shutdown() {
+        let (addr, tx) = spawn().await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         let payload = b"hello, envoy-rust\n";
         client.write_all(payload).await.unwrap();
@@ -105,25 +109,16 @@ mod tests {
         assert_eq!(echoed, payload);
 
         tx.send(()).unwrap();
-        timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server exits within drain window")
-            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            TcpStream::connect(addr).await.is_err(),
+            "listener closed on shutdown"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn handles_two_concurrent_connections() {
-        let listener = bind_random_local().await;
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = oneshot::channel::<()>();
-        let server = tokio::spawn(async move {
-            serve(listener, async move {
-                let _ = rx.await;
-            })
-            .await
-            .unwrap();
-        });
-
+        let (addr, _tx) = spawn().await;
         let one = tokio::spawn(async move {
             let mut c = TcpStream::connect(addr).await.unwrap();
             c.write_all(b"AAA").await.unwrap();
@@ -140,14 +135,14 @@ mod tests {
             c.read_to_end(&mut out).await.unwrap();
             out
         });
-
         assert_eq!(one.await.unwrap(), b"AAA");
         assert_eq!(two.await.unwrap(), b"BBBB");
+    }
 
-        tx.send(()).unwrap();
-        timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
+    /// 67.1: `EchoHandler` is a plain `ConnectionHandler`, so it composes under
+    /// `ChainHandler` exactly as `tcp_proxy` and HCM do.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn echo_handler_is_a_connection_handler() {
+        let _: Arc<dyn ConnectionHandler> = Arc::new(EchoHandler);
     }
 }
