@@ -1727,6 +1727,14 @@ pub enum Permission {
     /// Matches the request path with the `?query` stripped (ADR-0090 §B).
     #[serde(rename = "url_path")]
     UrlPath(PathMatcher),
+    /// 67.2: L4 destination IP prefix. Evaluated against `local_addr.ip()` by the
+    /// network engine; REJECTED fail-loud by the HTTP filter (ADR-0133).
+    #[serde(rename = "destination_ip")]
+    DestinationIp(CidrRange),
+    /// 67.2: L4 destination port. Plain `uint32` upstream with PGV `lte: 65535`,
+    /// so a bare `u16` is exactly faithful (rejects the wrapper AND > 65535).
+    #[serde(rename = "destination_port")]
+    DestinationPort(u16),
 }
 
 impl_single_key_oneof!(
@@ -1741,6 +1749,8 @@ impl_single_key_oneof!(
         "not_rule" => Permission::NotRule(Box::new(map.next_value::<Permission>()?)),
         "metadata" => Permission::Metadata(map.next_value::<MetadataMatcher>()?),
         "url_path" => Permission::UrlPath(map.next_value::<PathMatcher>()?),
+        "destination_ip" => Permission::DestinationIp(map.next_value::<CidrRange>()?),
+        "destination_port" => Permission::DestinationPort(map.next_value::<u16>()?),
     ]
 );
 
@@ -1775,6 +1785,16 @@ pub enum Principal {
     /// Envoy's `Principal` carries `url_path` too).
     #[serde(rename = "url_path")]
     UrlPath(PathMatcher),
+    /// 67.2: the downstream connection source IP (`peer_addr.ip()`). `remote_ip`
+    /// and `source_ip` coincide with this today (no listener filters, ADR-0133).
+    #[serde(rename = "direct_remote_ip")]
+    DirectRemoteIp(CidrRange),
+    #[serde(rename = "remote_ip")]
+    RemoteIp(CidrRange),
+    /// Deprecated alias of `direct_remote_ip` upstream (emits a deprecation
+    /// warning); identical evaluation here. ADR-0133 / SPEC X-2.
+    #[serde(rename = "source_ip")]
+    SourceIp(CidrRange),
 }
 
 impl_single_key_oneof!(
@@ -1789,6 +1809,9 @@ impl_single_key_oneof!(
         "not_id" => Principal::NotId(Box::new(map.next_value::<Principal>()?)),
         "metadata" => Principal::Metadata(map.next_value::<MetadataMatcher>()?),
         "url_path" => Principal::UrlPath(map.next_value::<PathMatcher>()?),
+        "direct_remote_ip" => Principal::DirectRemoteIp(map.next_value::<CidrRange>()?),
+        "remote_ip" => Principal::RemoteIp(map.next_value::<CidrRange>()?),
+        "source_ip" => Principal::SourceIp(map.next_value::<CidrRange>()?),
     ]
 );
 
@@ -4332,7 +4355,8 @@ macro_rules! define_rbac_tree_validator {
         $set_field:ident,
         $set_seg:literal,
         $not_seg:literal,
-        $empty_err:ident
+        $empty_err:ident,
+        extra_leaves: [ $($leaf:ident),* $(,)? ]
     ) => {
         fn $fn_name(
             node: &crate::$node,
@@ -4381,6 +4405,13 @@ macro_rules! define_rbac_tree_validator {
                     validate_metadata_matcher(m, listener_name, policy_name, path)
                 }
                 crate::$node::UrlPath(_) => Ok(()),
+                // 67.2: the connection-level leaves are asymmetric between the two
+                // enums (3 Principal-only, 2 Permission-only), so this shared macro
+                // body cannot name them uniformly — each instantiation passes its
+                // own set via `extra_leaves`. They are non-recursive leaves; the
+                // tree validator only bounds depth + rejects empty sets, so `Ok(())`
+                // is correct (CidrRange width is checked by the L4 walk). ADR-0133.
+                $( crate::$node::$leaf(_) => Ok(()), )*
             }
         }
     };
@@ -4394,7 +4425,8 @@ define_rbac_tree_validator!(
     rules,
     "{path}.rules[{idx}]",
     "{path}.not_rule",
-    EmptyRbacPermissionSet
+    EmptyRbacPermissionSet,
+    extra_leaves: [DestinationIp, DestinationPort]
 );
 
 define_rbac_tree_validator!(
@@ -4405,7 +4437,8 @@ define_rbac_tree_validator!(
     ids,
     "{path}.ids[{idx}]",
     "{path}.not_id",
-    EmptyRbacPrincipalSet
+    EmptyRbacPrincipalSet,
+    extra_leaves: [DirectRemoteIp, RemoteIp, SourceIp]
 );
 
 /// 67.1 D3 (CF-67-4): reject every `Permission` leaf a NETWORK (L4) rbac filter
@@ -4438,6 +4471,17 @@ fn validate_l4_permission(
         crate::Permission::Header(_) => reject("header"),
         crate::Permission::Metadata(_) => reject("metadata"),
         crate::Permission::UrlPath(_) => reject("url_path"),
+        // 67.2 D4: the connection-level arms are ADMITTED at L4 (ADR-0133); their
+        // CidrRange width is validated here (the tree validator only bounds depth).
+        crate::Permission::DestinationPort(_) => Ok(()),
+        crate::Permission::DestinationIp(cidr) => {
+            cidr.validate().map_err(|detail| crate::ConfigError::InvalidCidrRange {
+                listener: listener_name.to_string(),
+                policy_name: policy_name.to_string(),
+                path: path.to_string(),
+                detail,
+            })
+        }
         crate::Permission::AndRules(set) | crate::Permission::OrRules(set) => {
             for (idx, child) in set.rules.iter().enumerate() {
                 validate_l4_permission(
@@ -4482,6 +4526,18 @@ fn validate_l4_principal(
         crate::Principal::Header(_) => reject("header"),
         crate::Principal::Metadata(_) => reject("metadata"),
         crate::Principal::UrlPath(_) => reject("url_path"),
+        // 67.2 D4: the three source-IP arms are ADMITTED at L4 (ADR-0133); they
+        // share one CidrRange-width check (evaluated against `peer_addr.ip()`).
+        crate::Principal::DirectRemoteIp(cidr)
+        | crate::Principal::RemoteIp(cidr)
+        | crate::Principal::SourceIp(cidr) => {
+            cidr.validate().map_err(|detail| crate::ConfigError::InvalidCidrRange {
+                listener: listener_name.to_string(),
+                policy_name: policy_name.to_string(),
+                path: path.to_string(),
+                detail,
+            })
+        }
         crate::Principal::AndIds(set) | crate::Principal::OrIds(set) => {
             for (idx, child) in set.ids.iter().enumerate() {
                 validate_l4_principal(
@@ -6055,20 +6111,36 @@ static_resources:
         .is_err());
     }
 
-    /// 67.1 D3: the `67.2` arms do NOT exist — they are rejected as UNKNOWN KEYS
-    /// by the hand-rolled `impl_single_key_oneof!` deserializer, not stubbed
-    /// (BOOTSTRAP_PROMPT.md §6.3). This test pins that they cannot silently
-    /// appear.
+    /// 67.2 D2/D4: the connection-level arms now EXIST, deserialize, and pass the
+    /// widened L4 allow-list. (Supersedes `..._do_not_exist_yet`, which pinned the
+    /// pre-67.2 unknown-key rejection.)
     #[test]
-    fn network_rbac_connection_matcher_arms_do_not_exist_yet() {
+    fn network_rbac_accepts_connection_matcher_arms() {
         for arm in ["direct_remote_ip", "remote_ip", "source_ip"] {
-            let yaml = network_rbac_yaml(&format!(
-                "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{{ any: true }}]\n                      principals: [{{ {arm}: {{ address_prefix: 1.2.3.4, prefix_len: 32 }} }}]"
+            let mut b = network_rbac_bootstrap(&format!(
+                "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{{ any: true }}]\n                      principals: [{{ {arm}: {{ address_prefix: 10.0.0.0, prefix_len: 8 }} }}]"
             ));
-            let err = serde_yaml::from_str::<crate::Bootstrap>(&yaml)
-                .expect_err("a 67.2 connection-matcher arm must not deserialize");
-            assert!(err.to_string().contains(arm), "{arm}: got {err}");
+            validate(&mut b).unwrap_or_else(|e| panic!("{arm} must validate: {e:?}"));
         }
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{ destination_port: 8080 }, { destination_ip: { address_prefix: 127.0.0.0, prefix_len: 8 } }]\n                      principals: [{ any: true }]",
+        );
+        validate(&mut b).expect("destination_port + destination_ip must validate");
+    }
+
+    /// 67.2 D1/D4: an out-of-range prefix in a network rbac CidrRange is rejected
+    /// with `InvalidCidrRange`, naming the policy + path.
+    #[test]
+    fn network_rbac_rejects_invalid_cidr_prefix_len() {
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{ any: true }]\n                      principals: [{ direct_remote_ip: { address_prefix: 10.0.0.0, prefix_len: 99 } }]",
+        );
+        let err = validate(&mut b).expect_err("prefix_len 99 on IPv4 is invalid");
+        assert!(
+            matches!(err, crate::ConfigError::InvalidCidrRange { ref policy_name, ref path, .. }
+                if policy_name == "p0" && path == "principals[0]"),
+            "got {err:?}",
+        );
     }
 
     /// 67.1 D3: depth is bounded BEFORE the L4 walk recurses, so

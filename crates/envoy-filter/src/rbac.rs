@@ -280,6 +280,18 @@ fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimeMatcher, Filt
         }
         envoy_config::Permission::Metadata(m) => RuntimeMatcher::Metadata(compile_metadata(m)?),
         envoy_config::Permission::UrlPath(pm) => RuntimeMatcher::UrlPath(compile_url_path(pm)?),
+        // 67.2 D3 (ADR-0133): the L4-only arms are UNSUPPORTED in the HTTP RBAC
+        // filter — rejected fail-loud at construction (this `lower_*` runs inside a
+        // `collect::<Result<_,_>>()?` at filter build, so the `Err` is startup
+        // fatal). Upstream Envoy ACCEPTS them in an HTTP rbac filter (measured), so
+        // this is a deliberate divergence (ADR-0049 decision-2 (b)), not parity.
+        envoy_config::Permission::DestinationIp(_) | envoy_config::Permission::DestinationPort(_) => {
+            return Err(FilterError::InvalidConfig {
+                message: "envoy.filters.http.rbac: destination_ip / destination_port are \
+                          L4-only matchers, unsupported in the HTTP RBAC filter (ADR-0133)"
+                    .into(),
+            });
+        }
     })
 }
 
@@ -310,6 +322,17 @@ fn lower_principal(p: &envoy_config::Principal) -> Result<RuntimeMatcher, Filter
         envoy_config::Principal::Metadata(m) => RuntimeMatcher::Metadata(compile_metadata(m)?),
         // Phase 37: symmetric to `lower_permission`'s url_path arm.
         envoy_config::Principal::UrlPath(pm) => RuntimeMatcher::UrlPath(compile_url_path(pm)?),
+        // 67.2 D3 (ADR-0133): the connection-level source-IP arms are UNSUPPORTED
+        // in the HTTP RBAC filter — rejected fail-loud (see `lower_permission`).
+        envoy_config::Principal::DirectRemoteIp(_)
+        | envoy_config::Principal::RemoteIp(_)
+        | envoy_config::Principal::SourceIp(_) => {
+            return Err(FilterError::InvalidConfig {
+                message: "envoy.filters.http.rbac: direct_remote_ip / remote_ip / source_ip are \
+                          connection-level matchers, unsupported in the HTTP RBAC filter (ADR-0133)"
+                    .into(),
+            });
+        }
     })
 }
 
@@ -1266,5 +1289,26 @@ mod tests {
             filter.decode_headers(&mut req_dev),
             crate::pipeline::Decision::Continue
         ));
+    }
+
+    /// 67.2 D3 (ADR-0133): the HTTP RBAC filter REJECTS the L4-only arms fail-loud.
+    /// Upstream Envoy ACCEPTS them in an HTTP rbac filter (measured) — this is a
+    /// deliberate divergence (ADR-0049 decision-2 (b)), not parity.
+    #[test]
+    fn http_rbac_rejects_destination_port_permission() {
+        let err = lower_permission(&envoy_config::Permission::DestinationPort(8080))
+            .expect_err("destination_port is L4-only in the HTTP filter");
+        assert!(matches!(err, FilterError::InvalidConfig { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn http_rbac_rejects_direct_remote_ip_principal() {
+        let cidr = serde_yaml::from_str::<envoy_config::CidrRange>(
+            "address_prefix: 10.0.0.0\nprefix_len: 8",
+        )
+        .unwrap();
+        let err = lower_principal(&envoy_config::Principal::DirectRemoteIp(cidr))
+            .expect_err("direct_remote_ip is L4-only in the HTTP filter");
+        assert!(matches!(err, FilterError::InvalidConfig { .. }), "got {err:?}");
     }
 }

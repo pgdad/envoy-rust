@@ -38,3 +38,46 @@ in `::`, not a `CidrRange` logic issue; IPv4 literals and Rust `.parse()` litera
 unaffected. No `CidrRange` code changed — only the test YAML was quoted.
 
 **Result:** `cargo test -p envoy-config cidr_range` → **7 passed**.
+
+---
+
+## Task 2 — five enum arms + V-1 fallout across all match sites — ✅ DONE
+
+**Commit:** (see `phase 67.2 task 2`). The load-bearing, atomic task (the reason parent 67 split).
+Adding the arms broke the compile at four exhaustive match sites across three crates; all
+classified in ONE green commit (D-3.6). NO `_ =>` catch-all anywhere — the compile break was
+the forcing function (confirmed: `cargo build --workspace --all-targets` went RED on the missing
+variants, then GREEN once every site was classified).
+
+- **Enum arms + dispatch** (`crates/envoy-config/src/bootstrap.rs`):
+  `Permission::{DestinationIp(CidrRange), DestinationPort(u16)}`,
+  `Principal::{DirectRemoteIp, RemoteIp, SourceIp}(CidrRange)`, each with a `#[serde(rename)]`
+  and a line in the hand-rolled `impl_single_key_oneof!` deserializer.
+- **Site 1 — `define_rbac_tree_validator!`:** added a trailing `extra_leaves: [ $($leaf),* ]`
+  variadic macro param emitting `crate::$node::$leaf(_) => Ok(())`; instantiations pass
+  `[DestinationIp, DestinationPort]` / `[DirectRemoteIp, RemoteIp, SourceIp]`.
+- **Site 2 — `validate_l4_permission` / `validate_l4_principal`:** widened the L4 allow-list to
+  ADMIT the arms (the `header`/`url_path`/`metadata` rejections stay); each CidrRange's width is
+  validated via `CidrRange::validate` → `ConfigError::InvalidCidrRange`.
+- **Site 3 — HTTP filter `lower_permission` / `lower_principal`** (`crates/envoy-filter/src/rbac.rs`):
+  the L4-only arms are rejected fail-loud (`FilterError::InvalidConfig`) — startup-fatal (this runs
+  inside `collect::<Result<_,_>>()?` at filter build). Upstream ACCEPTS them in an HTTP rbac filter
+  (measured, ADR-0133), so this is a deliberate divergence (ADR-0049 decision-2 (b)), NOT parity.
+- **Site 4 — network engine `permission_matches` / `principal_matches`**
+  (`crates/envoy-bin/src/network_rbac.rs`): `destination_ip` → `local_addr.ip()`, `destination_port`
+  → `local_addr.port()`, the three source-IP arms → `peer_addr.ip()` (one shared expression).
+  REMOVED both `#[allow(clippy::only_used_in_recursion)]` attrs (`conn` is now read) and rewrote the
+  two stale "threaded through but not read" doc paragraphs + the stale module header.
+- **Replaced** the now-stale test `network_rbac_connection_matcher_arms_do_not_exist_yet` with
+  `network_rbac_accepts_connection_matcher_arms` (they now deserialize + validate) and added
+  `network_rbac_rejects_invalid_cidr_prefix_len`. Added HTTP-reject witnesses
+  (`http_rbac_rejects_destination_port_permission`, `http_rbac_rejects_direct_remote_ip_principal`)
+  and engine witnesses (`direct_remote_ip_matches_peer`, `destination_port_matches_local_port`).
+
+**Note for the state-4 session:** `envoy-bin` is a BINARY crate (no lib target), so the plan's
+`cargo test -p envoy-bin --lib ...` fails with "no library targets"; use `--bins` (or plain
+`cargo test -p envoy-bin`). Same applies to Tasks 3/5 commands in the plan.
+
+**Result:** `cargo build --workspace --all-targets` GREEN; `cargo clippy -p envoy-bin --all-targets
+-- -D warnings` clean; envoy-config network_rbac (16), envoy-filter http_rbac_rejects (2), envoy-bin
+network_rbac (13) all pass.

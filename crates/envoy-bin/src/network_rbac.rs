@@ -21,10 +21,12 @@
 //! then closes the connection with ZERO bytes written and a clean EOF, never an
 //! RST (SPEC R-2). This module never touches the socket.
 //!
-//! Phase 67.1 supports the `any` matcher plus the `and`/`or`/`not` combinators.
-//! The connection-level arms (`direct_remote_ip`, `remote_ip`, `source_ip`,
-//! `destination_port`, `destination_ip`) land in `67.2`; they are NOT stubbed
-//! here — they do not exist, and the config parser rejects them as unknown keys.
+//! Phase 67.1 supported the `any` matcher plus the `and`/`or`/`not` combinators.
+//! Phase 67.2 (ADR-0133) adds the connection-level arms: `direct_remote_ip` /
+//! `remote_ip` / `source_ip` (evaluated against `peer_addr.ip()`) and
+//! `destination_ip` / `destination_port` (against `local_addr`). `CidrRange`
+//! lives in `envoy-config`; the three source-IP arms coincide today (no listener
+//! filters). CF-67-3 (`on_data`-time iteration) remains deferred.
 
 use std::sync::Arc;
 
@@ -98,29 +100,28 @@ fn engine_allows(rules: &Rules, conn: &ConnectionInfo) -> bool {
     }
 }
 
-/// EXHAUSTIVE, no `_ =>` catch-all. `67.2` adds `DestinationPort` /
-/// `DestinationIp`; this must fail to compile until they are implemented, which
-/// is the GOOD failure mode. **Never add a catch-all.**
+/// EXHAUSTIVE, no `_ =>` catch-all. **Never add a catch-all** — a new shared-enum
+/// arm must break the build here so it is classified deliberately.
 ///
 /// `Any(b) => *b` — `any: false` never matches. Mirrors the landed HTTP RBAC
 /// evaluator (`crates/envoy-filter/src/rbac.rs`, `RuntimeMatcher::Any(b) => *b`).
+///
+/// 67.2 (ADR-0133): `destination_ip` matches `local_addr.ip()`, `destination_port`
+/// matches `local_addr.port()` — the connection's LOCAL (listener) address. These
+/// arms read `conn`.
 ///
 /// `Header` / `Metadata` / `UrlPath` are UNREACHABLE: `envoy-config`'s
 /// `validate_l4_permission` (67.1 D3, CF-67-4) rejects them at config load. They
 /// return `false` rather than panicking — a data-plane path must never panic —
 /// with a `debug_assert!` to catch a validator regression in test builds.
-///
-/// `conn` is threaded through but not read by any arm 67.1 ships: `any` and the
-/// combinators ignore the connection. `67.2`'s `destination_port` /
-/// `destination_ip` arms read it. Keeping it in the signature now is what lets
-/// `67.2` add those arms without touching every call site.
-#[allow(clippy::only_used_in_recursion)]
 fn permission_matches(p: &Permission, conn: &ConnectionInfo) -> bool {
     match p {
         Permission::Any(b) => *b,
         Permission::AndRules(set) => set.rules.iter().all(|c| permission_matches(c, conn)),
         Permission::OrRules(set) => set.rules.iter().any(|c| permission_matches(c, conn)),
         Permission::NotRule(inner) => !permission_matches(inner, conn),
+        Permission::DestinationIp(cidr) => cidr.contains(&conn.local_addr.ip()),
+        Permission::DestinationPort(port) => conn.local_addr.port() == *port,
         Permission::Header(_) | Permission::Metadata(_) | Permission::UrlPath(_) => {
             debug_assert!(
                 false,
@@ -131,16 +132,22 @@ fn permission_matches(p: &Permission, conn: &ConnectionInfo) -> bool {
     }
 }
 
-/// The `Principal` twin of [`permission_matches`]. EXHAUSTIVE, no catch-all:
-/// `67.2` adds `DirectRemoteIp` / `RemoteIp` / `SourceIp`, which are what will
-/// read `conn` (see [`permission_matches`] on why it is threaded through now).
-#[allow(clippy::only_used_in_recursion)]
+/// The `Principal` twin of [`permission_matches`]. EXHAUSTIVE, no catch-all.
+///
+/// 67.2 (ADR-0133): `direct_remote_ip` / `remote_ip` / `source_ip` all match the
+/// downstream connection SOURCE = `peer_addr.ip()`. The three coincide today —
+/// envoy-rust has no listener filters that would rewrite the remote address, so
+/// `remote_ip` ≡ `direct_remote_ip`, and `source_ip` is a deprecated upstream
+/// alias. They share ONE evaluation expression, not three code paths.
 fn principal_matches(p: &Principal, conn: &ConnectionInfo) -> bool {
     match p {
         Principal::Any(b) => *b,
         Principal::AndIds(set) => set.ids.iter().all(|c| principal_matches(c, conn)),
         Principal::OrIds(set) => set.ids.iter().any(|c| principal_matches(c, conn)),
         Principal::NotId(inner) => !principal_matches(inner, conn),
+        Principal::DirectRemoteIp(cidr) | Principal::RemoteIp(cidr) | Principal::SourceIp(cidr) => {
+            cidr.contains(&conn.peer_addr.ip())
+        }
         Principal::Header(_) | Principal::Metadata(_) | Principal::UrlPath(_) => {
             debug_assert!(
                 false,
@@ -383,5 +390,39 @@ mod tests {
             assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue);
         }
         assert_eq!(stat(&reg, "acc.rbac.allowed"), 7);
+    }
+
+    /// 67.2 D5: direct_remote_ip matches the connection's source IP (peer_addr).
+    #[test]
+    fn direct_remote_ip_matches_peer() {
+        let reg = envoy_stats::StatsRegistry::new();
+        let f = NetworkRbacFilter::new(
+            &cfg(
+                "dr",
+                Some(
+                    "  action: ALLOW\n  policies:\n    p0:\n      permissions: [{ any: true }]\n      principals: [{ direct_remote_ip: { address_prefix: 10.0.0.0, prefix_len: 8 } }]",
+                ),
+            ),
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue);
+        assert_eq!(stat(&reg, "dr.rbac.allowed"), 1);
+    }
+
+    /// 67.2 D5: destination_port matches the listener's local port.
+    #[test]
+    fn destination_port_matches_local_port() {
+        let reg = envoy_stats::StatsRegistry::new();
+        let f = NetworkRbacFilter::new(
+            &cfg(
+                "dp",
+                Some("  action: ALLOW\n  policies:\n    p0:\n      permissions: [{ destination_port: 10000 }]\n      principals: [{ any: true }]"),
+            ),
+            &reg,
+        )
+        .unwrap();
+        assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue);
+        assert_eq!(stat(&reg, "dp.rbac.allowed"), 1);
     }
 }
