@@ -285,7 +285,8 @@ fn lower_permission(p: &envoy_config::Permission) -> Result<RuntimeMatcher, Filt
         // `collect::<Result<_,_>>()?` at filter build, so the `Err` is startup
         // fatal). Upstream Envoy ACCEPTS them in an HTTP rbac filter (measured), so
         // this is a deliberate divergence (ADR-0049 decision-2 (b)), not parity.
-        envoy_config::Permission::DestinationIp(_) | envoy_config::Permission::DestinationPort(_) => {
+        envoy_config::Permission::DestinationIp(_)
+        | envoy_config::Permission::DestinationPort(_) => {
             return Err(FilterError::InvalidConfig {
                 message: "envoy.filters.http.rbac: destination_ip / destination_port are \
                           L4-only matchers, unsupported in the HTTP RBAC filter (ADR-0133)"
@@ -1298,7 +1299,10 @@ mod tests {
     fn http_rbac_rejects_destination_port_permission() {
         let err = lower_permission(&envoy_config::Permission::DestinationPort(8080))
             .expect_err("destination_port is L4-only in the HTTP filter");
-        assert!(matches!(err, FilterError::InvalidConfig { .. }), "got {err:?}");
+        assert!(
+            matches!(err, FilterError::InvalidConfig { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1309,7 +1313,10 @@ mod tests {
         .unwrap();
         let err = lower_principal(&envoy_config::Principal::DirectRemoteIp(cidr))
             .expect_err("direct_remote_ip is L4-only in the HTTP filter");
-        assert!(matches!(err, FilterError::InvalidConfig { .. }), "got {err:?}");
+        assert!(
+            matches!(err, FilterError::InvalidConfig { .. }),
+            "got {err:?}"
+        );
     }
 
     /// 67.2 D3 / Task 4: the remaining L4-only Permission arm (`destination_ip`).
@@ -1330,7 +1337,8 @@ mod tests {
     #[test]
     fn http_rbac_rejects_remote_ip_and_source_ip_principals() {
         for ctor in [
-            envoy_config::Principal::RemoteIp as fn(envoy_config::CidrRange) -> envoy_config::Principal,
+            envoy_config::Principal::RemoteIp
+                as fn(envoy_config::CidrRange) -> envoy_config::Principal,
             envoy_config::Principal::SourceIp,
         ] {
             let cidr = serde_yaml::from_str::<envoy_config::CidrRange>(

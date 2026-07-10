@@ -442,7 +442,10 @@ mod tests {
             &reg,
         ).unwrap();
         // conn2's peer 192.0.2.5 is NOT in 10.0.0.0/8 ⇒ no policy match ⇒ inverse of ALLOW.
-        assert_eq!(f.on_new_connection(&conn2()), NetworkFilterStatus::StopIteration);
+        assert_eq!(
+            f.on_new_connection(&conn2()),
+            NetworkFilterStatus::StopIteration
+        );
         assert_eq!(stat(&reg, "drn.rbac.denied"), 1);
     }
 
@@ -455,8 +458,16 @@ mod tests {
                 &reg,
             ).unwrap();
             // conn()'s peer 10.0.0.1 IS in 10.0.0.0/8.
-            assert_eq!(f.on_new_connection(&conn()), NetworkFilterStatus::Continue, "{arm} matches peer");
-            assert_eq!(f.on_new_connection(&conn2()), NetworkFilterStatus::StopIteration, "{arm} no-match");
+            assert_eq!(
+                f.on_new_connection(&conn()),
+                NetworkFilterStatus::Continue,
+                "{arm} matches peer"
+            );
+            assert_eq!(
+                f.on_new_connection(&conn2()),
+                NetworkFilterStatus::StopIteration,
+                "{arm} no-match"
+            );
         }
     }
 
@@ -467,7 +478,10 @@ mod tests {
             &cfg("dpn", Some("  action: ALLOW\n  policies:\n    p0:\n      permissions: [{ destination_port: 10000 }]\n      principals: [{ any: true }]")),
             &reg,
         ).unwrap();
-        assert_eq!(f.on_new_connection(&conn2()), NetworkFilterStatus::StopIteration); // local port 9999 != 10000
+        assert_eq!(
+            f.on_new_connection(&conn2()),
+            NetworkFilterStatus::StopIteration
+        ); // local port 9999 != 10000
     }
 
     #[test]

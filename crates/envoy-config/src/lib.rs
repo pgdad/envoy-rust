@@ -13,8 +13,8 @@ pub mod rds;
 
 pub use bootstrap::{
     AccessLog, AccessLogTypedConfig, Action, Address, Admin, AppendAction, AttemptOutcome,
-    Bootstrap, Buffer, BufferPerRoute, CdnLoopConfig, CertificateValidationContext,
-    CidrRange, CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig, CommonTlsContext,
+    Bootstrap, Buffer, BufferPerRoute, CdnLoopConfig, CertificateValidationContext, CidrRange,
+    CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig, CommonTlsContext,
     ConfigSource, CorsConfig, CorsPolicy, CsrfPolicy, DataSource, DataSourceInline,
     DenominatorType, DirectResponse, DirectResponseConfig, DnsLookupFamily, DownstreamTlsContext,
     DynamicResources, EdsClusterConfig, Endpoint, ExplicitHttpConfig, FaultAbort, FaultConfig,

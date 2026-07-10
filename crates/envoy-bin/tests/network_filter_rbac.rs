@@ -1036,7 +1036,10 @@ async fn direct_remote_ip_non_loopback_denies_end_to_end() {
 async fn destination_port_end_to_end() {
     // ALLOW: the rule names the listener's own port.
     let port = reserve_port();
-    let allow = allow_rules(&format!("[{{ destination_port: {port} }}]"), "[{ any: true }]");
+    let allow = allow_rules(
+        &format!("[{{ destination_port: {port} }}]"),
+        "[{ any: true }]",
+    );
     let (_child, _dir) = spawn_envoy_bin(&rbac_echo_cfg(port, "dp", &allow));
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
     wait_ready(addr, Duration::from_secs(10))
@@ -1055,7 +1058,10 @@ async fn destination_port_end_to_end() {
     // DENY: listener binds `port2`, but the rule names a DIFFERENT reserved port.
     let port2 = reserve_port();
     let wrong = reserve_port();
-    let deny = allow_rules(&format!("[{{ destination_port: {wrong} }}]"), "[{ any: true }]");
+    let deny = allow_rules(
+        &format!("[{{ destination_port: {wrong} }}]"),
+        "[{ any: true }]",
+    );
     let (_child2, _dir2) = spawn_envoy_bin(&rbac_echo_cfg(port2, "dp2", &deny));
     let addr2 = format!("127.0.0.1:{port2}").parse().unwrap();
     wait_ready(addr2, Duration::from_secs(10))

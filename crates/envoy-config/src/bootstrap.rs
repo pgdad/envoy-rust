@@ -4475,12 +4475,13 @@ fn validate_l4_permission(
         // CidrRange width is validated here (the tree validator only bounds depth).
         crate::Permission::DestinationPort(_) => Ok(()),
         crate::Permission::DestinationIp(cidr) => {
-            cidr.validate().map_err(|detail| crate::ConfigError::InvalidCidrRange {
-                listener: listener_name.to_string(),
-                policy_name: policy_name.to_string(),
-                path: path.to_string(),
-                detail,
-            })
+            cidr.validate()
+                .map_err(|detail| crate::ConfigError::InvalidCidrRange {
+                    listener: listener_name.to_string(),
+                    policy_name: policy_name.to_string(),
+                    path: path.to_string(),
+                    detail,
+                })
         }
         crate::Permission::AndRules(set) | crate::Permission::OrRules(set) => {
             for (idx, child) in set.rules.iter().enumerate() {
@@ -4531,12 +4532,13 @@ fn validate_l4_principal(
         crate::Principal::DirectRemoteIp(cidr)
         | crate::Principal::RemoteIp(cidr)
         | crate::Principal::SourceIp(cidr) => {
-            cidr.validate().map_err(|detail| crate::ConfigError::InvalidCidrRange {
-                listener: listener_name.to_string(),
-                policy_name: policy_name.to_string(),
-                path: path.to_string(),
-                detail,
-            })
+            cidr.validate()
+                .map_err(|detail| crate::ConfigError::InvalidCidrRange {
+                    listener: listener_name.to_string(),
+                    policy_name: policy_name.to_string(),
+                    path: path.to_string(),
+                    detail,
+                })
         }
         crate::Principal::AndIds(set) | crate::Principal::OrIds(set) => {
             for (idx, child) in set.ids.iter().enumerate() {
@@ -6101,14 +6103,18 @@ static_resources:
     fn cidr_range_rejects_unknown_field_and_wrapper_prefix_len() {
         // deny_unknown_fields + bare-u8 prefix_len (ADR-0133 divergence: Envoy also
         // accepts `prefix_len: {value: N}`, envoy-rust rejects it fail-loud).
-        assert!(serde_yaml::from_str::<crate::CidrRange>(
-            "address_prefix: 10.0.0.0\nprefix_len: 8\nextra: 1"
-        )
-        .is_err());
-        assert!(serde_yaml::from_str::<crate::CidrRange>(
-            "address_prefix: 10.0.0.0\nprefix_len: {value: 8}"
-        )
-        .is_err());
+        assert!(
+            serde_yaml::from_str::<crate::CidrRange>(
+                "address_prefix: 10.0.0.0\nprefix_len: 8\nextra: 1"
+            )
+            .is_err()
+        );
+        assert!(
+            serde_yaml::from_str::<crate::CidrRange>(
+                "address_prefix: 10.0.0.0\nprefix_len: {value: 8}"
+            )
+            .is_err()
+        );
     }
 
     /// 67.2 D2/D4: the connection-level arms now EXIST, deserialize, and pass the
