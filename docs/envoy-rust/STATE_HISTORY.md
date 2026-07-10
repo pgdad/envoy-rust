@@ -23,6 +23,10 @@
 
 ## Relocated from STATE.md `## Active phase` — historical status narratives
 
+_Historical (the phase-67.1 state-6-close-out Active-phase `**status:**` block — which pointed at sub-phase `67.2` at §5 state 2 — superseded by the phase-67.2 state-2-PLAN-write Active-phase status; relocated verbatim at the phase-67.2 state-2 PLAN-write session per ADR-0035.)_
+
+**status:** **`67.1` is CLOSED (`done`); the ACTIVE phase is now `67.2` at §5 state 2 (SPEC exists, no PLAN → PLAN-write).** This session ran the §5 state-6 CLOSE-OUT for `67.1`: **NO code changed.** It flipped ROADMAP row `67.1` → `done` (6 cells preserved; parent row `67` stays `in-progress` — it flips `done` only when ALL THREE of `67.1`/`67.2`/`67.3` are `done`), advanced this `STATE.md` to point at sibling `67.2`, and relocated the now-superseded `67.1` Active-phase block + the four state-5 top-section narratives + the closed `### Phase-67.1 §5 state-5 code-review` Notes subsection verbatim into `STATE_HISTORY.md` (ADR-0035; delta-based byte-preservation check PASS). `67.1` shipped the network-filter chain iteration protocol, the bilateral chain-termination rule, and `envoy.filters.network.rbac` (`any` matcher) with fixtures `0072`/`0073`, plus the C-1 repair (`ADR-0132`: `direct_response` bypasses the chain; `[rbac, tcp_proxy]` rejected fail-loud until `67.3`) — REVIEW.md APPROVED at state-5. **`67.2` adds the connection-level matcher arms** (`Principal::{DirectRemoteIp,RemoteIp,SourceIp}(CidrRange)`, `Permission::{DestinationPort(u16),DestinationIp(CidrRange)}`, the new `CidrRange` type) plus the V-1 breaking-change fallout on the HTTP RBAC filter's three exhaustive match sites — SPEC estimate ~695 net LoC / ~7-9 tasks (under the §6.1 gate; the PLAN-write re-derives it). **DECISIONS.md ledger head `ADR-0132`, next `ADR-0133` unreserved.** Per §5.1 this close-out did NOT chain into `67.2`'s state-2 PLAN-write.
+
 
 _Historical (the phase-67 state-0/1-brainstorm-complete Active-phase `**id:**` + `**slug:**` + `**directory:**` + `**status:**` block, superseded by the phase-67 §6.1-split Active-phase block that points at sub-phase `67.1` — relocated verbatim at the phase-67 state-2 PLAN-write/split session per ADR-0035.)_
 
@@ -1217,6 +1221,20 @@ Phase 01 (`01-static-bootstrap-config`) is **done** as of commit `aef36ce`; phas
 
 ## Relocated from STATE.md `## Next expected skill` — historical narratives
 
+_Historical (the phase-67.1 state-6-close-out Next-expected-skill pointer — which named `67.2`'s state-2 PLAN-write — superseded by the phase-67.2 state-3 implementation pointer; relocated verbatim at the phase-67.2 state-2 PLAN-write session per ADR-0035.)_
+
+**The ACTIVE phase is now `67.2-network-rbac-connection-matchers` at §5 state 2** (its `SPEC.md` exists — authored at the ADR-0129 split — and `PLAN.md` does not). Per `BOOTSTRAP_PROMPT.md` §5 state 2 + `SKILL_ROUTING.md`, the next session runs **`superpowers:writing-plans`** → `67.2/PLAN.md`, and (per invariant 4.1.2) flips ROADMAP row `67.2` → `in-progress` when it starts.
+
+**GATE at state-2 (§5 state 2 / §6.1):** if the re-derived `PLAN.md` exceeds ~25 tasks OR ~1500 net LoC, split `67.2` further and stop. The SPEC estimates ~695 net LoC / ~7-9 tasks (well under), but the state-2 PLAN-write MUST re-derive it fresh, and §6.1's mid-execution valve stays armed (it fired once this parent already, on the `tcp_proxy` split → `67.3`).
+
+**Read `67.2/SPEC.md` in full at cold-start** (it is the active phase's SPEC). Note its header line "This sub-phase flips parent row `67` to `done` at its state-6" is **STALE** — written before `67.3` was carved out at the C-1 re-entry; the parent now has `sub-phases = 67.1, 67.2, 67.3` and flips `done` only when ALL THREE are `done`. SPECs are not retro-edited (D-3.5); the `67.2` PLAN-write accounts for `67.3`.
+
+**`67.2` inherits the V-1 deferral from `67.1`:** the three exhaustive match sites over the shared `Permission`/`Principal` enums — `lower_permission` + `lower_principal` at `crates/envoy-filter/src/rbac.rs`, and `define_rbac_tree_validator!` at `crates/envoy-config/src/bootstrap.rs` — will break the compile when the new arms land. That break is the intended forcing function; do **NOT** add a `_ =>` catch-all. (`67.2` DOES legitimately edit `crates/envoy-filter/src/rbac.rs`'s lowering for this V-1 fallout — that is the HTTP filter, and editing its match arms is correct here, distinct from the "never edit it as if it were the network filter" trap.)
+
+**Standing traps** (unchanged). Confirm CI with the **FULL 40-char SHA** (`gh run list --commit <short-sha>` silently returns `[]`). **Any NEW ROADMAP row must escape literal pipes as `\|`**; rows `36`/`38`/`39`/`52`/`54` are already malformed and must **NOT** be "fixed" (append-only) — verify any row edit with `re.split(r'(?<!\\)\|', line)[1:-1]` yielding exactly 6 cells, and **never use `awk -F'|'`**. **Never weaken a fixture; never trim `known-failures.txt`; never pipe a verification run through `tail`; always `--no-fail-fast`.** **envoy-bin writes its `ConfigError` to STDOUT**, not stderr. **Never add `rbac` to `is_terminal_network_filter`**; **never reject `filters: []`**; **never revert `ADR-0131`**; **never re-wrap `direct_response` in the chain**.
+
+**Mission is NOT complete** — `67.2` (connection-level matcher arms) and `67.3` (establishment/data-phase split) are unbuilt, and the rest of the Network filters family (redis, mongo, kafka_broker, thrift, zookeeper, sni_cluster), plus HTTP filters, load balancing, upstream robustness, HTTP/3+QUIC, gRPC, xDS/dynamic config, observability, runtime/hot-restart, and the WASM host remain unbuilt. **Do NOT create a `stop` file.**
+
 
 _Historical (the phase-67 state-0/1-brainstorm Next-expected-skill pointer — which named the state-2 PLAN-write and its projected §6.1 split gate — superseded by the post-split pointer at sub-phase `67.1`'s state-2 PLAN-write; relocated verbatim at the phase-67 §6.1-split session per ADR-0035.)_
 
@@ -2359,6 +2377,10 @@ Inputs the phase-10 state-2 PLAN-write session should read, in order:
 
 ## Relocated from STATE.md `## Last commit` — historical narratives
 
+_Historical (the phase-67.1 state-6-close-out Last-commit block, superseded by the phase-67.2 state-2-PLAN-write Last-commit block; relocated verbatim at the phase-67.2 state-2 PLAN-write session per ADR-0035.)_
+
+**Phase-67.1 §5 STATE-6 CLOSE-OUT — ROADMAP row `67.1` flipped `done`; the active phase advanced to `67.2` (§5 state 2):** the state-6 close-out (no skill invocation — the close-out changes no code, re-runs no gate, and consumes only disk facts, per `ADR-0127`). Cold-started clean (`git status --porcelain` empty; branch `main`; `HEAD` = `origin/main` = `7a6bd7c`; `git fetch origin --prune` showed no sibling ahead → §5 state 6). **NO CODE CHANGED** — `ROADMAP.md` (row `67.1` `in-progress`→`done`, 6 cells preserved, parent `67` untouched), `STATE.md`, `STATE_HISTORY.md` only. `67.1` is fully closed: it shipped the network-filter chain iteration protocol, the bilateral chain-termination rule, and `envoy.filters.network.rbac` (`any` matcher), with fixtures `0072`/`0073`, the C-1 repair (`ADR-0132`), and an APPROVED state-5 `REVIEW.md`. Parent row `67` STAYS `in-progress` (flips `done` only when `67.1`+`67.2`+`67.3` are all `done`). The active phase is now sibling `67.2-network-rbac-connection-matchers`, which has `SPEC.md` but no `PLAN.md` → §5 state 2 (`superpowers:writing-plans`); its ROADMAP row stays `planned` until that PLAN-write session flips it `in-progress`. ADR-0035 relocation done (the whole `67.1` Active-phase block + the four state-5 top-section narratives + the closed `### Phase-67.1 §5 state-5 code-review` Notes subsection → `STATE_HISTORY.md`; delta-based byte-preservation check PASS). **NO new ADR** (ledger head `ADR-0132`, next `ADR-0133` unreserved). Per §5.1 this session did NOT chain into `67.2`'s state-2 PLAN-write.
+
 
 _Historical (the phase-67 state-0/1-pick Last-commit block, superseded by the phase-67 §6.1-split Last-commit block; relocated verbatim at the phase-67 state-2 PLAN-write/split session per ADR-0035.)_
 
@@ -3086,6 +3108,10 @@ No code changes at this commit. No test changes. No fixture changes. **No DECISI
 ---
 
 ## Relocated from STATE.md `## Last updated` — historical notes
+
+_Historical (the phase-67.1 state-6-close-out Last-updated note, superseded by the phase-67.2 state-2-PLAN-write Last-updated note; relocated verbatim at the phase-67.2 state-2 PLAN-write session per ADR-0035.)_
+
+2026-07-10 (phase-67.1 **§5 STATE-6 CLOSE-OUT — ROADMAP row `67.1` flipped `done`; active phase advanced to `67.2` at §5 state 2.** No skill invocation [the close-out changes no code, re-runs no gate, consumes only disk facts — `ADR-0127`]. **NO CODE CHANGED** — `ROADMAP.md` + `STATE.md` + `STATE_HISTORY.md` only. `67.1` `in-progress`→`done` [6 cells preserved]; parent `67` STAYS `in-progress` [flips `done` only when `67.1`+`67.2`+`67.3` all done]; `67.2`/`67.3` stay `planned`. Active phase → `67.2-network-rbac-connection-matchers`, which has `SPEC.md` and no `PLAN.md` → §5 state 2 [`superpowers:writing-plans`]; its row stays `planned` until the PLAN-write flips it `in-progress`. ADR-0035 relocation done [the whole `67.1` Active-phase block + four state-5 top-section narratives + the closed `### Phase-67.1 §5 state-5 code-review` Notes subsection → `STATE_HISTORY.md`; delta-based byte-preservation check PASS]. **NO new ADR** [ledger head `ADR-0132`, next `ADR-0133` unreserved]. ADR-0132/0131/0130/0129/0128 govern `67`; ADR-0124 untouched; ADR-0035 governs this relocation. `#![forbid(unsafe_code)]` holds. Per §5.1 this session did NOT chain into `67.2`'s PLAN-write. **The next session runs `superpowers:writing-plans` → `67.2/PLAN.md`**, re-deriving the §6.1 size estimate.)
 
 
 _Historical (the phase-67 state-0/1-brainstorm Last-updated note, superseded by the phase-67 §6.1-split Last-updated note; relocated verbatim at the phase-67 state-2 PLAN-write/split session per ADR-0035.)_
