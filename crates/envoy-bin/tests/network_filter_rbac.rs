@@ -666,6 +666,47 @@ async fn empty_stat_prefix_is_rejected() {
     assert!(output.contains("stat_prefix"), "got {output}");
 }
 
+/// REVIEW.md I-2: a STRUCTURALLY-INVALID `metadata` leaf on a NETWORK `rbac`
+/// filter must not be reported as an `"HCM listener"` error — that listener has no
+/// HCM at all.
+///
+/// The guarding comment in `envoy-config`'s `ConfigError` used to claim this was
+/// unreachable "because a network rbac filter's `metadata` leaf is rejected
+/// outright by `validate_l4_permission` before that error can be reached."
+/// **The validation order is the reverse.** `validate_rbac_rules` runs FIRST and
+/// validates `Metadata` leaves structurally, so an empty `filter` raises
+/// `RbacMetadataMatcherInvalid` before the L4 allow-list walk ever sees the leaf.
+///
+/// Note the L4 walk must NOT be reordered ahead of `validate_rbac_rules` — the
+/// current order is what bounds tree depth before the L4 recursion, pinned by
+/// `network_rbac_depth_bound_precedes_the_l4_walk`. The fix is to make the
+/// message scope-neutral instead.
+#[tokio::test]
+async fn structurally_invalid_metadata_leaf_is_not_reported_as_an_hcm_error() {
+    let rules = concat!(
+        "                rules:\n",
+        "                  action: ALLOW\n",
+        "                  policies:\n",
+        "                    p0:\n",
+        r#"                      permissions: [{ metadata: { filter: "", path: [{ key: k }], value: { string_match: { exact: v } } } }]"#,
+        "\n                      principals: [{ any: true }]",
+    );
+    let (ok, output) = validate_config(&rbac_echo_cfg(reserve_port(), "sp", rules)).await;
+    assert!(!ok, "a malformed metadata leaf must be rejected");
+    assert!(
+        output.contains("metadata matcher"),
+        "the structural tree validator must fire first, not the L4 walk; got {output}",
+    );
+    assert!(
+        !output.contains("HCM listener"),
+        "a network rbac filter has NO HCM; the message must be scope-neutral. got {output}",
+    );
+    assert!(
+        output.contains(r#"listener "rbac_listener""#),
+        "the message must still name the listener; got {output}",
+    );
+}
+
 /// D3 / CF-67-4: the three L4-unevaluable leaves are rejected at startup.
 /// `header` in PARITY with upstream Envoy; `url_path` and `metadata` as a
 /// deliberate FAIL-LOUD divergence (ADR-0049 decision-2 (b)).

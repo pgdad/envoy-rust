@@ -3961,6 +3961,16 @@ fn validate_network_rbac_config(
     // 67.1 D3 (CF-67-4): the L4 leaf allow-list. Runs AFTER the shared tree
     // validation, which bounds depth at RBAC_TREE_MAX_DEPTH — so these
     // recursions are stack-safe. `67.2` widens the allow-list.
+    //
+    // REVIEW.md I-2, stated once so nobody re-derives it backwards: because
+    // `validate_rbac_rules` runs FIRST, a `metadata` leaf that is *structurally*
+    // malformed (empty `filter`, multi-segment `path`) raises
+    // `RbacMetadataMatcherInvalid` — NOT `UnsupportedNetworkRbacMatcher`. Only a
+    // *well-formed* `metadata` leaf reaches the L4 walk below and is rejected as
+    // unevaluable. Both messages are scope-neutral, so neither says "HCM listener"
+    // for this filter, which has no HCM. Do NOT swap the order to make the L4
+    // error win: this order IS the depth bound, pinned by
+    // `network_rbac_depth_bound_precedes_the_l4_walk`.
     for (policy_name, policy) in rules.policies.iter() {
         for (idx, perm) in policy.permissions.iter().enumerate() {
             validate_l4_permission(
@@ -5912,6 +5922,61 @@ static_resources:
         assert!(
             matches!(err, crate::ConfigError::RbacTreeTooDeep { .. }),
             "depth bound must run first; got {err:?}",
+        );
+    }
+
+    /// 67.1 / REVIEW.md I-2. `validate_rbac_rules` runs BEFORE the L4 walk, so a
+    /// STRUCTURALLY-invalid `metadata` leaf raises `RbacMetadataMatcherInvalid`,
+    /// not `UnsupportedNetworkRbacMatcher` — reachable from a network `rbac`
+    /// filter, which has NO HCM. The message must therefore be scope-neutral.
+    ///
+    /// REVERT THE MESSAGE TO `"HCM listener {listener:?}: …"` AND THIS TEST FAILS.
+    #[test]
+    fn structurally_invalid_metadata_leaf_reports_a_scope_neutral_listener_error() {
+        let mut b = network_rbac_bootstrap(
+            r#"stat_prefix: sp
+                rules:
+                  policies:
+                    p0:
+                      permissions: [{ metadata: { filter: "", path: [{ key: k }], value: { string_match: { exact: v } } } }]
+                      principals: [{ any: true }]"#,
+        );
+        let err = validate(&mut b).expect_err("an empty metadata `filter` is malformed");
+        assert!(
+            matches!(err, crate::ConfigError::RbacMetadataMatcherInvalid { .. }),
+            "the structural tree validator runs first, not the L4 walk; got {err:?}",
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("HCM listener"),
+            "a network rbac filter has no HCM; got {msg}",
+        );
+        assert!(msg.starts_with("listener "), "got {msg}");
+    }
+
+    /// The other half of I-2's ordering claim: a WELL-FORMED `metadata` leaf gets
+    /// past `validate_rbac_rules` and is then rejected by the L4 allow-list walk.
+    /// Together with the test above this pins which validator owns which input.
+    #[test]
+    fn well_formed_metadata_leaf_is_rejected_by_the_l4_walk_instead() {
+        let mut b = network_rbac_bootstrap(
+            r#"stat_prefix: sp
+                rules:
+                  policies:
+                    p0:
+                      permissions: [{ metadata: { filter: f, path: [{ key: k }], value: { string_match: { exact: v } } } }]
+                      principals: [{ any: true }]"#,
+        );
+        let err = validate(&mut b).expect_err("metadata cannot be evaluated at L4");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedNetworkRbacMatcher {
+                    arm: "metadata",
+                    ..
+                }
+            ),
+            "got {err:?}",
         );
     }
 

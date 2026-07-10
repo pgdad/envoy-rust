@@ -542,14 +542,30 @@ pub enum ConfigError {
         path: String,
     },
 
-    // The six RBAC tree/empty-set variants below are raised by BOTH
+    // The SEVEN RBAC tree/empty-set/leaf variants below are raised by BOTH
     // `envoy.filters.http.rbac` (phase 10) and `envoy.filters.network.rbac`
     // (phase 67.1), which has no HCM. Their messages are therefore scope-neutral
     // (`listener {listener:?}`, never `HCM listener`) — 67.1 W-1, ADR-0130. The
     // other `"HCM listener"` variants in this enum are genuinely HCM-scoped.
-    // `RbacMetadataMatcherInvalid` stays among them: a network rbac filter's
-    // `metadata` leaf is rejected outright by `validate_l4_permission` (67.1 D3)
-    // before that error can be reached.
+    //
+    // `RbacMetadataMatcherInvalid` is the SEVENTH (REVIEW.md I-2). It was
+    // previously left `"HCM listener"`-scoped on the theory that a network rbac
+    // filter's `metadata` leaf "is rejected outright by `validate_l4_permission`
+    // (67.1 D3) before that error can be reached." **That stated the validation
+    // order backwards.** In `validate_network_rbac_config` (`bootstrap.rs`),
+    // `validate_rbac_rules` runs FIRST — and it validates `Metadata` leaves
+    // structurally via `validate_metadata_matcher` — and only THEN does the L4
+    // allow-list walk run. So a structurally-invalid `metadata` leaf (an empty
+    // `filter`, or a `path` that is not exactly one segment) raises this variant
+    // before `validate_l4_permission` ever sees it. Reproduced, and pinned by
+    // `structurally_invalid_metadata_leaf_is_not_reported_as_an_hcm_error`.
+    //
+    // That ORDER IS DELIBERATE and must not be swapped to "fix" this: running
+    // `validate_rbac_rules` first is what bounds tree depth before the L4
+    // recursion descends the same tree, a stack-safety guarantee pinned by
+    // `network_rbac_depth_bound_precedes_the_l4_walk`. The message is generalized
+    // instead — it stays accurate for the HTTP filter, whose listener IS an HCM
+    // listener.
     /// 10: RBAC filter has no policies (rules.policies is empty).
     #[error("listener {listener:?}: RBAC filter has no policies (rules.policies is empty)")]
     EmptyRbacPolicies { listener: String },
@@ -605,8 +621,12 @@ pub enum ConfigError {
     /// (Envoy: PGV min_len 1) or a `path` whose length is not exactly 1 (Envoy accepts a
     /// multi-segment path; envoy-rust's flat string store cannot resolve it → stricter boot-fatal).
     /// Both are config-load-time fatal (ADR-0049).
+    ///
+    /// 67.1 (REVIEW.md I-2): the message is **scope-neutral**. This variant is
+    /// reachable from a NETWORK `rbac` filter, which has no HCM — see the block
+    /// comment above.
     #[error(
-        "HCM listener {listener:?}: RBAC policy {policy_name:?} metadata matcher at {path} is invalid: {detail}"
+        "listener {listener:?}: RBAC policy {policy_name:?} metadata matcher at {path} is invalid: {detail}"
     )]
     RbacMetadataMatcherInvalid {
         listener: String,
