@@ -225,6 +225,100 @@ impl ConnectionHandler for ChainHandler {
     }
 }
 
+/// 67.1 (REVIEW.md I-4): the in-flight-connection-task count, aggregated across
+/// every accept loop backing one logical listener.
+///
+/// Under the `SO_REUSEPORT` fan-out a listener runs N accept loops, each owning
+/// its own `JoinSet`. The published figure must be their **total**. The previous
+/// shape — one `watch::Sender` cloned N times, each loop calling
+/// `send_replace(join_set.len())` with its own count — made it last-writer-wins:
+/// neither a total nor stable, while [`Listener::pending_tasks`] documented it as
+/// "in-flight connection tasks."
+///
+/// Each loop owns a [`PendingTasksSlot`] and publishes only into its own slot; the
+/// total is recomputed and broadcast under the lock, so concurrent publishes from
+/// different loops cannot lose an update. The lock is a `std::sync::Mutex` held
+/// across no `.await`, and is taken once per accept and once per reap.
+struct PendingTasks(Arc<PendingTasksInner>);
+
+struct PendingTasksInner {
+    /// One entry per accept loop. Guarded rather than atomic because the publish
+    /// is read-modify-broadcast: two loops summing lock-free could each observe a
+    /// stale peer and the later `send_replace` would clobber the correct total.
+    counts: std::sync::Mutex<Vec<usize>>,
+    tx: tokio::sync::watch::Sender<usize>,
+}
+
+impl PendingTasks {
+    /// `sockets` is the number of accept loops that will publish — one for the
+    /// single-socket path and for each `bind_shards` shard, N under fan-out.
+    fn new(sockets: usize) -> Self {
+        Self(Arc::new(PendingTasksInner {
+            counts: std::sync::Mutex::new(vec![0usize; sockets.max(1)]),
+            tx: tokio::sync::watch::channel(0usize).0,
+        }))
+    }
+
+    /// A publishing handle for accept loop `index`. Each index must be handed out
+    /// at most once, and `index` must be < the `sockets` this was built with —
+    /// i.e. `PendingTasks::new` must be sized from `listeners.len()`.
+    ///
+    /// Asserted here rather than left to `publish`: a slot is minted on the
+    /// `serve` path but published from inside a spawned accept loop, so an
+    /// out-of-range index would otherwise surface as an `index out of bounds`
+    /// panic on a `tokio-rt-worker` only once the kernel happened to steer a
+    /// connection to that socket — nondeterministically.
+    fn slot(&self, index: usize) -> PendingTasksSlot {
+        debug_assert!(
+            index
+                < self
+                    .0
+                    .counts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .len(),
+            "PendingTasks must be sized from the socket count",
+        );
+        PendingTasksSlot {
+            inner: Arc::clone(&self.0),
+            index,
+        }
+    }
+
+    fn get(&self) -> usize {
+        *self.0.tx.borrow()
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.0.tx.subscribe()
+    }
+}
+
+/// One accept loop's write handle into the shared [`PendingTasks`] total.
+struct PendingTasksSlot {
+    inner: Arc<PendingTasksInner>,
+    index: usize,
+}
+
+impl PendingTasksSlot {
+    /// Record this loop's in-flight count and broadcast the new TOTAL.
+    fn publish(&self, in_flight: usize) {
+        // Poisoning can only happen if a publisher panicked mid-update; the data
+        // is a plain `Vec<usize>` and cannot be left inconsistent, so recover.
+        let mut counts = self
+            .inner
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        counts[self.index] = in_flight;
+        let total: usize = counts.iter().sum();
+        // `send_replace` rather than `send` so the value updates even with no
+        // subscriber (the production case). Still under the lock: that is what
+        // serializes concurrent publishes into a monotonic view of the total.
+        self.inner.tx.send_replace(total);
+    }
+}
+
 /// Errors returned by `Listener::bind` and `Listener::serve`.
 #[derive(Debug, thiserror::Error)]
 pub enum ListenerError {
@@ -315,7 +409,7 @@ pub struct Listener {
     /// use it for introspection. Distinct from `cx_active`, which is decremented
     /// INSIDE each connection task and therefore cannot observe an unreaped
     /// completed task.
-    pending_tasks: tokio::sync::watch::Sender<usize>,
+    pending_tasks: PendingTasks,
 }
 
 /// 08.2 Task 6 (D12): RAII guard that increments
@@ -409,6 +503,7 @@ impl Listener {
         }
         let (cx_total, cx_active, cx_accept_failed, listener_manager_active) =
             register_listener_stats(&registry, &cfg.name)?;
+        let listeners_len = listeners.len();
         Ok(Self {
             listeners,
             handler,
@@ -417,7 +512,9 @@ impl Listener {
             cx_accept_failed,
             listener_manager_active,
             count_listener_active: true,
-            pending_tasks: tokio::sync::watch::channel(0usize).0,
+            // 67.1 (REVIEW.md I-4): one slot per accept loop; `serve` fans out one
+            // loop per bound socket and publishes their TOTAL.
+            pending_tasks: PendingTasks::new(listeners_len),
         })
     }
 
@@ -464,9 +561,11 @@ impl Listener {
                 cx_accept_failed: Arc::clone(&cx_accept_failed),
                 listener_manager_active: Arc::clone(&listener_manager_active),
                 count_listener_active: i == 0,
-                // 67.1: one watch per shard — each shard runs its own accept
-                // loop over its own SO_REUSEPORT socket, hence its own JoinSet.
-                pending_tasks: tokio::sync::watch::channel(0usize).0,
+                // 67.1: one aggregator per shard — each shard is its own
+                // `Listener` over a single SO_REUSEPORT socket, running one accept
+                // loop and hence holding one JoinSet. A single slot is the
+                // identity, so `pending_tasks()` reads that shard's own count.
+                pending_tasks: PendingTasks::new(1),
             })
             .collect())
     }
@@ -487,11 +586,18 @@ impl Listener {
         &self.listener_manager_active
     }
 
-    /// 67.1: in-flight connection tasks currently held by the accept loop's
-    /// `JoinSet`. Callable only before [`Listener::serve`] consumes `self`; use
+    /// 67.1: in-flight connection tasks currently held by this listener's accept
+    /// loops, **totalled across every bound socket**.
+    ///
+    /// Under the `SO_REUSEPORT` fan-out one logical listener runs N accept loops,
+    /// each with its own `JoinSet`; this is their sum, not any single loop's count
+    /// (REVIEW.md I-4). A `bind_shards` shard is its own `Listener` over one
+    /// socket, so there the total is that shard's own count.
+    ///
+    /// Callable only before [`Listener::serve`] consumes `self`; use
     /// [`Listener::pending_tasks_watch`] to keep observing afterwards.
     pub fn pending_tasks(&self) -> usize {
-        *self.pending_tasks.borrow()
+        self.pending_tasks.get()
     }
 
     /// 67.1: a receiver that keeps observing `pending_tasks` after
@@ -562,7 +668,7 @@ impl Listener {
                 cx_accept_failed,
                 shutdown,
                 drain,
-                pending_tasks,
+                pending_tasks.slot(0),
             )
             .await;
         }
@@ -581,16 +687,19 @@ impl Listener {
 
         let mut loops: tokio::task::JoinSet<Result<(), ListenerError>> =
             tokio::task::JoinSet::new();
-        for listener in listeners {
+        for (index, listener) in listeners.into_iter().enumerate() {
             let handler = Arc::clone(&handler);
             let cx_total = Arc::clone(&cx_total);
             let cx_active = Arc::clone(&cx_active);
             let cx_accept_failed = Arc::clone(&cx_accept_failed);
             let drain = Arc::clone(&drain);
             let mut sd_rx = sd_rx.clone();
-            // 67.1: every fan-out loop publishes its own socket's in-flight
-            // count onto the one shared watch.
-            let pending_tasks = pending_tasks.clone();
+            // 67.1 (REVIEW.md I-4): each fan-out loop gets its OWN slot and
+            // publishes only into it; `PendingTasks` broadcasts the total across
+            // slots. Previously every loop cloned one `watch::Sender` and wrote its
+            // own `join_set.len()` into the shared channel — last-writer-wins, and
+            // never the total the accessor's doc promised.
+            let pending_tasks = pending_tasks.slot(index);
             loops.spawn(async move {
                 // Per-loop shutdown: resolve once the broadcast flag is true.
                 // `wait_for` checks the current value first, so an already-fired
@@ -718,7 +827,7 @@ async fn accept_loop(
     cx_accept_failed: Arc<envoy_stats::Counter>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: Arc<DrainState>,
-    pending_tasks: tokio::sync::watch::Sender<usize>,
+    pending_tasks: PendingTasksSlot,
 ) -> Result<(), ListenerError> {
     let mut join_set: tokio::task::JoinSet<Result<(), Box<dyn std::error::Error + Send + Sync>>> =
         tokio::task::JoinSet::new();
@@ -791,7 +900,7 @@ async fn accept_loop(
         // climb without bound across sequential connections. `send_replace`
         // rather than `send` so the value is updated even when nothing has
         // subscribed (the production case).
-        pending_tasks.send_replace(join_set.len());
+        pending_tasks.publish(join_set.len());
     }
 
     // Drain.
@@ -1020,6 +1129,9 @@ mod tests {
         registry: &Arc<envoy_stats::StatsRegistry>,
         name: &str,
     ) -> Listener {
+        // 67.1 (REVIEW.md I-4): one slot per socket, because `serve` runs one
+        // accept loop per socket and hands each its own slot.
+        let pending_tasks = PendingTasks::new(listeners.len());
         Listener {
             listeners,
             handler,
@@ -1036,7 +1148,7 @@ mod tests {
                 .register_gauge("listener_manager.total_listeners_active")
                 .unwrap(),
             count_listener_active: true,
-            pending_tasks: tokio::sync::watch::channel(0usize).0,
+            pending_tasks,
         }
     }
 
@@ -2561,6 +2673,60 @@ filter_chains:
     /// task, so it reads 0 while the JoinSet entry still lingers. Only
     /// `pending_tasks()` (which publishes `join_set.len()`) sees the difference.
     ///
+    /// 67.1 / REVIEW.md I-4: under the SO_REUSEPORT fan-out, `pending_tasks` is a
+    /// TOTAL across every accept loop — not whichever loop published last.
+    ///
+    /// Before this fix, `Listener::serve` `.clone()`d one `watch::Sender` per
+    /// accept loop and each loop called `send_replace(join_set.len())` with **its
+    /// own socket's** count. `watch::Sender` clones share one channel, so the
+    /// published value flapped to the last writer and was neither a total nor
+    /// stable — while the public doc promised "in-flight connection tasks."
+    ///
+    /// This exercises the aggregator directly, so the assertion is deterministic
+    /// (which socket the kernel hands a given connection to is not).
+    ///
+    /// MAKE `PendingTasksSlot::publish` WRITE ITS OWN COUNT INSTEAD OF THE SUM
+    /// (the old last-writer-wins behavior) AND THIS TEST MUST FAIL: it would
+    /// read 4, not 7.
+    #[test]
+    fn pending_tasks_aggregates_across_accept_loops() {
+        let pending = PendingTasks::new(2);
+        let watch = pending.subscribe();
+        let loop_a = pending.slot(0);
+        let loop_b = pending.slot(1);
+
+        loop_a.publish(3);
+        assert_eq!(pending.get(), 3, "one loop reporting; total is its count");
+
+        loop_b.publish(4);
+        assert_eq!(
+            pending.get(),
+            7,
+            "TOTAL across both loops, not last-writer-wins"
+        );
+        assert_eq!(*watch.borrow(), 7, "subscribers observe the same total");
+
+        // A loop reaping back to zero must not zero the total.
+        loop_a.publish(0);
+        assert_eq!(pending.get(), 4, "loop_b still holds 4 in flight");
+
+        loop_b.publish(0);
+        assert_eq!(pending.get(), 0);
+    }
+
+    /// The single-socket path (`Listener::bind`, and every `bind_shards` shard)
+    /// has exactly one slot, so the total IS that loop's count — byte-for-byte
+    /// the pre-aggregation behavior the M66-3 witness below relies on.
+    #[test]
+    fn pending_tasks_single_slot_is_the_identity() {
+        let pending = PendingTasks::new(1);
+        let only = pending.slot(0);
+        only.publish(9);
+        assert_eq!(pending.get(), 9);
+        only.publish(0);
+        assert_eq!(pending.get(), 0);
+    }
+
     /// DELETE THE `join_next()` SELECT ARM IN `accept_loop` AND THIS TEST MUST
     /// FAIL (the count would climb to N).
     #[tokio::test(flavor = "multi_thread")]
