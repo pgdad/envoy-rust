@@ -483,6 +483,27 @@ pub enum ConfigError {
     #[error("listener {listener:?}: network rbac filter stat_prefix must be non-empty")]
     EmptyNetworkRbacStatPrefix { listener: String },
 
+    /// 67.1 D3 (CF-67-4, ADR-0129): a NETWORK `rbac` Permission/Principal leaf
+    /// that an L4 filter cannot evaluate.
+    ///
+    /// `header` is rejected in PARITY with upstream Envoy, which rejects it at
+    /// config load (`Found header(name: ":path"…`, SPEC R-6, measured).
+    /// `url_path` and `metadata` are rejected as a deliberate FAIL-LOUD
+    /// divergence (ADR-0049 decision-2 (b)): upstream ACCEPTS a matcher that can
+    /// never match at L4. No differential observable — neither fixture uses them.
+    ///
+    /// `67.2` WIDENS the allow-list to admit the connection-level arms. These
+    /// three rejections stay permanently.
+    #[error(
+        "listener {listener:?}: network rbac policy {policy_name:?} uses matcher {arm:?} at {path}, which cannot be evaluated at L4"
+    )]
+    UnsupportedNetworkRbacMatcher {
+        listener: String,
+        policy_name: String,
+        arm: &'static str,
+        path: String,
+    },
+
     // The six RBAC tree/empty-set variants below are raised by BOTH
     // `envoy.filters.http.rbac` (phase 10) and `envoy.filters.network.rbac`
     // (phase 67.1), which has no HCM. Their messages are therefore scope-neutral

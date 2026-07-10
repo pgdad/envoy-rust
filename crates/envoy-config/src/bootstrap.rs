@@ -3924,7 +3924,29 @@ fn validate_network_rbac_config(
     let Some(rules) = cfg.rules.as_ref() else {
         return Ok(()); // SPEC R-4: rules omitted ⇒ INERT.
     };
-    validate_rbac_rules(rules, listener_name)
+    validate_rbac_rules(rules, listener_name)?;
+    // 67.1 D3 (CF-67-4): the L4 leaf allow-list. Runs AFTER the shared tree
+    // validation, which bounds depth at RBAC_TREE_MAX_DEPTH — so these
+    // recursions are stack-safe. `67.2` widens the allow-list.
+    for (policy_name, policy) in rules.policies.iter() {
+        for (idx, perm) in policy.permissions.iter().enumerate() {
+            validate_l4_permission(
+                perm,
+                listener_name,
+                policy_name,
+                &format!("permissions[{idx}]"),
+            )?;
+        }
+        for (idx, prin) in policy.principals.iter().enumerate() {
+            validate_l4_principal(
+                prin,
+                listener_name,
+                policy_name,
+                &format!("principals[{idx}]"),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Phase 22: validate a jwt_authn filter config (minimum-viable). All errors
@@ -4255,6 +4277,97 @@ define_rbac_tree_validator!(
     "{path}.not_id",
     EmptyRbacPrincipalSet
 );
+
+/// 67.1 D3 (CF-67-4): reject every `Permission` leaf a NETWORK (L4) rbac filter
+/// cannot evaluate. `any` is admitted; `and_rules` / `or_rules` / `not_rule`
+/// recurse. `header` (parity), `url_path` and `metadata` (fail-loud) are
+/// rejected.
+///
+/// EXHAUSTIVE, with no `_ =>` catch-all: when `67.2` adds the connection-level
+/// arms, this function MUST fail to compile until they are classified. Never add
+/// a catch-all here.
+///
+/// Depth is NOT re-checked: `validate_rbac_rules` runs first and bounds the tree
+/// at `RBAC_TREE_MAX_DEPTH`, so this recursion is stack-safe by construction.
+fn validate_l4_permission(
+    node: &crate::Permission,
+    listener_name: &str,
+    policy_name: &str,
+    path: &str,
+) -> Result<(), crate::ConfigError> {
+    let reject = |arm: &'static str| {
+        Err(crate::ConfigError::UnsupportedNetworkRbacMatcher {
+            listener: listener_name.to_string(),
+            policy_name: policy_name.to_string(),
+            arm,
+            path: path.to_string(),
+        })
+    };
+    match node {
+        crate::Permission::Any(_) => Ok(()),
+        crate::Permission::Header(_) => reject("header"),
+        crate::Permission::Metadata(_) => reject("metadata"),
+        crate::Permission::UrlPath(_) => reject("url_path"),
+        crate::Permission::AndRules(set) | crate::Permission::OrRules(set) => {
+            for (idx, child) in set.rules.iter().enumerate() {
+                validate_l4_permission(
+                    child,
+                    listener_name,
+                    policy_name,
+                    &format!("{path}.rules[{idx}]"),
+                )?;
+            }
+            Ok(())
+        }
+        crate::Permission::NotRule(child) => validate_l4_permission(
+            child,
+            listener_name,
+            policy_name,
+            &format!("{path}.not_rule"),
+        ),
+    }
+}
+
+/// 67.1 D3 (CF-67-4): the `Principal` twin of [`validate_l4_permission`]. The
+/// set-wrapper field is `ids` (not `rules`) and the negation arm is `not_id`,
+/// per the upstream proto — which is exactly why the shared
+/// `define_rbac_tree_validator!` macro cannot express these verdicts.
+/// EXHAUSTIVE, no catch-all: see [`validate_l4_permission`].
+fn validate_l4_principal(
+    node: &crate::Principal,
+    listener_name: &str,
+    policy_name: &str,
+    path: &str,
+) -> Result<(), crate::ConfigError> {
+    let reject = |arm: &'static str| {
+        Err(crate::ConfigError::UnsupportedNetworkRbacMatcher {
+            listener: listener_name.to_string(),
+            policy_name: policy_name.to_string(),
+            arm,
+            path: path.to_string(),
+        })
+    };
+    match node {
+        crate::Principal::Any(_) => Ok(()),
+        crate::Principal::Header(_) => reject("header"),
+        crate::Principal::Metadata(_) => reject("metadata"),
+        crate::Principal::UrlPath(_) => reject("url_path"),
+        crate::Principal::AndIds(set) | crate::Principal::OrIds(set) => {
+            for (idx, child) in set.ids.iter().enumerate() {
+                validate_l4_principal(
+                    child,
+                    listener_name,
+                    policy_name,
+                    &format!("{path}.ids[{idx}]"),
+                )?;
+            }
+            Ok(())
+        }
+        crate::Principal::NotId(child) => {
+            validate_l4_principal(child, listener_name, policy_name, &format!("{path}.not_id"))
+        }
+    }
+}
 
 /// Phase 35: validate a single RBAC `metadata` matcher (shared by the Permission
 /// and Principal tree validators). Two boot-fatal rules (ADR-0086 §A4/A5):
@@ -5551,6 +5664,121 @@ static_resources:
             let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
             validate(&mut b).unwrap_or_else(|e| panic!("{name} chain must validate: {e}"));
         }
+    }
+
+    // --- 67.1 D3 (CF-67-4): the L4 leaf allow-list ---
+
+    /// 67.1 D3 / CF-67-4 / SPEC R-6: a `header` matcher in a NETWORK rbac config
+    /// is REJECTED — PARITY with upstream Envoy, which rejects it at config load.
+    #[test]
+    fn network_rbac_rejects_header_permission() {
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  action: ALLOW\n                  policies:\n                    p0:\n                      permissions: [{ header: { name: \":path\", exact_match: \"/x\" } }]\n                      principals: [{ any: true }]",
+        );
+        let err = validate(&mut b).expect_err("header rejected at L4");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedNetworkRbacMatcher {
+                ref policy_name, arm: "header", ref path, ..
+            } if policy_name == "p0" && path == "permissions[0]"),
+            "got {err:?}",
+        );
+    }
+
+    /// 67.1 D3 / CF-67-4 / SPEC R-6: `url_path` is a deliberate FAIL-LOUD
+    /// divergence (ADR-0049 decision-2 (b)) — upstream ACCEPTS it, but it can
+    /// never match at L4.
+    #[test]
+    fn network_rbac_rejects_url_path_principal_fail_loud() {
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{ any: true }]\n                      principals: [{ url_path: { path: { exact: \"/x\" } } }]",
+        );
+        let err = validate(&mut b).expect_err("url_path rejected at L4");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedNetworkRbacMatcher {
+                arm: "url_path", ref path, ..
+            } if path == "principals[0]"),
+            "got {err:?}",
+        );
+    }
+
+    /// 67.1 D3 / CF-67-4: `metadata` — same fail-loud posture.
+    #[test]
+    fn network_rbac_rejects_metadata_permission_fail_loud() {
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{ metadata: { filter: f, path: [{ key: k }], value: { string_match: { exact: v } } } }]\n                      principals: [{ any: true }]",
+        );
+        let err = validate(&mut b).expect_err("metadata rejected at L4");
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::UnsupportedNetworkRbacMatcher {
+                    arm: "metadata",
+                    ..
+                }
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// 67.1 D3: the walk RECURSES — a rejected leaf nested under combinators is
+    /// still caught, and the reported `path` names the exact position.
+    #[test]
+    fn network_rbac_rejects_header_nested_under_combinators() {
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions:\n                        - not_rule:\n                            or_rules:\n                              rules:\n                                - any: true\n                                - header: { name: x, exact_match: y }\n                      principals: [{ any: true }]",
+        );
+        let err = validate(&mut b).expect_err("nested header rejected");
+        assert!(
+            matches!(err, crate::ConfigError::UnsupportedNetworkRbacMatcher {
+                arm: "header", ref path, ..
+            } if path == "permissions[0].not_rule.rules[1]"),
+            "got {err:?}",
+        );
+    }
+
+    /// 67.1 D3: `any` + every combinator is ACCEPTED, arbitrarily nested. This
+    /// is the whole matcher surface `67.1` ships; `67.2` widens it.
+    #[test]
+    fn network_rbac_accepts_any_and_all_combinators() {
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  action: DENY\n                  policies:\n                    p0:\n                      permissions:\n                        - and_rules:\n                            rules:\n                              - any: true\n                              - not_rule: { any: false }\n                      principals:\n                        - or_ids:\n                            ids:\n                              - any: true\n                              - not_id: { any: false }",
+        );
+        validate(&mut b).expect("any + combinators are the 67.1 surface");
+    }
+
+    /// 67.1 D3: the `67.2` arms do NOT exist — they are rejected as UNKNOWN KEYS
+    /// by the hand-rolled `impl_single_key_oneof!` deserializer, not stubbed
+    /// (BOOTSTRAP_PROMPT.md §6.3). This test pins that they cannot silently
+    /// appear.
+    #[test]
+    fn network_rbac_connection_matcher_arms_do_not_exist_yet() {
+        for arm in ["direct_remote_ip", "remote_ip", "source_ip"] {
+            let yaml = network_rbac_yaml(&format!(
+                "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{{ any: true }}]\n                      principals: [{{ {arm}: {{ address_prefix: 1.2.3.4, prefix_len: 32 }} }}]"
+            ));
+            let err = serde_yaml::from_str::<crate::Bootstrap>(&yaml)
+                .expect_err("a 67.2 connection-matcher arm must not deserialize");
+            assert!(err.to_string().contains(arm), "{arm}: got {err}");
+        }
+    }
+
+    /// 67.1 D3: depth is bounded BEFORE the L4 walk recurses, so
+    /// `RbacTreeTooDeep` wins over `UnsupportedNetworkRbacMatcher` on a deep tree
+    /// with a bad leaf. This pins the ordering that keeps the L4 walk stack-safe.
+    #[test]
+    fn network_rbac_depth_bound_precedes_the_l4_walk() {
+        let mut inner = String::from("{ header: { name: x, exact_match: y } }");
+        for _ in 0..20 {
+            inner = format!("{{ not_rule: {inner} }}");
+        }
+        let mut b = network_rbac_bootstrap(&format!(
+            "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{inner}]\n                      principals: [{{ any: true }}]"
+        ));
+        let err = validate(&mut b).expect_err("too deep");
+        assert!(
+            matches!(err, crate::ConfigError::RbacTreeTooDeep { .. }),
+            "depth bound must run first; got {err:?}",
+        );
     }
 
     /// 67.1 D2 — closes M66-6. The pre-pass iterates
