@@ -140,11 +140,28 @@ pub async fn close_with_drain(mut stream: tokio::net::TcpStream) -> Result<(), s
 /// TERMINAL handler never runs. When every filter returns `Continue`, the
 /// connection is handed to `inner`.
 ///
-/// Because it wraps an arbitrary `Arc<dyn ConnectionHandler>`, ONE implementation
-/// covers every terminal filter — `echo`, `direct_response`, `tcp_proxy` and
-/// `http_connection_manager` — with no per-filter special-casing. The config
-/// validator's `NetworkFilterChainNotTerminated` rule (67.1 D2) guarantees a
-/// terminal handler always exists, so the iteration always terminates.
+/// **Which terminal filters may be wrapped — ADR-0132, measured.** The first-byte
+/// `peek` gates the *whole* chain, terminal handler included. That is only
+/// faithful for a terminal filter with **no establishment-time work**:
+///
+/// | terminal | establishment-time work | may be wrapped? |
+/// |---|---|---|
+/// | `echo` | none | **yes** |
+/// | `http_connection_manager` | none | **yes** |
+/// | `direct_response` | writes its payload, closes | **no** — `envoy-bin` bypasses the chain (ADR-0132 decision 2) |
+/// | `tcp_proxy` | connects upstream, relays a server-first banner | **no** — rejected at config load until phase `67.3` (ADR-0132 decision 4) |
+///
+/// `ADR-0130` Decision 2 claimed this wrapper "works uniformly for all four
+/// terminal filters." **That claim is false and is superseded by ADR-0132.**
+/// Wrapping `direct_response` or `tcp_proxy` here deadlocks a client of a
+/// server-speaks-first protocol, which never sends the byte the `peek` awaits.
+/// Splitting `ConnectionHandler` into establishment and data phases — so the
+/// `peek` gates the *filter's decision* rather than the *chain's hand-off* — is
+/// phase `67.3`'s charter.
+///
+/// The config validator's `NetworkFilterChainNotTerminated` rule (67.1 D2)
+/// guarantees a terminal handler always exists, so the iteration always
+/// terminates.
 ///
 /// On a TLS listener this runs on the raw `TcpStream` BEFORE the TLS handshake
 /// (`ChainHandler` wraps `TlsAcceptingHandler`). For the matcher arms that exist

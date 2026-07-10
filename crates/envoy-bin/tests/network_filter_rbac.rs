@@ -10,6 +10,15 @@
 //! establishment; envoy-rust matches. Every probe below that expects a decision
 //! therefore SENDS A BYTE FIRST. A probe that sends nothing is never evaluated —
 //! which is itself pinned, by `connection_that_sends_nothing_is_never_evaluated`.
+//!
+//! **ADR-0132 governs the COMPOSITION here.** That first-byte rule is the RBAC
+//! *verdict's* timing, not the terminal filter's. Upstream runs every filter's
+//! `onNewConnection` at connection establishment — the terminal filter's included.
+//! `echo` (and `http_connection_manager`) have no establishment-time work, so the
+//! chain's first-byte gate is observationally correct for them. `direct_response`
+//! writes and closes at establishment, so it BYPASSES the chain entirely; the two
+//! `*_direct_response_*` probes below are the witnesses. `tcp_proxy` connects
+//! upstream at establishment and is REJECTED at config load until phase `67.3`.
 
 use std::io::Write;
 use std::process::Stdio;
@@ -104,6 +113,46 @@ admin:
       port_value: {admin_port}
 {}"#,
         rbac_echo_cfg(port, stat_prefix, rules_block)
+    )
+}
+
+/// ADR-0132 decision 2: `[rbac, direct_response]`. The terminal filter writes its
+/// payload at connection ESTABLISHMENT, so the chain is bypassed entirely and the
+/// rbac counters — while REGISTERED — never tick. Measured against
+/// `envoyproxy/envoy:v1.33.0` (D-3.7).
+fn rbac_direct_response_cfg_with_admin(
+    port: u16,
+    admin_port: u16,
+    stat_prefix: &str,
+    rules_block: &str,
+) -> String {
+    format!(
+        r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: {admin_port}
+static_resources:
+  listeners:
+    - name: rbac_dr_listener
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: {port}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: {stat_prefix}
+{rules_block}
+            - name: envoy.filters.network.direct_response
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.direct_response.v3.Config
+                response:
+                  inline_string: "HELLO-DR\n"
+"#
     )
 }
 
@@ -281,6 +330,113 @@ async fn rules_omitted_is_inert_neither_counter_ticks() {
             .copied()
             .unwrap_or_else(|| panic!("counter {name} must be REGISTERED (stat tree parity)"));
         assert_eq!(got, 0, "INERT: {name} must not tick");
+    }
+}
+
+/// ADR-0132 decision 2 — THE C-1 REGRESSION WITNESS.
+///
+/// `[rbac(ALLOW, any), direct_response]`, client sends NOTHING. Upstream Envoy
+/// delivers the payload and closes cleanly, because it runs EVERY filter's
+/// `onNewConnection` at connection establishment — the TERMINAL filter's
+/// included — and defers only the RBAC *verdict* to the first downstream byte.
+/// `direct_response` writes and closes before any `onData` can fire, so RBAC
+/// never evaluates and no counter ticks.
+///
+/// Against the pre-fix code this test HANGS (the `ChainHandler` peek waits for a
+/// first byte that a well-behaved client of a server-speaks-first protocol never
+/// sends), which is why the read is wrapped in a timeout — see M-2.
+///
+/// RESTORE `wrap_in_chain` ON THE `direct_response` ARM AND THIS TEST MUST FAIL.
+#[tokio::test]
+async fn direct_response_delivers_payload_to_a_client_that_sends_nothing() {
+    let port = reserve_port();
+    let admin_port = reserve_port();
+    let (_child, _dir) = spawn_envoy_bin(&rbac_direct_response_cfg_with_admin(
+        port, admin_port, "dra", ALLOW_ALL,
+    ));
+    let data_addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("admin up");
+    wait_ready(data_addr, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+
+    let mut s = TcpStream::connect(data_addr).await.unwrap();
+    // Send NOTHING. The terminal filter speaks first.
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .expect("direct_response must write its payload without any client byte")
+        .expect("clean EOF, not RST");
+    assert_eq!(out, b"HELLO-DR\n");
+
+    let stats = scrape_admin_stats(admin_addr).await;
+    for name in ["dra.rbac.allowed", "dra.rbac.denied"] {
+        let got = stats
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| panic!("counter {name} must be REGISTERED (stat tree parity)"));
+        assert_eq!(got, 0, "the chain is bypassed; {name} must never tick");
+    }
+}
+
+/// ADR-0132 decision 2, the counter-intuitive half: **a DENY policy does NOT
+/// suppress the payload.** Measured on upstream Envoy — `[rbac(DENY, any),
+/// direct_response]` delivers `HELLO-DR\n` and closes cleanly with all four
+/// counters at `0`, whether or not the client sends a byte.
+///
+/// Both client behaviors are probed: sending a first byte must not change the
+/// outcome, because the terminal filter has already written and closed.
+#[tokio::test]
+async fn deny_does_not_suppress_the_direct_response_payload() {
+    let port = reserve_port();
+    let admin_port = reserve_port();
+    let (_child, _dir) = spawn_envoy_bin(&rbac_direct_response_cfg_with_admin(
+        port, admin_port, "drd", DENY_ALL,
+    ));
+    let data_addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("admin up");
+    wait_ready(data_addr, Duration::from_secs(10))
+        .await
+        .expect("listener up");
+
+    for send_first_byte in [false, true] {
+        let mut s = TcpStream::connect(data_addr).await.unwrap();
+        if send_first_byte {
+            s.write_all(b"X").await.unwrap();
+        }
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("DENY must still deliver (send_first_byte={send_first_byte})")
+            })
+            .expect("clean EOF, not RST");
+        assert_eq!(
+            out, b"HELLO-DR\n",
+            "a DENY policy must NOT suppress the direct_response payload \
+             (send_first_byte={send_first_byte})",
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stats = scrape_admin_stats(admin_addr).await;
+    for name in [
+        "drd.rbac.allowed",
+        "drd.rbac.denied",
+        "drd.rbac.shadow_allowed",
+        "drd.rbac.shadow_denied",
+    ] {
+        let got = stats
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| panic!("counter {name} must be REGISTERED (stat tree parity)"));
+        assert_eq!(got, 0, "the chain is bypassed; {name} must never tick");
     }
 }
 

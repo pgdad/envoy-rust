@@ -7,6 +7,17 @@
 //! Empirically matched against `envoyproxy/envoy:v1.33.0` (phase-66 SPEC §0
 //! R-0.5/R-0.7).
 //!
+//! **That "immediately" is load-bearing, and it is why `direct_response` BYPASSES
+//! the network-filter chain (ADR-0132 decision 2).** Upstream Envoy runs every
+//! filter's `onNewConnection` at connection establishment — including the terminal
+//! filter's — and defers only the RBAC verdict to the first downstream byte. With
+//! `direct_response` terminal, the payload is written and the connection closed
+//! before any `onData` can fire, so a preceding `envoy.filters.network.rbac` never
+//! evaluates and never ticks a counter, **even under `action: DENY`** (measured).
+//! `envoy-bin::main` therefore hands the connection straight to this handler and
+//! never builds an `envoy_listener::ChainHandler` for it. Wrapping this handler in
+//! the chain's first-byte `peek` would hang a client that correctly sends nothing.
+//!
 //! 67.1 (ADR-0130): the standalone accept loop this module used to own was
 //! DELETED, in the same sub-phase as `echo.rs`'s — preserving the "echo is the
 //! structural model" invariant the phase-66 review required, and consuming

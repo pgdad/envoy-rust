@@ -289,12 +289,28 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                         .unwrap_or(&[])
                         .into();
                     let payload_len = payload.len();
+                    // ADR-0132 decision 2: `direct_response` BYPASSES the chain.
+                    //
+                    // Upstream Envoy runs every filter's `onNewConnection` at
+                    // connection establishment — the TERMINAL filter's included —
+                    // and defers only the RBAC *verdict* to the first downstream
+                    // byte. `direct_response` writes its payload and closes at
+                    // establishment, so `onData` never fires and the network
+                    // `rbac` filter never evaluates: measured, all four counters
+                    // stay 0 even under `action: DENY`, and the payload is
+                    // delivered regardless.
+                    //
+                    // So no `wrap_in_chain` here. `chain_filters` was still built
+                    // above, which is what REGISTERS the `<stat_prefix>.rbac.*`
+                    // counters at 0 and keeps the stat tree matching upstream's.
+                    // Dropping it here is the point: the filters never run.
+                    //
+                    // Witnessed by `direct_response_delivers_payload_to_a_client_that_sends_nothing`
+                    // and `deny_does_not_suppress_the_direct_response_payload`.
+                    drop(chain_filters);
                     bind_and_spawn_listener(
                     listener_cfg,
-                    wrap_in_chain(
-                        chain_filters,
-                        std::sync::Arc::new(direct_response::DirectResponseHandler::new(payload)),
-                    ),
+                    std::sync::Arc::new(direct_response::DirectResponseHandler::new(payload)),
                     &registry,
                     listener_concurrency,
                     "direct_response",
