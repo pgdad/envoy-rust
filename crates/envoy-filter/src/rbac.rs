@@ -1311,4 +1311,71 @@ mod tests {
             .expect_err("direct_remote_ip is L4-only in the HTTP filter");
         assert!(matches!(err, FilterError::InvalidConfig { .. }), "got {err:?}");
     }
+
+    /// 67.2 D3 / Task 4: the remaining L4-only Permission arm (`destination_ip`).
+    #[test]
+    fn http_rbac_rejects_destination_ip_permission() {
+        let cidr = serde_yaml::from_str::<envoy_config::CidrRange>(
+            "address_prefix: 10.0.0.0\nprefix_len: 8",
+        )
+        .unwrap();
+        assert!(matches!(
+            lower_permission(&envoy_config::Permission::DestinationIp(cidr)),
+            Err(FilterError::InvalidConfig { .. })
+        ));
+    }
+
+    /// 67.2 D3 / Task 4: the remaining two source-IP Principal arms
+    /// (`remote_ip`, `source_ip`) are each rejected fail-loud.
+    #[test]
+    fn http_rbac_rejects_remote_ip_and_source_ip_principals() {
+        for ctor in [
+            envoy_config::Principal::RemoteIp as fn(envoy_config::CidrRange) -> envoy_config::Principal,
+            envoy_config::Principal::SourceIp,
+        ] {
+            let cidr = serde_yaml::from_str::<envoy_config::CidrRange>(
+                "address_prefix: 10.0.0.0\nprefix_len: 8",
+            )
+            .unwrap();
+            assert!(matches!(
+                lower_principal(&ctor(cidr)),
+                Err(FilterError::InvalidConfig { .. })
+            ));
+        }
+    }
+
+    /// 67.2 D3 / Task 4: the rejection is STARTUP-FATAL — it propagates through
+    /// the whole `RbacFilter::build_from_config` builder, not just the private
+    /// `lower_*` helpers. An HTTP rbac filter carrying an L4 principal fails to
+    /// construct. (Upstream ACCEPTS it — deliberate divergence, ADR-0133.)
+    #[test]
+    fn http_rbac_build_from_config_rejects_l4_principal_startup_fatal() {
+        use envoy_stats::StatsRegistry;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry = Arc::new(StatsRegistry::new());
+        let cidr = serde_yaml::from_str::<envoy_config::CidrRange>(
+            "address_prefix: 10.0.0.0\nprefix_len: 8",
+        )
+        .unwrap();
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            "l4".to_string(),
+            envoy_config::Policy {
+                permissions: vec![envoy_config::Permission::Any(true)],
+                principals: vec![envoy_config::Principal::DirectRemoteIp(cidr)],
+            },
+        );
+        let cfg = envoy_config::RbacConfig {
+            rules: envoy_config::Rules {
+                action: envoy_config::Action::Allow,
+                policies,
+            },
+        };
+        assert!(matches!(
+            RbacFilter::build_from_config(&cfg, &registry, "ingress_http"),
+            Err(FilterError::InvalidConfig { .. })
+        ));
+    }
 }

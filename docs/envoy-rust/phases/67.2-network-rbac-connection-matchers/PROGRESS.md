@@ -97,3 +97,18 @@ network_rbac (13) all pass.
   predicates + `not_id` over a non-matching `direct_remote_ip`).
 
 **Result:** `cargo test -p envoy-bin --bins network_rbac` → **18 passed**.
+
+---
+
+## Task 4 — HTTP RBAC rejects every L4-only arm (fail-loud) — ✅ DONE
+
+**Commit:** (see `phase 67.2 task 4`). Tests only (`crates/envoy-filter/src/rbac.rs`).
+
+- Added the remaining per-arm `lower_*` witnesses: `http_rbac_rejects_destination_ip_permission`
+  and `http_rbac_rejects_remote_ip_and_source_ip_principals` (all five arms now covered, alongside
+  Task 2's `destination_port` / `direct_remote_ip` witnesses).
+- Added `http_rbac_build_from_config_rejects_l4_principal_startup_fatal` — mirrors the existing
+  `build_from_config_allow_with_header_principal_creates_filter`, proving the rejection is
+  STARTUP-FATAL (propagates through `RbacFilter::build_from_config`, not just the private `lower_*`).
+
+**Result:** `cargo test -p envoy-filter http_rbac` → **5 passed**.
