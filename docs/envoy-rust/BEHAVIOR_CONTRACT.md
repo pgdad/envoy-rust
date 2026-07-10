@@ -364,6 +364,15 @@ no-op clause below).
    they can never match at L4 — a deliberate **fail-loud** divergence per the ADR-0049 decision-2
    (b) posture. **No differential observable** — neither fixture uses them. *(SPEC R-6, measured.)*
 
+9b. **Recorded divergence — `rules: { policies: {} }` (M-5, UNMEASURED for the network filter).**
+    envoy-rust rejects an empty `policies` map at config load (`ConfigError::EmptyRbacPolicies`,
+    the phase-10 check reused per 67.1 D1, ADR-0049 fail-loud posture). **Upstream Envoy's behavior
+    for the NETWORK filter on this input was never measured** — SPEC R-3 measured only `rules`
+    *omitted*, which is item 5 above and is genuine parity. Recorded rather than smoothed over: the
+    reuse is sanctioned, but the parity claim is not established. **No differential observable** —
+    no fixture configures an empty `policies` map. A phase that next probes upstream on this filter
+    should measure it.
+
 10. **Recorded divergence — `shadow_rules` (CF-67-1).** Upstream accepts `shadow_rules` /
     `shadow_rules_stat_prefix`; envoy-rust rejects them loudly at config load (serde
     `deny_unknown_fields`) and emits `shadow_allowed` / `shadow_denied` as constant `0` so the stat

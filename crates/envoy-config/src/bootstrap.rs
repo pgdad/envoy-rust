@@ -3058,6 +3058,14 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
             // once (`[echo, rbac]`) — measured upstream precedence, SPEC R-5.
             // An empty `filters: []` chain is ACCEPTED (SPEC R-7, upstream
             // parity, closes M66-5): `last()` is None and this check no-ops.
+            //
+            // M-4, a diagnostic consequence worth stating: because this check
+            // precedes the per-filter allow-list loop below, a chain ending in an
+            // UNKNOWN filter name reports `NetworkFilterChainNotTerminated` rather
+            // than `UnsupportedFilter` — an unknown name is, by definition, not
+            // terminal. Both are fail-loud rejections, so this is a loss of
+            // diagnostic precision, not of correctness. Pinned by
+            // `rejects_unknown_filter_name`.
             if let Some(last) = chain.filters.last()
                 && !is_terminal_network_filter(&last.name)
             {

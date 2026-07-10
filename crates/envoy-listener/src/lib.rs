@@ -205,10 +205,24 @@ impl ConnectionHandler for ChainHandler {
             // anything. Upstream Envoy takes no decision in that case (neither
             // counter ticks) and closes with a clean EOF. Match it: skip the
             // filters entirely.
+            //
+            // M-6: an `Err` here means the client went away before its first byte
+            // (typically a reset). That is not a connection-task FAILURE — it is
+            // the `Ok(0)` case arriving rudely — so it must not surface through
+            // `accept_loop` as a `warn!`-level "connection task failed". No
+            // decision is taken and no counter ticks, exactly as for `Ok(0)`. The
+            // socket is already unusable, so there is nothing to drain: drop it.
             let mut first_byte = [0u8; 1];
-            if downstream.peek(&mut first_byte).await? == 0 {
-                close_with_drain(downstream).await?;
-                return Ok(());
+            match downstream.peek(&mut first_byte).await {
+                Ok(0) => {
+                    close_with_drain(downstream).await?;
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!(error = %err, "client went away before its first byte");
+                    return Ok(());
+                }
             }
 
             for filter in filters.iter() {

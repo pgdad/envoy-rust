@@ -226,6 +226,11 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // probed, so envoy-rust asserts nothing about it. Carried forward as CF-67-5.
     // Recorded in BEHAVIOR_CONTRACT.md as a divergence with no differential
     // observable — no fixture configures an empty chain.
+    // M-8: envoy-rust serves only the FIRST listener, and only its first filter
+    // chain. **Pre-existing — NOT introduced by 67.1**, which merely moved the
+    // network-filter chain refactor inside this block. Noted here so a future
+    // session does not read `.next()` / `.first()` as new, and so whichever phase
+    // lands multi-listener support knows this is the site.
     if let Some(listener_cfg) = bootstrap.all_listeners().next() {
         let Some(chain) = listener_cfg.filter_chains.first() else {
             anyhow::bail!("listener {:?} has no filter_chains", listener_cfg.name);

@@ -172,8 +172,36 @@ mod tests {
 
     const ANY_POLICY: &str = "  policies:\n    p0:\n      permissions: [{ any: true }]\n      principals: [{ any: true }]";
 
+    /// Read a counter's value. **Do not use this to assert REGISTRATION** —
+    /// `register_counter` is get-or-create (`envoy_stats::StatsRegistry`), so it
+    /// would happily mint the counter and read 0 for a name nobody registered.
+    /// Use [`registered_stat`] for that (M-1).
     fn stat(reg: &envoy_stats::StatsRegistry, name: &str) -> u64 {
         reg.register_counter(name).expect("counter").value()
+    }
+
+    /// M-1: a NON-CREATING lookup. `snapshot()` reads the registry map without
+    /// inserting, so a missing name is a genuine "never registered" failure rather
+    /// than a silently-created zero.
+    ///
+    /// This is what makes the registration half of
+    /// `shadow_counters_register_at_zero_and_never_tick` non-vacuous. With `stat`
+    /// it passed even if `NetworkRbacFilter::new` had registered nothing at all.
+    fn registered_stat(reg: &envoy_stats::StatsRegistry, name: &str) -> u64 {
+        let (_, handle) = reg
+            .snapshot()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| {
+                panic!("counter {name} must be REGISTERED by NetworkRbacFilter::new")
+            });
+        match handle {
+            envoy_stats::StatHandle::Counter(c) => c.value(),
+            other => panic!(
+                "{name} registered as {:?}, expected a counter",
+                other.kind_str()
+            ),
+        }
     }
 
     /// D6 / SPEC R-2: `action: ALLOW` + a matching policy ⇒ Continue, `allowed` ticks.
@@ -315,6 +343,15 @@ mod tests {
 
     /// D6 / CF-67-1: all four counters register even with rules present, and the
     /// two shadow counters NEVER tick (shadow policies are not modeled).
+    ///
+    /// M-1: the REGISTRATION half asserts through the non-creating
+    /// [`registered_stat`]. It previously used `stat`, i.e. `register_counter`,
+    /// which is **get-or-create** — so it would have created each counter and read
+    /// 0 even had `NetworkRbacFilter::new` registered nothing. Only the
+    /// *behavioral* half (shadow counters never tick) was sound.
+    ///
+    /// DELETE A `register_counter` CALL IN `NetworkRbacFilter::new` AND THIS TEST
+    /// MUST FAIL.
     #[test]
     fn shadow_counters_register_at_zero_and_never_tick() {
         let reg = envoy_stats::StatsRegistry::new();
@@ -326,9 +363,11 @@ mod tests {
         for _ in 0..5 {
             let _ = f.on_new_connection(&conn());
         }
-        assert_eq!(stat(&reg, "s.rbac.denied"), 5);
-        assert_eq!(stat(&reg, "s.rbac.shadow_allowed"), 0);
-        assert_eq!(stat(&reg, "s.rbac.shadow_denied"), 0);
+        // Stat-tree parity: all four names exist, whether or not they ever tick.
+        assert_eq!(registered_stat(&reg, "s.rbac.allowed"), 0);
+        assert_eq!(registered_stat(&reg, "s.rbac.denied"), 5);
+        assert_eq!(registered_stat(&reg, "s.rbac.shadow_allowed"), 0);
+        assert_eq!(registered_stat(&reg, "s.rbac.shadow_denied"), 0);
     }
 
     /// D6: counters accumulate across connections.

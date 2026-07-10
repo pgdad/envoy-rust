@@ -49,6 +49,13 @@ fn spawn_envoy_bin(yaml: &str) -> (tokio::process::Child, tempfile::TempDir) {
     (child, dir)
 }
 
+/// M-2: every downstream read in this file is BOUNDED. Three probes here used to
+/// `read_to_end` with no timeout, so a "the connection never closes" regression --
+/// exactly what C-1 produced in neighboring configs -- hung CI instead of failing
+/// with a useful message. Any read that legitimately completes does so in
+/// milliseconds against a loopback listener.
+const READ_BUDGET: Duration = Duration::from_secs(5);
+
 /// How long a config REJECTION may take before we conclude the config was in fact
 /// ACCEPTED. A rejected config exits non-zero within milliseconds; this bound only
 /// has to beat process startup.
@@ -264,7 +271,7 @@ async fn deny_writes_zero_bytes_and_closes_cleanly_discarding_client_bytes() {
     // ADR-0131: the decision fires on the first downstream byte.
     s.write_all(b"PING-RBAC\n").await.unwrap();
     let mut out = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
         .await
         .expect("DENY must half-close within 5s")
         .expect("clean EOF, not RST");
@@ -292,7 +299,11 @@ async fn deny_post_eof_client_write_is_accepted_not_reset() {
     // ADR-0131: a byte is required for the decision to be taken at all.
     s.write_all(b"x").await.unwrap();
     let mut out = Vec::new();
-    s.read_to_end(&mut out).await.expect("clean EOF");
+    // M-2: bounded. A "never closes" regression must FAIL here, not hang CI.
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
+        .await
+        .expect("DENY must half-close within the read budget")
+        .expect("clean EOF");
     assert!(out.is_empty());
 
     // Two writes: the first may be absorbed locally; a returning RST surfaces on
@@ -319,7 +330,11 @@ async fn allow_yields_to_the_terminal_echo_filter() {
     s.write_all(b"PING-RBAC\n").await.unwrap();
     s.shutdown().await.unwrap();
     let mut out = Vec::new();
-    s.read_to_end(&mut out).await.expect("echo round-trip");
+    // M-2: bounded — an ALLOW that never yields would otherwise hang CI.
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
+        .await
+        .expect("ALLOW must yield to the terminal echo within the read budget")
+        .expect("echo round-trip");
     assert_eq!(out, b"PING-RBAC\n");
 }
 
@@ -391,8 +406,10 @@ async fn rules_omitted_is_inert_neither_counter_ticks() {
     s.write_all(b"HELLO\n").await.unwrap();
     s.shutdown().await.unwrap();
     let mut out = Vec::new();
-    s.read_to_end(&mut out)
+    // M-2: bounded — an INERT filter that silently stalled would otherwise hang CI.
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
         .await
+        .expect("an inert filter must pass the connection through within the read budget")
         .expect("allowed through to echo");
     assert_eq!(out, b"HELLO\n", "an inert filter allows the connection");
 
@@ -445,7 +462,7 @@ async fn direct_response_delivers_payload_to_a_client_that_sends_nothing() {
     let mut s = TcpStream::connect(data_addr).await.unwrap();
     // Send NOTHING. The terminal filter speaks first.
     let mut out = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
         .await
         .expect("direct_response must write its payload without any client byte")
         .expect("clean EOF, not RST");
@@ -490,7 +507,7 @@ async fn deny_does_not_suppress_the_direct_response_payload() {
             s.write_all(b"X").await.unwrap();
         }
         let mut out = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
             .await
             .unwrap_or_else(|_| {
                 panic!("DENY must still deliver (send_first_byte={send_first_byte})")
@@ -549,7 +566,7 @@ async fn rbac_before_hcm_evaluates_on_the_first_request() {
         .await
         .unwrap();
     let mut out = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
         .await
         .expect("ALLOW must yield to the terminal HCM within 5s")
         .expect("clean EOF");
@@ -593,7 +610,7 @@ async fn deny_before_hcm_writes_nothing_and_ticks_denied_once() {
         .await
         .unwrap();
     let mut out = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut out))
         .await
         .expect("DENY must half-close within 5s")
         .expect("clean EOF, not RST");
@@ -853,6 +870,63 @@ async fn structurally_invalid_metadata_leaf_is_not_reported_as_an_hcm_error() {
         output.contains(r#"listener "rbac_listener""#),
         "the message must still name the listener; got {output}",
     );
+}
+
+/// M-7: locks **CF-67-2**'s boundary. `action: LOG` is a real upstream Envoy RBAC
+/// action; envoy-rust's `Action` enum has exactly two variants, so `LOG` is
+/// rejected at config load rather than silently treated as ALLOW or DENY. The same
+/// goes for `enforcement_type` and `delay_deny`, rejected by serde's
+/// `deny_unknown_fields`.
+///
+/// All three are correctly rejected today; nothing pinned it. Whichever phase
+/// consumes CF-67-2 will delete the `LOG` case from this test.
+#[tokio::test]
+async fn log_action_and_unmodeled_rbac_fields_are_rejected() {
+    let cases = [
+        (
+            "LOG",
+            concat!(
+                "                rules:\n",
+                "                  action: LOG\n",
+                "                  policies:\n",
+                "                    p0:\n",
+                "                      permissions: [{ any: true }]\n",
+                "                      principals: [{ any: true }]",
+            ),
+        ),
+        (
+            "enforcement_type",
+            concat!(
+                "                enforcement_type: CONTINUOUS\n",
+                "                rules:\n",
+                "                  action: ALLOW\n",
+                "                  policies:\n",
+                "                    p0:\n",
+                "                      permissions: [{ any: true }]\n",
+                "                      principals: [{ any: true }]",
+            ),
+        ),
+        (
+            "delay_deny",
+            concat!(
+                "                delay_deny: 1s\n",
+                "                rules:\n",
+                "                  action: ALLOW\n",
+                "                  policies:\n",
+                "                    p0:\n",
+                "                      permissions: [{ any: true }]\n",
+                "                      principals: [{ any: true }]",
+            ),
+        ),
+    ];
+    for (what, rules) in cases {
+        let (ok, output) = validate_config(&rbac_echo_cfg(reserve_port(), "sp", rules)).await;
+        assert!(!ok, "{what} must be rejected, never silently ignored");
+        assert!(
+            output.to_lowercase().contains(&what.to_lowercase()),
+            "the error must name {what}; got {output}",
+        );
+    }
 }
 
 /// D3 / CF-67-4: the three L4-unevaluable leaves are rejected at startup.
