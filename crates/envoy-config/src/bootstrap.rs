@@ -6268,6 +6268,24 @@ static_resources:
         );
     }
 
+    #[test]
+    fn network_rbac_rejects_ipv4_mapped_ipv6_over_wide_cidr_at_config_load() {
+        // phase-67.2 REVIEW C-1, end-to-end through the real config path
+        // (`validate(&mut bootstrap)`, not just `CidrRange::validate`). An
+        // IPv4-mapped-IPv6 address_prefix with prefix_len > 32 must be rejected
+        // fail-loud at load — otherwise it validates and later panics the data
+        // plane. Before the fix, `validate` accepted this (raw IPv6 → ≤128).
+        let mut b = network_rbac_bootstrap(
+            "stat_prefix: sp\n                rules:\n                  policies:\n                    p0:\n                      permissions: [{ any: true }]\n                      principals: [{ direct_remote_ip: { address_prefix: \"::ffff:127.0.0.0\", prefix_len: 40 } }]",
+        );
+        let err = validate(&mut b).expect_err("v4-mapped-v6 /40 must be rejected at load");
+        assert!(
+            matches!(err, crate::ConfigError::InvalidCidrRange { ref policy_name, ref path, .. }
+                if policy_name == "p0" && path == "principals[0]"),
+            "got {err:?}",
+        );
+    }
+
     /// 67.1 D3: depth is bounded BEFORE the L4 walk recurses, so
     /// `RbacTreeTooDeep` wins over `UnsupportedNetworkRbacMatcher` on a deep tree
     /// with a bad leaf. This pins the ordering that keeps the L4 walk stack-safe.
