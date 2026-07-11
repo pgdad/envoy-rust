@@ -1050,3 +1050,60 @@ async fn sni_resolver_is_case_insensitive() {
 
     server_task.await.expect("server task joins");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sni_resolver_without_default_aborts_unknown_sni() {
+    // Security property (SniResolver doc contract): with NO catch-all chain, an
+    // unknown SNI resolves to `None`, and rustls MUST abort the handshake
+    // (`unrecognized_name`) rather than pick an arbitrary cert. The existing
+    // tests only assert the known-SNI happy paths; the reject path was untested.
+    install_provider_once();
+    let pki = pki::build();
+    let key_a = Arc::new(pki::certified_key_from_pem(
+        &pki.leaf_cert_pem,
+        &pki.leaf_key_pem,
+    ));
+    let mut map = std::collections::HashMap::new();
+    map.insert("a.example.com".to_string(), key_a);
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        Arc::new(SniResolver { map, default: None });
+    let server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(async move {
+        acceptor
+            .accept(listener.accept().await.expect("accept").0)
+            .await
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(pki.ca_der_for_root_store.clone())
+        .expect("add ca");
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let server_name =
+        rustls::pki_types::ServerName::try_from("unknown.example.com").expect("server name");
+
+    // Both sides must fail: the server has no cert for this SNI and no default,
+    // so it sends a fatal alert; the client connect surfaces the aborted handshake.
+    let client_result = connector.connect(server_name, stream).await;
+    assert!(
+        client_result.is_err(),
+        "unknown SNI without a catch-all must fail the client handshake"
+    );
+    let server_result = server_task.await.expect("server task joins");
+    assert!(
+        server_result.is_err(),
+        "server must abort (no cert for SNI, no default), got Ok"
+    );
+}
