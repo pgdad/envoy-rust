@@ -214,7 +214,51 @@ one new piece of test infrastructure" — in fact none is needed for the top ite
 
 ## 4. Implemented this pass
 
-_(filled in as work lands — see final report at the end of this file)_
+Seven commits, each a logical unit (fmt + clippy `-D warnings` clean, tests green):
+
+| Area | Change | Tests added | Bug? |
+|---|---|---|---|
+| **C-1** `CidrRange` (envoy-config) | `validate` now sizes `prefix_len` against the **canonical** address family via a shared `canonical_ip` helper, so an IPv4-mapped-IPv6 `address_prefix` is bounded at /32 and an over-wide one is rejected fail-loud at config load; `prefix_match` gains a defensive non-panicking bounds bail | regression test (mapped /33–/128 rejected, `contains` never panics), a `contains`-level property sweep over every validate-passing prefix × a v4/v6/v4-mapped address matrix (I-1), and an end-to-end config-load rejection through `validate(&mut bootstrap)` | **Yes — known Critical, now fixed** |
+| **P2** Content-Length (envoy-http1) | `parse_content_length` scans **all** `Content-Length` rows; conflicting values are rejected as `MalformedHeader` (no new response shape), identical repeats tolerated (RFC 7230 §3.3.3) | 5 unit tests + 2 end-to-end `drive` tests (conflicting → no response; identical-dup → 200) | **Yes — new, CL/CL smuggling** |
+| **P3** Transfer-Encoding (envoy-http1) | chunked detection now matches a `chunked` token in **any** comma-separated position or across multiple TE rows, not only the exact value `"chunked"` | `has_chunked_transfer_encoding` unit test + end-to-end `chunked, gzip` → 501 (was silently CL-framed 200) + codec characterization test (obs-fold, space-in-name, NUL-in-value all rejected) | **Yes — new, TE/CL smuggling** |
+| **P4** idle timeout (envoy-http1) | — (test only) | deterministic slow-client idle-read-timeout test using tokio's paused clock (no fixed sleep) — proves a stalled partial request is cleanly closed with no response | No (untested path now covered) |
+| **P6** TLS SNI (envoy-tls) | — (test only) | end-to-end handshake-abort test: unknown SNI with no catch-all fails both client connect and server accept | No (untested path now covered) |
+
+Each of the three bug fixes ships a test that was verified to **fail against the
+pre-fix code** (the C-1 property test panics at the exact `prefix_match` index;
+the CL and TE end-to-end tests return the wrong success status), so they are
+genuine regression guards, not tautologies.
+
+### Test-suite results before / after
+
+- **Unit + `envoy-bin` integration (non-Docker):** before ~1150 unit tests green;
+  after **1713 passed, 0 failed, 7 ignored** (`cargo test --workspace --exclude
+  differential --exclude h2spec-conformance`). +19 new tests from this pass; the
+  rest of the delta is the full integration set now counted.
+- **Differential (Docker):** unchanged — the only failure is the pre-existing,
+  host-dependent environmental RED where a backend resolves to an unroutable IPv6
+  address (Envoy logs `UF`/`immediate_connect_error: Network is unreachable`,
+  envoy-rust logs `UC`); documented in `STATE.md` as adjudicated. No fixture
+  exercises duplicate-CL, TE-variant, or v4-mapped-CIDR inputs, so all fixtures
+  stay green. Running the suite at full parallelism additionally surfaces ~8
+  transient `accept-ready within 10s` timeouts (container/port contention, not
+  product failures); at `--test-threads=4` only the one IPv6 RED remains.
+- **fmt / clippy:** `cargo fmt --all -- --check` and `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` both clean.
+
+### Implementation bugs discovered
+
+1. **C-1 (Critical, known, fixed):** config-reachable release-mode data-plane panic
+   on an IPv4-mapped-IPv6 `CidrRange` prefix with `prefix_len > 32`.
+2. **CL/CL request smuggling (new, fixed):** two conflicting `Content-Length` rows
+   were silently framed on the first — the classic smuggling desync.
+3. **TE/CL request smuggling (new, fixed):** a `Transfer-Encoding` value carrying a
+   `chunked` token in a non-exact position (`chunked, gzip`) was not recognised as
+   chunked and fell through to Content-Length framing instead of the 501 rejection.
+
+All three are small, clearly-correct fixes that break no differential fixture; the
+smuggling fixes reject strictly more malformed input than before and introduce no
+new response shape (they reuse the existing `MalformedHeader` reject disposition).
 
 ---
 
