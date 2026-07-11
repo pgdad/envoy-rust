@@ -836,9 +836,7 @@ async fn serve_connection(
 
         // 4. Compute body length (for the body read + the M25.1-1 reservation bound) before consuming.
         let body_len = parse_content_length(&req.headers)?;
-        let chunked = req.headers.iter().any(|(n, v)| {
-            n.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
-        });
+        let chunked = has_chunked_transfer_encoding(&req.headers);
 
         // 06.2 Task 6: request-side wire-byte count for
         // `%BYTES_RECEIVED%`. Per Envoy semantic, header bytes are NOT
@@ -1691,6 +1689,23 @@ fn build_access_log_record(
 /// rejected as `MalformedHeader` (the same disposition as a non-numeric value, so
 /// no new response shape is introduced), matching upstream Envoy's rejection.
 /// Identical repeated values are tolerated (§3.3.3 permits combining them).
+/// True if any `Transfer-Encoding` header names `chunked` as one of its
+/// comma-separated tokens (case-insensitive, OWS-trimmed). envoy-rust does not
+/// support chunked request bodies and rejects them 501. Matching only the exact
+/// value `"chunked"` (the former inline check) let smuggling-shaped values like
+/// `"chunked, gzip"` or `"gzip, chunked"` — and a `chunked` token split across
+/// two `Transfer-Encoding` rows — slip through to Content-Length framing, a
+/// TE/CL desync vector. Detecting the token in any position rejects them all,
+/// consistent with the codec's "chunked not supported" stance.
+fn has_chunked_transfer_encoding(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
+    })
+}
+
 pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Error> {
     let mut seen: Option<usize> = None;
     for (name, value) in headers {
@@ -3478,6 +3493,119 @@ static_resources:
         assert!(
             resp_str.starts_with("HTTP/1.1 200 OK\r\n"),
             "identical duplicate Content-Length must be served, got: {resp_str}"
+        );
+    }
+
+    // ── Transfer-Encoding smuggling variants ──────────────────────────────────
+
+    fn te_headers(values: &[&str]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|v| ("Transfer-Encoding".to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn chunked_detection_covers_multi_token_and_multi_row() {
+        // Exact "chunked" (the pre-existing case).
+        assert!(has_chunked_transfer_encoding(&te_headers(&["chunked"])));
+        assert!(has_chunked_transfer_encoding(&te_headers(&["Chunked"])));
+        // Multi-token values: chunked in any position must be detected. The old
+        // exact-match check missed these, silently falling back to
+        // Content-Length framing (a TE/CL smuggling desync).
+        assert!(has_chunked_transfer_encoding(&te_headers(&[
+            "chunked, gzip"
+        ])));
+        assert!(has_chunked_transfer_encoding(&te_headers(&[
+            "gzip, chunked"
+        ])));
+        assert!(has_chunked_transfer_encoding(&te_headers(&[
+            "gzip ,  chunked "
+        ])));
+        // Split across two Transfer-Encoding rows.
+        assert!(has_chunked_transfer_encoding(&te_headers(&[
+            "gzip", "chunked"
+        ])));
+        // No chunked token present → not chunked.
+        assert!(!has_chunked_transfer_encoding(&te_headers(&["gzip"])));
+        assert!(!has_chunked_transfer_encoding(&[]));
+    }
+
+    #[tokio::test]
+    async fn transfer_encoding_chunked_gzip_is_rejected_501_not_cl_framed() {
+        // Regression: `Transfer-Encoding: chunked, gzip` parses cleanly, so the
+        // former exact-"chunked" detector treated it as a plain (non-chunked)
+        // request and framed on Content-Length. It must instead be rejected 501,
+        // the same as a bare `chunked`, closing the desync.
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
+        let req = b"POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+            "got: {resp_str}"
+        );
+    }
+
+    #[test]
+    fn codec_rejects_obs_fold_and_smuggling_shaped_headers() {
+        // Characterization of the codec's rejection surface (via httparse), pinned
+        // so a parser swap can't silently loosen it. All of these are rejected —
+        // matching upstream Envoy's stance on smuggling-shaped request headers.
+        // obs-fold (obsolete line folding, RFC 7230 §3.2.4 — must be rejected):
+        assert!(
+            Http1Codec::parse_request(b"GET / HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n 2\r\n\r\n")
+                .is_err()
+        );
+        // space inside a header name:
+        assert!(
+            Http1Codec::parse_request(b"GET / HTTP/1.1\r\nHost: x\r\nFoo Bar: 1\r\n\r\n").is_err()
+        );
+        // NUL byte in a header value:
+        assert!(
+            Http1Codec::parse_request(b"GET / HTTP/1.1\r\nHost: x\r\nX-A: a\x00b\r\n\r\n").is_err()
+        );
+    }
+
+    // ── Slow-client idle-read timeout ─────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_client_partial_request_hits_idle_read_timeout() {
+        // IDLE_READ_TIMEOUT guards the request-head read, but no test exercised
+        // the deadline — a regression that removed or lengthened it would be
+        // invisible. With the clock paused, tokio auto-advances virtual time to
+        // the next armed timer once the runtime is otherwise idle, so the
+        // idle-read branch fires DETERMINISTICALLY (no real 5s wait, no fixed
+        // sleep). A slow client that sends a partial request head and then stalls
+        // must have its connection cleanly closed with no response written.
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            serve_connection(config, sock).await
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Complete-looking but missing the terminating CRLF: the codec returns
+        // Ok(None) (incomplete) so the server parks on the idle read.
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        // Never send the rest. The idle timer is the only way the server can make
+        // progress, so virtual time advances to it.
+        let result = server.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "idle-read timeout must be a clean close, got: {result:?}"
+        );
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        assert!(
+            buf.is_empty(),
+            "idle-timed-out request must produce no response, got: {}",
+            String::from_utf8_lossy(&buf)
         );
     }
 
