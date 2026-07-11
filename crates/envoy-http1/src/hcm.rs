@@ -1680,11 +1680,32 @@ fn build_access_log_record(
     }
 }
 
+/// Resolve the request body length from `Content-Length`, rejecting the
+/// request-smuggling shapes RFC 7230 §3.3.3 forbids.
+///
+/// Previously this read only the FIRST `Content-Length` (via `find_header`), so a
+/// request carrying two `Content-Length` rows with different values
+/// (`Content-Length: 5` / `Content-Length: 6`) framed on the first and left the
+/// second body as a pipelined "next request" — the classic CL/CL smuggling
+/// vector. Now every `Content-Length` row is scanned: conflicting values are
+/// rejected as `MalformedHeader` (the same disposition as a non-numeric value, so
+/// no new response shape is introduced), matching upstream Envoy's rejection.
+/// Identical repeated values are tolerated (§3.3.3 permits combining them).
 pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize, Http1Error> {
-    match find_header(headers, headers::CONTENT_LENGTH) {
-        Some(v) => v.parse::<usize>().map_err(|_| Http1Error::MalformedHeader),
-        None => Ok(0),
+    let mut seen: Option<usize> = None;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case(headers::CONTENT_LENGTH) {
+            continue;
+        }
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| Http1Error::MalformedHeader)?;
+        match seen {
+            Some(prev) if prev != parsed => return Err(Http1Error::MalformedHeader),
+            _ => seen = Some(parsed),
+        }
     }
+    Ok(seen.unwrap_or(0))
 }
 
 /// Phase 32 Task 5 (ADR-0079) — build the access-log `CompiledFormat` for a
@@ -3368,6 +3389,95 @@ static_resources:
         assert!(
             resp_str.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
             "got: {resp_str}"
+        );
+    }
+
+    // ── Content-Length smuggling (RFC 7230 §3.3.3) ────────────────────────────
+
+    fn cl_headers(values: &[&str]) -> Vec<(String, String)> {
+        values
+            .iter()
+            .map(|v| ("Content-Length".to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_content_length_absent_is_zero() {
+        assert_eq!(parse_content_length(&[]).unwrap(), 0);
+        let other = vec![("Host".to_string(), "x".to_string())];
+        assert_eq!(parse_content_length(&other).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_content_length_single_value() {
+        assert_eq!(parse_content_length(&cl_headers(&["42"])).unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_content_length_non_numeric_rejected() {
+        assert!(matches!(
+            parse_content_length(&cl_headers(&["not-a-number"])),
+            Err(Http1Error::MalformedHeader)
+        ));
+    }
+
+    #[test]
+    fn parse_content_length_identical_duplicates_tolerated() {
+        // RFC 7230 §3.3.3: repeated identical Content-Length values may be
+        // combined into a single value — accept.
+        assert_eq!(
+            parse_content_length(&cl_headers(&["7", "7", "7"])).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn parse_content_length_conflicting_duplicates_rejected() {
+        // The CL/CL request-smuggling vector: two Content-Length rows with
+        // different values. RFC 7230 §3.3.3 requires rejection; upstream Envoy
+        // returns 400. Previously this silently framed on the FIRST value (5) and
+        // left the second body as a pipelined next request. Now it is rejected as
+        // MalformedHeader — the same disposition as a non-numeric value.
+        assert!(matches!(
+            parse_content_length(&cl_headers(&["5", "6"])),
+            Err(Http1Error::MalformedHeader)
+        ));
+        // Order-independent: the conflict is detected regardless of which value
+        // appears first.
+        assert!(matches!(
+            parse_content_length(&cl_headers(&["6", "5"])),
+            Err(Http1Error::MalformedHeader)
+        ));
+    }
+
+    #[tokio::test]
+    async fn conflicting_content_length_request_is_rejected_no_response() {
+        // End-to-end: a request carrying two conflicting Content-Length rows must
+        // NOT be served (it would otherwise smuggle a second request). The codec
+        // rejects it and the connection is dropped with no HTTP response written.
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
+        let req =
+            b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabc";
+        let resp = drive(config, req).await;
+        assert!(
+            resp.is_empty(),
+            "conflicting Content-Length must be rejected with no response, got: {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_duplicate_content_length_request_is_served() {
+        // The tolerant half: identical repeated Content-Length values frame a
+        // single body and the request is served normally (direct_response route).
+        let config = hcm_config_single_route("/", 200, "ok\n").await;
+        let req =
+            b"POST /up HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 200 OK\r\n"),
+            "identical duplicate Content-Length must be served, got: {resp_str}"
         );
     }
 
