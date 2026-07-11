@@ -1639,12 +1639,39 @@ pub struct CidrRange {
     pub prefix_len: u8,
 }
 
+/// Canonicalise an `IpAddr` the way `CidrRange` matching does: an
+/// IPv4-mapped-IPv6 address (`::ffff:a.b.c.d`) collapses to its 4-byte IPv4
+/// form (ADR-0133), everything else is left as-is. This MUST be the single
+/// canonicalisation rule shared by `validate` and `contains` — if the two
+/// disagree on an address's family, `validate` can size `prefix_len` against a
+/// 16-byte width while `contains` indexes a 4-byte octet array, which panics
+/// `prefix_match` out of bounds (phase-67.2 REVIEW C-1).
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
 impl CidrRange {
-    /// Validate the prefix width against the address family: ≤ 32 for IPv4,
-    /// ≤ 128 for IPv6. `Err(detail)` is mapped to `ConfigError::InvalidCidrRange`
-    /// by the L4 allow-list walk (`validate_l4_permission` / `_principal`).
+    /// Validate the prefix width against the **canonical** address family:
+    /// ≤ 32 for IPv4, ≤ 128 for IPv6. `Err(detail)` is mapped to
+    /// `ConfigError::InvalidCidrRange` by the L4 allow-list walk
+    /// (`validate_l4_permission` / `_principal`).
+    ///
+    /// The family is taken AFTER `canonical_ip`, so an IPv4-mapped-IPv6
+    /// `address_prefix` such as `"::ffff:127.0.0.0"` is bounded at 32 — the same
+    /// width `contains`/`prefix_match` will actually index. Sizing against the
+    /// raw (pre-canonical) IPv6 family accepted `prefix_len` up to 128 on a range
+    /// that `contains` then indexes as 4 bytes, panicking the data plane on the
+    /// first matching connection (phase-67.2 REVIEW C-1). Rejecting the over-wide
+    /// mapped prefix fail-loud at config load closes that validate/contains
+    /// disagreement.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        let (max, family) = match self.address_prefix {
+        let (max, family) = match canonical_ip(self.address_prefix) {
             std::net::IpAddr::V4(_) => (32u8, "IPv4"),
             std::net::IpAddr::V6(_) => (128u8, "IPv6"),
         };
@@ -1662,16 +1689,7 @@ impl CidrRange {
     /// IPv4 `127.0.0.0/8` range — upstream Envoy's behavior. After
     /// canonicalisation, a cross-family comparison never matches.
     pub fn contains(&self, addr: &std::net::IpAddr) -> bool {
-        fn canonical(ip: std::net::IpAddr) -> std::net::IpAddr {
-            match ip {
-                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                    Some(v4) => std::net::IpAddr::V4(v4),
-                    None => std::net::IpAddr::V6(v6),
-                },
-                v4 => v4,
-            }
-        }
-        match (canonical(self.address_prefix), canonical(*addr)) {
+        match (canonical_ip(self.address_prefix), canonical_ip(*addr)) {
             (std::net::IpAddr::V4(net), std::net::IpAddr::V4(a)) => {
                 prefix_match(&net.octets(), &a.octets(), self.prefix_len)
             }
@@ -1688,6 +1706,17 @@ impl CidrRange {
 fn prefix_match(net: &[u8], addr: &[u8], prefix_len: u8) -> bool {
     let bits = prefix_len as usize;
     let full = bits / 8;
+    // Defensive bounds guard (phase-67.2 REVIEW N-1). The family-consistent
+    // `validate` above is the real fix — a prefix wider than its canonical
+    // address family can no longer reach here from config. This guard keeps the
+    // data-plane invariant "must never panic" true unconditionally, even for a
+    // future caller that constructs a `CidrRange` without validating: an over-wide
+    // or cross-length prefix simply never matches instead of indexing out of
+    // bounds. A silent bail (not `debug_assert!`) so `contains` cannot panic in
+    // debug builds either — the whole point of C-1's fix.
+    if full > net.len() || full > addr.len() {
+        return false;
+    }
     if net[..full] != addr[..full] {
         return false;
     }
@@ -6097,6 +6126,96 @@ static_resources:
         let ok: crate::CidrRange =
             serde_yaml::from_str("address_prefix: 10.0.0.0\nprefix_len: 32").unwrap();
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn cidr_range_validate_rejects_ipv4_mapped_ipv6_over_wide_prefix() {
+        // phase-67.2 REVIEW C-1 regression. `IpAddr::from_str` parses an
+        // IPv4-mapped-IPv6 literal as `IpAddr::V6`, but `contains` canonicalises
+        // it to a 4-byte IPv4 before indexing. `validate` must therefore size the
+        // prefix against the CANONICAL (IPv4, ≤32) family — NOT the raw IPv6
+        // (≤128) family — or it accepts a width `contains`/`prefix_match` then
+        // indexes out of bounds, panicking the data plane on the first connection.
+        for prefix_len in [33u8, 39, 40, 64, 128] {
+            let c: crate::CidrRange = serde_yaml::from_str(&format!(
+                "address_prefix: \"::ffff:127.0.0.0\"\nprefix_len: {prefix_len}"
+            ))
+            .unwrap();
+            assert!(
+                c.validate().is_err(),
+                "v4-mapped-v6 prefix /{prefix_len} must be rejected (canonical IPv4 caps at /32)"
+            );
+            // And — the load-bearing half — evaluating the arm must not panic,
+            // regardless of validation, for either an IPv4 or a v4-mapped peer.
+            let _ = c.contains(&"127.0.0.1".parse().unwrap());
+            let _ = c.contains(&"::ffff:127.0.0.1".parse().unwrap());
+        }
+        // A mapped prefix within the canonical IPv4 width still validates and
+        // matches (equivalence with the plain-IPv4 spelling is preserved).
+        let ok: crate::CidrRange =
+            serde_yaml::from_str("address_prefix: \"::ffff:127.0.0.0\"\nprefix_len: 8").unwrap();
+        assert!(ok.validate().is_ok());
+        assert!(ok.contains(&"127.0.0.42".parse().unwrap()));
+        assert!(ok.contains(&"::ffff:127.0.0.42".parse().unwrap()));
+        assert!(!ok.contains(&"10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_range_contains_never_panics_for_validated_prefixes() {
+        // phase-67.2 REVIEW I-1: `contains` is data-plane-only, so the
+        // `parse_bootstrap` fuzzer (deserialize + validate) can never reach it —
+        // gate (d) was structurally blind to C-1. This is the missing coverage: an
+        // exhaustive property check that for EVERY `validate`-passing `CidrRange`
+        // and a representative sweep of peer/local addresses (v4, v6, and the
+        // v4-mapped-v6 forms that triggered C-1), `contains` returns a bool and
+        // never panics. It fails (panics with an index-out-of-bounds) against the
+        // pre-C-1 `validate`, and passes once `validate` uses the canonical family.
+        let prefixes = [
+            "0.0.0.0",
+            "127.0.0.0",
+            "10.1.2.0",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "2001:db8::",
+            "::ffff:0.0.0.0",
+            "::ffff:127.0.0.0",
+            "::ffff:255.255.255.255",
+            "ffff::",
+        ];
+        let addrs: Vec<std::net::IpAddr> = [
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.1.2.5",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "2001:db8::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.1.2.5",
+            "fe80::1",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+
+        for p in prefixes {
+            for prefix_len in 0u8..=128 {
+                let cidr = crate::CidrRange {
+                    address_prefix: p.parse().unwrap(),
+                    prefix_len,
+                };
+                // Only validated prefixes reach the data plane — mirror that gate.
+                if cidr.validate().is_err() {
+                    continue;
+                }
+                for addr in &addrs {
+                    // The assertion is "does not panic"; the bool value itself is
+                    // covered by the direct-match tests above.
+                    let _ = cidr.contains(addr);
+                }
+            }
+        }
     }
 
     #[test]
