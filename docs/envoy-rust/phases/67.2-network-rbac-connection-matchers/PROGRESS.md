@@ -310,3 +310,73 @@ environmental REDs); (f) is the one unmet gate and is the state-5 review's job. 
 IMPLEMENTATION-COMPLETE and VERIFIED → §5 state 5. **NO new ADR** (ledger head `ADR-0133`, next
 `ADR-0134` unreserved). `#![forbid(unsafe_code)]` holds. Per §5.1 this session did NOT chain into
 state-5.
+
+---
+
+# Phase 67.2 — §5.2 STATE-3 RE-ENTRY (C-1 repair) — the NOT-APPROVED review's blocking findings landed
+
+> This section RECONCILES the state machine. The §5 state-5 code-review (commit `ab216b4`,
+> `REVIEW.md`) returned **NOT APPROVED** on Critical **C-1** (plus Important **I-1** and advisory
+> **N-1**); per §5's asymmetry the phase re-opened at **§5 state 3**. The C-1/I-1/N-1 repair was
+> then landed on `main` by a **sibling test-hardening workstream** (commits `e0a15dc` +
+> `8cab4af`, which cite `REVIEW.md`) as bare `fix()`/`test()` commits — WITHOUT walking the §5
+> phase-state machine (no PROGRESS.md entry, no STATE advance). This recording session (per
+> `BOOTSTRAP_PROMPT.md` §1 Step E — a state-machine discrepancy adjudicated with
+> `superpowers:systematic-debugging`) records that landed repair as the state-3 re-entry and
+> advances STATE to §5 state 4. **NO code changed this session** — docs-only reconciliation.
+
+## What landed (the REVIEW.md C-1/I-1/N-1 obligations), and where
+
+- **C-1 (Critical, blocking) — the config-reachable, release-mode data-plane PANIC — FIXED**
+  (`e0a15dc fix(envoy-config): CidrRange v4-mapped-v6 prefix panics data plane (C-1)`). Exactly the
+  fix `REVIEW.md` §1 prescribed: `CidrRange::validate` now sizes `prefix_len` against the **canonical**
+  address family via a new shared `canonical_ip` helper (the single canonicalisation rule now used by
+  BOTH `validate` and `contains`), so an IPv4-mapped-IPv6 `address_prefix` such as `"::ffff:127.0.0.0"`
+  is bounded at 32 and an over-wide `prefix_len` is rejected fail-loud with
+  `ConfigError::InvalidCidrRange` at config load — closing the `validate`/`contains` family
+  disagreement (`bootstrap.rs:1646` vs `:1664`/`:1691`).
+- **N-1 (advisory) — the defensive `prefix_match` bounds guard — INCLUDED** (same commit): a silent
+  `if full > net.len() || full > addr.len() { return false }` bail (NOT a `debug_assert!`, so `contains`
+  cannot panic even in debug), keeping the data-plane "must never panic" invariant true
+  unconditionally even for a future caller that constructs a `CidrRange` without validating.
+- **I-1 (Important) — the coverage blind spot — CLOSED** (`8cab4af test(envoy-config): C-1 config-load
+  rejection through real validate path`, plus tests in `e0a15dc`): a mapped-prefix regression test
+  `cidr_range_validate_rejects_ipv4_mapped_ipv6_over_wide_prefix` AND a `contains`-level property sweep
+  `cidr_range_contains_never_panics_for_validated_prefixes` over every `validate`-passing prefix across
+  a v4/v6/v4-mapped address matrix (the `parse_bootstrap` fuzzer never reaches `contains`, so gate (d)
+  was structurally blind — the property test replaces it, no new fuzz target, honoring the SPEC posture).
+  Both tests fail against the pre-fix code (the property test panics at the exact index).
+
+## Verification of the landed repair (this session, read-only — NOT the §7.5 gate)
+
+Confirmed the repair is real and complete before recording it as the re-entry:
+
+- `cargo build --workspace --all-targets` → exit 0.
+- `cargo test -p envoy-config` → **586 passed / 0 failed** (was 583 at state-4; +3 for the
+  C-1/I-1 regression + property tests). `cargo test -p envoy-http1` 168, `cargo test -p envoy-tls` 16 —
+  green (the sibling workstream's unrelated http1-smuggling / TLS-SNI hardening, NOT 67.2 scope).
+- `cargo clippy -p envoy-config -p envoy-http1 -p envoy-tls --all-targets --all-features -- -D warnings`
+  → clean.
+- **The original live C-1 repro is now CLOSED:** booting `target/debug/envoy-bin` on the exact config
+  that previously was accepted-then-panicked (`destination_ip: { address_prefix: "::ffff:127.0.0.0",
+  prefix_len: 40 }`) now **exits 1 fail-loud at config load** — `listener "rbac_listener": network rbac
+  policy "p0" has an invalid CidrRange at permissions[0]: prefix_len 40 exceeds 32 for IPv4` — no
+  panic, no acceptance.
+- CI GREEN on `main` at `96a1fd7` (run `29164710520`, the commit carrying the fix).
+
+## Scope note
+
+The C-1/I-1/N-1 repair touched ONLY `crates/envoy-config/src/bootstrap.rs`. The sibling workstream's
+other commits on `main` (`076b178`/`de7b643` HTTP/1 Content-Length + Transfer-Encoding smuggling
+hardening, `c0689af` TLS unknown-SNI, `000f776`/`96a1fd7` `docs/TEST_GAP_ANALYSIS.md`) are **OTHER
+workstreams, NOT phase-67.2 scope** — recorded here only so a reader of `main`'s log is not confused.
+`67.2` added no fixture, no fuzz target, no ADR; `#![forbid(unsafe_code)]` holds; `ADR-0131` not
+reverted; the deliberate HTTP-rejects-L4 divergence is untouched (confirmed WAI, `REVIEW.md` §5).
+
+## Handoff to state-4
+
+The state-3 re-entry's obligations (C-1 + I-1 + N-1) are landed and verified. Per §5.1 this recording
+session does NOT run the §7.5 (a)-(f) gate — that is the SEPARATE state-4 verification session's job,
+which then hands to a fresh state-5 re-review that SUPERSEDES `REVIEW.md` (D-3.5) before the state-6
+close-out. **NO new ADR** (ledger head `ADR-0133`, next `ADR-0134` unreserved). ROADMAP row `67.2`
+stays `in-progress`.
