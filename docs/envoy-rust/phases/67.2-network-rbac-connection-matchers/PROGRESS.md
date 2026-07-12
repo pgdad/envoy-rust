@@ -380,3 +380,162 @@ session does NOT run the §7.5 (a)-(f) gate — that is the SEPARATE state-4 ver
 which then hands to a fresh state-5 re-review that SUPERSEDES `REVIEW.md` (D-3.5) before the state-6
 close-out. **NO new ADR** (ledger head `ADR-0133`, next `ADR-0134` unreserved). ROADMAP row `67.2`
 stays `in-progress`.
+
+---
+
+# Phase 67.2 — §5 STATE-4 (verification, POST-C-1-repair) — the FULL §7.5 (a)-(f) gate re-run
+
+> `superpowers:verification-before-completion`. This is the SEPARATE state-4 session following the
+> §5.2 state-3 re-entry recording (§5.1 — no chaining; ADR-0127 names 4→5 as un-chainable too, so
+> this session does NOT chain into the state-5 re-review either). It re-ran the whole §7.5 gate
+> against the current tree — the tree carrying the C-1/I-1/N-1 repair (`e0a15dc` + `8cab4af`) — and
+> quotes every command's output below. **NO code, no fixture, no `known-failures.txt`, no ROADMAP
+> row changed; `REVIEW.md` untouched** (still the NOT-APPROVED `ab216b4` review — a review is
+> superseded only by a LATER review, D-3.5; that is the SEPARATE state-5 re-review's job).
+> Cold-started clean: `git status --porcelain` empty; branch `main`; `HEAD` = `origin/main` =
+> `62eb345` (the §5.2 state-3 re-entry reconciliation commit); `git fetch origin --prune` showed no
+> sibling ahead.
+
+## STEP 0.5 — CI on the reconciliation push (FULL 40-char SHA)
+
+```
+$ gh run list --commit 62eb34582171afe83182c7c9af436bd9e08a5878
+completed  success  ci  29173066885
+```
+
+CI run `29173066885` GREEN on the full SHA (a docs-only push still builds — CI has no
+`paths-ignore`). It was `in_progress` at cold-start and completed `success` mid-session. No rerun
+needed.
+
+## §7.5 gate (a) — `cargo build --workspace --all-targets`
+
+```
+$ cargo build --workspace --all-targets
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+BUILD_EXIT=0
+```
+
+Clean (the tree was already fully compiled — 0.11s no-op rebuild). The debug `target/debug/envoy-bin`
+the differential harness runs is fresh.
+
+## §7.5 gate (e) — clippy / fmt / deny
+
+```
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+CLIPPY_EXIT=0
+```
+
+```
+$ cargo fmt --all -- --check
+FMT_EXIT=0           # (empty output)
+```
+
+```
+$ cargo deny check
+DENY_EXIT=0
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+All clean. No fresh RustSec advisory — no patch-bump needed this session (memory
+`cargo-deny-reds-on-unrelated-advisory` did not fire). Only the benign standing
+`license-not-encountered` warnings (e.g. `Zlib` unmatched allowance).
+
+## §7.5 gate (e) — `cargo test --workspace --no-fail-fast`
+
+Full output redirected to a file (NEVER piped through `tail`). Aggregate over all **150**
+`test result:` lines:
+
+```
+$ cargo test --workspace --no-fail-fast     # TEST_EXIT=101
+TOTAL passed=1939 failed=6
+```
+
+**Cross-check: `local passed+failed = 1939 + 6 = 1945 == CI passed = 1945, failed = 0`** (summed
+from CI run `29173066885`'s logs — every local RED passes on CI's networking). The suite grew from
+1930 (first state-4) to 1945: +3 C-1/I-1 repair tests in `envoy-config` and +12 from the sibling
+test-hardening workstream (`envoy-http1` smuggling, `envoy-tls` SNI — NOT 67.2 scope).
+
+**Adjudication of the 6 local REDs (memory `local-red-set-varies-run-to-run`) — 5 are the
+documented environmental core, 1 is a parallel-load flake re-run green in isolation:**
+
+| Failing test | Cause (memory) |
+|---|---|
+| `access_log_h2_rcd_upstream_reset` | envoy `UF` (IPv6 close-backend unreachable) vs rust `UC` — `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_h2_uc_upstream_reset` | same — envoy `UF`, rust `UC` |
+| `access_log_rcd_upstream_reset` | same — envoy `UF`/`Network_is_unreachable`, rust `UC` |
+| `access_log_rf_upstream_reset` | same — envoy `UF`, rust `UC` |
+| `admin_config_dump_server_info` | envoy routes backend via `192.168.65.2` (non-allow-listed host bridge IP) — `differential-host-bridge-ip-192-168-65-2` |
+| `access_log_rcd_route_not_found` | **NOT in the core** — failed `upstream Envoy never became accept-ready within 10s: Connection refused` (container startup timeout under full-workspace parallel load, the `differential-fixtures-flake-under-parallel-load` shape, NOT a divergence). **Re-run in isolation → `test result: ok. 1 passed` in 1.20s.** Flake, not a regression. |
+
+**The phase + repair surface is GREEN:** `envoy_config` unittests **586 passed / 0 failed** —
+including the two C-1/I-1 repair tests, both quoted from the run:
+
+```
+test bootstrap::tests::cidr_range_validate_rejects_ipv4_mapped_ipv6_over_wide_prefix ... ok
+test bootstrap::tests::cidr_range_contains_never_panics_for_validated_prefixes ... ok
+```
+
+(586 was 583 at the first state-4; +3 = the repair's regression + property tests.) `envoy_filter`
+**211 passed** (incl. `http_rbac` 5); `envoy_bin` unittests **37 passed** (incl. `network_rbac` 18);
+the `network_filter_rbac.rs` integration binary **21 passed**. A grep for any failing test matching
+`rbac|cidr` across the whole log returns **0**.
+
+## §7.5 gate (d) — fuzz — RECORDED EXPLICITLY
+
+**NO new fuzz target** (SPEC §D7, re-affirmed by the state-3 re-entry: the I-1 blind spot is closed
+by the IN-PROCESS `contains`-level property test `cidr_range_contains_never_panics_for_validated_prefixes`,
+NOT by a fuzzer — the `parse_bootstrap` fuzzer only reaches deserialize + `validate`, never
+`contains`). The pre-existing `parse_bootstrap` target is still the only one, and the 67.2 corpus
+seed is still tracked:
+
+```
+$ ls crates/envoy-config/fuzz/fuzz_targets/
+parse_bootstrap.rs
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap | grep rbac_cidr
+crates/envoy-config/fuzz/corpus/parse_bootstrap/network_filter_rbac_cidr.yaml
+```
+
+Exercised short-budget (from `crates/envoy-config/` — cargo-fuzz resolves `fuzz/` relative to the
+crate, not the workspace root):
+
+```
+$ cargo +nightly fuzz run parse_bootstrap -- -runs=20000 -max_total_time=100    # FUZZ_EXIT=0
+#20000	DONE   cov: 15044 ft: 30450 corp: 2586/1680Kb lim: 2544 exec/s: 10000 rss: 353Mb
+Done 20000 runs in 2 second(s)
+```
+
+20000 runs, no crash / no panic / no deadly signal (grep count 0). **Gate (d) is SATISFIED by the
+pre-existing target + tracked seed + the in-process property test** — recorded, not passed over in
+silence.
+
+## §7.5 gate (b) — differential surface (regression-only)
+
+**NO new fixture** (`0001`–`0073` unchanged). The differential crate ran inside the workspace run
+above after gate (a) rebuilt `target/debug/envoy-bin`; the only differential REDs are the 5
+environmental-core fixtures + the 1 isolation-green startup flake tabulated above — all
+CI-authoritative (CI run `29173066885`: **1945 passed, 0 failed**). Regression surface holds; the
+C-1 repair changed only `crates/envoy-config/src/bootstrap.rs` internals (config-load rejection +
+never-panic guard), no wire shape.
+
+## §7.5 gate (c) — conformance
+
+Unchanged this phase; `tests/conformance/h2spec/known-failures.txt` untouched (never trimmed —
+`h2spec-3-5-2-preface-host-sensitive`). CI-authoritative — the GREEN run `29173066885` includes the
+conformance job.
+
+## §7.5 gate (f)
+
+`REVIEW.md` exists and is **NOT APPROVED** (the `ab216b4` review that opened C-1). (f) is UNMET by
+design at state 4 — it is satisfied only by the SEPARATE state-5 **re-review**
+(`superpowers:requesting-code-review`), which must verify the C-1 fix is measured-correct with no
+new Critical and SUPERSEDE `REVIEW.md` (D-3.5). This session does NOT chain into it (§5.1;
+ADR-0127 names 4→5 as un-chainable).
+
+## Verdict
+
+§7.5 (a), (b), (c), (d), (e) all satisfied (modulo the fully-adjudicated, CI-authoritative
+environmental REDs + one isolation-green startup flake); (f) is the one unmet gate and is the
+state-5 re-review's job. The C-1/I-1/N-1 repair is verified in place through the full gate. `67.2`
+is IMPLEMENTATION-COMPLETE and RE-VERIFIED → **§5 state 5 (re-review pending)**. **NO new ADR**
+(ledger head `ADR-0133`, next `ADR-0134` unreserved). `#![forbid(unsafe_code)]` holds. Per §5.1
+this session did NOT chain into state-5.
