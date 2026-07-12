@@ -36,6 +36,17 @@ pub struct TcpProxy {
     upstream_tls: Option<Arc<envoy_tls::UpstreamTls>>,
 }
 
+/// The established upstream side of a `tcp_proxy` connection: the (possibly
+/// TLS-wrapped) stream, the RAII `cx_active` guard (held until relay ends), and
+/// diagnostics. Produced by [`TcpProxy::connect_upstream`] at ESTABLISHMENT
+/// (67.3 D4), so a caller can interpose the first-byte gate before relaying.
+pub struct UpstreamConn {
+    stream: Box<dyn AsyncReadWrite + Send + Unpin>,
+    _cx_guard: envoy_cluster::ConnGaugeGuard,
+    addr: SocketAddr,
+    cluster_name: String,
+}
+
 impl TcpProxy {
     /// Plaintext-upstream constructor. Unchanged surface from 03.1; the new
     /// 03.2 `upstream_tls` field defaults to `None`.
@@ -62,23 +73,14 @@ impl TcpProxy {
         }
     }
 
-    /// 03.1: generalize over any `AsyncRead + AsyncWrite` stream so the
-    /// listener can pass either a `TcpStream` (plaintext path) or a
-    /// `TlsStream<TcpStream>` (post-handshake TLS path) into it. The proxy
-    /// logic itself does not care.
-    ///
-    /// This is an inherent generic method, NOT a trait method — the
-    /// `ConnectionHandler` trait stays object-safe with a `TcpStream`-only
-    /// `handle`, and the `envoy-bin::TlsAcceptingHandler` adapter (Task 9)
-    /// calls this inherent method directly via `Arc<TcpProxy>`. See SPEC §6
-    /// signpost 3.
-    pub async fn handle<S>(
+    /// 67.3 D4: the ESTABLISHMENT half — pick an endpoint, hold the `cx_active`
+    /// guard, TCP-connect, tick `cluster.<name>.upstream_cx_total`, and (if
+    /// configured) run the upstream rustls handshake. Preserves ADR-0016 posture
+    /// and the exact 06.x guard/tick placement. Returns the upstream side so the
+    /// caller can interpose the first-byte gate before relaying (67.3 D1).
+    pub async fn connect_upstream(
         &self,
-        downstream: S,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
+    ) -> Result<UpstreamConn, Box<dyn std::error::Error + Send + Sync>> {
         // 28 Task 6: TCP proxying has no HTTP-level `hash_policy` — pass `None`
         // (RoundRobin clusters ignore the key; a RING_HASH cluster would fall
         // back to the cursor path here).
@@ -94,7 +96,8 @@ impl TcpProxy {
         // `cluster.<name>.upstream_cx_active` before the dial attempt and
         // decrements via Drop at scope exit, covering both success and error
         // close paths uniformly (the `?` below short-circuits on error but
-        // Drop still fires). Mirrors the H1 + H2 HCM guard placement.
+        // Drop still fires). Mirrors the H1 + H2 HCM guard placement. Held in
+        // `UpstreamConn` until `relay`/`relay_gated` returns.
         let _cx_guard = self.cluster.cx_active_guard();
 
         let stream = tokio::net::TcpStream::connect(addr)
@@ -111,9 +114,9 @@ impl TcpProxy {
         self.cluster.cx_total().inc();
 
         // 03.2 branched dial: TLS or plaintext upstream. Both arms unify into
-        // `Box<dyn AsyncReadWrite + Send + Unpin>` so the bidirectional copy
-        // body below stays a single code path.
-        let upstream: Box<dyn AsyncReadWrite + Send + Unpin> = match &self.upstream_tls {
+        // `Box<dyn AsyncReadWrite + Send + Unpin>` so the relay body stays a
+        // single code path.
+        let stream: Box<dyn AsyncReadWrite + Send + Unpin> = match &self.upstream_tls {
             None => Box::new(stream),
             Some(tls) => {
                 let tls_stream = tls.connect(stream).await.map_err(|source| {
@@ -123,6 +126,32 @@ impl TcpProxy {
                 Box::new(tls_stream)
             }
         };
+
+        Ok(UpstreamConn {
+            stream,
+            _cx_guard,
+            addr,
+            cluster_name,
+        })
+    }
+
+    /// 67.3 D4: the DATA half — the ADR-0016 bidirectional half-close copy.
+    /// Unchanged from the old `handle::<S>` tail; `up` carries the `cx_active`
+    /// guard, dropped when this returns.
+    pub async fn relay<D>(
+        &self,
+        downstream: D,
+        up: UpstreamConn,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let UpstreamConn {
+            stream: upstream,
+            _cx_guard,
+            addr,
+            cluster_name,
+        } = up;
 
         // ADR-0016: half-close posture. `tokio::select!` over the two copy
         // futures so EOF on either side drops the other future and propagates
@@ -147,6 +176,31 @@ impl TcpProxy {
 
         tracing::debug!(%addr, cluster = %cluster_name, "tcp proxy connection complete");
         Ok(())
+    }
+
+    /// 03.1 / 67.3 D4: generalize over any `AsyncRead + AsyncWrite` stream so the
+    /// listener can pass either a `TcpStream` (plaintext path) or a
+    /// `TlsStream<TcpStream>` (post-handshake TLS path) into it. The proxy
+    /// logic itself does not care.
+    ///
+    /// This is an inherent generic method, NOT a trait method — the
+    /// `ConnectionHandler` trait stays object-safe with a `TcpStream`-only
+    /// `handle`, and the `envoy-bin::TlsAcceptingHandler` adapter (Task 9)
+    /// calls this inherent method directly via `Arc<TcpProxy>`. See SPEC §6
+    /// signpost 3.
+    ///
+    /// 67.3 D4: now composes [`connect_upstream`](Self::connect_upstream) +
+    /// [`relay`](Self::relay). Behavior is identical to the pre-67.3 straight-line
+    /// body (the regression tests prove it).
+    pub async fn handle<S>(
+        &self,
+        downstream: S,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let up = self.connect_upstream().await?;
+        self.relay(downstream, up).await
     }
 }
 
