@@ -431,3 +431,119 @@ correctness gap, introducing no new measured wire-shape or divergence. Ledger he
 **ADR-0135** (next `ADR-0136`, unreserved). Per §5.1 this session did NOT chain into the
 state-4 re-verification. The next session runs `superpowers:verification-before-completion`
 → the full §7.5 gate.
+
+## Session: §5 state-4 RE-verification (`superpowers:verification-before-completion`)
+
+Cold-started clean: `git status --porcelain` empty, branch `main`, `HEAD` at the
+§5.2 state-3 re-entry commit `e551e15` = `origin/main`; `git fetch origin --prune`
+showed no sibling ahead → §5 state 4 (re-verification).
+**STEP 0.5 (CI confirmation, FULL 40-char SHA):** the re-entry commit's CI run
+`29208575008` was GREEN (`completed`/`success`) on
+`e551e15e90e93db8454a7b97b5a2b25d263734d1`. This ran the full §7.5 gate (PLAN Task 6)
+over the post-fix tree and quotes every command's output below (§5 state-4 discipline;
+never piped through `tail` — full output redirected to files).
+
+### Gate (e) — `cargo build --workspace --all-targets`
+
+```
+   Compiling envoy-tcp v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tcp)
+   Compiling envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.09s
+```
+
+**EXIT 0; 0 warnings** (`grep -iE warning|error` over stderr → nothing).
+`target/debug/envoy-bin` is fresh for the differential/integration runs
+(memory `differential-harness-uses-debug-envoy-bin`).
+
+### Gate (e) — `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+```
+    Checking envoy-tcp v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-tcp)
+    Checking envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.56s
+```
+
+**EXIT 0; zero `warning`/`error` lines.**
+
+### Gate (e) — `cargo fmt --all -- --check`
+
+**EXIT 0; zero output** (no diff).
+
+### Gate (e) — `cargo test --workspace --no-fail-fast`
+
+Full output redirected to a file (memory `never-pipe-verification-runs-through-tail`).
+Aggregate across all test-result lines: **1949 passed; 6 failed.** The two new
+re-entry witnesses are GREEN:
+`test tests::upstream_eof_before_first_byte_closes_downstream_promptly ... ok` and
+`test tests::allowed_first_byte_and_payload_round_trip_both_directions ... ok`.
+
+The **6** failures are ALL in the documented CI-authoritative host-flake set — none is
+in the phase-67.3-changed file (`crates/envoy-tcp/src/lib.rs`, whose lib is GREEN 16/16;
+`network_filter_rbac` GREEN 24/24, see below). Adjudicated per the memories, re-running
+each in isolation:
+
+| Failing test (crate) | Isolation | Class / memory |
+|---|---|---|
+| `access_log_h2_rcd_upstream_reset` (`differential`) | fails deterministically | upstream-reset witness fixture-0061/62/69/70; real Envoy can't reach the host-spawned close backend → reports `rf:"UF"` where envoy-rust correctly reports `rf:"UC"`. `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_h2_uc_upstream_reset` (`differential`) | fails deterministically | same reset-witness class |
+| `access_log_rcd_upstream_reset` (`differential`) | fails deterministically | same reset-witness class |
+| `access_log_rf_upstream_reset` (`differential`) | fails deterministically | same reset-witness class |
+| `admin_config_dump_server_info` (`envoy-bin`) | **PASS in isolation** (`1 passed`) | parallel-load env flake (handoff-named) |
+| `upstream_circuit_breaker_max_pending_requests_fixture` (`differential`) | **PASS in isolation** (`1 passed`) | Docker-differential parallel-load flake, `differential-fixtures-flake-under-parallel-load` class |
+
+Confirmed failure cause on the `access_log_rf_upstream_reset` RED (its stdout):
+`access log byte-exact mismatch … envoy="{\"rc\":503,\"rf\":\"UF\"}" envoy-rust="{\"rc\":503,\"rf\":\"UC\"}"`
+— the mismatch is on the **reference Envoy** side (it fails to connect to the
+host-spawned close backend and logs `UF`/connect-failure instead of the intended
+reset), i.e. purely environmental, NOT a phase regression. CI-authoritative.
+**Cross-check:** local `1949 passed + 6 failed = 1955`; all 6 pass on CI (the
+re-entry run `29208575008` was GREEN), so `local passed+failed == CI passed`.
+
+### Phase-touched greens (isolated)
+
+```
+envoy-tcp lib:       test result: ok. 16 passed; 0 failed; …
+network_filter_rbac: test result: ok. 24 passed; 0 failed; …
+```
+
+16 = 14 prior + `upstream_eof_before_first_byte_closes_downstream_promptly` (C-1) +
+`allowed_first_byte_and_payload_round_trip_both_directions` (I-2). 24 = banner/DENY/FIN/TLS
+backstops. envoy-listener 53, envoy-config 587 (unaffected, GREEN in the workspace run).
+
+### Gate (a) — `cargo deny check`
+
+**EXIT 0.** Only a benign `warning[license-not-encountered]` for the unused `"Zlib"`
+allowance in `deny.toml` — a config allowance that was not matched, NOT an advisory/ban
+failure. No fresh-advisory RED this session.
+
+### Gate (c) — Differential surface `0001`/`0071`/`0072`/`0073`
+
+`0001-tcp-echo` (`echo`), `0071-network-filter-direct-response`
+(`network_filter_direct_response`), `0072-network-filter-rbac-deny`
+(`network_filter_rbac_deny`), `0073-network-filter-rbac-allow`
+(`network_filter_rbac_allow`) — all **green** (re-confirmed in isolation:
+`1 passed` each) and **UNEDITED** (`git status --porcelain` empty ⇒ no fixture,
+no harness, no `known-failures.txt` touched).
+
+### Gate (d) — fuzz
+
+**Satisfied by the pre-existing `parse_bootstrap` target; NO new fuzz target this
+phase** (network `rbac` parses nothing new — PLAN §"No new fuzz target"). Recorded
+explicitly per the handoff, not skipped silently.
+
+### Conformance
+
+Unchanged; `known-failures.txt` UNEDITED (never trimmed — memory
+`h2spec-3-5-2-preface-host-sensitive`).
+
+### Outcome
+
+**§7.5 gate GREEN.** All 6 REDs adjudicated as documented CI-authoritative flakes
+(4 upstream-reset host-env witnesses fail deterministically = the reference Envoy's
+close-backend unreachability; `admin_config_dump_server_info` + the circuit-breaker
+differential both PASS in isolation = parallel-load flakes); NO real regression, NO
+fixture/`known-failures.txt` edit, the C-1 `SkippedCleanly`-on-upstream-EOF route + the
+I-1 continuous-`u2d` copy intact. Per §5.1 this session did NOT chain into the state-5
+re-review. **The next session runs `superpowers:requesting-code-review` → a NEW
+`REVIEW.md` that SUPERSEDES the NOT-APPROVED one** (a review is never edited, only
+superseded — D-3.5), grading whether the C-1/I-1/I-2 fixes hold.
