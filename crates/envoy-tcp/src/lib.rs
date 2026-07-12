@@ -329,12 +329,9 @@ impl TcpProxy {
                 // Drop the upstream (guard fires), reunite the downstream halves,
                 // and close it cleanly (zero bytes, clean EOF — close_with_drain).
                 drop((ur, uw));
-                let ds = dr
-                    .reunite(dw)
-                    .map_err(|e| {
-                        Box::new(std::io::Error::other(e))
-                            as Box<dyn std::error::Error + Send + Sync>
-                    })?;
+                let ds = dr.reunite(dw).map_err(|e| {
+                    Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
+                })?;
                 envoy_listener::close_with_drain(ds).await?;
                 Ok(())
             }

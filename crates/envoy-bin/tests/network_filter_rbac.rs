@@ -915,13 +915,7 @@ async fn deny_before_tcp_proxy_delivers_banner_then_withholds_the_byte() {
         .expect("clean EOF, not RST");
     drop(s);
 
-    wait_for_stat(
-        admin_addr,
-        "tpd.rbac.denied",
-        1,
-        Duration::from_secs(5),
-    )
-    .await;
+    wait_for_stat(admin_addr, "tpd.rbac.denied", 1, Duration::from_secs(5)).await;
     // W-4 / R-2: the first downstream byte must NEVER reach the upstream on DENY.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
@@ -969,7 +963,8 @@ async fn dataless_fin_ticks_allowed_for_tcp_proxy_but_not_echo() {
     // property (D3).
     let eport = reserve_port();
     let eadmin = reserve_port();
-    let (_echild, _edir) = spawn_envoy_bin(&rbac_echo_cfg_with_admin(eport, eadmin, "ef", ALLOW_ALL));
+    let (_echild, _edir) =
+        spawn_envoy_bin(&rbac_echo_cfg_with_admin(eport, eadmin, "ef", ALLOW_ALL));
     let edata_addr = format!("127.0.0.1:{eport}").parse().unwrap();
     let eadmin_addr = format!("127.0.0.1:{eadmin}").parse().unwrap();
     wait_ready(eadmin_addr, Duration::from_secs(10))
@@ -977,7 +972,9 @@ async fn dataless_fin_ticks_allowed_for_tcp_proxy_but_not_echo() {
         .expect("echo admin up");
 
     let mut es = connect_when_ready(edata_addr, Duration::from_secs(10)).await;
-    es.shutdown().await.expect("half-close the write side, no data");
+    es.shutdown()
+        .await
+        .expect("half-close the write side, no data");
     // Give the peek's Ok(0) path time to close cleanly, then confirm no tick.
     tokio::time::sleep(Duration::from_millis(400)).await;
     let estats = scrape_admin_stats(eadmin_addr).await;

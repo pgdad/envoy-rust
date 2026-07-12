@@ -5874,8 +5874,7 @@ static_resources:
     fn tls_rbac_before_tcp_proxy_is_still_rejected() {
         let yaml = chain_before_tcp_proxy_yaml_tls(RBAC_FILTER_YAML);
         let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
-        let err =
-            validate(&mut b).expect_err("TLS [rbac, tcp_proxy] stays rejected until CF-67-7");
+        let err = validate(&mut b).expect_err("TLS [rbac, tcp_proxy] stays rejected until CF-67-7");
         assert!(
             matches!(
                 err,
