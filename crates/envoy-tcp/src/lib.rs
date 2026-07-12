@@ -302,22 +302,35 @@ impl TcpProxy {
         let (mut dr, mut dw) = downstream.into_split(); // OwnedReadHalf/OwnedWriteHalf: reunitable
         let (mut ur, mut uw) = tokio::io::split(upstream);
 
-        // Phase 1: banner (upstream→downstream) runs WHILE we await the first
-        // downstream byte / FIN. The gate reads `dr`; the banner writes `dw`;
-        // disjoint halves, so no contention.
+        // The upstream→downstream copy is ONE continuous future for the whole
+        // connection (67.3 REVIEW I-1): it delivers the server-first banner during
+        // the gate wait AND all subsequent upstream bytes after admission. It is
+        // NEVER dropped-and-restarted, so its internal `CopyBuffer` (read-but-
+        // unwritten bytes under client backpressure) can never be silently lost.
+        // `Box::pin` (not `pin!`) so the close paths can `drop` it early to reclaim
+        // the `dw`/`ur` borrows for `reunite`.
+        let mut u2d = Box::pin(tokio::io::copy(&mut ur, &mut dw));
+
+        // Phase 1: `u2d` (banner) runs WHILE we await the first downstream byte /
+        // FIN. The gate reads `dr`; `u2d` writes `dw`; disjoint halves, no contention.
         let (outcome, first) = {
-            let mut banner = std::pin::pin!(tokio::io::copy(&mut ur, &mut dw));
             let mut gate_fut = std::pin::pin!(gate.evaluate_read_half(&mut dr, &conn));
             tokio::select! {
                 biased;
                 g = &mut gate_fut => g?,
-                r = &mut banner => {
-                    // Upstream reached EOF before the client's first byte. ADR-0016:
-                    // the connection closes. `dw` is dropped at scope end → client
-                    // sees FIN. Finish resolving the gate, then fall through.
+                r = &mut u2d => {
+                    // Upstream reached EOF before the client's first byte. ADR-0016
+                    // (`enable_half_close:false`): the connection must be torn down
+                    // NOW. Do NOT await the gate — a passive client would never send
+                    // the byte the gate waits for, so the connection would HANG and
+                    // the client would never see the FIN (67.3 REVIEW C-1). No byte
+                    // was ever sent, so RBAC never evaluates (ADR-0131 case C): route
+                    // to the clean-close path below (`SkippedCleanly` → reunite the
+                    // downstream halves + `close_with_drain`), which sends the client
+                    // a clean EOF.
                     r.map_err(|source| Box::new(TcpProxyError::CopyFailed { source })
                         as Box<dyn std::error::Error + Send + Sync>)?;
-                    gate_fut.await?
+                    (envoy_listener::GateOutcome::SkippedCleanly, None)
                 }
             }
         };
@@ -326,8 +339,10 @@ impl TcpProxy {
             envoy_listener::GateOutcome::ClientGoneEarly => Ok(()),
             envoy_listener::GateOutcome::SkippedCleanly | envoy_listener::GateOutcome::Denied => {
                 // W-4 / R-2: on Denied the first byte MUST NOT reach the upstream.
-                // Drop the upstream (guard fires), reunite the downstream halves,
-                // and close it cleanly (zero bytes, clean EOF — close_with_drain).
+                // Drop `u2d` (releases the `ur`/`dw` borrows) and the upstream (guard
+                // fires), reunite the downstream halves, and close cleanly (zero
+                // bytes, clean EOF — close_with_drain).
+                drop(u2d);
                 drop((ur, uw));
                 let ds = dr.reunite(dw).map_err(|e| {
                     Box::new(std::io::Error::other(e)) as Box<dyn std::error::Error + Send + Sync>
@@ -338,15 +353,19 @@ impl TcpProxy {
             envoy_listener::GateOutcome::Admitted => {
                 match first {
                     Some(b) => {
-                        // Re-inject the peeked byte, then the ADR-0016 select copy.
+                        // Re-inject the peeked byte, then the ADR-0016 half-close
+                        // select — CONTINUING the same `u2d` copy (no restart, no
+                        // lost buffer — 67.3 REVIEW I-1) against the now-open
+                        // downstream→upstream copy.
                         uw.write_all(&[b]).await.map_err(|source| {
                             Box::new(TcpProxyError::CopyFailed { source })
                                 as Box<dyn std::error::Error + Send + Sync>
                         })?;
                         let result: Result<(), std::io::Error> = tokio::select! {
                             res = tokio::io::copy(&mut dr, &mut uw) => res.map(|_| ()),
-                            res = tokio::io::copy(&mut ur, &mut dw) => res.map(|_| ()),
+                            res = &mut u2d => res.map(|_| ()),
                         };
+                        drop(u2d);
                         drop((dr, dw, ur, uw));
                         result.map_err(|source| {
                             Box::new(TcpProxyError::CopyFailed { source })
@@ -355,9 +374,9 @@ impl TcpProxy {
                     }
                     None => {
                         // Data-less FIN, ALLOW: propagate FIN upstream, drain the
-                        // upstream→downstream direction to EOF.
+                        // SAME continuous upstream→downstream copy to EOF (no restart).
                         uw.shutdown().await.ok();
-                        let _ = tokio::io::copy(&mut ur, &mut dw).await;
+                        let _ = u2d.await;
                         drop((dr, dw, ur, uw));
                     }
                 }
@@ -632,6 +651,158 @@ admin:
             .expect("backend observed the propagated data-less FIN within 3s");
         drop(client);
         let _ = task.await;
+    }
+
+    /// Spawn a server-FIRST backend that writes the banner then CLOSES immediately
+    /// (upstream EOF right after the banner). (67.3 REVIEW C-1.)
+    async fn spawn_banner_then_close_backend() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                s.write_all(b"220 BANNER\r\n").await.ok();
+                s.flush().await.ok();
+                // Close immediately — do NOT wait for any client data.
+            }
+        });
+        addr
+    }
+
+    /// 67.3 REVIEW C-1 REGRESSION WITNESS. When the `tcp_proxy` upstream reaches
+    /// EOF BEFORE the client's first downstream byte (a server-first backend that
+    /// closes right after its banner), the connection must be torn down promptly
+    /// (ADR-0016 `enable_half_close:false`): the client sees the banner then a
+    /// clean EOF. Against the pre-fix code `relay_gated`'s banner branch awaits the
+    /// gate for a byte the passive client never sends, so `dw` stays open and the
+    /// client HANGS — this test times out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upstream_eof_before_first_byte_closes_downstream_promptly() {
+        use envoy_listener::{
+            ChainHandler, ConnectionHandler, ConnectionInfo, NetworkFilter, NetworkFilterStatus,
+        };
+        struct AllowAll;
+        impl NetworkFilter for AllowAll {
+            fn on_new_connection(&self, _: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::Continue
+            }
+        }
+        let backend_addr = spawn_banner_then_close_backend().await;
+        let handle = mk_handle("backend", backend_addr).await;
+        let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(AllowAll) as Arc<dyn NetworkFilter>],
+            proxy,
+        ));
+        let dl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daddr = dl.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (s, _) = dl.accept().await.unwrap();
+            chain.handle(s).await
+        });
+
+        let mut client = TcpStream::connect(daddr).await.unwrap();
+        // Read the banner (server-first), then send NOTHING.
+        let mut buf = [0u8; 12];
+        client.read_exact(&mut buf).await.expect("read banner");
+        assert_eq!(&buf, b"220 BANNER\r\n");
+        // Upstream already EOF'd. The client must observe a PROMPT EOF (`Ok(0)`),
+        // not hang. A read returning 0 within the budget == clean teardown.
+        let mut tail = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut tail))
+            .await
+            .expect("connection must be torn down promptly on upstream EOF (67.3 REVIEW C-1)")
+            .expect("read");
+        assert_eq!(
+            n, 0,
+            "expected a clean EOF after upstream closed, got {n} bytes"
+        );
+        drop(client);
+        let _ = task.await;
+    }
+
+    /// 67.3 REVIEW I-2 / I-1 GUARD. The `Admitted(Some(b))` re-inject + duplex
+    /// branch had no behavioural witness (every ALLOW test was byte-less; every
+    /// first-byte test was DENY). This drives an ALLOWED first byte + payload
+    /// through `[rbac(ALLOW), tcp_proxy]` over a server-first backend and asserts:
+    /// (a) the re-injected first byte AND the subsequent client payload reach the
+    /// backend intact and IN ORDER (no dropped/reordered bytes — the I-1 concern
+    /// on the upstream→downstream side is guarded by the banner+response integrity
+    /// check below); (b) the banner and a backend response both flow downstream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allowed_first_byte_and_payload_round_trip_both_directions() {
+        use envoy_listener::{
+            ChainHandler, ConnectionHandler, ConnectionInfo, NetworkFilter, NetworkFilterStatus,
+        };
+        struct AllowAll;
+        impl NetworkFilter for AllowAll {
+            fn on_new_connection(&self, _: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::Continue
+            }
+        }
+        const REQUEST: &[u8] = b"HELLO WORLD, this is the client payload after the first byte";
+        // Server-first backend: banner, then read exactly REQUEST.len() bytes,
+        // assert they equal REQUEST (re-inject + payload order), then reply.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let backend_addr = listener.local_addr().unwrap();
+        let got = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let got_be = got.clone();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                s.write_all(b"220 BANNER\r\n").await.ok();
+                s.flush().await.ok();
+                let mut buf = vec![0u8; REQUEST.len()];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    *got_be.lock().await = buf;
+                }
+                s.write_all(b"250 OK\r\n").await.ok();
+                s.flush().await.ok();
+            }
+        });
+
+        let handle = mk_handle("backend", backend_addr).await;
+        let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(AllowAll) as Arc<dyn NetworkFilter>],
+            proxy,
+        ));
+        let dl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daddr = dl.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (s, _) = dl.accept().await.unwrap();
+            chain.handle(s).await
+        });
+
+        let mut client = TcpStream::connect(daddr).await.unwrap();
+        // Read the banner (server-first), then send the ALLOWED first byte + payload.
+        let mut banner = [0u8; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_exact(&mut banner),
+        )
+        .await
+        .expect("banner within 3s")
+        .expect("read banner");
+        assert_eq!(&banner, b"220 BANNER\r\n");
+        client.write_all(REQUEST).await.expect("send request");
+        client.flush().await.ok();
+        // Read the backend's response back through the proxy.
+        let mut resp = [0u8; 8];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_exact(&mut resp),
+        )
+        .await
+        .expect("response within 3s")
+        .expect("read response");
+        assert_eq!(&resp, b"250 OK\r\n");
+        drop(client);
+        let _ = task.await;
+        // The re-injected first byte + payload reached the backend intact & in order.
+        assert_eq!(
+            got.lock().await.as_slice(),
+            REQUEST,
+            "re-inject + payload must reach the backend byte-exact and in order"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

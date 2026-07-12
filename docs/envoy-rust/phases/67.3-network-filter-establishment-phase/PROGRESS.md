@@ -339,3 +339,95 @@ to §5 state 5 (`superpowers:requesting-code-review` → `REVIEW.md`, next sessi
 Per §5.1 this session did NOT chain into state-5. No new ADR (ledger head ADR-0135).
 Live carry-forwards unchanged: M-1, CF-67-6, **CF-67-7 (NEW — TLS composition)**,
 CF-67-3.
+
+---
+
+## Session: §5.2 state-3 RE-ENTRY (`superpowers:test-driven-development`)
+
+Cold-started clean: `git status --porcelain` empty, branch `main`, `HEAD` at the
+state-5 code-review commit `7fd7e4e` = `origin/main`; `git fetch origin --prune`
+showed no sibling ahead. **STEP 0.5:** the state-5 commit's CI run `29207485564` was
+GREEN on `7fd7e4e9237575fbf7a6c71b90f016887fee35ee` (after rerunning a known
+`admin_drain_listeners` Docker-differential flake); the code-complete `9b09bdc`'s run
+`29194938132` is the authoritative §7.5-GREEN signal. Re-entered per §5.2 to fix the
+NOT-APPROVED review's Critical + Important findings under TDD (failing witness FIRST,
+then repair). **Only `crates/envoy-tcp/src/lib.rs` changed** (the `relay_gated` body +
+two new witnesses); no other production code; no fixture edited.
+
+### C-1 (Critical) — `relay_gated` hangs on upstream-EOF-before-first-byte — FIXED
+
+- **RED:** added `upstream_eof_before_first_byte_closes_downstream_promptly` (+ a
+  `spawn_banner_then_close_backend` helper): a server-first backend that closes right
+  after its banner, `[rbac(ALLOW), tcp_proxy]`, a client that reads the banner then
+  sends nothing → asserts the client observes a prompt EOF. Confirmed FAIL against the
+  pre-fix code: `Elapsed` (3s timeout) — the connection HUNG, reproducing C-1.
+- **GREEN:** the banner branch (`r = &mut u2d`) no longer `gate_fut.await?`s; on
+  upstream EOF it yields `(GateOutcome::SkippedCleanly, None)`, routing to the existing
+  clean-close path (drop upstream, reunite the downstream halves, `close_with_drain` →
+  clean EOF). Correct per ADR-0016 (`enable_half_close:false` → upstream FIN tears the
+  connection down) and ADR-0131 case C (a byte-less client is never evaluated, so no
+  RBAC verdict/counter). Test passes instantly (0.00s).
+- **Also resolves M67.3-1:** `SkippedCleanly` is now reachable and meaningful on the
+  `tcp_proxy` gated path (the upstream-EOF signal), no longer a dead arm.
+
+### I-1 (Important) — silent upstream-byte loss at the `Admitted(Some(b))` transition — FIXED
+
+- **The fix:** the upstream→downstream copy is now ONE continuous `Box::pin`'d future
+  `u2d`, created once and NEVER dropped-and-restarted. Phase 1 (banner) and phase 2
+  (post-admission relay) both drive the SAME `u2d`, so its internal `CopyBuffer`
+  (read-but-unwritten bytes under client backpressure) can never be silently discarded.
+  The `Admitted(Some(b))` branch re-injects `b` then `select!`s `copy(dr→uw)` against
+  `&mut u2d` (was: a fresh `copy(ur→dw)` — the loss window); the `None` (data-less FIN)
+  branch drains the same `u2d` to EOF; the close paths `drop(u2d)` first to reclaim the
+  `dw`/`ur` borrows for `reunite`. `Box::pin` (not `pin!`) makes that early drop legal.
+- **On the TDD red-first for I-1 (honest note):** the loss MECHANISM was proven
+  deterministically at the state-5 review (a throwaway probe drove `tokio::io::copy` to
+  a parked-mid-write state, dropped it, restarted a fresh copy → exactly the buffered
+  bytes vanished). The END-TO-END trigger over real sockets is non-deterministic (18
+  runs up to 64 MiB showed no loss — the parked-mid-write instant rarely coincides with
+  the drop), so a reliably-red integration test is not achievable. The fix is therefore
+  a **structural elimination of the drop-and-restart** (the copy is provably continuous),
+  guarded by the I-2 behavioural witness below (payload integrity through the
+  `Some(b)` branch) rather than a flaky red-first e2e test. `§6.1` valve re-derived on
+  the restructure (~8 sub-steps, same shape) — did NOT fire.
+
+### I-2 (Important) — the `Admitted(Some(b))` re-inject/duplex branch had no witness — CLOSED
+
+- Added `allowed_first_byte_and_payload_round_trip_both_directions`: drives an ALLOWED
+  first byte + a 59-byte payload through `[rbac(ALLOW), tcp_proxy]` over a server-first
+  backend that reads exactly the payload and replies; asserts (a) the re-injected first
+  byte + subsequent payload reach the backend byte-exact and IN ORDER, and (b) the
+  banner and the `250 OK` response both flow downstream. Exercises the most intricate
+  branch (re-inject + bidirectional copy) — the gap that let C-1 + I-1 ship green.
+  Passes; stable across 5 runs.
+
+### Minors — disposition
+
+M67.3-1 CONSUMED (see C-1). M67.3-2 (item-13 "FULL PARITY") is now accurate (C-1 + I-1
+fixed) — no `BEHAVIOR_CONTRACT` edit needed. M67.3-3 (config `is_some()` →
+`chain_has_tls` legibility), M67.3-4 (`ClientGoneEarly` drops the I/O error), M67.3-5
+(swallowed drain results + broken-pipe log noise) stay as non-blocking carry-forward
+Minors (the review marked them "Nice to Have"; deferring keeps this re-entry's change
+surface minimal — envoy-config/envoy-listener untouched).
+
+### Verification (state-3 discipline — NOT the full §7.5 gate; that is state-4)
+
+- `cargo build -p envoy-bin` EXIT 0 / 0 warnings; `cargo clippy -p envoy-tcp
+  --all-targets --all-features -- -D warnings` clean; `cargo fmt --all -- --check` EXIT 0.
+- `cargo test -p envoy-tcp --lib` = **16 passed** (14 prior + C-1 + I-2); the real-binary
+  `cargo test -p envoy-bin --test network_filter_rbac` = **24 passed** (banner / DENY /
+  FIN-matrix / TLS-reject backstops all green after the fix); envoy-listener 53, envoy-config
+  587 (unaffected). C-1 + I-2 stable across 5 reruns.
+- Differential surface `0001`/`0071`/`0072`/`0073` + `known-failures.txt` UNEDITED (only
+  `relay_gated` + two witnesses changed; no fixture composes `rbac` with `tcp_proxy` — the
+  witnesses are in-process). The full §7.5 gate + Docker differential run at the state-4
+  re-verification / CI (host-flaky, CI-authoritative).
+
+### ADR decision
+
+**NO new ADR.** The fixes align with EXISTING decisions (ADR-0016 half-close teardown,
+ADR-0131 first-byte verdict, ADR-0124 drain) — they close a divergence and an internal
+correctness gap, introducing no new measured wire-shape or divergence. Ledger head stays
+**ADR-0135** (next `ADR-0136`, unreserved). Per §5.1 this session did NOT chain into the
+state-4 re-verification. The next session runs `superpowers:verification-before-completion`
+→ the full §7.5 gate.
