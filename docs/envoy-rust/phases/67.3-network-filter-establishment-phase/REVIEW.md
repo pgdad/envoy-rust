@@ -1,313 +1,241 @@
-# Phase 67.3 — §5 state-5 CODE-REVIEW
+# Phase 67.3 — §5 state-5 RE-REVIEW (SUPERSEDES the NOT-APPROVED state-5 review)
 
-> Written by the §5 **state-5 code-review** session (`superpowers:requesting-code-review`), per
-> `BOOTSTRAP_PROMPT.md` §5 state 5 and `SKILL_ROUTING.md`. The output of this session IS this file.
-> Cold-started clean: `git status --porcelain` empty; branch `main`; `HEAD` = `origin/main` =
-> `d01e218` (the state-4 verification commit); `git fetch origin --prune` showed no sibling ahead.
-> **STEP 0.5 CI (FULL 40-char SHA):** the code-complete commit `9b09bdc`'s CI run `29194938132` is
-> GREEN on `9b09bdcc93f8b8ba77eeacdaef86110867e8a143` (the authoritative §7.5 gate-GREEN signal); the
-> state-4 verify commit `d01e218`'s CI run `29204641108` is GREEN on
-> `d01e2187e6f09c889dcb4e5a631871a2c148dbc5`.
+> Written by the §5 **state-5 RE-review** session (`superpowers:requesting-code-review`), per
+> `BOOTSTRAP_PROMPT.md` §5 state 5 and `SKILL_ROUTING.md`. A review is NEVER edited, only
+> superseded (D-3.5): this file **supersedes** the earlier NOT-APPROVED state-5 review (preserved
+> in git history at commit `7fd7e4e`, and as this file's prior revision). The output of this session
+> IS this file.
 >
-> **Review surface:** the phase's landed diff `b5fc211..HEAD` (`git diff b5fc211..HEAD -- crates docs`)
-> — the five task commits `412e133`/`7be5bf2`/`23ff455`/`7946aec`/`0872f6b` + the `9b09bdc` fmt
-> fixup. The establishment/data split (`envoy_listener::{GateOutcome, FirstByteGate,
-> ConnectionHandler::handle_gated}` + the `ChainHandler` delegation), `envoy_tcp::TcpProxy::{
-> connect_upstream, relay, relay_gated}` + the `handle_gated` override, the narrowed
-> `UnsupportedNetworkFilterChainComposition` (TLS-only), the envoy-bin backstops + FIN matrix, and
-> `BEHAVIOR_CONTRACT.md` item 13.
+> Cold-started clean: `git status --porcelain` empty; branch `main`; `HEAD` = `origin/main` =
+> `2bd6d5e` (the §5 state-4 RE-verification commit); `git fetch origin --prune` showed no sibling
+> ahead. **STEP 0.5 CI (FULL 40-char SHA):** the §5.2 state-3 re-entry commit `e551e15` — the
+> commit that actually carries the C-1/I-1/I-2 fix — CI run `29208575008` is GREEN
+> (`completed`/`success`) on `e551e15e90e93db8454a7b97b5a2b25d263734d1` (the authoritative §7.5
+> gate-GREEN signal for the post-fix tree); the docs-only state-4 RE-verification commit `2bd6d5e`
+> changed no code (`67.3/PROGRESS.md` + `STATE.md` + `STATE_HISTORY.md` only).
+>
+> **Review surface:** the §5.2 state-3 re-entry's fix diff `e551e15 -- crates/envoy-tcp/src/lib.rs`
+> (the `relay_gated` body + two new in-process witnesses), read against the full landed phase diff
+> `b5fc211..HEAD` and the NOT-APPROVED review's C-1/I-1/I-2. **Only `crates/envoy-tcp/src/lib.rs`
+> changed in the re-entry** — no other production code, no fixture, no `known-failures.txt`.
 >
 > **Method (memory `state5-must-probe-untested-compositions`).** A green §7.5 gate proves the code
-> does what its tests ask, not that the tests ask the right question. The phase adds `handle_gated`
-> over N terminal handlers (`echo`/`hcm` inherit the default; `tcp_proxy` overrides; `direct_response`
-> bypasses). This review (1) code-read every branch of `relay_gated` and the gate primitive; (2)
-> grepped which compositions the fixtures/backstops actually exercise; (3) **LIVE-PROBED an untested
-> composition** — the "upstream EOFs before the client's first byte" case the PLAN itself flagged as
-> the risky part (`PLAN.md:403`) — building a throwaway integration test against a freshly-built
-> `target/debug` and a **control** on the non-gated path; and (4) dispatched an independent
-> adversarial `general-purpose` subagent for breadth. The live probe surfaced a **Critical**.
+> does what its tests ask, not that the tests ask the right question. This RE-review (1) code-read
+> every branch of the repaired `relay_gated` and re-read the gate primitive + `close_with_drain`;
+> (2) LIVE-PROBED the compositions the PLAN flagged (`PLAN.md:403`) and that the prior review found
+> defective — running the in-process witnesses that now encode them (the C-1 regression witness
+> re-run **5× for stability**, the full `envoy-tcp` lib, and the **real-binary** `envoy-bin`
+> establishment backstops); (3) dispatched an independent adversarial `general-purpose` subagent and
+> **MEASURED** (not merely accepted) each of its "proven-safe" hypotheses against the code and the
+> non-gated `relay` control. The prior arc's Critical hid behind an untested branch; this pass
+> confirms those branches are now both correct AND witnessed.
 
 ---
 
 ## VERDICT
 
-> ### **NOT APPROVED — one Critical (C-1) + two Important (I-1, I-2). §5.2 re-entry at state-3 required.**
+> ### **APPROVED.** The §5.2 state-3 re-entry's C-1 fix, I-1 fix, and I-2 witness resolve every
+> ### finding of the NOT-APPROVED state-5 review; no new defect is introduced; all standing traps
+> ### are honored; the §7.5 acceptance frame is GREEN (state-4 RE-verification). Advance to §5
+> ### state 6 (close-out) — a SEPARATE session per §5.1 / ADR-0127.
 >
-> The phase's structure is sound and its stated witnesses pass, but **two untested branches of
-> `relay_gated`** — both flagged by the PLAN's own §6.1 mid-execution-valve note (`PLAN.md:403`) as
-> the risky part — carry defects, and neither is covered by any witness:
+> The three findings are resolved as follows, each confirmed by code-read **and** a green, stable
+> witness, and cross-checked by an independent adversarial subagent that reached the same conclusions
+> and found no regression:
 >
-> - **C-1 (Critical) — hang on upstream-EOF-before-first-byte.** When a server-first `tcp_proxy`
->   backend reaches EOF *before* the client's first downstream byte, the banner branch awaits the
->   first-byte gate *after* the upstream has already closed, holding the downstream write half open
->   indefinitely for a client that then stays passive. The client never sees the FIN, the connection
->   task blocks forever, and the `upstream_cx_active` guard stays held. The **non-gated** `relay` path
->   tears the same connection down promptly (ADR-0016 `select!`) — proven by a control probe — so
->   this is an internal liveness regression, a divergence from `enable_half_close: false`, and it
->   **contradicts the BEHAVIOR_CONTRACT item-13 "PLAINTEXT = FULL PARITY" claim**. *Deterministically
->   reproduced this session.*
-> - **I-1 (Important) — silent upstream-byte loss at the `Admitted(Some(b))` transition.** The
->   phase-1 banner `tokio::io::copy(ur, dw)` future is *dropped* when the gate wins the biased select,
->   then phase-2 starts a *fresh* copy on the same `ur`. If the dropped future was parked mid-write,
->   its internal `CopyBuffer` (read-but-unwritten upstream bytes, ≤ tokio's 8 KiB) is discarded — a
->   silent data-loss window for full-duplex traffic. *The mechanism is deterministically proven
->   (probe #3: exactly the buffered bytes vanish); end-to-end reproduction over real sockets did NOT
->   trigger it in 18 trials up to 64 MiB (the parked-mid-write instant has a narrow window), so the
->   trigger is narrow but the corruption is real and silent.*
-> - **I-2 (Important) — the `Admitted(Some(b))` re-inject + duplex-payload branch is behaviourally
->   unverified.** Every ALLOW witness is byte-less (`None`); every first-byte witness is DENY. No test
->   sends an *allowed* first byte through `[rbac(ALLOW), tcp_proxy]` and asserts the re-injected byte
->   + subsequent bidirectional payload arrive intact. The single most intricate branch is untested —
->   which is exactly why C-1 and I-1 shipped green.
+> - **C-1 (was Critical) — RESOLVED.** The phase-1 `u2d`-wins (upstream-EOF-before-first-byte) branch
+>   (`crates/envoy-tcp/src/lib.rs:321-334`) no longer `gate_fut.await?`s; on upstream EOF it yields
+>   `(GateOutcome::SkippedCleanly, None)`, routing to the `SkippedCleanly | Denied` close arm
+>   (`:340-352`): drop `u2d`, drop the upstream (guard fires), `reunite` the downstream halves, and
+>   `close_with_drain`. `close_with_drain` **shuts the write half FIRST** (`envoy-listener/src/lib.rs:240`),
+>   so a *passive* client receives a prompt clean EOF — the exact hang the prior review reproduced is
+>   gone. Correct per ADR-0016 (`enable_half_close:false` → an upstream FIN tears the connection down)
+>   and ADR-0131 case C (a byte-less client is never evaluated, so there is no RBAC verdict to defer).
+>   The regression witness `upstream_eof_before_first_byte_closes_downstream_promptly` reproduced the
+>   pre-fix 3-second hang (documented RED) and now passes **5/5** reruns (0.00s each).
+> - **I-1 (was Important) — RESOLVED (structurally).** The upstream→downstream copy is now ONE
+>   continuous `Box::pin`'d future `u2d = tokio::io::copy(&mut ur, &mut dw)` (`:312`), created once and
+>   carried across both phases — `&mut u2d` in the `Admitted(Some(b))` select (`:366`), `u2d.await` in
+>   the `Admitted(None)` drain (`:379`). It is NEVER dropped-and-restarted on any admitted path, so its
+>   internal `CopyBuffer` (read-but-unwritten banner bytes under client backpressure) can no longer be
+>   silently discarded. The prior review MEASURED the loss *mechanism* as deterministic but the
+>   *end-to-end* trigger as narrow (18 real-socket runs, no loss); a reliably-red e2e test is therefore
+>   not achievable, so the fix is correctly framed as a **structural elimination** of the
+>   drop-and-restart, guarded by the I-2 behavioural witness — an honest and defensible call.
+> - **I-2 (was Important) — RESOLVED.** `allowed_first_byte_and_payload_round_trip_both_directions`
+>   drives an ALLOWED first byte + a 59-byte payload through `[rbac(ALLOW), tcp_proxy]` over a
+>   server-first backend and asserts (a) the re-injected first byte + subsequent payload reach the
+>   backend byte-exact and IN ORDER, and (b) the banner and a `250 OK` response both flow downstream.
+>   It genuinely exercises the single most intricate branch — the gap that let C-1 and I-1 ship green.
+>   Passes; stable.
 >
-> Everything else is in good shape: the `FirstByteGate` extraction is clean and preserves echo/hcm
-> byte-for-byte (verified — they inherit the non-consuming `evaluate_peek` default); the
-> `connect_upstream`/`relay` split preserves ADR-0016 posture and the `cx_active`/`cx_total`
-> placement; the config narrowing to `transport_socket.is_some()` is a sound TLS proxy (envoy-rust
-> rejects every non-`tls` transport-socket name, so a validated chain with a transport socket is
-> necessarily TLS); the DENY-withholds-the-byte and FIN-matrix witnesses test what they claim and
-> incorporate the `connect_when_ready` counter-pollution fix (memory
-> `wait-ready-probe-pollutes-tcp-proxy-counters`). No security or data-durability issue; no other
-> Critical.
->
-> Per §5.2, the next session **re-enters at state-3** (fix C-1 + I-1 + close I-2's gap under TDD —
-> add the failing witnesses first), **not state-4**. Per §5.1 / ADR-0127 this session does NOT chain
-> into the fix.
+> Everything the prior review praised still holds and was re-confirmed: the `FirstByteGate` extraction,
+> the `connect_upstream`/`relay` establishment/data split (ADR-0016 posture + `cx_active`/`cx_total`
+> placement intact), echo/hcm byte-for-byte parity (they inherit the non-consuming `evaluate_peek`
+> default), the DENY-withholds-the-byte + FIN-matrix witnesses, and the `transport_socket.is_some()`
+> TLS narrowing. No new Critical, no new Important, no security or data-durability issue.
 
 ---
 
-## §1. What the phase is (code-read, verified at `HEAD`)
+## §1. What changed since the NOT-APPROVED review (code-read, verified at `HEAD`)
 
-- **`envoy_listener::GateOutcome`** (`crates/envoy-listener/src/lib.rs:138`): `ClientGoneEarly` /
-  `SkippedCleanly` / `Admitted` / `Denied`. `Copy`, `Eq`. Clean.
-- **`envoy_listener::FirstByteGate`** (`:158`): owns `Arc<[Arc<dyn NetworkFilter>]>`; `run` (no I/O,
-  first `StopIteration` denies), `run_for_test`, `evaluate_peek` (non-consuming `peek`; `Ok(0)` ⇒
-  `SkippedCleanly` — no eval), `evaluate_read_half` (consuming one-byte `read`; `Ok(0)` ⇒ STILL
-  evaluates, byte `None`; a real byte returned `Some(b)` for re-injection). The `NetworkFilter` shape
-  is unchanged and no payload is exposed — CF-67-3 stays deferred. **Verified** the two front-ends
-  encode the D3 FIN asymmetry as a handler property (which front-end the terminal uses), not a
-  name-check.
-- **`ConnectionHandler::handle_gated`** default (`:58`): `self: Arc<Self>`; peek-gate → `handle`;
-  `SkippedCleanly | Denied` → `close_with_drain`; `ClientGoneEarly` → drop. Dyn-safe. echo/hcm
-  inherit it ⇒ **byte-for-byte unchanged** (fixtures `0072`/`0073` need no edit — confirmed unedited).
-- **`ChainHandler::handle`** (`:313`): now builds a `FirstByteGate` and delegates to
-  `inner.handle_gated`. The old inline peek/loop is gone (moved verbatim into the gate). Observationally
-  identical for the default path.
-- **`TcpProxy::connect_upstream` + `relay`** (`crates/envoy-tcp/src/lib.rs:81`, `:141`): the
-  establishment/data split. `UpstreamConn` carries the RAII `_cx_guard`. ADR-0016 `select!` posture
-  and the `cx_active`/`cx_total` placement preserved exactly; `handle::<S>` now composes the two. The
-  11 pre-existing regression tests pass unchanged.
-- **`TcpProxy::handle_gated` override + `relay_gated`** (`:265`, `:288`): connect upstream at
-  establishment, then race the banner (upstream→downstream copy) against the first-byte gate on the
-  split downstream read half; branch on the outcome. **This is where C-1 lives (§3).**
-- **Config narrowing** (`crates/envoy-config/src/bootstrap.rs:3233`, `lib.rs:130`): the
-  `UnsupportedNetworkFilterChainComposition` rejection gains `&& chain.transport_socket.is_some()`,
-  so plaintext `[rbac, tcp_proxy]` validates and only TLS-downstream stays fail-loud (re-messaged to
-  name CF-67-7). Sound (§4).
+The re-entry touched **only** `crates/envoy-tcp/src/lib.rs` (`git show e551e15 --stat`): the
+`relay_gated` body and two new `#[cfg(test)]` witnesses (+ one backend helper). The rest of the phase
+(the `FirstByteGate`/`handle_gated` primitive, the config narrowing, the envoy-bin backstops, the
+BEHAVIOR_CONTRACT item-13 split) is byte-identical to the state-5-reviewed tree and is not re-graded
+here beyond the standing-trap spot-checks in §3.
+
+The repaired `relay_gated` (`crates/envoy-tcp/src/lib.rs:288-388`):
+
+1. **`let mut u2d = Box::pin(tokio::io::copy(&mut ur, &mut dw));`** (`:312`) — the continuous
+   upstream→downstream copy (I-1). `Box::pin` (not `pin!`) so the close paths can `drop` it early to
+   reclaim the `dw`/`ur` borrows for `reunite`.
+2. **Phase-1 `biased` `select!`** (`:318-335`): the gate (`evaluate_read_half(&mut dr)`) is polled
+   first; the `u2d`-wins arm (upstream EOF before the first byte) now returns
+   `(GateOutcome::SkippedCleanly, None)` — **no gate await** (C-1).
+3. **`ClientGoneEarly`** → drop (`:339`).
+4. **`SkippedCleanly | Denied`** (`:340-352`): `drop(u2d)`; drop upstream; `reunite`; `close_with_drain`.
+   This arm is now reachable via BOTH the gate's `Denied` and the phase-1 banner branch's
+   `SkippedCleanly` — which **consumes M67.3-1** (the arm is no longer a dead `SkippedCleanly` match).
+5. **`Admitted(Some(b))`** (`:355-374`): `uw.write_all(&[b])` (re-inject), then `select!` `copy(dr→uw)`
+   against `&mut u2d` (the SAME copy — no restart, I-1), then `drop(u2d)` + drop halves.
+6. **`Admitted(None)`** (data-less FIN) (`:375-381`): `uw.shutdown()`, then `u2d.await` (drain the SAME
+   copy to upstream EOF).
 
 ---
 
-## §2. Strengths
+## §2. Grading — do the fixes actually resolve the findings?
 
-- **The gate extraction is the right abstraction.** Pulling the peek+filter loop into a
-  filter-owned `FirstByteGate` with two explicit front-ends (`evaluate_peek` vs `evaluate_read_half`)
-  makes the D3 FIN asymmetry fall out of *which* front-end a terminal uses, exactly as ADR-0135 W-3
-  prescribes — no filter-name special-casing, no `NetworkFilter` shape change.
-- **echo/hcm parity is structurally guaranteed, not just tested.** They inherit the default
-  `handle_gated`, whose body is the pre-67.3 `ChainHandler` peek verbatim. Fixtures `0072`/`0073`
-  and `known-failures.txt` are unedited (verified by `git diff --name-only`).
-- **DENY-withholds-the-byte is correctly implemented and witnessed.** `evaluate_read_half` returns
-  the byte as `Some(b)`; `relay_gated`'s `Denied` arm drops the upstream and `close_with_drain`s the
-  downstream without ever writing `b` to `uw`. `deny_delivers_banner_then_closes_without_forwarding_the_byte`
-  (in-process) + `deny_before_tcp_proxy_delivers_banner_then_withholds_the_byte` (envoy-bin, asserts
-  the recording backend never saw the byte) pin it. W-4/R-2 honored.
-- **The counter-pollution trap was found and fixed during implementation.** The envoy-bin backstops
-  use a new `connect_when_ready` (retry-connect that KEEPS the stream) instead of `wait_ready` on the
-  data listener, so the test client is the sole data connection — matching memory
-  `wait-ready-probe-pollutes-tcp-proxy-counters`. The FIN-matrix backstop correctly contrasts
-  `tpf.rbac.allowed == 1` (tcp_proxy) against `ef.rbac.allowed == 0` (echo).
-- **The config narrowing is a faithful TLS proxy.** `transport_socket.is_some()` is sound because
-  `rejects_unknown_transport_socket_name` (`bootstrap.rs:7965`) proves envoy-rust accepts only the
-  `envoy.transport_sockets.tls` name; any other transport socket is already rejected, so a validated
-  chain carrying a transport socket is necessarily TLS-downstream. No false-accept, no false-reject
-  of a genuinely-plaintext chain. The precedence guard (`terminal_not_last_wins_for_echo_rbac_tcp_proxy`)
-  and the over-rejection guards survive.
+### C-1 — RESOLVED (confirmed by code-read + LIVE re-probe)
 
----
+- **The hang is gone.** The banner branch no longer awaits a byte a passive client will never send.
+  It routes to the clean-close path; `close_with_drain`'s `writer.shutdown().await` sends the FIN
+  before the drain loop, so the client observes `Ok(0)` promptly.
+- **The banner is not truncated on this path.** `tokio::io::copy` resolves only after flushing on
+  source EOF, so `u2d` completing `Ok` means the full banner was written to `dw` before the
+  SkippedCleanly routing — the passive client reads the full banner, then the clean EOF (asserted by
+  the witness's `read_exact(&banner)` then `read == 0`).
+- **No guard leak.** `_cx_guard` is bound in the function-scope `UpstreamConn` destructure (`:296-301`)
+  and drops when `relay_gated` returns down every arm — including the close arm. (It is held *for the
+  duration of* `close_with_drain`; see the non-blocking note in §4 — pre-existing, matches `relay`.)
+- **Live re-probe:** `upstream_eof_before_first_byte_closes_downstream_promptly` green **5/5**; the full
+  `envoy-tcp` lib green **16/16**; the real-binary `envoy-bin` backstops green **24/24**.
+- **M67.3-1 consumed, M67.3-2 resolved:** `SkippedCleanly` is now reachable + meaningful on the gated
+  path; BEHAVIOR_CONTRACT item-13's "PLAINTEXT = FULL PARITY" claim (`:429`) is now accurate (the C-1
+  and I-1 counter-examples are fixed), so no contract row needs a divergence note.
 
-## §3. Issues
+### I-1 — RESOLVED structurally (mechanism eliminated, not merely papered over)
 
-### Critical (Must Fix)
+- The copy is provably continuous across the phase-1→phase-2 transition on every admitted path. There
+  is no `tokio::io::copy(&mut ur, &mut dw)` reconstruction anywhere after `:312` (verified by reading
+  the whole function). The CopyBuffer survives because the future survives.
+- **No double-poll / poll-after-Ready.** `tokio::select!` returns a branch only when it is `Ready`; if
+  control is still inside the phase-1 select, `u2d` has not returned `Ready` (or the select would have
+  returned via the `u2d` arm → SkippedCleanly, not Admitted). So re-polling `&mut u2d` / `u2d.await` in
+  phase 2 is always on a still-pending future. The `biased` order means a gate-`Ready` tick does not
+  poll `u2d`, leaving its state untouched. (Measured against the subagent's hypothesis — confirmed.)
+- **Borrows are sound.** `drop(u2d)` releases the `&mut ur`/`&mut dw` borrows before `drop((ur, uw))`
+  and `dr.reunite(dw)`; the halves are owned split-halves of one stream, so `reunite` succeeds. Compiles
+  under `cargo clippy --all-targets --all-features -- -D warnings` clean.
+- **Guarded by I-2** rather than a flaky red-first e2e — the correct engineering choice given the
+  MEASURED-narrow trigger.
 
-**C-1. `relay_gated` hangs the connection when the `tcp_proxy` upstream reaches EOF before the
-client's first downstream byte.**
+### I-2 — RESOLVED
 
-- **File:** `crates/envoy-tcp/src/lib.rs:314-321` (the `r = &mut banner =>` branch of the phase-1
-  `select!` inside `relay_gated`; the offending `gate_fut.await?` is at `:320`).
-- **What's wrong.** The phase-1 `select!` races the banner copy (`copy(ur, dw)`) against the gate
-  (`evaluate_read_half(dr)`). When the upstream closes *before* the client sends its first byte, the
-  banner copy completes (upstream EOF) and the **banner branch** is taken. That branch does
-  `gate_fut.await?` — it *blocks on a downstream read that never resolves* for a client that received
-  the banner and then stays passive (sends neither a byte nor a FIN). The downstream write half `dw`
-  is a live local, dropped only at function end, so **the function never returns, the client never
-  sees the FIN, the connection task blocks indefinitely, and the `_cx_guard` (`upstream_cx_active`)
-  stays held.** The branch's own comment claims "`dw` is dropped at scope end → client sees FIN," but
-  the `gate_fut.await` *is* the scope, so scope-end is never reached.
-- **Why it matters.** (a) **Liveness / resource leak.** A connection that should close stays open
-  forever (until the client independently closes), pinning a task and the active-connection gauge.
-  (b) **Divergence from ADR-0016.** With `enable_half_close: false`, either side's FIN tears the
-  whole connection down. The **non-gated** `relay` path implements this via its `select!`. The gated
-  path breaks it. (c) **Divergence from upstream Envoy**, which closes the downstream when the
-  upstream closes. (d) **Contradicts the BEHAVIOR_CONTRACT item-13 "PLAINTEXT = FULL PARITY" claim**
-  landed this phase. (e) It is a **narrower re-appearance of exactly the hang** that 67.1's fail-loud
-  rejection existed to prevent, on the composition this phase re-enables. The PLAN flagged this exact
-  race as the risky part (`PLAN.md:403`: *"the 'upstream EOFs before the client's first byte' race"*);
-  the implemented handling is incorrect.
-- **Repro (live-probed this session; throwaway test deleted, tree clean).** A server-first backend
-  that writes `220 BANNER\r\n` then closes immediately, a `[rbac(ALLOW), tcp_proxy]` chain, a client
-  that reads the banner then sends nothing:
-  - **gated path** (`ChainHandler` → `relay_gated`): client does **not** observe EOF within 2s →
-    **hang confirmed** (the read times out).
-  - **control, non-gated path** (lone `Arc<TcpProxy>` → `relay`): client observes EOF promptly →
-    "correctly tore down on upstream EOF".
-  The two paths, same backend, opposite outcomes — isolating the defect to `relay_gated`'s banner
-  branch, not the backend or the harness.
-- **Why the gate is green anyway.** No witness exercises upstream-EOF-*before*-first-byte. The banner
-  witnesses keep the backend's read loop alive (it never closes first);
-  `dataless_fin_through_rbac_allow_reaches_backend_as_eof` has the *client* close first, not the
-  upstream. The anticipated race (`PLAN.md:403`) shipped without a witness.
-- **How to fix (for the state-3 re-entry — do NOT fix in this review session).** In the banner
-  (upstream-EOF) branch, do **not** `await` the gate. Upstream is already gone; under
-  `enable_half_close: false` the connection must be torn down, and per ADR-0131 case C a client that
-  never sent a byte is never evaluated — so RBAC-on-a-later-byte is moot (there is no upstream left to
-  forward to). Tear down immediately: drop the halves (client sees FIN) and return `Ok(())`. Add the
-  failing witness first (the probe above), confirm it hangs against current code, then repair.
-
-### Important (Should Fix)
-
-**I-1. `relay_gated` can silently drop buffered upstream bytes at the `Admitted(Some(b))`
-phase-1→phase-2 transition.**
-
-- **File:** `crates/envoy-tcp/src/lib.rs:309` (phase-1 `banner = tokio::io::copy(&mut ur, &mut dw)`,
-  dropped at the select block end) → `:348` (phase-2 `tokio::io::copy(&mut ur, &mut dw)`, a fresh
-  copy on the same `ur`).
-- **What's wrong.** When the gate wins the biased select (the client's first ALLOW byte), the phase-1
-  banner copy future is dropped. `tokio::io::copy` owns an internal `CopyBuffer` (default 8 KiB); if
-  the dropped future was parked **mid-write** (it had read a chunk from `ur` but the write to `dw` was
-  `Pending` under client backpressure), those read-but-unwritten bytes are discarded with the buffer.
-  Phase-2 then starts a *fresh* copy that reads the *next* bytes from `ur` — so the buffered bytes are
-  **silently lost**. `[rbac, tcp_proxy]` is a generic byte proxy, so any full-duplex protocol where
-  the upstream is streaming when the client sends its first byte is exposed.
-- **Why it matters.** Silent data corruption on a proxy data path is worse than a visible failure —
-  no error, no counter, no log. Bounded per occurrence (≤ one `CopyBuffer`, ~8 KiB) but unbounded in
-  aggregate across connections.
-- **Evidence (measured this session — reviewer hypothesis, verified, tree clean).** The **mechanism
-  is deterministic** (probe #3: drive a `copy` to a parked mid-write state — writer accepted 4096 of
-  an 8192-byte chunk, then `Pending` — drop it, restart a fresh `copy` on the same reader; result:
-  **exactly 4096 bytes lost**, contiguity gap confirmed). The **end-to-end trigger is narrow**: an
-  8 MiB and a 64 MiB real-socket flood with a non-reading client (probe #2, 18 runs) delivered every
-  byte — on real loopback the parked-mid-write-with-buffered-data instant did not coincide with the
-  drop. So: real mechanism, narrow real-world window. Honest severity is **Important** (elevate to
-  Critical if the deployment expects large server preambles / slow-reading full-duplex clients).
-- **How to fix (state-3 re-entry).** Do not drop-and-restart the upstream→downstream copy. Keep the
-  **same** `copy(ur, dw)` future alive across phase 1 and phase 2 — e.g. in the `Admitted(Some(b))`
-  branch, `select!` the already-running banner copy against `copy(dr → uw)` instead of starting a new
-  `copy(ur, dw)`. Add a gated-ALLOW-with-payload witness (I-2) that would have caught it.
-
-**I-2. The `Admitted(Some(b))` re-inject + bidirectional-payload branch has no behavioural test.**
-
-- **File (test gap):** `crates/envoy-tcp/src/lib.rs` `#[cfg(test)]` + `crates/envoy-bin/tests/network_filter_rbac.rs`.
-- **What's missing.** Every ALLOW witness is byte-less (exercises the `None` / data-less-FIN branch);
-  every first-byte witness is DENY (the byte is withheld, so the re-inject + duplex-copy path at
-  `:340-354` never runs). No test sends an *allowed* first byte through `[rbac(ALLOW), tcp_proxy]` and
-  asserts (a) the re-injected first byte reaches the backend in order, and (b) subsequent client
-  payload and a return payload both flow intact. `proxies_payload_end_to_end` covers only the
-  non-gated `handle`.
-- **Why it matters.** The single most intricate branch — the one the whole banner/gate/re-inject
-  dance exists to serve — is unverified at the behavioural level. Both C-1 and I-1 shipped green
-  precisely because this path is untested. Add the witness at the state-3 re-entry (it is also the
-  natural regression guard for the I-1 fix).
-
-### Minor (Nice to Have)
-
-**M67.3-1. `SkippedCleanly` is unreachable in `relay_gated` (dead arm, harmless).**
-`evaluate_read_half` returns only `ClientGoneEarly` / `Denied` / `Admitted` — never `SkippedCleanly`
-(that outcome is produced only by `evaluate_peek`). The `SkippedCleanly | Denied` arm at
-`crates/envoy-tcp/src/lib.rs:327` therefore never matches `SkippedCleanly` on this path. Defensively
-grouped with `Denied` and harmless, but a one-line comment noting the arm is `Denied`-only-here (or a
-split with `unreachable!`) would prevent a future reader assuming a data-less FIN can reach it.
-
-**M67.3-2. The item-13 "FULL PARITY" phrasing over-claims (resolved by the C-1 fix).**
-`BEHAVIOR_CONTRACT.md:425` asserts plaintext `[rbac, tcp_proxy]` is "FULL PARITY." C-1 (and, more
-narrowly, I-1) are live counter-examples. Once fixed the phrasing becomes accurate; if any fix is
-deferred, narrow the row to record the divergence (invariant 4.1.5 "never silently"). Tracked by C-1.
-
-**M67.3-3. Config-narrowing legibility: prefer the precise TLS predicate over `is_some()`.**
-`crates/envoy-config/src/bootstrap.rs:3233` uses `chain.transport_socket.is_some()`. This is
-*correct* today only because the earlier block (`:3136`) already `return`s `UnknownTransportSocketName`
-for any non-`tls` transport-socket name and `MismatchedTransportSocketDirection` for a non-Downstream
-context, so control reaches `:3233` only for a valid TLS-downstream socket. The chain already
-computes `chain_has_tls` (`:3132`) with the exact `name == TLS_TRANSPORT_SOCKET` predicate; using
-that here would be self-documenting and immune to a future reordering of the two blocks. Low-risk
-robustness cleanup.
-
-**M67.3-4. `ClientGoneEarly` drops the underlying I/O error (minor diagnostic regression).**
-`crates/envoy-listener/src/lib.rs:199,220` (`evaluate_peek`/`evaluate_read_half`) map `Err(_) =>
-ClientGoneEarly`, discarding the error; the default `handle_gated` then logs a generic message with
-no `error = %err` field. The pre-67.3 `ChainHandler` logged the error. Consider threading it through
-for parity of diagnostics.
-
-**M67.3-5. Swallowed results on the data-less-FIN ALLOW drain; broken-pipe-on-re-inject log noise.**
-`crates/envoy-tcp/src/lib.rs:359-360` discards `uw.shutdown()` and the drain `copy` results (the
-non-gated `relay` propagates `CopyFailed`) — acceptable on a teardown drain but inconsistent, and a
-genuine upstream error there is invisible. Separately, an upstream reset between establishment and
-the `uw.write_all(&[b])` re-inject (`:342`) propagates `CopyFailed`, which `accept_loop` surfaces at
-`warn!` as "connection task failed"; real Envoy treats an upstream reset as a normal close (UF), so
-this is log noise, not a correctness issue. Both cosmetic.
+- The witness exercises the `Admitted(Some(b))` re-inject + bidirectional copy and asserts byte-exact,
+  in-order delivery in both directions. Re-inject ordering is guaranteed: `write_all(&[b])` completes
+  before `copy(dr→uw)` reads the remainder of the client stream, so the first byte precedes the payload
+  at the backend (asserted). This is the natural regression guard for the I-1 fix.
 
 ---
 
-## §4. Contract & invariant conformance (spot-checks)
+## §3. Contract & invariant conformance (spot-checks, re-verified at `HEAD`)
 
-- **§7.5 acceptance frame** — all six (a)-(f) gates are GREEN per PROGRESS.md's state-4 section
-  (build/clippy `-D warnings`/fmt/deny EXIT 0; `cargo test --workspace --no-fail-fast` 1947 passed +
-  6 documented CI-authoritative host-flake REDs; local `1947+6 == CI 1953 passed`). This review does
-  not re-run the gate (it is the acceptance frame, already met); it reviews code quality + contract
-  conformance, and C-1 is a gap the gate cannot see.
-- **Standing traps — all honored.** `is_terminal_network_filter` untouched; `filters: []` still
-  accepted; `direct_response` bypass intact (not re-wrapped); ADR-0131 first-byte verdict preserved;
-  ADR-0016 `select!` + `cx_active`/`cx_total` placement preserved in `connect_upstream`/`relay`;
-  ADR-0124 `close_with_drain` + both `post_eof_*` tests unweakened; `rbac.rs` untouched (item 14 /
-  ADR-0133 not re-litigated); `tls_handler.rs` untouched (D6 keeps TLS rejected); differential surface
-  `0001`/`0071`/`0072`/`0073` + `known-failures.txt` unedited; `#![forbid(unsafe_code)]` holds.
-- **Carry-forwards.** M-1 not consumed (67.3 doesn't touch CidrRange); CF-67-6 not folded (D8
-  opportunistic); CF-67-7 correctly opened for the TLS composition. Unchanged.
+- **§7.5 acceptance frame — GREEN at state-4 RE-verification.** `67.3/PROGRESS.md`'s
+  `## Session: §5 state-4 RE-verification` records build/clippy(`-D warnings`)/fmt/deny EXIT 0;
+  `cargo test --workspace --no-fail-fast` **1949 passed / 6 failed** — all 6 the documented
+  CI-authoritative host-flakes (the four `access_log_*_upstream_reset` witnesses `0061`/`0062`/`0069`/`0070`
+  fail deterministically = the reference Envoy can't reach the host-spawned close backend and logs
+  `rf:"UF"` where envoy-rust correctly logs `rf:"UC"`; `admin_config_dump_server_info` +
+  `upstream_circuit_breaker_max_pending_requests_fixture` PASS in isolation = parallel-load flakes);
+  `local 1949+6 == CI passed`. The two new re-entry witnesses are GREEN. This RE-review does not
+  re-run the gate (it is the acceptance frame, already met); it grades whether the fixes hold and
+  probes what the gate cannot see.
+- **Standing traps — all honored** (`git diff --name-only b5fc211..HEAD`): `tests/fixtures/`,
+  `tests/conformance/h2spec/known-failures.txt`, `crates/envoy-filter/src/rbac.rs`, and
+  `crates/envoy-bin/src/tls_handler.rs` are all **UNTOUCHED**. `is_terminal_network_filter` untouched;
+  `filters: []` still accepted; the `direct_response` chain bypass intact (not re-wrapped); ADR-0131
+  first-byte verdict preserved; ADR-0016 `select!` + `cx_active`/`cx_total` placement preserved in
+  `connect_upstream`/`relay`; ADR-0124 `close_with_drain` + both `post_eof_*` tests unweakened; item-14
+  / ADR-0133 (`rbac.rs` HTTP-vs-L4 divergence) not re-litigated; D6 keeps TLS `[rbac, tcp_proxy]`
+  rejected (CF-67-7); differential surface `0001`/`0071`/`0072`/`0073` unedited; `#![forbid(unsafe_code)]`
+  holds. The C-1 `SkippedCleanly`-on-upstream-EOF route and the I-1 continuous-`u2d` copy are present
+  and intact.
+- **No new ADR.** The fixes align with existing decisions (ADR-0016 teardown, ADR-0131 first-byte
+  verdict, ADR-0124 drain) — they close a divergence and an internal correctness gap without a new
+  measured wire-shape. Ledger head stays **ADR-0135** (next `ADR-0136`, unreserved).
+- **Carry-forwards.** **M-1** not consumed (67.3 doesn't touch the CidrRange surface); **CF-67-6** not
+  folded (D8 opportunistic); **CF-67-7** correctly opened for the TLS composition. Unchanged.
 
 ---
 
-## §5. Independent adversarial subagent
+## §4. Independent adversarial subagent
 
-An independent `general-purpose` subagent reviewed the same range for `relay_gated`'s branch logic,
-error handling, guard lifetimes, and the config narrowing. It **independently reproduced C-1**
-(upstream-EOF-first delays FIN indefinitely) and **raised I-1** (the `Admitted(Some(b))` copy
-drop-and-restart data-loss window) and **I-2** (the untested re-inject/duplex branch), all folded
-into §3 above. It confirmed the config narrowing is *correct* but fragile (M67.3-3), and flagged the
-Minors M67.3-4/M67.3-5. It found **no security, data-durability, or additional Critical** issue.
-This session did not merely accept its I-1 hypothesis: I-1 was **measured** — the mechanism confirmed
-deterministically (probe #3) and the end-to-end trigger characterised as narrow (18 real-socket runs,
-no loss). That measurement is *why* I-1 is graded Important rather than Critical (memory
-`state5-must-probe-untested-compositions`: measure reviewer hypotheses; here the mechanism was real
-but its real-world window narrow).
+An independent `general-purpose` subagent re-reviewed `e551e15`'s diff for the `relay_gated` state
+machine — C-1 fix correctness, I-1 buffer continuity, poll-after-Ready hazards, re-inject backpressure
+deadlock, borrow/reunite soundness, and error handling. It **independently graded C-1/I-1/I-2 all
+RESOLVED** and **found no new defect**, proving each probed hazard safe:
+
+- poll-after-Ready is impossible (a still-in-phase-1 `u2d` has never returned `Ready`);
+- the single re-injected byte is the first write to a fresh upstream socket → cannot block;
+- the gate reads `dr` and `u2d` reads `ur` → no contention, no dropped/duplicated downstream byte;
+- `drop(u2d)` before `reunite` makes the borrows sound.
+
+This session did not merely accept those hypotheses (memory `state5-must-probe-untested-compositions`):
+each was re-derived from the code here and cross-checked against the green + stable witnesses and the
+non-gated `relay` control. The subagent's one **hypothesised, pre-existing** note is recorded below as
+non-blocking.
+
+**Non-blocking observations (pre-existing, NOT introduced by the fix — do not block APPROVE):**
+
+- **`_cx_guard` held across `close_with_drain` on the SkippedCleanly/Denied path.** On the C-1 path the
+  upstream is already fully closed, yet `cluster.<name>.upstream_cx_active` stays incremented until the
+  downstream client closes (or the listener's `DRAIN_BUDGET` aborts). This connection-lifetime guard
+  timing is the existing design — identical on the `Denied` close path and to `relay`, and a strict
+  improvement over the pre-fix behaviour, which held the guard *forever* by hanging. Cosmetic; folds
+  naturally with the M67.3-5 cosmetic family for a future phase that touches these close paths.
+- **`enable_half_close:false` teardown drops the other direction's in-flight copy** on a downstream FIN
+  in the `Admitted(Some(b))` select — ADR-0016 semantics, present in the pre-fix `select` structure,
+  unchanged, and matching the non-gated `relay`.
+
+---
+
+## §5. Minors — disposition
+
+- **M67.3-1 — CONSUMED.** `SkippedCleanly` is now produced by the phase-1 banner branch and handled
+  meaningfully; no longer a dead arm.
+- **M67.3-2 — RESOLVED.** BEHAVIOR_CONTRACT item-13's plaintext "FULL PARITY" is accurate now that
+  C-1/I-1 are fixed; no contract edit required.
+- **M67.3-3** (config narrowing uses `transport_socket.is_some()` rather than the precise
+  `chain_has_tls` predicate — correct today, fragile to a future reorder of the two `bootstrap.rs`
+  blocks), **M67.3-4** (`ClientGoneEarly` discards the underlying I/O error — a minor diagnostic
+  regression), **M67.3-5** (swallowed `uw.shutdown()`/drain results on the data-less-FIN ALLOW drain;
+  upstream-reset-on-re-inject surfaced at `warn!` as log noise) — all **stay non-blocking carry-forward
+  Minors**. `crates/envoy-config/src/bootstrap.rs` and `crates/envoy-listener/src/lib.rs` were
+  deliberately not touched by the re-entry (minimal change surface). **Confirmed: none blocks the
+  phase.** They surface for the next phase that touches their respective surfaces.
 
 ---
 
 ## §6. Assessment
 
-**Ready to merge? No — with fixes.** One Critical (C-1: the gated path hangs on
-upstream-EOF-before-first-byte) and two Important (I-1: a proven silent-data-loss mechanism at the
-`Admitted(Some(b))` copy transition, narrow real-world trigger; I-2: the re-inject/duplex branch is
-behaviourally untested — the gap that let C-1 and I-1 ship green). The rest of the phase — the gate
-abstraction, the establishment/data split, echo/hcm parity, DENY-withholds, the FIN matrix, the
-config narrowing — is well-built and contract-conformant. Fix C-1 + I-1 and close I-2's gap under TDD
-at a §5.2 state-3 re-entry (add the failing/duplex witnesses first), then re-verify (state-4) and
-re-review (state-5). Per §5.1 / ADR-0127 this session does not chain into the fix.
+**Ready to merge? Yes.** The §5.2 state-3 re-entry resolves the Critical and both Important findings of
+the NOT-APPROVED state-5 review: C-1's hang is structurally gone (banner-EOF → `SkippedCleanly` clean
+close, prompt FIN to a passive client), I-1's silent-loss mechanism is eliminated (one continuous
+`u2d` copy), and I-2's untested branch now has a byte-exact duplex witness. No new defect is introduced
+(confirmed by an independent adversarial subagent whose hypotheses were measured, not assumed), every
+standing trap is honored, the surviving Minors are all non-blocking, and the §7.5 acceptance frame is
+GREEN over the post-fix tree. Advance to §5 state 6 (close-out): flip ROADMAP row `67.3` → `done`
+(which also flips parent row `67` → `done`, since `67.1`/`67.2`/`67.3` are then all done), relocate the
+active-phase Notes subsection, and set STATE → awaiting next planning. Per §5.1 / ADR-0127 this session
+does NOT chain into the close-out — that is a SEPARATE session.
