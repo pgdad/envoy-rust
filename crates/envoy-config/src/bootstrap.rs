@@ -3206,16 +3206,20 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
                     last_filter: last.name.clone(),
                 });
             }
-            // 67.1 (ADR-0132 decision 4): reject a NON-TERMINAL prefix in front of
-            // `tcp_proxy`, fail-loud, until phase `67.3` lands the establishment/
-            // data-phase split.
+            // 67.3 D5/D6 (ADR-0135): the plaintext `[non-terminal, tcp_proxy]`
+            // composition is now SUPPORTED (the establishment/data split — a
+            // terminal filter connects upstream and relays a server-first banner
+            // BEFORE the chain's first-byte gate). Only the TLS-DOWNSTREAM case
+            // stays fail-loud: the D6 probe measured that upstream Envoy
+            // establishes the upstream at raw-TCP accept (before the handshake) and
+            // takes the RBAC verdict on the first DECRYPTED byte — an ordering
+            // envoy-rust's TLS handler does not yet reproduce. Owner: CF-67-7.
             //
-            // `tcp_proxy` connects upstream at connection ESTABLISHMENT and relays
-            // a server-first banner before any downstream byte. `ChainHandler`
-            // gates the whole chain — terminal handler included — on that first
-            // byte, so this composition DEADLOCKS at runtime. Upstream Envoy
-            // accepts the config, so this is a recorded divergence (ADR-0049
-            // decision-2 (b)), and it is strictly better than the hang.
+            // (67.1's fail-loud rejection covered ALL such chains; ADR-0135 narrows
+            // it to `chain.transport_socket.is_some()`. Upstream Envoy accepts the
+            // config either way, so the TLS rejection is a recorded divergence,
+            // ADR-0049 decision-2 (b) — strictly better than a wrong-ordering
+            // runtime for a composition we cannot yet reproduce.)
             //
             // Only `tcp_proxy` needs this. `echo` / `http_connection_manager` do no
             // establishment-time work (measured), and `direct_response` bypasses the
@@ -3223,11 +3227,10 @@ pub(crate) fn validate(bootstrap: &mut Bootstrap) -> Result<(), crate::ConfigErr
             //
             // Placed AFTER both terminal-position checks above so their errors keep
             // winning: `[echo, rbac, tcp_proxy]` still reports terminal-not-last.
-            //
-            // **`67.3` DELETES this block and its `ConfigError` variant.**
             if chain_len >= 2
                 && let Some(last) = chain.filters.last()
                 && last.name == crate::TCP_PROXY_FILTER
+                && chain.transport_socket.is_some()
             {
                 let non_terminal = &chain.filters[chain_len - 2];
                 return Err(
@@ -5840,21 +5843,39 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
                 stat_prefix: sp"#;
 
-    /// 67.1 (ADR-0132 decision 4): `[rbac, tcp_proxy]` is REJECTED at config load,
-    /// fail-loud, until phase `67.3`.
-    ///
-    /// `tcp_proxy` connects upstream at connection establishment and relays a
-    /// server-first banner before any downstream byte; `ChainHandler` gates the
-    /// whole chain on that byte, so the composition DEADLOCKS at runtime. Upstream
-    /// Envoy ACCEPTS this config — a recorded, deliberate divergence (ADR-0049
-    /// decision-2 (b)) that is strictly better than the hang.
-    ///
-    /// **`67.3` DELETES the rejection and this test.**
+    /// A TLS-downstream variant of [`chain_before_tcp_proxy_yaml`]: the single
+    /// filter_chain gains a `transport_socket` carrying a `DownstreamTlsContext`
+    /// with a (filename-only, wire-shape-valid) leaf cert, so the chain passes the
+    /// TLS cert-content validation and reaches the composition check. (67.3 D6.)
+    fn chain_before_tcp_proxy_yaml_tls(prefix_filters: &str) -> String {
+        let base = chain_before_tcp_proxy_yaml(prefix_filters);
+        base.replace(
+            "      filter_chains:\n        - filters:",
+            "      filter_chains:\n        - transport_socket:\n            name: envoy.transport_sockets.tls\n            typed_config:\n              \"@type\": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext\n              common_tls_context:\n                tls_certificates:\n                  - certificate_chain: { filename: /tmp/leaf.pem }\n                    private_key: { filename: /tmp/leaf.key }\n          filters:",
+        )
+    }
+
+    /// 67.3 D5/D6 (ADR-0135): the plaintext `[rbac, tcp_proxy]` composition is now
+    /// SUPPORTED (the establishment/data split — `tcp_proxy` connects upstream and
+    /// relays a server-first banner BEFORE the chain's first-byte gate). It must
+    /// VALIDATE.
     #[test]
-    fn rejects_rbac_composed_with_tcp_proxy() {
+    fn plaintext_rbac_before_tcp_proxy_is_now_accepted() {
         let yaml = chain_before_tcp_proxy_yaml(RBAC_FILTER_YAML);
         let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
-        let err = validate(&mut b).expect_err("[rbac, tcp_proxy] must be rejected until 67.3");
+        validate(&mut b).expect("plaintext [rbac, tcp_proxy] is supported from 67.3");
+    }
+
+    /// 67.3 D6 (ADR-0135, MEASURED): on a TLS-DOWNSTREAM listener upstream Envoy
+    /// establishes the upstream at raw-TCP accept and defers the RBAC verdict to
+    /// the first DECRYPTED byte — an ordering envoy-rust's TLS handler does not yet
+    /// reproduce. That composition stays fail-loud (owner CF-67-7).
+    #[test]
+    fn tls_rbac_before_tcp_proxy_is_still_rejected() {
+        let yaml = chain_before_tcp_proxy_yaml_tls(RBAC_FILTER_YAML);
+        let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
+        let err =
+            validate(&mut b).expect_err("TLS [rbac, tcp_proxy] stays rejected until CF-67-7");
         assert!(
             matches!(
                 err,
@@ -5869,8 +5890,11 @@ static_resources:
             ),
             "got {err:?}",
         );
-        // Never silent: the message names its owning phase.
-        assert!(err.to_string().contains("67.3"), "got {err}");
+        // Never silent: the message names its owning carry-forward.
+        assert!(
+            err.to_string().contains("CF-67-7"),
+            "message must name its owner; got {err}"
+        );
     }
 
     /// ADR-0132 decision 4 does NOT reject `tcp_proxy` — only the COMPOSITION.
@@ -5882,13 +5906,13 @@ static_resources:
         validate(&mut b).expect("a lone tcp_proxy chain stays valid");
     }
 
-    /// ERROR PRECEDENCE, extended for ADR-0132 decision 4. `[echo, rbac, tcp_proxy]`
-    /// violates BOTH the terminal-not-last rule AND the composition rule. The
-    /// terminal-not-last error must still WIN — the composition check is placed
-    /// after it deliberately. If a future edit hoists the composition check ahead
-    /// of the terminal scan, this test catches it.
+    /// 67.1 D2 / SPEC R-5: ERROR PRECEDENCE. `[echo, rbac, tcp_proxy]` violates the
+    /// terminal-not-last rule (echo is terminal but not last). That error fires
+    /// from the in-order scan regardless of 67.3's composition narrowing (the
+    /// plaintext chain no longer hits the composition rule at all — its
+    /// `transport_socket` is None — so terminal-not-last is the sole violation).
     #[test]
-    fn terminal_not_last_error_wins_over_unsupported_composition() {
+    fn terminal_not_last_wins_for_echo_rbac_tcp_proxy() {
         let prefix = format!("            - name: envoy.filters.network.echo\n{RBAC_FILTER_YAML}");
         let yaml = chain_before_tcp_proxy_yaml(&prefix);
         let mut b: crate::Bootstrap = serde_yaml::from_str(&yaml).expect("parses");
@@ -5899,7 +5923,7 @@ static_resources:
                 crate::ConfigError::NetworkFilterNotTerminal { ref name, .. }
                     if name == crate::ECHO_FILTER
             ),
-            "terminal-not-last must WIN over the composition rejection; got {err:?}",
+            "got {err:?}",
         );
     }
 

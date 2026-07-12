@@ -112,19 +112,19 @@ pub enum ConfigError {
         last_filter: String,
     },
 
-    /// 67.1 (ADR-0132 decision 4): a network filter chain composing a NON-TERMINAL
-    /// filter with a terminal filter that does **establishment-time work**.
+    /// A NON-TERMINAL filter (e.g. network `rbac`) precedes `tcp_proxy` on a
+    /// **TLS-downstream** filter chain.
     ///
-    /// Upstream Envoy runs every filter's `onNewConnection` at connection
-    /// establishment — the terminal filter's included — and defers only the RBAC
-    /// verdict to the first downstream byte (measured, `envoyproxy/envoy:v1.33.0`).
-    /// envoy-rust's `envoy_listener::ChainHandler` instead gates the whole chain,
-    /// terminal handler included, on that first byte. For `echo` and
-    /// `http_connection_manager` — which have NO establishment-time work — the two
-    /// models are observationally identical. For `tcp_proxy`, which connects
-    /// upstream and relays a server-first banner before any downstream byte, the
-    /// composition is a **runtime DEADLOCK**: the client waits for the banner while
-    /// envoy-rust waits for a byte the client will never send.
+    /// The PLAINTEXT form is SUPPORTED from phase **67.3** (ADR-0135): the
+    /// establishment/data-phase split of `envoy_listener::ConnectionHandler` lets
+    /// `tcp_proxy` connect upstream and relay a server-first banner BEFORE the
+    /// chain's first-byte gate resolves, then gate the downstream→upstream
+    /// direction on the first byte (or a data-less FIN). Only the TLS-downstream
+    /// form stays fail-loud: the D6 probe MEASURED (`envoyproxy/envoy:v1.33.0`)
+    /// that upstream Envoy establishes the `tcp_proxy` upstream at raw-TCP accept
+    /// (BEFORE the handshake) and takes the RBAC verdict on the first DECRYPTED
+    /// byte — an ordering envoy-rust's TLS handler does not yet reproduce.
+    /// Owner: **CF-67-7**.
     ///
     /// (`direct_response`, the other establishment-time terminal, needs no rejection
     /// — `envoy-bin` bypasses the chain for it entirely, which is exact measured
@@ -132,15 +132,16 @@ pub enum ConfigError {
     ///
     /// This rejection is a **deliberate FAIL-LOUD divergence** (`ADR-0049`
     /// decision-2 (b)): upstream Envoy ACCEPTS this config. It is strictly better
-    /// than shipping the hang, and it is not a `BOOTSTRAP_PROMPT.md` §6.3 stub — the
-    /// correct behavior is chartered to phase **`67.3`**, which owns the
-    /// establishment/data-phase split of `envoy_listener::ConnectionHandler` and
-    /// **DELETES this variant**. Recorded in `BEHAVIOR_CONTRACT.md`, never silent.
+    /// than shipping a wrong-ordering runtime for a composition envoy-rust cannot
+    /// yet reproduce, and it is not a `BOOTSTRAP_PROMPT.md` §6.3 stub — the correct
+    /// behavior is chartered to a future TLS-establishment phase (**CF-67-7**).
+    /// Recorded in `BEHAVIOR_CONTRACT.md`, never silent.
     #[error(
         "listener {listener:?} filter_chains[{chain_index}]: non-terminal filter {non_terminal:?} \
-         before terminal filter {terminal:?} is not yet supported — {terminal:?} does \
-         establishment-time work before the first downstream byte, which envoy-rust's network \
-         filter chain cannot yet express (phase 67.3 owns this; upstream Envoy accepts this config)"
+         before terminal filter {terminal:?} on a TLS-downstream chain is not yet supported — \
+         upstream Envoy establishes the upstream at raw-TCP accept and takes the RBAC verdict on the \
+         first decrypted byte (CF-67-7 owns this; upstream Envoy accepts this config; the plaintext \
+         form IS supported from phase 67.3)"
     )]
     UnsupportedNetworkFilterChainComposition {
         listener: String,
