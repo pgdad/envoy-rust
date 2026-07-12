@@ -40,6 +40,44 @@ pub trait ConnectionHandler: Send + Sync + 'static {
         &self,
         downstream: tokio::net::TcpStream,
     ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+
+    /// 67.3 D1: the establishment/data-phase-aware entry point. `ChainHandler`
+    /// hands the connection here WITH a [`FirstByteGate`]. The DEFAULT — used by
+    /// every handler with no establishment-time work (`echo`,
+    /// `http_connection_manager`) — awaits the gate via a non-consuming `peek`
+    /// and then delegates to `handle`, which is observationally identical to the
+    /// pre-67.3 `ChainHandler` (ADR-0132 decision 1: for these handlers the
+    /// chain's first-byte gate and the filter's verdict coincide).
+    ///
+    /// A handler that does establishment-time work (`tcp_proxy`) OVERRIDES this
+    /// to run that work BEFORE awaiting the gate.
+    ///
+    /// The receiver is `self: Arc<Self>` (not `&self`) so the returned future is
+    /// `'static` without the trait knowing which fields to clone — the same
+    /// reason the concrete impls hand-clone their `Arc` fields before `Box::pin`.
+    fn handle_gated(
+        self: Arc<Self>,
+        downstream: tokio::net::TcpStream,
+        gate: FirstByteGate,
+    ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        Box::pin(async move {
+            let conn = ConnectionInfo {
+                peer_addr: downstream.peer_addr()?,
+                local_addr: downstream.local_addr()?,
+            };
+            match gate.evaluate_peek(&downstream, &conn).await? {
+                GateOutcome::Admitted => self.handle(downstream).await,
+                GateOutcome::SkippedCleanly | GateOutcome::Denied => {
+                    close_with_drain(downstream).await?;
+                    Ok(())
+                }
+                GateOutcome::ClientGoneEarly => {
+                    tracing::debug!("client went away before its first byte");
+                    Ok(())
+                }
+            }
+        })
+    }
 }
 
 /// 67.1 D4 (CONSUMES carry-forward CF-66-2, on exactly the trigger ADR-0123 §2.2
@@ -91,6 +129,99 @@ pub trait NetworkFilter: Send + Sync + 'static {
     fn on_new_connection(&self, conn: &ConnectionInfo) -> NetworkFilterStatus;
 }
 
+/// The verdict of the network-filter chain's first-byte gate (67.3 D2).
+///
+/// Extracted from `ChainHandler` so the gate is a reusable, filter-owned
+/// primitive that a terminal handler can consult AFTER its establishment-time
+/// work (upstream connect, banner relay), not only before the chain's hand-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// The client went away (reset/error) before its first byte. Drop the
+    /// socket — it is already unusable — with no drain and no counter tick.
+    ClientGoneEarly,
+    /// `Ok(0)`: the client closed or half-closed WITHOUT sending. For a handler
+    /// with no establishment-time work this is NOT an evaluation event
+    /// (ADR-0132 / ADR-0131 case C): close cleanly, tick nothing.
+    SkippedCleanly,
+    /// Every non-terminal filter returned `Continue`.
+    Admitted,
+    /// A non-terminal filter returned `StopIteration`.
+    Denied,
+}
+
+/// The reusable first-byte gate (67.3 D2). Owns the chain's NON-TERMINAL filters
+/// and runs each one's `on_new_connection` once the first-byte event is observed.
+/// The `NetworkFilter` trait shape is UNCHANGED and no payload is ever exposed:
+/// `evaluate_peek` does not consume; `evaluate_read_half` reads exactly one byte
+/// and returns it for RE-INJECTION. CF-67-3 (payload-visible iteration) stays
+/// deferred.
+pub struct FirstByteGate {
+    filters: Arc<[Arc<dyn NetworkFilter>]>,
+}
+
+impl FirstByteGate {
+    pub fn new(filters: Arc<[Arc<dyn NetworkFilter>]>) -> Self {
+        Self { filters }
+    }
+
+    /// The shared core: run every filter in order; the first `StopIteration`
+    /// denies. No I/O.
+    fn run(&self, conn: &ConnectionInfo) -> GateOutcome {
+        for filter in self.filters.iter() {
+            if filter.on_new_connection(conn) == NetworkFilterStatus::StopIteration {
+                return GateOutcome::Denied;
+            }
+        }
+        GateOutcome::Admitted
+    }
+
+    /// Test-only shim over [`run`](Self::run), so a unit test needs no live
+    /// socket.
+    #[cfg(test)]
+    pub fn run_for_test(&self, conn: &ConnectionInfo) -> GateOutcome {
+        self.run(conn)
+    }
+
+    /// Non-consuming first-byte gate for a handler with NO establishment-time
+    /// work (`echo`, `http_connection_manager`, and the trait default). Waits
+    /// for the first downstream byte via `peek` (ADR-0131). `Ok(0)` (byte-less
+    /// close / data-less FIN) => `SkippedCleanly` — these handlers do NOT
+    /// evaluate on a data-less FIN (D3, measured). `peek` Err => `ClientGoneEarly`.
+    pub async fn evaluate_peek(
+        &self,
+        s: &tokio::net::TcpStream,
+        conn: &ConnectionInfo,
+    ) -> std::io::Result<GateOutcome> {
+        let mut b = [0u8; 1];
+        match s.peek(&mut b).await {
+            Ok(0) => Ok(GateOutcome::SkippedCleanly),
+            Ok(_) => Ok(self.run(conn)),
+            Err(_) => Ok(GateOutcome::ClientGoneEarly),
+        }
+    }
+
+    /// Consuming first-byte gate for a handler already in its data phase on a
+    /// SPLIT stream (`tcp_proxy`). Reads exactly ONE byte from the read half.
+    /// A data-less FIN (`Ok(0)`) STILL evaluates the chain for such a handler
+    /// (D3, measured — downstream half-close propagation), returned as byte
+    /// `None`. A real byte is returned as `Some(b)` for RE-INJECTION into the
+    /// upstream copy (`peek` is unavailable on `OwnedReadHalf`). Read Err =>
+    /// `ClientGoneEarly`.
+    pub async fn evaluate_read_half(
+        &self,
+        r: &mut tokio::net::tcp::OwnedReadHalf,
+        conn: &ConnectionInfo,
+    ) -> std::io::Result<(GateOutcome, Option<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut b = [0u8; 1];
+        match r.read(&mut b).await {
+            Ok(0) => Ok((self.run(conn), None)),
+            Ok(_) => Ok((self.run(conn), Some(b[0]))),
+            Err(_) => Ok((GateOutcome::ClientGoneEarly, None)),
+        }
+    }
+}
+
 /// Close `stream` the way upstream Envoy closes a connection it refuses to
 /// forward: write NOTHING, half-close (the client sees a clean EOF, never an
 /// RST), then drain and discard the read half until the client closes.
@@ -131,33 +262,28 @@ pub async fn close_with_drain(mut stream: tokio::net::TcpStream) -> Result<(), s
 /// | connect, half-close without sending | clean EOF; no counter ticks | same |
 /// | sends a first byte (now or later) | decision taken; counters tick | same |
 ///
-/// The wait uses [`tokio::net::TcpStream::peek`], which does **not** consume the
-/// byte, so the terminal handler still receives the entire stream.
+/// **67.3 D1: the chain gates the FILTER'S DECISION, not the chain's hand-off.**
+/// `handle` no longer peeks the socket itself. It builds a [`FirstByteGate`] from
+/// the non-terminal filters and hands `(downstream, gate)` to the terminal
+/// handler's [`ConnectionHandler::handle_gated`]. The terminal handler decides
+/// WHEN to consult the gate relative to its establishment-time work:
 ///
-/// Once a byte is readable it runs every non-terminal filter's
-/// `on_new_connection` in configured order. The first `StopIteration` closes the
-/// connection via [`close_with_drain`] — zero bytes, clean EOF, no RST — and the
-/// TERMINAL handler never runs. When every filter returns `Continue`, the
-/// connection is handed to `inner`.
-///
-/// **Which terminal filters may be wrapped — ADR-0132, measured.** The first-byte
-/// `peek` gates the *whole* chain, terminal handler included. That is only
-/// faithful for a terminal filter with **no establishment-time work**:
-///
-/// | terminal | establishment-time work | may be wrapped? |
+/// | terminal | establishment-time work | `handle_gated` |
 /// |---|---|---|
-/// | `echo` | none | **yes** |
-/// | `http_connection_manager` | none | **yes** |
-/// | `direct_response` | writes its payload, closes | **no** — `envoy-bin` bypasses the chain (ADR-0132 decision 2) |
-/// | `tcp_proxy` | connects upstream, relays a server-first banner | **no** — rejected at config load until phase `67.3` (ADR-0132 decision 4) |
+/// | `echo` | none | inherits the DEFAULT — `evaluate_peek` (non-consuming, ADR-0131), then `handle`; byte-for-byte unchanged |
+/// | `http_connection_manager` | none | inherits the DEFAULT — same |
+/// | `direct_response` | writes its payload, closes | `envoy-bin` bypasses the chain entirely (ADR-0132 decision 2) |
+/// | `tcp_proxy` | connects upstream, relays a server-first banner | OVERRIDES — connects upstream FIRST, then gates the downstream→upstream direction on the first byte or a data-less FIN (67.3 D3) |
 ///
-/// `ADR-0130` Decision 2 claimed this wrapper "works uniformly for all four
-/// terminal filters." **That claim is false and is superseded by ADR-0132.**
-/// Wrapping `direct_response` or `tcp_proxy` here deadlocks a client of a
-/// server-speaks-first protocol, which never sends the byte the `peek` awaits.
-/// Splitting `ConnectionHandler` into establishment and data phases — so the
-/// `peek` gates the *filter's decision* rather than the *chain's hand-off* — is
-/// phase `67.3`'s charter.
+/// For the DEFAULT path the gate uses [`tokio::net::TcpStream::peek`], which does
+/// **not** consume the byte, so the terminal handler still receives the entire
+/// stream; the first `StopIteration` closes via [`close_with_drain`] (zero bytes,
+/// clean EOF, no RST) and the terminal handler never runs — observationally
+/// identical to the pre-67.3 `ChainHandler`, so fixtures `0072`/`0073` need no
+/// edit. `ADR-0130` Decision 2's claim that the old wrapper "works uniformly for
+/// all four terminal filters" was false (it deadlocked a server-speaks-first
+/// `tcp_proxy` client) and is superseded by ADR-0132; the establishment/data
+/// split is what makes `tcp_proxy` faithful (67.3, ADR-0135).
 ///
 /// The config validator's `NetworkFilterChainNotTerminated` rule (67.1 D2)
 /// guarantees a terminal handler always exists, so the iteration always
@@ -189,53 +315,15 @@ impl ConnectionHandler for ChainHandler {
         &self,
         downstream: tokio::net::TcpStream,
     ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
-        let filters = Arc::clone(&self.filters);
+        // 67.3 D1: the chain now GATES THE FILTER'S DECISION, not the chain's
+        // hand-off. Build the first-byte gate from the non-terminal filters and
+        // hand it, with the connection, to the terminal handler's `handle_gated`.
+        // For `echo`/`http_connection_manager` the default `handle_gated` peeks
+        // exactly as this method used to — byte-for-byte unchanged (fixtures
+        // `0072`/`0073`). For `tcp_proxy` the override connects upstream first.
+        let gate = FirstByteGate::new(Arc::clone(&self.filters));
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            let conn = ConnectionInfo {
-                peer_addr: downstream.peer_addr()?,
-                local_addr: downstream.local_addr()?,
-            };
-
-            // ADR-0131: wait for the first downstream byte before evaluating —
-            // upstream Envoy's ONE_TIME_ON_FIRST_BYTE enforcement. `peek` does
-            // not consume, so `inner` still receives the whole stream.
-            //
-            // `Ok(0)` means the client closed or half-closed WITHOUT sending
-            // anything. Upstream Envoy takes no decision in that case (neither
-            // counter ticks) and closes with a clean EOF. Match it: skip the
-            // filters entirely.
-            //
-            // M-6: an `Err` here means the client went away before its first byte
-            // (typically a reset). That is not a connection-task FAILURE — it is
-            // the `Ok(0)` case arriving rudely — so it must not surface through
-            // `accept_loop` as a `warn!`-level "connection task failed". No
-            // decision is taken and no counter ticks, exactly as for `Ok(0)`. The
-            // socket is already unusable, so there is nothing to drain: drop it.
-            let mut first_byte = [0u8; 1];
-            match downstream.peek(&mut first_byte).await {
-                Ok(0) => {
-                    close_with_drain(downstream).await?;
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::debug!(error = %err, "client went away before its first byte");
-                    return Ok(());
-                }
-            }
-
-            for filter in filters.iter() {
-                if filter.on_new_connection(&conn) == NetworkFilterStatus::StopIteration {
-                    // ADR-0131 / SPEC R-2: zero bytes, clean EOF, never an RST;
-                    // the terminal filter never runs, and the client's already-
-                    // sent bytes are discarded by `close_with_drain`.
-                    close_with_drain(downstream).await?;
-                    return Ok(());
-                }
-            }
-            inner.handle(downstream).await
-        })
+        Box::pin(async move { inner.handle_gated(downstream, gate).await })
     }
 }
 
@@ -1164,6 +1252,36 @@ mod tests {
             count_listener_active: true,
             pending_tasks,
         }
+    }
+
+    /// 67.3 D2: the extracted first-byte gate runs each non-terminal filter in
+    /// order — `Admitted` when all `Continue`, `Denied` on the first
+    /// `StopIteration`.
+    #[test]
+    fn gate_admits_when_all_continue_and_denies_on_first_stop() {
+        use std::sync::Arc;
+        struct Yes;
+        impl NetworkFilter for Yes {
+            fn on_new_connection(&self, _: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::Continue
+            }
+        }
+        struct No;
+        impl NetworkFilter for No {
+            fn on_new_connection(&self, _: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::StopIteration
+            }
+        }
+        let conn = ConnectionInfo {
+            peer_addr: "10.0.0.1:1".parse().unwrap(),
+            local_addr: "127.0.0.1:2".parse().unwrap(),
+        };
+        let admit = FirstByteGate::new((vec![Arc::new(Yes) as Arc<dyn NetworkFilter>]).into());
+        assert_eq!(admit.run_for_test(&conn), GateOutcome::Admitted);
+        let deny = FirstByteGate::new(
+            (vec![Arc::new(Yes) as Arc<dyn NetworkFilter>, Arc::new(No)]).into(),
+        );
+        assert_eq!(deny.run_for_test(&conn), GateOutcome::Denied);
     }
 
     #[tokio::test]
