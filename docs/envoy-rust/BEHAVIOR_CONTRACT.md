@@ -464,6 +464,22 @@ no-op clause below).
       (upstream defaults it to 0). **No differential observable** for any of these — 67.2 ships no
       new fixture.
 
+    - **RECORDED DIVERGENCE — mapped-prefix width rejected at load (the C-1 repair, ADR-0134).**
+      An IPv4-mapped-IPv6 `address_prefix` (e.g. `"::ffff:127.0.0.0"`) is canonicalised to IPv4 for
+      BOTH validation and matching (the shared `canonical_ip` rule), so `prefix_len > 32` on a
+      mapped prefix is rejected fail-loud at config load (`ConfigError::InvalidCidrRange`,
+      `prefix_len N exceeds 32 for IPv4`, with policy name + path — nested combinators and LDS
+      listeners included). **Upstream Envoy v1.33.0 ACCEPTS the same config** (measured,
+      `--mode validate` → `configuration OK`); its RUNTIME matching semantics for a mapped prefix
+      were NOT measured (the IP arms are host-dependent under the Docker harness — parent V-4 — so
+      no fixture can witness them), and only acceptance is asserted. Deliberate **fail-loud
+      divergence** per ADR-0049 decision-2 (b): pre-repair, this config was accepted and then
+      PANICKED the connection task on first evaluation (phase-67.2 REVIEW C-1) — rejection at load
+      is strictly safer than either accept-then-panic or silently-dead 16-byte matching. A mapped
+      prefix within the canonical width (`prefix_len ≤ 32`) validates and matches identically to
+      its plain-IPv4 spelling (witnessed end-to-end at the state-5 re-review). **No differential
+      observable** — no fixture uses a mapped prefix.
+
     - **`destination_port` is a `u16`.** Upstream models it as a plain `uint32` with PGV `lte: 65535`
       that itself rejects the `{value:N}` wrapper AND values > 65535 (both measured), so a bare `u16`
       is exactly faithful (serde rejects the wrapper and > 65535 for free).

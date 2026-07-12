@@ -1,281 +1,266 @@
-# Phase 67.2 — §5 state-5 CODE REVIEW (the FIRST REVIEW.md for `67.2`)
+# Phase 67.2 — §5 state-5 RE-REVIEW (SUPERSEDES the NOT-APPROVED `ab216b4` review, per D-3.5)
 
-> Written by the §5 **state-5 code-review** session (`superpowers:requesting-code-review`), per
+> Written by the §5 **state-5 RE-REVIEW** session (`superpowers:requesting-code-review`), per
 > `BOOTSTRAP_PROMPT.md` §5 state 5 and `SKILL_ROUTING.md`. The output of this session IS this file.
-> Cold-started clean: `git status --porcelain` empty; branch `main`; `HEAD` = `origin/main` =
-> `f2fb252` (the §5 state-4 verification commit); `git fetch origin --prune` showed no sibling ahead;
-> CI run `29130784660` GREEN on the full 40-char SHA `f2fb2524bca2fae8f6e208461bb309ac5f0de6a3`.
+> **This review SUPERSEDES the first `67.2` review** (verdict NOT APPROVED on Critical C-1), whose
+> full text is preserved in git at commit `ab216b4` — a review is never edited, only superseded by a
+> LATER review (D-3.5). Cold-started clean: `git status --porcelain` empty; branch `main`;
+> `HEAD` = `origin/main` = `cb73bd8` (the POST-C-1-repair state-4 verification commit);
+> `git fetch origin --prune` showed no sibling ahead; CI run `29173588258` GREEN on the full 40-char
+> SHA `cb73bd80ff524a96b49cac0505a025caec6c6db4`.
 >
-> **Review surface:** the whole `67.2` sub-phase (`08f820d..f2fb252`) — the five connection-level
-> matcher arms (`Permission::{DestinationIp(CidrRange), DestinationPort(u16)}`,
-> `Principal::{DirectRemoteIp, RemoteIp, SourceIp}(CidrRange)`), the new `CidrRange` type, the V-1
-> shared-enum fallout across the four exhaustive match sites, and the docs/fuzz seed.
+> **Review surface:** the whole `67.2` arc (`08f820d..cb73bd8`) — the six task commits
+> (`f31b21c`..`bbcbe7c` + the `494043f` fmt cleanup) PLUS the C-1/I-1/N-1 repair
+> (`e0a15dc` + `8cab4af`, landed out-of-band by a sibling workstream and reconciled as the §5.2
+> state-3 re-entry). The five connection-level matcher arms, the `CidrRange` type, the V-1
+> shared-enum fallout, the docs/fuzz seed, and the repair.
 >
-> **Method (the load-bearing part — memory `state5-must-probe-untested-compositions`).** A green
-> §7.5 (a)-(e) gate proves the code does what its tests ask, never that the tests ask the right
-> question — the whole reason `67.1`'s C-1 shipped. So this review did not merely re-read the diff.
-> It **LIVE-PROBED the untested `CidrRange` compositions**: (1) a standalone `rustc -O` reproduction
-> copying `validate` / `contains` / `prefix_match` verbatim, and (2) a full end-to-end drive of
-> `target/debug/envoy-bin` with a crafted config, plus (3) an independent adversarial
-> `general-purpose` reviewer subagent tasked to reproduce-or-refute. Every measurement is quoted
-> inline.
+> **Method (memory `state5-must-probe-untested-compositions`).** This re-review did not merely
+> re-read the repair diff. It (1) **re-drove the original C-1 live repro** end-to-end against a
+> freshly-built `target/debug/envoy-bin`; (2) **live-probed the untested compositions** (boundary
+> widths, nested combinators, the validate-passing mapped-prefix equivalence, the LDS path);
+> (3) **measured upstream** on the acceptance question the repair left open (`--mode validate`
+> against the pinned `envoyproxy/envoy:v1.33.0`); and (4) dispatched an **independent adversarial
+> `general-purpose` subagent** tasked to reproduce-or-refute every primary finding and to hunt for
+> new Criticals with exhaustive old-vs-new differential probes. Every measurement is quoted inline.
 
 ---
 
 ## VERDICT
 
-> ### **NOT APPROVED. §7.5 gate (f) is NOT satisfied.**
+> ### **APPROVED. §7.5 gate (f) is satisfied.**
 >
-> `67.2` ships a **config-reachable, release-mode data-plane PANIC** (Critical **C-1** below): a
-> `CidrRange` whose `address_prefix` is an IPv4-mapped-IPv6 literal (e.g. `"::ffff:127.0.0.0"`) with
-> `prefix_len` in `33..=128` **passes startup validation** but **panics the connection task** the
-> first time the arm is evaluated — an index-out-of-bounds in `prefix_match`. It affects all four IP
-> arms (`destination_ip` on `local_addr`; `direct_remote_ip`/`remote_ip`/`source_ip` on `peer_addr`),
-> reproduced end-to-end against the shipped binary and independently confirmed. The codebase's own
-> invariant — *"a data-plane path must never panic"* (`network_rbac.rs`, the `debug_assert!` arms) —
-> is violated in release.
+> The C-1 repair is **measured-correct**: the config-reachable, release-mode data-plane panic the
+> `ab216b4` review found is CLOSED at its root. `CidrRange::validate` now sizes `prefix_len`
+> against the **canonical** address family via the shared `canonical_ip` helper — the single
+> canonicalisation rule used by both `validate` and `contains` — so an IPv4-mapped-IPv6
+> `address_prefix` is bounded at 32 and every over-wide width is rejected fail-loud with
+> `ConfigError::InvalidCidrRange` at config load. Reproduced end-to-end (§2), confirmed through
+> nested combinators and the LDS path (§2, §4), and independently verified by an adversarial
+> subagent whose exhaustive old-vs-new sweep found **no new Critical and no behavior change other
+> than panic→load-time-rejection** (§4). The I-1 coverage blind spot is closed by a regression test
+> + a `contains`-level property sweep, both proven to fail against the pre-fix code (§4 V-4).
 >
-> Per `BOOTSTRAP_PROMPT.md` §5's asymmetry, a NOT-APPROVED review re-opens the phase at **§5 state 3
-> (NOT state 4)**: the **SEPARATE next session** performs a §5.2 state-3 re-entry to land the C-1
-> repair under TDD, then a fresh state-4 verification and a fresh state-5 re-review (which SUPERSEDES
-> this file per D-3.5 — a review is never edited, only superseded by a later one). Per §5.1 /
-> `ADR-0127` this session does **not** chain into the repair.
+> **No new Critical. No new Important.** Two Minors are opened (§5), neither blocking: **M-1** (the
+> N-1 defensive guard has a measured off-by-one band that is NOT config-reachable, plus an
+> overclaiming comment) and **M-2** (the repair is a measured config-acceptance divergence vs
+> upstream that was unrecorded — **closed THIS session** by ADR-0134 + the `BEHAVIOR_CONTRACT.md`
+> item-14 bullet landed with this review, per D-3.5 / invariant 4.1.5's "never silently").
 >
-> Everything else in `67.2` is well-built (see §3). C-1 is a single, well-localised defect with a
-> one-site fix.
+> With (f) met, all six §7.5 gates are satisfied. The SEPARATE next session runs the §5 state-6
+> close-out — which flips ONLY ROADMAP row `67.2` to `done` (parent `67` waits for `67.3`; the
+> `67.2/SPEC.md` header + D8 are stale on this point). Per §5.1 / ADR-0127 this session does NOT
+> chain into the close-out.
 
 ---
 
-## §1. C-1 (CRITICAL) — a validated `CidrRange` panics the data plane on IPv4-mapped-IPv6 prefixes
+## §1. What the repair is (code-read, verified at `HEAD`)
 
-### What it is
-
-`CidrRange::validate` (`crates/envoy-config/src/bootstrap.rs:1646`) picks the family cap from the
-**pre-canonicalised** `address_prefix`:
-
-```rust
-let (max, family) = match self.address_prefix {
-    IpAddr::V4(_) => (32u8, "IPv4"),
-    IpAddr::V6(_) => (128u8, "IPv6"),
-};
-if self.prefix_len > max { return Err(...) }
-```
-
-`IpAddr`'s `FromStr` parses `"::ffff:127.0.0.0"` as `IpAddr::V6`, so `validate` treats it as IPv6 and
-accepts any `prefix_len ≤ 128`. But `CidrRange::contains` (`:1664`) **canonicalises** an
-IPv4-mapped-IPv6 address to a **4-byte** `Ipv4Addr` *before* indexing in `prefix_match` (`:1688`):
-
-```rust
-fn prefix_match(net: &[u8], addr: &[u8], prefix_len: u8) -> bool {
-    let full = (prefix_len as usize) / 8;
-    if net[..full] != addr[..full] { ... }   // :1691  ← panics: full can be 5..16 on a 4-byte slice
-```
-
-So `validate` and `contains` **disagree on the address family**. A prefix `validate` sized against
-128 bits is then indexed as 4 bytes → `net[..full]` / `net[full]` slices past the array.
-
-`ADR-0133` only ever contemplated the mapped-**peer** direction ("IPv4-mapped-IPv6 **peers** are
-canonicalised to IPv4 before matching"); the mapped-**prefix** direction — the `address_prefix` side
-— was never considered, and no test exercises it (see I-1).
-
-### It is reachable through the real config path, for all four IP arms
-
-- **Deserialize → validate → accept.** `parse_bootstrap` runs `serde_yaml` then `validate`;
-  `validate_l4_permission` / `validate_l4_principal` (`bootstrap.rs:4477`, `:4532`) call
-  `cidr.validate()`, which returns `Ok` for the mapped prefix. Config loads clean.
-- **Engine → contains → panic.** `permission_matches`/`principal_matches`
-  (`crates/envoy-bin/src/network_rbac.rs:123`, `:148`) call `cidr.contains(&conn.local_addr.ip())`
-  and `cidr.contains(&conn.peer_addr.ip())`. On an IPv4 listener both addresses are `V4`, so any
-  connection that reaches first-byte evaluation panics.
-
-### Trigger range (measured)
-
-With a v4-mapped-IPv6 `address_prefix` and the compared address canonicalising to V4 (the normal
-IPv4-connection case):
-
-- `prefix_len ∈ 40..=128`: **unconditional** panic — `net[..full]` with `full ≥ 5` slices past the
-  4-byte array before any comparison, regardless of the peer/local address.
-- `prefix_len ∈ 33..=39`: `full == 4`, so `net[..4]` is in-bounds; panics via `net[4]` **only when
-  the first four octets match** (comparison passes, then indexes byte 4).
-- `prefix_len ≤ 32`: safe.
-
-### Why it matters
-
-An operator writing an IPv4-mapped-IPv6 CIDR (a legal, if unusual, way to spell an IPv4 range) gets a
-config that **starts cleanly and then crashes the connection task on the first matching-ish
-connection** — a latent, client-triggerable denial of service shipped as "valid." It is exactly the
-"untested composition" shape `state5-must-probe-untested-compositions` warns about: the existing
-`cidr_range_ipv4_mapped_ipv6_peer_matches_ipv4_range` test covers the *safe* mapped-peer direction
-and gives false confidence about the mapped-prefix direction.
-
-### How to fix (for the state-3 re-entry — do NOT apply this session)
-
-Make `validate` size the prefix against the **canonical** family, matching `contains`. Concretely:
-canonicalise `address_prefix` via `to_ipv4_mapped()` first, then a mapped prefix is bounded at 32 and
-`prefix_len: 40` is rejected fail-loud with `InvalidCidrRange` at config load. (Belt-and-braces, also
-guard `prefix_match` so a length mismatch can never index OOB — but the family-consistent `validate`
-is the root-cause fix.) Add a regression unit test: `address_prefix: "::ffff:127.0.0.0"`,
-`prefix_len: 40` asserts `validate()` is `Err`, and a `contains()` call proves no panic. See I-1 for
-the coverage gap that let this through.
-
----
+- **`canonical_ip`** (`crates/envoy-config/src/bootstrap.rs:1649`): collapses an IPv4-mapped-IPv6
+  address to its 4-byte IPv4 form; everything else unchanged. Documented as THE single
+  canonicalisation rule shared by `validate` and `contains`, with the C-1 mechanism spelled out.
+- **`CidrRange::validate`** (`:1673`): takes the family cap from `canonical_ip(self.address_prefix)`
+  — a mapped prefix is now IPv4 (≤ 32). This is exactly the root-cause fix the `ab216b4` review §1
+  prescribed ("make `validate` size the prefix against the canonical family, matching `contains`").
+- **`prefix_match`** (`:1706`): gains the N-1 defensive bounds bail
+  (`if full > net.len() || full > addr.len() { return false }`) — a silent bail, not a
+  `debug_assert!`. See M-1 for its measured limitation.
+- **Tests** (`e0a15dc` + `8cab4af`): `cidr_range_validate_rejects_ipv4_mapped_ipv6_over_wide_prefix`
+  (widths 33/39/40/64/128 rejected + the /8 equivalence preserved),
+  `cidr_range_contains_never_panics_for_validated_prefixes` (property sweep: every
+  validate-passing prefix × a v4/v6/mapped address matrix, no panic), and
+  `network_rbac_rejects_ipv4_mapped_ipv6_over_wide_cidr_at_config_load` (through the real
+  `validate(&mut bootstrap)` path). The repair touched ONLY `crates/envoy-config/src/bootstrap.rs`.
 
 ## §2. First-hand measurement performed this session
 
-### (a) Standalone reproduction of the exact logic (`rustc -O`, release opt — index OOB always panics)
+### (a) The original C-1 live repro is CLOSED (end-to-end, the exact `ab216b4` config)
 
-Copying `validate` / `contains` / `prefix_match` verbatim from `bootstrap.rs`:
-
-```
-address_prefix parsed as: ::ffff:127.0.0.0
-validate() => Ok(())                       ← config is ACCEPTED
-about to call contains() ...
-thread 'main' panicked at cidr_probe.rs:49: range end index 5 out of range for slice of length 4
-```
-
-### (b) End-to-end against the shipped binary
-
-`target/debug/envoy-bin -c <cfg>` where `<cfg>` is a `[rbac, echo]` listener with
-`permissions: [{ destination_ip: { address_prefix: "::ffff:127.0.0.0", prefix_len: 40 } }]`,
-`action: ALLOW`, `principals: [{ any: true }]`:
+`cargo build -p envoy-bin` first (memory `differential-harness-uses-debug-envoy-bin`), then
+`target/debug/envoy-bin -c <cfg>` with the exact previously-accepted-then-panicking config
+(`[rbac, echo]`, `destination_ip: { address_prefix: "::ffff:127.0.0.0", prefix_len: 40 }`):
 
 ```
-=== Step 1: listener is UP (config ACCEPTED) ===
-=== Step 2: drive a loopback connection ===
-recv: b''                                  ← connection dropped, zero bytes
-=== envoy-bin output ===
-thread 'tokio-rt-worker' panicked at crates/envoy-config/src/bootstrap.rs:1691:11:
-range end index 5 out of range for slice of length 4
- WARN connection task panicked error=task 69 panicked with message "range end index 5 out of range for slice of length 4"
+EXIT=1
+ERROR envoy-rust exited with error error=listener "rbac_listener": network rbac policy "p0"
+      has an invalid CidrRange at permissions[0]: prefix_len 40 exceeds 32 for IPv4
 ```
 
-The proxy process survives (tokio isolates the panic to the per-connection task), but the connection
-is aborted with an internal panic — a data-plane path panicking on accepted config.
+Exit 1 fail-loud at config load, `ConfigError` on STDOUT, **no panic, no acceptance, no listener
+bound**. The boundary width `/33` is likewise rejected (`prefix_len 33 exceeds 32 for IPv4`).
 
-### (c) Independent adversarial reviewer — CONFIRMED
+### (b) Untested compositions LIVE-PROBED (the `state5-must-probe-untested-compositions` duty)
 
-An independent `general-purpose` reviewer subagent, given the diff and asked to reproduce-or-refute,
-returned **CONFIRMED** with its own `rustc -O` probe (`prefix_len 40 → "range end index 5"`;
-`prefix_len 128 → "range end index 16 out of range for slice of length 4"`), independently traced
-reachability through `parse_bootstrap → validate → contains` for both the `local_addr` and
-`peer_addr` arms, and independently derived the `33..=39` conditional sub-range. It found **no other**
-validated-but-panics input (pure-v4 can never exceed /32 past validate; pure-v6 stays 16 bytes;
-cross-family hits the `_ => false` arm; `/0` and full-byte boundaries are fine) — so the mapped-prefix
-direction is the lone hole.
+- **Nested combinators:** a mapped `/40` under `and_ids → not_id` is rejected at load with the
+  exact nested path — `invalid CidrRange at principals[0].ids[0].not_id: prefix_len 40 exceeds 32
+  for IPv4`. (The adversarial subagent additionally probed `not_id` directly, `and_ids` positional,
+  `or_ids → not_id → remote_ip`, `not_rule → destination_ip`, AND the **LDS dynamic-listener**
+  path — all rejected fail-loud with correct paths; the `validate_l4_*` walkers recurse into every
+  combinator and LDS listeners re-run the same validation gauntlet.)
+- **The validate-passing mapped prefix works end-to-end:** `direct_remote_ip:
+  { address_prefix: "::ffff:127.0.0.0", prefix_len: 8 }` boots, a loopback client is ALLOWed, and
+  the echo terminal round-trips the payload (`recv: b'ping'`) — the mapped spelling is equivalent
+  to plain `127.0.0.0/8`, as item 14 claims, live.
+- **Repair tests green from the run:** `cargo test -p envoy-config cidr_range` → **9 passed / 0
+  failed**, including both repair tests quoted `ok`.
 
----
+### (c) Upstream measured on the question the repair left open
 
-## §3. Strengths (the rest of the change is sound)
+```
+$ docker run --rm -v <cfg>:/cfg.yaml:ro envoyproxy/envoy:v1.33.0 --mode validate -c /cfg.yaml
+configuration '/cfg.yaml' OK        # the exact C-1 config: mapped /40 destination_ip
+```
 
-1. **Exhaustive, catch-all-free classification at every site.** `permission_matches` /
-   `principal_matches`, `validate_l4_permission` / `_principal`, the HTTP `lower_permission` /
-   `lower_principal`, and the `define_rbac_tree_validator!` macro all enumerate every arm with no
-   `_ =>`. A future shared-enum arm breaks the build at each classification site — the intended safety,
-   preserved.
-2. **The HTTP-rejects-L4-arms divergence is correct and complete** (confirmed WAI, see §5). All five
-   arms return `FilterError::InvalidConfig` (`rbac.rs:288`, `:328`), and
-   `http_rbac_build_from_config_rejects_l4_principal_startup_fatal` pins that the rejection is
-   *startup-fatal*, not merely private to `lower_*`. Every arm has a witness.
-3. **`destination_port: u16`** is exactly faithful to upstream's `uint32 + PGV lte:65535` — rejects
-   both the `{value:N}` wrapper and `>65535` via serde, pinned by
-   `cidr_range_rejects_unknown_field_and_wrapper_prefix_len`.
-4. **The three source-IP arms correctly share one `peer_addr.ip()` evaluation**, and
-   `remote_ip_and_source_ip_evaluate_peer_like_direct_remote_ip` *proves* the coincidence rather than
-   assuming it.
-5. **The `extra_leaves` macro parameter is correct for both instantiations** — the tree validator only
-   bounds depth + rejects empty sets, so leaf `Ok(())` is right; the CidrRange width check is (meant to
-   be) deferred to the L4 walk, which does run for both permission and principal, nested and
-   combinators.
-6. **The two removed `#[allow(clippy::only_used_in_recursion)]` attrs are correctly removed** — the new
-   arms read `conn`, so clippy is clean (verified at the state-4 gate).
-7. **Docs kept in step with code** — `BEHAVIOR_CONTRACT.md` item 14 records the arms, the
-   `remote_ip ≡ direct_remote_ip ≡ source_ip` equivalence, the bare-`u8` `prefix_len` divergence, and
-   the corrected fail-loud framing; the stale `network_rbac.rs` module header was rewritten.
+**Upstream Envoy v1.33.0 ACCEPTS the config envoy-rust now rejects.** The C-1 repair is therefore
+a **measured config-acceptance divergence**, not parity — falsifying the state-3 re-entry's "no
+new ADR — the fix corrects an internal family classification, no measured wire shape changes"
+rationale. Recorded NOW: **ADR-0134** + a `BEHAVIOR_CONTRACT.md` item-14 bullet, both landed with
+this review (see M-2). Upstream's *runtime matching* semantics for a mapped prefix remain
+UNMEASURED (the IP arms are host-dependent under the Docker harness — parent V-4 — so no fixture
+can witness them); only config ACCEPTANCE was measured, and only acceptance is asserted.
 
----
+### (d) The N-1 guard probed adversarially (found: M-1)
 
-## §4. Issues
+Standalone `rustc -O` probe of the HEAD code, verbatim:
 
-### CRITICAL
+```
+validate() = Err("prefix_len 33 exceeds 32 for IPv4")     # config path rejects this
+contains(127.0.0.1)  [octets differ at byte 3] -> Ok(false)
+contains(127.0.0.0)  [first 4 octets EQUAL]    -> PANIC: index out of bounds: len 4, index 4
+v6 /129 contains(2001:db8::) [16 octets equal] -> PANIC: index out of bounds: len 16, index 16
+```
 
-- **C-1** — the config-reachable data-plane panic. Detailed in §1–§2. **Blocks merge.**
+For an **unvalidated** `CidrRange`, the guard's `full > net.len()` check misses the band
+`full == net.len() && rem > 0` (v4 `prefix_len` 33..=39, v6 129..=135): when the first `full`
+octets compare equal, `net[full]` still indexes out of bounds. **Not config-reachable** — see M-1.
 
-### IMPORTANT
+## §3. Independent adversarial subagent — CONFIRMED on all counts
 
-- **I-1 — the coverage/fuzz shape is structurally blind to C-1.** No test anywhere calls
-  `CidrRange::contains()` with a v4-mapped-IPv6 *prefix*, and the `parse_bootstrap` fuzz target only
-  exercises deserialize + `validate` — `contains` is a data-plane-only entry point the fuzzer never
-  reaches, so the "20000 runs, no crash" gate (d) is *structurally* incapable of finding this panic,
-  and the new corpus seed cannot change that. The state-3 re-entry should add (a) the mapped-prefix
-  regression unit test from §1, and (b) a property test or fuzz target over `CidrRange::contains(cidr,
-  addr)` asserting no panic for any `validate`-passing `cidr` and any `IpAddr` — which both catches
-  C-1 and guards the regression. (No obligation to add a *fuzz target* if the property test covers it;
-  weigh against the "NO new fuzz target" SPEC posture.)
+An independent `general-purpose` reviewer, given the repair commits and tasked to
+reproduce-or-refute, returned:
 
-### MINOR — none blocks
+- **V-1 — config-reachable surface CLOSED.** Traced every path to the only two
+  `CidrRange::contains` production call sites (`network_rbac.rs:123`/`:149`): static listeners,
+  LDS dynamic listeners (same validation gauntlet re-run over the merged set; no LDS hot-reload
+  exists), and the HTTP RBAC filter (all five L4 arms rejected at `lower_*`; `RuntimeMatcher` has
+  no CIDR variant, so HTTP can never reach `contains`). Six live nested/LDS probes all rejected
+  fail-loud with correct path strings; a nested `/8` control config boots and serves.
+- **V-2a — the M-1 guard band CONFIRMED** with its own probe (all 14 band members panic on
+  equal-octet inputs), and **CONFIRMED not config-reachable**: an exhaustive sweep (14 prefixes ×
+  256 prefix_lens × 13 addresses) found **0 validate-passing configs that panic**. The guard
+  comment's "unconditionally" claim adjudicated FALSE as written.
+- **V-2b — the divergence-unrecorded finding CONFIRMED**, independently reproducing the upstream
+  `configuration OK` and grepping `BEHAVIOR_CONTRACT.md` + `DECISIONS.md` (item 14 records only the
+  peer-side canonicalisation; ADR-0133 predates the fix; no record of the mapped-prefix-width
+  rejection existed).
+- **V-3 — NO new Critical.** Old (`f2fb252`) vs new differential probe over the full matrix: **288
+  behavior diffs, all of them** validate-verdict flips on the three mapped prefixes × widths
+  33..=128, **every one** a previously-panic-capable config (`old_contains_panics_on_some_addr=true`
+  for all 288; zero `contains` diffs on any both-validated config). No previously-correct config
+  changed behavior — the only change is accept-then-panic → reject-at-load.
+- **V-4 — the repair tests PIN the fix.** Replayed against the extracted pre-fix code: the property
+  sweep panics at exactly `("::ffff:0.0.0.0", 33, 0.0.0.0)`, the regression test's first `is_err()`
+  fails (old validate accepts all five sampled widths), and the `8cab4af` end-to-end test's
+  `expect_err` fails. All 10 relevant tests pass at `HEAD`.
 
-- **N-1 (defensive depth, advisory).** Even after the `validate` fix, `contains`/`prefix_match` remain
-  `pub` and will panic on any `prefix_len` that outruns the octet length. A `debug_assert!` (or a
-  saturating `full.min(net.len())` guard with an early cross-length bail) at the top of `prefix_match`
-  would turn a future "validate forgot a family" regression into a caught assertion rather than a
-  data-plane panic — the same defense-in-depth the `permission_matches` unreachable arms already use.
-  Optional; the family-consistent `validate` is the real fix.
+## §4. Strengths (carried and new)
 
----
+1. The `ab216b4` review's §3 strengths all still hold: exhaustive catch-all-free classification at
+   every match site (re-verified: the only `_ =>` string in `network_rbac.rs` is inside the doc
+   comment forbidding it); the deliberate HTTP-rejects-L4 divergence complete and pinned; the
+   faithful `destination_port: u16`; the shared source-IP evaluation; the `extra_leaves` macro.
+2. **The repair is the prescribed minimal fix, executed exactly**: one shared helper, the family
+   decision moved to the canonical side, a defensive bail, and tests that demonstrably fail
+   pre-fix. No scope creep — the diff touches only `bootstrap.rs`.
+3. **The `canonical_ip` doc comment encodes the C-1 mechanism** (why the two functions MUST share
+   one rule), so the invariant survives the next editor.
+4. **The property sweep mirrors the data-plane gate** (`if cidr.validate().is_err() { continue }`)
+   — it tests exactly the reachable surface, not a fantasy one.
 
-## §5. Findings explicitly considered and REJECTED by this review
+## §5. Issues
 
-Recorded so a future session (and the state-3 re-entry) does not "fix" what is deliberate:
+### CRITICAL — none.
 
-- **"The HTTP RBAC filter rejecting `destination_ip`/`destination_port`/`*_remote_ip`/`source_ip` is a
-  parity bug — make it accept them."** **NO.** This is a DELIBERATE FAIL-LOUD DIVERGENCE
-  (`BEHAVIOR_CONTRACT.md` item 14, ADR-0133, ADR-0049 decision-2 (b)): upstream Envoy *accepts* these
-  arms in an HTTP rbac filter (measured), envoy-rust rejects them startup-fatal because they can never
-  match at L7. Confirmed the framing; do **not** edit `crates/envoy-filter/src/rbac.rs` toward
-  HTTP-accepts-L4 parity.
-- **"The bare-`u8` `prefix_len` (rejecting the `{value:N}` wrapper) is a divergence bug."** **NO.**
-  Deliberate, matching the `max_request_bytes` UInt32Value precedent (ADR-0063) and the fail-loud
-  posture (ADR-0049). Pinned by test.
-- **"There is no differential fixture for the IP/port arms — add one."** **NO.** The arms are
-  structurally host-dependent under the Docker harness (parent V-4, ADR-0128, SPEC §2): the source-IP
-  arms see the bridge address `192.168.65.2` and the destination arms see per-proxy reserved ports.
-  In-process + loopback coverage is the recorded posture; regression surface `0001`–`0073` stays green.
-  This is acceptable and is NOT what C-1 is about — C-1 is a panic reachable *without* any differential.
-- **"Add a `_ =>` catch-all to the four exhaustive RBAC match sites."** **NO.** The compile break is
-  the intended forcing function; never add a catch-all.
+### IMPORTANT — none.
 
----
+### MINOR — neither blocks
 
-## §6. Assessment
+- **M-1 (defensive-guard band + overclaiming comment; carry-forward).** The N-1 bail in
+  `prefix_match` (`bootstrap.rs:1717`) misses `full == net.len() && rem > 0`: an **unvalidated**
+  `CidrRange` with v4-canonical `prefix_len` 33..=39 (or v6 129..=135) still panics on `net[full]`
+  when the first `full` octets are equal — measured (§2d), independently confirmed with an
+  exhaustive sweep proving it is **NOT config-reachable** (every data-plane `CidrRange` passes
+  `validate` first; both `contains` call sites evaluate config-validated ranges only). The code
+  comment at `:1709-1716` ("keeps the data-plane invariant … true **unconditionally**, even for a
+  future caller that constructs a `CidrRange` without validating") is FALSE as written, and the
+  regression test's "must not panic, regardless of validation" line holds only for its sampled
+  addresses. **Fix (one line + comment)**: bail on whole-byte-rounded width — e.g.
+  `let needed = bits.div_ceil(8); if needed > net.len() || needed > addr.len() { return false; }`
+  — plus a no-panic test for the band, and correct the comment. Severity: the original N-1 was
+  itself advisory/optional; its incomplete implementation cannot outrank the absence it improved
+  on. Carried forward to the next phase that touches `bootstrap.rs`'s CidrRange surface (`67.3` or
+  later); do NOT fix in the close-out session.
+- **M-2 (unrecorded acceptance divergence — CLOSED THIS SESSION).** The C-1 repair rejects a config
+  upstream Envoy v1.33.0 accepts (measured, §2c) — a divergence that every sibling in item 14
+  records explicitly, but which had no record (the re-entry's "no new ADR" rationale assumed no wire
+  shape changed; acceptance IS a wire-visible surface). Per D-3.5 ("decisions are written, not
+  remembered") and invariant 4.1.5 ("never both silently"), this review lands **ADR-0134** (the
+  measurement, the options, the kept rejection posture per ADR-0049 decision-2 (b)) and the
+  matching **`BEHAVIOR_CONTRACT.md` item-14 bullet** in this commit. Docs-only; no production code,
+  no fixture, no fuzz target — the review's probe produced a new measurement, and recording
+  measurements is exactly what the contract/ledger exist for.
+- **N-2 (cosmetic, no action required).** No in-repo test pins the nested-combinator
+  `InvalidCidrRange` paths (`principals[0].ids[0].not_id` etc.) — live-probed green here and
+  structurally shared with the depth/empty-set walk the 67.1 tests cover. Note only.
 
-**Ready to merge?** **No.**
+## §6. Findings explicitly considered and REJECTED (carried verbatim from `ab216b4` §5 — do NOT re-litigate)
 
-**Reasoning.** The change is otherwise well-structured, exhaustive, and well-tested — but it admits a
-config-reachable, release-mode data-plane panic (C-1) across all four IP arms, independently
-reproduced end-to-end, because `validate()` and `contains()` disagree on the address family of an
-IPv4-mapped-IPv6 `address_prefix`. That violates the codebase's own "data plane must never panic"
-invariant and cannot ship.
+- **HTTP-accepts-L4-arms "parity fix"** — NO. Deliberate FAIL-LOUD DIVERGENCE, confirmed WAI
+  (`BEHAVIOR_CONTRACT.md` item 14, ADR-0133, ADR-0049 decision-2 (b)). Do not edit
+  `crates/envoy-filter/src/rbac.rs` toward parity.
+- **The bare-`u8` `prefix_len` wrapper rejection** — NO. Deliberate (ADR-0063 precedent, ADR-0049).
+- **A differential fixture for the IP/port arms** — NO. Structurally host-dependent (parent V-4);
+  in-process + loopback coverage is the recorded posture.
+- **A `_ =>` catch-all at the exhaustive RBAC match sites** — NEVER. The compile break is the
+  forcing function.
+- *(New this review)* **"Reject-at-load is wrong; match the mapped prefix as raw 16-byte IPv6 for
+  upstream parity"** — NO. That would contradict the measured mapped-PEER canonicalisation
+  (ADR-0133) and make mapped-prefix ranges silently unmatchable against the v4 peers they textually
+  name; the pre-repair accept-then-panic was strictly worse. ADR-0134 records the options and keeps
+  the fail-loud rejection.
 
-**Next session (SEPARATE, per §5.1 / `ADR-0127`; a NOT-APPROVED review re-opens at §5 state 3, NOT
-state 4):** a §5.2 **state-3 re-entry** — land the C-1 repair (family-consistent `validate`) + the I-1
-regression coverage under TDD, then a fresh state-4 verification, then a fresh state-5 re-review that
-SUPERSEDES this file. ROADMAP row `67.2` stays `in-progress`; parent row `67` stays `in-progress`
-(it flips `done` only when `67.1`+`67.2`+`67.3` are all `done`). `67.2` must NOT touch `67.3`'s scope.
+## §7. Assessment
 
----
+**Ready to merge?** **Yes.**
 
-## §7. Carry-forward ledger
+**Reasoning.** The single Critical that blocked the `ab216b4` review is fixed at its root, proven
+closed end-to-end (original repro, boundary widths, nested combinators, LDS), pinned by tests that
+fail pre-fix, and independently confirmed with an exhaustive old-vs-new sweep showing no other
+behavior change and no new Critical. The two residual findings are a non-config-reachable
+defensive-guard band with an overclaiming comment (M-1, carried forward with a precise one-line
+fix) and a documentation gap (M-2, closed in this very commit by ADR-0134 + the contract bullet).
+§7.5 (a)-(e) were re-verified GREEN at the post-repair state-4 (evidence in `PROGRESS.md`); with
+this APPROVED review, **(f) is met and all six gates are satisfied**.
 
-This review **opens C-1 (Critical, blocking) and I-1 (Important)** against `67.2`, both consumed by
-the imminent state-3 re-entry; and one advisory Minor **N-1**.
+**Next session (SEPARATE, per §5.1 / ADR-0127): the §5 state-6 close-out.** Flip ROADMAP row
+`67.2` → `done` (ONLY row `67.2` — parent `67` flips `done` only when `67.3` is also `done`; the
+`67.2/SPEC.md` header + D8 are STALE on this), relocate the closed-phase STATE narrative per
+ADR-0035, and advance `STATE.md` (sibling `67.3` has `SPEC.md` → its §5 state-2 PLAN-write is the
+next phase work). `67.2` must NOT touch `67.3`'s scope (ADR-0132).
 
-- **State as of `ADR-0133` (unchanged by this review):** `CF-67-1` (`shadow_rules`), `CF-67-2`
-  (`Action::LOG`), `CF-67-3` (`on_data`-time iteration) stay live, none blocks; the parent SPEC's V-1
-  was CONSUMED by `67.2`.
+## §8. Carry-forward ledger
+
+- **CONSUMED by the repair + this re-review:** `ab216b4`'s **C-1** (Critical — fixed `e0a15dc`,
+  verified §2/§3), **I-1** (Important — regression + property tests, proven to pin the fix), and
+  **N-1** (advisory — implemented as the `prefix_match` bail, with its M-1 residual).
+- **OPENED by this review:** **M-1** (the guard band + comment fix + band test; carried to the next
+  phase touching the CidrRange surface — `67.3` or later); **N-2** (cosmetic note, no obligation).
+  **M-2 was opened and CLOSED within this session** (ADR-0134 + the item-14 bullet).
+- **Unchanged:** `CF-67-1` (`shadow_rules`), `CF-67-2` (`Action::LOG`), `CF-67-3` (`on_data`
+  iteration) stay live, none blocks; parent V-1 remains CONSUMED by `67.2`.
 - **DEFERRED to `67.3` (unchanged):** the `ConnectionHandler` establishment/data-phase split, the
-  correct `[rbac, tcp_proxy]` composition (which DELETES `UnsupportedNetworkFilterChainComposition`),
-  the per-terminal data-less-FIN semantics.
-- **This review needs no ADR.** **`DECISIONS.md` ledger head: `ADR-0133`; next available: `ADR-0134`,
-  unreserved.** (The state-3 re-entry likewise needs none unless the fix changes a measured wire
-  shape, which it does not — it corrects an internal family classification.)
+  `[rbac, tcp_proxy]` composition, the `UnsupportedNetworkFilterChainComposition` deletion
+  (ADR-0132).
+- **This review fired ADR-0134** (the mapped-prefix-width acceptance divergence). **`DECISIONS.md`
+  ledger head: `ADR-0134`; next available: `ADR-0135`, unreserved.**
 - **Numbering:** `M66-1` was never allocated; the ledger does not backfill.
