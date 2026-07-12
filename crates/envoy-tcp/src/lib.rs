@@ -236,7 +236,8 @@ impl ConnectionHandler for TcpProxy {
     ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
         // Thin wrapper that defers to the inherent generic method via the
         // concrete TcpStream type. This impl exists for object safety —
-        // `Listener::serve` works over `Arc<dyn ConnectionHandler>`.
+        // `Listener::serve` works over `Arc<dyn ConnectionHandler>`. Used on the
+        // lone-`tcp_proxy` (no non-terminal chain) path.
         //
         // The trait's `&self` borrow doesn't extend into the boxed future
         // (needs `'static`), so we clone the two Arc-bearing fields and
@@ -254,6 +255,119 @@ impl ConnectionHandler for TcpProxy {
             };
             proxy.handle::<tokio::net::TcpStream>(downstream).await
         })
+    }
+
+    /// 67.3 D1/D3/D4: connect upstream at ESTABLISHMENT (before any downstream
+    /// byte — so a server-first banner reaches a byte-less client), then gate the
+    /// DOWNSTREAM→UPSTREAM direction on the first byte OR a data-less FIN. This
+    /// OVERRIDES the trait default (which peeks first, deadlocking a server-first
+    /// protocol). `self: Arc<Self>` keeps the returned future `'static`.
+    fn handle_gated(
+        self: Arc<Self>,
+        downstream: tokio::net::TcpStream,
+        gate: envoy_listener::FirstByteGate,
+    ) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        Box::pin(async move {
+            let conn = envoy_listener::ConnectionInfo {
+                peer_addr: downstream.peer_addr()?,
+                local_addr: downstream.local_addr()?,
+            };
+            let up = self.connect_upstream().await?; // establishment: cx_total ticks here
+            self.relay_gated(downstream, up, gate, conn).await
+        })
+    }
+}
+
+impl TcpProxy {
+    /// The gated relay (67.3 D3). Runs the upstream→downstream banner concurrently
+    /// with the first-byte gate on the downstream read half; then:
+    ///  - `Admitted(Some(b))`: re-inject `b` upstream, then the ADR-0016 select copy;
+    ///  - `Admitted(None)` (data-less FIN): propagate FIN upstream, drain upstream→downstream;
+    ///  - `Denied`: close downstream WITHOUT forwarding the byte upstream (R-2, W-4);
+    ///  - `ClientGoneEarly`: drop.
+    async fn relay_gated(
+        &self,
+        downstream: tokio::net::TcpStream,
+        up: UpstreamConn,
+        gate: envoy_listener::FirstByteGate,
+        conn: envoy_listener::ConnectionInfo,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use tokio::io::AsyncWriteExt;
+        let UpstreamConn {
+            stream: upstream,
+            _cx_guard,
+            addr,
+            cluster_name,
+        } = up;
+        let (mut dr, mut dw) = downstream.into_split(); // OwnedReadHalf/OwnedWriteHalf: reunitable
+        let (mut ur, mut uw) = tokio::io::split(upstream);
+
+        // Phase 1: banner (upstream→downstream) runs WHILE we await the first
+        // downstream byte / FIN. The gate reads `dr`; the banner writes `dw`;
+        // disjoint halves, so no contention.
+        let (outcome, first) = {
+            let mut banner = std::pin::pin!(tokio::io::copy(&mut ur, &mut dw));
+            let mut gate_fut = std::pin::pin!(gate.evaluate_read_half(&mut dr, &conn));
+            tokio::select! {
+                biased;
+                g = &mut gate_fut => g?,
+                r = &mut banner => {
+                    // Upstream reached EOF before the client's first byte. ADR-0016:
+                    // the connection closes. `dw` is dropped at scope end → client
+                    // sees FIN. Finish resolving the gate, then fall through.
+                    r.map_err(|source| Box::new(TcpProxyError::CopyFailed { source })
+                        as Box<dyn std::error::Error + Send + Sync>)?;
+                    gate_fut.await?
+                }
+            }
+        };
+
+        match outcome {
+            envoy_listener::GateOutcome::ClientGoneEarly => Ok(()),
+            envoy_listener::GateOutcome::SkippedCleanly | envoy_listener::GateOutcome::Denied => {
+                // W-4 / R-2: on Denied the first byte MUST NOT reach the upstream.
+                // Drop the upstream (guard fires), reunite the downstream halves,
+                // and close it cleanly (zero bytes, clean EOF — close_with_drain).
+                drop((ur, uw));
+                let ds = dr
+                    .reunite(dw)
+                    .map_err(|e| {
+                        Box::new(std::io::Error::other(e))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?;
+                envoy_listener::close_with_drain(ds).await?;
+                Ok(())
+            }
+            envoy_listener::GateOutcome::Admitted => {
+                match first {
+                    Some(b) => {
+                        // Re-inject the peeked byte, then the ADR-0016 select copy.
+                        uw.write_all(&[b]).await.map_err(|source| {
+                            Box::new(TcpProxyError::CopyFailed { source })
+                                as Box<dyn std::error::Error + Send + Sync>
+                        })?;
+                        let result: Result<(), std::io::Error> = tokio::select! {
+                            res = tokio::io::copy(&mut dr, &mut uw) => res.map(|_| ()),
+                            res = tokio::io::copy(&mut ur, &mut dw) => res.map(|_| ()),
+                        };
+                        drop((dr, dw, ur, uw));
+                        result.map_err(|source| {
+                            Box::new(TcpProxyError::CopyFailed { source })
+                                as Box<dyn std::error::Error + Send + Sync>
+                        })?;
+                    }
+                    None => {
+                        // Data-less FIN, ALLOW: propagate FIN upstream, drain the
+                        // upstream→downstream direction to EOF.
+                        uw.shutdown().await.ok();
+                        let _ = tokio::io::copy(&mut ur, &mut dw).await;
+                        drop((dr, dw, ur, uw));
+                    }
+                }
+                tracing::debug!(%addr, cluster = %cluster_name, "tcp proxy gated connection complete");
+                Ok(())
+            }
+        }
     }
 }
 
@@ -325,6 +439,202 @@ admin:
             stat_prefix: "ingress_tcp".to_string(),
             cluster: cluster_name.to_string(),
         }
+    }
+
+    /// Spawn an in-process server-FIRST backend: writes `220 BANNER\r\n`
+    /// immediately on accept, then records every byte it subsequently receives.
+    /// Returns its address and the recording handle. (67.3 D7.)
+    async fn spawn_banner_backend() -> (SocketAddr, Arc<tokio::sync::Mutex<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rec = recorded.clone();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                s.write_all(b"220 BANNER\r\n").await.ok();
+                s.flush().await.ok();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => rec.lock().await.extend_from_slice(&buf[..n]),
+                    }
+                }
+            }
+        });
+        (addr, recorded)
+    }
+
+    /// 67.3 D7 / C-1 REGRESSION WITNESS. `[rbac(ALLOW, any), tcp_proxy]` over a
+    /// server-first backend: the banner must reach a client that has SENT
+    /// NOTHING. Fails against the post-Task-2 code (the default `handle_gated`
+    /// peeks, so tcp_proxy never connects upstream and the banner never arrives).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn banner_reaches_a_client_that_sends_nothing_through_rbac_allow() {
+        use envoy_listener::{
+            ChainHandler, ConnectionHandler, ConnectionInfo, NetworkFilter, NetworkFilterStatus,
+        };
+        struct AllowAll;
+        impl NetworkFilter for AllowAll {
+            fn on_new_connection(&self, _: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::Continue
+            }
+        }
+
+        let (backend_addr, _rec) = spawn_banner_backend().await;
+        let handle = mk_handle("backend", backend_addr).await;
+        let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(AllowAll) as Arc<dyn NetworkFilter>],
+            proxy,
+        ));
+
+        let dl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daddr = dl.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (s, _) = dl.accept().await.unwrap();
+            chain.handle(s).await
+        });
+
+        let mut client = TcpStream::connect(daddr).await.unwrap();
+        // Client sends NOTHING. It must still receive the banner.
+        let mut buf = [0u8; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_exact(&mut buf),
+        )
+        .await
+        .expect("banner must reach a byte-less client")
+        .expect("read banner");
+        assert_eq!(&buf, b"220 BANNER\r\n");
+        drop(client);
+        let _ = task.await;
+    }
+
+    /// 67.3 D7 / W-4 / R-2. `[rbac(DENY), tcp_proxy]` over a server-first
+    /// backend: the banner is STILL delivered (upstream connected at
+    /// establishment), then the client's first byte triggers the DENY and the
+    /// connection closes — and that byte must NEVER reach the backend.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deny_delivers_banner_then_closes_without_forwarding_the_byte() {
+        use envoy_listener::{
+            ChainHandler, ConnectionHandler, ConnectionInfo, NetworkFilter, NetworkFilterStatus,
+        };
+        struct DenyAll;
+        impl NetworkFilter for DenyAll {
+            fn on_new_connection(&self, _: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::StopIteration
+            }
+        }
+        let (backend_addr, rec) = spawn_banner_backend().await;
+        let handle = mk_handle("backend", backend_addr).await;
+        let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(DenyAll) as Arc<dyn NetworkFilter>],
+            proxy,
+        ));
+        let dl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daddr = dl.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (s, _) = dl.accept().await.unwrap();
+            chain.handle(s).await
+        });
+
+        let mut client = TcpStream::connect(daddr).await.unwrap();
+        // Banner still delivered (upstream connected at establishment).
+        let mut buf = [0u8; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_exact(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buf, b"220 BANNER\r\n");
+        // Now send the first byte → DENY closes; the byte must not reach the backend.
+        client.write_all(b"Z").await.ok();
+        let mut tail = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_to_end(&mut tail),
+        )
+        .await;
+        drop(client);
+        let _ = task.await;
+        assert!(
+            !rec.lock().await.contains(&b'Z'),
+            "DENY must NOT forward the first byte upstream"
+        );
+    }
+
+    /// 67.3 D7 / D3. A data-less FIN through `[rbac(ALLOW), tcp_proxy]` reaches
+    /// the backend as a clean EOF: the upstream is connected at establishment and
+    /// the downstream FIN propagates upstream (half-close). The banner is also
+    /// delivered. Pairs with the envoy-bin FIN-matrix backstop (Task 5) that
+    /// contrasts this against `echo` (which does NOT evaluate on a data-less FIN).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dataless_fin_through_rbac_allow_reaches_backend_as_eof() {
+        use envoy_listener::{
+            ChainHandler, ConnectionHandler, ConnectionInfo, NetworkFilter, NetworkFilterStatus,
+        };
+        struct AllowAll;
+        impl NetworkFilter for AllowAll {
+            fn on_new_connection(&self, _: &ConnectionInfo) -> NetworkFilterStatus {
+                NetworkFilterStatus::Continue
+            }
+        }
+        // Backend that signals when it has seen its client's EOF (the propagated FIN).
+        let saw_eof = Arc::new(tokio::sync::Notify::new());
+        let saw_eof_sig = saw_eof.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let backend_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                s.write_all(b"220 BANNER\r\n").await.ok();
+                s.flush().await.ok();
+                let mut buf = [0u8; 64];
+                // Read to EOF: a data-less FIN propagated from downstream yields Ok(0).
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+                saw_eof_sig.notify_one();
+            }
+        });
+
+        let handle = mk_handle("backend", backend_addr).await;
+        let proxy: Arc<TcpProxy> = Arc::new(TcpProxy::new(handle, &mk_cfg("backend")));
+        let chain: Arc<dyn ConnectionHandler> = Arc::new(ChainHandler::new(
+            vec![Arc::new(AllowAll) as Arc<dyn NetworkFilter>],
+            proxy,
+        ));
+        let dl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daddr = dl.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (s, _) = dl.accept().await.unwrap();
+            chain.handle(s).await
+        });
+
+        let mut client = TcpStream::connect(daddr).await.unwrap();
+        // Read the banner (server-first), then half-close WITHOUT sending data.
+        let mut buf = [0u8; 12];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_exact(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buf, b"220 BANNER\r\n");
+        client.shutdown().await.expect("half-close write side");
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), saw_eof.notified())
+            .await
+            .expect("backend observed the propagated data-less FIN within 3s");
+        drop(client);
+        let _ = task.await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
