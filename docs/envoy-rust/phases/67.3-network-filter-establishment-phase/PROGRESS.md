@@ -205,3 +205,137 @@ Live carry-forwards unchanged: M-1 (not consumed — 67.3 doesn't touch CidrRang
 CF-67-6 (not folded — D8 opportunistic), **CF-67-7 (NEW — the TLS composition)**,
 CF-67-3 (deferred). ADR ledger head unchanged at ADR-0135 (no new ADR this session;
 ADR-0135 authored the resolutions at state-2).
+
+---
+
+## Session: §5 state-4 verification (`superpowers:verification-before-completion`)
+
+Cold-started clean: `git status --porcelain` empty, branch `main`, `HEAD` at the
+state-3-complete / STATE-advance commit `32d3804` = `origin/main`;
+`git fetch origin --prune` showed no sibling ahead → §5 state 4.
+**STEP 0.5 (CI confirmation, FULL 40-char SHA):** the code-complete commit's CI run
+`29194938132` was GREEN (`completed`/`success`) on
+`9b09bdcc93f8b8ba77eeacdaef86110867e8a143`; the docs-only STATE-advance commit
+`32d3804c1e464ce321a10907508c5d9606417388` CI run `29195219802` also GREEN
+(`completed`/`success`). This ran the full §7.5 gate (PLAN Task 6) and quotes every
+command's output below (§5 state-4 discipline; never piped through `tail` — full
+output redirected to files).
+
+### Gate (e) — `cargo build --workspace --all-targets`
+
+```
+   Compiling envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+   Compiling http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.47s
+```
+
+**EXIT 0; 0 warnings** (`grep -c warning` → 0). `target/debug/envoy-bin` is fresh
+for the differential/integration runs.
+
+### Gate (e) — `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+```
+    Checking envoy-bin v0.0.0 (/home/esa/git/envoy-rust/crates/envoy-bin)
+    Checking http2-echo-server v0.0.0 (/home/esa/git/envoy-rust/tests/helpers/http2-echo-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.92s
+```
+
+**EXIT 0; zero `^warning`/`^error`/`generated … warning` lines.** (NOT run this
+phase before now, as flagged in the handoff — passed clean on first run this gate.)
+
+### Gate (e) — `cargo fmt --all -- --check`
+
+**EXIT 0; zero output** (no diff). Confirms the `9b09bdc` fmt fixup holds.
+
+### Gate (e) — `cargo test --workspace --no-fail-fast`
+
+Full output redirected to a file (memory `never-pipe-verification-runs-through-tail`).
+Aggregate across **150** test-result lines: **1947 passed; 6 failed.**
+
+The **6** failures are ALL in the documented CI-authoritative host-flake set —
+none are in a phase-67.3-changed file (the phase touched `envoy-listener`,
+`envoy-tcp`, `envoy-config/{bootstrap,lib}`, `envoy-bin/tests/network_filter_rbac`;
+every one of those is GREEN, see below). Adjudicated per the memories, re-running
+each in isolation to categorize:
+
+| Failing test (crate) | Isolation | Class / memory |
+|---|---|---|
+| `access_log_h2_rcd_upstream_reset` (`differential`) | fails deterministically | upstream-reset witness fixture-0061/62/69/70; real Envoy can't reach the host-spawned close backend → reports `rf:"UF"` where envoy-rust correctly reports `rf:"UC"`. `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_h2_uc_upstream_reset` (`differential`) | fails deterministically | same reset-witness class |
+| `access_log_rcd_upstream_reset` (`differential`) | fails deterministically | same reset-witness class |
+| `access_log_rf_upstream_reset` (`differential`) | fails deterministically | same reset-witness class |
+| `admin_config_dump_server_info` (`envoy-bin`) | **PASS in isolation** (`1 passed`) | parallel-load env flake (handoff-named) |
+| `rds_route_to_unknown_cluster_is_fatal` (`envoy-bin`, `xds_file_based_rds`) | **PASS in isolation** (`1 passed`) | fatal-startup port-reuse race, `eds-fatal-startup-test-port-reuse-flake` class |
+
+Confirmed failure cause on a re-run of `access_log_rf_upstream_reset` in isolation
+(fixture `envoy-rust-phase-53-fixture-0061`):
+
+```
+fixture green: access log byte-exact mismatch: line 0 not byte-identical:
+  envoy="{\"rc\":503,\"rf\":\"UF\"}" envoy-rust="{\"rc\":503,\"rf\":\"UC\"}"
+```
+
+i.e. **real Envoy** reports `UF` (upstream connect failure — the host-spawned close
+backend is unreachable on this host), while **envoy-rust** produces the correct
+`UC` (upstream connection termination). The divergence is a property of the host's
+Docker/IPv6 networking, not of envoy-rust — exactly the documented flake.
+
+**Cross-check (memory `local-red-set-varies-run-to-run`):** `local passed + failed
+= 1947 + 6 = 1953` **==** CI run `29194938132` (`9b09bdc`, green) **1953 passed**.
+Exact match → the 6 local REDs are precisely the tests that pass on CI; no real
+regression, no missing/extra test.
+
+**Phase-touched test binaries — all GREEN in this workspace run:**
+
+```
+envoy_config       => test result: ok. 587 passed; 0 failed
+envoy_listener     => test result: ok.  53 passed; 0 failed
+envoy_tcp          => test result: ok.  14 passed; 0 failed   (new banner/DENY/FIN witnesses)
+network_filter_rbac=> test result: ok.  24 passed; 0 failed   (establishment backstops + FIN matrix)
+```
+
+Matches the state-3 exit greens exactly. **NOT a §5.2 re-entry** — the gate's real
+signal is fully green; the 6 REDs are CI-authoritative host flakes.
+
+### Gate (e) — `cargo deny check`
+
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+
+**EXIT 0.** (The five `license-not-encountered` warnings for unmatched allowances
+in `deny.toml` are benign and pre-existing, not errors.) No fresh-advisory RED.
+
+### Gate (a)/(b) — Differential surface
+
+`git diff --name-only b5fc211..HEAD | grep -iE 'fixtures|known-failures|0001|0071|0072|0073'`
+→ **NONE.** `0001`/`0071`/`0072`/`0073` and every other fixture UNEDITED; only
+production code, tests, and docs changed. The Docker differential first runs at this
+gate; the four upstream-reset witnesses that executed locally are the known
+host-flake set above (memories `envoy-rust-state4-ci-first-execution`,
+`differential-host-bridge-ip-192-168-65-2`, `tcpclosebackend-ipv6-unreachable-host-flake`) —
+**CI is authoritative** and is green on `9b09bdc`.
+
+### Gate (c) — Conformance
+
+`known-failures.txt` UNEDITED (same `git diff` grep → NONE). `h2spec` corpus
+unchanged; never trimmed (memory `h2spec-3-5-2-preface-host-sensitive`). CI-authoritative.
+
+### Gate (d) — Fuzz
+
+**Satisfied by the pre-existing `parse_bootstrap` target; NO new fuzz target.**
+Network `rbac` parses nothing (the phase adds no config-parse surface — it splits an
+in-process handler and narrows an existing rejection), so there is no new input to
+fuzz. Recorded explicitly per the handoff (not skipped silently).
+
+### State-4 exit summary
+
+**The §7.5 six-gate checklist is GREEN.** build EXIT 0 / 0 warnings; clippy EXIT 0
+clean; fmt EXIT 0; test 1947 passed with the 6 REDs adjudicated as the documented
+CI-authoritative host-flake set (local `1953` == CI `1953 passed`); deny EXIT 0;
+differential surface + `known-failures.txt` UNEDITED; gate (d) satisfied by
+`parse_bootstrap`. No real regression → **NOT a §5.2 re-entry.** The state advances
+to §5 state 5 (`superpowers:requesting-code-review` → `REVIEW.md`, next session).
+Per §5.1 this session did NOT chain into state-5. No new ADR (ledger head ADR-0135).
+Live carry-forwards unchanged: M-1, CF-67-6, **CF-67-7 (NEW — TLS composition)**,
+CF-67-3.
