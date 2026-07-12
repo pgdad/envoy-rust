@@ -317,7 +317,11 @@ no-op clause below).
 
    The data-less-FIN row is **per-terminal, not a chain property** (ADR-0132, measured): upstream
    ticks no counter for `echo` / `http_connection_manager`, but **does** evaluate for `tcp_proxy`
-   (downstream half-close propagation). Owned by phase **`67.3`**.
+   (downstream half-close propagation). **Reproduced in envoy-rust from phase `67.3`** (ADR-0135):
+   `echo`/`hcm` inherit the default `handle_gated` (a non-consuming `peek` → `Ok(0)` → skip), while
+   `tcp_proxy`'s `handle_gated` override consumes one read on the split downstream half, so a
+   data-less FIN (`Ok(0)`) still evaluates the chain. Pinned by
+   `dataless_fin_ticks_allowed_for_tcp_proxy_but_not_echo` (envoy-bin FIN matrix).
 
 2. **DENY semantics.** Zero bytes written; clean EOF, **never an RST**; the client's already-sent
    bytes are discarded; a post-EOF client write is **accepted**. The terminal filter never runs.
@@ -418,21 +422,33 @@ no-op clause below).
       `direct_response_delivers_payload_to_a_client_that_sends_nothing` and
       `deny_does_not_suppress_the_direct_response_payload`. **No differential observable** — no
       fixture composes `rbac` with `direct_response`.
-    - **`tcp_proxy` — RECORDED DIVERGENCE: REJECTED AT CONFIG LOAD, fail-loud, owner phase `67.3`.**
-      Upstream **accepts** `[rbac, tcp_proxy]`; envoy-rust rejects it with
-      `ConfigError::UnsupportedNetworkFilterChainComposition`, whose message names phase `67.3`.
-      Faithful behavior requires connecting upstream at establishment, relaying the server-first
-      banner immediately, and evaluating the chain on the first downstream byte *or* a data-less FIN
-      — which needs an establishment/data-phase split of `envoy_listener::ConnectionHandler`. That
-      split **fired `BOOTSTRAP_PROMPT.md` §6.1's mid-execution valve** and was carved into phase
-      `67.3` (§6.2). The rejection is a deliberate **fail-loud** divergence (ADR-0049 decision-2 (b))
-      and is strictly better than the alternative, which is a **runtime deadlock**: the client waits
-      forever for a banner while envoy-rust waits for a byte the client will never send. It is **not**
-      a §6.3 stub — it is a loud refusal with a named owner and its own ROADMAP row. **`67.3` DELETES
-      this rejection and its `ConfigError` variant.** **No differential observable** — no fixture
-      composes `rbac` with `tcp_proxy`. Pinned by `rejects_rbac_composed_with_tcp_proxy` and
-      `rbac_before_tcp_proxy_is_rejected_at_config_load`; the over-rejection guard is
-      `lone_tcp_proxy_chain_is_still_accepted` / `tcp_proxy_alone_is_still_accepted`.
+    - **`tcp_proxy` — SPLIT OUTCOME (phase `67.3`, ADR-0135).** The establishment/data-phase split of
+      `envoy_listener::ConnectionHandler` (`handle_gated` + the filter-owned `FirstByteGate`) makes
+      the composition behave for **plaintext** listeners; the **TLS-downstream** form stays a recorded
+      fail-loud divergence.
+      - **PLAINTEXT `[rbac, tcp_proxy]` = FULL PARITY.** `tcp_proxy` connects upstream at
+        ESTABLISHMENT (`cluster.<name>.upstream_cx_total` ticks before any downstream byte), so a
+        server-first banner reaches a byte-less client; the RBAC verdict lands on the first downstream
+        byte **or** a data-less FIN; on **DENY the first byte is withheld from the upstream**. Pinned
+        by the in-process witnesses (`banner_reaches_a_client_that_sends_nothing_through_rbac_allow`,
+        `deny_delivers_banner_then_closes_without_forwarding_the_byte`,
+        `dataless_fin_through_rbac_allow_reaches_backend_as_eof` in `envoy-tcp`) and the envoy-bin
+        backstops (`plaintext_rbac_before_tcp_proxy_delivers_banner_to_a_byteless_client`,
+        `deny_before_tcp_proxy_delivers_banner_then_withholds_the_byte`,
+        `dataless_fin_ticks_allowed_for_tcp_proxy_but_not_echo`). **No differential observable** — a
+        server-first backend is not host-deterministic under the Docker harness (the `67.2`
+        precedent), so the witnesses are in-process. ADR-0135.
+      - **TLS-DOWNSTREAM `[rbac, tcp_proxy]` = RECORDED FAIL-LOUD DIVERGENCE, owner CF-67-7.** MEASURED
+        (ADR-0135, the D6 probe against `envoyproxy/envoy:v1.33.0`): upstream Envoy establishes the
+        `tcp_proxy` upstream at **raw-TCP accept (BEFORE the handshake)** and takes the RBAC verdict on
+        the first **DECRYPTED** byte — an ordering envoy-rust's TLS handler does not yet reproduce.
+        Upstream **accepts** the config; envoy-rust rejects it at config load with
+        `ConfigError::UnsupportedNetworkFilterChainComposition`, whose message names **CF-67-7**. A
+        deliberate fail-loud divergence (ADR-0049 decision-2 (b)); **never silent**. Pinned by
+        `tls_rbac_before_tcp_proxy_is_still_rejected` (envoy-config) and
+        `tls_rbac_before_tcp_proxy_is_rejected_at_config_load` (envoy-bin); the over-rejection guards
+        are `lone_tcp_proxy_chain_is_still_accepted` / `tcp_proxy_alone_is_still_accepted` and the
+        plaintext-accept `plaintext_rbac_before_tcp_proxy_is_now_accepted`.
 
 14. **Connection-level matcher arms (phase 67.2, ADR-0133; wire shapes MEASURED against
     `envoyproxy/envoy:v1.33.0` with `--mode validate`).** The network `rbac` filter evaluates five

@@ -17,18 +17,29 @@
 //! `echo` (and `http_connection_manager`) have no establishment-time work, so the
 //! chain's first-byte gate is observationally correct for them. `direct_response`
 //! writes and closes at establishment, so it BYPASSES the chain entirely; the two
-//! `*_direct_response_*` probes below are the witnesses. `tcp_proxy` connects
-//! upstream at establishment and is REJECTED at config load until phase `67.3`.
+//! `*_direct_response_*` probes below are the witnesses.
+//!
+//! **ADR-0135 (phase 67.3) governs `tcp_proxy` here.** `tcp_proxy` connects upstream
+//! at establishment and relays a server-first banner before any downstream byte.
+//! The establishment/data-phase split (`handle_gated`) makes the PLAINTEXT
+//! `[rbac, tcp_proxy]` composition behave — the banner reaches a byte-less client,
+//! the verdict lands on the first downstream byte or a data-less FIN, and DENY
+//! withholds that byte from the upstream. The TLS-downstream form stays REJECTED at
+//! config load (owner CF-67-7): the D6 probe measured upstream Envoy establishing
+//! the upstream at raw-TCP accept and taking the verdict on the first DECRYPTED
+//! byte, which envoy-rust's TLS handler does not yet reproduce.
 
 use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 mod common;
-use common::{reserve_port, scrape_admin_stats, wait_ready};
+use common::{reserve_port, scrape_admin_stats, wait_for_stat, wait_ready};
 
 fn spawn_envoy_bin(yaml: &str) -> (tokio::process::Child, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -718,18 +729,273 @@ static_resources:
     child.kill().await.ok();
 }
 
-/// ADR-0132 decision 4: `[rbac, tcp_proxy]` is REJECTED AT CONFIG LOAD, fail-loud,
-/// until phase `67.3` lands the establishment/data-phase split.
-///
-/// `tcp_proxy` connects upstream at connection establishment and relays a
-/// server-first banner before any downstream byte. Under `ChainHandler`'s
-/// first-byte `peek` that composition is a **runtime deadlock** — the client waits
-/// for a banner while envoy-rust waits for a byte. Upstream Envoy ACCEPTS this
-/// config, so the rejection is a deliberate divergence in the fail-loud direction
-/// (`ADR-0049` decision-2 (b)), recorded in `BEHAVIOR_CONTRACT.md` and strictly
-/// better than shipping the hang. **`67.3` DELETES this rejection.**
+// --- 67.3: the `[rbac, tcp_proxy]` establishment backstops over the real binary --
+//
+// `tcp_proxy` connects upstream at ESTABLISHMENT (before any downstream byte), so a
+// server-first backend's banner reaches a byte-less client. The RBAC verdict lands
+// on the first downstream byte OR a data-less FIN; DENY withholds that byte from
+// the upstream. These boot `target/debug/envoy-bin` against an in-process banner
+// backend (a sibling process on loopback is exactly how the differential harness
+// reaches a backend). Every downstream read is `READ_BUDGET`-bounded (M-2).
+
+/// Spawn an in-process server-FIRST backend: writes `220 BANNER\r\n` on accept,
+/// then records every byte it subsequently receives. Returns its bound address and
+/// the recording handle. A sibling process (`envoy-bin`) reaches it over loopback.
+async fn spawn_banner_backend() -> (std::net::SocketAddr, Arc<tokio::sync::Mutex<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let recorded = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let rec = recorded.clone();
+    tokio::spawn(async move {
+        // Serve multiple connections: the FIN-matrix / DENY tests reconnect.
+        while let Ok((mut s, _)) = listener.accept().await {
+            let rec = rec.clone();
+            tokio::spawn(async move {
+                s.write_all(b"220 BANNER\r\n").await.ok();
+                s.flush().await.ok();
+                let mut buf = [0u8; 1024];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => rec.lock().await.extend_from_slice(&buf[..n]),
+                    }
+                }
+            });
+        }
+    });
+    (addr, recorded)
+}
+
+/// Connect to `addr`, retrying until the listener is up, and return the LIVE
+/// stream. Unlike `wait_ready` (which opens a throwaway probe and drops it), this
+/// keeps the connection, so for a `[rbac, tcp_proxy]` listener the test client is
+/// the SOLE data connection — a `wait_ready` probe would connect upstream and, on
+/// its own data-less FIN, evaluate the chain, polluting the counters under test.
+async fn connect_when_ready(addr: std::net::SocketAddr, budget: Duration) -> TcpStream {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(s) => return s,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("data listener never came up within {budget:?}: {e}"),
+        }
+    }
+}
+
+/// `[rbac, tcp_proxy→backend]` over a plaintext listener, with an admin endpoint.
+/// `rules_block` mirrors `ALLOW_ALL`/`DENY_ALL`'s indentation.
+fn rbac_tcp_proxy_cfg(
+    port: u16,
+    admin_port: u16,
+    backend_port: u16,
+    stat_prefix: &str,
+    rules_block: &str,
+) -> String {
+    format!(
+        r#"
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: {admin_port}
+static_resources:
+  listeners:
+    - name: rbac_tcp_listener
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: {port}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.rbac
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
+                stat_prefix: {stat_prefix}
+{rules_block}
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: ingress_tcp
+                cluster: backend
+  clusters:
+    - name: backend
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: {{ address: 127.0.0.1, port_value: {backend_port} }}
+"#
+    )
+}
+
+/// 67.3 D7 (ADR-0135): plaintext `[rbac(ALLOW), tcp_proxy]` over the real binary.
+/// The upstream is connected at ESTABLISHMENT, so a byte-less client still receives
+/// the server-first banner, and `cluster.backend.upstream_cx_total` ticks to 1.
 #[tokio::test]
-async fn rbac_before_tcp_proxy_is_rejected_at_config_load() {
+async fn plaintext_rbac_before_tcp_proxy_delivers_banner_to_a_byteless_client() {
+    let (backend_addr, _rec) = spawn_banner_backend().await;
+    let port = reserve_port();
+    let admin_port = reserve_port();
+    let (_child, _dir) = spawn_envoy_bin(&rbac_tcp_proxy_cfg(
+        port,
+        admin_port,
+        backend_addr.port(),
+        "tpa",
+        ALLOW_ALL,
+    ));
+    let data_addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("admin up");
+
+    // The test client is the SOLE data connection (see `connect_when_ready`).
+    let mut s = connect_when_ready(data_addr, Duration::from_secs(10)).await;
+    // Send NOTHING. The upstream (connected at establishment) speaks first.
+    let mut buf = [0u8; 12];
+    tokio::time::timeout(READ_BUDGET, s.read_exact(&mut buf))
+        .await
+        .expect("banner must reach a byte-less client (upstream connected at establishment)")
+        .expect("read banner");
+    assert_eq!(&buf, b"220 BANNER\r\n");
+
+    // The upstream connection was established BEFORE any downstream byte (R-2).
+    wait_for_stat(
+        admin_addr,
+        "cluster.backend.upstream_cx_total",
+        1,
+        Duration::from_secs(5),
+    )
+    .await;
+    drop(s);
+}
+
+/// 67.3 D7 / W-4 / R-2 (ADR-0135): plaintext `[rbac(DENY), tcp_proxy]` over the real
+/// binary. The banner is STILL delivered (upstream connected at establishment); the
+/// client's first byte triggers the DENY, `<sp>.rbac.denied` ticks to 1, the
+/// connection closes — and that byte NEVER reaches the backend.
+#[tokio::test]
+async fn deny_before_tcp_proxy_delivers_banner_then_withholds_the_byte() {
+    let (backend_addr, rec) = spawn_banner_backend().await;
+    let port = reserve_port();
+    let admin_port = reserve_port();
+    let (_child, _dir) = spawn_envoy_bin(&rbac_tcp_proxy_cfg(
+        port,
+        admin_port,
+        backend_addr.port(),
+        "tpd",
+        DENY_ALL,
+    ));
+    let data_addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("admin up");
+
+    let mut s = connect_when_ready(data_addr, Duration::from_secs(10)).await;
+    // Banner delivered despite DENY (upstream connected at establishment).
+    let mut buf = [0u8; 12];
+    tokio::time::timeout(READ_BUDGET, s.read_exact(&mut buf))
+        .await
+        .expect("banner must reach the client before the verdict")
+        .expect("read banner");
+    assert_eq!(&buf, b"220 BANNER\r\n");
+    // First byte → DENY: the connection closes with a clean EOF.
+    s.write_all(b"Z").await.ok();
+    let mut tail = Vec::new();
+    tokio::time::timeout(READ_BUDGET, s.read_to_end(&mut tail))
+        .await
+        .expect("DENY must close within the read budget")
+        .expect("clean EOF, not RST");
+    drop(s);
+
+    wait_for_stat(
+        admin_addr,
+        "tpd.rbac.denied",
+        1,
+        Duration::from_secs(5),
+    )
+    .await;
+    // W-4 / R-2: the first downstream byte must NEVER reach the upstream on DENY.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !rec.lock().await.contains(&b'Z'),
+        "DENY must NOT forward the first byte upstream",
+    );
+}
+
+/// 67.3 D3 (ADR-0135) — the FIN MATRIX. A data-less FIN (connect, `shutdown(WR)`,
+/// no payload) EVALUATES the chain for `tcp_proxy` (downstream half-close
+/// propagation) but NOT for `echo` (which peeks and sees `Ok(0)` → skip). The
+/// asymmetry is a property of the TERMINAL handler, not a filter-name check.
+#[tokio::test]
+async fn dataless_fin_ticks_allowed_for_tcp_proxy_but_not_echo() {
+    // tcp_proxy: a data-less FIN ticks `allowed` to 1.
+    let (backend_addr, _rec) = spawn_banner_backend().await;
+    let port = reserve_port();
+    let admin_port = reserve_port();
+    let (_child, _dir) = spawn_envoy_bin(&rbac_tcp_proxy_cfg(
+        port,
+        admin_port,
+        backend_addr.port(),
+        "tpf",
+        ALLOW_ALL,
+    ));
+    let data_addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let admin_addr = format!("127.0.0.1:{admin_port}").parse().unwrap();
+    wait_ready(admin_addr, Duration::from_secs(10))
+        .await
+        .expect("admin up");
+
+    let mut s = connect_when_ready(data_addr, Duration::from_secs(10)).await;
+    // Read the banner (server-first), then half-close WITHOUT sending data.
+    let mut buf = [0u8; 12];
+    tokio::time::timeout(READ_BUDGET, s.read_exact(&mut buf))
+        .await
+        .expect("banner")
+        .expect("read banner");
+    s.shutdown().await.expect("half-close the write side");
+    wait_for_stat(admin_addr, "tpf.rbac.allowed", 1, Duration::from_secs(5)).await;
+    drop(s);
+
+    // echo: the SAME data-less FIN ticks `allowed` 0 (ADR-0131 case C — echo peeks,
+    // sees Ok(0), and never evaluates the chain). The asymmetry is a terminal
+    // property (D3).
+    let eport = reserve_port();
+    let eadmin = reserve_port();
+    let (_echild, _edir) = spawn_envoy_bin(&rbac_echo_cfg_with_admin(eport, eadmin, "ef", ALLOW_ALL));
+    let edata_addr = format!("127.0.0.1:{eport}").parse().unwrap();
+    let eadmin_addr = format!("127.0.0.1:{eadmin}").parse().unwrap();
+    wait_ready(eadmin_addr, Duration::from_secs(10))
+        .await
+        .expect("echo admin up");
+
+    let mut es = connect_when_ready(edata_addr, Duration::from_secs(10)).await;
+    es.shutdown().await.expect("half-close the write side, no data");
+    // Give the peek's Ok(0) path time to close cleanly, then confirm no tick.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let estats = scrape_admin_stats(eadmin_addr).await;
+    assert_eq!(
+        estats.get("ef.rbac.allowed").copied(),
+        Some(0),
+        "echo does NOT evaluate on a data-less FIN (ADR-0131 case C); the asymmetry is a terminal property",
+    );
+    assert_eq!(estats.get("ef.rbac.denied").copied(), Some(0));
+    drop(es);
+}
+
+/// 67.3 D6 (ADR-0135, MEASURED): the TLS-downstream `[rbac, tcp_proxy]` composition
+/// stays REJECTED at config load, owner CF-67-7. Upstream Envoy establishes the
+/// upstream at raw-TCP accept and takes the verdict on the first DECRYPTED byte, an
+/// ordering envoy-rust's TLS handler does not yet reproduce. Never silent.
+#[tokio::test]
+async fn tls_rbac_before_tcp_proxy_is_rejected_at_config_load() {
     let port = reserve_port();
     let yaml = format!(
         r#"
@@ -739,7 +1005,15 @@ static_resources:
       address:
         socket_address: {{ address: 127.0.0.1, port_value: {port} }}
       filter_chains:
-        - filters:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: {{ filename: /tmp/leaf.pem }}
+                    private_key: {{ filename: /tmp/leaf.key }}
+          filters:
             - name: envoy.filters.network.rbac
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
@@ -763,15 +1037,15 @@ static_resources:
 "#
     );
     let (ok, output) = validate_config(&yaml).await;
-    assert!(!ok, "[rbac, tcp_proxy] must be rejected until 67.3");
+    assert!(!ok, "TLS [rbac, tcp_proxy] must be rejected until CF-67-7");
     assert!(
         output.contains("envoy.filters.network.tcp_proxy")
             && output.contains("envoy.filters.network.rbac"),
         "the error must name BOTH filters; got {output}",
     );
     assert!(
-        output.contains("67.3"),
-        "the error must name its owning phase, never be silent (ADR-0132 D4); got {output}",
+        output.contains("CF-67-7"),
+        "the error must name its owning carry-forward, never be silent (ADR-0135); got {output}",
     );
 }
 
