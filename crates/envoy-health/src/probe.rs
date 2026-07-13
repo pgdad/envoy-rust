@@ -15,6 +15,8 @@ use envoy_config::Int64Range;
 use envoy_http1::client::{Client, ClientStream};
 use envoy_http1::codec::{HttpVersion, Request};
 use envoy_stats::Counter;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -131,6 +133,137 @@ fn status_acceptable(status: u16, expected: &[Int64Range]) -> bool {
     expected.iter().any(|r| s >= r.start && s < r.end)
 }
 
+/// 68 (ADR-0137 PV-3): scan `buf` for the `receive` payloads in order — each
+/// found as a contiguous substring at/after the previous match's end. Empty
+/// `receive` ⇒ connection-only (always true once connected). Single-block
+/// reduces to "substring anywhere" (the reliably-measured Envoy behavior);
+/// multi-block is envoy-rust's own sequential contract, NOT an Envoy-parity claim.
+fn receive_matches(receive: &[Vec<u8>], buf: &[u8]) -> bool {
+    let mut offset = 0usize;
+    for payload in receive {
+        if payload.is_empty() {
+            continue;
+        }
+        match find_subslice(&buf[offset..], payload) {
+            Some(pos) => offset += pos + payload.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+/// First index of `needle` in `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 68: TCP-probe failure surface (diagnostic; the counters + EndpointHealth carry
+/// the live signal, mirroring the HTTP `ProbeError`).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum TcpProbeError {
+    /// `tokio::time::timeout(probe_timeout, ...)` elapsed (connect hang, or
+    /// `receive` never matched — the MEASURED `active_hc_timeout` path).
+    Timeout,
+    /// `TcpStream::connect` failed (the MEASURED connect-refuse path).
+    Connect(String),
+    /// Write of the `send` payload failed.
+    Send(String),
+    /// The connection reached EOF before `receive` matched.
+    Eof,
+}
+
+/// 68 (ADR-0137 PV-6): one TCP probe — connect → optional `send` → scan for
+/// `receive`, the WHOLE thing under one `timeout(probe_timeout, ...)` (the HC
+/// timeout, not the cluster connect_timeout, bounds connect). Empty `receive`
+/// ⇒ a successful connect is healthy. Mirrors the HTTP `probe_once` shape.
+pub(crate) async fn tcp_probe_once(
+    addr: SocketAddr,
+    send: &Option<Vec<u8>>,
+    receive: &[Vec<u8>],
+    probe_timeout: Duration,
+) -> Result<(), TcpProbeError> {
+    let probe = async move {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| TcpProbeError::Connect(e.to_string()))?;
+        if let Some(bytes) = send {
+            stream
+                .write_all(bytes)
+                .await
+                .map_err(|e| TcpProbeError::Send(e.to_string()))?;
+        }
+        if receive.is_empty() {
+            // Connection-only: connect success ⇒ healthy.
+            return Ok(());
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| TcpProbeError::Send(e.to_string()))?;
+            if n == 0 {
+                return Err(TcpProbeError::Eof);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if receive_matches(receive, &buf) {
+                return Ok(());
+            }
+        }
+    };
+    match timeout(probe_timeout, probe).await {
+        Ok(r) => r,
+        Err(_) => Err(TcpProbeError::Timeout),
+    }
+}
+
+/// 68: the periodic TCP-probe loop — the L4 sibling of `probe_loop`. Same
+/// `interval` ticker + `tokio::select!` cancel branch + counter/EndpointHealth
+/// wiring; only `probe_once` → `tcp_probe_once` differs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn tcp_probe_loop(
+    addr: SocketAddr,
+    send: Option<Vec<u8>>,
+    receive: Vec<Vec<u8>>,
+    probe_timeout: Duration,
+    interval_dur: Duration,
+    endpoint_health: Arc<EndpointHealth>,
+    attempt: Arc<Counter>,
+    success: Arc<Counter>,
+    failure: Arc<Counter>,
+    cancel: CancellationToken,
+) {
+    let mut ticker = interval(interval_dur);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::debug!(addr=%addr, "active-HC TCP probe task shutting down");
+                return;
+            }
+            _ = ticker.tick() => {
+                attempt.inc();
+                match tcp_probe_once(addr, &send, &receive, probe_timeout).await {
+                    Ok(()) => {
+                        success.inc();
+                        endpoint_health.record_success();
+                    }
+                    Err(e) => {
+                        tracing::debug!(addr=%addr, error=?e, "active-HC TCP probe failed");
+                        failure.inc();
+                        endpoint_health.record_failure();
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +301,112 @@ mod tests {
         assert!(status_acceptable(418, &r));
         assert!(!status_acceptable(419, &r));
         assert!(!status_acceptable(503, &r));
+    }
+
+    // -----------------------------------------------------------------------
+    // 68: TCP probe (pure matcher + integration)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn receive_matches_single_block_substring_anywhere() {
+        // MEASURED: banner "ABPINGCD", receive [PING] → healthy (substring in the middle).
+        assert!(receive_matches(&[b"PING".to_vec()], b"ABPINGCD"));
+        assert!(receive_matches(&[b"PING".to_vec()], b"PING"));
+        assert!(!receive_matches(&[b"PONG".to_vec()], b"ABPINGCD"));
+    }
+
+    #[test]
+    fn receive_matches_empty_receive_is_true() {
+        // Connection-only: no receive payloads ⇒ connect success alone is healthy.
+        assert!(receive_matches(&[], b""));
+        assert!(receive_matches(&[], b"anything"));
+    }
+
+    #[test]
+    fn receive_matches_sequential_in_order() {
+        // envoy-rust's OWN documented multi-block contract (NOT an Envoy-parity claim,
+        // ADR-0137 PV-3): each block found at/after the previous match end.
+        assert!(receive_matches(&[b"AB".to_vec(), b"CD".to_vec()], b"AB__CD"));
+        assert!(!receive_matches(&[b"CD".to_vec(), b"AB".to_vec()], b"AB__CD"));
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_connection_only_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        assert!(
+            tcp_probe_once(addr, &None, &[], Duration::from_secs(2))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_connect_refused_is_err() {
+        // Reserve then drop a listener → the port refuses.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let r = tcp_probe_once(addr, &None, &[], Duration::from_secs(1)).await;
+        assert!(matches!(
+            r,
+            Err(TcpProbeError::Connect(_)) | Err(TcpProbeError::Timeout)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_receive_match_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            let _ = s.write_all(b"AB").await;
+            let _ = s.write_all(b"PING").await;
+            let _ = s.write_all(b"CD").await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let r = tcp_probe_once(addr, &None, &[b"PING".to_vec()], Duration::from_secs(2)).await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_receive_mismatch_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            let _ = s.write_all(b"NOPE").await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let r = tcp_probe_once(addr, &None, &[b"PING".to_vec()], Duration::from_millis(400)).await;
+        assert!(matches!(r, Err(TcpProbeError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_send_then_receive_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut b = [0u8; 16];
+            let n = s.read(&mut b).await.unwrap();
+            assert_eq!(&b[..n], b"hi");
+            let _ = s.write_all(b"resp-OKOK-end").await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let r = tcp_probe_once(
+            addr,
+            &Some(b"hi".to_vec()),
+            &[b"OKOK".to_vec()],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(r.is_ok());
     }
 }
