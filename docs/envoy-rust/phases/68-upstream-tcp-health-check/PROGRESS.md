@@ -124,6 +124,93 @@ Docker differential first run at the state-4 gate):
 `differential-harness-uses-debug-envoy-bin`; the documented host-flake set is
 CI-authoritative). Quote all outputs into this file.
 
+## §5 state-4 verification — full §7.5 gate run (`superpowers:verification-before-completion`)
+
+> Session cold-started clean (`git status --porcelain` empty, branch `main`,
+> `HEAD` = `9ac38d8`, `git fetch origin --prune` showed no sibling ahead). **STEP
+> 0.5:** CI run `29216603720` for the FULL 40-char SHA
+> `9ac38d89a710972daeb55041a3933edb7d83dedf` is `completed`/`success`. Below is
+> the state-4 gate re-run over the whole tree with every command's output quoted
+> (memory `envoy-rust-state4-ci-first-execution` — fmt-check + Docker differential
+> first run at THIS gate; the gate is run itself, not skipped because CI is green).
+
+**(1) `cargo build --workspace --all-targets`** — EXIT 0.
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.40s
+```
+
+**(2) `cargo clippy --workspace --all-targets --all-features -- -D warnings`** — EXIT 0, zero warnings.
+```
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+```
+
+**(3) `cargo fmt --all -- --check`** — EXIT 0 (no output = fully formatted; fmt-check
+first runs at this gate and is clean, no `cargo fmt --all` re-format needed).
+
+**(4) `cargo test --workspace --no-fail-fast`** (redirected to a file — memories
+`never-pipe-verification-runs-through-tail`, `local-red-set-varies-run-to-run`) —
+EXIT 101; **1973 passed, 6 failed** across all binaries. The phase-68 fixture
+`0074` (`upstream_tcp_health_check_fixture`) is **GREEN** locally:
+```
+2026-07-13T06:38:11Z  WARN no healthy endpoint for cluster — returning 503 cluster=tcp_hc_backend
+test upstream_tcp_health_check_fixture ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.13s
+```
+All 6 local REDs are in the `differential` crate and each maps to a DOCUMENTED
+host-environmental flake; the SAME tree passes all 6 on CI (run `29216603720`,
+`success`), so none is a phase regression (`local passed+failed` = 1979 = `CI
+passed`):
+
+| Failing test | Local signature | Documented flake |
+|---|---|---|
+| `access_log_h2_rcd_upstream_reset` | ref Envoy routes host-spawned close backend to unreachable IPv6 `[fdc4:f303:9324::254]` (`immediate_connect_error: Network is unreachable`) → `UF`; envoy-rust reaches it → `UC` | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_h2_uc_upstream_reset` | same IPv6-unreachable `UF` vs `UC` | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_rcd_upstream_reset` | same | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_rf_upstream_reset` | same (`envoy="{\"rc\":503,\"rf\":\"UF\"}"` vs `envoy-rust="{...\"rf\":\"UC\"}"`) | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `admin_config_dump_server_info` | envoy-only `/clusters` lines `backend::192.168.65.2:34247::…` — ref Envoy routes the backend via the host bridge IP `192.168.65.2` (not allow-listed) | `differential-host-bridge-ip-192-168-65-2` |
+| `xds_file_based_eds` | `upstream Envoy never became accept-ready within 10s: Connection refused` — port-reuse/parallel-load startup race | `eds-fatal-startup-test-port-reuse-flake` / `differential-fixtures-flake-under-parallel-load` |
+
+Adjudication per memory `local-red-set-varies-run-to-run` (re-run each member in
+isolation — the environmental host-networking ones fail DETERMINISTICALLY, the
+parallel-load startup one PASSES):
+- `cargo test -p differential --test xds_file_based_eds` (isolation) → **EXIT 0**,
+  `test result: ok. 1 passed; 0 failed` — parallel-load startup flake, NOT a regression.
+- `cargo test -p differential --test access_log_rf_upstream_reset` (isolation) →
+  EXIT 101, SAME `UF` vs `UC` signature — deterministic host-networking (this host's
+  Docker cannot reach the host-spawned close backend), environmental; CI (correct
+  networking) passes it. NOT a regression, fixture NOT weakened.
+
+**No `gh run rerun --failed`** is needed — CI on the HEAD SHA is ALREADY
+`success` (there is no red CI run to rerun); the rerun guidance only applies when
+CI itself reds.
+
+**(5) `cargo deny check`** — EXIT 0.
+```
+advisories ok, bans ok, licenses ok, sources ok
+```
+(The `license-not-encountered` lines are pre-existing unmatched-allowance warnings
+in `deny.toml`, unrelated to phase 68.)
+
+**(6) `cd crates/envoy-config && cargo +nightly fuzz run parse_bootstrap -- -max_total_time=30`**
+(the §7.4 CI-style short-budget run; memory `cargo-fuzz-runs-from-crate-dir-not-repo-root`;
+NO new target — a `parse_bootstrap` seed only, so no `ci.yml` change) — EXIT 0, no crash.
+```
+INFO:     6870 files found in .../fuzz/corpus/parse_bootstrap   (incl. the new seed)
+#9359	DONE   cov: 15244 ft: 30658 corp: 2589/1689Kb ...
+Done 9359 runs in 91 second(s)
+```
+
+**(7) The differential suite for the HC surface** — `target/debug/envoy-bin`
+rebuilt by the `--all-targets` build above (memory
+`differential-harness-uses-debug-envoy-bin`); fixture `0074`
+(`upstream_tcp_health_check_fixture`) GREEN locally (quoted in (4)) and on CI; the
+pre-existing `0001`–`0073` stay green modulo the documented host-flake set (§7.5
+(a)+(b)).
+
+**Gate verdict: GREEN.** Every §7.5 command passes; the only local REDs are 6
+DOCUMENTED host-environmental flakes (all green on the HEAD-SHA CI run). The
+implementation is verified. Advancing `STATE.md` to §5 state-5 (code-review).
+
 ## Traps honored
 - No CidrRange changes (M-1 untouched); no revert of landed 67/12 work; no fixture
   weakened; `known-failures.txt` untouched; no ROADMAP malformed-row "fixes".
