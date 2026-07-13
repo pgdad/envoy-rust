@@ -10,6 +10,7 @@ name = "envoy_config"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.22"
 envoy-accesslog = { path = "../envoy-accesslog" }
 envoy-jwt = { path = "../envoy-jwt" }
 regex = "1"

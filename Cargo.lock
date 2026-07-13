@@ -419,6 +419,7 @@ dependencies = [
 name = "envoy-config"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "envoy-accesslog",
  "envoy-jwt",
  "regex",

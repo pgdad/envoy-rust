@@ -765,6 +765,21 @@ pub enum ConfigError {
     #[error("cluster '{cluster}' http_health_check.path must be non-empty")]
     EmptyHealthCheckPath { cluster: String },
 
+    /// 68 (ADR-0137 PV-1): a `tcp_health_check` `send`/`receive` payload `text`
+    /// was odd-length or non-hex. Native fail-loud (byte-parity with Envoy's
+    /// `invalid hex string` waived — config-load errors are not a wire surface).
+    #[error("cluster '{cluster}' tcp_health_check payload text '{value}' is not a valid hex string")]
+    InvalidHealthCheckPayloadHex { cluster: String, value: String },
+
+    /// 68 (ADR-0137 PV-1): a `tcp_health_check` payload `binary` was not valid base64.
+    #[error("cluster '{cluster}' tcp_health_check payload binary '{value}' is not valid base64")]
+    InvalidHealthCheckPayloadBase64 { cluster: String, value: String },
+
+    /// 68 (ADR-0137 PV-1): a `tcp_health_check` payload set neither `text` nor
+    /// `binary` (or both). The `Payload` oneof requires exactly one.
+    #[error("cluster '{cluster}' tcp_health_check payload must set exactly one of text or binary")]
+    EmptyHealthCheckPayload { cluster: String },
+
     /// 12.1: `common_lb_config.healthy_panic_threshold.value` is outside [0.0, 100.0].
     #[error("cluster '{cluster}' healthy_panic_threshold value {value} is outside [0.0, 100.0]")]
     InvalidPanicThreshold { cluster: String, value: f64 },

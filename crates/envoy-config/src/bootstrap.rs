@@ -2463,6 +2463,71 @@ pub struct HttpHealthCheck {
     pub expected_statuses: Vec<Int64Range>,
 }
 
+/// 68 (ADR-0136/0137): a `tcp_health_check` `send`/`receive` payload — an
+/// `envoy.config.core.v3.HealthCheck.Payload` oneof `{ text: <hex> | binary:
+/// <base64> }`. Modeled as two serde Options (the bootstrap oneof-as-two-Options
+/// precedent); `decode()` yields the raw bytes fail-loud (ADR-0137 PV-1).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheckPayload {
+    /// Hex-encoded bytes (upstream `Payload.text`). Odd-length / non-hex → fatal.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Base64-encoded bytes (upstream `Payload.binary`).
+    #[serde(default)]
+    pub binary: Option<String>,
+}
+
+/// 68: `HealthCheckPayload::decode` failure — mapped to a `ConfigError` by the
+/// validator (Task 3) and `.expect()`ed by the probe (Task 4, defense-in-depth,
+/// the `parse_duration` precedent).
+#[derive(Debug, PartialEq)]
+pub enum PayloadDecodeError {
+    /// `text` was odd-length or contained a non-hex digit. Carries the offending string.
+    InvalidHex(String),
+    /// `binary` was not valid base64. Carries the offending string.
+    InvalidBase64(String),
+    /// Neither `text` nor `binary` set, OR both set (the `Payload` oneof requires exactly one).
+    Empty,
+}
+
+impl HealthCheckPayload {
+    /// 68 (ADR-0137 PV-1): decode to raw bytes. Native fail-loud (byte-parity waived).
+    pub fn decode(&self) -> Result<Vec<u8>, PayloadDecodeError> {
+        match (&self.text, &self.binary) {
+            (Some(hex), None) => {
+                decode_hex(hex).ok_or_else(|| PayloadDecodeError::InvalidHex(hex.clone()))
+            }
+            (None, Some(b64)) => {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .map_err(|_| PayloadDecodeError::InvalidBase64(b64.clone()))
+            }
+            _ => Err(PayloadDecodeError::Empty),
+        }
+    }
+}
+
+/// 68: hand-rolled hex decode (the `from_str_radix` precedent at
+/// `crates/envoy-http1/src/client.rs:631`). Returns `None` on odd length or a
+/// non-hex digit. Kept private; `HealthCheckPayload::decode` is the entry point.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
 /// 12.1 (parent-12 D1): the subset of `common_lb_config` phase-12 consumes.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -14936,6 +15001,69 @@ admin:
         let cluster = &bootstrap.static_resources.clusters[0];
         assert!(cluster.health_checks.is_empty());
         assert!(cluster.common_lb_config.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // 68: HealthCheckPayload hex/base64 decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn payload_decode_hex_text_ok() {
+        let p = HealthCheckPayload {
+            text: Some("50494e47".to_string()),
+            binary: None,
+        };
+        assert_eq!(p.decode().unwrap(), b"PING");
+    }
+
+    #[test]
+    fn payload_decode_odd_length_hex_is_err() {
+        let p = HealthCheckPayload {
+            text: Some("0".to_string()),
+            binary: None,
+        };
+        assert!(matches!(p.decode(), Err(PayloadDecodeError::InvalidHex(ref s)) if s == "0"));
+    }
+
+    #[test]
+    fn payload_decode_non_hex_is_err() {
+        let p = HealthCheckPayload {
+            text: Some("zzzz".to_string()),
+            binary: None,
+        };
+        assert!(matches!(p.decode(), Err(PayloadDecodeError::InvalidHex(ref s)) if s == "zzzz"));
+    }
+
+    #[test]
+    fn payload_decode_base64_binary_ok() {
+        let p = HealthCheckPayload {
+            text: None,
+            binary: Some("AAECAw==".to_string()),
+        };
+        assert_eq!(p.decode().unwrap(), vec![0u8, 1, 2, 3]);
+    }
+
+    #[test]
+    fn payload_decode_bad_base64_is_err() {
+        let p = HealthCheckPayload {
+            text: None,
+            binary: Some("!!!!".to_string()),
+        };
+        assert!(matches!(p.decode(), Err(PayloadDecodeError::InvalidBase64(_))));
+    }
+
+    #[test]
+    fn payload_decode_empty_is_err() {
+        let p = HealthCheckPayload {
+            text: None,
+            binary: None,
+        };
+        assert!(matches!(p.decode(), Err(PayloadDecodeError::Empty)));
+        let both = HealthCheckPayload {
+            text: Some("00".to_string()),
+            binary: Some("AA==".to_string()),
+        };
+        assert!(matches!(both.decode(), Err(PayloadDecodeError::Empty)));
     }
 
     #[test]
