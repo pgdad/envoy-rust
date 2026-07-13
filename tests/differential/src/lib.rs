@@ -3487,6 +3487,21 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
     };
     let h2_close_backend_port_str = _h2_close_backend.as_ref().map(|b| b.port().to_string());
 
+    // 68 (ADR-0137 PV-2): a hermetic REFUSED port — reserve an ephemeral port
+    // and spawn NO listener, so both proxies get ECONNREFUSED on the TCP HC
+    // probe. `reserve_port` skips ports already handed out to the proxies, so
+    // nothing binds it for the test's duration.
+    let needs_dead_backend = scan_needs_marker(&backend_scan_sources, "DEAD_BACKEND_PORT");
+    let dead_backend_port_str: Option<String> = if needs_dead_backend {
+        Some(
+            reserve_port()
+                .context("reserving DEAD_BACKEND_PORT")?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
     // (c) Build per-side substitution maps with TLS path keys.
     // Type is Vec<(&str, String)> to accommodate owned strings from TLS paths.
     let upstream_tls_paths = tls_pki.as_ref().map(|p| p.envoy_side_paths());
@@ -3521,6 +3536,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(h2cp) = h2_close_backend_port_str.as_deref() {
             v.push(("H2_CLOSE_BACKEND_PORT", h2cp.to_string()));
         }
+        // 68 (ADR-0137 PV-2): the hermetic refused port (no listener).
+        if let Some(dp) = dead_backend_port_str.as_deref() {
+            v.push(("DEAD_BACKEND_PORT", dp.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
@@ -3529,6 +3548,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || http2_backend_port_str.is_some()
             || close_backend_port_str.is_some()
             || h2_close_backend_port_str.is_some()
+            || dead_backend_port_str.is_some()
         {
             // Per ADR-0015: container-side reaches the host backend via
             // host.docker.internal (with the harness's with_host call below).
@@ -3617,6 +3637,10 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
         if let Some(h2cp) = h2_close_backend_port_str.as_deref() {
             v.push(("H2_CLOSE_BACKEND_PORT", h2cp.to_string()));
         }
+        // 68 (ADR-0137 PV-2): the hermetic refused port (no listener).
+        if let Some(dp) = dead_backend_port_str.as_deref() {
+            v.push(("DEAD_BACKEND_PORT", dp.to_string()));
+        }
         if backend_port_str.is_some()
             || tls_backend_port_str.is_some()
             || http1_backend_port_str.is_some()
@@ -3625,6 +3649,7 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             || http2_backend_port_str.is_some()
             || close_backend_port_str.is_some()
             || h2_close_backend_port_str.is_some()
+            || dead_backend_port_str.is_some()
         {
             v.push(("BACKEND_HOST", "127.0.0.1".to_string()));
         }
