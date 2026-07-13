@@ -519,6 +519,55 @@ no-op clause below).
 
 ---
 
+## Active TCP health check (`tcp_health_check`)
+
+Phase 68 (ADR-0136 / ADR-0137) adds active **TCP** health checking — the
+upstream-robustness family's second checker type after phase-12 HTTP. Every
+wire/behavior fact below was MEASURED against `envoyproxy/envoy:v1.33.0` during
+the state-0 recon (SPEC §0) and the state-2 §6.2 re-verification (ADR-0137); the
+implementation asserts only what is measured (D-3.3).
+
+- **Checker shape.** `HealthCheck.tcp_health_check` is a sub-message
+  `{ send?: Payload, receive?: [Payload] }`. **Empty** (`tcp_health_check: {}`)
+  ⇒ a **connection-only** check: a successful TCP connect ⇒ Healthy. `send` (a
+  single `Payload`) is written once after connect; `receive` (repeated `Payload`)
+  is then scanned in the inbound bytes.
+- **`Payload` oneof.** `Payload` is `{ text: <hex> | binary: <base64> }` —
+  exactly one of the two. `text` is a hex string, `binary` is base64. Decoded to
+  raw bytes at **validate time**, fail-loud: odd-length / non-hex `text`, invalid
+  base64, and neither-or-both-set are all **load-fatal** typed `ConfigError`s
+  (native messages — byte-parity with Envoy's `invalid hex string '…'` is WAIVED
+  per ADR-0049 / ADR-0137 PV-1; config-load errors are not a differential wire
+  surface).
+- **`health_checker` oneof.** A `HealthCheck` setting **both** `http_health_check`
+  and `tcp_health_check` is **load-fatal** (`ConfigError::BothHttpAndTcpHealthCheck`)
+  — the upstream `health_checker` oneof (MEASURED, R-0.4 / ADR-0137 PV-4). Setting
+  **neither** stays `UnsupportedHealthCheckType` (gRPC/custom still deferred).
+- **`receive` matching.** The `receive` scan is a **contiguous-substring** search:
+  a payload found anywhere in the accumulated inbound bytes matches (MEASURED for
+  a single block — a banner `ABPINGCD` matches `receive: [PING]`). **Only
+  single-block is Envoy-parity-pinned** (ADR-0137 PV-3); multi-block is
+  implemented as envoy-rust's own sequential-in-order contract (each block at/after
+  the previous match end) and is NOT asserted for Envoy parity.
+- **Timeout.** ONE `timeout(hc.timeout, …)` bounds the WHOLE probe — connect,
+  `send`, and the `receive` scan (MEASURED: a blackhole endpoint is ejected at
+  ~`timeout`, well before any cluster `connect_timeout`; ADR-0137 PV-6). The
+  cluster `connect_timeout` is NOT consulted by the checker (mirrors the HTTP
+  `probe_once`).
+- **Outcomes & stats.** A matched `receive` or a successful connection-only probe
+  ⇒ `.success` + (after `healthy_threshold`) Healthy. A **connect refusal** ⇒ an
+  immediate `.failure` (Envoy `health_flags` `/failed_active_hc`). A `receive`
+  **no-match within `timeout`** ⇒ a `.failure` on timeout elapse (Envoy
+  `/failed_active_hc/active_hc_timeout`). Ejection after `unhealthy_threshold`
+  consecutive failures drives `membership_healthy` → 0 and, on a cluster fronted
+  by an HCM/router with panic disabled, `pick() → None` → synth-503
+  `no healthy upstream` (the fixture-0074 differential observable, identical to
+  fixture 0019). The `cluster.<name>.health_check.*` + `membership_*` stat tree is
+  **identical** to phase 12 — no new stat names (see the Stat-name mapping "68
+  entries" note).
+
+---
+
 ## Header allow-list
 
 > **To be filled per-phase as needed.**
@@ -631,6 +680,15 @@ value wins.
 | `cluster.<name>.health_check.attempt` | name-required, value-may-differ | Counter; one increment per health-check probe issued by the `envoy-health` scheduler. The count is **timing-dependent** — both proxies tick on their own independent `tokio::time::interval` schedules from independent process-start instants, so the elapsed-probe count over a fixed test window differs across proxies. Both proxies emit the name; the equivalence dimension is name-required only (value-exact is not feasible without timing-tolerance opt-in per §Timing tolerances, which phase 12 does NOT take). Registered at `Scheduler::spawn` time only when the cluster configures `health_checks`. |
 | `cluster.<name>.health_check.success` | name-required, value-may-differ | Counter; one increment per probe whose response status ∈ `expected_statuses` (default exactly 200, half-open `Int64Range`). Same timing-dependence rationale as `.attempt`. |
 | `cluster.<name>.health_check.failure` | name-required, value-may-differ | Counter; one increment per probe whose response status is NOT in `expected_statuses`, OR connect failure, OR per-probe `tokio::time::timeout` elapsed, OR malformed response (the network-failure-class results fold into `failure` at phase-12 scope; the dedicated `network_failure` sub-counter defers per parent SPEC §4). Same timing-dependence rationale as `.attempt`. |
+
+**68 entries (active TCP health checking — IDENTICAL stat tree):** the active
+**TCP** checker (`tcp_health_check`, phase 68, ADR-0136 / ADR-0137) witnesses the
+**same** `cluster.<name>.membership_healthy` gauge and `cluster.<name>.health_check.{attempt,success,failure}`
+counters listed in the 12.1 / 12.2 rows above — **no new stat names**. A TCP
+probe increments `.success` on a matched/connection-only probe and `.failure` on
+a connect refusal or a `receive` no-match within `timeout`; ejection drives
+`membership_healthy` exactly as the HTTP checker does. See the behavior section
+[Active TCP health check (`tcp_health_check`)](#active-tcp-health-check-tcp_health_check).
 
 **13.1 entries (H1 connection pool):**
 
