@@ -15104,7 +15104,10 @@ admin:
             text: None,
             binary: Some("!!!!".to_string()),
         };
-        assert!(matches!(p.decode(), Err(PayloadDecodeError::InvalidBase64(_))));
+        assert!(matches!(
+            p.decode(),
+            Err(PayloadDecodeError::InvalidBase64(_))
+        ));
     }
 
     #[test]

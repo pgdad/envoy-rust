@@ -22,22 +22,20 @@ pub use bootstrap::{
     HeaderMatcher, HeaderMatcherMode, HeaderMutationConfig, HeaderMutationEntry,
     HeaderToMetadataConfig, HeaderToMetadataKeyValue, HeaderToMetadataRule, HeaderToMetadataType,
     HeaderValue, HeaderValueOption, HealthCheck, HealthCheckPayload, Http1ProtocolOptions,
-    Http2ProtocolOptions,
-    HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpHealthCheck,
-    HttpProtocolOptions, HttpStatus, Int64Range, JsonFormatValue, JwtAuthnConfig, JwtProvider,
-    JwtRequirement, LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig, LbSubsetFallbackPolicy,
-    LbSubsetSelector, Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints,
-    MetadataEntry, MetadataMatcher, MetadataPathSegment, Mutations, NetworkFilter,
-    NetworkRbacConfig, Node, OutlierDetection, PathConfigSource, PathMatcher, PayloadDecodeError,
-    PerFilterConfig,
-    Percent, Permission, PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds,
-    RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
-    RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent,
-    SafeRegex, SetMetadataConfig, SocketAddress, StaticResources, StringMatcher, StringMatcherMode,
-    SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig, Thresholds, TlsCertificate,
-    TokenBucket,
-    TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
-    UpstreamTlsContext, ValueMatcher, VirtualHost, parse_duration,
+    Http2ProtocolOptions, HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig,
+    HttpHealthCheck, HttpProtocolOptions, HttpStatus, Int64Range, JsonFormatValue, JwtAuthnConfig,
+    JwtProvider, JwtRequirement, LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig,
+    LbSubsetFallbackPolicy, LbSubsetSelector, Listener, LoadAssignment, LocalRateLimitConfig,
+    LocalityLbEndpoints, MetadataEntry, MetadataMatcher, MetadataPathSegment, Mutations,
+    NetworkFilter, NetworkRbacConfig, Node, OutlierDetection, PathConfigSource, PathMatcher,
+    PayloadDecodeError, PerFilterConfig, Percent, Permission, PermissionSet, Policy, Principal,
+    PrincipalSet, RbacConfig, Rds, RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route,
+    RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority,
+    Rules, RuntimeFractionalPercent, SafeRegex, SetMetadataConfig, SocketAddress, StaticResources,
+    StringMatcher, StringMatcherMode, SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig,
+    Thresholds, TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig,
+    TypedConfig, TypedExtensionProtocolOptions, UpstreamTlsContext, ValueMatcher, VirtualHost,
+    parse_duration,
 };
 pub use cds::parse_cds_file;
 pub use eds::parse_eds_file;
@@ -742,7 +740,9 @@ pub enum ConfigError {
     /// 68 (ADR-0137 PV-4): a health check sets BOTH `http_health_check` and
     /// `tcp_health_check` — the upstream `HealthCheck.health_checker` oneof
     /// rejects this at load (MEASURED against v1.33.0).
-    #[error("cluster '{cluster}' health check sets both http_health_check and tcp_health_check (mutually exclusive)")]
+    #[error(
+        "cluster '{cluster}' health check sets both http_health_check and tcp_health_check (mutually exclusive)"
+    )]
     BothHttpAndTcpHealthCheck { cluster: String },
 
     /// 12.1: `healthy_threshold` or `unhealthy_threshold` is zero (must be >= 1).
@@ -778,7 +778,9 @@ pub enum ConfigError {
     /// 68 (ADR-0137 PV-1): a `tcp_health_check` `send`/`receive` payload `text`
     /// was odd-length or non-hex. Native fail-loud (byte-parity with Envoy's
     /// `invalid hex string` waived — config-load errors are not a wire surface).
-    #[error("cluster '{cluster}' tcp_health_check payload text '{value}' is not a valid hex string")]
+    #[error(
+        "cluster '{cluster}' tcp_health_check payload text '{value}' is not a valid hex string"
+    )]
     InvalidHealthCheckPayloadHex { cluster: String, value: String },
 
     /// 68 (ADR-0137 PV-1): a `tcp_health_check` payload `binary` was not valid base64.

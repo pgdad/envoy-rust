@@ -326,8 +326,14 @@ mod tests {
     fn receive_matches_sequential_in_order() {
         // envoy-rust's OWN documented multi-block contract (NOT an Envoy-parity claim,
         // ADR-0137 PV-3): each block found at/after the previous match end.
-        assert!(receive_matches(&[b"AB".to_vec(), b"CD".to_vec()], b"AB__CD"));
-        assert!(!receive_matches(&[b"CD".to_vec(), b"AB".to_vec()], b"AB__CD"));
+        assert!(receive_matches(
+            &[b"AB".to_vec(), b"CD".to_vec()],
+            b"AB__CD"
+        ));
+        assert!(!receive_matches(
+            &[b"CD".to_vec(), b"AB".to_vec()],
+            b"AB__CD"
+        ));
     }
 
     #[tokio::test]
