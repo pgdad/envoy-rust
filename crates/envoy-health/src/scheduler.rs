@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::HealthError;
-use crate::probe::probe_loop;
+use crate::probe::{probe_loop, tcp_probe_loop};
 
 /// 12.2: the active-HC scheduler. Holds the JoinHandles of every spawned
 /// probe task. Drop without `shutdown()` is safe — the tasks observe the
@@ -45,15 +45,12 @@ impl Scheduler {
     ) -> Result<Self, HealthError> {
         let mut handles = Vec::new();
         for cfg in bootstrap.all_clusters() {
-            // 12.1 D2 validator guarantees 0 or 1 HC entry, HTTP-only.
+            // 12.1 D2 / 68 validator guarantees 0 or 1 HC entry, with exactly
+            // one of `http_health_check` / `tcp_health_check` present.
             let hc = match cfg.health_checks.first() {
                 Some(h) => h,
                 None => continue,
             };
-            let http = hc
-                .http_health_check
-                .as_ref()
-                .expect("validator-guaranteed http_health_check present");
 
             // Register the 3 counters (one set per cluster).
             let attempt = register_counter(&registry, &cfg.name, "attempt")?;
@@ -77,9 +74,28 @@ impl Scheduler {
                 }
             })?;
 
-            let host_default = http.host.clone().unwrap_or_else(|| cfg.name.clone());
-            let path = http.path.clone();
-            let expected = http.expected_statuses.clone();
+            // 68: select the checker type (validator guarantees exactly one).
+            // Re-decode TCP payloads at spawn (defense-in-depth; the validator
+            // already accepted them — the `parse_duration` precedent).
+            let tcp_cfg = hc.tcp_health_check.as_ref().map(|tcp| {
+                let send = tcp
+                    .send
+                    .as_ref()
+                    .map(|p| p.decode().expect("validator-accepted send payload"));
+                let receive: Vec<Vec<u8>> = tcp
+                    .receive
+                    .iter()
+                    .map(|p| p.decode().expect("validator-accepted receive payload"))
+                    .collect();
+                (send, receive)
+            });
+            let http_cfg = hc.http_health_check.as_ref().map(|http| {
+                (
+                    http.host.clone().unwrap_or_else(|| cfg.name.clone()),
+                    http.path.clone(),
+                    http.expected_statuses.clone(),
+                )
+            });
 
             // Walk the resolved (addr, EndpointHealth) pairs from the
             // ClusterManager (the 12.2 `health_probe_targets` accessor).
@@ -92,29 +108,51 @@ impl Scheduler {
                 .expect("HC-configured cluster has health_probe_targets");
             for (addr, endpoint_health) in targets {
                 let cancel = cancel.clone();
-                let host_str = host_default.clone();
-                let path_str = path.clone();
-                let exp = expected.clone();
                 let a = Arc::clone(&attempt);
                 let s = Arc::clone(&success);
                 let f = Arc::clone(&failure);
                 let eh: Arc<EndpointHealth> = endpoint_health;
-                let h = tokio::spawn(async move {
-                    probe_loop(
-                        addr,
-                        host_str,
-                        path_str,
-                        probe_timeout,
-                        interval_dur,
-                        exp,
-                        eh,
-                        a,
-                        s,
-                        f,
-                        cancel,
-                    )
-                    .await;
-                });
+                let h = match (&http_cfg, &tcp_cfg) {
+                    (Some((host, path, exp)), None) => {
+                        let (host, path, exp) = (host.clone(), path.clone(), exp.clone());
+                        tokio::spawn(async move {
+                            probe_loop(
+                                addr,
+                                host,
+                                path,
+                                probe_timeout,
+                                interval_dur,
+                                exp,
+                                eh,
+                                a,
+                                s,
+                                f,
+                                cancel,
+                            )
+                            .await;
+                        })
+                    }
+                    (None, Some((send, receive))) => {
+                        let (send, receive) = (send.clone(), receive.clone());
+                        tokio::spawn(async move {
+                            tcp_probe_loop(
+                                addr,
+                                send,
+                                receive,
+                                probe_timeout,
+                                interval_dur,
+                                eh,
+                                a,
+                                s,
+                                f,
+                                cancel,
+                            )
+                            .await;
+                        })
+                    }
+                    // Validator guarantees exactly one checker present.
+                    _ => unreachable!("validator guarantees exactly one health checker"),
+                };
                 handles.push(h);
             }
         }
@@ -203,6 +241,60 @@ admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
 "#;
+
+    const TCP_HC_BOOTSTRAP: &str = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: tcp_hc_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      common_lb_config:
+        healthy_panic_threshold: { value: 0 }
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 2
+          tcp_health_check: { receive: [ { text: "50494e47" } ] }
+      load_assignment:
+        cluster_name: tcp_hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 60011 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+
+    #[tokio::test]
+    async fn spawns_tcp_probe_task_and_registers_counters() {
+        let bootstrap = parse_bootstrap(TCP_HC_BOOTSTRAP).expect("parse");
+        let registry = Arc::new(StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("build"),
+        );
+        let cancel = CancellationToken::new();
+        let scheduler = Scheduler::spawn(&bootstrap, cluster_mgr, registry.clone(), cancel.clone())
+            .expect("scheduler");
+        assert_eq!(
+            scheduler.task_count(),
+            1,
+            "one TCP probe task for the single endpoint"
+        );
+        let snapshot = registry.snapshot();
+        for kind in ["attempt", "success", "failure"] {
+            let name = format!("cluster.tcp_hc_backend.health_check.{kind}");
+            assert!(
+                snapshot.iter().any(|(n, _)| n == &name),
+                "registry must contain {name}"
+            );
+        }
+        scheduler.shutdown().await;
+    }
 
     #[tokio::test]
     async fn spawns_one_task_per_hc_endpoint() {
