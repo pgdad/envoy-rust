@@ -21,18 +21,21 @@ pub use bootstrap::{
     FileAccessLog, FilterChain, FilterChainMatch, FractionalPercent, HashPolicy, HashPolicyHeader,
     HeaderMatcher, HeaderMatcherMode, HeaderMutationConfig, HeaderMutationEntry,
     HeaderToMetadataConfig, HeaderToMetadataKeyValue, HeaderToMetadataRule, HeaderToMetadataType,
-    HeaderValue, HeaderValueOption, HealthCheck, Http1ProtocolOptions, Http2ProtocolOptions,
+    HeaderValue, HeaderValueOption, HealthCheck, HealthCheckPayload, Http1ProtocolOptions,
+    Http2ProtocolOptions,
     HttpConnectionManagerConfig, HttpFilter, HttpFilterTypedConfig, HttpHealthCheck,
     HttpProtocolOptions, HttpStatus, Int64Range, JsonFormatValue, JwtAuthnConfig, JwtProvider,
     JwtRequirement, LbEndpoint, LbMetadata, LbPolicy, LbSubsetConfig, LbSubsetFallbackPolicy,
     LbSubsetSelector, Listener, LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints,
     MetadataEntry, MetadataMatcher, MetadataPathSegment, Mutations, NetworkFilter,
-    NetworkRbacConfig, Node, OutlierDetection, PathConfigSource, PathMatcher, PerFilterConfig,
+    NetworkRbacConfig, Node, OutlierDetection, PathConfigSource, PathMatcher, PayloadDecodeError,
+    PerFilterConfig,
     Percent, Permission, PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds,
     RequirementRule, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,
     RouteConfiguration, RouteMatch, RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent,
     SafeRegex, SetMetadataConfig, SocketAddress, StaticResources, StringMatcher, StringMatcherMode,
-    SubstitutionFormatString, TcpProxyConfig, Thresholds, TlsCertificate, TokenBucket,
+    SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig, Thresholds, TlsCertificate,
+    TokenBucket,
     TransportSocket, TransportSocketTypedConfig, TypedConfig, TypedExtensionProtocolOptions,
     UpstreamTlsContext, ValueMatcher, VirtualHost, parse_duration,
 };
@@ -729,11 +732,18 @@ pub enum ConfigError {
     )]
     UnsupportedMultipleHealthChecks { cluster: String },
 
-    /// 12.1: cluster's health check has no `http_health_check` (TCP/gRPC/custom defer).
+    /// 12.1 / 68: cluster's health check sets NEITHER `http_health_check` nor
+    /// `tcp_health_check` (gRPC/custom still deferred, fail-loud).
     #[error(
-        "cluster '{cluster}' health check is not an http_health_check; phase 12 supports HTTP health checks only"
+        "cluster '{cluster}' health check sets neither http_health_check nor tcp_health_check; only HTTP and TCP health checks are supported"
     )]
     UnsupportedHealthCheckType { cluster: String },
+
+    /// 68 (ADR-0137 PV-4): a health check sets BOTH `http_health_check` and
+    /// `tcp_health_check` — the upstream `HealthCheck.health_checker` oneof
+    /// rejects this at load (MEASURED against v1.33.0).
+    #[error("cluster '{cluster}' health check sets both http_health_check and tcp_health_check (mutually exclusive)")]
+    BothHttpAndTcpHealthCheck { cluster: String },
 
     /// 12.1: `healthy_threshold` or `unhealthy_threshold` is zero (must be >= 1).
     #[error("cluster '{cluster}' health check {field} must be >= 1")]

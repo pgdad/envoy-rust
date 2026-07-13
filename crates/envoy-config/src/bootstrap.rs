@@ -2439,12 +2439,17 @@ pub struct HealthCheck {
     /// Consecutive failures to mark an endpoint Unhealthy.
     pub unhealthy_threshold: u32,
     /// The HTTP checker. Optional at the schema level so a config omitting it
-    /// (or carrying a deferred TCP/gRPC checker, which `deny_unknown_fields`
+    /// (or carrying a deferred gRPC/custom checker, which `deny_unknown_fields`
     /// rejects) surfaces as `ConfigError::UnsupportedHealthCheckType` at
     /// validate time rather than a bare serde missing-field error. The
-    /// validator (Task 2) requires it present.
+    /// validator (Task 2) requires exactly one of http/tcp present.
     #[serde(default)]
     pub http_health_check: Option<HttpHealthCheck>,
+    /// 68 (ADR-0136): the TCP checker. Optional at the schema level, alongside
+    /// `http_health_check`; the validator (Task 3) rejects BOTH present (the
+    /// upstream oneof) and NEITHER present (`UnsupportedHealthCheckType`).
+    #[serde(default)]
+    pub tcp_health_check: Option<TcpHealthCheck>,
 }
 
 /// 12.1 (parent-12 D1): the HTTP health-check probe shape.
@@ -2461,6 +2466,17 @@ pub struct HttpHealthCheck {
     /// Reuses `Int64Range` (half-open `[start, end)`).
     #[serde(default)]
     pub expected_statuses: Vec<Int64Range>,
+}
+
+/// 68 (ADR-0136/0137): the active TCP health-check probe shape
+/// (`envoy.config.core.v3.HealthCheck.TcpHealthCheck`). Empty ⇒ connection-only.
+/// `send` (optional) is written once after connect; `receive` (repeated) is
+/// scanned as a contiguous substring in the inbound bytes (ADR-0137 PV-3).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct TcpHealthCheck {
+    pub send: Option<HealthCheckPayload>,
+    pub receive: Vec<HealthCheckPayload>,
 }
 
 /// 68 (ADR-0136/0137): a `tcp_health_check` `send`/`receive` payload — an
@@ -4750,11 +4766,19 @@ fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
         });
     }
     if let Some(hc) = cluster.health_checks.first() {
-        let http = hc.http_health_check.as_ref().ok_or_else(|| {
-            crate::ConfigError::UnsupportedHealthCheckType {
+        // 68 (ADR-0137 PV-4): the upstream `health_checker` oneof — both present is fatal.
+        if hc.http_health_check.is_some() && hc.tcp_health_check.is_some() {
+            return Err(crate::ConfigError::BothHttpAndTcpHealthCheck {
                 cluster: cluster.name.clone(),
-            }
-        })?;
+            });
+        }
+        // Neither present → unsupported (gRPC/custom deferred). Precedence preserved.
+        if hc.http_health_check.is_none() && hc.tcp_health_check.is_none() {
+            return Err(crate::ConfigError::UnsupportedHealthCheckType {
+                cluster: cluster.name.clone(),
+            });
+        }
+        // Shared threshold + timing validation (both checker types).
         if hc.healthy_threshold < 1 {
             return Err(crate::ConfigError::InvalidHealthCheckThreshold {
                 cluster: cluster.name.clone(),
@@ -4775,17 +4799,48 @@ fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
                 });
             }
         }
-        if http.path.is_empty() {
-            return Err(crate::ConfigError::EmptyHealthCheckPath {
-                cluster: cluster.name.clone(),
-            });
-        }
-        for range in &http.expected_statuses {
-            if range.start >= range.end {
-                return Err(crate::ConfigError::InvalidInt64Range {
-                    start: range.start,
-                    end: range.end,
+        // Per-checker-type validation.
+        if let Some(http) = &hc.http_health_check {
+            if http.path.is_empty() {
+                return Err(crate::ConfigError::EmptyHealthCheckPath {
+                    cluster: cluster.name.clone(),
                 });
+            }
+            for range in &http.expected_statuses {
+                if range.start >= range.end {
+                    return Err(crate::ConfigError::InvalidInt64Range {
+                        start: range.start,
+                        end: range.end,
+                    });
+                }
+            }
+        }
+        if let Some(tcp) = &hc.tcp_health_check {
+            let validate_payload = |p: &HealthCheckPayload| match p.decode() {
+                Ok(_) => Ok(()),
+                Err(PayloadDecodeError::InvalidHex(value)) => {
+                    Err(crate::ConfigError::InvalidHealthCheckPayloadHex {
+                        cluster: cluster.name.clone(),
+                        value,
+                    })
+                }
+                Err(PayloadDecodeError::InvalidBase64(value)) => {
+                    Err(crate::ConfigError::InvalidHealthCheckPayloadBase64 {
+                        cluster: cluster.name.clone(),
+                        value,
+                    })
+                }
+                Err(PayloadDecodeError::Empty) => {
+                    Err(crate::ConfigError::EmptyHealthCheckPayload {
+                        cluster: cluster.name.clone(),
+                    })
+                }
+            };
+            if let Some(send) = &tcp.send {
+                validate_payload(send)?;
+            }
+            for recv in &tcp.receive {
+                validate_payload(recv)?;
             }
         }
     }
@@ -15066,9 +15121,55 @@ admin:
         assert!(matches!(both.decode(), Err(PayloadDecodeError::Empty)));
     }
 
+    // -----------------------------------------------------------------------
+    // 68: TcpHealthCheck parse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_empty_tcp_health_check_connection_only() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          tcp_health_check: {}",
+            "",
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("empty tcp_health_check parses");
+        let hc = &bs.static_resources.clusters[0].health_checks[0];
+        let tcp = hc.tcp_health_check.as_ref().expect("tcp checker present");
+        assert!(tcp.send.is_none());
+        assert!(tcp.receive.is_empty());
+        assert!(hc.http_health_check.is_none());
+    }
+
+    #[test]
+    fn parses_tcp_health_check_send_receive() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          tcp_health_check:\n            send: { text: \"000102\" }\n            receive:\n              - { text: \"0304\" }",
+            "",
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("send/receive tcp_health_check parses");
+        let tcp = bs.static_resources.clusters[0].health_checks[0]
+            .tcp_health_check
+            .as_ref()
+            .unwrap();
+        assert_eq!(tcp.send.as_ref().unwrap().text.as_deref(), Some("000102"));
+        assert_eq!(tcp.receive.len(), 1);
+        assert_eq!(tcp.receive[0].text.as_deref(), Some("0304"));
+    }
+
+    #[test]
+    fn tcp_health_check_rejects_unknown_field() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          tcp_health_check: { bogus: 1 }",
+            "",
+        );
+        assert!(
+            crate::parse_bootstrap(&yaml).is_err(),
+            "deny_unknown_fields rejects unknown tcp_health_check key"
+        );
+    }
+
     #[test]
     fn cluster_rejects_unknown_health_check_field() {
-        // deny_unknown_fields rejects TCP/gRPC checkers + deferred upstream knobs.
+        // deny_unknown_fields rejects gRPC/custom checkers + deferred upstream knobs (TCP is now supported — phase 68).
         let yaml = r#"
 static_resources:
   listeners: []
@@ -15081,7 +15182,7 @@ static_resources:
           interval: 1s
           healthy_threshold: 1
           unhealthy_threshold: 1
-          tcp_health_check: {}
+          grpc_health_check: {}
       load_assignment:
         cluster_name: backend
         endpoints:
@@ -15197,6 +15298,74 @@ admin:
         let err = crate::parse_bootstrap(&hc_yaml(zero, "")).unwrap_err();
         assert!(
             matches!(err, crate::ConfigError::InvalidHealthCheckThreshold { ref cluster, field } if cluster == "hc_backend" && field == "unhealthy_threshold"),
+            "got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 68: validate_health_checks TCP arm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_tcp_only_checker() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          tcp_health_check: { receive: [ { text: \"50494e47\" } ] }",
+            "",
+        );
+        assert!(
+            crate::parse_bootstrap(&yaml).is_ok(),
+            "tcp-only checker validates"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_both_http_and_tcp() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          http_health_check: { path: /z }\n          tcp_health_check: {}",
+            "",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("both checkers rejected");
+        assert!(
+            matches!(err, crate::ConfigError::BothHttpAndTcpHealthCheck { ref cluster } if cluster == "hc_backend"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_tcp_payload_bad_hex() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          tcp_health_check: { send: { text: \"zzzz\" } }",
+            "",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("bad hex rejected");
+        assert!(
+            matches!(err, crate::ConfigError::InvalidHealthCheckPayloadHex { ref cluster, ref value } if cluster == "hc_backend" && value == "zzzz"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_tcp_payload_empty() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          tcp_health_check: { receive: [ {} ] }",
+            "",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("empty payload rejected");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyHealthCheckPayload { ref cluster } if cluster == "hc_backend"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_tcp_bad_threshold() {
+        let yaml = hc_yaml(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 0\n          unhealthy_threshold: 2\n          tcp_health_check: {}",
+            "",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("threshold validated for tcp too");
+        assert!(
+            matches!(err, crate::ConfigError::InvalidHealthCheckThreshold { ref cluster, field } if cluster == "hc_backend" && field == "healthy_threshold"),
             "got {err:?}"
         );
     }
