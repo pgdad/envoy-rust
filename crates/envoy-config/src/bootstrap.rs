@@ -2529,7 +2529,7 @@ impl HealthCheckPayload {
 /// `crates/envoy-http1/src/client.rs:631`). Returns `None` on odd length or a
 /// non-hex digit. Kept private; `HealthCheckPayload::decode` is the entry point.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();
