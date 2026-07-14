@@ -2450,6 +2450,25 @@ pub struct HealthCheck {
     /// upstream oneof) and NEITHER present (`UnsupportedHealthCheckType`).
     #[serde(default)]
     pub tcp_health_check: Option<TcpHealthCheck>,
+    /// 69 (ADR-0138/0139): the gRPC checker. Optional at the schema level,
+    /// alongside `http_health_check`/`tcp_health_check`; the validator
+    /// rejects more than one present (the upstream `health_checker` oneof)
+    /// and requires the cluster to be H2 when this is set.
+    #[serde(default)]
+    pub grpc_health_check: Option<GrpcHealthCheck>,
+}
+
+/// 69 (ADR-0138/0139): the gRPC checker sub-message
+/// (`envoy.config.core.v3.HealthCheck.GrpcHealthCheck`). All fields optional:
+/// `service_name` empty ⇒ probe the OVERALL server (gRPC service name "").
+/// `initial_metadata` accepted for schema completeness; the probe does not
+/// thread it (MINIMAL support per SPEC §2.2 — unobservable in fixture 0075).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct GrpcHealthCheck {
+    pub service_name: String,
+    pub authority: String,
+    pub initial_metadata: Vec<HeaderValueOption>,
 }
 
 /// 12.1 (parent-12 D1): the HTTP health-check probe shape.
@@ -15170,6 +15189,53 @@ admin:
         );
     }
 
+    // -----------------------------------------------------------------------
+    // 69: GrpcHealthCheck parse
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_grpc_health_check_with_fields() {
+        // gRPC checker on an H2-upstream cluster; all three fields set.
+        // NOTE: HeaderValueOption.append_action has no schema default
+        // (verified in-tree: every other call site sets it explicitly), so
+        // unlike the brief's literal snippet this YAML must set it too.
+        let yaml = cluster_yaml_with_h2_and_health_check(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          grpc_health_check:\n            service_name: my.svc\n            authority: hc.example.com\n            initial_metadata:\n              - header: { key: x-hc, value: \"1\" }\n                append_action: APPEND_IF_EXISTS_OR_ADD",
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("grpc_health_check parses");
+        let hc = bs.static_resources.clusters[0].health_checks.first().unwrap();
+        let grpc = hc.grpc_health_check.as_ref().expect("grpc checker present");
+        assert_eq!(grpc.service_name, "my.svc");
+        assert_eq!(grpc.authority, "hc.example.com");
+        assert_eq!(grpc.initial_metadata.len(), 1);
+        assert!(hc.http_health_check.is_none());
+        assert!(hc.tcp_health_check.is_none());
+    }
+
+    #[test]
+    fn parses_empty_grpc_health_check() {
+        let yaml = cluster_yaml_with_h2_and_health_check(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          grpc_health_check: {}",
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("empty grpc_health_check parses");
+        let grpc = bs.static_resources.clusters[0].health_checks[0]
+            .grpc_health_check
+            .as_ref()
+            .unwrap();
+        assert_eq!(grpc.service_name, ""); // empty ⇒ overall server
+    }
+
+    #[test]
+    fn grpc_health_check_rejects_unknown_field() {
+        let yaml = cluster_yaml_with_h2_and_health_check(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          grpc_health_check: { bogus: 1 }",
+        );
+        assert!(
+            crate::parse_bootstrap(&yaml).is_err(),
+            "deny_unknown_fields rejects unknown grpc key"
+        );
+    }
+
     #[test]
     fn cluster_rejects_unknown_health_check_field() {
         // deny_unknown_fields rejects gRPC/custom checkers + deferred upstream knobs (TCP is now supported — phase 68).
@@ -15221,6 +15287,63 @@ static_resources:
           - lb_endpoints:
               - endpoint:
                   address: {{ socket_address: {{ address: localhost, port_value: 7000 }} }}
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
+"#
+        )
+    }
+
+    /// 69: like `hc_yaml`, but the cluster is STATIC and carries H2
+    /// `typed_extension_protocol_options` (gRPC health checking requires the
+    /// upstream to support HTTP/2 — ADR-0139).
+    fn cluster_yaml_with_h2_and_health_check(health_checks_block: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+{health_checks_block}
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {{}}
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: {{ socket_address: {{ address: 127.0.0.1, port_value: 7000 }} }}
+admin:
+  address:
+    socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
+"#
+        )
+    }
+
+    /// 69: like `hc_yaml`, but the cluster carries NO
+    /// `typed_extension_protocol_options` (non-H2), for negative
+    /// `grpc_health_check` validator tests.
+    fn cluster_yaml_non_h2_with_health_check(health_checks_block: &str) -> String {
+        format!(
+            r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+{health_checks_block}
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: {{ socket_address: {{ address: 127.0.0.1, port_value: 7000 }} }}
 admin:
   address:
     socket_address: {{ address: 127.0.0.1, port_value: 9901 }}
