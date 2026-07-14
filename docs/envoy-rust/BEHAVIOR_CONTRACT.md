@@ -539,10 +539,13 @@ implementation asserts only what is measured (D-3.3).
   (native messages — byte-parity with Envoy's `invalid hex string '…'` is WAIVED
   per ADR-0049 / ADR-0137 PV-1; config-load errors are not a differential wire
   surface).
-- **`health_checker` oneof.** A `HealthCheck` setting **both** `http_health_check`
-  and `tcp_health_check` is **load-fatal** (`ConfigError::BothHttpAndTcpHealthCheck`)
-  — the upstream `health_checker` oneof (MEASURED, R-0.4 / ADR-0137 PV-4). Setting
-  **neither** stays `UnsupportedHealthCheckType` (gRPC/custom still deferred).
+- **`health_checker` oneof.** A `HealthCheck` setting **more than one** of
+  `http_health_check` / `tcp_health_check` / `grpc_health_check` is **load-fatal**
+  (`ConfigError::MultipleHealthCheckers`) — the upstream `health_checker` oneof
+  (MEASURED, R-0.4 / ADR-0137 PV-4; generalized from the phase-68 two-checker
+  rejection to at-most-one-of-three at phase 69, ADR-0139). Setting **neither**
+  stays `UnsupportedHealthCheckType` (`custom_health_check` still deferred; gRPC
+  is supported as of phase 69 — see [Active gRPC health check](#active-grpc-health-check-grpc_health_check)).
 - **`receive` matching.** The `receive` scan is a **contiguous-substring** search:
   a payload found anywhere in the accumulated inbound bytes matches (MEASURED for
   a single block — a banner `ABPINGCD` matches `receive: [PING]`). **Only
@@ -565,6 +568,76 @@ implementation asserts only what is measured (D-3.3).
   fixture 0019). The `cluster.<name>.health_check.*` + `membership_*` stat tree is
   **identical** to phase 12 — no new stat names (see the Stat-name mapping "68
   entries" note).
+
+---
+
+## Active gRPC health check (`grpc_health_check`)
+
+Phase 69 (ADR-0138 / ADR-0139) adds active **gRPC** health checking — the
+upstream-robustness family's third checker type after phase-12 HTTP and phase-68
+TCP. Every wire/behavior fact below was MEASURED against `envoyproxy/envoy:v1.33.0`
+during the state-0 recon (SPEC §0) and the state-2 §6.2 re-verification (ADR-0139);
+the implementation asserts only what is measured (D-3.3).
+
+- **Checker shape.** `HealthCheck.grpc_health_check` is a sub-message
+  `{ service_name?: String, authority?: String, initial_metadata?: [HeaderValueOption] }`.
+  **Empty** (`grpc_health_check: {}`) ⇒ probe the **overall server** (gRPC service
+  name `""`). `service_name` names a specific gRPC health service; `authority`
+  overrides the probe's `:authority`. `initial_metadata` is accepted for schema
+  completeness but the probe does **not** thread it (MINIMAL support per SPEC §2.2 —
+  unobservable in fixture 0075).
+- **HTTP/2-upstream requirement.** `grpc_health_check` **requires** the cluster to
+  be H2-upstream (`typed_extension_protocol_options` →
+  `HttpProtocolOptions.explicit_http_config.http2_protocol_options`). On a non-H2
+  cluster it is **load-fatal** (`ConfigError::GrpcHealthCheckRequiresHttp2`),
+  mirroring Envoy's MEASURED "cluster must support HTTP/2 for gRPC healthchecking"
+  (R-0.3; native message per ADR-0049). Because the cluster must be H2-upstream and
+  the H1-listener × H2-cluster dispatch stays deferred (ADR-0028, NOT lifted),
+  fixture 0075 uses an **H2 listener** (`codec_type: HTTP2`).
+- **`health_checker` oneof.** Covered above in the TCP section — setting more than
+  one of `http`/`tcp`/`grpc` ⇒ `ConfigError::MultipleHealthCheckers`.
+- **Probe protocol.** The probe is a unary `grpc.health.v1.Health/Check` RPC over
+  the cluster's upstream H2: `POST /grpc.health.v1.Health/Check`,
+  `content-type: application/grpc`, `te: trailers`; request body = a length-prefixed
+  gRPC frame (1 compression byte `0x00` + 4-byte big-endian length +
+  `HealthCheckRequest { string service = 1 }`). Response = `:status 200` +
+  `content-type: application/grpc` + a gRPC frame
+  (`HealthCheckResponse { ServingStatus status = 1 }`, enum
+  `UNKNOWN=0/SERVING=1/NOT_SERVING=2/SERVICE_UNKNOWN=3`) + the **`grpc-status`
+  trailer** (`0` = OK). The two messages are hand-rolled (no `prost`/`tonic`
+  in-tree, ADR-0139 PV-3).
+- **Verdict.** (`grpc-status` trailer `== 0` (OK)) **AND**
+  (`HealthCheckResponse.status == SERVING`) ⇒ Healthy (`.success` + after
+  `healthy_threshold`). **Any other** `ServingStatus` (`UNKNOWN`/`NOT_SERVING`/
+  `SERVICE_UNKNOWN`), a non-zero `grpc-status`, a decode error, a connect/transport
+  failure, or a per-probe timeout ⇒ `.failure`.
+- **No `network_failure` distinction.** A `NOT_SERVING` response is an
+  **application-level** failure (the gRPC call completed) while a connect refusal is
+  a **transport** failure — but envoy-rust does **NOT** model `health_check.network_failure`
+  for **any** checker type (CF-69-2). Both fold into the same `.failure` counter,
+  exactly as HTTP/TCP do; the transport-vs-app distinction is neither emitted nor
+  differentially asserted.
+- **Timeout.** ONE `timeout(hc.timeout, …)` bounds the **whole** probe — H2 connect,
+  handshake, request, response, and trailers (ADR-0139 PV-6, mirroring HTTP/TCP).
+  The cluster `connect_timeout` is NOT consulted by the checker. No `grpc-timeout`
+  request header is emitted (deferred-unobservable).
+- **Outcomes & stats.** Ejection after `unhealthy_threshold` consecutive failures
+  drives `membership_healthy` → 0 and, on a cluster fronted by an HCM/router with
+  panic disabled, `pick() → None` → synth-503 `no healthy upstream`. The
+  `cluster.<name>.health_check.{attempt,success,failure}` + `membership_*` stat tree
+  is **identical** to phases 12/68 — no new stat names (the gRPC checker witnesses
+  the same names via the shared scheduler).
+- **Differential surface.** Fixture 0075 (`0075-upstream-grpc-health-check`)
+  witnesses ejection via the **connect-refuse** observable (`grpc_health_check: {}`
+  pointing at a dead port → after settle Unhealthy → `pick() → None` → synth-503),
+  driven over an H2 listener by the `http2_after_settle` differential driver. It
+  asserts **status + byte-exact body ONLY**; the header axis is **OMITTED** because
+  envoy-rust's H2 no-healthy synth-503 emits a narrower header set (`server` +
+  `content-type` only, no `content-length`/`date`) than Envoy — a pre-existing H2-503
+  gap (CF-69-1), out of scope for this checker phase. The SERVING-healthy,
+  NOT_SERVING-failure, gRPC framing, trailers, and message-decode paths are covered
+  **in-process** (the connect-refuse fixture fully witnesses the ejection→503 path;
+  the response-status verdict is exhaustively unit-tested).
 
 ---
 
