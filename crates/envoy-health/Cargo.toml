@@ -13,6 +13,7 @@ path = "src/lib.rs"
 envoy-cluster = { path = "../envoy-cluster" }
 envoy-config = { path = "../envoy-config" }
 envoy-http1 = { path = "../envoy-http1" }
+envoy-http2 = { path = "../envoy-http2" }
 envoy-stats = { path = "../envoy-stats" }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "io-util"] }

@@ -174,6 +174,9 @@ pub(crate) enum TcpProbeError {
     Send(String),
     /// The connection reached EOF before `receive` matched.
     Eof,
+    /// A `read` on the connection failed (M68-2 fold: previously mislabeled
+    /// `TcpProbeError::Send` even though no write was involved).
+    Read(String),
 }
 
 /// 68 (ADR-0137 PV-6): one TCP probe — connect → optional `send` → scan for
@@ -206,7 +209,7 @@ pub(crate) async fn tcp_probe_once(
             let n = stream
                 .read(&mut chunk)
                 .await
-                .map_err(|e| TcpProbeError::Send(e.to_string()))?;
+                .map_err(|e| TcpProbeError::Read(e.to_string()))?;
             if n == 0 {
                 return Err(TcpProbeError::Eof);
             }
@@ -255,6 +258,108 @@ pub(crate) async fn tcp_probe_loop(
                     }
                     Err(e) => {
                         tracing::debug!(addr=%addr, error=?e, "active-HC TCP probe failed");
+                        failure.inc();
+                        endpoint_health.record_failure();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 69: gRPC-probe failure surface (diagnostic; the counters + EndpointHealth
+/// carry the live signal, mirroring `TcpProbeError`). `network_failure` is
+/// NOT modeled — every non-Serving outcome, transport or RPC, ticks the same
+/// `failure` counter (ADR-0139 CF-69-2).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum GrpcProbeError {
+    /// `tokio::time::timeout(probe_timeout, ...)` elapsed (bounds the WHOLE
+    /// probe — connect + RPC — not just connect; the cluster
+    /// `connect_timeout` is NOT consulted).
+    Timeout,
+    /// `Client::connect` failed (the MEASURED connect-refuse path).
+    Connect(String),
+    /// The RPC itself failed at the H2/transport layer (any
+    /// `GrpcCallError` other than `GrpcStatus`/`Decode`, e.g. a dropped
+    /// connection, a missing trailer block, or a non-200 `:status`).
+    Rpc(String),
+    /// The call succeeded and decoded cleanly but reported a `ServingStatus`
+    /// other than `Serving` (`Unknown`/`NotServing`/`ServiceUnknown`).
+    NotServing,
+    /// The `grpc-status` trailer was non-zero (RPC-level failure).
+    GrpcStatus(i64),
+    /// The gRPC health-check response frame failed to decode.
+    Decode(String),
+}
+
+/// 69 (ADR-0139): one gRPC-HC probe — `Client::connect` + one unary
+/// `grpc.health.v1.Health/Check` call, the WHOLE thing under one
+/// `timeout(probe_timeout, ...)` (mirrors `tcp_probe_once`'s shape; the HC
+/// timeout, not the cluster connect_timeout, bounds connect). Verdict:
+/// `grpc-status == 0` AND `ServingStatus::Serving` ⇒ healthy; anything else
+/// ⇒ a `GrpcProbeError` (no `network_failure` classification).
+pub(crate) async fn grpc_probe_once(
+    addr: SocketAddr,
+    authority: &str,
+    service: &str,
+    probe_timeout: Duration,
+) -> Result<(), GrpcProbeError> {
+    let probe = async move {
+        let mut stream = envoy_http2::client::Client::connect(addr, authority)
+            .await
+            .map_err(|e| GrpcProbeError::Connect(e.to_string()))?;
+        match envoy_http2::grpc::grpc_health_check_call(&mut stream, authority, service).await {
+            Ok(envoy_http2::grpc::ServingStatus::Serving) => Ok(()),
+            Ok(_other) => Err(GrpcProbeError::NotServing),
+            Err(envoy_http2::grpc::GrpcCallError::GrpcStatus(n)) => {
+                Err(GrpcProbeError::GrpcStatus(n))
+            }
+            Err(envoy_http2::grpc::GrpcCallError::Decode(e)) => {
+                Err(GrpcProbeError::Decode(format!("{e:?}")))
+            }
+            Err(e) => Err(GrpcProbeError::Rpc(format!("{e:?}"))),
+        }
+    };
+    match timeout(probe_timeout, probe).await {
+        Ok(r) => r,
+        Err(_) => Err(GrpcProbeError::Timeout),
+    }
+}
+
+/// 69: the periodic gRPC-probe loop — the gRPC sibling of `tcp_probe_loop`.
+/// Same `interval` ticker + `tokio::select!` cancel branch + counter/
+/// EndpointHealth wiring; only `probe_once` → `grpc_probe_once` differs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn grpc_probe_loop(
+    addr: SocketAddr,
+    authority: String,
+    service: String,
+    probe_timeout: Duration,
+    interval_dur: Duration,
+    endpoint_health: Arc<EndpointHealth>,
+    attempt: Arc<Counter>,
+    success: Arc<Counter>,
+    failure: Arc<Counter>,
+    cancel: CancellationToken,
+) {
+    let mut ticker = interval(interval_dur);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::debug!(addr=%addr, "active-HC gRPC probe task shutting down");
+                return;
+            }
+            _ = ticker.tick() => {
+                attempt.inc();
+                match grpc_probe_once(addr, &authority, &service, probe_timeout).await {
+                    Ok(()) => {
+                        success.inc();
+                        endpoint_health.record_success();
+                    }
+                    Err(e) => {
+                        tracing::debug!(addr=%addr, error=?e, "active-HC gRPC probe failed");
                         failure.inc();
                         endpoint_health.record_failure();
                     }
@@ -391,6 +496,26 @@ mod tests {
         });
         let r = tcp_probe_once(addr, &None, &[b"PING".to_vec()], Duration::from_millis(400)).await;
         assert!(matches!(r, Err(TcpProbeError::Timeout)));
+    }
+
+    // -----------------------------------------------------------------------
+    // 69: gRPC probe
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn grpc_probe_connect_refused_is_err() {
+        // Reserve a port then drop the listener ⇒ ECONNREFUSED.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        let r = grpc_probe_once(addr, "hc.local", "", Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                r,
+                Err(GrpcProbeError::Connect(_)) | Err(GrpcProbeError::Timeout)
+            ),
+            "got {r:?}"
+        );
     }
 
     #[tokio::test]
