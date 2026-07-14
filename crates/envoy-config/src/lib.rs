@@ -730,20 +730,29 @@ pub enum ConfigError {
     )]
     UnsupportedMultipleHealthChecks { cluster: String },
 
-    /// 12.1 / 68: cluster's health check sets NEITHER `http_health_check` nor
-    /// `tcp_health_check` (gRPC/custom still deferred, fail-loud).
+    /// 12.1 / 68 / 69: cluster's health check sets NONE of `http_health_check`,
+    /// `tcp_health_check`, `grpc_health_check` (custom still deferred, fail-loud).
     #[error(
-        "cluster '{cluster}' health check sets neither http_health_check nor tcp_health_check; only HTTP and TCP health checks are supported"
+        "cluster '{cluster}' health check sets none of http_health_check/tcp_health_check/grpc_health_check; custom_health_check is not supported"
     )]
     UnsupportedHealthCheckType { cluster: String },
 
-    /// 68 (ADR-0137 PV-4): a health check sets BOTH `http_health_check` and
-    /// `tcp_health_check` — the upstream `HealthCheck.health_checker` oneof
-    /// rejects this at load (MEASURED against v1.33.0).
+    /// 69 (ADR-0139): a health check sets MORE THAN ONE of
+    /// http_health_check / tcp_health_check / grpc_health_check — the upstream
+    /// `HealthCheck.health_checker` oneof rejects this at load (Generalizes the
+    /// phase-68 `BothHttpAndTcpHealthCheck`.)
     #[error(
-        "cluster '{cluster}' health check sets both http_health_check and tcp_health_check (mutually exclusive)"
+        "cluster '{cluster}' health check sets more than one of http_health_check/tcp_health_check/grpc_health_check (mutually exclusive)"
     )]
-    BothHttpAndTcpHealthCheck { cluster: String },
+    MultipleHealthCheckers { cluster: String },
+
+    /// 69 (ADR-0139): grpc_health_check on a cluster whose upstream is not HTTP/2.
+    /// Real Envoy makes this load-fatal (MEASURED v1.33.0: "cluster must support
+    /// HTTP/2 for gRPC healthchecking").
+    #[error(
+        "cluster '{cluster}' uses grpc_health_check but the cluster does not support HTTP/2 (set typed_extension_protocol_options HttpProtocolOptions.explicit_http_config.http2_protocol_options)"
+    )]
+    GrpcHealthCheckRequiresHttp2 { cluster: String },
 
     /// 12.1: `healthy_threshold` or `unhealthy_threshold` is zero (must be >= 1).
     #[error("cluster '{cluster}' health check {field} must be >= 1")]

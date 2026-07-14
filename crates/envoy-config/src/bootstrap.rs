@@ -4774,10 +4774,11 @@ fn is_valid_rfc7230_token(s: &str) -> bool {
 }
 
 /// 12.1 (parent-12 D2): validate a cluster's `health_checks` + `common_lb_config`.
-/// Returns the first error encountered (validator-wide convention). HTTP-only,
-/// 0-or-1; TCP/gRPC/custom checkers are rejected (the schema's
-/// `http_health_check: Option<_>` surfaces a non-HTTP checker as
-/// `UnsupportedHealthCheckType`; `deny_unknown_fields` rejects unknown checker keys).
+/// Returns the first error encountered (validator-wide convention). HTTP/TCP/gRPC
+/// checkers supported (custom is rejected); the schema's `Option<_>` checker
+/// fields surface a missing checker as `UnsupportedHealthCheckType` and more
+/// than one as `MultipleHealthCheckers` (`deny_unknown_fields` rejects unknown
+/// checker keys, e.g. `custom_health_check`).
 fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
     if cluster.health_checks.len() > 1 {
         return Err(crate::ConfigError::UnsupportedMultipleHealthChecks {
@@ -4785,17 +4786,42 @@ fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
         });
     }
     if let Some(hc) = cluster.health_checks.first() {
-        // 68 (ADR-0137 PV-4): the upstream `health_checker` oneof — both present is fatal.
-        if hc.http_health_check.is_some() && hc.tcp_health_check.is_some() {
-            return Err(crate::ConfigError::BothHttpAndTcpHealthCheck {
+        // 69 (ADR-0139): the upstream `health_checker` oneof — more than one
+        // of http/tcp/grpc present is fatal. Generalizes the phase-68
+        // both-http-and-tcp check.
+        let n_set = [
+            hc.http_health_check.is_some(),
+            hc.tcp_health_check.is_some(),
+            hc.grpc_health_check.is_some(),
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        if n_set > 1 {
+            return Err(crate::ConfigError::MultipleHealthCheckers {
                 cluster: cluster.name.clone(),
             });
         }
-        // Neither present → unsupported (gRPC/custom deferred). Precedence preserved.
-        if hc.http_health_check.is_none() && hc.tcp_health_check.is_none() {
+        // None present → unsupported (custom deferred). Precedence preserved.
+        if n_set == 0 {
             return Err(crate::ConfigError::UnsupportedHealthCheckType {
                 cluster: cluster.name.clone(),
             });
+        }
+        // 69 (ADR-0139): grpc_health_check requires the cluster's upstream to
+        // support HTTP/2 (real Envoy makes this load-fatal).
+        if hc.grpc_health_check.is_some() {
+            let is_h2 = cluster.typed_extension_protocol_options.as_ref().is_some_and(|teo| {
+                teo.http_protocol_options
+                    .explicit_http_config
+                    .http2_protocol_options
+                    .is_some()
+            });
+            if !is_h2 {
+                return Err(crate::ConfigError::GrpcHealthCheckRequiresHttp2 {
+                    cluster: cluster.name.clone(),
+                });
+            }
         }
         // Shared threshold + timing validation (both checker types).
         if hc.healthy_threshold < 1 {
@@ -15238,7 +15264,9 @@ admin:
 
     #[test]
     fn cluster_rejects_unknown_health_check_field() {
-        // deny_unknown_fields rejects gRPC/custom checkers + deferred upstream knobs (TCP is now supported — phase 68).
+        // deny_unknown_fields rejects custom checkers + deferred upstream knobs
+        // (TCP is supported since phase 68; gRPC is supported since phase 69,
+        // gated on H2 — see cluster_yaml_with_h2_and_health_check tests).
         let yaml = r#"
 static_resources:
   listeners: []
@@ -15251,7 +15279,7 @@ static_resources:
           interval: 1s
           healthy_threshold: 1
           unhealthy_threshold: 1
-          grpc_health_check: {}
+          custom_health_check: {}
       load_assignment:
         cluster_name: backend
         endpoints:
@@ -15452,7 +15480,47 @@ admin:
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("both checkers rejected");
         assert!(
-            matches!(err, crate::ConfigError::BothHttpAndTcpHealthCheck { ref cluster } if cluster == "hc_backend"),
+            matches!(err, crate::ConfigError::MultipleHealthCheckers { ref cluster } if cluster == "hc_backend"),
+            "got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 69: validate_health_checks gRPC arm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_grpc_on_non_h2_cluster() {
+        // STATIC (non-H2) cluster + grpc_health_check ⇒ GrpcHealthCheckRequiresHttp2.
+        let yaml = cluster_yaml_non_h2_with_health_check(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          grpc_health_check: {}",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("grpc on non-H2 is fatal");
+        assert!(
+            matches!(err, crate::ConfigError::GrpcHealthCheckRequiresHttp2 { ref cluster } if cluster == "hc_backend"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_grpc_on_h2_cluster() {
+        let yaml = cluster_yaml_with_h2_and_health_check(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          grpc_health_check: {}",
+        );
+        assert!(
+            crate::parse_bootstrap(&yaml).is_ok(),
+            "grpc on H2 cluster validates OK"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_multiple_health_checkers() {
+        let yaml = cluster_yaml_with_h2_and_health_check(
+            "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          http_health_check: { path: /z }\n          grpc_health_check: {}",
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("two checkers is fatal");
+        assert!(
+            matches!(err, crate::ConfigError::MultipleHealthCheckers { ref cluster } if cluster == "hc_backend"),
             "got {err:?}"
         );
     }
