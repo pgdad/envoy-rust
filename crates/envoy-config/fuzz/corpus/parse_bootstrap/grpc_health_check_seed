@@ -1,0 +1,28 @@
+
+static_resources:
+  listeners: []
+  clusters:
+    - name: hc_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 2
+          grpc_health_check:
+            service_name: svc
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 7000 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
