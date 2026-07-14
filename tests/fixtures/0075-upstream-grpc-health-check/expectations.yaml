@@ -1,0 +1,28 @@
+# Phase-69 fixture-0075 expectations: post-convergence steady state on the H2
+# listener after a 3.5s settle. The sole endpoint fails an active
+# `grpc_health_check` (ECONNREFUSED to {{DEAD_BACKEND_PORT}}) → Unhealthy →
+# pick() None → synth-503 "no healthy upstream" (19 bytes, ADR-0037). Same
+# downstream body/status observable as fixture 0074 (the TCP-HC ejection);
+# settle_ms = interval 1s × unhealthy_threshold 2 + timeout 1s + margin =
+# 3500ms.
+#
+# `expected_headers` is deliberately OMITTED (unlike 0074): envoy-rust's H2
+# no-healthy synth-503 emits a narrower header set than upstream Envoy
+# (`server` + `content-type` only) — a pre-existing H2-503 gap (CF-69-1), not
+# a regression introduced by this fixture. With `#[serde(default)]` on
+# `Driver::Http2AfterSettle::expected_headers`, omitting the field
+# deserializes to `None` and the header-axis check is skipped entirely.
+driver:
+  kind: http2_after_settle
+  settle_ms: 3500
+  method: get
+  path: "/"
+  host: "grpc_hc_backend"
+  expected_status: 503
+  expected_body:
+    kind: byte_exact
+    body: "no healthy upstream"
+equivalence:
+  response_status: exact
+  response_body:
+    kind: byte_exact
