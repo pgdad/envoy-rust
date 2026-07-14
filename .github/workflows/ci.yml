@@ -127,7 +127,7 @@ jobs:
         run: cargo +nightly fuzz run accesslog_format_parse -- -max_total_time=30
 
       - name: fuzz grpc_health_decode
-        working-directory: crates/envoy-http2/fuzz
+        working-directory: crates/envoy-http2
         # Phase-69 §7.4 fuzz target over the hand-rolled gRPC health-check
         # response decoder (`decode_health_check_response` in the
         # envoy-http2 crate). Same `+nightly` rationale as above.

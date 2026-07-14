@@ -91,8 +91,18 @@ pub fn decode_health_check_response(frame: &[u8]) -> Result<ServingStatus, GrpcD
                     _ => return Err(GrpcDecodeError::LengthMismatch),
                 }
             }
-            1 => { if i + 8 > body.len() { return Err(GrpcDecodeError::LengthMismatch); } i += 8; }
-            5 => { if i + 4 > body.len() { return Err(GrpcDecodeError::LengthMismatch); } i += 4; }
+            1 => {
+                if i + 8 > body.len() {
+                    return Err(GrpcDecodeError::LengthMismatch);
+                }
+                i += 8;
+            }
+            5 => {
+                if i + 4 > body.len() {
+                    return Err(GrpcDecodeError::LengthMismatch);
+                }
+                i += 4;
+            }
             _ => return Err(GrpcDecodeError::BadWireType), // 3/4 groups
         }
     }
@@ -230,7 +240,10 @@ mod tests {
     #[test]
     fn encode_request_empty_service() {
         // service="" ⇒ empty message ⇒ frame = flag(0) + len(0)
-        assert_eq!(encode_health_check_request(""), vec![0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            encode_health_check_request(""),
+            vec![0x00, 0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -238,47 +251,70 @@ mod tests {
         // service="svc.up" ⇒ 00 00 00 00 08 0A 06 73 76 63 2E 75 70
         assert_eq!(
             encode_health_check_request("svc.up"),
-            vec![0x00, 0x00, 0x00, 0x00, 0x08, 0x0A, 0x06, 0x73, 0x76, 0x63, 0x2E, 0x75, 0x70]
+            vec![
+                0x00, 0x00, 0x00, 0x00, 0x08, 0x0A, 0x06, 0x73, 0x76, 0x63, 0x2E, 0x75, 0x70
+            ]
         );
     }
 
     #[test]
     fn decode_serving() {
         // frame 00 00 00 00 02 08 01 ⇒ SERVING
-        assert_eq!(decode_health_check_response(&[0, 0, 0, 0, 2, 0x08, 0x01]).unwrap(), ServingStatus::Serving);
+        assert_eq!(
+            decode_health_check_response(&[0, 0, 0, 0, 2, 0x08, 0x01]).unwrap(),
+            ServingStatus::Serving
+        );
     }
 
     #[test]
     fn decode_not_serving() {
-        assert_eq!(decode_health_check_response(&[0, 0, 0, 0, 2, 0x08, 0x02]).unwrap(), ServingStatus::NotServing);
+        assert_eq!(
+            decode_health_check_response(&[0, 0, 0, 0, 2, 0x08, 0x02]).unwrap(),
+            ServingStatus::NotServing
+        );
     }
 
     #[test]
     fn decode_empty_message_is_unknown() {
         // absent field ⇒ protobuf default 0 ⇒ UNKNOWN (NOT healthy)
-        assert_eq!(decode_health_check_response(&[0, 0, 0, 0, 0]).unwrap(), ServingStatus::Unknown);
+        assert_eq!(
+            decode_health_check_response(&[0, 0, 0, 0, 0]).unwrap(),
+            ServingStatus::Unknown
+        );
     }
 
     #[test]
     fn decode_skips_unknown_field() {
         // an unknown field 2 (wire 2, len 1) before status: 12 01 FF 08 01 ⇒ still SERVING
-        assert_eq!(decode_health_check_response(&[0, 0, 0, 0, 5, 0x12, 0x01, 0xFF, 0x08, 0x01]).unwrap(), ServingStatus::Serving);
+        assert_eq!(
+            decode_health_check_response(&[0, 0, 0, 0, 5, 0x12, 0x01, 0xFF, 0x08, 0x01]).unwrap(),
+            ServingStatus::Serving
+        );
     }
 
     #[test]
     fn decode_rejects_short_frame() {
-        assert!(matches!(decode_health_check_response(&[0, 0, 0]), Err(GrpcDecodeError::ShortFrame)));
+        assert!(matches!(
+            decode_health_check_response(&[0, 0, 0]),
+            Err(GrpcDecodeError::ShortFrame)
+        ));
     }
 
     #[test]
     fn decode_rejects_compressed() {
-        assert!(matches!(decode_health_check_response(&[1, 0, 0, 0, 2, 0x08, 0x01]), Err(GrpcDecodeError::Compressed)));
+        assert!(matches!(
+            decode_health_check_response(&[1, 0, 0, 0, 2, 0x08, 0x01]),
+            Err(GrpcDecodeError::Compressed)
+        ));
     }
 
     #[test]
     fn decode_rejects_length_mismatch() {
         // declared len 9 but only 2 message bytes present
-        assert!(matches!(decode_health_check_response(&[0, 0, 0, 0, 9, 0x08, 0x01]), Err(GrpcDecodeError::LengthMismatch)));
+        assert!(matches!(
+            decode_health_check_response(&[0, 0, 0, 0, 9, 0x08, 0x01]),
+            Err(GrpcDecodeError::LengthMismatch)
+        ));
     }
 
     #[test]
@@ -322,7 +358,11 @@ mod tests {
                     .unwrap();
                 let mut send = respond.send_response(resp, false).unwrap();
                 // SERVING frame: 00 00 00 00 02 08 01
-                send.send_data(bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0x08, 0x01]), false).unwrap();
+                send.send_data(
+                    bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0x08, 0x01]),
+                    false,
+                )
+                .unwrap();
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
                 send.send_trailers(trailers).unwrap();
@@ -330,8 +370,12 @@ mod tests {
             // drive the connection to completion
             while conn.accept().await.is_some() {}
         });
-        let mut stream = crate::client::Client::connect(addr, "hc.local").await.unwrap();
-        let status = grpc_health_check_call(&mut stream, "hc.local", "").await.unwrap();
+        let mut stream = crate::client::Client::connect(addr, "hc.local")
+            .await
+            .unwrap();
+        let status = grpc_health_check_call(&mut stream, "hc.local", "")
+            .await
+            .unwrap();
         assert_eq!(status, ServingStatus::Serving);
         srv.abort();
     }
@@ -353,15 +397,23 @@ mod tests {
                     .unwrap();
                 let mut send = respond.send_response(resp, false).unwrap();
                 // NOT_SERVING frame: 00 00 00 00 02 08 02
-                send.send_data(bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0x08, 0x02]), false).unwrap();
+                send.send_data(
+                    bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0x08, 0x02]),
+                    false,
+                )
+                .unwrap();
                 let mut trailers = http::HeaderMap::new();
                 trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
                 send.send_trailers(trailers).unwrap();
             }
             while conn.accept().await.is_some() {}
         });
-        let mut stream = crate::client::Client::connect(addr, "hc.local").await.unwrap();
-        let status = grpc_health_check_call(&mut stream, "hc.local", "").await.unwrap();
+        let mut stream = crate::client::Client::connect(addr, "hc.local")
+            .await
+            .unwrap();
+        let status = grpc_health_check_call(&mut stream, "hc.local", "")
+            .await
+            .unwrap();
         assert_eq!(status, ServingStatus::NotServing);
         srv.abort();
     }
@@ -388,9 +440,14 @@ mod tests {
             }
             while conn.accept().await.is_some() {}
         });
-        let mut stream = crate::client::Client::connect(addr, "hc.local").await.unwrap();
+        let mut stream = crate::client::Client::connect(addr, "hc.local")
+            .await
+            .unwrap();
         let result = grpc_health_check_call(&mut stream, "hc.local", "").await;
-        assert!(matches!(result, Err(GrpcCallError::GrpcStatus(5))), "expected GrpcStatus(5), got {result:?}");
+        assert!(
+            matches!(result, Err(GrpcCallError::GrpcStatus(5))),
+            "expected GrpcStatus(5), got {result:?}"
+        );
         srv.abort();
     }
 }

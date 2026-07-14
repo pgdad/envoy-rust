@@ -2439,15 +2439,16 @@ pub struct HealthCheck {
     /// Consecutive failures to mark an endpoint Unhealthy.
     pub unhealthy_threshold: u32,
     /// The HTTP checker. Optional at the schema level so a config omitting it
-    /// (or carrying a deferred gRPC/custom checker, which `deny_unknown_fields`
+    /// (or carrying a deferred `custom_health_check`, which `deny_unknown_fields`
     /// rejects) surfaces as `ConfigError::UnsupportedHealthCheckType` at
-    /// validate time rather than a bare serde missing-field error. The
-    /// validator (Task 2) requires exactly one of http/tcp present.
+    /// validate time rather than a bare serde missing-field error. The validator
+    /// requires at most one of http/tcp/grpc present (see `grpc_health_check`).
     #[serde(default)]
     pub http_health_check: Option<HttpHealthCheck>,
     /// 68 (ADR-0136): the TCP checker. Optional at the schema level, alongside
-    /// `http_health_check`; the validator (Task 3) rejects BOTH present (the
-    /// upstream oneof) and NEITHER present (`UnsupportedHealthCheckType`).
+    /// `http_health_check`/`grpc_health_check`; the validator rejects more than
+    /// one present (the upstream `health_checker` oneof, `MultipleHealthCheckers`)
+    /// and NEITHER present (`UnsupportedHealthCheckType`).
     #[serde(default)]
     pub tcp_health_check: Option<TcpHealthCheck>,
     /// 69 (ADR-0138/0139): the gRPC checker. Optional at the schema level,
@@ -4811,12 +4812,15 @@ fn validate_health_checks(cluster: &Cluster) -> Result<(), crate::ConfigError> {
         // 69 (ADR-0139): grpc_health_check requires the cluster's upstream to
         // support HTTP/2 (real Envoy makes this load-fatal).
         if hc.grpc_health_check.is_some() {
-            let is_h2 = cluster.typed_extension_protocol_options.as_ref().is_some_and(|teo| {
-                teo.http_protocol_options
-                    .explicit_http_config
-                    .http2_protocol_options
-                    .is_some()
-            });
+            let is_h2 = cluster
+                .typed_extension_protocol_options
+                .as_ref()
+                .is_some_and(|teo| {
+                    teo.http_protocol_options
+                        .explicit_http_config
+                        .http2_protocol_options
+                        .is_some()
+                });
             if !is_h2 {
                 return Err(crate::ConfigError::GrpcHealthCheckRequiresHttp2 {
                     cluster: cluster.name.clone(),
@@ -15229,7 +15233,10 @@ admin:
             "      health_checks:\n        - timeout: 1s\n          interval: 1s\n          healthy_threshold: 1\n          unhealthy_threshold: 2\n          grpc_health_check:\n            service_name: my.svc\n            authority: hc.example.com\n            initial_metadata:\n              - header: { key: x-hc, value: \"1\" }\n                append_action: APPEND_IF_EXISTS_OR_ADD",
         );
         let bs = crate::parse_bootstrap(&yaml).expect("grpc_health_check parses");
-        let hc = bs.static_resources.clusters[0].health_checks.first().unwrap();
+        let hc = bs.static_resources.clusters[0]
+            .health_checks
+            .first()
+            .unwrap();
         let grpc = hc.grpc_health_check.as_ref().expect("grpc checker present");
         assert_eq!(grpc.service_name, "my.svc");
         assert_eq!(grpc.authority, "hc.example.com");
