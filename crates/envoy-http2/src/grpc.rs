@@ -125,6 +125,99 @@ fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     None // truncated
 }
 
+/// Errors surfaced by [`grpc_health_check_call`]: transport-level H2 failures,
+/// a non-OK `grpc-status` trailer, a missing trailer block, a codec decode
+/// failure, or a response that didn't carry `:status 200`.
+#[derive(Debug)]
+pub enum GrpcCallError {
+    Http2(String),
+    GrpcStatus(i64),
+    MissingTrailer,
+    Decode(GrpcDecodeError),
+    BadResponse,
+}
+
+/// Perform one unary `grpc.health.v1.Health/Check` call over an existing H2
+/// connection (`stream`). Builds the request per the gRPC-over-H2 wire
+/// contract (`:method POST`, `:path /grpc.health.v1.Health/Check`, absolute
+/// URI, `content-type: application/grpc`, `te: trailers`), sends the framed
+/// `HealthCheckRequest` body, drains the response DATA frames releasing
+/// flow-control capacity as it goes (mirrors `ClientStream::send_request`'s
+/// drain loop at client.rs:193-200), then — unlike `send_request`, which
+/// drops `recv_stream` before trailers are available — reads the trailer
+/// block via `recv_stream.trailers().await` to recover the `grpc-status`
+/// pseudo-trailer that gRPC uses to carry the RPC-level verdict (HTTP/2
+/// trailers, RFC 7540 §8.1, cannot be observed any other way).
+///
+/// `Ok(status)` is produced only when `grpc-status == 0` (OK) AND the body
+/// decodes cleanly; any other outcome surfaces the specific `GrpcCallError`
+/// variant so the caller (the active-health-check probe, Task 5) can
+/// distinguish transport failure from an RPC-level failure from a decoded
+/// NOT_SERVING/SERVICE_UNKNOWN status (which is itself an `Ok` — the verdict
+/// mapping is the caller's responsibility, not this call's).
+pub async fn grpc_health_check_call(
+    stream: &mut crate::client::ClientStream,
+    authority: &str,
+    service: &str,
+) -> Result<ServingStatus, GrpcCallError> {
+    let uri_str = format!("http://{authority}/grpc.health.v1.Health/Check");
+    let http_req = http::Request::builder()
+        .method("POST")
+        .uri(uri_str.as_str())
+        .version(http::Version::HTTP_2)
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(())
+        .map_err(|e| GrpcCallError::Http2(e.to_string()))?;
+
+    let (response_future, mut send_stream) = stream
+        .send_request
+        .send_request(http_req, false)
+        .map_err(|e| GrpcCallError::Http2(e.to_string()))?;
+
+    let frame = encode_health_check_request(service);
+    send_stream
+        .send_data(bytes::Bytes::from(frame), true)
+        .map_err(|e| GrpcCallError::Http2(e.to_string()))?;
+
+    let http_resp = response_future
+        .await
+        .map_err(|e| GrpcCallError::Http2(e.to_string()))?;
+    let (resp_parts, mut recv_stream) = http_resp.into_parts();
+
+    if resp_parts.status.as_u16() != 200 {
+        return Err(GrpcCallError::BadResponse);
+    }
+
+    let mut body_bytes = bytes::BytesMut::new();
+    while let Some(chunk_result) = recv_stream.data().await {
+        let chunk = chunk_result.map_err(|e| GrpcCallError::Http2(e.to_string()))?;
+        body_bytes.extend_from_slice(&chunk);
+        recv_stream
+            .flow_control()
+            .release_capacity(chunk.len())
+            .map_err(|e| GrpcCallError::Http2(e.to_string()))?;
+    }
+
+    let trailers = recv_stream
+        .trailers()
+        .await
+        .map_err(|e| GrpcCallError::Http2(e.to_string()))?
+        .ok_or(GrpcCallError::MissingTrailer)?;
+
+    let grpc_status: i64 = trailers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .ok_or(GrpcCallError::MissingTrailer)?;
+
+    if grpc_status != 0 {
+        return Err(GrpcCallError::GrpcStatus(grpc_status));
+    }
+
+    decode_health_check_response(&body_bytes).map_err(GrpcCallError::Decode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +274,95 @@ mod tests {
     fn decode_rejects_length_mismatch() {
         // declared len 9 but only 2 message bytes present
         assert!(matches!(decode_health_check_response(&[0, 0, 0, 0, 9, 0x08, 0x01]), Err(GrpcDecodeError::LengthMismatch)));
+    }
+
+    #[tokio::test]
+    async fn call_serving_verdict() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Server: accept one H2 conn, read the request, reply SERVING + grpc-status:0 trailer.
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(tcp).await.unwrap();
+            if let Some(req) = conn.accept().await {
+                let (_req, mut respond) = req.unwrap();
+                let resp = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(resp, false).unwrap();
+                // SERVING frame: 00 00 00 00 02 08 01
+                send.send_data(bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0x08, 0x01]), false).unwrap();
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                send.send_trailers(trailers).unwrap();
+            }
+            // drive the connection to completion
+            while conn.accept().await.is_some() {}
+        });
+        let mut stream = crate::client::Client::connect(addr, "hc.local").await.unwrap();
+        let status = grpc_health_check_call(&mut stream, "hc.local", "").await.unwrap();
+        assert_eq!(status, ServingStatus::Serving);
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn call_not_serving_still_ok_grpc_status() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(tcp).await.unwrap();
+            if let Some(req) = conn.accept().await {
+                let (_req, mut respond) = req.unwrap();
+                let resp = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(resp, false).unwrap();
+                // NOT_SERVING frame: 00 00 00 00 02 08 02
+                send.send_data(bytes::Bytes::from_static(&[0, 0, 0, 0, 2, 0x08, 0x02]), false).unwrap();
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                send.send_trailers(trailers).unwrap();
+            }
+            while conn.accept().await.is_some() {}
+        });
+        let mut stream = crate::client::Client::connect(addr, "hc.local").await.unwrap();
+        let status = grpc_health_check_call(&mut stream, "hc.local", "").await.unwrap();
+        assert_eq!(status, ServingStatus::NotServing);
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn call_nonzero_grpc_status_is_err() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(tcp).await.unwrap();
+            if let Some(req) = conn.accept().await {
+                let (_req, mut respond) = req.unwrap();
+                let resp = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(resp, false).unwrap();
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("5"));
+                send.send_trailers(trailers).unwrap();
+            }
+            while conn.accept().await.is_some() {}
+        });
+        let mut stream = crate::client::Client::connect(addr, "hc.local").await.unwrap();
+        let result = grpc_health_check_call(&mut stream, "hc.local", "").await;
+        assert!(matches!(result, Err(GrpcCallError::GrpcStatus(5))), "expected GrpcStatus(5), got {result:?}");
+        srv.abort();
     }
 }
