@@ -20,6 +20,7 @@
 pub mod client;
 pub mod codec;
 mod error;
+pub mod grpc;
 pub mod hcm;
 pub mod pool;
 pub mod request;
