@@ -28,6 +28,7 @@ exclude = [
     "crates/envoy-accesslog/fuzz",
     "crates/envoy-config/fuzz",
     "crates/envoy-filter/fuzz",
+    "crates/envoy-http2/fuzz",
     "crates/envoy-jwt/fuzz",
 ]
 

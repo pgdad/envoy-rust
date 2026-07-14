@@ -1,0 +1,5 @@
+target/
+artifacts/
+Cargo.lock
+corpus/grpc_health_decode/*
+!corpus/grpc_health_decode/serving_seed

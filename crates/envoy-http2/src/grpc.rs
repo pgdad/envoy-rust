@@ -81,10 +81,15 @@ pub fn decode_health_check_response(frame: &[u8]) -> Result<ServingStatus, GrpcD
                 let (l, n) = read_varint(&body[i..]).ok_or(GrpcDecodeError::BadVarint)?;
                 i += n;
                 let l = l as usize;
-                if i + l > body.len() {
-                    return Err(GrpcDecodeError::LengthMismatch);
+                // `l` is attacker-controlled and unbounded by the frame's
+                // declared length (unlike `i`, which is bounded by
+                // `body.len()` via the `body.len() != len` check above), so
+                // `i + l` can overflow `usize` on a malicious/fuzzed input.
+                // Use `checked_add` rather than `i + l > body.len()`.
+                match i.checked_add(l) {
+                    Some(next) if next <= body.len() => i = next,
+                    _ => return Err(GrpcDecodeError::LengthMismatch),
                 }
-                i += l;
             }
             1 => { if i + 8 > body.len() { return Err(GrpcDecodeError::LengthMismatch); } i += 8; }
             5 => { if i + 4 > body.len() { return Err(GrpcDecodeError::LengthMismatch); } i += 4; }
@@ -274,6 +279,29 @@ mod tests {
     fn decode_rejects_length_mismatch() {
         // declared len 9 but only 2 message bytes present
         assert!(matches!(decode_health_check_response(&[0, 0, 0, 0, 9, 0x08, 0x01]), Err(GrpcDecodeError::LengthMismatch)));
+    }
+
+    #[test]
+    fn decode_rejects_huge_length_delimited_field_without_overflow_panic() {
+        // 69 fuzz regression: a wire-type-2 (length-delimited) field whose
+        // varint-decoded length `l` is attacker-controlled and unbounded by
+        // the frame's declared length used to make `i + l` overflow `usize`
+        // and panic (found by the grpc_health_decode fuzz target). It must
+        // instead be rejected as LengthMismatch.
+        //
+        // Minimized fuzz crash input: field tag 0x02 (field 2, wire type 2)
+        // followed by a 10-byte varint encoding a length near u64::MAX.
+        let body: &[u8] = &[
+            0x12, // tag: field 2, wire type 2
+            0xFB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F, // varint ~ u64::MAX
+        ];
+        let mut frame = vec![0x00];
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        assert!(matches!(
+            decode_health_check_response(&frame),
+            Err(GrpcDecodeError::LengthMismatch)
+        ));
     }
 
     #[tokio::test]
