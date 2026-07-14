@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::HealthError;
-use crate::probe::{probe_loop, tcp_probe_loop};
+use crate::probe::{grpc_probe_loop, probe_loop, tcp_probe_loop};
 
 /// 12.2: the active-HC scheduler. Holds the JoinHandles of every spawned
 /// probe task. Drop without `shutdown()` is safe — the tasks observe the
@@ -96,6 +96,14 @@ impl Scheduler {
                     http.expected_statuses.clone(),
                 )
             });
+            let grpc_cfg = hc.grpc_health_check.as_ref().map(|g| {
+                let authority = if g.authority.is_empty() {
+                    cfg.name.clone()
+                } else {
+                    g.authority.clone()
+                };
+                (authority, g.service_name.clone())
+            });
 
             // Walk the resolved (addr, EndpointHealth) pairs from the
             // ClusterManager (the 12.2 `health_probe_targets` accessor).
@@ -112,8 +120,8 @@ impl Scheduler {
                 let s = Arc::clone(&success);
                 let f = Arc::clone(&failure);
                 let eh: Arc<EndpointHealth> = endpoint_health;
-                let h = match (&http_cfg, &tcp_cfg) {
-                    (Some((host, path, exp)), None) => {
+                let h = match (&http_cfg, &tcp_cfg, &grpc_cfg) {
+                    (Some((host, path, exp)), None, None) => {
                         let (host, path, exp) = (host.clone(), path.clone(), exp.clone());
                         tokio::spawn(async move {
                             probe_loop(
@@ -132,13 +140,31 @@ impl Scheduler {
                             .await;
                         })
                     }
-                    (None, Some((send, receive))) => {
+                    (None, Some((send, receive)), None) => {
                         let (send, receive) = (send.clone(), receive.clone());
                         tokio::spawn(async move {
                             tcp_probe_loop(
                                 addr,
                                 send,
                                 receive,
+                                probe_timeout,
+                                interval_dur,
+                                eh,
+                                a,
+                                s,
+                                f,
+                                cancel,
+                            )
+                            .await;
+                        })
+                    }
+                    (None, None, Some((authority, service))) => {
+                        let (authority, service) = (authority.clone(), service.clone());
+                        tokio::spawn(async move {
+                            grpc_probe_loop(
+                                addr,
+                                authority,
+                                service,
                                 probe_timeout,
                                 interval_dur,
                                 eh,
@@ -242,6 +268,38 @@ admin:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
 "#;
 
+    const GRPC_HC_BOOTSTRAP: &str = r#"
+static_resources:
+  listeners: []
+  clusters:
+    - name: grpc_hc_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      common_lb_config:
+        healthy_panic_threshold: { value: 0 }
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      health_checks:
+        - timeout: 1s
+          interval: 1s
+          healthy_threshold: 1
+          unhealthy_threshold: 1
+          grpc_health_check:
+            service_name: "envoy.service.health.v3.HealthCheck"
+      load_assignment:
+        cluster_name: grpc_hc_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address: { socket_address: { address: 127.0.0.1, port_value: 60021 } }
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+"#;
+
     const TCP_HC_BOOTSTRAP: &str = r#"
 static_resources:
   listeners: []
@@ -293,6 +351,55 @@ admin:
                 "registry must contain {name}"
             );
         }
+        scheduler.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawns_grpc_probe_task_and_registers_counters() {
+        let bootstrap = parse_bootstrap(GRPC_HC_BOOTSTRAP).expect("parse");
+        let registry = Arc::new(StatsRegistry::new());
+        let cluster_mgr = Arc::new(
+            from_bootstrap(&bootstrap, Arc::clone(&registry))
+                .await
+                .expect("build"),
+        );
+        let cancel = CancellationToken::new();
+        let scheduler = Scheduler::spawn(&bootstrap, cluster_mgr, registry.clone(), cancel.clone())
+            .expect("scheduler");
+        assert_eq!(
+            scheduler.task_count(),
+            1,
+            "one gRPC probe task for the single endpoint"
+        );
+        let snapshot = registry.snapshot();
+        for kind in ["attempt", "success", "failure"] {
+            let name = format!("cluster.grpc_hc_backend.health_check.{kind}");
+            assert!(
+                snapshot.iter().any(|(n, _)| n == &name),
+                "registry must contain {name}"
+            );
+        }
+        // The endpoint is a dead port (nothing listening on 60021), so the
+        // probe attempts and fails — assert the `attempt` counter ticks.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let snapshot = registry.snapshot();
+        let attempt = snapshot
+            .iter()
+            .find_map(|(n, h)| {
+                if n == "cluster.grpc_hc_backend.health_check.attempt" {
+                    match h {
+                        envoy_stats::StatHandle::Counter(c) => Some(c.value()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .expect("attempt counter present");
+        assert!(
+            attempt >= 1,
+            "attempt counter must have ticked at least once, got {attempt}"
+        );
         scheduler.shutdown().await;
     }
 
