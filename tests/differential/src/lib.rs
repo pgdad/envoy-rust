@@ -220,6 +220,25 @@ pub enum Driver {
         #[serde(default)]
         expected_headers: Option<Http1HeaderRule>,
     },
+    /// Phase 69 (grpc_health_check, ADR-0138): the H2 sibling of
+    /// `Http1AfterSettle`. Sleeps `settle_ms` past active-HC convergence,
+    /// then drives ONE H2C prior-knowledge request via `drive_http2` and
+    /// applies the same equivalence cascade. Fixture 0075 asserts the
+    /// post-convergence 503 "no healthy upstream" steady state and omits
+    /// `expected_headers` entirely — with `#[serde(default)]` that field
+    /// deserializes to `None` and the header-axis check is skipped.
+    Http2AfterSettle {
+        settle_ms: u64,
+        method: Http1Method,
+        path: String,
+        host: String,
+        #[serde(default)]
+        expected_status: Option<u16>,
+        #[serde(default)]
+        expected_body: Option<Http1BodyRule>,
+        #[serde(default)]
+        expected_headers: Option<Http1HeaderRule>,
+    },
     /// 13.1 D10: drive N sequential HTTP/1.1 requests over a SINGLE downstream
     /// keep-alive conn. The discriminating-observable shape per parent-13 §2
     /// item-iv: with separate per-request conns, upstream_cx_total: N. With
@@ -2942,6 +2961,9 @@ fn port_key_for(driver: &Driver) -> &'static str {
         // HCM-shaped drivers.
         | Driver::Http1AccessLogByteExact { .. }
         | Driver::Http1AfterSettle { .. }
+        // Phase 69 (ADR-0138): Http2AfterSettle's HCM listener uses {{PORT}}
+        // like its H1 sibling above.
+        | Driver::Http2AfterSettle { .. }
         // 13.1 D10: Http1KeepAlive's HCM listener uses {{PORT}} like
         // the other HCM-shaped drivers; the admin listener is wired via
         // {{ADMIN_PORT}} (see needs_admin_port below).
@@ -4115,6 +4137,35 @@ pub async fn run_fixture(fixture_dir: &Path) -> Result<()> {
             )
             .await?;
         }
+        // Phase 69 (grpc_health_check, ADR-0138): Driver::Http2AfterSettle —
+        // the H2 sibling of `Driver::Http1AfterSettle` immediately above.
+        // Sleep `settle_ms` past active-HC convergence, then drive ONE H2C
+        // prior-knowledge request via `drive_http2` and apply the same
+        // equivalence cascade. Fixture 0075 asserts the post-convergence
+        // 503 "no healthy upstream" steady state.
+        Driver::Http2AfterSettle {
+            settle_ms,
+            method,
+            path,
+            host,
+            expected_status,
+            expected_body,
+            expected_headers,
+        } => {
+            run_http2_after_settle_arm(
+                &ctx,
+                upstream,
+                subject,
+                settle_ms,
+                method,
+                path,
+                host,
+                expected_status,
+                expected_body,
+                expected_headers,
+            )
+            .await?;
+        }
         // 13.1 D10 / Task 7: drive N sequential HTTP/1.1 requests over a
         // SINGLE downstream keep-alive conn against BOTH proxies in turn,
         // then sleep `settle_ms` past the last request + scrape named
@@ -4944,6 +4995,109 @@ async fn run_http1_after_settle_arm(
     let subject_resp = drive_http1(subject_addr, method, path, host, &[], None)
         .await
         .context("envoy-rust http1 drive (after settle)")?;
+    subject.shutdown(Duration::from_secs(5)).await.ok();
+    drop(upstream);
+
+    // Status: envoy ↔ envoy-rust under `response_status: exact`.
+    if matches!(
+        expectations.equivalence.response_status,
+        Some(StatusRule::Exact)
+    ) && upstream_resp.status != subject_resp.status
+    {
+        bail!(
+            "response status mismatch under `response_status: exact`\n  \
+                     upstream: {}\n  subject:  {}",
+            upstream_resp.status,
+            subject_resp.status,
+        );
+    }
+    if let Some(es) = expected_status {
+        if upstream_resp.status != *es {
+            bail!(
+                "upstream status {} != expected {}",
+                upstream_resp.status,
+                es,
+            );
+        }
+        if subject_resp.status != *es {
+            bail!("subject status {} != expected {}", subject_resp.status, es,);
+        }
+    }
+
+    if let Some(rule) = &expectations.equivalence.response_body {
+        assert_body_rule(rule, &upstream_resp.body, &subject_resp.body)?;
+    }
+    if let Some(Http1BodyRule::ByteExact { body }) = expected_body {
+        let expected = body.as_bytes();
+        if upstream_resp.body != expected {
+            bail!(
+                "upstream body != expected\n  upstream: {:?}\n  expected: {:?}",
+                upstream_resp.body,
+                expected,
+            );
+        }
+        if subject_resp.body != expected {
+            bail!(
+                "subject body != expected\n  subject:  {:?}\n  expected: {:?}",
+                subject_resp.body,
+                expected,
+            );
+        }
+    }
+
+    if matches!(
+        expected_headers,
+        Some(Http1HeaderRule::SetEqualModuloAllowList)
+    ) {
+        diff_headers(
+            &upstream_resp.headers,
+            &subject_resp.headers,
+            HEADER_ALLOW_LIST,
+        )
+        .context("diff_headers (set_equal_modulo_allow_list)")?;
+    }
+    Ok(())
+}
+
+/// `Driver::Http2AfterSettle` arm of `run_fixture` — the H2 sibling of
+/// `run_http1_after_settle_arm` immediately above (Phase 69, ADR-0138):
+/// verbatim clone with the two `drive_http1(..., &[], None)` calls replaced
+/// by `drive_http2(..., &[])` (H2C prior-knowledge, no request body).
+// The parameter list mirrors the `Driver` variant's fields, threaded straight
+// from the `run_fixture` dispatcher; bundling them into a struct would add
+// indirection without clarifying the dispatch (same disposition as
+// `upstream::start`).
+#[allow(clippy::too_many_arguments)]
+async fn run_http2_after_settle_arm(
+    ctx: &FixtureCtx<'_>,
+    upstream: upstream::UpstreamProxy,
+    mut subject: subject::Subject,
+    settle_ms: &u64,
+    method: &Http1Method,
+    path: &str,
+    host: &str,
+    expected_status: &Option<u16>,
+    expected_body: &Option<Http1BodyRule>,
+    expected_headers: &Option<Http1HeaderRule>,
+) -> Result<()> {
+    let FixtureCtx {
+        expectations,
+        upstream_addr,
+        subject_addr,
+        ..
+    } = *ctx;
+    tracing::debug!(
+        settle_ms,
+        "Driver::Http2AfterSettle: sleeping for active-HC settle"
+    );
+    tokio::time::sleep(Duration::from_millis(*settle_ms)).await;
+
+    let upstream_resp = drive_http2(upstream_addr, method, path, host, &[])
+        .await
+        .context("upstream envoy http2 drive (after settle)")?;
+    let subject_resp = drive_http2(subject_addr, method, path, host, &[])
+        .await
+        .context("envoy-rust http2 drive (after settle)")?;
     subject.shutdown(Duration::from_secs(5)).await.ok();
     drop(upstream);
 
@@ -9237,6 +9391,52 @@ scrapes:
                     scrapes[1].expected_body_rule,
                     BodyRule::TextLines { .. }
                 ));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn driver_http2_after_settle_parses_expected_fields() {
+        // Phase 69 (grpc_health_check, ADR-0138): the H2 sibling of
+        // `Driver::Http1AfterSettle` (12.2). Fixture 0075 drives an H2
+        // request past active-HC settle and asserts a byte-exact
+        // "no healthy upstream" 503 body, with no `expected_headers`
+        // (the header axis is skipped when the fixture omits the field).
+        let yaml = r#"
+kind: http2_after_settle
+settle_ms: 100
+method: get
+path: "/"
+host: h
+expected_status: 503
+expected_body:
+  kind: byte_exact
+  body: "no healthy upstream"
+"#;
+        let d: Driver = serde_yaml::from_str(yaml).expect("parses");
+        match d {
+            Driver::Http2AfterSettle {
+                settle_ms,
+                method,
+                path,
+                host,
+                expected_status,
+                expected_body,
+                expected_headers,
+            } => {
+                assert_eq!(settle_ms, 100);
+                assert_eq!(method, Http1Method::Get);
+                assert_eq!(path, "/");
+                assert_eq!(host, "h");
+                assert_eq!(expected_status, Some(503));
+                assert_eq!(
+                    expected_body,
+                    Some(Http1BodyRule::ByteExact {
+                        body: "no healthy upstream".to_string()
+                    })
+                );
+                assert_eq!(expected_headers, None);
             }
             other => panic!("unexpected: {other:?}"),
         }
