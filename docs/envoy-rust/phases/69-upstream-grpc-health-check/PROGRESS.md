@@ -219,3 +219,60 @@ passes in isolation), NONE in the phase-69 surface; CI is authoritative and GREE
 `known-failures.txt` trim. **NO new ADR** (ADR-0139 governs; ADR-0140 stays
 reserved-unfired). The next session is the §5 state-5 code-review
 (`superpowers:requesting-code-review`).
+
+## §5.2 state-3 re-entry (`superpowers:test-driven-development`) — commit `e0c6885`
+
+The §5 state-5 code-review returned **MERGE WITH FIXES** with one Important
+(**I-1**), so per `BOOTSTRAP_PROMPT.md` §5.2 the phase RE-ENTERS §5 state-3 (a
+SEPARATE session) to close I-1 under TDD, then re-runs state-4 + state-5.
+
+**I-1 fix (the merge-blocker) — three `grpc_probe_once` tests added to
+`crates/envoy-health/src/probe.rs`'s `#[cfg(test)] mod tests`:**
+
+- **`grpc_probe_serving_is_ok`** — a loopback `h2::server` (helper
+  `spawn_grpc_verdict_server`, mirroring the `envoy-http2::grpc`
+  `call_serving_verdict` body) replies `08 01` (SERVING) + `grpc-status: 0`
+  trailer ⇒ asserts `grpc_probe_once(addr, "hc.local", "", 2s).is_ok()`. Pins the
+  `Ok(Serving) ⇒ Ok(())` verdict arm (`probe.rs:313`).
+- **`grpc_probe_not_serving_is_err`** — the same server replies `08 02`
+  (NOT_SERVING) + `grpc-status: 0` ⇒ asserts
+  `matches!(err, GrpcProbeError::NotServing)`. Pins the
+  `Ok(_other) ⇒ Err(NotServing)` verdict arm (`probe.rs:314`) — the
+  eject-vs-keep decision the active health check exists to make.
+- **`grpc_probe_hang_times_out`** — an H2 backend that completes the handshake +
+  accepts the request stream but never sends a response ⇒ asserts
+  `Err(GrpcProbeError::Timeout)` under a 300ms `probe_timeout` (the gRPC
+  analogue of `tcp_probe_receive_mismatch_times_out`). Pins the whole-probe
+  `timeout(probe_timeout, ...)` wrap (`probe.rs:324`-`327`).
+
+**Product code is verified-correct and UNCHANGED** (state-5 found no live bug) —
+these tests PIN the arm against future regression, which is the POINT of I-1: a
+mutation flipping the verdict currently passes the entire suite.
+
+**RED→GREEN discipline (D-3.1):** the tests were driven RED-first by temporarily
+mutating the product (swapping the two verdict arms + widening the timeout
+wrapper to `Duration::from_secs(30)`), against which all three FAIL for the exact
+right reasons — `expected Ok, got Err(NotServing)` / `got Ok(())` /
+`got Err(Rpc(...broken pipe))` — then the mutation was reverted and all three
+pass GREEN (`cargo test -p envoy-health --lib grpc_probe_` → 5 passed). The final
+diff to `probe.rs` is entirely within the `#[cfg(test)]` module (`@@ -518`,
+module starts `:372`); the `grpc_probe_once`/codec/validator product logic is
+byte-identical to the state-5 head.
+
+**Dev-deps:** `h2 = "0.4"`, `http = "1"`, `bytes = "1"` added to
+`crates/envoy-health/Cargo.toml` `[dev-dependencies]` (test-only, for the
+loopback `h2::server`; the product path reaches `h2` transitively via
+`envoy-http2`). `cargo fmt -p envoy-health --check` clean; `cargo clippy
+-p envoy-health --tests` clean.
+
+**Optional Minor sweep — NOT taken.** M69-A..G stay carry-forwards. Per §5.2 the
+re-entry is scoped tightly to the merge-blocker (one indivisible unit — three
+sibling tests in one file); the Minors are non-blocking polish and opening them
+would widen scope. They remain for a future phase that re-enters the surface.
+
+**NO code change to product logic; NO new ADR** (ADR-0139 governs; ADR-0140 stays
+reserved-unfired). `#![forbid(unsafe_code)]` holds at every crate root; no
+fixture weakened; no `known-failures.txt` trim; no revert of landed 67/68/69
+work. The next session is the **§5 state-4 RE-VERIFICATION**
+(`superpowers:verification-before-completion`) — do NOT chain into it this
+session (§5.1: one state per session).
