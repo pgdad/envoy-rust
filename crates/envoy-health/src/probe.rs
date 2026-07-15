@@ -518,6 +518,88 @@ mod tests {
         );
     }
 
+    /// 69 I-1: a loopback `h2::server` that accepts one H2 connection, reads the
+    /// `Health/Check` request, and replies `:status 200` + a
+    /// `HealthCheckResponse` DATA frame carrying `status_byte` + a
+    /// `grpc-status: 0` trailer. Mirrors the `envoy-http2::grpc`
+    /// `call_serving_verdict` server body. Returns the bound addr + the join
+    /// handle (aborted by the caller).
+    fn spawn_grpc_verdict_server(status_byte: u8) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(tcp).await.unwrap();
+            if let Some(req) = conn.accept().await {
+                let (_req, mut respond) = req.unwrap();
+                let resp = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .body(())
+                    .unwrap();
+                let mut send = respond.send_response(resp, false).unwrap();
+                // HealthCheckResponse frame: 00 00 00 00 02 08 <status_byte>
+                send.send_data(
+                    bytes::Bytes::from(vec![0, 0, 0, 0, 2, 0x08, status_byte]),
+                    false,
+                )
+                .unwrap();
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                send.send_trailers(trailers).unwrap();
+            }
+            while conn.accept().await.is_some() {}
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn grpc_probe_serving_is_ok() {
+        // SERVING (08 01) + grpc-status:0 ⇒ the probe reports healthy. Pins the
+        // `Ok(Serving) ⇒ Ok(())` verdict arm (grpc_probe_once:313).
+        let (addr, srv) = spawn_grpc_verdict_server(0x01);
+        let r = grpc_probe_once(addr, "hc.local", "", Duration::from_secs(2)).await;
+        assert!(r.is_ok(), "expected Ok, got {r:?}");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn grpc_probe_not_serving_is_err() {
+        // NOT_SERVING (08 02) + grpc-status:0 ⇒ the probe reports failure via
+        // `NotServing`. Pins the `Ok(_other) ⇒ Err(NotServing)` verdict arm
+        // (grpc_probe_once:314) — the eject-vs-keep decision.
+        let (addr, srv) = spawn_grpc_verdict_server(0x02);
+        let r = grpc_probe_once(addr, "hc.local", "", Duration::from_secs(2)).await;
+        assert!(matches!(r, Err(GrpcProbeError::NotServing)), "got {r:?}");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn grpc_probe_hang_times_out() {
+        // An H2 backend that completes the handshake + accepts the request but
+        // never sends a response ⇒ the whole-probe `timeout` elapses. The gRPC
+        // analogue of `tcp_probe_receive_mismatch_times_out`; pins the
+        // `timeout(probe_timeout, ...)` wrap (grpc_probe_once:324-327).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(tcp).await.unwrap();
+            if let Some(req) = conn.accept().await {
+                // Hold the request stream open without responding.
+                let _held = req.unwrap();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let r = grpc_probe_once(addr, "hc.local", "", Duration::from_millis(300)).await;
+        assert!(matches!(r, Err(GrpcProbeError::Timeout)), "got {r:?}");
+        srv.abort();
+    }
+
     #[tokio::test]
     async fn tcp_probe_send_then_receive_healthy() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

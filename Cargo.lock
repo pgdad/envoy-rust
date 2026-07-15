@@ -448,11 +448,14 @@ dependencies = [
 name = "envoy-health"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "envoy-cluster",
  "envoy-config",
  "envoy-http1",
  "envoy-http2",
  "envoy-stats",
+ "h2",
+ "http",
  "thiserror",
  "tokio",
  "tokio-util",

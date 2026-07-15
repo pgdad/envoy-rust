@@ -22,3 +22,9 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+# 69 §5.2 state-3 re-entry (I-1): a loopback `h2::server` in the `grpc_probe_once`
+# verdict/timeout tests, mirroring the `envoy-http2::grpc` `call_serving_verdict`
+# server body. Test-only — the product path reaches h2 via `envoy-http2`.
+h2 = "0.4"
+http = "1"
+bytes = "1"
