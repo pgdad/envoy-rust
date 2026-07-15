@@ -276,3 +276,162 @@ fixture weakened; no `known-failures.txt` trim; no revert of landed 67/68/69
 work. The next session is the **§5 state-4 RE-VERIFICATION**
 (`superpowers:verification-before-completion`) — do NOT chain into it this
 session (§5.1: one state per session).
+
+## §5 state-4 re-verification (`superpowers:verification-before-completion`)
+
+> This section RE-RUNS the FULL §7.5 phase-done gate over the whole tree now that
+> the Important I-1 fix has landed (`e0c6885` — three `grpc_probe_once` verdict +
+> timeout tests in `crates/envoy-health/src/probe.rs` + the `h2`/`http`/`bytes`
+> `envoy-health` dev-deps), per `BOOTSTRAP_PROMPT.md` §5.2. It does NOT overwrite
+> the earlier `## §5 state-4 verification` section — it is appended. Cold-started
+> clean: `git status --porcelain` empty, branch `main`, `HEAD` = `origin/main` =
+> `ff5a574484876058e6d22addbf7165ed8fbac685` (the §5.2 state-3 re-entry ledger
+> commit); `git fetch origin --prune` showed no sibling ahead. Toolchain:
+> `nightly` present, `cargo-fuzz 0.13.2`. Verification is READ-ONLY over the tree
+> — `git status --porcelain` stays empty throughout (no code touched).
+
+**STEP 0.5 — CI confirmation (FULL 40-char SHA).** The §5.2 state-3 re-entry head
+commit's CI run is GREEN (the code commit `e0c6885` + the ledger commit `ff5a574`
+were pushed as a batch; CI ran on the head `ff5a574`, the state-4 head):
+```
+$ gh run list --commit ff5a574484876058e6d22addbf7165ed8fbac685 --limit 10
+completed  success  phase 69: §5.2 state-3 re-entry COMPLETE — I-1 fixed under TDD (e0c68…  ci  main  push  29379942969  7m0s  2026-07-15T00:46:23Z
+```
+That GREEN run builds/tests/fuzzes/differentials the full tree at HEAD inclusive of
+the I-1 fix and is authoritative for the documented host-flake set (memory
+`envoy-rust-state4-ci-first-execution`).
+
+### (a) new/changed differential fixture `0075` — GREEN
+
+`cargo build -p envoy-bin` FIRST (harness runs `target/debug/envoy-bin`, memory
+`differential-harness-uses-debug-envoy-bin`), then the fixture-`0075` differential:
+```
+$ cargo build -p envoy-bin
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s   (exit 0)
+
+$ cargo test -p differential --test upstream_grpc_health_check
+running 1 test
+… WARN no healthy endpoint — emitting 503 cluster=grpc_hc_backend
+test upstream_grpc_health_check_fixture ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.11s   (exit 0)
+```
+The subject emitted synth-503 `no healthy upstream` after gRPC-HC connect-refuse
+ejection over the H2 (`codec_type: HTTP2`) listener, matching Envoy byte-exact.
+
+### (b) all pre-existing fixtures still green — GREEN modulo 7 documented host-flakes
+
+`cargo test --workspace --no-fail-fast` (full output redirected to a file, NEVER
+piped through `tail`, memory `never-pipe-verification-runs-through-tail`):
+```
+TOTAL passed=1998  failed=7   (2005 tests run = 2002 prior + 3 new I-1 tests)
+```
+The **3 new I-1 tests all PASS** in the full workspace run (and in isolation):
+```
+test probe::tests::grpc_probe_serving_is_ok ... ok
+test probe::tests::grpc_probe_not_serving_is_err ... ok
+test probe::tests::grpc_probe_hang_times_out ... ok
+
+$ cargo test -p envoy-health --lib grpc_probe_
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out   (exit 0)
+```
+The 7 REDs are all pre-existing documented host-flakes, NONE in the phase-69
+surface (the RED set VARIES run-to-run, memory `local-red-set-varies-run-to-run`):
+
+| Failing test | Cause (measured) | Documented flake memory |
+|---|---|---|
+| `access_log_h2_rcd_upstream_reset` | envoy `rf/uc:UF` IPv6-unreachable `remote_address:[fdc4:f303:9324::254]` vs subject `UC` | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_h2_uc_upstream_reset` | same IPv6-unreachable UF-vs-UC divergence | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_rcd_upstream_reset` | same IPv6-unreachable | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `access_log_rf_upstream_reset` | same IPv6-unreachable | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| `admin_config_dump_server_info` | envoy-only backend `192.168.65.2` (`host.docker.internal`), `text_lines diverged after allow-lists` | `differential-host-bridge-ip-192-168-65-2` |
+| `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` | H2 handshake unexpectedly SUCCEEDS on this host's networking (envoy-http2 unit, untouched by I-1) | `envoyrust-h2-handshake-test-host-flake` |
+| `tests::wait_accept_ready_times_out_for_closed_socket` | differential harness-helper unit (`tests/differential/src/lib.rs:8346`): binds an ephemeral port, `drop`s it, asserts `wait_accept_ready` fails — but a parallel test re-binds that freed port and listens, so the probe succeeds (`assertion failed: result.is_err()`); ephemeral-port-reuse under parallel load | family of `differential-fixtures-flake-under-parallel-load` / `eds-fatal-startup-test-port-reuse-flake` |
+
+The one unfamiliar RED (`wait_accept_ready_times_out_for_closed_socket`, NOT in the
+prior state-4 RED set) was re-run in isolation and passes DETERMINISTICALLY —
+confirming a parallel-load port-reuse flake, not a regression; it is a harness
+helper untouched by the I-1 fix (which only added `#[cfg(test)]` tests to
+`envoy-health/src/probe.rs` + `envoy-health` dev-deps):
+```
+$ cargo test -p differential --lib wait_accept_ready_times_out_for_closed_socket
+test tests::wait_accept_ready_times_out_for_closed_socket ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 158 filtered out   (exit 0)
+```
+The 4 IPv6-unreachable + the bridge-IP + the h2-handshake REDs fail
+deterministically (environmental). CI (the `ff5a574` run above) is authoritative
+and GREEN. NO phase-69 test (fixture `0075`, the 3 new `grpc_probe_*` units, any
+`envoy-config`/`envoy-http2`/`envoy-health` unit) is among the REDs.
+
+### (c) conformance — unchanged
+
+No new protocol surface; `known-failures.txt` untouched (never trimmed, memory
+`h2spec-3-5-2-preface-host-sensitive`). Tree clean:
+```
+$ git status --porcelain -- '*known-failures*'
+      (empty)
+$ git diff --stat HEAD -- '*known-failures*'
+      (empty)
+```
+
+### (d) `grpc_health_decode` fuzz target — GREEN
+
+```
+$ cd crates/envoy-http2 && cargo +nightly fuzz run grpc_health_decode -- -max_total_time=60
+#86101641  DONE   cov: 84 ft: 243 corp: 89/5447b lim: 4096 exec/s: 1411502 rss: 488Mb
+Done 86101641 runs in 61 second(s)   (FUZZ_EXIT=0)
+```
+86,101,641 executions, no crash / panic / leak (the state-3 `checked_add`
+integer-overflow fix holds). Both seeds `git ls-files`-tracked and the `ci.yml`
+fuzz step present:
+```
+$ git ls-files crates/envoy-http2/fuzz/corpus/grpc_health_decode/serving_seed crates/envoy-config/fuzz/corpus/parse_bootstrap/grpc_health_check_seed
+crates/envoy-config/fuzz/corpus/parse_bootstrap/grpc_health_check_seed
+crates/envoy-http2/fuzz/corpus/grpc_health_decode/serving_seed
+
+$ grep -n grpc_health_decode .github/workflows/ci.yml
+78:    name: fuzz (parse_bootstrap + jwt_parse + cdn_loop_parse + accesslog_format_parse + grpc_health_decode, 30s each)
+129:      - name: fuzz grpc_health_decode
+134:        run: cargo +nightly fuzz run grpc_health_decode -- -max_total_time=30
+```
+
+### (e) build / clippy / fmt / test / deny — all clean
+
+```
+$ cargo fmt --all -- --check
+      (empty)   (FMT_EXIT=0)
+
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+    Finished `dev` profile … (CLIPPY_EXIT=0)   — no warnings
+
+$ cargo build --workspace --all-targets
+    Finished `dev` profile … (BUILD_EXIT=0)
+
+$ cargo test --workspace --no-fail-fast
+    passed=1998  failed=7   (the 7 documented host-flakes adjudicated in (b))
+
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok   (DENY_EXIT=0)
+```
+`cargo deny check` run FRESH (memory `cargo-deny-reds-on-unrelated-advisory`): no
+new RustSec advisory; the only output is benign `license-not-encountered` warnings
+for allow-listed licenses no dependency uses — NOT a failure.
+
+### (f) `REVIEW.md` — deferred to the SEPARATE §5 state-5 RE-review
+
+The RE-review is a SEPARATE later session (§5.1: one state per session) and
+SUPERSEDES the current `REVIEW.md` per D-3.5. Not written this session.
+
+### State-4 re-verification verdict
+
+**GREEN.** All six §7.5 gates pass over the whole tree with the I-1 fix landed.
+The 3 new `grpc_probe_*` verdict/timeout tests PASS (full run + isolation). The
+only REDs are 7 pre-existing documented host-flakes (4× IPv6-unreachable
+`access_log_*_upstream_reset`, `admin_config_dump_server_info` bridge-IP, the
+`send_request_maps_h2_handshake_failure_to_typed_error` h2-handshake host-flake,
+and `wait_accept_ready_times_out_for_closed_socket` — a parallel-load port-reuse
+flake that passes in isolation), NONE in the phase-69 surface; CI (`ff5a574`) is
+authoritative and GREEN. `#![forbid(unsafe_code)]` holds at every crate root; no
+code changed (tree clean throughout); no fixture weakened; no `known-failures.txt`
+trim. **NO new ADR** (ADR-0139 governs; ADR-0140 stays reserved-unfired). The next
+session is the §5 state-5 RE-review (`superpowers:requesting-code-review`), which
+supersedes the current `REVIEW.md`.
