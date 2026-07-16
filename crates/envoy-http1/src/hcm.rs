@@ -4671,6 +4671,158 @@ static_resources:
         );
     }
 
+    /// Phase 70 Task 11: parse `yaml` through the production
+    /// `envoy_config::parse_bootstrap` path and return the compiled
+    /// `LogFilter` of the first listener's HCM's first access-log entry —
+    /// `None` when that entry carries no `filter`. Mirrors the production
+    /// `entry.filter.as_ref().map(compile_access_log_filter)` line in
+    /// `from_config`, so the whole config → runtime translation (serde shape,
+    /// validators, compiler) is the thing under test rather than a struct
+    /// literal.
+    fn compiled_filter_from_bootstrap_yaml(yaml: &str) -> Option<envoy_accesslog::LogFilter> {
+        let bootstrap = envoy_config::parse_bootstrap(yaml).expect("bootstrap parses");
+        let terminal = &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0];
+        let Some(envoy_config::TypedConfig::HttpConnectionManager(hcm_cfg)) =
+            terminal.typed_config.as_ref()
+        else {
+            panic!("first network filter is not an HCM");
+        };
+        hcm_cfg.access_log[0]
+            .filter
+            .as_ref()
+            .map(compile_access_log_filter)
+    }
+
+    /// Phase 70 Task 11: a bootstrap whose single HCM access-log entry carries
+    /// a `GE 500` `status_code_filter` with the given `runtime_key`. Only the
+    /// `runtime_key` varies across callers.
+    fn bootstrap_yaml_with_runtime_key(runtime_key: &str) -> String {
+        format!(
+            r#"
+node: {{ id: t11, cluster: t11 }}
+static_resources:
+  listeners:
+    - name: l1
+      address: {{ socket_address: {{ address: 127.0.0.1, port_value: 10000 }} }}
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: HTTP1
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/t11-access.log
+                    filter:
+                      status_code_filter:
+                        comparison:
+                          op: GE
+                          value: {{ default_value: 500, runtime_key: {runtime_key} }}
+                route_config:
+                  name: r
+                  virtual_hosts:
+                    - name: v
+                      domains: ["*"]
+                      routes:
+                        - match: {{ prefix: "/" }}
+                          direct_response: {{ status: 200, body: {{ inline_string: "b\n" }} }}
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters: []
+"#
+        )
+    }
+
+    /// Phase 70 Task 11: `runtime_key` is RTDS-INERT. Upstream Envoy would
+    /// consult the runtime layer under this key for a `default_value`
+    /// override; envoy-rust has no runtime subsystem, so the comparison ALWAYS
+    /// uses `default_value`. Two bootstraps differing ONLY in `runtime_key`
+    /// must therefore compile to filters with identical `should_log` outcomes
+    /// across the status classes the phase cares about. The key is still
+    /// REQUIRED non-empty (upstream PGV `min_len 1`) — that is a load-parity
+    /// constraint, pinned separately by the envoy-config validator tests.
+    #[test]
+    fn runtime_key_is_rtds_inert() {
+        let inert = compiled_filter_from_bootstrap_yaml(&bootstrap_yaml_with_runtime_key("unused"))
+            .expect("filter compiles");
+        let named =
+            compiled_filter_from_bootstrap_yaml(&bootstrap_yaml_with_runtime_key("some.key"))
+                .expect("filter compiles");
+
+        for status in [200u16, 499, 500, 503] {
+            assert_eq!(
+                inert.should_log(status),
+                named.should_log(status),
+                "runtime_key must not alter should_log({status}): \
+                 runtime_key=unused -> {}, runtime_key=some.key -> {}",
+                inert.should_log(status),
+                named.should_log(status),
+            );
+        }
+
+        // The compiled filters are structurally identical too — the compiler
+        // carries `default_value` through as the threshold and drops the key
+        // entirely (it has nowhere to go: `StatusCodeComparison` has no
+        // runtime-key field).
+        assert_eq!(
+            inert, named,
+            "runtime_key must not survive compilation into the runtime filter"
+        );
+
+        // Sanity: the shared `GE 500` threshold really is the one in effect,
+        // so the equality above is not two identically-vacuous filters.
+        assert!(!inert.should_log(499), "GE 500 must reject a 499");
+        assert!(inert.should_log(500), "GE 500 must accept a 500");
+    }
+
+    /// Phase 70 Task 11: regression parity for the 27 pre-phase-70 access-log
+    /// differential fixtures — an `AccessLog` with NO `filter` compiles to
+    /// `None`, and a `None`-filtered sink logs EVERY record. Both legs are
+    /// pinned: the config → `None` compile step, and the sink's unconditional
+    /// `should_log` on a sink built by the production `from_config`.
+    #[tokio::test]
+    async fn no_filter_logs_every_record() {
+        use tempfile::tempdir;
+
+        // Leg 1: a filterless access-log entry compiles to `None`.
+        let yaml = bootstrap_yaml_with_runtime_key("unused").replace(
+            r#"                    filter:
+                      status_code_filter:
+                        comparison:
+                          op: GE
+                          value: { default_value: 500, runtime_key: unused }
+"#,
+            "",
+        );
+        assert!(
+            !yaml.contains("filter:"),
+            "the filter block must be stripped from the YAML under test"
+        );
+        assert!(
+            compiled_filter_from_bootstrap_yaml(&yaml).is_none(),
+            "an access_log with no `filter` must compile to None"
+        );
+
+        // Leg 2: the sink `from_config` builds from that shape logs every
+        // record, whatever the final response code.
+        let dir = tempdir().expect("tempdir");
+        let config =
+            hcm_config_with_filtered_access_log(None, &dir.path().join("unfiltered.log"), 200)
+                .await;
+        let sink = &config.access_log[0];
+        for status in [200u16, 499, 500, 503] {
+            assert!(
+                sink.should_log(status),
+                "a sink with no filter must log every record; should_log({status}) was false"
+            );
+        }
+    }
+
     /// 06.3 D15.3.a: 2xx class counter increments on a 200 direct-response.
     #[tokio::test(flavor = "multi_thread")]
     async fn hcm_increments_downstream_rq_2xx_on_2xx_response() {
