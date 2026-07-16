@@ -1504,16 +1504,21 @@ async fn serve_connection(
                     connect_failure: connect_failure_for_log,
                 },
             );
-            // 06.3 D15.3.e NEW: increment access_logs_total at queue-enter
-            // time (BEFORE the per-sink await), per parent SPEC §6 Rule 4 —
-            // fire-and-forget emission's failures do NOT deflate the count.
-            // Counter::add(N) per 06.1 REVIEW §7 R-8 — one bulk increment per
-            // request, not N individual .inc() calls.
-            config
-                .stats
-                .access_logs_total
-                .add(config.access_log.len() as u64);
             for sink in &config.access_log {
+                // Phase 70 Task 7: gate emission on the sink's compiled filter.
+                // A sink with no filter accepts every record, so the resulting
+                // access_logs_total is identical to the pre-70 bulk add(len).
+                if !sink.should_log(record.response_code) {
+                    continue;
+                }
+                // 06.3 D15.3.e: increment access_logs_total at queue-enter time
+                // (BEFORE the per-sink await), per parent SPEC §6 Rule 4 —
+                // fire-and-forget emission's failures do NOT deflate the count.
+                // Phase 70 moved this INSIDE the loop (was one bulk
+                // `add(access_log.len())` per 06.1 REVIEW §7 R-8): the count is
+                // now per intent-to-emit, so a filter-suppressed sink does not
+                // over-count.
+                config.stats.access_logs_total.inc();
                 if let Err(err) = sink.emit(&record).await {
                     // 06.3 D15.3.e NEW: count emission failures alongside the warn.
                     config.stats.access_logs_failed.inc();
@@ -4567,6 +4572,58 @@ static_resources:
         let sink = &config.access_log[0];
         assert!(!sink.should_log(200), "GE 500 filter must reject a 200");
         assert!(sink.should_log(503), "GE 500 filter must accept a 503");
+    }
+
+    /// Phase 70 Task 7: the H1 emit loop gates each sink on `should_log` of the
+    /// record's final response code — a GE-500 sink drops a 200 (0 lines) and
+    /// keeps a 503 (1 line). The third leg pins the regression parity that
+    /// carries the 27 pre-existing access-log differential fixtures: a sink
+    /// with NO filter still logs every record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_filtered_sink_suppresses_below_threshold() {
+        use tempfile::tempdir;
+
+        /// Drive one request through an HCM whose single sink is built from
+        /// `filter`, and return the sink file's line count.
+        async fn lines_after_one_request(
+            filter: Option<(envoy_config::ComparisonOp, u32)>,
+            path: &std::path::Path,
+            status: u16,
+        ) -> usize {
+            let config = hcm_config_with_filtered_access_log(filter, path, status).await;
+            let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            let _ = drive(config, req).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::fs::read_to_string(path)
+                .await
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let ge = envoy_config::ComparisonOp::Ge;
+
+        let suppressed = dir.path().join("filtered_200.log");
+        assert_eq!(
+            lines_after_one_request(Some((ge, 500)), &suppressed, 200).await,
+            0,
+            "GE 500 sink must suppress a 200 record"
+        );
+
+        let emitted = dir.path().join("filtered_503.log");
+        assert_eq!(
+            lines_after_one_request(Some((ge, 500)), &emitted, 503).await,
+            1,
+            "GE 500 sink must emit a 503 record"
+        );
+
+        let unfiltered = dir.path().join("unfiltered_200.log");
+        assert_eq!(
+            lines_after_one_request(None, &unfiltered, 200).await,
+            1,
+            "a sink with no filter logs every record (pre-phase-70 parity)"
+        );
     }
 
     /// 06.3 D15.3.a: 2xx class counter increments on a 200 direct-response.
