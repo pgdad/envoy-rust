@@ -703,6 +703,65 @@ pub enum TypedConfig {
 pub struct AccessLog {
     pub name: String,
     pub typed_config: AccessLogTypedConfig,
+    /// Phase 70: the per-record emission predicate (`AccessLogFilter` oneof).
+    /// Absent → the sink logs every record (today's behavior). Present → the
+    /// record is emitted to this sink only when the filter matches.
+    #[serde(default)]
+    pub filter: Option<AccessLogFilter>,
+}
+
+/// Models `envoy.config.accesslog.v3.AccessLogFilter` — the per-record emission
+/// predicate carried by an `AccessLog` entry. This phase models ONLY the
+/// `status_code_filter` arm; future filter-family phases add further `Option`
+/// arms here rather than reshaping the type. Cardinality (exactly one arm set)
+/// is enforced by `validate_access_logs` (`ConfigError::AmbiguousAccessLogFilter`),
+/// NOT by serde — mirroring the `SubstitutionFormatString` oneof precedent above.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccessLogFilter {
+    pub status_code_filter: Option<StatusCodeFilter>,
+}
+
+/// Models `envoy.config.accesslog.v3.StatusCodeFilter` — the `AccessLogFilter`
+/// arm that compares the response status code against a configured value.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct StatusCodeFilter {
+    pub comparison: ComparisonFilter,
+}
+
+/// Models `envoy.config.accesslog.v3.ComparisonFilter` — the `{op, value}` pair
+/// evaluated against the response status code.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ComparisonFilter {
+    pub op: ComparisonOp,
+    pub value: RuntimeUInt32,
+}
+
+/// The upstream `ComparisonFilter.Op` enum. Exactly `{EQ, GE, LE}` (measured:
+/// NE / bogus REJECTED). serde has no catch-all → any other token is a fatal
+/// deserialize error (parity with upstream's unknown-enum rejection); see
+/// `rejects_status_code_filter_unknown_op`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub enum ComparisonOp {
+    #[serde(rename = "EQ")]
+    Eq,
+    #[serde(rename = "GE")]
+    Ge,
+    #[serde(rename = "LE")]
+    Le,
+}
+
+/// Models `envoy.config.core.v3.RuntimeUInt32`. `runtime_key` is PGV-mandatory
+/// (`min_len 1`) but RTDS-inert here (no runtime subsystem) — the comparison
+/// always uses `default_value`. An empty `runtime_key` is rejected by
+/// `validate_access_logs` (`ConfigError::EmptyStatusCodeFilterRuntimeKey`).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeUInt32 {
+    pub default_value: u32,
+    pub runtime_key: String,
 }
 
 /// AccessLogTypedConfig — the `@type`-tagged envelope for an AccessLog
@@ -12811,6 +12870,62 @@ static_resources:
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("expected reject");
         assert!(matches!(err, crate::ConfigError::InvalidAccessLogPath));
+    }
+
+    // --- phase 70 t1: AccessLog.filter (AccessLogFilter oneof) schema ---
+
+    #[test]
+    fn parses_status_code_filter_ge_500() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      status_code_filter:
+                        comparison:
+                          op: GE
+                          value:
+                            default_value: 500
+                            runtime_key: unused
+"#,
+        );
+        let bootstrap = crate::parse_bootstrap(&yaml).expect("should parse");
+        let hcm = match &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0]
+            .typed_config
+        {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        let filter = hcm.access_log[0].filter.as_ref().expect("filter present");
+        let scf = filter
+            .status_code_filter
+            .as_ref()
+            .expect("status_code_filter present");
+        assert_eq!(scf.comparison.op, crate::bootstrap::ComparisonOp::Ge);
+        assert_eq!(scf.comparison.value.default_value, 500);
+        assert_eq!(scf.comparison.value.runtime_key, "unused");
+    }
+
+    #[test]
+    fn rejects_status_code_filter_unknown_op() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      status_code_filter:
+                        comparison:
+                          op: NE
+                          value: { default_value: 500, runtime_key: unused }
+"#,
+        );
+        // Unknown enum token → serde deserialize error → ConfigError::Yaml.
+        let err = crate::parse_bootstrap(&yaml).expect_err("NE must be rejected");
+        assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
     }
 
     // --- phase 32 t4: FileAccessLog.log_format boot-fatal format validation ---
