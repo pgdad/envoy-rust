@@ -2155,8 +2155,12 @@ The flag-off control over the SAME map (live-captured) keeps the `-` sentinel:
 ENTRY, beside its `typed_config` — not on the HCM. Each sink in `access_log: []`
 carries its own independent predicate, so one HCM can hold an unfiltered sink
 and a `GE 500` sink and each decides separately for the same record. A sink
-whose predicate rejects a record writes NOTHING for it (and does not tick
-`access_logs_total`, which counts EMITTED records only).
+whose predicate rejects a record writes NOTHING for it, and does not tick
+`access_logs_total`: that counter is incremented once per sink that PASSES the
+gate, before the write is attempted, so it counts intent-to-emit rather than
+successful emission. A sink that passes the gate and then fails to write still
+ticks `access_logs_total` (and additionally ticks `access_logs_failed`); the
+failure does not deflate the total.
 
 **§B — the schema.** The `filter` block nests exactly:
 
@@ -2205,6 +2209,28 @@ The oneof cardinality is fail-loud rather than defaulted: a zero-arm `filter`
 is an ambiguous instruction (log everything? nothing?), so it is rejected at
 boot rather than silently guessed. Omitting `filter` ENTIRELY is the valid way
 to say "log every record".
+
+**§E.1 — where envoy-rust is STRICTER than upstream (measured, v1.33.0).**
+§D's load-parity rule is one-way: a config upstream rejects must not boot here.
+The converse does NOT hold on this surface. `op` and `default_value` are proto3
+scalars, so upstream supplies an implicit default for an omitted field, and
+upstream accepts an enum's numeric token; envoy-rust models both fields as
+serde-REQUIRED and no enum in the tree accepts numeric tokens. Three configs
+upstream ACCEPTS are therefore boot-fatal here (`ConfigError::Yaml`):
+
+| config | upstream v1.33.0 | envoy-rust |
+|---|---|---|
+| `op` omitted | accepted (implicit default → `EQ`) | rejected (missing field `op`) |
+| `default_value` omitted | accepted (implicit default → `0`) | rejected (missing field) |
+| `op: 1` — numeric enum token | accepted (→ `GE`) | rejected (expects `EQ`/`GE`/`LE`) |
+
+This divergence is fail-loud, never silent: envoy-rust refuses to BOOT such a
+config, and never runs it with different behavior. It is consistent with the
+tree-wide posture on proto3 scalars — `FractionalPercent.numerator` and
+`TokenBucket.max_tokens` are serde-required in the same way. The practical
+consequence: a working upstream Envoy config that relies on the implicit `op`
+default, an implicit `default_value`, or a numeric `op` token will not boot on
+envoy-rust; spell all three out explicitly.
 
 **§F — `direct_response` IS logged, and its 503 carries `%RESPONSE_FLAGS%` =
 `-`.** A response the HCM authors itself (no upstream involved) is a normal
