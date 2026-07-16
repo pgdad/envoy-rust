@@ -18,6 +18,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::error::AccessLogError;
+use crate::filter::LogFilter;
 use crate::log_format::LogFormat;
 use crate::record::AccessLogRecord;
 
@@ -29,12 +30,15 @@ use crate::record::AccessLogRecord;
 /// retained for error reporting via `AccessLogError::Write`. The
 /// `format` is the compiled access-log format the sink renders each
 /// record through (the Envoy default via `CompiledFormat::default()`,
-/// or a config-derived custom format).
+/// or a config-derived custom format). The `filter` is the optional
+/// compiled per-record emission predicate (phase 70); `None` means the
+/// sink logs every record.
 #[derive(Debug)]
 pub struct FileSink {
     path: PathBuf,
     handle: Arc<Mutex<File>>,
     format: LogFormat,
+    filter: Option<LogFilter>,
 }
 
 impl FileSink {
@@ -44,7 +48,11 @@ impl FileSink {
     /// directory, etc.). Per 06.2 SPEC §6 signpost 6 + signpost 7,
     /// the constructor does NOT mkdir -p, does NOT pre-validate
     /// path shape, and does NOT truncate existing files.
-    pub async fn new(path: PathBuf, format: impl Into<LogFormat>) -> Result<Self, AccessLogError> {
+    pub async fn new(
+        path: PathBuf,
+        format: impl Into<LogFormat>,
+        filter: Option<LogFilter>,
+    ) -> Result<Self, AccessLogError> {
         let file = tokio::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -58,6 +66,7 @@ impl FileSink {
             path,
             handle: Arc::new(Mutex::new(file)),
             format: format.into(),
+            filter,
         })
     }
 
@@ -73,11 +82,26 @@ impl FileSink {
     /// — production code uses `FileSink::new` exclusively.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-util"))]
-    pub fn from_file_for_test(path: PathBuf, file: File, format: impl Into<LogFormat>) -> Self {
+    pub fn from_file_for_test(
+        path: PathBuf,
+        file: File,
+        format: impl Into<LogFormat>,
+        filter: Option<LogFilter>,
+    ) -> Self {
         Self {
             path,
             handle: Arc::new(Mutex::new(file)),
             format: format.into(),
+            filter,
+        }
+    }
+
+    /// Phase 70: returns `true` iff a record with final response `status`
+    /// should be emitted to this sink. A sink with no filter always logs.
+    pub fn should_log(&self, status: u16) -> bool {
+        match &self.filter {
+            Some(f) => f.should_log(status),
+            None => true,
         }
     }
 
@@ -169,7 +193,7 @@ mod tests {
     async fn file_sink_writes_one_record() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
-        let sink = FileSink::new(path.clone(), CompiledFormat::default())
+        let sink = FileSink::new(path.clone(), CompiledFormat::default(), None)
             .await
             .expect("open");
         let record = make_record();
@@ -206,7 +230,7 @@ mod tests {
     async fn file_sink_appends_multiple_records() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
-        let sink = FileSink::new(path.clone(), CompiledFormat::default())
+        let sink = FileSink::new(path.clone(), CompiledFormat::default(), None)
             .await
             .expect("open");
         for i in 0..3 {
@@ -229,7 +253,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
         let sink = Arc::new(
-            FileSink::new(path.clone(), CompiledFormat::default())
+            FileSink::new(path.clone(), CompiledFormat::default(), None)
                 .await
                 .expect("open"),
         );
@@ -284,7 +308,7 @@ mod tests {
         // FileSink::new does NOT mkdir -p; the OS-level open() will
         // return ENOENT and FileSink::new maps to AccessLogError::Open.
         let path = PathBuf::from("/nonexistent-parent-directory-06-2-fixture/access.log");
-        let err = FileSink::new(path.clone(), CompiledFormat::default())
+        let err = FileSink::new(path.clone(), CompiledFormat::default(), None)
             .await
             .expect_err("expected open error");
         match err {
@@ -308,10 +332,33 @@ mod tests {
             crate::JsonValueInput::Format("%RESPONSE_CODE%".to_string()),
         );
         let fmt = crate::CompiledJsonFormat::from_map(&map).unwrap();
-        let sink = FileSink::new(path.clone(), fmt).await.unwrap(); // CompiledJsonFormat: Into<LogFormat>
+        let sink = FileSink::new(path.clone(), fmt, None).await.unwrap(); // CompiledJsonFormat: Into<LogFormat>
         sink.emit(&make_record()).await.unwrap();
         drop(sink);
         assert_eq!(read_to_string(&path).await, "{\"status\":200}\n");
+    }
+
+    #[tokio::test]
+    async fn should_log_gates_on_filter() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("al.log");
+        let filter = Some(crate::LogFilter::StatusCode(crate::StatusCodeComparison {
+            op: crate::FilterOp::Ge,
+            threshold: 500,
+        }));
+        let sink = FileSink::new(path, CompiledFormat::default(), filter)
+            .await
+            .expect("open");
+        assert!(!sink.should_log(200));
+        assert!(sink.should_log(503));
+
+        // A sink with no filter logs everything.
+        let dir2 = tempdir().expect("tempdir");
+        let sink2 = FileSink::new(dir2.path().join("al2.log"), CompiledFormat::default(), None)
+            .await
+            .expect("open");
+        assert!(sink2.should_log(200));
+        assert!(sink2.should_log(503));
     }
 
     #[tokio::test]
@@ -319,7 +366,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("access.log");
         let fmt = CompiledFormat::from_inline("%RESPONSE_CODE%").expect("valid");
-        let sink = FileSink::new(path.clone(), fmt).await.expect("open");
+        let sink = FileSink::new(path.clone(), fmt, None).await.expect("open");
         sink.emit(&make_record()).await.expect("emit");
         drop(sink);
         let contents = read_to_string(&path).await;
