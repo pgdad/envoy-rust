@@ -2137,6 +2137,98 @@ The flag-off control over the SAME map (live-captured) keeps the `-` sentinel:
 
 ---
 
+### Phase 70 (ADR-0140/0141): `status_code_filter` — the per-record emission gate
+
+> Every access-log subsection ABOVE this one describes how a record is
+> RENDERED. Phase 70 opens the orthogonal FILTER axis: WHETHER a record is
+> emitted at all. An `AccessLog` entry gains an optional `filter`
+> (`envoy.config.accesslog.v3.AccessLogFilter`, a oneof); this phase ships the
+> single `status_code_filter` arm. When `filter` is absent the sink logs every
+> record, so all 27 pre-phase-70 access-log fixtures are untouched. The
+> cross-proxy witness is **fixture 0076**
+> (`0076-accesslog-status-code-filter`): one file sink with a `GE 500` filter
+> and two `direct_response` routes — the 503 record is emitted, the 200 is
+> dropped, byte-exact on both proxies. All facts below are empirically locked
+> against live `envoyproxy/envoy:v1.33.0` (ADR-0140 state-1 recon).
+
+**§A — the gate is PER SINK, not per HCM.** `filter` sits on the `AccessLog`
+ENTRY, beside its `typed_config` — not on the HCM. Each sink in `access_log: []`
+carries its own independent predicate, so one HCM can hold an unfiltered sink
+and a `GE 500` sink and each decides separately for the same record. A sink
+whose predicate rejects a record writes NOTHING for it (and does not tick
+`access_logs_total`, which counts EMITTED records only).
+
+**§B — the schema.** The `filter` block nests exactly:
+
+```yaml
+filter:
+  status_code_filter:
+    comparison:
+      op: GE                    # EQ | GE | LE
+      value:                    # envoy.config.core.v3.RuntimeUInt32
+        default_value: 500      # uint32
+        runtime_key: unused     # non-empty string (see §D)
+```
+
+`op` is the upstream `ComparisonFilter.Op` enum — exactly `{EQ, GE, LE}`. An
+unknown token (`NE`, `GT`, `LT`, lowercase `ge`) is boot-fatal via serde
+(`ConfigError::Yaml`); upstream has no such operators.
+
+**§C — the decision.** `op(status, default_value)` on the **FINAL response
+code** decides emission — the same value `%RESPONSE_CODE%` renders, evaluated
+after the response is complete. The comparison is
+`status <op> default_value` with the config value on the RIGHT: `GE 500` drops
+a 200 and keeps a 503; `EQ 404` keeps only a 404; `LE 200` keeps a 200 and
+drops a 201. Boundaries are inclusive on both `GE` and `LE` (`GE 500` keeps a
+500; `LE 200` keeps a 200).
+
+**§D — `runtime_key` is REQUIRED but RTDS-INERT.** Upstream PGV marks
+`RuntimeUInt32.runtime_key` `min_len 1`, so envoy-rust requires it non-empty
+for LOAD PARITY — a config upstream rejects must not boot here. It has NO
+behavioral effect: upstream would consult its runtime layer under this key for
+a `default_value` override, but envoy-rust has no runtime subsystem, so the
+comparison ALWAYS reads `default_value`. The key never reaches the wire, the
+log, or the compiled runtime filter (`StatusCodeComparison` carries only
+`{op, threshold}` — the key is dropped at compile time). Two configs differing
+only in `runtime_key` are behaviorally identical; fixture 0076 uses the literal
+`unused` to say so at the config site.
+
+**§E — validity (all boot-fatal, ADR-0049).** Three fail-loud rules:
+
+| config | outcome |
+|---|---|
+| `filter: {}` — the `AccessLogFilter` oneof sets NO arm | `ConfigError::AmbiguousAccessLogFilter` |
+| `runtime_key: ""` — present but empty | `ConfigError::EmptyStatusCodeFilterRuntimeKey` |
+| an unknown `op` token, or an unknown key anywhere under `filter` | `ConfigError::Yaml` / `deny_unknown_fields` |
+
+The oneof cardinality is fail-loud rather than defaulted: a zero-arm `filter`
+is an ambiguous instruction (log everything? nothing?), so it is rejected at
+boot rather than silently guessed. Omitting `filter` ENTIRELY is the valid way
+to say "log every record".
+
+**§F — `direct_response` IS logged, and its 503 carries `%RESPONSE_FLAGS%` =
+`-`.** A response the HCM authors itself (no upstream involved) is a normal
+loggable record — the filter sees its status and gates on it exactly as it
+would an upstream-derived one. The 503 in fixture 0076 renders the NO-FLAGS
+sentinel `-`, NOT an upstream-failure flag such as `UF`/`UC`: no upstream was
+attempted, so no failure flag applies. This is what keeps the fixture
+deterministic (measured, ADR-0140 state-1 recon).
+
+**§G — authoritative fixture-0076 file** (two probes — `GET /log` → 503 KEPT,
+`GET /nolog` → 200 DROPPED; `text_format_source` inline
+`STATUS=%RESPONSE_CODE% PATH=%REQ(:PATH)% FLAGS=%RESPONSE_FLAGS%\n`; `GE 500`).
+Each proxy's file holds EXACTLY ONE line:
+
+```
+STATUS=503 PATH=/log FLAGS=-
+```
+
+The assertion is pure cross-proxy equality — both proxies must agree on the
+KEPT half AND the DROPPED half. The line above documents the measured value; it
+is not the oracle.
+
+---
+
 ## xDS wire state machine
 
 > **To be filled per-phase as needed.**
