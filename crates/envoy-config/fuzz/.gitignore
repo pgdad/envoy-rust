@@ -57,5 +57,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/network_filter_rbac_cidr.yaml
 !corpus/parse_bootstrap/cluster_tcp_health_check.yaml
 !corpus/parse_bootstrap/grpc_health_check_seed
+!corpus/parse_bootstrap/status_code_filter.yaml
 artifacts/
 target/
