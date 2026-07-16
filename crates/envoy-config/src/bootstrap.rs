@@ -12959,6 +12959,15 @@ static_resources:
         // Unknown enum token → serde deserialize error → ConfigError::Yaml.
         let err = crate::parse_bootstrap(&yaml).expect_err("NE must be rejected");
         assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
+        // M70-R3: `ConfigError::Yaml(_)` alone is satisfied by ANY YAML-level
+        // error, so an unrelated typo in the fixture above would keep this test
+        // green for the wrong reason. Pin that the rejection is about the
+        // offending token specifically.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NE"),
+            "rejection must name the offending op token, got {msg:?}",
+        );
     }
 
     #[test]

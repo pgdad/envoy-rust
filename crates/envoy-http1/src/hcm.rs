@@ -4556,23 +4556,56 @@ static_resources:
     }
 
     /// Phase 70 Task 6: `from_config` compiles an `AccessLog.filter`'s
-    /// `status_code_filter` into the built `FileSink`'s runtime predicate —
-    /// a GE-500 filter makes the sink reject a 200 and accept a 503.
+    /// `status_code_filter` into the built `FileSink`'s runtime predicate.
+    ///
+    /// Table-driven across ALL THREE shipped operators (`EQ`/`GE`/`LE`) so the
+    /// config `ComparisonOp` → runtime `FilterOp` mapping in
+    /// `compile_access_log_filter` is pinned arm-by-arm. Each leg probes a
+    /// status the operator must KEEP and statuses on BOTH sides that it must
+    /// DROP, so no other operator satisfies the same row — swapping any two
+    /// arms of that match makes this test RED. `filter.rs` pins that each
+    /// `FilterOp` evaluates correctly and the envoy-config tests pin that
+    /// `op: EQ` parses; this is what connects the two.
     #[tokio::test]
     async fn from_config_compiles_status_code_filter_into_sink() {
         use tempfile::tempdir;
 
+        /// One table row: the configured operator, its threshold, and the
+        /// statuses the compiled predicate must keep (`true`) or drop (`false`).
+        type OpCase<'a> = (envoy_config::ComparisonOp, u32, &'a [(u16, bool)]);
+
+        let cases: &[OpCase] = &[
+            (
+                envoy_config::ComparisonOp::Ge,
+                500,
+                &[(499, false), (500, true), (503, true)],
+            ),
+            (
+                envoy_config::ComparisonOp::Eq,
+                404,
+                &[(403, false), (404, true), (405, false)],
+            ),
+            (
+                envoy_config::ComparisonOp::Le,
+                200,
+                &[(100, true), (200, true), (201, false)],
+            ),
+        ];
+
         let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("access.log");
-        let config = hcm_config_with_filtered_access_log(
-            Some((envoy_config::ComparisonOp::Ge, 500)),
-            &path,
-            200,
-        )
-        .await;
-        let sink = &config.access_log[0];
-        assert!(!sink.should_log(200), "GE 500 filter must reject a 200");
-        assert!(sink.should_log(503), "GE 500 filter must accept a 503");
+        for (i, (op, threshold, expectations)) in cases.iter().enumerate() {
+            let path = dir.path().join(format!("access_{i}.log"));
+            let config =
+                hcm_config_with_filtered_access_log(Some((*op, *threshold)), &path, 200).await;
+            let sink = &config.access_log[0];
+            for (status, must_log) in *expectations {
+                assert_eq!(
+                    sink.should_log(*status),
+                    *must_log,
+                    "{op:?} {threshold} filter on status {status}: expected should_log={must_log}",
+                );
+            }
+        }
     }
 
     /// Phase 70 Task 7: the H1 emit loop gates each sink on `should_log` of the

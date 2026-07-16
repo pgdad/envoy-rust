@@ -307,10 +307,20 @@ Findings and disposition:
   static+dynamic listeners) — so it is not a live panic. **It becomes a live footgun the
   moment a second `AccessLogFilter` arm lands:** the phase adding arm #2 **must** convert the
   `expect()` to a full match.
-- **CF-70-2 — latent `expected_lines == 0` in the differential arms.** If a future fixture
-  suppressed **every** probe, `wait_file_lines(path, 0)` returns instantly and
-  `read_to_string` would error on a never-created file, yielding a misleading I/O failure
-  rather than a clean pass. Unreachable from `0076`. Owner: the next filter fixture.
+- **CF-70-2 — ~~latent `expected_lines == 0` in the differential arms~~ — CLOSED at the §5.2
+  state-3 re-entry (its premise was MEASURED FALSE; see `REVIEW.md` §4.2 / M70-R5).** As
+  originally written this warned: if a future fixture suppressed **every** probe,
+  `wait_file_lines(path, 0)` returns instantly and `read_to_string` "would error on a
+  never-created file, yielding a misleading I/O failure rather than a clean pass."
+  **That failure mode cannot occur.** The state-5 review measured both proxies opening the
+  sink file **eagerly at config-load, before any request**: envoy-rust booted with the
+  filtered config and no request driven leaves `access.log` present at size 0, and upstream
+  `envoyproxy/envoy:v1.33.0` likewise creates it at boot (still size 0 after a single
+  suppressed 200). So an all-suppressed fixture reads `""` → 0 lines → compares 0 against 0
+  → **a correct clean pass**, which is the desired behavior. The file is never
+  "never-created", so there is no misleading I/O failure to guard against. **No owner, no
+  action: this is CLOSED, not carried.** It is recorded here rather than deleted (D-3.5)
+  precisely so a future filter phase does not re-open it and chase a phantom.
 - **CF-70-3 — `wait_file_lines(have >= want)` false-GREEN window on the DROPPED half.** Now
   that `want = expected_logged_count(probes)` (1 for `0076`) rather than `probes.len()` (2),
   a proxy that *wrongly* logged the suppressed probe could satisfy the poll with the kept line
@@ -569,3 +579,201 @@ false-pass-only — and remain live carry-forwards for the state-5 reviewer to w
 **§5 state-5 code-review** (`superpowers:requesting-code-review`) — a SEPARATE session per §5.1.
 Its deliverable is `REVIEW.md` (gate (f)). If it finds issues, the re-entry point is **state-3,
 not state-4** (§5.2).
+
+---
+
+# §5.2 RE-ENTRY — state-3 implementation (the `REVIEW.md` I-1 fix)
+
+> **Written by the §5.2 state-3 RE-ENTRY session** (`superpowers:executing-plans` +
+> `superpowers:test-driven-development`). Per `BOOTSTRAP_PROMPT.md` §5.2 a `REVIEW.md`
+> carrying issues re-enters at **state 3, NOT state 4** — this session resumed
+> IMPLEMENTATION under TDD; it did **not** re-run the §7.5 gate (state-4 owns that; its
+> evidence is §V1–§V8 above) and did **not** re-do the review (state-5's artifact is
+> `REVIEW.md`). Written for a stranger with zero prior context (D-3.4).
+>
+> **Sections §1–§8 (state-3) and §V1–§V8 (state-4) above are the historical record and were
+> NOT rewritten.** The sole exception is §6's **CF-70-2** entry, which M70-R5 explicitly
+> directs be corrected or closed; its original wording is preserved inline, struck through,
+> alongside the measurement that falsifies it (D-3.5 — nothing was deleted).
+>
+> **Cold-start:** `git status --porcelain` clean, branch `main`, `HEAD` = `origin/main` =
+> `b860e4e6` (the phase-70 §5 state-5 code-review commit); `git fetch origin --prune` showed
+> no sibling ahead. **STEP 0.5:** that commit's CI run `29516429241` re-confirmed
+> `completed`/`success` on the FULL 40-char SHA.
+
+## §R1. The blocking finding and what was actually wrong
+
+`REVIEW.md` §3.2 **I-1 (Important)** — the config→runtime `ComparisonOp` → `FilterOp` mapping
+in `compile_access_log_filter` (`crates/envoy-http1/src/hcm.rs:1746-1750`) was **unpinned for
+`Eq` and `Le`**. This is a **test-coverage gap, NOT a behavioral bug**: the mapping is correct
+as written; nothing held it correct.
+
+**Independently re-confirmed this session before touching anything** (not taken on trust from
+`REVIEW.md`):
+
+```
+$ grep -rn "op: EQ\|op: LE" crates/ tests/
+(zero hits)
+$ grep -rn "ComparisonOp::Eq\|ComparisonOp::Le" crates/ tests/
+crates/envoy-http1/src/hcm.rs:1747:  ComparisonOp::Eq => FilterOp::Eq,
+crates/envoy-http1/src/hcm.rs:1749:  ComparisonOp::Le => FilterOp::Le,
+```
+
+Both tokens appeared **nowhere in the tree except the two match arms that define them**. The
+`envoy-accesslog` `filter.rs` tests prove each `FilterOp` **evaluates** correctly and the
+`envoy-config` tests prove `op: EQ` **parses** correctly — **nothing connected the two**, so a
+user config saying `op: EQ` could compile to an `Le` predicate (logging every record at-or-below
+404 instead of exactly 404) with the entire suite still green.
+
+## §R2. The fix (one file, one test — the seam already existed)
+
+`hcm_config_with_filtered_access_log` (`hcm.rs:4487`) **already took the operator as a
+parameter** (`filter: Option<(envoy_config::ComparisonOp, u32)>`), so no production code and no
+new helper was needed. `from_config_compiles_status_code_filter_into_sink` (`hcm.rs:4562`) —
+previously a single `(Ge, 500)` leg — is now **table-driven across all three shipped operators**,
+routed through the production `from_config` constructor so the config→runtime compilation is the
+thing under test:
+
+| leg | threshold | probed statuses (`must_log`) |
+|---|---|---|
+| `Ge` | 500 | 499 → false, 500 → **true**, 503 → **true** |
+| `Eq` | 404 | 403 → false, 404 → **true**, 405 → false |
+| `Le` | 200 | 100 → **true**, 200 → **true**, 201 → false |
+
+**Each leg probes both sides of the boundary deliberately, so no other operator satisfies the
+same row.** The `Le` leg's `(100, true)` probe is load-bearing and is the reason the table is
+shaped this way: a naive `Le 200` table of only `(200, true), (201, false)` is **also satisfied
+by `Eq 200`** and would have stayed GREEN under the very mutation this fix exists to catch.
+`(100, true)` is what separates them.
+
+**No production code changed.** The mapping at `hcm.rs:1746-1750` is byte-for-byte as it landed.
+
+## §R3. RED→GREEN evidence (D-3.1 — the RED was PROVEN, three times, arm by arm)
+
+The production code was already correct, so the RED could not come from absence of the feature —
+it comes from **mutating the mapping** and proving the new assertions catch it. Per memory
+`mutation-checks-collide-with-parallel-subagents`, **every mutation ran in an isolated
+`git worktree --detach` at `b860e4e6`, never in-place** (during the state-5 review a concurrent
+subagent's `git checkout --` silently clobbered an in-place mutation and nearly produced a false
+conclusion). Per memory `mutation-check-needs-forced-rebuild`, **every run was grepped for
+`Compiling envoy-http1`** (a stale binary yields a FALSE PASS), and the mutation's **presence was
+re-grepped AFTER each run**, not just before.
+
+| # | Mutation (`Ge` untouched unless noted) | `Compiling envoy-http1` | Result |
+|---|---|---|---|
+| 1 | `Eq => FilterOp::Le` **and** `Le => FilterOp::Eq` (the review's swap) | 1 hit | **RED** — `Eq 404 filter on status 403: expected should_log=false` |
+| 2 | `Le => FilterOp::Eq` **only** (`Eq` correct) | 1 hit | **RED** — `Le 200 filter on status 100: expected should_log=true` |
+| 3 | `Ge => FilterOp::Le` **only** | 1 hit | **RED** — `Ge 500 filter on status 499: expected should_log=false` |
+
+Mutations 2 and 3 exist because `assert_eq!` **bails at the first failing assertion**: run 1
+alone only proves the `Eq` leg fires, and would leave "does the `Le` leg actually bite?"
+unproven — precisely the "a test that could not fail" trap this phase keeps hitting. Each arm is
+therefore pinned **independently**, each failing for its own correct and distinct reason.
+
+**GREEN** — the mapping restored (unmutated: `Eq => Eq`, `Ge => Ge`, `Le => Le`), in the main
+tree, `Compiling envoy-http1` confirmed:
+
+```
+test hcm::tests::from_config_compiles_status_code_filter_into_sink ... ok
+test result: ok. 1 passed; 0 failed
+```
+
+**A fourth mutation re-proved the RED against the FINAL landed test code**, after the
+`clippy::type_complexity` refactor in §R4 changed the test (a mutation proof against
+pre-refactor code does not cover post-refactor code): the `Eq`⇄`Le` swap → **RED**,
+`Eq 404 filter on status 403`, `Compiling envoy-http1` = 1 hit, mutation confirmed present after
+the run.
+
+## §R4. `clippy::type_complexity` — caught locally, not left for CI
+
+The table's first form tripped the phase's own gate-(e) lint (memory `plan-md-example-code-trips-clippy`):
+
+```
+error: very complex type used. Consider factoring parts into `type` definitions
+    --> crates/envoy-http1/src/hcm.rs:4574:20
+     |     let cases: &[(envoy_config::ComparisonOp, u32, &[(u16, bool)])] = &[
+     = note: `-D clippy::type-complexity` implied by `-D warnings`
+```
+
+Resolved per D-3.5 to the clippy-clean equivalent — a documented local `type OpCase<'a>` alias —
+rather than an `#[allow]`.
+
+## §R5. The Minors folded (M70-R3, M70-R5) — and the three deliberately NOT folded
+
+**M70-R3 — FOLDED** (`crates/envoy-config/src/bootstrap.rs`, `rejects_status_code_filter_unknown_op`).
+The test asserted only `matches!(err, ConfigError::Yaml(_))`, which **any** YAML-level error
+satisfies — an unrelated typo in its own fixture would have kept it green for the wrong reason.
+It now also asserts the rejection **names the offending token**. **The tightening was proven to
+bite** (isolated worktree, `Compiling envoy-config` = 1 hit): mutating the fixture so `op` is
+valid (`GE`) but an unrelated field is typo'd (`path` → `pathx`) still yields a
+`ConfigError::Yaml(_)` — the OLD assertion stays green — while the NEW assertion goes **RED**:
+
+```
+rejection must name the offending op token, got "parsing bootstrap YAML: static_resources
+.listeners[0].filter_chains[0].filters[0]: unknown field `pathx`, expected `path` or
+`log_format` at line 9 column 15"
+```
+
+**M70-R5 — FOLDED: CF-70-2 is CLOSED** (§6 above). Its premise is MEASURED FALSE (`REVIEW.md`
+§4.2): both proxies create the sink file **eagerly at config-load** (size 0 before any request,
+verified on envoy-rust AND on real `envoyproxy/envoy:v1.33.0`), so an all-suppressed fixture
+`read_to_string`s `""` → 0 lines → 0 == 0 → **a correct clean pass**, never the "misleading I/O
+failure on a never-created file" it warned of. Closed rather than propagated so a future filter
+phase does not chase a phantom. **This session relied on the state-5 measurement and did not
+re-derive it.**
+
+**NOT folded, and why** (all three remain live carry-forwards):
+- **M70-R1** (the hand-maintained one-element `set_arms` array + its overclaiming doc comment,
+  `bootstrap.rs:5117-5130` / `5097-5098`) — `REVIEW.md` §3.3 is explicit that this is best
+  discharged **by the phase that lands oneof arm #2, alongside CF-70-1**, which is the same
+  surface. Folding it here would touch a surface this re-entry has no other reason to open.
+- **M70-R2** (`expected_logged_count`'s wiring into the two byte-exact arms has no in-process
+  witness) and **M70-R4** (`AccessLog.filter` serializes as `"filter": null` — no
+  `skip_serializing_if`; it EXTENDS the existing `FileAccessLog.log_format` pattern rather than
+  introducing one) — both explicitly "reasonable carry-forwards" per `REVIEW.md` §7.
+
+## §R6. Verification run this session (NOT the §7.5 gate — that is state-4's job)
+
+Scoped to the three crates this re-entry touches. **The full §7.5 gate was deliberately NOT
+re-run** (§5.1 — that is the next session's state-4 re-verification).
+
+```
+$ cargo test -p envoy-http1 -p envoy-config -p envoy-accesslog --no-fail-fast
+test result: ok. 102 passed; 0 failed    (envoy-accesslog)
+test result: ok. 611 passed; 0 failed    (envoy-config)
+test result: ok. 173 passed; 0 failed    (envoy-http1)
+→ 886 passed / 0 failed
+
+$ cargo clippy -p envoy-http1 -p envoy-config -p envoy-accesslog --all-targets --all-features -- -D warnings
+(exit 0, clean)
+
+$ cargo fmt --all -- --check
+(exit 0, clean)
+```
+
+**886 / 0 is the same total the state-5 review measured GREEN *under the mutation*** (102 + 611 +
+173) — the count is unchanged because this fix adds assertions to two EXISTING tests rather than
+new test functions. That is the point: the suite that was green under a silently-inverted mapping
+is now green with the mapping actually pinned, and goes RED the moment it is inverted. `cargo fmt`
+was run and checked here rather than deferred, since CI has no `paths-ignore` and a fmt miss reds
+the next push (memory `envoy-rust-state4-ci-first-execution`).
+
+## §R7. Scope discipline
+
+- **No production code changed** — the diff is two test bodies (`envoy-http1`, `envoy-config`)
+  plus this record and the CF-70-2 correction. The `ComparisonOp`→`FilterOp` mapping is exactly
+  as it landed at state-3.
+- **No ADR fired.** The I-1 fix adds test coverage; it changes no decision. Next-available ADR
+  remains **ADR-0143** (unreserved). **ADR-0142's settlement of the `BEHAVIOR_CONTRACT.md` §E.1
+  stricter-than-upstream boundary was NOT re-litigated** — the phase-70 config surface stays
+  closed and no code is owed by it.
+- **No fixture weakened; `known-failures.txt` untouched** (memory `h2spec-3-5-2-preface-host-sensitive`).
+- `#![forbid(unsafe_code)]` holds; no new dependency (D-3.2/D-3.8).
+
+## §R8. Next session
+
+**§5 state-4 RE-VERIFICATION** (`superpowers:verification-before-completion`) — a SEPARATE
+session per §5.1; this session did NOT chain into it. A fresh context re-runs the **full §7.5
+gate** (a)–(e) over the re-entry's head commit and appends its evidence. Then a **state-5
+re-review** (gate (f) — the current `REVIEW.md` verdict is NOT approved and I-1 is now fixed),
+then the **state-6 close-out**.
