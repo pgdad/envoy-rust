@@ -1,5 +1,21 @@
 # Phase 70 — `status_code_filter` — §5 state-5 CODE REVIEW
 
+> ## ⚠️ CURRENT VERDICT LIVES IN §8 (the state-5 RE-REVIEW). READ §8 FIRST.
+>
+> **This file now carries TWO reviews.** The header block and §1–§7 below are the
+> **FIRST** state-5 review (of range `b362bae..899ca5c`); its verdict is **SUPERSEDED** by
+> **§8**, appended by the §5 state-5 **RE-REVIEW** session after the §5.2 re-entry fixed its
+> blocking finding. Per D-3.5 nothing below is rewritten — the first review's reasoning is
+> preserved verbatim because most of it still stands, and §8 states precisely which parts
+> are discharged, which are superseded, and which are corrected.
+>
+> **Current verdict (§8): NOT approved — 0 Critical / 1 Important (I-2, NEW) / 7 Minor.**
+> I-1 below is **DISCHARGED** (measured). Per §5.2 the phase re-enters at **state 3**.
+
+---
+
+## THE FIRST REVIEW (superseded verdict — reasoning preserved per D-3.5)
+
 > **Written by the §5 state-5 code-review session** (`superpowers:requesting-code-review`).
 > This is the INDEPENDENT review: per **ADR-0127** the context that wrote an artifact must
 > not grade it, so neither the state-3 session's own final whole-branch review
@@ -10,7 +26,7 @@
 > **Reviewed range:** `b362bae..899ca5c` — 18 commits (14 TDD task commits + 2 review-fix
 > commits + the state-3 docs commit + the state-4 docs commit); +2113 / −103 across 19 files.
 >
-> ## VERDICT: **NOT ready to merge — 1 Important.**
+> ## VERDICT (SUPERSEDED BY §8): **NOT ready to merge — 1 Important.**
 >
 > **0 Critical / 1 Important / 5 Minor.** Per `BOOTSTRAP_PROMPT.md` §5.2 an Important
 > finding sends the phase back to **§5 state-3 (implementation), NOT state-4** — that is a
@@ -21,6 +37,10 @@
 >
 > **§7.5 gate (f) is now MET** in the sense that `REVIEW.md` exists and is reasoned; it is
 > **not APPROVED**, so the phase does not advance to state-6.
+>
+> **[§8 UPDATE — I-1 is now DISCHARGED.](#8-the-re-review-5-state-5-re-review--the-re-issued-verdict)**
+> The §5.2 re-entry's fix was measured to bite. But the re-review found the **same defect
+> class one layer up** (I-2, §8.3) and the verdict remains NOT approved.
 
 ---
 
@@ -364,3 +384,330 @@ them** (§5.1 — one state per session).
 FALSE — correct or close it**, M70-R5), **CF-70-3** (unchanged — false-pass-only), plus the
 new **M70-R1..R5**. Not consumed by this phase and still live: **M69-A..I**, **CF-69-1/2/3/5**,
 **M68-1**, **M-1**, **CF-67-3/5/6/7**, the older Minors, and the HTTP-filters-family (1)–(4).
+
+---
+---
+
+# §8. THE RE-REVIEW (§5 state-5 RE-REVIEW) — the re-issued verdict
+
+> **Written by the §5 state-5 RE-REVIEW session** (`superpowers:requesting-code-review`),
+> **appended to — never rewriting — the first review above (§1–§7)**, per D-3.5. Written for
+> a stranger with zero prior context (D-3.4).
+>
+> **Why a RE-review exists.** The first review (above) returned **NOT approved** on one
+> blocking Important (§3.2 **I-1**). Per `BOOTSTRAP_PROMPT.md` §5.2 the phase re-entered at
+> **state 3**, where a re-entry session landed the I-1 fix and folded two Minors; a separate
+> state-4 session then re-ran the full §7.5 gate over the re-entry head and measured
+> **(a)–(e) PASS** (`PROGRESS.md` §V(2)). Gate **(f)** — an APPROVED `REVIEW.md` — is the
+> only sub-gate outstanding, and it is this session's sole deliverable. Per ADR-0127 the
+> re-entry's own scoped `886/0` run carries **zero authority** here; every claim below was
+> re-measured by this session.
+>
+> **Reviewed range:** `b860e4e..80978e8` (the §5.2 re-entry `2763c73` + the state-4
+> re-verification `80978e8`). The re-entry's code delta is **two test bodies**
+> (`crates/envoy-config/src/bootstrap.rs`, `crates/envoy-http1/src/hcm.rs`) + docs;
+> **no production code changed** (independently re-verified — §8.2).
+>
+> ## VERDICT: **NOT approved — 1 Important (I-2, NEW).**
+>
+> **0 Critical / 1 Important / 7 Minor.**
+>
+> - **I-1 (the first review's blocker) — DISCHARGED.** Measured, not read: the fix bites on
+>   all three arms independently (§8.1).
+> - **M70-R3, M70-R5 — CONSUMED.** Both measured genuinely discharged (§8.4).
+> - **I-2 — NEW Important.** The re-entry closed the *lower* half of the config→runtime
+>   seam (`ComparisonOp` → `FilterOp`) and its own doc comment asserts the *upper* half
+>   (YAML token → `ComparisonOp`) is already covered. **It is not.** That claim is false, and
+>   the gap it conceals is the **same defect class as I-1, displaced one layer up** — the
+>   fourth instance in this phase (§8.3).
+>
+> Per §5.2 an Important sends the phase back to **§5 state-3 (implementation), NOT state-4**
+> — a SEPARATE session. **§7.5 gate (f) remains UNMET**; the phase does **not** advance to
+> state-6.
+>
+> **This is not a reversal of the re-entry's work.** The I-1 fix is correct, well-shaped, and
+> proven. I-2 is an adjacent gap that the fix's own justification wrongly claimed was closed.
+
+---
+
+## §8.1 I-1 is DISCHARGED — measured on all three arms, not read
+
+The I-1 fix is a **test** change, and a test fix is exactly the kind that can be cosmetic. It
+was therefore measured by mutation, never by reading the diff and agreeing.
+
+**Method (every run).** Mutations applied in an **isolated `git worktree --detach`** at
+`80978e8`, never in-place (during the first review a concurrent subagent's
+`git checkout -- <file>` silently clobbered an in-place mutation and nearly produced a false
+conclusion). Every run grepped for **`Compiling envoy-http1`** (a stale test binary yields a
+FALSE PASS that makes a new test look vacuous) and the mutation was **re-grepped as still
+present AFTER each run**, not merely before. The target was **named** (`--lib`) and the
+verdict taken from the **`N passed` count, never the exit code** — `cargo test -p <pkg>
+<name>` can exit 0 reporting `0 passed; N filtered out`, meaning the test never ran.
+
+| # | Mutation of `compile_access_log_filter` (`hcm.rs:1746-1750`) | `Compiling` | Result | The assertion that caught it |
+|---|---|---|---|---|
+| — | *(baseline, unmutated)* | 1 hit | **1 passed** | — (proves the test genuinely RUNS) |
+| A | `Eq => FilterOp::Le` **and** `Le => FilterOp::Eq` (the first review's swap) | 1 hit | **RED** | `Eq 404 filter on status 403: expected should_log=false` |
+| B | `Le => FilterOp::Eq` **only** | 1 hit | **RED** | `Le 200 filter on status 100: expected should_log=true` |
+| C | `Ge => FilterOp::Le` **only** | 1 hit | **RED** | `Ge 500 filter on status 499: expected should_log=false` |
+| F | `threshold: …default_value` → `threshold: 0` | 1 hit | **RED** | `Ge 500 filter on status 499: expected should_log=false` |
+
+**Each arm fails for its own distinct reason**, which is the property that matters: `assert_eq!`
+bails at the first failing assertion, so a single mutation would leave the later legs' bite
+unproven. Mutation **F** additionally pins the `threshold`'s **provenance** (that it comes from
+`default_value` and not a constant) — a site the first review never asked about.
+
+### The re-entry's sufficiency argument — MEASURED TRUE, not accepted
+
+The re-entry argued the `Le` leg's `(100, true)` probe is **load-bearing**: a naive `Le 200`
+table of only `(200,true),(201,false)` is **also satisfied by `Eq 200`** and would stay green
+under the very mutation the fix exists to catch. That is a hypothesis, so it was measured
+rather than believed:
+
+```
+# Le leg weakened to &[(200, true), (201, false)]  AND  mutation B (Le => Eq) applied
+test result: ok. 1 passed; 0 failed          <-- GREEN: the arm's coverage is VACUOUS
+(both mutations confirmed present after the run; Compiling envoy-http1 = 1 hit)
+```
+
+**The claim is TRUE.** Without `(100, true)` the `Le` arm is pinned by nothing. The table's
+shape is deliberate and correct, and each of the three rows is uniquely satisfied by its own
+operator (all six op×row combinations were checked).
+
+---
+
+## §8.2 Claims re-verified rather than inherited
+
+Facts handed to this session by the ledger were re-measured where they were load-bearing.
+
+1. **"No production code changed" — CONFIRMED.** `git diff b860e4e..2763c73 -- crates/`
+   contains exactly two test bodies. `compile_access_log_filter` reads `Eq => Eq`, `Ge => Ge`,
+   `Le => Le` with **no `_` wildcard** (so a future oneof arm is a compile error, not a silent
+   fallthrough).
+2. **The H1 mapping test covers H2 as well — CONFIRMED INDEPENDENTLY.** The first review's
+   §3.1 concluded H2 owns no sink construction. Re-derived here from scratch:
+   `compile_access_log_filter` exists **only** in `crates/envoy-http1/src/hcm.rs:1741`; the
+   **only production** `FileSink::new` is `crates/envoy-http1/src/hcm.rs:212` (fed by
+   `entry.filter.as_ref().map(compile_access_log_filter)` at `:208`); **every**
+   `FileSink::new` in `crates/envoy-http2/src/hcm.rs` sits at line ≥2214 while that file's
+   `#[cfg(test)]` begins at line **1286** → all test-only; and `envoy_http2::HCMConfig` is
+   `{ pub inner: Arc<Http1HCMConfig>, h2_pool_mgr }`. **The single table-driven test pins the
+   sole production config→runtime path for BOTH codecs.**
+3. **CF-70-2 is CLOSED and the closure is honest — CONFIRMED** (§8.4, M70-R5).
+4. **M70-R1 is still accurately characterized — CONFIRMED.** The doc comment at
+   `bootstrap.rs:5097-5098` does still claim the one-element `set_arms` array is "written to
+   stay correct as future phases add arms"; it is hand-maintained and is not. Deferring it to
+   the phase that lands oneof arm #2 (alongside CF-70-1, the same surface) remains correct:
+   failure is loud (a boot reject), not silent-wrong.
+
+---
+
+## §8.3 Important (must fix — triggers a second §5.2 state-3 re-entry)
+
+**I-2 — the serde token→variant mapping is unpinned for `EQ` and `LE`, and the I-1 fix's own
+justification wrongly claims otherwise.**
+
+- **Files:** `crates/envoy-config/src/bootstrap.rs:747-754` (the `#[serde(rename)]`
+  attributes); the false claim at `crates/envoy-http1/src/hcm.rs:4566-4568` and again in
+  `PROGRESS.md` §R1.
+- **What is wrong.** I-1 was "config `ComparisonOp` → runtime `FilterOp` is unpinned for `Eq`
+  and `Le`". The fix pins that `match` — but it drives it with **Rust struct literals**
+  (`hcm_config_with_filtered_access_log` takes `ComparisonOp` as a parameter), so it **never
+  crosses the serde boundary**. The translation `op: EQ` (YAML) → `ComparisonOp::Eq` (Rust) is
+  a *separate* mapping, expressed in `#[serde(rename)]` attributes, and it is pinned by
+  nothing for `EQ` and `LE`. `GE` is the only token any test parses.
+- **The fix's own doc comment asserts the opposite.** `hcm.rs:4568` reads "*the envoy-config
+  tests pin that `op: EQ` parses; this is what connects the two*". That is **false**, and the
+  re-entry's own record disproves it: `PROGRESS.md` §R1 quotes
+  `grep -rn "op: EQ\|op: LE" crates/ tests/` → **"(zero hits)"**, then six lines later asserts
+  the `envoy-config` tests prove `op: EQ` parses. Both cannot be true. Re-run at `80978e8`,
+  the only `op: EQ` in the tree is **that doc comment itself**; `op: LE` has zero hits.
+- **MEASURED, not hypothesized.** In an isolated worktree the `EQ`/`LE` **renames** were
+  swapped (`#[serde(rename="LE")] Eq`, `#[serde(rename="EQ")] Le`; the Rust variant names —
+  and therefore every literal construction site — untouched):
+
+  ```
+  Compiling envoy-config                        (forced rebuild confirmed — 1 hit)
+  mutation present at run time                  (confirmed after the run)
+  test result: ok. 102 passed; 0 failed         (envoy-accesslog)
+  test result: ok. 611 passed; 0 failed         (envoy-config)
+  test result: ok. 173 passed; 0 failed         (envoy-http1)
+  → 886 passed / 0 failed — GREEN UNDER THE SWAP
+  ```
+
+  **886/0 is the exact total the re-entry reported as its GREEN** (`PROGRESS.md` §R6). The
+  suite cannot tell the two trees apart.
+- **The wrong behavior is real, and was demonstrated end-to-end through PRODUCTION YAML.** A
+  temporary probe driven through the **existing** seam `compiled_filter_from_bootstrap_yaml`
+  (`hcm.rs:4716` — it calls `envoy_config::parse_bootstrap` and the real
+  `compile_access_log_filter`):
+
+  ```
+  # against the swapped-rename tree:
+  test result: FAILED. 0 passed; 1 failed
+  op: EQ 404 must DROP a 403 (got logged)
+  # with the renames restored (Compiling envoy-config = 1 hit):
+  test result: ok. 1 passed; 0 failed
+  ```
+
+  So a user config `op: EQ, default_value: 404` compiles to an `Le` predicate and **logs every
+  record at or below 404 instead of exactly 404** — silently, with the whole repository green.
+  That is I-1's failure scenario verbatim, one layer up.
+- **Why Important and not Minor.** This is the **fourth** instance of this phase's recurring
+  defect class ("a test that could not fail"): the state-3 review found two, the first state-5
+  review found I-1, and this is the next link in the same chain. It is a **test-coverage gap,
+  not a behavioral bug** — the renames are correct **as written**; the defect is that nothing
+  holds them correct. Severity matches I-1's for the same reason: the failure is **silent
+  wrong behavior**, not a fail-loud boot reject.
+- **How to fix (cheap — the seam already exists, and the RED is already proven).**
+  `compiled_filter_from_bootstrap_yaml` (`hcm.rs:4716`) already drives production YAML through
+  the full serde→validator→compiler path. Its caller `bootstrap_yaml_with_runtime_key`
+  (`hcm.rs:4732`) hard-codes `op: GE` at `hcm.rs:4755`. **Parameterize the op token** and
+  table-drive all three through the seam — e.g. `op: EQ`/404 → drops 403, keeps 404, drops
+  405; `op: LE`/200 → keeps 100, keeps 200, drops 201. That kills the swap mutation above.
+  Per D-3.1 do it under TDD: prove RED against the swapped renames first (the probe above is a
+  working RED), then restore and confirm GREEN. **Do the mutation in a scratch git worktree**,
+  never in-place. **Also correct the false claim** at `hcm.rs:4566-4568` and `PROGRESS.md` §R1.
+- **Scope note.** Fixing I-2 requires **no production change** — it is one test + two comment
+  corrections. It does **not** reopen the phase-70 config surface (ADR-0142 stays settled).
+
+---
+
+## §8.4 The two folded Minors — both genuinely CONSUMED (measured)
+
+**M70-R3 — CONSUMED, and the tightening BITES.** The test
+`rejects_status_code_filter_unknown_op` (`crates/envoy-config/src/bootstrap.rs:12958`) now
+also asserts the rejection **names the offending token**. Measured in an isolated worktree by
+making `op` **valid** (`GE`) while typo-ing an **unrelated** field (`path` → `pathx`):
+
+```
+Compiling envoy-config                       (1 hit; mutation present after the run)
+# the OLD assertion `matches!(err, ConfigError::Yaml(_))` — STILL SATISFIED (execution
+# reached the new assertion), i.e. the wrong-reason-green it describes is REAL
+# the NEW assertion — RED:
+rejection must name the offending op token, got "parsing bootstrap YAML: static_resources
+.listeners[0].filter_chains[0].filters[0]: unknown field `pathx`, expected `path` or
+`log_format` at line 9 column 15"
+```
+
+The real message for the unmutated test is ``unknown variant `NE`, expected one of `EQ`,
+`GE`, `LE` at line 9 column 15`` — "NE" occurs **only** in the offending token (not in
+`EQ`/`GE`/`LE`, "unknown variant", the lowercase serde path, or the fixture's `/tmp/al.log`),
+so `contains("NE")` cannot pass for a wrong reason here. See **M70-R6** for the residual nit.
+
+**M70-R5 — CONSUMED: CF-70-2 is CLOSED.** `PROGRESS.md` §6 now strikes the entry through
+(`~~latent expected_lines == 0 in the differential arms~~ — CLOSED`), **preserves the original
+warning inline** rather than deleting it (D-3.5), and records the falsifying measurement so a
+stranger sees *why* it is closed without opening this file. The disposition is drawn
+deliberately against its live siblings: CF-70-1 and CF-70-3 both retain named owners, while
+CF-70-2 alone says "**No owner, no action: this is CLOSED, not carried**". **No file lists
+CF-70-2 as live** — `STATE.md:15` and `:126` both say CLOSED. The remaining mentions are in
+append-only historical records (`PROGRESS.md` §V7, and §7 of the first review above), which is
+correct: those are frozen text, not live claims. See **M70-R8** for the residual nit.
+
+---
+
+## §8.5 Minor (carry-forwards — none blocks; fold the cheap same-file ones with I-2 if convenient)
+
+**Still live from the first review, unchanged:** **M70-R1** (the hand-maintained `set_arms`
+array + its overclaiming doc comment — discharge with oneof arm #2, alongside CF-70-1, the
+same surface), **M70-R2** (`expected_logged_count`'s wiring into the two byte-exact arms has
+no in-process witness; re-confirmed accurate — the helper is at
+`tests/differential/src/lib.rs:1134`, wired at `:6258` and `:6401`, pinned in isolation only
+by `expected_logged_count_excludes_suppressed` at `:7314`), **M70-R4** (`AccessLog.filter`
+serializes as `"filter": null` — no `skip_serializing_if`; re-confirmed that the sibling
+`FileAccessLog.log_format` does the identical thing, so phase 70 extends an existing pattern
+rather than introducing one).
+
+**NEW, opened by this re-review:**
+
+**M70-R6 — the `contains("NE")` assertion is unanchored.** `bootstrap.rs:12967`. Measured
+robust *today* (§8.4), but it is a 2-character substring that asserts neither "this is an
+unknown-**variant** error" nor "it is about the **`op`** field". `grep -rn 'rename = "[^"]*NE[^"]*"' crates/envoy-config/src/`
+is currently zero-hit, so no other token contains uppercase `NE` — but a future enum gaining a
+`NONE`-like variant would silently weaken it. `msg.contains("unknown variant `NE`")` is
+strictly stronger at zero cost. **Preference, not a defect.**
+
+**M70-R7 — the I-1 fix's doc comment misdescribes the table's probe shape.**
+`crates/envoy-http1/src/hcm.rs:4563-4565` claims "*Each leg probes a status the operator must
+KEEP and statuses on **BOTH sides** that it must DROP*". Only the `Eq` leg does (403 **and**
+405). `Ge 500` drops on one side only (499; 503 is kept) and `Le 200` drops on one side only
+(201; 100 is kept) — a `Ge`/`Le` predicate **cannot** drop on both sides, so the sentence is
+unsatisfiable for two of three legs. The **conclusion** it draws ("no other operator satisfies
+the same row") is nonetheless **correct** (verified over all six op×row combinations). Wrong
+rationale, right table. `PROGRESS.md` §R2's own wording is accurate; only the code comment is
+wrong. **Fix with I-2** (same file, same comment block).
+
+**M70-R8 — the CF-70-2 closure elides a sentence instead of striking it (D-3.5 hygiene).**
+`PROGRESS.md:310-323`. The original entry (`git show 2d272aa:…PROGRESS.md`) ended
+"*Unreachable from `0076`. Owner: the next filter fixture.*" The load-bearing part (the
+falsified warning) **is** preserved essentially verbatim, and "Owner:" is explicitly superseded
+by "No owner, no action" — so D-3.5's intent is met — but "Unreachable from `0076`." was
+dropped with no strikethrough. **Fix:** strike the full original sentence set rather than
+eliding the tail.
+
+**M70-R9 — a provenance error in §3.3 of the first review (above).** `REVIEW.md:174` dates the
+`FileAccessLog.log_format` precedent "shipped since phase 38". It actually shipped in **phase
+32** (`c869f91`, "phase 32 t4: FileAccessLog.log_format config field", already
+`#[serde(default)]` with no `skip_serializing_if`); the phase-38/ADR-0092 attribution belongs
+to the `SubstitutionFormatString` oneof **type**, not to the field's serde shape. Recorded
+here rather than edited above, per D-3.5. **This does not weaken M70-R4** — if anything the
+pattern predates phase 70 by *more* than the first review claimed. (Cosmetic sibling: the first
+review's M70-R2 cites `:6255`/`:6398`; the actual call sites are `:6258`/`:6401` — the cited
+lines are the first line of the explaining comment block, so it points at the right code.)
+
+---
+
+## §8.6 Doctrine compliance (re-checked over the re-entry head)
+
+| Rule | Status |
+|---|---|
+| D-3.1 TDD (RED→GREEN per task) | ✅ the re-entry proved its RED 4×, arm by arm, in isolated worktrees |
+| D-3.2 dependency stance | ✅ no new crate, no new dependency |
+| D-3.3 differential-over-fidelity | ✅ `0076` is pure cross-proxy equality |
+| D-3.4 stranger-readability | ✅ — but see **I-2**: `PROGRESS.md` §R1 contains a self-contradiction a stranger would have to catch |
+| D-3.5 decisions written | ⚠️ met in substance; **M70-R8** is a hygiene nit on the CF-70-2 elision |
+| D-3.6 green build | ✅ state-4 re-verification (a)–(e) PASS over `2763c73`; CI GREEN on `80978e8` (run `29524535731`) |
+| D-3.7 version pin | ✅ `envoyproxy/envoy:v1.33.0` untouched |
+| D-3.8 `#![forbid(unsafe_code)]` | ✅ holds; no `unsafe` added |
+| §6.1 split gate | ✅ does not fire |
+| §7.4 fuzz | ✅ corpus seed on the existing target; no new target → no `ci.yml` step owed |
+| Scope discipline (ADR-0140) | ✅ only `status_code_filter` shipped |
+| ADR-0142 (§E.1 boundary) | ✅ **NOT re-litigated** — the phase-70 config surface stays CLOSED |
+| `known-failures.txt` | ✅ untouched, not trimmed |
+
+**No ADR fired by this re-review** — I-2 is a coverage gap, not an ambiguity; it settles no
+decision. Next-available **ADR-0143** remains unreserved.
+
+---
+
+## §8.7 Next session — a SECOND §5.2 state-3 re-entry (NOT state-4, NOT state-6)
+
+Per §5.2 an Important re-enters at **state 3**: you are resuming implementation **under TDD**,
+not re-verifying. **Do not re-run the §7.5 gate** — state-4 measured (a)–(e) green over this
+head; a state-4 **re**-verification is owed only *after* the I-2 fix lands.
+
+**The single required fix — I-2** (§8.3): pin the YAML-token → `ComparisonOp` mapping for `EQ`
+and `LE` by table-driving `bootstrap_yaml_with_runtime_key`'s hard-coded `op: GE`
+(`hcm.rs:4755`) through the existing `compiled_filter_from_bootstrap_yaml` seam
+(`hcm.rs:4716`). **Prove the RED first** by swapping the `EQ`/`LE` renames
+(`bootstrap.rs:748-753`) — a working RED is quoted in §8.3. Grep every run for
+`Compiling envoy-config`; do the mutation in a **scratch git worktree**, never in-place. Then
+**correct the false claim** at `hcm.rs:4566-4568` and in `PROGRESS.md` §R1 (a strikethrough
+correction, D-3.5).
+
+**Cheap same-file folds** (safe to take in the same re-entry): **M70-R7** (the "BOTH sides"
+comment — same comment block as I-2's correction), **M70-R6** (anchor the `contains("NE")`
+assertion), **M70-R8** (strike CF-70-2's elided sentence). **M70-R1** stays with oneof arm #2
+alongside CF-70-1; **M70-R2**/**M70-R4**/**M70-R9** remain reasonable carry-forwards.
+
+After the fix lands: a state-4 **re**-verification (fresh session, full §7.5 gate over the new
+head), then a state-5 **re**-review, then the state-6 close-out. **This session did NOT chain
+into any of them** (§5.1 — one state per session).
+
+**Carry-forwards after this re-review.** Live: **CF-70-1** (the zero-arm `expect()`; arm #2's
+phase must convert it to a full match), **CF-70-3** (false-pass-only), **M70-R1**, **M70-R2**,
+**M70-R4**, and the new **M70-R6/R7/R8/R9**. **CONSUMED:** M70-R3, M70-R5 (and **I-1**).
+**CLOSED:** ~~CF-70-2~~ (premise measured FALSE — do not re-open). Not consumed by this phase
+and still live: **M69-A..I**, **CF-69-1/2/3/5**, **M68-1**, **M-1**, **CF-67-3/5/6/7**, the
+older Minors, and the HTTP-filters-family (1)–(4).
