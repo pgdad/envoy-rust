@@ -456,6 +456,13 @@ pub enum ConfigError {
     #[error("access_log filter must set exactly one filter variant: {detail}")]
     AmbiguousAccessLogFilter { detail: String },
 
+    /// Phase 70: a `status_code_filter.comparison.value.runtime_key` is present
+    /// but empty. Upstream enforces `min_len 1` (`RuntimeUInt32ValidationError`).
+    /// The key is RTDS-inert here (the comparison always uses `default_value`),
+    /// but load-time parity requires a non-empty key.
+    #[error("status_code_filter runtime_key must be non-empty")]
+    EmptyStatusCodeFilterRuntimeKey,
+
     /// 06.3 D14.3: listener with codec_type HTTP1 or AUTO routes to a cluster
     /// whose typed_extension_protocol_options.HttpProtocolOptions.
     /// explicit_http_config.http2_protocol_options is set. Closes

@@ -5098,6 +5098,11 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 ///      to stay correct as future phases add arms. This mirrors the
 ///      `SubstitutionFormatString` / `AmbiguousLogFormat` oneof precedent —
 ///      the cardinality lives here, not in serde.
+///   4. Phase 70 — non-empty `runtime_key`: a `status_code_filter`'s
+///      `comparison.value.runtime_key` must not be `""`. Upstream enforces
+///      PGV `min_len 1`; the key is RTDS-inert here (the comparison always
+///      reads `default_value`), but load-time parity requires the rejection.
+///      Surfaces as `ConfigError::EmptyStatusCodeFilterRuntimeKey`.
 ///
 /// Mutates nothing; returns the first error encountered (validator-wide
 /// convention).
@@ -5122,6 +5127,11 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                         "more than one filter variant is set".into()
                     },
                 });
+            }
+            if let Some(scf) = &filter.status_code_filter
+                && scf.comparison.value.runtime_key.is_empty()
+            {
+                return Err(crate::ConfigError::EmptyStatusCodeFilterRuntimeKey);
             }
         }
         match &entry.typed_config {
@@ -12965,6 +12975,28 @@ static_resources:
         let err = crate::parse_bootstrap(&yaml).expect_err("empty filter must be rejected");
         assert!(
             matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_status_code_filter_empty_runtime_key() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      status_code_filter:
+                        comparison:
+                          op: GE
+                          value: { default_value: 500, runtime_key: "" }
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("empty runtime_key must be rejected");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyStatusCodeFilterRuntimeKey),
             "got {err:?}"
         );
     }
