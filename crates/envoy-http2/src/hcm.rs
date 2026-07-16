@@ -1128,16 +1128,20 @@ async fn finalize_h2_stream(
             response_code_details: response_code_details_for_log_h2,
             dynamic_metadata,
         };
-        // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
-        // Counter::add(N) per 06.1 REVIEW §7 R-8; fires BEFORE the per-sink
-        // await so failures do NOT deflate access_logs_total (parent SPEC §6
-        // Rule 4 fire-and-forget posture).
-        config
-            .inner
-            .stats
-            .access_logs_total
-            .add(config.inner.access_log.len() as u64);
         for sink in &config.inner.access_log {
+            // Phase 70: the per-sink emit gate. A sink with no filter always
+            // logs, so unfiltered sinks (every H2 fixture today) behave exactly
+            // as before this gate landed.
+            if !sink.should_log(record.response_code) {
+                continue;
+            }
+            // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
+            // Counts intent-to-emit, so it fires BEFORE the per-sink await —
+            // failures do NOT deflate access_logs_total (parent SPEC §6 Rule 4
+            // fire-and-forget posture). Phase 70 moved this from a pre-loop
+            // `add(len)` into the gated branch so a suppressed sink does not
+            // over-count; for unfiltered sinks the total is unchanged.
+            config.inner.stats.access_logs_total.inc();
             if let Err(err) = sink.emit(&record).await {
                 // 06.3 D15.3.e NEW: count emission failures alongside the warn.
                 config.inner.stats.access_logs_failed.inc();
@@ -1618,6 +1622,7 @@ static_resources:
                         omit_empty_values: false,
                     }),
                 }),
+                filter: None,
             }],
             route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
@@ -1731,6 +1736,7 @@ static_resources:
                         omit_empty_values: false,
                     }),
                 }),
+                filter: None,
             }],
             route_config: Some(RouteConfiguration {
                 name: "r".to_string(),
@@ -2205,7 +2211,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -2385,7 +2391,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -2751,6 +2757,7 @@ static_resources:
                 envoy_accesslog::FileSink::new(
                     p.clone(),
                     envoy_accesslog::CompiledFormat::default(),
+                    None,
                 )
                 .await
                 .expect("open sink"),
@@ -2968,7 +2975,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -3077,7 +3084,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -3154,6 +3161,152 @@ static_resources:
         );
     }
 
+    /// Phase 70 T8: the H2 sibling of the H1 per-sink `should_log` emit gate.
+    /// A sink carrying `status_code_filter { op: GE, value: 500 }` must SUPPRESS
+    /// a 200 (0 lines) and EMIT a 503 (1 line). Both responses are
+    /// direct-responses so the gate is exercised without an upstream. The
+    /// `access_logs_total` counter must count EMITTED records only — a
+    /// suppressed sink must not tick it (the counter moved from a pre-loop
+    /// `add(len)` into the gated branch for exactly this reason).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_filtered_sink_suppresses_below_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let fmt = envoy_accesslog::CompiledFormat::from_inline("%RESPONSE_CODE%\n")
+            .expect("format parses");
+        let filter =
+            envoy_accesslog::LogFilter::StatusCode(envoy_accesslog::StatusCodeComparison {
+                op: envoy_accesslog::FilterOp::Ge,
+                threshold: 500,
+            });
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, Some(filter))
+                .await
+                .expect("open FileSink"),
+        );
+
+        // Two direct-response routes on the default wildcard vhost: /ok -> 200
+        // (below the GE 500 threshold -> suppressed), /err -> 503 (at or above
+        // -> emitted).
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![
+                        Route {
+                            name: "ok".to_string(),
+                            r#match: RouteMatch {
+                                prefix: Some("/ok".to_string()),
+                                path: None,
+                                headers: vec![],
+                            },
+                            action: RouteAction::DirectResponse(DirectResponse {
+                                status: 200,
+                                body: DataSource {
+                                    filename: None,
+                                    inline_string: Some("ok\n".to_string()),
+                                },
+                            }),
+                            typed_per_filter_config: Default::default(),
+                        },
+                        Route {
+                            name: "err".to_string(),
+                            r#match: RouteMatch {
+                                prefix: Some("/err".to_string()),
+                                path: None,
+                                headers: vec![],
+                            },
+                            action: RouteAction::DirectResponse(DirectResponse {
+                                status: 503,
+                                body: DataSource {
+                                    filename: None,
+                                    inline_string: Some("nope\n".to_string()),
+                                },
+                            }),
+                            typed_per_filter_config: Default::default(),
+                        },
+                    ],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let stats = Arc::clone(&built.stats.access_logs_total);
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+
+        // The suppressed leg: 200 < 500 -> the sink must write nothing.
+        h2_direct_response_roundtrip(addr, "/ok", 200).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged.lines().count(),
+            0,
+            "GE 500 sink must suppress the 200: {logged:?}"
+        );
+        assert_eq!(
+            stats.value(),
+            0,
+            "a suppressed sink must not tick access_logs_total"
+        );
+
+        // The emitted leg: 503 >= 500 -> exactly one line.
+        h2_direct_response_roundtrip(addr, "/err", 503).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "503\n",
+            "GE 500 sink must emit exactly the 503 record: {logged:?}"
+        );
+        assert_eq!(
+            stats.value(),
+            1,
+            "the emitted record ticks access_logs_total"
+        );
+    }
+
+    /// Drive one H2 request to `path` against `addr`, assert the response
+    /// status, and drain the body (so the HCM reaches its access-log dispatch
+    /// before the caller samples the sink).
+    async fn h2_direct_response_roundtrip(addr: std::net::SocketAddr, path: &str, expect: u16) {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri(format!("http://any.test{path}"))
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status(), expect, "status for {path}");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+    }
+
     /// Phase 56 (ADR-0113): the H2 sibling of the H1 phase-48 backstop
     /// `h1_host_miss_access_log_carries_nr_flag`
     /// (`crates/envoy-http1/src/hcm.rs:6016`). Same HCM config as
@@ -3180,7 +3333,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -3269,6 +3422,7 @@ static_resources:
                 path.clone(),
                 envoy_accesslog::CompiledFormat::from_inline("r=%ROUTE_NAME%")
                     .expect("format parses"),
+                None,
             )
             .await
             .expect("open sink"),
@@ -3367,6 +3521,7 @@ static_resources:
                 path.clone(),
                 envoy_accesslog::CompiledFormat::from_inline("d=%RESPONSE_CODE_DETAILS%")
                     .expect("format parses"),
+                None,
             )
             .await
             .expect("open sink"),
@@ -3502,6 +3657,7 @@ static_resources:
                 path.clone(),
                 envoy_accesslog::CompiledFormat::from_inline("c=%UPSTREAM_CLUSTER%")
                     .expect("format parses"),
+                None,
             )
             .await
             .expect("open sink"),
@@ -3589,6 +3745,7 @@ static_resources:
                 path.clone(),
                 envoy_accesslog::CompiledFormat::from_inline("c=%UPSTREAM_CLUSTER%")
                     .expect("format parses"),
+                None,
             )
             .await
             .expect("open sink"),
@@ -4649,7 +4806,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -4855,7 +5012,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -5004,7 +5161,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -5093,7 +5250,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
