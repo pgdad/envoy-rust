@@ -202,12 +202,16 @@ impl HCMConfig {
         // promoting this constructor to async is a clean change.
         let mut access_log_sinks: Vec<Arc<envoy_accesslog::FileSink>> = Vec::new();
         for entry in &cfg.access_log {
+            // Phase 70 Task 6: compile the optional per-record emission
+            // predicate. `None` → the sink logs every record (pre-70 parity).
+            let filter = entry.filter.as_ref().map(compile_access_log_filter);
             match &entry.typed_config {
                 envoy_config::AccessLogTypedConfig::FileAccessLog(file_cfg) => {
                     let format = compiled_log_format(file_cfg)?;
                     let sink = envoy_accesslog::FileSink::new(
                         std::path::PathBuf::from(&file_cfg.path),
                         format,
+                        filter,
                     )
                     .await
                     .map_err(|err| Http1Error::AccessLogOpen {
@@ -1730,6 +1734,29 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize
 /// the string at config-load, so `from_inline` here re-parses an already-validated
 /// string and cannot fail in practice — but we map any error defensively rather
 /// than panic (the HCM build is `Result`-returning).
+/// Phase 70 Task 6 — translate a config-side `AccessLogFilter` into the
+/// runtime `LogFilter` predicate the sink evaluates per record. The
+/// envoy-config validator (Task 2) already enforced that exactly one oneof
+/// arm is set, so the `expect` below is unreachable in practice; this phase
+/// ships the single `status_code_filter` arm.
+fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accesslog::LogFilter {
+    let scf = f
+        .status_code_filter
+        .as_ref()
+        .expect("validated: exactly one filter arm is set");
+    let op = match scf.comparison.op {
+        envoy_config::ComparisonOp::Eq => envoy_accesslog::FilterOp::Eq,
+        envoy_config::ComparisonOp::Ge => envoy_accesslog::FilterOp::Ge,
+        envoy_config::ComparisonOp::Le => envoy_accesslog::FilterOp::Le,
+    };
+    envoy_accesslog::LogFilter::StatusCode(envoy_accesslog::StatusCodeComparison {
+        op,
+        // `runtime_key` is RTDS-inert here — the comparison always uses
+        // `default_value` (see `RuntimeUInt32`'s envoy-config doc comment).
+        threshold: scf.comparison.value.default_value,
+    })
+}
+
 fn compiled_log_format(
     file_cfg: &envoy_config::FileAccessLog,
 ) -> Result<envoy_accesslog::LogFormat, Http1Error> {
@@ -4444,6 +4471,104 @@ static_resources:
         (hcm_config, registry)
     }
 
+    /// Phase 70 Task 6: build an HCMConfig via the production `from_config`
+    /// constructor with ONE file access-log sink at `path` and a single
+    /// `/`-prefix direct-response route returning `status`. `filter` is
+    /// `Some((op, value))` for a sink carrying a `status_code_filter`, or
+    /// `None` for the unfiltered (pre-phase-70 parity) shape. Routed through
+    /// `from_config` — not a struct literal — so the config → runtime filter
+    /// compilation is the thing under test.
+    async fn hcm_config_with_filtered_access_log(
+        filter: Option<(envoy_config::ComparisonOp, u32)>,
+        path: &std::path::Path,
+        status: u16,
+    ) -> Arc<HCMConfig> {
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = cluster_mgr_empty().await;
+        let envoy_cfg = envoy_config::HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: envoy_config::CodecType::HTTP1,
+            http2_protocol_options: None,
+            access_log: vec![envoy_config::AccessLog {
+                name: "envoy.access_loggers.file".to_string(),
+                typed_config: envoy_config::AccessLogTypedConfig::FileAccessLog(
+                    envoy_config::FileAccessLog {
+                        path: path.to_string_lossy().into_owned(),
+                        log_format: None,
+                    },
+                ),
+                filter: filter.map(|(op, value)| envoy_config::AccessLogFilter {
+                    status_code_filter: Some(envoy_config::StatusCodeFilter {
+                        comparison: envoy_config::ComparisonFilter {
+                            op,
+                            value: envoy_config::RuntimeUInt32 {
+                                default_value: value,
+                                runtime_key: "access_log.status_code".to_string(),
+                            },
+                        },
+                    }),
+                }),
+            }],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("body\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            }],
+        };
+        Arc::new(
+            HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
+                .await
+                .expect("HCMConfig builds"),
+        )
+    }
+
+    /// Phase 70 Task 6: `from_config` compiles an `AccessLog.filter`'s
+    /// `status_code_filter` into the built `FileSink`'s runtime predicate —
+    /// a GE-500 filter makes the sink reject a 200 and accept a 503.
+    #[tokio::test]
+    async fn from_config_compiles_status_code_filter_into_sink() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("access.log");
+        let config = hcm_config_with_filtered_access_log(
+            Some((envoy_config::ComparisonOp::Ge, 500)),
+            &path,
+            200,
+        )
+        .await;
+        let sink = &config.access_log[0];
+        assert!(!sink.should_log(200), "GE 500 filter must reject a 200");
+        assert!(sink.should_log(503), "GE 500 filter must accept a 503");
+    }
+
     /// 06.3 D15.3.a: 2xx class counter increments on a 200 direct-response.
     #[tokio::test(flavor = "multi_thread")]
     async fn hcm_increments_downstream_rq_2xx_on_2xx_response() {
@@ -4592,6 +4717,7 @@ static_resources:
             envoy_accesslog::FileSink::new(
                 path.clone(),
                 envoy_accesslog::CompiledFormat::default(),
+                None,
             )
             .await
             .expect("open sink"),
@@ -4629,6 +4755,7 @@ static_resources:
                     path.clone(),
                     envoy_accesslog::CompiledFormat::from_inline("r=%ROUTE_NAME%")
                         .expect("format parses"),
+                    None,
                 )
                 .await
                 .expect("open sink"),
@@ -4703,6 +4830,7 @@ static_resources:
                 path.clone(),
                 envoy_accesslog::CompiledFormat::from_inline("d=%RESPONSE_CODE_DETAILS%")
                     .expect("format parses"),
+                None,
             )
             .await
             .expect("open sink"),
@@ -4774,6 +4902,7 @@ static_resources:
                 path.clone(),
                 envoy_accesslog::CompiledFormat::from_inline("c=%UPSTREAM_CLUSTER%")
                     .expect("format parses"),
+                None,
             )
             .await
             .expect("open sink"),
@@ -4836,6 +4965,7 @@ static_resources:
                 path.clone(),
                 envoy_accesslog::CompiledFormat::from_inline("c=%UPSTREAM_CLUSTER%")
                     .expect("format parses"),
+                None,
             )
             .await
             .expect("open sink"),
@@ -4960,6 +5090,7 @@ static_resources:
                 envoy_accesslog::FileSink::new(
                     p.clone(),
                     envoy_accesslog::CompiledFormat::default(),
+                    None,
                 )
                 .await
                 .expect("open sink"),
@@ -5081,6 +5212,7 @@ static_resources:
             path.clone(),
             ro_file,
             envoy_accesslog::CompiledFormat::default(),
+            None,
         ));
         let result = serve_one_request_with_pre_constructed_sinks(&[sink]).await;
         assert!(
@@ -5168,6 +5300,7 @@ static_resources:
             envoy_accesslog::FileSink::new(
                 path.clone(),
                 envoy_accesslog::CompiledFormat::default(),
+                None,
             )
             .await
             .expect("open sink"),
@@ -5240,6 +5373,7 @@ static_resources:
             path.clone(),
             ro_file,
             envoy_accesslog::CompiledFormat::default(),
+            None,
         ));
         let (config, _registry) = hcm_config_with_access_log_and_registry(vec![sink]).await;
 
@@ -5548,6 +5682,7 @@ static_resources:
             envoy_accesslog::FileSink::new(
                 log_path.to_path_buf(),
                 envoy_accesslog::CompiledFormat::default(),
+                None,
             )
             .await
             .expect("open FileSink"),
@@ -5836,7 +5971,7 @@ static_resources:
         )
         .expect("valid log_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), format)
+            envoy_accesslog::FileSink::new(log_path.clone(), format, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -5951,7 +6086,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -6042,7 +6177,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -6134,7 +6269,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -6261,7 +6396,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -6353,7 +6488,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -6442,7 +6577,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -6525,7 +6660,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -6631,7 +6766,7 @@ static_resources:
         )
         .expect("valid log_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), format)
+            envoy_accesslog::FileSink::new(log_path.clone(), format, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -7711,7 +7846,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -7798,7 +7933,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -7880,7 +8015,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -8034,7 +8169,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
@@ -8125,7 +8260,7 @@ static_resources:
         );
         let fmt = envoy_accesslog::CompiledJsonFormat::from_map(&map).expect("valid json_format");
         let sink = Arc::new(
-            envoy_accesslog::FileSink::new(log_path.clone(), fmt)
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, None)
                 .await
                 .expect("open FileSink"),
         );
