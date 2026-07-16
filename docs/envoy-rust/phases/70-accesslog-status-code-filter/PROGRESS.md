@@ -777,3 +777,242 @@ session per §5.1; this session did NOT chain into it. A fresh context re-runs t
 gate** (a)–(e) over the re-entry's head commit and appends its evidence. Then a **state-5
 re-review** (gate (f) — the current `REVIEW.md` verdict is NOT approved and I-1 is now fixed),
 then the **state-6 close-out**.
+
+---
+---
+
+# §5 STATE-4 RE-VERIFICATION — the full §7.5 gate re-run over the §5.2 re-entry head (SEPARATE session)
+
+> **Written by the §5 state-4 RE-VERIFICATION session** (`superpowers:verification-before-completion`),
+> **appended to — never rewriting — §1–§8 (state-3), §V1–§V8 (the state-4 verification of the
+> PRE-fix commit `899ca5c`), and §R1–§R8 (the §5.2 re-entry).** Written for a stranger with zero
+> prior context (D-3.4).
+>
+> **Why this re-run exists.** The §V1–§V8 evidence was measured against the **PRE-fix** commit
+> `899ca5c` and does **NOT** carry over to the re-entry's head. Per **ADR-0127** the re-entry
+> session's own scoped run (§R6: `886 passed / 0 failed`) carries **ZERO authority** here — that is
+> the implementing context grading itself, and it never ran the workspace-global gate, the
+> differential, `cargo deny`, or the fuzzer. **Every gate below was re-measured from scratch by this
+> session.**
+>
+> **VERDICT: the §7.5 gate PASSES on every sub-gate this state owns — (a), (b), (c), (d), (e).**
+> Sub-gate **(f)** is **NOT met and is NOT this session's job**: `REVIEW.md` exists but its verdict
+> is **NOT approved**. Discharging it is the §5 **state-5 RE-review**. Phase 70 therefore advances
+> to the state-5 re-review, **NOT** to state-6.
+
+## §V(2)1. Preconditions confirmed (disk + CI are the authority, not the handoff)
+
+| Check | Command | Result |
+|---|---|---|
+| Tree clean | `git status --porcelain` | empty |
+| Branch | `git rev-parse --abbrev-ref HEAD` | `main` |
+| HEAD | `git rev-parse HEAD` | `2763c73525821a42012ee354fcb2b0c34ed449a4` (the §5.2 re-entry commit) |
+| No sibling ahead | `git fetch origin --prune` + `git log --oneline -1 origin/main` | `2763c73` — `HEAD` == `origin/main` |
+| Re-entry CI GREEN | `gh run list --commit 2763c73525821a42012ee354fcb2b0c34ed449a4` | `{"conclusion":"success","databaseId":29520553072,"status":"completed","workflowName":"ci"}` |
+
+Confirmed with the **FULL 40-char SHA** (a short SHA silently returns `[]` and would look like "CI
+never ran"). Both jobs are `success` with `steps=15` (`build + test + lint`) and `steps=13` (`fuzz`)
+— **not** the runner-starvation signature (`cancelled` + `steps:0`), so the commit genuinely executed.
+
+## §V(2)2. Gate (e) — build / lint / format / deny — ALL CLEAN
+
+Run **serially** (cargo's file lock makes concurrent invocations contend), full output redirected to
+files — **never piped through `tail`**, which truncates the `failures:` block.
+
+| Gate | Command | Exit | Output |
+|---|---|---|---|
+| fmt | `cargo fmt --all -- --check` | **0** | **zero bytes** (a 0-line file — no diff) |
+| build | `cargo build --workspace --all-targets` | **0** | `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 10.79s` |
+| clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **0** | `grep -cE "^(warning\|error)"` → **0** |
+| deny | `cargo deny check` | **0** | `advisories ok, bans ok, licenses ok, sources ok` |
+
+`cargo deny check` emitted five `warning[license-not-encountered]` lines — **unmatched-allowance
+notices about `deny.toml`'s allow-list, not findings against any dependency**; the summary is
+`advisories ok, bans ok, licenses ok, sources ok`, exit 0. **No freshly-published RustSec advisory
+fired this session** — no `cargo update -p X --precise` was needed.
+
+**`cargo build -p envoy-bin` was run BEFORE any differential** (exit 0) — the harness executes
+`target/debug/envoy-bin` (debug, NOT release), and a stale debug binary REDs with
+`unknown field: filter` on this phase's config key, which mimics a real failure but is not one.
+
+## §V(2)3. Gates (a)+(b) — `cargo test --workspace --no-fail-fast` — 2015 passed / 7 failed / 9 ignored
+
+`--no-fail-fast` is **mandatory** for adjudication: a bare `cargo test --workspace` aborts at the
+first failing *binary* and never exercises the rest of the gate.
+
+```
+TEST_RUN1_EXIT=101
+passed=2015 failed=7 ignored=9
+```
+
+### Gate (a) — the new fixture is GREEN
+
+`0076` passed **inside the full workspace run** (i.e. under full parallel load) **and** again in
+isolation:
+
+```
+     Running tests/access_log_status_code_filter.rs
+test access_log_status_code_filter ... ok
+
+$ cargo test -p differential --test access_log_status_code_filter
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.14s
+```
+
+### Gate (b) — all 7 failures adjudicated NOT-A-REGRESSION; none in the phase-70 surface
+
+**Blast-radius check first (the load-bearing one).** The only fixture anywhere in the tree that
+configures a `status_code_filter` is the new fixture itself:
+
+```
+$ grep -rlE "status_code_filter" tests/fixtures/ | sed 's|/[^/]*$||' | sort -u
+tests/fixtures/0076-accesslog-status-code-filter
+```
+
+**None of the 7 failures touches a filter**, and `0076` — the one that does — passes. A sink with no
+filter takes the `should_log → true` path, which is exactly the pre-phase-70 behavior.
+
+Each failure was re-run **in isolation** to separate deterministic-environmental from parallel-load
+flake (**the discriminator: environmental fails alone; load-flake passes alone**):
+
+| # | Test | Isolated | Class | MEASURED evidence |
+|---|---|---|---|---|
+| 1–4 | `access_log_rcd_upstream_reset`, `access_log_rf_upstream_reset`, `access_log_h2_rcd_upstream_reset`, `access_log_h2_uc_upstream_reset` | **FAILS alone** (deterministic) | environmental — IPv6-unreachable close backend | `immediate_connect_error:_Network_is_unreachable` + `remote_address:[fdc4:f303:9324::254]:33837` |
+| 5 | `admin_config_dump_server_info` | **FAILS alone** (deterministic) | environmental — Docker bridge IP | envoy-only stats `backend::192.168.65.2:37497::{canary,cx_active,cx_connect_fail}` (this host routes the backend via `192.168.65.2`, not the allow-listed address) |
+| 6 | `admin_ready_returns_200_post_migration` (`crates/envoy-bin/tests/admin_ready.rs:47`) | **PASSES alone** (`1 passed; 0 failed`) | parallel-load startup race | `drive /ready: Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }` |
+| 7 | `dataless_fin_ticks_allowed_for_tcp_proxy_but_not_echo` (`crates/envoy-bin/tests/network_filter_rbac.rs:782`) | **PASSES alone** (`1 passed; 0 failed`) | parallel-load startup race | `data listener never came up within 10s: Connection refused (os error 111)` |
+
+Failures 1–4 are **one root cause seen from two sides**: real Envoy cannot reach the host-spawned
+close backend over IPv6, so it logs a **connect failure (`UF`)** where envoy-rust logs a genuine
+**reset (`UC`)**. That is a property of this host's networking, not of the code.
+
+**#6 and #7 are NEW members relative to the §V3 sweep — and were investigated, not waved through.**
+Neither is in the phase-70 surface (neither configures an access log at all; the blast-radius grep
+above is decisive), and **both pass deterministically in isolation**, which is the signature of the
+documented **port-reuse / startup-race** family (memories `eds-fatal-startup-test-port-reuse-flake`,
+`rds-no-rds-is-inert-startup-flake`, `xds-eds-hot-reload-admin-ready-startup-flake`,
+`xds-file-cds-happy-path-admin-ready-startup-flake`, `differential-fixtures-flake-under-parallel-load`)
+— a listener/admin endpoint not yet accepting when the probe fires (`Connection refused` /
+`WouldBlock`). Conversely `client::tests::send_request_maps_h2_handshake_failure_to_typed_error`,
+which the §V3 sweep saw RED, **passed this run**. **The RED set legitimately varies run-to-run**;
+the membership here is entirely within the documented flake families, with no new *family*.
+
+### The decisive cross-check — local `passed + failed` == CI `passed`
+
+CI ran this **exact tree** (SHA `2763c73525…`) and was GREEN, so every one of these 7 tests passes on CI:
+
+```
+$ gh run view 29520553072 --log | grep -oE "test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed" \
+    | awk '{p+=$4; f+=$6} END {print "CI passed="p" CI failed="f}'
+CI passed=2022 CI failed=0
+```
+
+**2015 local passed + 7 local failed = 2022 == 2022 CI passed.** The identity holds **exactly**.
+This proves two things at once: the local RED set is **entirely environmental/flake** (CI runs the
+same code green), and **no test silently disappeared** from the local run. **CI is authoritative for
+this documented flake set — never a regression, and never to be "fixed" by weakening a fixture.**
+
+**The total is UNCHANGED from the §V3 sweep (2022 == 2022)** — the predicted result, and it was
+checked rather than assumed: the §5.2 re-entry adds assertions to two EXISTING tests rather than new
+test functions, so the count must not move. A changed total would have been a signal worth chasing.
+
+### A methodological trap this session hit (recorded so the next session does not repeat it)
+
+The first isolation attempt used `cargo test -p envoy-bin <test_name> -- --exact` and reported
+`test result: ok. 0 passed; 0 failed; 5 filtered out` — **exit 0 with the test never having run.**
+That is a **FALSE GREEN**: `-p envoy-bin` selects *a* test binary, and the name lived in a different
+one, so the filter matched nothing and cargo still exited 0. **`0 passed` is not a pass.** The
+re-run named the target explicitly (`--test admin_ready` / `--test network_filter_rbac`) and only
+then produced the real `1 passed` verdicts quoted above. Always assert on the `N passed` count, never
+on the exit code alone.
+
+## §V(2)4. Gate (c) — conformance — unchanged, nothing owed
+
+No protocol-conformance surface this phase.
+
+```
+$ git diff --stat b362bae..HEAD -- tests/conformance/ .github/
+(empty)
+```
+
+`tests/conformance/h2spec/known-failures.txt` is **untouched** (21 lines) and **must not be trimmed**
+— local h2spec scores invalid-preface 3.5/2 as PASS while CI still fails it, so trimming from local
+evidence would break CI (memory `h2spec-3-5-2-preface-host-sensitive`).
+
+## §V(2)5. Gate (d) — fuzz — no new target; the corpus seed is genuinely tracked
+
+The §7.4 disposition (ADR-0141 PV-5) is a `parse_bootstrap` **corpus seed** only, riding the EXISTING
+target — so **no new fuzz target and no `ci.yml` step is owed** (a new target is not auto-discovered
+and would need hand-wiring; the empty `.github/` diff in §V(2)4 confirms none was added). The seed is
+verified tracked the only way that actually proves it — the corpus dir is `*`-ignored, so a seed is
+silently untracked and invisible to CI without an explicit `!`-un-ignore line:
+
+```
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml
+crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml     # PRINTS → tracked
+$ git check-ignore crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml
+CHECK_IGNORE_EXIT=1                                                          # exit 1 → NOT ignored
+```
+
+Short-budget run executed from the **crate dir** (`cd crates/envoy-config` first — it errors from the
+repo root with `could not read .../fuzz/Cargo.toml`, memory `cargo-fuzz-runs-from-crate-dir-not-repo-root`):
+
+```
+$ cargo +nightly fuzz run parse_bootstrap -- -max_total_time=60
+INFO: seed corpus: files: 9448 min: 1b max: 2922b total: 5285897b
+#9449     INITED cov: 16260 ft: 33689 corp: 3071/2070Kb
+#106327   DONE   cov: 16316 ft: 33878 corp: 3114/2091Kb lim: 2966 exec/s: 1084
+Done 106327 runs in 98 second(s)
+FUZZ_EXIT=0
+```
+
+**106,327 runs, zero crashes / panics / leaks, exit 0.** CI's fuzz job independently ran the
+`parse_bootstrap` target green on this SHA (run `29520553072`, `steps=13` → `success`).
+
+## §V(2)6. Gate (f) — `REVIEW.md` — NOT this state's job, and NOT met
+
+`REVIEW.md` **exists** but its verdict is **NOT approved** (0 Critical / 1 Important / 5 Minor). Its
+one blocking finding (§3.2 **I-1**) is what the §5.2 re-entry fixed. Confirming that discharge and
+re-issuing the verdict is the §5 **state-5 RE-review**'s deliverable
+(`superpowers:requesting-code-review`). Per §5.1 this session advances exactly ONE state and does
+**not** chain into it.
+
+## §V(2)7. State-4 re-verification verdict
+
+**PASS on (a), (b), (c), (d), (e). (f) is unmet by design — state-5's job.** No REAL regression was
+found, so there is **no §5.2 re-entry to state-3**: this session changed **no code** and weakened
+**no fixture**. Its only artifacts are this §V(2) section, the ledger (`STATE.md` /
+`STATE_HISTORY.md`), and the commit.
+
+**The re-entry's "no production code changed" claim was independently VERIFIED, not accepted on
+trust** (it is the premise that makes the unchanged 2022 total meaningful):
+
+```
+$ diff <(git show 899ca5c:crates/envoy-http1/src/hcm.rs | sed -n '/fn compile_access_log_filter/,/^}/p') \
+       <(sed -n '/fn compile_access_log_filter/,/^}/p' crates/envoy-http1/src/hcm.rs)
+(no output — exit 0)
+```
+
+`compile_access_log_filter` is **byte-identical** to the pre-review landing `899ca5c`, and the
+mapping reads `Eq => FilterOp::Eq`, `Ge => FilterOp::Ge`, `Le => FilterOp::Le` with **no `_`
+wildcard**. The re-entry diff (`b860e4e..2763c73`) touches 5 files: two test bodies
+(`crates/envoy-config/src/bootstrap.rs`, `crates/envoy-http1/src/hcm.rs`) plus docs
+(`PROGRESS.md`, `STATE.md`, `STATE_HISTORY.md`).
+
+The **29 pre-phase-70 access-log-driver fixtures (28 byte-exact)** figure was **independently
+recounted** this session by driver `kind`: 22 `http1_access_log_byte_exact` + 7
+`http2_access_log_byte_exact` + 1 `http1_with_access_log` = **30 including `0076` → 29 pre-phase-70**.
+Confirmed correct.
+
+Live carry-forwards are **not** gate failures and remain for the state-5 reviewer to weigh:
+**CF-70-1** (unreachable today), **CF-70-3** (false-pass-only), **M70-R1/M70-R2/M70-R4**
+(**M70-R3 + M70-R5 CONSUMED** by the re-entry; **CF-70-2 CLOSED**).
+
+## §V(2)8. Next session
+
+**§5 state-5 RE-review** (`superpowers:requesting-code-review`) — a SEPARATE session per §5.1. It is
+a **RE-review**: the current `REVIEW.md` verdict is NOT approved, and its I-1 is now fixed. Its job
+is to confirm I-1 is genuinely discharged (**the fix is a test change — verify it BITES**, e.g. by
+re-running the `Eq`⇄`Le` mutation in an ISOLATED worktree, rather than reading the diff and
+agreeing), confirm M70-R3 + M70-R5 are genuinely consumed, and re-issue the verdict. If it approves,
+the phase advances to the **state-6 close-out**. If it finds issues, the re-entry point is
+**state-3, not state-4** (§5.2).
