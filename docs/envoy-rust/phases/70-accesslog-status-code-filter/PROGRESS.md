@@ -355,3 +355,217 @@ scoped.
 session per §5.1 (one state per session; the context that wrote an artifact must not grade
 it — ADR-0127). The §4 dry-run above is **not** the state-4 verdict: state-4 re-runs the full
 §7.5 gate (a)–(f) itself and records its own evidence.
+
+---
+---
+
+# §5 STATE-4 VERIFICATION — independent gate re-run (SEPARATE session)
+
+> **Written by the §5 state-4 verification session** (`superpowers:verification-before-completion`),
+> appended to — never rewriting — the state-3 record above (§1–§8 are the state-3 session's
+> artifact). Per **ADR-0127** the context that wrote an artifact must not grade it: the §4
+> dry-run above carried **no authority** here, and **every gate below was re-run from scratch
+> by this session**. Written for a stranger with zero prior context (D-3.4).
+>
+> **VERDICT: the §7.5 gate PASSES on every sub-gate this state owns — (a), (b), (c), (d), (e).**
+> Sub-gate **(f) `REVIEW.md` is NOT this session's job** — it is the §5 state-5 code-review's
+> deliverable and remains legitimately unmet. Phase 70 therefore advances to state-5, NOT to
+> state-6.
+
+## §V1. Preconditions confirmed (disk + CI are the authority, not the handoff)
+
+| Check | Command | Result |
+|---|---|---|
+| Tree clean | `git status --porcelain` | empty |
+| Branch | `git rev-parse --abbrev-ref HEAD` | `main` |
+| HEAD | `git rev-parse HEAD` | `2d272aaf88268b55266e996ef2c6f9234079fb8e` (the state-3 commit) |
+| No sibling ahead | `git fetch origin --prune` + `git log --oneline -1 origin/main` | `2d272aa` — `HEAD` == `origin/main` |
+| State-3 CI GREEN | `gh run list --commit 2d272aaf88268b55266e996ef2c6f9234079fb8e` | `{"conclusion":"success","databaseId":29488932188,"status":"completed","workflowName":"ci"}` |
+
+The state-3 CI run was re-confirmed with the **FULL 40-char SHA** (a short SHA silently returns
+`[]` and would look like "CI never ran"). Both jobs are `success` with `steps=15` / `steps=13` —
+**not** the runner-starvation signature (`cancelled` + `runner_name:""` + `steps:0`), so the
+commit genuinely executed.
+
+## §V2. Gate (e) — build / lint / format / deny — ALL CLEAN
+
+Run serially (cargo's file lock makes concurrent invocations contend), full output redirected
+to files — **never piped through `tail`**, which truncates the `failures:` block.
+
+| Gate | Command | Exit | Output |
+|---|---|---|---|
+| fmt | `cargo fmt --all -- --check` | **0** | **zero bytes** (a 0-line file — no diff) |
+| build | `cargo build --workspace --all-targets` | **0** | `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 9.17s` |
+| clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **0** | `Finished \`dev\` profile … in 1.66s`; `grep -cE "^(warning\|error)"` → **0** |
+| deny | `cargo deny check` | **0** | `advisories ok, bans ok, licenses ok, sources ok` |
+
+`cargo deny check` emitted five `warning[license-not-encountered]` lines (`0BSD`,
+`BSD-2-Clause`, `MPL-2.0`, `Unicode-DFS-2016`, `Zlib` — allow-list entries no dependency
+actually uses). These are **unmatched-allowance notices about `deny.toml`, not findings against
+any dependency**; the summary line is `advisories ok, bans ok, licenses ok, sources ok` and the
+exit code is 0. **No freshly-published RustSec advisory fired this session** — no `cargo update
+-p X --precise` was needed.
+
+**`cargo build -p envoy-bin` was run BEFORE any differential** (exit 0) — the harness executes
+`target/debug/envoy-bin`, and a stale debug binary would RED with `unknown field: filter` on
+this phase's new config key, which mimics a real failure but is not one.
+
+## §V3. Gates (a)+(b) — `cargo test --workspace` — 2016 passed / 6 failed / 9 ignored
+
+Run as `cargo test --workspace --no-fail-fast`. **`--no-fail-fast` is mandatory for
+adjudication**: the bare `cargo test --workspace` aborts at the first failing *binary* and never
+exercises the rest of the gate.
+
+```
+TEST_RUN1_EXIT=101
+passed=2016 failed=6 ignored=9
+```
+
+### Gate (a) — the new fixture is GREEN
+
+```
+     Running tests/access_log_status_code_filter.rs (target/debug/deps/access_log_status_code_filter-1d5200f2899a0d82)
+test access_log_status_code_filter ... ok
+```
+
+`0076` passed **inside the full workspace run** (i.e. under full parallel load) **and** again in
+isolation:
+
+```
+$ cargo test -p differential --test access_log_status_code_filter
+test access_log_status_code_filter ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+```
+
+### Gate (b) — all 6 failures adjudicated ENVIRONMENTAL; none in the phase-70 surface
+
+**Blast-radius check first (the load-bearing one).** The only fixture anywhere in the tree that
+configures a `status_code_filter` is the new fixture itself:
+
+```
+$ grep -rlE "status_code_filter" tests/fixtures/*/expectations.yaml tests/fixtures/*/*.yaml | sed 's|/[^/]*$||' | sort -u
+tests/fixtures/0076-accesslog-status-code-filter
+```
+
+**None of the 6 failures touches a filter**, and `0076` — the one that does — passes. A sink
+with no filter takes the `should_log → true` path, which is the pre-phase-70 behavior.
+
+Each failure was re-run **in isolation** to separate deterministic-environmental from
+parallel-load flake (the discriminator: environmental fails alone, load-flake passes alone):
+
+| # | Test | Isolated | Class | MEASURED evidence |
+|---|---|---|---|---|
+| 1–4 | `access_log_rcd_upstream_reset`, `access_log_rf_upstream_reset`, `access_log_h2_rcd_upstream_reset`, `access_log_h2_uc_upstream_reset` | **FAILS alone** (deterministic) | environmental — IPv6-unreachable close backend | `immediate_connect_error:_Network_is_unreachable` + `remote_address:[fdc4:f303:9324::254]:40435`; and the mirror assert `envoy="{\"rc\":503,\"rf\":\"UF\"}"` vs `envoy-rust="{\"rc\":503,\"rf\":\"UC\"}"` |
+| 5 | `admin_config_dump_server_info` | **FAILS alone** (deterministic) | environmental — Docker bridge IP | envoy-only stats `backend::192.168.65.2:38459::hostname::host.docker.internal` (this host routes the backend via `192.168.65.2`, not the allow-listed address) |
+| 6 | `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` | **PASSES alone** (`1 passed; 0 failed`) | parallel-load / host flake | `expected H2ClientHandshake, got Ok(ClientStream { host: "test.example", .. })` — the handshake *unexpectedly succeeds* on this host's networking |
+
+Failures 1–4 are one root cause seen from two sides: real Envoy **cannot reach** the
+host-spawned close backend over IPv6, so it logs a **connect failure (`UF`)** where envoy-rust
+logs a genuine **reset (`UC`)**. That is a property of this host's networking, not of the code.
+
+**Difference from the state-3 dry-run (5 failures) is fully accounted for:** this run added
+exactly one — #6, the `envoy-http2` handshake test, which is itself a documented host-flake and
+**passes deterministically in isolation**. The set is non-identical run-to-run by design; the
+membership is a subset of the documented flake families, with no new member.
+
+### The decisive cross-check — local `passed + failed` == CI `passed`
+
+CI ran this **exact tree** (SHA `2d272aaf…`) and was GREEN, so every one of these 6 tests passes
+on CI:
+
+```
+$ gh run view 29488932188 --log | grep -oE "test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed" | awk '{p+=$1; f+=$3} END {print "CI passed="p" CI failed="f}'
+CI passed=2022 CI failed=0
+```
+
+**2016 local passed + 6 local failed = 2022 == 2022 CI passed.** The identity holds exactly.
+This proves two things at once: the local RED set is **entirely environmental** (CI runs the same
+code green), and **no test silently disappeared** from the local run. **CI is authoritative for
+this documented flake set — never a regression, and never to be "fixed" by weakening a fixture.**
+
+## §V4. Gate (c) — conformance — unchanged, nothing owed
+
+No protocol-conformance surface this phase.
+
+```
+$ git diff --stat b362bae..HEAD -- tests/conformance/ .github/
+(empty)
+```
+
+`known-failures.txt` is **untouched** and **must not be trimmed** — local h2spec scores
+invalid-preface 3.5/2 as PASS while CI still fails it, so trimming from local evidence would
+break CI.
+
+## §V5. Gate (d) — fuzz — no new target; the corpus seed is genuinely tracked
+
+The §7.4 disposition (ADR-0141 PV-5) is a `parse_bootstrap` **corpus seed** only, riding the
+EXISTING target — so **no new fuzz target and no `ci.yml` step is owed** (a new target is not
+auto-discovered and would need hand-wiring; the empty `.github/` diff in §V4 confirms none was
+added). The seed is **verified tracked** the only way that actually proves it — `git status` is
+not sufficient, because the corpus dir is `*`-ignored and a seed is silently untracked and
+invisible to CI without an explicit `!`-un-ignore line:
+
+```
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml
+crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml     # PRINTS → tracked
+$ git check-ignore crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml
+CHECK_IGNORE_EXIT=1                                                          # exit 1 → NOT ignored
+```
+
+Short-budget run executed from the **crate dir** (`cd crates/envoy-config` first — it errors from
+the repo root with `could not read .../fuzz/Cargo.toml`):
+
+```
+$ cargo +nightly fuzz run parse_bootstrap -- -max_total_time=60
+seed corpus: files: 6882
+#6883     INITED cov: 15401 ft: 30817 corp: 2587/1693Kb exec/s: 6883 rss: 336Mb
+#797741   DONE   cov: 16262 ft: 33691 corp: 3154/2200Kb lim: 3055 exec/s: 13077 rss: 354Mb
+Done 797741 runs in 61 second(s)
+FUZZ_EXIT=0
+```
+
+**797,741 runs, zero crashes / panics / leaks, exit 0.** CI's fuzz job independently ran the
+`parse_bootstrap` target green on this SHA (run `29488932188`, job `fuzz (parse_bootstrap + …)`
+→ `success`).
+
+## §V6. Gate (f) — `REVIEW.md` — NOT this state's job
+
+`REVIEW.md` does not exist and **is not owed by state-4**. It is the §5 state-5 code-review's
+deliverable (`superpowers:requesting-code-review`). Per §5.1 this session advances exactly ONE
+state and does **not** chain into the review.
+
+## §V7. State-4 verdict
+
+**PASS on (a), (b), (c), (d), (e). (f) deferred to state-5 by design.** No REAL regression was
+found, so there is **no §5.2 re-entry to state-3**: no code was changed by this session, and no
+fixture was weakened. The 3 Minors carried from the state-3 review (**CF-70-1/2/3**) are
+**not** gate failures — CF-70-1 is unreachable today, CF-70-2 is latent, CF-70-3 is
+false-pass-only — and remain live carry-forwards for the state-5 reviewer to weigh.
+
+**This session changed no code.** Its only artifact is this §V section plus the ledger
+(`STATE.md`) and the commit.
+
+### For the state-5 code-review session (NOT state-4's job — recorded here so it is not lost)
+
+- **The untested composition:** phase 70 added a per-sink gate over **two** consumers (H1 + H2),
+  but the differential covers **H1 only**. The H2 filtered path is covered **in-process only**,
+  and — as the blast-radius grep in §V3 re-confirmed this session — **no fixture anywhere sets a
+  filter on H2**. A green gate proves the code does what its tests ask, not that the tests ask
+  the right question; weigh whether that composition warrants a live probe against both proxies.
+- **A judgment call to weigh:** the state-3 session recorded a MEASURED **stricter-than-upstream**
+  acceptance boundary in `BEHAVIOR_CONTRACT.md` §E.1 rather than firing a new ADR (upstream
+  ACCEPTS `op` omitted → proto3 default `EQ`, `default_value` omitted → `0`, and numeric enum
+  tokens `op: 1`; envoy-rust REJECTS all three, because these proto3 scalars are modeled
+  serde-required). It is fail-loud (never a silent runtime divergence) and consistent with the
+  tree-wide posture (`FractionalPercent.numerator`, `TokenBucket.max_tokens`). ADR-0049 already
+  governs config-validity as all-fatal with native messages. Weigh whether this narrows
+  ADR-0049's "same class of configs is rejected/accepted" claim enough to deserve its own ADR —
+  **ADR-0142 is available** (the §6.1 split it was reserved for is confirmed NOT to fire).
+- T7 reverses the phase-06.1 REVIEW §7 R-8 directive (bulk `add(N)` over N×`inc()`); the move is
+  ADR-0141-mandated and R-8's rationale is now dead.
+
+## §V8. Next session
+
+**§5 state-5 code-review** (`superpowers:requesting-code-review`) — a SEPARATE session per §5.1.
+Its deliverable is `REVIEW.md` (gate (f)). If it finds issues, the re-entry point is **state-3,
+not state-4** (§5.2).
