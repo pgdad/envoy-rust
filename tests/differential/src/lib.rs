@@ -7325,6 +7325,29 @@ mod tests {
         assert_eq!(expected_logged_count(&[p(true), p(true)]), 2);
     }
 
+    /// Phase 70 (ADR-0141): `expect_logged`'s serde default is load-bearing —
+    /// it is the sole reason the 28 pre-phase-70 byte-exact fixtures, whose
+    /// `expectations.yaml` predates the field and never mentions it, still
+    /// deserialize as "every probe logs". The literal-built test above bypasses
+    /// serde, so pin the real `Deserialize` path in BOTH directions: omitted →
+    /// `true`, explicit `false` → `false`.
+    #[test]
+    fn byte_exact_probe_expect_logged_defaults_true() {
+        let omitted = "method: get\npath: /x\nhost: h\n";
+        let p: AccessLogByteExactProbe = serde_yaml::from_str(omitted).unwrap();
+        assert!(
+            p.expect_logged,
+            "a probe omitting `expect_logged` must default to logged"
+        );
+
+        let explicit = "method: get\npath: /x\nhost: h\nexpect_logged: false\n";
+        let p: AccessLogByteExactProbe = serde_yaml::from_str(explicit).unwrap();
+        assert!(
+            !p.expect_logged,
+            "`expect_logged: false` must mark the probe suppressed"
+        );
+    }
+
     #[test]
     fn expectations_parse_byte_exact() {
         let yaml =

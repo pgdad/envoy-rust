@@ -4780,7 +4780,7 @@ static_resources:
         assert!(inert.should_log(500), "GE 500 must accept a 500");
     }
 
-    /// Phase 70 Task 11: regression parity for the 27 pre-phase-70 access-log
+    /// Phase 70 Task 11: regression parity for the 29 pre-phase-70 access-log
     /// differential fixtures — an `AccessLog` with NO `filter` compiles to
     /// `None`, and a `None`-filtered sink logs EVERY record. Both legs are
     /// pinned: the config → `None` compile step, and the sink's unconditional

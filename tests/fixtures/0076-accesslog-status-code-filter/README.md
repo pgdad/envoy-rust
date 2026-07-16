@@ -1,9 +1,9 @@
 # Fixture 0076 — access-log `status_code_filter` (`GE 500`, byte-exact)
 
 The **FIRST access-log FILTER witness** (phase 70, ADR-0140 / ADR-0141). Every
-prior access-log fixture (0012 / 0040 / 0046-0070) carries an UNFILTERED sink,
-where every record reaches the file. This fixture witnesses the per-record
-emission PREDICATE: an `AccessLog` entry carrying
+prior access-log fixture (0012 / 0040 / 0041 / 0042 / 0046-0070) carries an
+UNFILTERED sink, where every record reaches the file. This fixture witnesses
+the per-record emission PREDICATE: an `AccessLog` entry carrying
 `filter.status_code_filter.comparison { op: GE, value.default_value: 500 }`
 emits the 503 record and DROPS the 200 — byte-exact cross-proxy.
 

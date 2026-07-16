@@ -2144,7 +2144,7 @@ The flag-off control over the SAME map (live-captured) keeps the `-` sentinel:
 > emitted at all. An `AccessLog` entry gains an optional `filter`
 > (`envoy.config.accesslog.v3.AccessLogFilter`, a oneof); this phase ships the
 > single `status_code_filter` arm. When `filter` is absent the sink logs every
-> record, so all 27 pre-phase-70 access-log fixtures are untouched. The
+> record, so all 29 pre-phase-70 access-log fixtures are untouched. The
 > cross-proxy witness is **fixture 0076**
 > (`0076-accesslog-status-code-filter`): one file sink with a `GE 500` filter
 > and two `direct_response` routes — the 503 record is emitted, the 200 is
