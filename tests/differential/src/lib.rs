@@ -1111,10 +1111,28 @@ pub struct AccessLogByteExactProbe {
     pub body: Option<String>,
     #[serde(default = "default_byte_exact_status")]
     pub expected_status: u16,
+    /// Phase 70 (ADR-0141): `false` marks a probe whose response is expected to
+    /// be SUPPRESSED by an access-log filter (contributes no log line on EITHER
+    /// proxy). Defaults to `true` so every pre-existing byte-exact fixture
+    /// deserializes unchanged.
+    #[serde(default = "default_expect_logged")]
+    pub expect_logged: bool,
 }
 
 fn default_byte_exact_status() -> u16 {
     200
+}
+
+fn default_expect_logged() -> bool {
+    true
+}
+
+/// Phase 70 (ADR-0141): how many access-log lines a byte-exact probe sequence is
+/// expected to produce — filter-suppressed probes (`expect_logged: false`) emit
+/// none. Feeds both the `wait_file_lines` flush poll and the line-count
+/// assertions of the H1/H2 byte-exact arms.
+fn expected_logged_count(probes: &[AccessLogByteExactProbe]) -> usize {
+    probes.iter().filter(|p| p.expect_logged).count()
 }
 
 /// 04.2 NEW: one probe entry inside `Driver::Http1ProbeList`. Each probe drives
@@ -6234,7 +6252,10 @@ async fn run_http1_access_log_byte_exact_arm(
         subject_addr,
         ..
     } = *ctx;
-    let expected_lines = probes.len();
+    // Phase 70 (ADR-0141): filter-suppressed probes emit NO line, so the
+    // target is the LOGGED count — not `probes.len()`, which would starve
+    // every `wait_file_lines` poll below for the full flush timeout.
+    let expected_lines = expected_logged_count(probes);
 
     // Drive each probe in order against BOTH proxies. Reuse the exact
     // request build (`drive_http1`) the `Http1WithAccessLog` arm uses;
@@ -6374,7 +6395,10 @@ async fn run_http2_access_log_byte_exact_arm(
         subject_addr,
         ..
     } = *ctx;
-    let expected_lines = probes.len();
+    // Phase 70 (ADR-0141): filter-suppressed probes emit NO line, so the
+    // target is the LOGGED count — not `probes.len()`, which would starve
+    // every `wait_file_lines` poll below for the full flush timeout.
+    let expected_lines = expected_logged_count(probes);
 
     for (idx, probe) in probes.iter().enumerate() {
         let upstream_resp = drive_http2(
@@ -7281,6 +7305,25 @@ fn assert_equivalence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 70 (ADR-0141): the byte-exact line-count target must EXCLUDE
+    /// probes an access-log filter is expected to suppress. Pins the helper
+    /// that feeds every `wait_file_lines` poll and line-count assertion in
+    /// both the H1 and H2 byte-exact arms.
+    #[test]
+    fn expected_logged_count_excludes_suppressed() {
+        let p = |expect_logged: bool| AccessLogByteExactProbe {
+            method: Http1Method::Get,
+            path: "/x".into(),
+            host: "h".into(),
+            extra_headers: vec![],
+            body: None,
+            expected_status: 200,
+            expect_logged,
+        };
+        assert_eq!(expected_logged_count(&[p(true), p(false), p(true)]), 2);
+        assert_eq!(expected_logged_count(&[p(true), p(true)]), 2);
+    }
 
     #[test]
     fn expectations_parse_byte_exact() {
