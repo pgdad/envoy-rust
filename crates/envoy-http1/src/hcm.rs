@@ -65,14 +65,15 @@ pub struct HCMStats {
     /// `http.<stat_prefix>.downstream_rq_5xx` — HTTP 5xx responses.
     pub downstream_rq_5xx: Arc<envoy_stats::Counter>,
     // 06.3 D15.3.e NEW — access-log emission counters. `access_logs_total`
-    // fires at queue-enter time (BEFORE the per-sink await loop) using
-    // Counter::add(N) where N is the configured sink count, per 06.1 REVIEW
-    // §7 R-8 (one bulk increment per request, not N individual .inc() calls).
-    // `access_logs_failed` fires inside the per-sink Err arm alongside
-    // tracing::warn!. Per parent SPEC §6 Rule 4: sink failures do NOT deflate
+    // fires once per record actually dispatched: a single `.inc()` inside the
+    // per-sink emit loop's filter-gated branch, so a sink whose filter
+    // suppresses the record does not tick. The `.inc()` precedes the emit
+    // await, so per parent SPEC §6 Rule 4 sink failures do NOT deflate
     // access_logs_total — the total counts intent-to-emit, not successful emit.
+    // `access_logs_failed` fires inside the per-sink Err arm alongside
+    // tracing::warn!.
     /// `http.<stat_prefix>.access_logs_total` — total access-log records
-    /// dispatched to sinks (bulk-incremented by sink count at queue-enter time).
+    /// dispatched to sinks (one increment per accepting sink, per request).
     pub access_logs_total: Arc<envoy_stats::Counter>,
     /// `http.<stat_prefix>.access_logs_failed` — per-sink emission failures
     /// (incremented inside the Err arm alongside tracing::warn!).
@@ -1732,13 +1733,6 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize
     Ok(seen.unwrap_or(0))
 }
 
-/// Phase 32 Task 5 (ADR-0079) — build the access-log `CompiledFormat` for a
-/// file sink: the config-supplied
-/// `log_format.text_format_source.inline_string` if present, else the Envoy
-/// default format. The config validator (`envoy-config` Task 4) already compiled
-/// the string at config-load, so `from_inline` here re-parses an already-validated
-/// string and cannot fail in practice — but we map any error defensively rather
-/// than panic (the HCM build is `Result`-returning).
 /// Phase 70 Task 6 — translate a config-side `AccessLogFilter` into the
 /// runtime `LogFilter` predicate the sink evaluates per record. The
 /// envoy-config validator (Task 2) already enforced that exactly one oneof
@@ -1762,6 +1756,13 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
     })
 }
 
+/// Phase 32 Task 5 (ADR-0079) — build the access-log `CompiledFormat` for a
+/// file sink: the config-supplied
+/// `log_format.text_format_source.inline_string` if present, else the Envoy
+/// default format. The config validator (`envoy-config` Task 4) already compiled
+/// the string at config-load, so `from_inline` here re-parses an already-validated
+/// string and cannot fail in practice — but we map any error defensively rather
+/// than panic (the HCM build is `Result`-returning).
 fn compiled_log_format(
     file_cfg: &envoy_config::FileAccessLog,
 ) -> Result<envoy_accesslog::LogFormat, Http1Error> {
@@ -4623,6 +4624,50 @@ static_resources:
             lines_after_one_request(None, &unfiltered, 200).await,
             1,
             "a sink with no filter logs every record (pre-phase-70 parity)"
+        );
+    }
+
+    /// Phase 70 Task 7: `access_logs_total` counts EMITTED records only — a
+    /// filter-suppressed sink must not tick it. The counter lives INSIDE the
+    /// gated branch (it was a pre-loop `add(access_log.len())`); this pins that
+    /// placement, which the line-count assertions above cannot see.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_filtered_sink_suppresses_access_logs_total() {
+        use tempfile::tempdir;
+
+        /// Drive one request through an HCM whose single GE-500 sink is at
+        /// `path`, and return `access_logs_total` after the emit loop.
+        async fn total_after_one_request(path: &std::path::Path, status: u16) -> u64 {
+            let config = hcm_config_with_filtered_access_log(
+                Some((envoy_config::ComparisonOp::Ge, 500)),
+                path,
+                status,
+            )
+            .await;
+            let total = Arc::clone(&config.stats.access_logs_total);
+            let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            let _ = drive(config, req).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            total.value()
+        }
+
+        let dir = tempdir().expect("tempdir");
+
+        // The suppressed leg: 200 < 500 -> the sink emits nothing, so the
+        // counter must stay at 0 (a pre-loop add(len) would read 1 here).
+        let suppressed = dir.path().join("filtered_200.log");
+        assert_eq!(
+            total_after_one_request(&suppressed, 200).await,
+            0,
+            "a suppressed sink must not tick access_logs_total"
+        );
+
+        // The emitted leg: 503 >= 500 -> exactly one tick.
+        let emitted = dir.path().join("filtered_503.log");
+        assert_eq!(
+            total_after_one_request(&emitted, 503).await,
+            1,
+            "the emitted record ticks access_logs_total"
         );
     }
 
