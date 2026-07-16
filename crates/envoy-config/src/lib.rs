@@ -450,6 +450,12 @@ pub enum ConfigError {
     #[error("log_format must set exactly one of text_format_source or json_format: {detail}")]
     AmbiguousLogFormat { detail: String },
 
+    /// Phase 70: an `AccessLog.filter` (`AccessLogFilter` oneof) sets neither
+    /// (or, in a future multi-variant phase, more than one) filter variant.
+    /// Exactly one variant is required. Mirrors `AmbiguousLogFormat`.
+    #[error("access_log filter must set exactly one filter variant: {detail}")]
+    AmbiguousAccessLogFilter { detail: String },
+
     /// 06.3 D14.3: listener with codec_type HTTP1 or AUTO routes to a cluster
     /// whose typed_extension_protocol_options.HttpProtocolOptions.
     /// explicit_http_config.http2_protocol_options is set. Closes

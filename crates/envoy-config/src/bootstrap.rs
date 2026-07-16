@@ -5081,7 +5081,7 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 
 /// 06.2 Task 5 — validate an HCM's `access_log` Vec.
 ///
-/// Two rejections enforced here (see SPEC §3 D2.2):
+/// Rejections enforced here (see SPEC §3 D2.2; item 3 added by phase 70):
 ///   1. `name` allow-list: only `envoy.access_loggers.file` is accepted.
 ///      Anything else surfaces as `ConfigError::UnsupportedAccessLogType`.
 ///      The `@type` URL allow-list is enforced by serde's tagged-enum
@@ -5091,6 +5091,13 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 ///      Empty paths surface as `ConfigError::InvalidAccessLogPath`. The
 ///      sink-side `FileSink::new` would also fail on `""`, but rejecting
 ///      at parse time gives a clearer diagnostic.
+///   3. Phase 70 — `AccessLog.filter` (`AccessLogFilter` oneof) cardinality:
+///      when a `filter` is present it must set EXACTLY ONE arm. Zero arms
+///      (`filter: {}`) surfaces as `ConfigError::AmbiguousAccessLogFilter`;
+///      the >1 branch is unreachable while only one arm exists but is written
+///      to stay correct as future phases add arms. This mirrors the
+///      `SubstitutionFormatString` / `AmbiguousLogFormat` oneof precedent —
+///      the cardinality lives here, not in serde.
 ///
 /// Mutates nothing; returns the first error encountered (validator-wide
 /// convention).
@@ -5100,6 +5107,22 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
             return Err(crate::ConfigError::UnsupportedAccessLogType {
                 actual: entry.name.clone(),
             });
+        }
+        if let Some(filter) = &entry.filter {
+            // Count the set oneof arms (this phase has exactly one arm).
+            let set_arms = [filter.status_code_filter.is_some()]
+                .iter()
+                .filter(|set| **set)
+                .count();
+            if set_arms != 1 {
+                return Err(crate::ConfigError::AmbiguousAccessLogFilter {
+                    detail: if set_arms == 0 {
+                        "no filter variant is set".into()
+                    } else {
+                        "more than one filter variant is set".into()
+                    },
+                });
+            }
         }
         match &entry.typed_config {
             AccessLogTypedConfig::FileAccessLog(cfg) => {
@@ -12926,6 +12949,24 @@ static_resources:
         // Unknown enum token → serde deserialize error → ConfigError::Yaml.
         let err = crate::parse_bootstrap(&yaml).expect_err("NE must be rejected");
         assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_access_log_filter_with_no_variant() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter: {}
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("empty filter must be rejected");
+        assert!(
+            matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
+            "got {err:?}"
+        );
     }
 
     // --- phase 32 t4: FileAccessLog.log_format boot-fatal format validation ---
