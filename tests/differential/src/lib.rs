@@ -6351,10 +6351,10 @@ async fn run_http1_access_log_byte_exact_arm(
     let envoy_lines: Vec<String> = envoy_contents.lines().map(|s| s.to_owned()).collect();
     let envoy_rust_lines: Vec<String> = envoy_rust_contents.lines().map(|s| s.to_owned()).collect();
 
-    // Each probe emits exactly one access-log line.
+    // Each NON-suppressed probe emits exactly one access-log line.
     if envoy_lines.len() != expected_lines {
         bail!(
-            "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            "envoy emitted {} access-log lines but {} were expected to be logged; lines: {:?}",
             envoy_lines.len(),
             expected_lines,
             envoy_lines,
@@ -6362,7 +6362,7 @@ async fn run_http1_access_log_byte_exact_arm(
     }
     if envoy_rust_lines.len() != expected_lines {
         bail!(
-            "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            "envoy-rust emitted {} access-log lines but {} were expected to be logged; lines: {:?}",
             envoy_rust_lines.len(),
             expected_lines,
             envoy_rust_lines,
@@ -6475,7 +6475,7 @@ async fn run_http2_access_log_byte_exact_arm(
 
     if envoy_lines.len() != expected_lines {
         bail!(
-            "envoy emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            "envoy emitted {} access-log lines but {} were expected to be logged; lines: {:?}",
             envoy_lines.len(),
             expected_lines,
             envoy_lines,
@@ -6483,7 +6483,7 @@ async fn run_http2_access_log_byte_exact_arm(
     }
     if envoy_rust_lines.len() != expected_lines {
         bail!(
-            "envoy-rust emitted {} access-log lines but {} probes were driven; lines: {:?}",
+            "envoy-rust emitted {} access-log lines but {} were expected to be logged; lines: {:?}",
             envoy_rust_lines.len(),
             expected_lines,
             envoy_rust_lines,

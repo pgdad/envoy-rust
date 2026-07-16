@@ -1,0 +1,36 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0076-envoy-mount/access.log
+    envoy_rust: /tmp/0076-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — KEPT. `GET /log` hits the 503 direct_response route; the
+    # `status_code_filter` comparison (GE 500) matches, so the record IS
+    # emitted. A direct_response carries no upstream, so %RESPONSE_FLAGS%
+    # renders the absent-value sentinel `-` on both proxies (state-1 recon).
+    # Expected line (byte-identical on both sides):
+    #   STATUS=503 PATH=/log FLAGS=-
+    - method: get
+      path: /log
+      host: envoy-rust.test
+      expected_status: 503
+      expect_logged: true
+    # Probe 2 — SUPPRESSED. `GET /nolog` hits the 200 direct_response route;
+    # 200 < 500 fails the GE comparison, so the sink emits NOTHING for this
+    # record on EITHER proxy. `expect_logged: false` removes it from the
+    # driver's line-count target (`expected_logged_count`), so the flush poll
+    # waits for 1 line, not 2. The 200 response itself is still asserted.
+    - method: get
+      path: /nolog
+      host: envoy-rust.test
+      expected_status: 200
+      expect_logged: false
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static literal:
+  # the `http1_access_log_byte_exact` driver asserts each emitted line is
+  # byte-identical between upstream Envoy v1.33.0 and envoy-rust. Both proxies
+  # must agree on BOTH halves of the filter decision — the kept 503 line AND
+  # the absence of any /nolog line (a one-sided suppression fails the
+  # line-count assertion before the byte compare is reached). The file on each
+  # side holds EXACTLY ONE line (measured, state-1 recon):
+  #   STATUS=503 PATH=/log FLAGS=-
+  # Both routes are direct_response → `clusters: []`, no backend spawns.
