@@ -8489,6 +8489,87 @@ static_resources:
         server.abort();
     }
 
+    /// Test-audit 2026-07-17 (TEST_GAP_ANALYSIS §5 item 4): upstream reset
+    /// AFTER a partial response — status line + headers + a strict prefix of
+    /// the Content-Length-declared body, then FIN. The client's CL body-read
+    /// loop hits EOF mid-body (`Http1Error::UnexpectedEof`,
+    /// client.rs:477-479) and the attempt classifies as Reset, so the
+    /// DOWNSTREAM never sees the upstream's 200: envoy-rust fully buffers the
+    /// upstream response before writing anything downstream, so a mid-body
+    /// reset yields the same clean synth-503 as a reset-before-response.
+    ///
+    /// DOCUMENTED DIVERGENCE from upstream Envoy: Envoy streams — by the time
+    /// the upstream dies mid-body Envoy has already forwarded the 200 headers
+    /// and the body prefix, so the downstream observes a TRUNCATED 200 and a
+    /// closed connection (no 503 is possible once headers are committed).
+    /// The buffered-proxy architecture makes envoy-rust's behavior here
+    /// deliberately different; this test pins that choice so any future move
+    /// to streaming proxying revisits it consciously (the fixture suite has
+    /// no mid-body-reset case — this is the only guard).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_upstream_reset_mid_body_synthesizes_503() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                // 200 + CL:1000 but only a 10-byte body prefix, then FIN.
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n0123456789")
+                    .await;
+                drop(sock);
+            }
+        });
+        let cluster_mgr = cluster_mgr_with_endpoint("backend", port).await;
+        let config = Arc::new(HCMConfig {
+            stat_prefix: "ingress_http".to_string(),
+            cluster_mgr,
+            http2_protocol_options: None,
+            stats: mk_stats("ingress_http"),
+            access_log: vec![],
+            filter_pipeline: test_router_only_pipeline(),
+            pool_mgr: None,
+            route_config: RwLock::new(Arc::new(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: Some("/".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::Route(RouteAction_Route {
+                            cluster: "backend".to_string(),
+                            retry_policy: None,
+                            hash_policy: vec![],
+                            metadata_match: None,
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            })),
+        });
+        let req = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let resp = drive(config, req).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 503 "),
+            "mid-body upstream reset surfaces the synth-503 (nothing was \
+             committed downstream — buffered proxy): {resp_str}"
+        );
+        assert!(
+            !resp_str.contains("0123456789"),
+            "no fragment of the truncated upstream body may leak downstream: {resp_str}"
+        );
+        server.abort();
+    }
+
     /// phase 53 (ADR-0110) / 54 (ADR-0111): the accept-then-close reset path (NO
     /// retry_policy), wired to a {rc,rcd,rf} FILE json access-log. Asserts the
     /// downstream is the synth-503 AND the logged line carries the deterministic

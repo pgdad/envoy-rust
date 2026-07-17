@@ -5256,6 +5256,94 @@ static_resources:
         (addr, handle)
     }
 
+    /// Test-audit 2026-07-17 (TEST_GAP_ANALYSIS §5 item 4): an upstream that
+    /// sends the 200 HEADERS + a partial DATA frame (`end_stream=false`,
+    /// promising more that never comes) and then RST_STREAMs — the H2 shape
+    /// of a mid-body upstream reset.
+    async fn spawn_upstream_h2_midbody_reset_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (tcp, _peer) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut conn = match h2::server::handshake(tcp).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            if let Some(Ok((_req, mut send_response))) = conn.accept().await {
+                let resp = http::Response::builder().status(200).body(()).unwrap();
+                if let Ok(mut send_stream) = send_response.send_response(resp, false) {
+                    // A body prefix with end_stream=false — more is promised…
+                    let _ = send_stream.send_data(bytes::Bytes::from_static(b"0123456789"), false);
+                    // …then the stream is reset instead.
+                    send_stream.send_reset(h2::Reason::INTERNAL_ERROR);
+                }
+            }
+            // Drive the connection so the queued frames actually flush.
+            while let Some(next) = conn.accept().await {
+                if next.is_err() {
+                    return;
+                }
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Test-audit 2026-07-17 (TEST_GAP_ANALYSIS §5 item 4): the H2 sibling of
+    /// `h1_upstream_reset_mid_body_synthesizes_503` (envoy-http1 hcm.rs).
+    /// The upstream 200 + partial DATA + RST_STREAM fails the buffered
+    /// `send_request` recv loop mid-body, classifying as Reset — the
+    /// downstream sees the clean synth-503, never the upstream's 200 or any
+    /// fragment of the truncated body.
+    ///
+    /// DOCUMENTED DIVERGENCE from upstream Envoy: Envoy streams, so by
+    /// mid-body reset time it has already forwarded the 200 HEADERS and the
+    /// DATA prefix and can only RST_STREAM the downstream. envoy-rust's
+    /// buffered proxy makes the mid-body reset indistinguishable from a
+    /// pre-response reset; this pin makes any future move to streaming
+    /// proxying revisit the choice consciously.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_upstream_reset_mid_body_synthesizes_503() {
+        let (upstream_addr, _upstream_handle) = spawn_upstream_h2_midbody_reset_server().await;
+        let cluster_mgr =
+            build_cluster_mgr_with_upstream(upstream_addr, envoy_cluster::UpstreamProtocol::Http2)
+                .await;
+        let config = synth_h2_hcm_config_proxy(cluster_mgr).await;
+        let (addr, _server) = spawn_h2_hcm(config).await;
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), response_fut)
+            .await
+            .expect("mid-body upstream reset must resolve downstream, not hang")
+            .expect("downstream stream stays intact (synth response, no RST passthrough)");
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "mid-body upstream reset surfaces the synth-503 downstream"
+        );
+        let mut body = resp.into_body();
+        let mut bytes = bytes::BytesMut::new();
+        while let Some(chunk) = body.data().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        assert!(
+            !bytes.windows(10).any(|w| w == b"0123456789"),
+            "no fragment of the truncated upstream body may leak downstream"
+        );
+    }
+
     /// 65 (ADR-0122) §G: like `spawn_upstream_h2_reset_server` but accepts an
     /// UNBOUNDED number of connections and resets EVERY stream on each. The
     /// one-shot helper above closes its listener as soon as its single
