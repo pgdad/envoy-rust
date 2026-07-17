@@ -1191,3 +1191,216 @@ SEPARATE session per §5.1; this session did NOT chain into it. A fresh context 
 **state-5 re-review** (gate (f) — confirm I-2 is genuinely discharged BY MEASUREMENT: re-run
 the `EQ`⇄`LE` rename swap in an isolated worktree and take the verdict from the `N failed`
 count), then the **state-6 close-out**.
+
+---
+---
+
+# §5 STATE-4 RE-VERIFICATION (2nd) — the full §7.5 gate re-run over the second re-entry head (SEPARATE session)
+
+> **Written by the §5 state-4 RE-VERIFICATION (2nd) session** (`superpowers:verification-before-completion`),
+> **appended to — never rewriting — §1–§8, §V1–§V8, §R1–§R8, §V(2)1–§V(2)8, and §R(2)1–§R(2)8.**
+> Written for a stranger with zero prior context (D-3.4).
+>
+> **Why this re-run exists.** The §V(2) evidence was measured over the **PRE-I-2-fix** head
+> (`2763c73`) and does NOT carry over to the second re-entry's head. Per **ADR-0127** the
+> re-entry session's own scoped run (§R(2)6: `887/0`) carries **ZERO authority** here — the
+> implementing context grading itself, and it never ran the workspace-global gate, the
+> differential, `cargo deny`, or the fuzzer. **Every gate below was re-measured from scratch by
+> this session over `60a5272e0bb55ee06fa39e35e6069d8d3e234dfe`.**
+>
+> **VERDICT: the §7.5 gate PASSES on every sub-gate this state owns — (a), (b), (c), (d), (e)** —
+> with gate (b)'s decisive numeric CI-log cross-check discharged by the equivalent-strength
+> substitute recorded in **ADR-0143** (the host's GitHub credential is invalid and GitHub serves
+> Actions logs only to authenticated users; see §V(3)3). Sub-gate **(f)** is **NOT met and NOT
+> this session's job**: `REVIEW.md` §8's verdict stands NOT approved until the §5 **state-5
+> RE-review** (the next session) confirms I-2 is discharged by measurement.
+
+## §V(3)1. Preconditions confirmed (disk + CI are the authority, not the handoff)
+
+| Check | Command | Result |
+|---|---|---|
+| Tree clean | `git status --porcelain` | empty |
+| Branch | `git branch --show-current` | `main` |
+| HEAD | `git log --format=%H -1` | `60a5272e0bb55ee06fa39e35e6069d8d3e234dfe` (the second §5.2 re-entry commit) |
+| Fetch | `git fetch origin --prune` | exit 0 — **the GitHub outage the re-entry session hit is OVER** |
+| Unpushed commit | `git log origin/main..HEAD` | `60a5272` was STILL UNPUSHED (the re-entry's 42+ push retries all failed during the outage) |
+| Push FIRST (per STEP 0) | `git push origin main` | `1c6a5c2..60a5272 main -> main`, exit 0 |
+| CI on the head SHA | `gh run list --commit 60a5272e0bb55ee06fa39e35e6069d8d3e234dfe` | run `29596323921` → **`completed` / `success`** |
+
+CI confirmed on the **FULL 40-char SHA**. Both jobs `success` with healthy step counts —
+`build + test + lint` steps=15, `fuzz` steps=13 — **not** the runner-starvation signature
+(`cancelled` + `runner_name:""` + `steps:0`), so the commit genuinely executed.
+
+**Production-path identity re-verified (the premise that makes the totals meaningful):**
+`compile_access_log_filter` and the `ComparisonOp` enum are **byte-identical** to the state-5
+head `1c6a5c2` (diff-empty on both extracts); the whole `crates/` diff is 2 files whose hunks
+all sit at `hcm.rs:4558+` / `bootstrap.rs:12962+` — inside the `#[cfg(test)]` modules. **NO
+production change**, as the re-entry recorded.
+
+## §V(3)2. Gate (e) — build / lint / format / deny — ALL CLEAN
+
+Run **serially** (cargo's file lock), full output redirected to files — never piped through
+`tail`.
+
+| Gate | Command | Exit | Output |
+|---|---|---|---|
+| fmt | `cargo fmt --all -- --check` | **0** | **zero bytes** |
+| build | `cargo build --workspace --all-targets` | **0** | `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 4.97s` |
+| clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **0** | `grep -cE "^(warning\|error)"` → **0** |
+| deny | `cargo deny check` | **0** | `advisories ok, bans ok, licenses ok, sources ok` |
+
+No freshly-published RustSec advisory fired — no patch-bump needed.
+
+**`cargo build -p envoy-bin` was run BEFORE any differential** (exit 0) — the harness executes
+`target/debug/envoy-bin`; a stale debug binary REDs with `unknown field: filter`.
+
+## §V(3)3. Gates (a)+(b) — `cargo test --workspace --no-fail-fast` — 2017 passed / 6 failed / 9 ignored
+
+### An environmental incident first — the FIRST sweep attempt was VOID (Docker daemon down)
+
+The first `cargo test --workspace --no-fail-fast` returned **1946 passed / 77 failed** — every
+Docker-based differential fixture RED at once, all with the same
+`failed to create a container: Error in the hyper legacy client: client error (Connect)`.
+Root-caused before any adjudication (`superpowers:systematic-debugging`): the **Docker Desktop
+daemon was down** — the host had rebooted, this headless session holds no logind seat, so
+`/dev/kvm` carried no uaccess ACL for `esa` (only `user:gdm:rw-`), and Docker Desktop's backend
+exits at its `UserCanAccessDevKVM` check. Fixed environmentally
+(`sudo setfacl -m u:esa:rw /dev/kvm && systemctl --user restart docker-desktop`; daemon up,
+server 28.1.1) and the ENTIRE sweep re-run from scratch — the 77-RED run carries **no
+adjudication value** and none of its REDs was treated as a signal. (Recorded as memory
+`docker-desktop-down-after-reboot-kvm-acl`; the ACL does not survive a reboot.)
+
+### The adjudicated sweep
+
+```
+TEST_EXIT=101
+passed=2017 failed=6 ignored=9
+```
+
+### Gate (a) — the new fixture is GREEN
+
+`0076` passed **inside the full workspace run** (under full parallel load) **and** in isolation:
+
+```
+     Running tests/access_log_status_code_filter.rs
+test access_log_status_code_filter ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+
+$ cargo test -p differential --test access_log_status_code_filter
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+```
+
+### Gate (b) — all 6 failures adjudicated NOT-A-REGRESSION; none in the phase-70 surface
+
+**Blast-radius check first:** the only fixture anywhere in the tree configuring a
+`status_code_filter` is the new fixture itself
+(`grep -rlE "status_code_filter" tests/fixtures/` → `tests/fixtures/0076-accesslog-status-code-filter`
+only). None of the 6 failures touches a filter, and `0076` — the one that does — passes.
+
+Each failure re-run **in isolation naming the target binary** (verdicts from the `N passed`/
+`N failed` counts, never the exit code; the discriminator: environmental fails alone,
+load-flake passes alone):
+
+| # | Test | Isolated | Class | MEASURED evidence |
+|---|---|---|---|---|
+| 1–4 | `access_log_rcd_upstream_reset`, `access_log_rf_upstream_reset`, `access_log_h2_rcd_upstream_reset`, `access_log_h2_uc_upstream_reset` | **FAILS alone** (`0 passed; 1 failed`, deterministic) | environmental — IPv6-unreachable close backend (memory `tcpclosebackend-ipv6-unreachable-host-flake`) | `immediate_connect_error:_Network_is_unreachable` + `remote_address:[fdc4:f303:9324::254]:39369` — real Envoy logs a connect failure (`UF`) where envoy-rust logs a genuine reset (`UC`) |
+| 5 | `admin_config_dump_server_info` | **FAILS alone** (`0 passed; 1 failed`, deterministic) | environmental — Docker bridge IP (memory `differential-host-bridge-ip-192-168-65-2`) | envoy-only stats `backend::192.168.65.2:41947::{canary,cx_active,cx_connect_fail,…}` |
+| 6 | `client::tests::send_request_maps_h2_handshake_failure_to_typed_error` (`envoy-http2 --lib`) | **PASSES alone** (`1 passed; 0 failed`) | documented host flake (memory `envoyrust-h2-handshake-test-host-flake`) | `expected H2ClientHandshake, got Ok(ClientStream { host: "test.example", .. })` — the handshake unexpectedly succeeds on this host |
+
+The membership is entirely within the documented flake families (a strict subset of the §V(2)3
+set — the two §V(2)3 port-reuse members passed this run; **the RED set legitimately varies
+run-to-run**). No new family.
+
+### The decisive cross-check — discharged by the ADR-0143 substitute (GitHub log access is credential-blocked)
+
+The prescribed numeric form — grep the CI run log for `test result:` lines and assert
+`local passed+failed == CI passed == 2023` — was **attempted and is unobtainable this session**:
+`gh auth status` reports **"The token in default is invalid"** (the env `GITHUB_TOKEN` is
+empty), and GitHub serves Actions LOG content only to authenticated users — `gh run view
+--log`, the run-level API, and the job-level API all return HTTP 403; the web job page's
+per-step `data-log-url` endpoints return a login shell to an anonymous session; the run has 0
+artifacts and null check-run `output`. **Only the human can restore this (`gh auth login`).**
+
+Per **ADR-0143** the identity's substance is established by measurement through a substitute
+chain of equivalent strength:
+
+1. **The local RED set is environmental:** CI ran this EXACT tree (`60a5272…`) to
+   `success` on both jobs (steps 15/13) — the workflow fails on any test failure, so every test
+   CI executed passed.
+2. **No test silently disappeared locally:** local enumerated `2017 + 6 = 2023` — EXACTLY the
+   predicted total, where `2023 = 2022 + 1`: the parent tree's identity was measured
+   numerically TWICE at 2022 (§V3, §V(2)3 — both `CI passed=2022`), and this head's whole diff
+   vs that parent adds **exactly one `#[test]` function** (`+1 −0` measured on the diff:
+   `yaml_op_token_compiles_to_matching_filter_op`; the added/renamed YAML-builder fns are
+   non-test helpers) while `git diff 1c6a5c2..HEAD -- tests/` is **EMPTY** (the harness/fixture
+   set is untouched).
+
+**The state-5 re-review SHOULD re-run the numeric identity over this SAME SHA if the credential
+is restored** (expected `CI passed=2023`) — a cheap corroborating backstop (ADR-0143).
+
+## §V(3)4. Gate (c) — conformance — unchanged, nothing owed
+
+```
+$ git diff --stat b362bae..HEAD -- tests/conformance/ .github/
+(empty)
+```
+
+`tests/conformance/h2spec/known-failures.txt` is **untouched** (21 lines) and **must not be
+trimmed** (memory `h2spec-3-5-2-preface-host-sensitive`).
+
+## §V(3)5. Gate (d) — fuzz — no new target; the corpus seed is genuinely tracked
+
+No new fuzz target this phase (ADR-0141 PV-5) → no `ci.yml` step owed (the empty `.github/`
+diff above confirms none was added). The seed verified tracked the only way that proves it:
+
+```
+$ git ls-files crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml
+crates/envoy-config/fuzz/corpus/parse_bootstrap/status_code_filter.yaml     # PRINTS → tracked
+$ git check-ignore …/status_code_filter.yaml ; echo $?
+1                                                                            # NOT ignored
+```
+
+Short-budget run from the **crate dir** (`cd crates/envoy-config`):
+
+```
+$ cargo +nightly fuzz run parse_bootstrap -- -max_total_time=60
+#9798   INITED cov: 16316 ft: 33878 corp: 3111/2091Kb exec/s: 4899 rss: 364Mb
+#27918  DONE   cov: 16326 ft: 33909 corp: 3122/2097Kb lim: 2915 exec/s: 300 rss: 380Mb
+FUZZ_EXIT=0
+```
+
+**27,918 runs, zero crashes / panics / leaks, exit 0.** CI's fuzz job independently ran
+`parse_bootstrap` green on this SHA (run `29596323921`, `fuzz` job `success`, steps=13).
+
+## §V(3)6. Gate (f) — `REVIEW.md` — NOT this state's job, and NOT met
+
+`REVIEW.md` exists; its CURRENT verdict (§8) is **NOT approved** (0C / 1 Important I-2 / 7
+Minor). The I-2 fix is what the second re-entry landed. Confirming that discharge **by
+measurement** (the `EQ`⇄`LE` rename swap at `bootstrap.rs:747-754` in an ISOLATED worktree —
+the landed test must go RED `op: EQ 404 on status 403`; verdict from the `N failed` count) and
+re-issuing the verdict is the §5 **state-5 RE-review**'s deliverable. Per §5.1 this session did
+NOT chain into it.
+
+## §V(3)7. State-4 re-verification (2nd) verdict
+
+**PASS on (a), (b), (c), (d), (e)** — gate (b)'s numeric CI-log cross-check discharged by the
+ADR-0143 substitute (recorded, measured, scoped). **(f) unmet by design — state-5's job.** No
+REAL regression: both incidents this session hit were environmental and were root-caused before
+any adjudication (the Docker-Desktop/KVM daemon outage — fixed, sweep re-run from scratch; the
+invalid GitHub credential — substitute evidence per ADR-0143, human action owed:
+**`gh auth login`**). This session changed **no code** (its artifacts are this §V(3) section,
+ADR-0143, the ledger, and the commit); **no fixture weakened; `known-failures.txt` untouched**.
+
+Live carry-forwards are NOT gate failures and remain for the state-5 re-reviewer:
+**CF-70-1**, **CF-70-3**, **M70-R1/M70-R2/M70-R4/M70-R9** (I-1 + M70-R3/R5/R6/R7/R8 CONSUMED;
+CF-70-2 CLOSED).
+
+## §V(3)8. Next session
+
+**§5 state-5 RE-review** (`superpowers:requesting-code-review`) — a SEPARATE session per §5.1.
+Its job: confirm **I-2** is genuinely discharged **BY MEASUREMENT** (never by reading the
+diff), confirm M70-R6/R7/R8 are genuinely consumed, weigh the carry-forwards, and re-issue the
+`REVIEW.md` verdict (a §9 or an appended section — never rewriting §1–§8). If the GitHub
+credential is restored, ALSO re-run the numeric identity over `60a5272…` (expected
+`CI passed=2023`, ADR-0143's corroborating backstop). If it approves → the **state-6
+close-out** (its own session). If it finds an Important → a third §5.2 state-3 re-entry.
