@@ -5,6 +5,10 @@
 # Rust build artifacts
 /target/
 
+# local h2spec binary drop location (tests/conformance/h2spec locate_h2spec
+# step (2)); CI provisions h2spec on PATH instead — never commit the binary
+/tools/
+
 # operator scratch (session-local; never committed)
 /next-prompt.txt
 /.claude/

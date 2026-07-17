@@ -277,3 +277,137 @@ new response shape (they reuse the existing `MalformedHeader` reject disposition
    `validate`-vs-runtime divergence pattern (e.g. header-mutation, route matching).
 7. **Bench pin drift**: `bench/` uses Envoy v1.31 while the differential target is
    v1.33; align or document.
+
+---
+
+# Second pass — 2026-07-17
+
+> Author: unattended test-coverage audit session, 2026-07-17 (second pass).
+> Baseline: `60a5272` (origin/main), 79 commits after the first pass's
+> `96a1fd7`. Branch: `test-review-20260717`.
+
+## 6. Baseline and new-surface inventory
+
+**Baseline suite state at `60a5272`:** `cargo build --workspace --all-targets`
+clean; fast suite (`cargo test --workspace --exclude differential --exclude
+h2spec-conformance`) **1785 passed, 0 failed, 7 ignored** — green on a clean
+checkout. (First pass ended at 1713; the delta is phases 68–70's own tests.)
+
+**New surface since the first pass** (phases 67.3, 68, 69, 70):
+
+| Phase | Surface | Test posture found |
+|---|---|---|
+| 67.3 | `FirstByteGate` / establishment-then-gate TCP RBAC (`envoy-tcp`) | Well covered: +309 lines of `network_filter_rbac.rs` integration tests incl. the C-1 regression witness (send-nothing client vs `direct_response`), FIN matrix, counter parity. |
+| 68 | Active TCP health checking (`tcp_probe_once`, `receive_matches`, payload hex/base64 decode) | Well covered: pure-matcher units + socket-level probe tests + fixture 0074 + fuzz seed. Multi-block `receive` is documented as envoy-rust's own contract (not Envoy parity) — acceptable. |
+| 69 | gRPC health checking (hand-rolled codec `envoy-http2/src/grpc.rs`, `grpc_probe_once`) | Well covered: encode/decode units incl. a **fuzz-found usize-overflow regression pin** (`decode_rejects_huge_length_delimited_field_without_overflow_panic`), loopback H2 verdict servers for Serving/NotServing/timeout/non-zero-grpc-status, fixture 0075, `grpc_health_decode` fuzz target wired into CI. |
+| 70 (in-progress) | Access-log `status_code_filter` (`ComparisonFilter` EQ/GE/LE) | Well covered: `LogFilter` boundary units, H1+H2 per-sink emit gates with `access_logs_total` non-tick pins, config→runtime op-mapping table test, YAML-token→`ComparisonOp` serde pin (landed in `60a5272` — not redone here), fixture 0076 (byte-exact, no backend). |
+
+Verdict on the new surface: the phase machine's TDD/review loop is producing
+genuinely strong test coverage — no smuggling-class, panic-class, or
+tautology-class gap was found in phases 67.3–70. The second pass therefore
+went to the first pass's §5 ranked remaining work.
+
+## 7. Implemented this pass
+
+| Commit | Change | Bug? |
+|---|---|---|
+| `db633bd` | **P5 (top-ranked): H2 inbound header-list bound + abuse-resistance guards.** `build_h2_server` now pins `max_header_list_size` to a new `DEFAULT_MAX_HEADER_LIST_SIZE = 60 KiB` (Envoy's HCM `max_request_headers_kb` default). The `h2` crate's receive-side default is **16 MiB** — a ~273× wider per-stream memory-amplification window than Envoy grants, asymmetric with envoy-http1's 8 KiB cap. Guard tests: (a) a ~100 KiB header list draws h2's synthesized **431** — the same status upstream Envoy returns on this path — and the listener stays live (fail-first verified: without the bound the request is served 200); (b) 8 KiB is accepted (pins the bound's position); (c) **rapid-reset (CVE-2023-44487) flood guard** — 512 open+RST cycles must leave the listener serving a fresh connection; surviving OR GOAWAY-ing the flooding connection (h2 0.4.x's `DEFAULT_REMOTE_RESET_STREAM_MAX = 20` mitigation) are both acceptable bounded outcomes. No new infrastructure needed — the h2 client crate can drive both attacks. | **Yes — unbounded (16 MiB/stream) inbound H2 header lists, fixed** |
+| `446627f` | **Item 4: upstream-reset-mid-body pins (H1 + H2).** Upstream sends 200 + partial CL body then FIN (H1) / 200 HEADERS + partial DATA then RST_STREAM (H2). Both classify as Reset in the buffered proxy → clean synth-503 downstream, no truncated-body leak. Tests **document the deliberate divergence** from streaming Envoy (which would forward the 200 and truncate) so a future move to streaming proxying revisits it consciously. | No (untested path pinned) |
+| `45ec1bf` | **Item 7: bench pin drift.** `bench/*.sh` compared against `envoyproxy/envoy:v1.31-latest`; now `v1.33.0`, matching the conformance pin. | No |
+| (docs commit) | `.gitignore` `/tools/` (the h2spec runner's documented local-binary drop location) + this section. | No |
+
+**Item 5 (sleep→poll) re-adjudicated, not implemented:** the
+`upstream_outlier_detection.rs:338,374` sites flagged in §2.7/§5 are in fact
+already poll-with-deadline loops (the sleeps are poll *intervals* inside
+`Instant::now() < deadline` loops — fine practice). The remaining fixed
+sleeps in the integration tests (`network_filter_rbac.rs` 300–400 ms settles,
+`SETTLE_MS` sites) mostly precede **assert-zero** checks (proving a counter
+did NOT tick), which polling cannot replace — a fixed settle is inherent to
+negative assertions. Withdrawn from the ranked list.
+
+**P6 (ALPN) re-adjudicated:** `envoy-tls` contains no ALPN support at all —
+an ALPN-failure test has nothing to exercise. This is a feature gap for the
+phase machine, not a test gap; withdrawn (the SNI half was done in pass 1).
+
+### Test-suite results (after)
+
+- **Fast suite:** 1790 passed, 0 failed, 7 ignored (`cargo test --workspace
+  --exclude differential --exclude h2spec-conformance`); +5 tests.
+  fmt + clippy `-D warnings` clean.
+  **Flake observed (pre-existing, F-2):** `network_filter_rbac::
+  rules_omitted_is_inert_neither_counter_ticks` failed with
+  `listener up: ConnectionRefused` in 2 of 3 full parallel runs on this
+  loaded host (passes 5/5 in isolation). Root cause is
+  `tests/common/mod.rs::reserve_port`'s bind-then-release TOCTOU: under
+  parallel load the freed port can be re-taken before `envoy-bin` binds it,
+  the data listener dies while admin survives, and `wait_ready` refuses for
+  its whole 10 s budget. Every `spawn_envoy_bin`-based test shares the
+  pattern; a proper fix needs `envoy-bin` to accept port 0 and advertise the
+  bound address (e.g. via admin), which is phase-machine work — ranked below.
+- **Differential (Docker, v1.33.0, `--no-fail-fast --test-threads=4`,
+  against the rebuilt post-change binary):** **230 passed, 5 failed** — all
+  5 are the pre-adjudicated environmental REDs enumerated in
+  `docs/envoy-rust/phases/70-accesslog-status-code-filter/PROGRESS.md`
+  (triage table): 4× the IPv6-unreachable close-backend divergence
+  (`access_log_{rcd,rf}_upstream_reset`, `access_log_h2_{rcd,uc}_upstream_reset`;
+  Envoy `UF`/`Network is unreachable` vs envoy-rust `UC`) and 1× the Docker
+  bridge-IP `/clusters` divergence (`admin_config_dump_server_info`,
+  `host.docker.internal` → `192.168.65.2`). Zero failures attributable to
+  this pass; the new fixture 0076 and both new-phase fixtures 0074/0075 are
+  green against the post-change binary. (Operational note: the first attempt
+  aborted on a wedged Docker Desktop daemon — `docker run` hanging at
+  container create — cleared by `systemctl --user restart docker-desktop`.)
+- **h2spec (2.6.0, local binary in `tools/`):** `passed=145 failed=0
+  total=145 pass_rate=1.0000` — but the gate itself reports **RED on this
+  host** because the sole `known-failures.txt` entry `3.5/2` now PASSES and
+  the gate enforces lockstep trimming. Adjudication: this is
+  **host-dependent and pre-existing** — a clean worktree build of the
+  pre-change baseline `60a5272` produces the identical stale-entry RED with
+  the same 145/145. Not caused by this pass, and `known-failures.txt` is
+  out of scope for the audit (trimming it is the phase machine's call —
+  the entry's own comment documents the RST-vs-GOAWAY handshake timing
+  that evidently resolves differently on this host/h2 version). Recorded,
+  not "fixed".
+- The `max_header_list_size` change is wire-visible (SETTINGS advertisement),
+  so both Docker/e2e conformance suites were re-run against the rebuilt
+  binary specifically to clear it: h2spec is unaffected (145/145 before and
+  after), and the differential fixtures below ran against the post-change
+  `envoy-bin`.
+
+### Implementation bugs discovered this pass
+
+1. **Unbounded inbound H2 header lists (fixed, `db633bd`):** the H2 listener
+   accepted up to 16 MiB of decoded headers per stream (h2 crate default;
+   nothing in envoy-rust set a bound), vs Envoy's 60 KiB
+   `max_request_headers_kb` default and envoy-http1's own 8 KiB cap. A
+   config-independent memory-amplification DoS window; now bounded at 60 KiB
+   with Envoy's 431 reject observable.
+
+## 8. Re-ranked remaining recommended work
+
+1. **Streaming vs buffered proxying decision record**: the mid-body-reset pins
+   (`446627f`) make the divergence explicit; if streaming ever lands, those
+   tests plus the H1/H2 502/503 synth arms are the contract to revisit. Until
+   then, response-size limits are the buffered proxy's real exposure — there
+   is **no cap on upstream response body size** (an upstream can make
+   envoy-rust buffer an arbitrarily large CL/chunked body per request).
+   Worth a bound + test, same shape as the header-list fix.
+2. **`max_request_headers_kb` as config**: the 60 KiB H2 bound is a constant;
+   Envoy exposes it on the HCM. When the phase machine adds the knob, the
+   constant and `h2_oversized_request_header_list_is_rejected` are the seam.
+3. **F-2 — de-flake `reserve_port` (bind-then-release TOCTOU)**: observed
+   failing 2/3 full parallel runs on a loaded host (details in §"Test-suite
+   results" above). The clean fix is `envoy-bin` accepting port 0 and
+   advertising bound addresses (admin `/listeners` parity — real Envoy
+   exposes exactly this), then tests stop guessing ports entirely.
+4. **Property/fuzz coverage for other validate-vs-runtime pairs** (first pass
+   §5 item 6, still open): header-mutation and route matching remain
+   data-plane-only paths with no property sweep.
+5. **h2spec in-repo ergonomics**: the runner's `tools/h2spec` drop location
+   is now gitignored; consider a script target that fetches the pinned 2.6.0
+   binary so local runs stop silently skipping. Separately, the stale
+   `known-failures.txt` entry `3.5/2` (now passing on this host, see above)
+   needs a phase-machine decision: trim it in lockstep or make the gate
+   tolerate host-dependent entries.
+6. **Differential fixture for oversized-header 431 parity** (H2): pin the 431
+   against real Envoy (needs a raw-ish client in the harness driver — medium).
