@@ -36,7 +36,7 @@ case "$PROXY" in
     docker run -d --rm --name "$PROXY_NAME" --network "$NET" \
       --cpuset-cpus 1,2 \
       -v "$(pwd)/envoy.yaml:/etc/envoy/envoy.yaml:ro" \
-      envoyproxy/envoy:v1.31-latest \
+      envoyproxy/envoy:v1.33.0 \
       -c /etc/envoy/envoy.yaml --concurrency 2 >/dev/null
     ;;
   rust)
