@@ -9,10 +9,27 @@
 
 use envoy_config::Http2ProtocolOptions;
 
+/// Default bound on the decoded size of an inbound header list (the
+/// `SETTINGS_MAX_HEADER_LIST_SIZE` we advertise AND enforce on receipt).
+///
+/// Upstream Envoy bounds request headers at `max_request_headers_kb`
+/// (HCM-level, default **60 KiB**); the `h2` crate's receive-side default is
+/// 16 MiB (`framed_read::DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE`) — a ~273×
+/// wider memory-amplification window per stream than Envoy grants, and wildly
+/// asymmetric with envoy-http1's 8 KiB request-headers cap. envoy-config's
+/// `Http2ProtocolOptions` has no field for this (Envoy's knob lives on the
+/// HCM, not on `Http2ProtocolOptions`), so the bound is a constant applied
+/// unconditionally. Test-guarded by
+/// `hcm::tests::h2_oversized_request_header_list_is_rejected`.
+pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 60 * 1024;
+
 /// Build an `h2::server::Builder` configured per the given options. Absent
-/// options leave the field at the `h2`-crate default.
+/// options leave the field at the `h2`-crate default, EXCEPT
+/// `max_header_list_size`, which is always pinned to
+/// [`DEFAULT_MAX_HEADER_LIST_SIZE`] (see its doc for why).
 pub fn build_h2_server(opts: Option<&Http2ProtocolOptions>) -> h2::server::Builder {
     let mut builder = h2::server::Builder::new();
+    builder.max_header_list_size(DEFAULT_MAX_HEADER_LIST_SIZE);
     if let Some(o) = opts {
         if let Some(v) = o.max_concurrent_streams {
             builder.max_concurrent_streams(v);

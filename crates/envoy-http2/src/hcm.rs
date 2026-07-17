@@ -1588,6 +1588,164 @@ static_resources:
         assert_eq!(&bytes[..], b"ok\n");
     }
 
+    /// Test-audit 2026-07-17 (TEST_GAP_ANALYSIS §5 item P5): the listener
+    /// enforces `codec::DEFAULT_MAX_HEADER_LIST_SIZE` (60 KiB, Envoy's
+    /// `max_request_headers_kb` default) on inbound header lists. A request
+    /// carrying a single ~100 KiB header value must NOT reach the HCM handler:
+    /// the h2 layer rejects the over-size header block with a synthesized
+    /// **431 Request Header Fields Too Large** — the SAME status upstream
+    /// Envoy returns when request headers exceed `max_request_headers_kb` —
+    /// and the server must remain live for a well-formed follow-up request.
+    ///
+    /// Fail-first: without the `max_header_list_size` bound in
+    /// `build_h2_server`, h2's receive-side default is 16 MiB and the 100 KiB
+    /// request is served with a 200 (verified during the audit).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_oversized_request_header_list_is_rejected() {
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
+
+        // Oversized request: one header well past the 60 KiB bound.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let big = "a".repeat(100 * 1024);
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .header("x-oversized", big)
+            .body(())
+            .unwrap();
+        let (response_fut, _stream) = send_request
+            .send_request(req, true)
+            .expect("send is accepted; rejection happens on receipt");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), response_fut)
+            .await
+            .expect("oversized-header request must resolve, not hang")
+            .expect("h2 synthesizes a response for the over-size header block");
+        assert_eq!(
+            resp.status().as_u16(),
+            431,
+            "over-size header list draws 431 Request Header Fields Too Large \
+             (Envoy's max_request_headers_kb reject status)"
+        );
+
+        // Liveness: a fresh, well-formed request still gets the 200.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("follow-up request succeeds");
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    /// Test-audit 2026-07-17 (TEST_GAP_ANALYSIS §5 item P5): a header list
+    /// under the 60 KiB bound is NOT rejected — pins the bound's position
+    /// (rejects 100 KiB, accepts ~8 KiB) so an over-tight future default
+    /// (e.g. copying H1's 8 KiB cap onto H2) fails loud here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_large_but_legal_header_list_is_served() {
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let big_but_legal = "b".repeat(8 * 1024);
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .header("x-large", big_but_legal)
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("8 KiB header list is legal");
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    /// Test-audit 2026-07-17 (TEST_GAP_ANALYSIS §5 item P5) — rapid-reset
+    /// (CVE-2023-44487 class) guard. A client that opens streams and
+    /// immediately RST_STREAMs each one (h2 sends the reset when the
+    /// `SendStream`/`ResponseFuture` pair is dropped after `send_reset`) must
+    /// not wedge, crash, or leak the server: h2 0.4.x's pending-accept reset
+    /// bound (`DEFAULT_REMOTE_RESET_STREAM_MAX = 20`) may legitimately
+    /// GOAWAY the flooding connection — EITHER surviving the flood OR
+    /// tearing down the flooded connection is acceptable bounded behavior.
+    /// The invariant under test: after 512 open+reset cycles the listener
+    /// still serves a well-formed request on a fresh connection.
+    ///
+    /// This is a regression guard for the mitigation-inheriting posture (the
+    /// mitigation itself lives in the h2 crate): if a future refactor drops
+    /// h2's accept loop draining or replaces the codec, this fails loud.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_rapid_reset_flood_leaves_server_responsive() {
+        let (addr, _server) = spawn_h2_hcm(synth_h2_hcm_config().await).await;
+
+        let flood = async {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let mut cycles = 0u32;
+            for _ in 0..512 {
+                // `ready()` errors once the server GOAWAYs the connection —
+                // an acceptable mitigation outcome; stop flooding then.
+                send_request = match send_request.ready().await {
+                    Ok(sr) => sr,
+                    Err(_) => break,
+                };
+                let req = http::Request::builder()
+                    .method("GET")
+                    .uri("http://test.example/")
+                    .body(())
+                    .unwrap();
+                match send_request.send_request(req, false) {
+                    Ok((response_fut, mut stream)) => {
+                        stream.send_reset(h2::Reason::CANCEL);
+                        drop(response_fut);
+                        cycles += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            cycles
+        };
+        let cycles = tokio::time::timeout(std::time::Duration::from_secs(30), flood)
+            .await
+            .expect("rapid-reset flood loop must not hang");
+        assert!(
+            cycles > 0,
+            "the flood must have exercised at least one open+reset cycle"
+        );
+
+        // The invariant: a fresh connection is served normally after the flood.
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://test.example/")
+            .body(())
+            .unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), response_fut)
+            .await
+            .expect("post-flood request must not hang")
+            .expect("post-flood request succeeds");
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
     /// Phase 33 T10 backstop: prove the per-request dynamic-metadata store
     /// threads end-to-end through the H2 HCM into its OWN access-log record
     /// (the H2 record build does NOT inherit from H1 — spec C-1), and is
