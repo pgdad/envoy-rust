@@ -4558,14 +4558,30 @@ static_resources:
     /// Phase 70 Task 6: `from_config` compiles an `AccessLog.filter`'s
     /// `status_code_filter` into the built `FileSink`'s runtime predicate.
     ///
-    /// Table-driven across ALL THREE shipped operators (`EQ`/`GE`/`LE`) so the
-    /// config `ComparisonOp` → runtime `FilterOp` mapping in
-    /// `compile_access_log_filter` is pinned arm-by-arm. Each leg probes a
-    /// status the operator must KEEP and statuses on BOTH sides that it must
-    /// DROP, so no other operator satisfies the same row — swapping any two
-    /// arms of that match makes this test RED. `filter.rs` pins that each
-    /// `FilterOp` evaluates correctly and the envoy-config tests pin that
-    /// `op: EQ` parses; this is what connects the two.
+    /// Table-driven across ALL THREE shipped operators so the config
+    /// `ComparisonOp` → runtime `FilterOp` mapping in
+    /// `compile_access_log_filter` is pinned arm-by-arm. Each row is uniquely
+    /// satisfied by its own operator (all six op×row combinations checked, and
+    /// the `Le` leg's `(100, true)` probe is what separates `Le` from `Eq`) —
+    /// swapping any two arms of that match makes this test RED.
+    ///
+    /// Two of this comment's original claims are struck rather than deleted
+    /// (D-3.5), corrected at the second §5.2 re-entry:
+    /// - ~~"Each leg probes a status the operator must KEEP and statuses on
+    ///   BOTH sides that it must DROP"~~ — true only for the `Eq` leg (403 AND
+    ///   405); a `Ge`/`Le` predicate cannot drop on both sides, so the
+    ///   sentence was unsatisfiable for two of the three legs (M70-R7). The
+    ///   uniqueness conclusion it argued for holds anyway, as restated above.
+    /// - ~~"`filter.rs` pins that each `FilterOp` evaluates correctly and the
+    ///   envoy-config tests pin that `op: EQ` parses; this is what connects
+    ///   the two"~~ — the second half is FALSE (REVIEW.md §8.3, I-2): no test
+    ///   anywhere parsed `op: EQ` or `op: LE`, and this table drives Rust
+    ///   `ComparisonOp` literals that never cross the serde boundary. The
+    ///   YAML-token → `ComparisonOp` mapping is pinned by
+    ///   `yaml_op_token_compiles_to_matching_filter_op` below, which drives
+    ///   all three tokens through the real `parse_bootstrap` path.
+    ///   (`filter.rs` does still pin that each `FilterOp` evaluates
+    ///   correctly.)
     #[tokio::test]
     async fn from_config_compiles_status_code_filter_into_sink() {
         use tempfile::tempdir;
@@ -4726,10 +4742,14 @@ static_resources:
             .map(compile_access_log_filter)
     }
 
-    /// Phase 70 Task 11: a bootstrap whose single HCM access-log entry carries
-    /// a `GE 500` `status_code_filter` with the given `runtime_key`. Only the
-    /// `runtime_key` varies across callers.
-    fn bootstrap_yaml_with_runtime_key(runtime_key: &str) -> String {
+    /// The second §5.2 re-entry (REVIEW.md §8.3, I-2): a bootstrap whose single
+    /// HCM access-log entry carries a `status_code_filter` with the given YAML
+    /// `op` TOKEN, `default_value`, and `runtime_key`. The token is spliced
+    /// into the YAML verbatim, so callers can drive all three upstream tokens
+    /// (`EQ`/`GE`/`LE`) through the real serde path — the seam I-1's table
+    /// test cannot reach, because it constructs `ComparisonOp` as a Rust
+    /// literal.
+    fn bootstrap_yaml_with_filter(op_token: &str, default_value: u32, runtime_key: &str) -> String {
         format!(
             r#"
 node: {{ id: t11, cluster: t11 }}
@@ -4752,8 +4772,8 @@ static_resources:
                     filter:
                       status_code_filter:
                         comparison:
-                          op: GE
-                          value: {{ default_value: 500, runtime_key: {runtime_key} }}
+                          op: {op_token}
+                          value: {{ default_value: {default_value}, runtime_key: {runtime_key} }}
                 route_config:
                   name: r
                   virtual_hosts:
@@ -4769,6 +4789,14 @@ static_resources:
   clusters: []
 "#
         )
+    }
+
+    /// Phase 70 Task 11: a bootstrap whose single HCM access-log entry carries
+    /// a `GE 500` `status_code_filter` with the given `runtime_key`. Only the
+    /// `runtime_key` varies across callers. (Since the second §5.2 re-entry a
+    /// thin wrapper over `bootstrap_yaml_with_filter` — byte-identical output.)
+    fn bootstrap_yaml_with_runtime_key(runtime_key: &str) -> String {
+        bootstrap_yaml_with_filter("GE", 500, runtime_key)
     }
 
     /// Phase 70 Task 11: `runtime_key` is RTDS-INERT. Upstream Envoy would
@@ -4853,6 +4881,50 @@ static_resources:
                 sink.should_log(status),
                 "a sink with no filter must log every record; should_log({status}) was false"
             );
+        }
+    }
+
+    /// The second §5.2 re-entry (REVIEW.md §8.3, I-2): pin the YAML-token →
+    /// `ComparisonOp` serde mapping — the `#[serde(rename)]` attributes on
+    /// `envoy_config::ComparisonOp` — for ALL THREE shipped tokens, by driving
+    /// production YAML through the real `parse_bootstrap` → validators →
+    /// `compile_access_log_filter` path. The Task-6 table test above drives
+    /// Rust `ComparisonOp` literals that never cross the serde boundary, so it
+    /// cannot see a swapped rename: swapping the `EQ`/`LE` renames (variant
+    /// names untouched) left the whole suite green at 886/0 while `op: EQ 404`
+    /// silently logged a 403 (measured, REVIEW.md §8.3). This test goes RED
+    /// under exactly that mutation.
+    ///
+    /// Each row is uniquely satisfied by its own operator: the `EQ` leg drops
+    /// on both sides (403 AND 405), and the `LE` leg's `(100, true)` probe is
+    /// load-bearing — a naive `(200, true), (201, false)` table is also
+    /// satisfied by `Eq 200` and stays green under the rename swap (measured,
+    /// REVIEW.md §8.1).
+    #[test]
+    fn yaml_op_token_compiles_to_matching_filter_op() {
+        /// One table row: the YAML `op` token, its threshold, and the statuses
+        /// the compiled predicate must keep (`true`) or drop (`false`).
+        type TokenCase<'a> = (&'a str, u32, &'a [(u16, bool)]);
+
+        let cases: &[TokenCase] = &[
+            ("EQ", 404, &[(403, false), (404, true), (405, false)]),
+            ("GE", 500, &[(499, false), (500, true), (503, true)]),
+            ("LE", 200, &[(100, true), (200, true), (201, false)]),
+        ];
+
+        for (token, threshold, expectations) in cases {
+            let filter = compiled_filter_from_bootstrap_yaml(&bootstrap_yaml_with_filter(
+                token, *threshold, "unused",
+            ))
+            .expect("filter compiles");
+            for (status, must_log) in *expectations {
+                assert_eq!(
+                    filter.should_log(*status),
+                    *must_log,
+                    "op: {token} {threshold} on status {status}: expected should_log={must_log} \
+                     (the YAML token compiled to the wrong FilterOp)",
+                );
+            }
         }
     }
 

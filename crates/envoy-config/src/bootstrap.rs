@@ -12962,10 +12962,12 @@ static_resources:
         // M70-R3: `ConfigError::Yaml(_)` alone is satisfied by ANY YAML-level
         // error, so an unrelated typo in the fixture above would keep this test
         // green for the wrong reason. Pin that the rejection is about the
-        // offending token specifically.
+        // offending token specifically. Anchored to the full serde phrase
+        // (M70-R6): a bare `contains("NE")` is a 2-char substring that a future
+        // `NONE`-like enum token would silently satisfy.
         let msg = err.to_string();
         assert!(
-            msg.contains("NE"),
+            msg.contains("unknown variant `NE`"),
             "rejection must name the offending op token, got {msg:?}",
         );
     }
