@@ -711,3 +711,130 @@ phase must convert it to a full match), **CF-70-3** (false-pass-only), **M70-R1*
 **CLOSED:** ~~CF-70-2~~ (premise measured FALSE — do not re-open). Not consumed by this phase
 and still live: **M69-A..I**, **CF-69-1/2/3/5**, **M68-1**, **M-1**, **CF-67-3/5/6/7**, the
 older Minors, and the HTTP-filters-family (1)–(4).
+
+---
+---
+
+# §9. THE SECOND RE-REVIEW (§5 state-5 RE-REVIEW, 2nd) — the re-issued verdict
+
+> **Written by the §5 state-5 RE-REVIEW (2nd) session** (`superpowers:requesting-code-review`),
+> **appended to — never rewriting — §1–§8**, per D-3.5. Written for a stranger with zero prior
+> context (D-3.4).
+>
+> **Session provenance (recorded per the ADR-0127 precedent).** This re-review ran in the SAME
+> operator-supervised session as the state-4 RE-VERIFICATION (2nd), at **explicit human
+> instruction** ("continue with the state-5 re-review") — the phase-66 human-authorized-chain
+> precedent ADR-0127 records. §5.1 remains binding on every autonomous session. The self-review
+> hazard is bounded here because the decisive measurements grade the **second re-entry
+> session's fix** (a different context wrote it), and the state-4 evidence this session might
+> otherwise have had to trust was instead **numerically corroborated** — the GitHub credential
+> was restored mid-session, and ADR-0143's backstop was executed (below) rather than waived.
+>
+> **Reviewed subject:** the second §5.2 re-entry (`1c6a5c2..60a5272` — the I-2 fix + the
+> M70-R6/R7/R8 folds), measured over the CURRENT head `8844445` (a parallel workstream landed
+> 4 commits after the state-4 commit `64218fa` — an `envoy-http2` header-list bound + tests +
+> bench/docs — **outside phase-70 scope**; verified: `bootstrap.rs` is untouched since
+> `60a5272` and the parallel `hcm.rs` delta touches none of the phase-70 sites, so measuring at
+> `8844445` covers the fix on both heads, strictly stronger).
+>
+> ## VERDICT: **APPROVED — 0 Critical / 0 Important / remaining Minors are carry-forwards.**
+>
+> **I-2 is DISCHARGED** (measured, §9.1). **M70-R6, M70-R7, M70-R8 are CONSUMED** (measured +
+> audited, §9.2). **§7.5 gate (f) is now MET.** The phase advances to the **state-6 close-out**
+> (its own session).
+
+## §9.1 I-2 is DISCHARGED — measured arm-by-arm, not read
+
+Method identical to §8.1's discipline: every mutation in an **isolated `git worktree --detach`**
+at `8844445` (never in-place), every run grepped for **`Compiling envoy-config`** (forced
+rebuild), the mutation **re-grepped as present AFTER each run**, the target **named** (`--lib`),
+every verdict from the **`N passed`/`N failed` counts** (the baseline shows `174 filtered out` —
+the count, not the exit code, is the evidence the test ran).
+
+| # | Mutation of the `#[serde(rename)]` attributes (`bootstrap.rs:747-754`; variant names untouched) | `Compiling` | Result | The assertion that caught it |
+|---|---|---|---|---|
+| — | *(baseline, unmutated)* | 1 hit | **1 passed** | — (proves the test genuinely RUNS) |
+| A | `EQ`⇄`LE` renames swapped (§8.3's kill) | 1 hit | **RED — 0 passed / 1 failed** | `op: EQ 404 on status 403: expected should_log=false (the YAML token compiled to the wrong FilterOp)` |
+| B | renames restored, then `GE`⇄`LE` swapped | 1 hit | **RED — 0 passed / 1 failed** | `op: GE 500 on status 499: expected should_log=false` |
+| — | *(all restored; worktree `git status` 0 dirty, `git diff HEAD` 0 lines)* | 2 hits | **GREEN — 1 passed** | — |
+
+The two swaps fail for **distinct, arm-specific reasons**, so the tokens are pinned
+independently (the re-entry's third leg — the LE-first reorder proving the `(100,true)` probe
+bites — is quoted with its distinct RED in `PROGRESS.md` §R(2)3 and was not re-run here; the
+`(100,true)` probe's load-bearing property was already measured by §8.1's vacuity experiment).
+The landed test drives all three tokens through the REAL path
+(`bootstrap_yaml_with_filter` → `compiled_filter_from_bootstrap_yaml` → `parse_bootstrap` →
+validators → `compile_access_log_filter`) — the seam I-1's literal-driven table cannot reach.
+**The defect I-2 named cannot recur silently.**
+
+## §9.2 The three folded Minors — CONSUMED (measured + independently audited)
+
+**M70-R6 — CONSUMED and the anchor BITES.** `rejects_status_code_filter_unknown_op` now asserts
+``msg.contains("unknown variant `NE`")`` (`bootstrap.rs:12970`) with the explaining comment.
+Measured in the worktree by §8.4's wrong-reason probe: `op` made VALID (`GE`) while an unrelated
+field is typo'd (`path` → `pathx`) → the old `matches!(Yaml(_))` is still satisfied, and the NEW
+assertion goes **RED**: `rejection must name the offending op token, got "… unknown field
+\`pathx\`, expected \`path\` or \`log_format\` …"` (`0 passed / 1 failed`, compile confirmed,
+probe re-grepped present). Restored → **GREEN 1 passed**.
+
+**M70-R7 + M70-R8 + the I-2 comment corrections — CONFIRMED by an independent READ-ONLY
+auditor** (a fresh-context subagent, no cargo, no writes): the Task-6 doc block strikes both
+original claims with corrections alongside (`hcm.rs:4570-4584`); `PROGRESS.md` §R1 strikes the
+false claim and names its self-contradiction with the zero-hit grep quoted six lines earlier;
+CF-70-2's elided tail is restored struck-through (`PROGRESS.md:315-316`); and a tree-wide sweep
+found **no live, unstruck copy** of the false claim (every remaining hit is inside a `~~…~~`
+strike or an append-only historical record). One cosmetic note, correctly frozen: §R(2)1 cites
+the struck block's pre-fix location `hcm.rs:4566-4568`; it now sits at `4575-4584` (append-only
+record — not edited, noted here per D-3.5).
+
+## §9.3 ADR-0143's numeric backstop — EXECUTED, and it corroborates exactly
+
+The GitHub credential was restored during this session (`gh auth status`: logged in via
+keyring), so the backstop ADR-0143 directed at this re-review was run rather than waived:
+
+```
+$ gh run view 29596323921 --log | grep -oE "test result: (ok|FAILED)\. [0-9]+ passed; [0-9]+ failed" \
+    | awk '{p+=$4; f+=$6} END {print "CI passed="p" CI failed="f}'
+CI passed=2023 CI failed=0          # run on 60a5272 — the state-4 gate subject
+$ …same for run 29622523725…
+CI passed=2028 CI failed=0          # run on 8844445 — the current merged head
+```
+
+**`2023` is EXACTLY the total ADR-0143's substitute chain predicted** (`2022 + 1`), and `2028`
+equals the merged head's local enumeration (`2017 + 11`, measured when the parallel push was
+pulled and verified). The substitute evidence is therefore **numerically corroborated on both
+identities** — no contradiction, no unexpected state. ADR-0143's protocol note stands for any
+future credential outage; the standard numeric check is back in force.
+
+## §9.4 Doctrine compliance (re-checked)
+
+| Rule | Status |
+|---|---|
+| D-3.1 TDD | ✅ the re-entry's RED proven token-by-token (§R(2)3), reproduced here (§9.1) |
+| D-3.4 stranger-readability | ✅ the §R(2)/§V(3) records read cold; the audited corrections close I-2's doc debt |
+| D-3.5 decisions written | ✅ strikethrough corrections everywhere; ADR-0143 records the one genuine ambiguity |
+| D-3.6 green build | ✅ §V(3) gate (a)-(e) PASS over `60a5272`; CI `success` on `60a5272`, `64218fa`, and `8844445` |
+| D-3.7/D-3.8 | ✅ pin untouched; `#![forbid(unsafe_code)]` holds |
+| Scope (ADR-0140/0142) | ✅ no production change since `1c6a5c2` on the phase-70 surface; config surface CLOSED |
+| `known-failures.txt` | ✅ untouched |
+
+**No new ADR fired by this re-review** (next-available **ADR-0144**, unreserved).
+
+## §9.5 Carry-forwards after this re-review (the state-6 close-out inherits this list)
+
+**Live:** **CF-70-1** (the zero-arm `expect()` — arm #2's phase MUST convert it to a full
+match, alongside **M70-R1**, same surface), **CF-70-3** (false-pass-only `wait_file_lines`
+window — next access-log-filter phase), **M70-R2**, **M70-R4**, **M70-R9**.
+**CONSUMED:** I-1, I-2, M70-R3, M70-R5, M70-R6, M70-R7, M70-R8.
+**CLOSED:** ~~CF-70-2~~ (do not re-open).
+Unconsumed and still live: **M69-A..I**, **CF-69-1/2/3/5**, **M68-1**, **M-1**,
+**CF-67-3/5/6/7**, the older Minors, and the HTTP-filters-family (1)–(4).
+
+## §9.6 Next session — the §5 state-6 CLOSE-OUT (its own session)
+
+Gate (f) is MET; all six §7.5 sub-gates now hold. The close-out (memory
+`closeout-and-pick-are-separate-sessions`): flip ROADMAP row `70` → `done` (6 cells preserved;
+the `op: EQ\|GE\|LE` escapes are CORRECT), relocate the closed-phase Notes + the four
+top-section blocks to `STATE_HISTORY.md` (DELTA-based byte-preservation check, memory
+`state6-relocation-check-must-be-delta-based`), set STATE → awaiting next planning. The
+next-phase state-0/1 pick is a SEPARATE session again.
