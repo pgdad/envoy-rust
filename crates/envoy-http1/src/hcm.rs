@@ -4714,6 +4714,41 @@ static_resources:
         assert!(!sink.should_log(200, "UH")); // dropped (UH ∉ ["NR"])
     }
 
+    /// Phase 71 Task 9: a sink built from a filterless `AccessLog` logs EVERY
+    /// record regardless of status/flags — the regression that carries the 28
+    /// byte-exact fixtures under the widened `should_log(status, flags)`.
+    #[tokio::test]
+    async fn no_filter_sink_logs_every_record_after_widening() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let config =
+            hcm_config_with_filtered_access_log(None, &dir.path().join("plain.log"), 200).await;
+        let sink = &config.access_log[0];
+        assert!(sink.should_log(200, "-"));
+        assert!(sink.should_log(503, "NR"));
+        assert!(sink.should_log(404, "UF"));
+    }
+
+    /// Phase 71 Task 9: the phase-70 `status_code_filter` still gates PURELY on
+    /// status, ignoring the newly-threaded `response_flags` arg — a GE-500 sink
+    /// drops a 200 whatever its flag, keeps a 503 whatever its flag.
+    #[tokio::test]
+    async fn status_code_filter_unchanged_under_widening() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let config = hcm_config_with_filtered_access_log(
+            Some((envoy_config::ComparisonOp::Ge, 500)),
+            &dir.path().join("sc.log"),
+            200,
+        )
+        .await;
+        let sink = &config.access_log[0];
+        assert!(!sink.should_log(200, "NR")); // status-only: 200 < 500 drops
+        assert!(!sink.should_log(200, "-"));
+        assert!(sink.should_log(503, "-")); // 503 >= 500 keeps
+        assert!(sink.should_log(503, "NR"));
+    }
+
     /// Phase 70 Task 7: the H1 emit loop gates each sink on `should_log` of the
     /// record's final response code — a GE-500 sink drops a 200 (0 lines) and
     /// keeps a 503 (1 line). The third leg pins the regression parity that
