@@ -2253,6 +2253,80 @@ The assertion is pure cross-proxy equality — both proxies must agree on the
 KEPT half AND the DROPPED half. The line above documents the measured value; it
 is not the oracle.
 
+### Phase 71 (ADR-0144/0145): `response_flag_filter` — the SECOND emission-gate arm
+
+> Sibling to phase 70's `status_code_filter`. The `AccessLogFilter` oneof gains
+> its SECOND arm, `response_flag_filter`
+> (`envoy.config.accesslog.v3.ResponseFlagFilter`): a per-sink predicate that
+> gates emission on the record's single `%RESPONSE_FLAGS%` token rather than its
+> status. The two arms are mutually exclusive. The cross-proxy witness is
+> **fixture 0077** (`0077-accesslog-response-flag-filter`): one file sink with
+> `flags: ["NR"]`, one `direct_response` route and a no-route path — the
+> no-route 404 `NR` record is emitted, the clean 503 `-` is dropped, byte-exact
+> on both proxies. All facts below are empirically locked against live
+> `envoyproxy/envoy:v1.33.0` (ADR-0145 §6.2 reconciliation, incl. the PV-6 live
+> measurement).
+
+**§A — the schema.** The `filter` block nests exactly:
+
+```yaml
+filter:
+  response_flag_filter:
+    flags: ["NR", "UF"]       # subset of the 29-token v1.33.0 in-list (see §B)
+```
+
+`response_flag_filter` sits beside `status_code_filter` under `filter`. A
+`filter` carrying BOTH arms is boot-fatal (`ConfigError::AmbiguousAccessLogFilter`
+— the oneof-cardinality rule, now reachable with two arms). Omitting `filter`
+entirely is still the way to say "log every record".
+
+**§B — the token vocabulary (MEASURED: 29 / 6 / 23).** `flags` accepts EXACTLY
+the 29-token v1.33.0 PGV `in`-list (measured via `--mode validate`):
+
+```
+LH UH UT LR UR UF UC UO NR DI FI RL UAEX RLSE DC URX SI IH DPE UMSDR
+RFCF NFCF DT UPE NC OM DF DO DR
+```
+
+Of these, envoy-rust PRODUCES only 6 — `{NR, UH, UO, UC, UF, URX}` (the six
+witnessed `%RESPONSE_FLAGS%` values, see the access-log field mapping above).
+The other 23 are parsed-but-inert: accepted for LOAD-PARITY (a config upstream
+accepts must boot here) but never rendered, so a `flags` listing only inert
+tokens (e.g. `["DI"]`) validates and simply never matches. A token outside the
+29-set (`BOGUS`, lowercase `nr`) is boot-fatal (`ConfigError::UnknownResponseFlag`)
+— parity with upstream's PGV `in`-list rejection.
+
+**§C — the decision (token membership over the SINGLE rendered token).**
+`%RESPONSE_FLAGS%` renders exactly ONE token per record (brace-free; `-` is the
+no-flag sentinel). A record is KEPT iff its token ∈ `flags`. Since `-` ∉ the
+29-token set, a NON-EMPTY `flags` never matches a no-flag record: a clean 503
+`direct_response` (which renders `-`, §F of phase 70) is always dropped by
+`flags: ["NR"]`, while a no-route 404 (which renders `NR`) is kept.
+
+**§D — EMPTY or absent `flags` matches ANY record with a flag set (MEASURED,
+PV-6).** `flags: []` and `response_flag_filter: {}` both parse, are ACTIVE (not
+inert), and match a record iff it HAS a response flag — i.e. iff its token is
+NOT `-`. So an empty-`flags` sink keeps the no-route 404 `NR` and drops the
+clean 503 `-`. Load-parity forbids rejecting the upstream-accepted empty list;
+the runtime models it as `response_flags != "-"`.
+
+**§E — mutual exclusion.** `response_flag_filter` and `status_code_filter` are
+the two arms of the same oneof. Exactly one must be set: zero arms
+(`filter: {}`) and both arms are each `ConfigError::AmbiguousAccessLogFilter`.
+
+**§F — authoritative fixture-0077 file** (two probes — `GET /direct` → 503
+DROPPED (renders `-`), `GET /nowhere` → no-route 404 KEPT (renders `NR`);
+dropped FIRST + kept LAST as the CF-70-3 ordering witness; same
+`text_format_source` as 0076; `flags: ["NR"]`). Each proxy's file holds EXACTLY
+ONE line:
+
+```
+STATUS=404 PATH=/nowhere FLAGS=NR
+```
+
+Pure cross-proxy equality — both proxies must agree on the KEPT half AND the
+DROPPED half. The line above documents the measured value; it is not the oracle.
+
 ---
 
 ## xDS wire state machine
