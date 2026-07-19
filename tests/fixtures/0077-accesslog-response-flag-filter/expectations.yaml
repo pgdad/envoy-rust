@@ -1,0 +1,36 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0077-envoy-mount/access.log
+    envoy_rust: /tmp/0077-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — SUPPRESSED, and FIRST (CF-70-3 ordering witness: the dropped
+    # probe must precede the kept one so the kept line is the LAST to flush).
+    # `GET /direct` hits the 503 direct_response route; a direct_response is
+    # HCM-authored, so %RESPONSE_FLAGS% renders the no-flag sentinel `-`, which
+    # is ∉ the `flags: [NR]` set → the sink emits NOTHING on EITHER proxy.
+    # `expect_logged: false` removes it from the driver's line-count target.
+    - method: get
+      path: /direct
+      host: envoy-rust.test
+      expected_status: 503
+      expect_logged: false
+    # Probe 2 — KEPT, and LAST (the ordering witness Task-7 asserts).
+    # `GET /nowhere` matches NO route → the HCM synthesizes a 404 whose
+    # %RESPONSE_FLAGS% is `NR` (NoRouteFound), which IS in `flags: [NR]` → the
+    # record IS emitted. Expected line (byte-identical on both sides):
+    #   STATUS=404 PATH=/nowhere FLAGS=NR
+    - method: get
+      path: /nowhere
+      host: envoy-rust.test
+      expected_status: 404
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static literal:
+  # the `http1_access_log_byte_exact` driver asserts each emitted line is
+  # byte-identical between upstream Envoy v1.33.0 and envoy-rust. Both proxies
+  # must agree on BOTH halves of the filter decision — the kept 404 `NR` line
+  # AND the absence of any /direct line (a one-sided suppression fails the
+  # line-count assertion before the byte compare is reached). The file on each
+  # side holds EXACTLY ONE line (measured, ADR-0145 PV-6 live measurement):
+  #   STATUS=404 PATH=/nowhere FLAGS=NR
+  # The only route is a direct_response → `clusters: []`, no backend spawns.
