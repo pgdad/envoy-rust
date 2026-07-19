@@ -153,10 +153,47 @@ No commit for Task 12 (dry-run only).
 
 ---
 
+## Post-push CI regression + fix (ADR-0146) — T7 ordering-witness assertion retired
+
+The state-3 STATE-advance commit `c2efbd0` was pushed; CI (run `29668532521`)
+went **RED** on the `test` step. `fmt`/`clippy`/`build`/`fuzz` all passed; the
+Docker differential `access_log_status_code_filter` (the PHASE-70 fixture
+**0076**, NOT the new 0077) panicked at `tests/differential/src/lib.rs:6275`:
+`CF-70-3: a suppression fixture's LAST probe must have expect_logged=true
+(ordering witness)`.
+
+**Root cause (systematic-debugging).** The T7 ordering-witness HARD `assert!`
+(a suppression fixture's LAST probe must be `expect_logged=true`) is incompatible
+with the pre-existing fixture 0076, whose probes are `/log` KEPT first + `/nolog`
+DROPPED last. The PLAN's premise "the 30 existing all-kept fixtures see ZERO
+change" was FALSE — 0076 is itself a suppression fixture. The T12 dry-run ran
+`cargo test --workspace --lib --bins`, which EXCLUDES the differential
+integration-test binaries, so the regression surfaced only at the CI push.
+Reproduced deterministically locally.
+
+**Fix (ADR-0146).** RETIRE the hard ordering-witness `assert!` from BOTH byte-exact
+arms; KEEP the `has_suppression`-gated bounded settle as the sole, ordering-AGNOSTIC
+CF-70-3 closure (sound for both orderings: envoy-rust writes per-record
+immediately; upstream Envoy flushes its buffer atomically). A strict improvement
+over phase 70 (no settle). Fired **ADR-0146** (supersedes ADR-0145 PV-7's
+assertion mechanism only; CF-70-3 stays closed via the settle). Softened the 0077
+fixture's now-inaccurate "Task-7 asserts this ordering" comments.
+
+**Verification.** Both differentials green locally after the fix:
+`cargo test -p differential --test access_log_status_code_filter` → **1 passed**;
+`--test access_log_response_flag_filter` → **1 passed**. fmt/clippy clean;
+M70-R2 witnesses **2 passed**. Committed the fix; re-pushed; CI re-confirmed.
+
+This is a within-state-3 correction (the T7 implementation was defective; the fix
+stays in the authoring session, re-verified before the state advance stands).
+
+---
+
 ## Session close
 
-All 12 PLAN tasks landed (commits `e3208e4`..`76bad75` + fmt `e43cdb4`). STATE
-advanced to state-4 (docs-only). `#![forbid(unsafe_code)]` holds. Consumed
-CF-70-1 + M70-R1, CLOSED CF-70-3 (driver ordering witness + fixture 0077 probe
-order), FOLDED IN M70-R2. `next-prompt.txt` refreshed for the §5 state-4
-verification. No `stop` file (the §9 feature families remain largely unbuilt).
+All 12 PLAN tasks landed (commits `e3208e4`..`76bad75` + fmt `e43cdb4`) + the
+ADR-0146 CF-70-3 fix. STATE advanced to state-4 (docs-only). `#![forbid(unsafe_code)]`
+holds. Consumed CF-70-1 + M70-R1, CLOSED CF-70-3 (the driver bounded settle —
+ordering-agnostic per ADR-0146), FOLDED IN M70-R2. `next-prompt.txt` refreshed
+for the §5 state-4 verification. No `stop` file (the §9 feature families remain
+largely unbuilt).

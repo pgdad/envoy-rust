@@ -4,8 +4,9 @@ driver:
     envoy: /tmp/0077-envoy-mount/access.log
     envoy_rust: /tmp/0077-envoy-rust-mount/access.log
   probes:
-    # Probe 1 — SUPPRESSED, and FIRST (CF-70-3 ordering witness: the dropped
-    # probe must precede the kept one so the kept line is the LAST to flush).
+    # Probe 1 — SUPPRESSED, and FIRST (kept-last is the sound convention, though
+    # ADR-0146 retired the hard assertion — the driver's bounded settle is the
+    # ordering-agnostic CF-70-3 closure).
     # `GET /direct` hits the 503 direct_response route; a direct_response is
     # HCM-authored, so %RESPONSE_FLAGS% renders the no-flag sentinel `-`, which
     # is ∉ the `flags: [NR]` set → the sink emits NOTHING on EITHER proxy.
@@ -15,7 +16,7 @@ driver:
       host: envoy-rust.test
       expected_status: 503
       expect_logged: false
-    # Probe 2 — KEPT, and LAST (the ordering witness Task-7 asserts).
+    # Probe 2 — KEPT, and LAST (the sound kept-last convention; see ADR-0146).
     # `GET /nowhere` matches NO route → the HCM synthesizes a 404 whose
     # %RESPONSE_FLAGS% is `NR` (NoRouteFound), which IS in `flags: [NR]` → the
     # record IS emitted. Expected line (byte-identical on both sides):

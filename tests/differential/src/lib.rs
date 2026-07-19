@@ -6263,20 +6263,19 @@ async fn run_http1_access_log_byte_exact_arm(
     // every `wait_file_lines` poll below for the full flush timeout.
     let expected_lines = expected_logged_count(probes);
 
-    // Phase 71 (CF-70-3) ordering witness (ADR-0145 PV-7): FileAccessLog
-    // flushes in request order, so a suppression fixture's LAST probe must be
-    // KEPT — once its line is on disk (which `wait_file_lines(expected_lines)`
-    // waits for below), every earlier non-suppressed record has ALSO flushed,
-    // making the exact count-equality assertions sound (they reject a leaked
-    // line instead of false-passing on an un-flushed one). Only suppression
-    // fixtures pay this; the all-kept fixtures see ZERO change.
+    // Phase 71 (CF-70-3, corrected by ADR-0146): a suppression fixture must not
+    // false-pass on a filter-DROPPED record whose line is merely un-flushed at
+    // the moment the kept-line count is reached. The bounded settle below (both
+    // proxies still live) is the ORDERING-AGNOSTIC closure: it re-reads both
+    // files after a fixed wait and rejects any growth past the kept-line count.
+    // ADR-0145 PV-7 originally proposed ALSO asserting the LAST probe is KEPT
+    // (an authorship convention that makes the count-equality sound without a
+    // settle) — but that HARD precondition is incompatible with the pre-existing
+    // phase-70 fixture 0076 (kept `/log` FIRST, dropped `/nolog` LAST), so
+    // ADR-0146 RETIRES it and relies on the settle alone (a strict improvement
+    // over phase 70, which had no settle). Only suppression fixtures pay it; the
+    // all-kept fixtures see ZERO change.
     let has_suppression = expected_lines < probes.len();
-    if has_suppression {
-        assert!(
-            probes.last().map(|p| p.expect_logged).unwrap_or(false),
-            "CF-70-3: a suppression fixture's LAST probe must have expect_logged=true (ordering witness)"
-        );
-    }
 
     // Drive each probe in order against BOTH proxies. Reuse the exact
     // request build (`drive_http1`) the `Http1WithAccessLog` arm uses;
@@ -6441,16 +6440,11 @@ async fn run_http2_access_log_byte_exact_arm(
     // every `wait_file_lines` poll below for the full flush timeout.
     let expected_lines = expected_logged_count(probes);
 
-    // Phase 71 (CF-70-3) ordering witness (ADR-0145 PV-7): see the H1 arm — a
-    // suppression fixture's LAST probe must be KEPT so the exact count-equality
-    // below is sound. Only suppression fixtures pay this.
+    // Phase 71 (CF-70-3, corrected by ADR-0146): see the H1 arm — the bounded
+    // settle below is the ordering-agnostic closure; the ADR-0145 PV-7 hard
+    // "last probe must be KEPT" precondition was RETIRED (incompatible with the
+    // pre-existing dropped-last fixture 0076). Only suppression fixtures pay it.
     let has_suppression = expected_lines < probes.len();
-    if has_suppression {
-        assert!(
-            probes.last().map(|p| p.expect_logged).unwrap_or(false),
-            "CF-70-3: a suppression fixture's LAST probe must have expect_logged=true (ordering witness)"
-        );
-    }
 
     for (idx, probe) in probes.iter().enumerate() {
         let upstream_resp = drive_http2(

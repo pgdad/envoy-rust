@@ -42,14 +42,15 @@ literal. The line above is documentation of the measured value, not the oracle.
 ## Ordering witness (CF-70-3)
 
 The dropped probe (`/direct`) is FIRST and the kept probe (`/nowhere`) is LAST.
-FileAccessLog flushes in request order, so once the kept `/nowhere` line is on
-disk (which the driver's `wait_file_lines(1)` waits for), every earlier record
-that was NOT suppressed has also flushed — making the driver's exact
-count-equality assertion sound rather than a false-pass on an un-flushed line.
-The Task-7 driver hardening ASSERTS this ordering (`expect_logged` of the last
-probe must be `true`) and adds a bounded settle confirming neither file grows
-past the kept-line count. This is the fixture that first exercises that path
-(`has_suppression == true`).
+This kept-last ordering is the sound convention (FileAccessLog flushes in
+request order, so once the kept `/nowhere` line is on disk — which the driver's
+`wait_file_lines(1)` waits for — every earlier non-suppressed record has also
+flushed), but it is NOT enforced: ADR-0146 RETIRED the hard "last probe must be
+kept" assertion because it is incompatible with the pre-existing dropped-last
+fixture 0076. The CF-70-3 closure is the driver's bounded settle (both proxies
+still live, re-read both files after a fixed wait, reject any growth past the
+kept-line count) — ordering-agnostic, so it protects both 0076 and 0077. This is
+the fixture that first exercises that path (`has_suppression == true`).
 
 ## Probes / driver
 
