@@ -189,6 +189,116 @@ stays in the authoring session, re-verified before the state advance stands).
 
 ---
 
+## §5 STATE-4 VERIFICATION (`superpowers:verification-before-completion`)
+
+The full §7.5 phase-done gate, re-run from scratch over the phase-71 head
+`7559fffe577ed107649eb199dbad7bb1660d0062` (state-3 CF-70-3 fix, ADR-0146). Solo-serial
+(the cargo lock makes concurrency pointless; the adjudication is one indivisible
+judgment). Every command output quoted below. A green state-3 T12 dry-run is NOT
+the state-4 verdict — this is the authoritative re-run incl. the FULL Docker
+differential regression sweep.
+
+### Pre-flight
+
+- `git status --porcelain` clean; branch `main`; `HEAD` = `7559fff…` (state-3 head).
+  `git fetch origin --prune` — no sibling advanced (`STATE.md` still names state-3-complete).
+- **CI on the FULL 40-char SHA** `7559fffe577ed107649eb199dbad7bb1660d0062`:
+  `gh run list --commit 7559fff…` → run **`29668978351`** `completed` / **`success`**
+  (`ci`, `main`, 6m52s). Re-confirmed green at state-4-verify time.
+- `cargo build -p envoy-bin` → **Finished** (exit 0) — the DEBUG `target/debug/envoy-bin`
+  the differential harness runs is rebuilt BEFORE any local differential (memory
+  `differential-harness-uses-debug-envoy-bin`; else a stale binary REDs with
+  `unknown field response_flag_filter`). Docker daemon confirmed up (`docker ps` OK).
+
+### Gate (e) — deterministic gates, ALL CLEAN
+
+- `cargo fmt --all -- --check` → **exit 0, empty output** (already clean at T12 `e43cdb4`; re-confirmed).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → **exit 0**,
+  0 `^warning`/`^error` lines; final `Finished \`dev\` profile … target(s)`.
+- `cargo build --workspace --all-targets` → **exit 0**, `Finished \`dev\` profile …
+  target(s) in 8.51s` (every test binary compiles).
+- `cargo deny check` → **exit 0**: `advisories ok, bans ok, licenses ok, sources ok`
+  (the `license-not-encountered` lines are pre-existing non-fatal warnings, not errors).
+- `cargo test --workspace --no-fail-fast` → **exit 101** (`--no-fail-fast` so the gate
+  is fully exercised — memory `local-red-set-varies-run-to-run`; full output REDIRECTED
+  to a file, never `tail`). Aggregate **2036 passed / 8 failed** across 154 test binaries
+  (146 `test result: ok`, 8 `FAILED`). The 8 REDs are adjudicated below — **every one is a
+  documented host-flake; none is in the phase-71 surface; none is a regression.**
+
+### Gate (a)/(b) — the Docker differential regression sweep
+
+**Phase-71 surface — BOTH GREEN** (the decisive measurement):
+- (a) NEW fixture **`0077`** — `access_log_response_flag_filter` →
+  `test access_log_response_flag_filter ... ok` / `test result: ok. 1 passed`.
+- (b) the phase-70 sibling **`0076`** — `access_log_status_code_filter` →
+  `test access_log_status_code_filter ... ok`.
+
+**The 8 `cargo test --workspace` REDs — full adjudication** (isolation re-run naming
+each target binary + the `local passed+failed == CI passed` cross-check):
+
+| # | Failing binary | Isolation re-run | Documented host-flake / signature |
+|---|---|---|---|
+| 1 | `access_log_h2_rcd_upstream_reset` | FAILED (deterministic) | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| 2 | `access_log_h2_uc_upstream_reset` | FAILED (deterministic) | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| 3 | `access_log_rcd_upstream_reset` | FAILED (deterministic) | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| 4 | `access_log_rf_upstream_reset` | FAILED (deterministic) | `tcpclosebackend-ipv6-unreachable-host-flake` |
+| 5 | `access_log_upstream_host` | **ok. 1 passed** | `differential-fixtures-flake-under-parallel-load` |
+| 6 | `admin_config_dump_server_info` | FAILED (deterministic) | `differential-host-bridge-ip-192-168-65-2` |
+| 7 | `http_filter_rbac` | **ok. 1 passed** | `differential-fixtures-flake-under-parallel-load` |
+| 8 | `eds_cluster_with_neither_is_fatal` (`xds_file_based_eds`) | **ok. 1 passed** | `eds-fatal-startup-test-port-reuse-flake` |
+
+- **Two flake classes** (memory `local-red-set-varies-run-to-run`: "core fails
+  deterministically [environmental], tail passes [parallel-load flake]"):
+  - **Environmental (deterministic fail in isolation, but CI-green + documented):**
+    #1–4 upstream-reset — real Envoy reports `upstream_reset_before_response_started{…
+    immediate_connect_error:_Network_is_unreachable|remote_address:[fdc4:f303:9324::254]:36001}` /
+    `rf:UF` because it can't reach the host-spawned close backend over IPv6 (host-net; envoy-rust
+    correctly emits `connection_termination`/`UC`). #6 admin — envoy-only stats key on
+    `192.168.65.2:46745` (this host's Docker-bridge route, not the allow-listed IP).
+    These are constants of THIS host, so they fail in isolation too — that is EXPECTED and
+    is NOT evidence of a regression (the memories mark them CI-authoritative).
+  - **Parallel-load flakes (PASS in isolation):** #5 `access_log_upstream_host`,
+    #7 `http_filter_rbac`, #8 `eds_cluster_with_neither_is_fatal` all → `test result: ok.
+    1 passed` when re-run alone.
+- **Cross-check `local passed+failed == CI passed`:** local `2036 + 8 = 2044`;
+  CI run `29668978351` aggregate = **2044 passed / 0 failed** → **2044 == 2044**. Every
+  local RED passes on CI. **No regression; the phase-71 code is CI-green.**
+- **NONE of the 8 REDs touches the phase-71 surface** (`response_flag_filter` /
+  `status_code_filter` both GREEN locally AND on CI).
+
+### Gate (c) — conformance
+
+**N/A for this phase.** The access-log surface has no h2spec/h3spec conformance gate
+(those bind to the HTTP/2 + HTTP/3 protocol layers; a per-`AccessLog`-sink emission
+predicate is orthogonal). `known-failures.txt` untouched.
+
+### Gate (d) — fuzz
+
+- **No new fuzz target this phase.** The `parse_bootstrap` corpus seed
+  `crates/envoy-config/fuzz/corpus/parse_bootstrap/response_flag_filter.yaml` (T10) is
+  tracked (`git ls-files` lists it — the `!`-un-ignore held; memory
+  `fuzz-corpus-seed-gitignored-by-default`).
+- Optional short-budget re-run: `cd crates/envoy-config && cargo +nightly fuzz run
+  parse_bootstrap -- -max_total_time=30` → **exit 0**, `Done 38258 runs in 93 second(s)`,
+  `cov: 16368`, **no crash / panic / leak / OOM**.
+
+### Gate (f) — REVIEW.md
+
+**NOT this session.** Per §5.1 (one state per session) the state-5 code-review
+(`superpowers:requesting-code-review`, which writes `REVIEW.md`) is the NEXT session.
+
+### VERDICT
+
+**§7.5 gate (a)–(e) PASS** over the phase-71 head `7559fff…`. The new fixture `0077`
+and the pre-existing `0076` are byte-exact green locally AND on CI; the 8 workspace-test
+REDs are all documented host-flakes (proven by isolation re-runs + the `2044 == 2044`
+CI cross-check), none in the phase surface. `#![forbid(unsafe_code)]` holds. STATE
+advances to **state-5** (the code-review). No genuine (non-flake) regression → no §5.2
+state-3 re-entry. This state-4 verification commit is docs-only
+(`PROGRESS.md` + `STATE.md` + `STATE_HISTORY.md`).
+
+---
+
 ## Session close
 
 All 12 PLAN tasks landed (commits `e3208e4`..`76bad75` + fmt `e43cdb4`) + the
