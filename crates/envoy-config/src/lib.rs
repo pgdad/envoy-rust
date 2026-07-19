@@ -30,12 +30,11 @@ pub use bootstrap::{
     Mutations, NetworkFilter, NetworkRbacConfig, Node, OutlierDetection, PathConfigSource,
     PathMatcher, PayloadDecodeError, PerFilterConfig, Percent, Permission, PermissionSet, Policy,
     Principal, PrincipalSet, RbacConfig, Rds, RequirementRule, ResponseFlagFilter, RetryConfig,
-    RetryOn, RetryPolicy,
-    Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch, RouterConfig,
-    RoutingPriority, Rules, RuntimeFractionalPercent, RuntimeUInt32, SafeRegex, SetMetadataConfig,
-    SocketAddress, StaticResources, StatusCodeFilter, StringMatcher, StringMatcherMode,
-    SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig, Thresholds, TlsCertificate,
-    TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
+    RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route, RouteConfiguration, RouteMatch,
+    RouterConfig, RoutingPriority, Rules, RuntimeFractionalPercent, RuntimeUInt32, SafeRegex,
+    SetMetadataConfig, SocketAddress, StaticResources, StatusCodeFilter, StringMatcher,
+    StringMatcherMode, SubstitutionFormatString, TcpHealthCheck, TcpProxyConfig, Thresholds,
+    TlsCertificate, TokenBucket, TransportSocket, TransportSocketTypedConfig, TypedConfig,
     TypedExtensionProtocolOptions, UpstreamTlsContext, ValueMatcher, VirtualHost, parse_duration,
 };
 pub use cds::parse_cds_file;

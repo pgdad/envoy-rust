@@ -787,9 +787,8 @@ pub struct ResponseFlagFilter {
 /// envoy-rust produces only `{NR, UH, UO, UC, UF, URX}`; the other 23 are
 /// parsed-but-inert. Order matches the upstream rejection message.
 pub(crate) const RESPONSE_FLAG_TOKENS: [&str; 29] = [
-    "LH", "UH", "UT", "LR", "UR", "UF", "UC", "UO", "NR", "DI", "FI", "RL",
-    "UAEX", "RLSE", "DC", "URX", "SI", "IH", "DPE", "UMSDR", "RFCF", "NFCF",
-    "DT", "UPE", "NC", "OM", "DF", "DO", "DR",
+    "LH", "UH", "UT", "LR", "UR", "UF", "UC", "UO", "NR", "DI", "FI", "RL", "UAEX", "RLSE", "DC",
+    "URX", "SI", "IH", "DPE", "UMSDR", "RFCF", "NFCF", "DT", "UPE", "NC", "OM", "DF", "DO", "DR",
 ];
 
 /// AccessLogTypedConfig — the `@type`-tagged envelope for an AccessLog

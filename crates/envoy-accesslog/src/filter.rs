@@ -25,7 +25,9 @@ pub enum LogFilter {
     StatusCode(StatusCodeComparison),
     /// Phase 71: emit a record iff its response-flag token ∈ `flags`. An EMPTY
     /// `flags` matches any record that HAS a flag set (ADR-0145 PV-6).
-    ResponseFlag { flags: Vec<String> },
+    ResponseFlag {
+        flags: Vec<String>,
+    },
 }
 
 impl LogFilter {

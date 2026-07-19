@@ -3451,8 +3451,9 @@ static_resources:
     async fn h2_response_flag_filter_suppresses_no_flag() {
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("access.log");
-        let fmt = envoy_accesslog::CompiledFormat::from_inline("%RESPONSE_CODE% %RESPONSE_FLAGS%\n")
-            .expect("format parses");
+        let fmt =
+            envoy_accesslog::CompiledFormat::from_inline("%RESPONSE_CODE% %RESPONSE_FLAGS%\n")
+                .expect("format parses");
         let filter = envoy_accesslog::LogFilter::ResponseFlag {
             flags: vec!["NR".to_string()],
         };
@@ -3536,7 +3537,11 @@ static_resources:
             logged, "404 NR\n",
             "flags:[NR] must keep the no-route 404 (rf=NR): {logged:?}"
         );
-        assert_eq!(stats.value(), 1, "the emitted record ticks access_logs_total");
+        assert_eq!(
+            stats.value(),
+            1,
+            "the emitted record ticks access_logs_total"
+        );
     }
 
     /// Drive one H2 request to `path` against `addr`, assert the response
