@@ -13101,6 +13101,43 @@ static_resources:
     }
 
     #[test]
+    fn accepts_response_flag_filter_duplicate_and_multi_tokens() {
+        // Phase-71 state-5 review probe (REVIEW.md §2): upstream v1.33.0
+        // `--mode validate` ACCEPTS `flags: ["NR", "NR", "UF"]` (no PGV
+        // uniqueness constraint — SPEC R-0.2), and envoy-rust boots the same
+        // config (live-measured). This pins the measured load-parity fact so a
+        // future "helpful" dedup/uniqueness check cannot regress it silently.
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      response_flag_filter:
+                        flags: ["NR", "NR", "UF"]
+"#,
+        );
+        let bootstrap =
+            crate::parse_bootstrap(&yaml).expect("duplicate + multiple tokens must validate");
+        let hcm = match &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0]
+            .typed_config
+        {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        let filter = hcm.access_log[0].filter.as_ref().expect("filter present");
+        let rff = filter
+            .response_flag_filter
+            .as_ref()
+            .expect("response_flag_filter present");
+        assert_eq!(
+            rff.flags,
+            vec!["NR".to_string(), "NR".to_string(), "UF".to_string()]
+        );
+    }
+
+    #[test]
     fn rejects_status_code_filter_unknown_op() {
         let yaml = hcm_with_access_log_yaml(
             r#"                access_log:

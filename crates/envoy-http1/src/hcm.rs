@@ -4665,11 +4665,15 @@ static_resources:
                     name: "default".to_string(),
                     domains: vec!["*".to_string()],
                     include_attempt_count_in_response: false,
+                    // A FIXED-path route (not a catch-all) so a request to any
+                    // other path is a no-route synth 404 whose record carries
+                    // `%RESPONSE_FLAGS%` = `NR` — lets the end-to-end emit-loop
+                    // test below drive both a flagged and a flagless record.
                     routes: vec![Route {
                         name: String::new(),
                         r#match: RouteMatch {
-                            prefix: Some("/".to_string()),
-                            path: None,
+                            prefix: None,
+                            path: Some("/routed".to_string()),
                             headers: vec![],
                         },
                         action: RouteAction::DirectResponse(DirectResponse {
@@ -4712,6 +4716,49 @@ static_resources:
         assert!(sink.should_log(404, "NR")); // kept
         assert!(!sink.should_log(503, "-")); // dropped (no flag)
         assert!(!sink.should_log(200, "UH")); // dropped (UH ∉ ["NR"])
+    }
+
+    /// Phase-71 state-5 review probe (REVIEW.md §2): the H1 EMIT LOOP threads
+    /// the record's REAL `response_flags` token into the widened `should_log`
+    /// gate. A mutation measurement showed every prior in-process H1 test stays
+    /// green when the gate passes a placeholder `"-"` instead of
+    /// `&record.response_flags` (only differential fixture 0077 caught it) —
+    /// this test closes that hole in-process: against a `flags: ["NR"]` sink,
+    /// a no-route request (404, `NR`) is WRITTEN by the emit loop and a routed
+    /// clean 200 (`-`) is NOT. Mirrors the H2 sibling
+    /// `h2_response_flag_filter_suppresses_no_flag`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_response_flag_sink_gates_emit_loop_end_to_end() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("rf_e2e.log");
+        let config = hcm_config_with_response_flag_access_log(&["NR"], &path).await;
+
+        // A routed clean 200 renders `-` → dropped by ["NR"].
+        let _ = drive(
+            config.clone(),
+            b"GET /routed HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        // A no-route 404 renders `NR` → kept.
+        let _ = drive(
+            config,
+            b"GET /nowhere HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let contents = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "flags:[NR] must keep ONLY the no-route 404 record; got {lines:?}"
+        );
+        assert!(
+            lines[0].contains("404"),
+            "the single kept line must be the 404 NR record; got {lines:?}"
+        );
     }
 
     /// Phase 71 Task 9: a sink built from a filterless `AccessLog` logs EVERY
