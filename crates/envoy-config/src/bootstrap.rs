@@ -782,6 +782,16 @@ pub struct ResponseFlagFilter {
     pub flags: Vec<String>,
 }
 
+/// The `ResponseFlagFilter.flags` PGV `in`-list as MEASURED against
+/// `envoyproxy/envoy:v1.33.0` (`--mode validate`; ADR-0145): exactly 29 tokens.
+/// envoy-rust produces only `{NR, UH, UO, UC, UF, URX}`; the other 23 are
+/// parsed-but-inert. Order matches the upstream rejection message.
+pub(crate) const RESPONSE_FLAG_TOKENS: [&str; 29] = [
+    "LH", "UH", "UT", "LR", "UR", "UF", "UC", "UO", "NR", "DI", "FI", "RL",
+    "UAEX", "RLSE", "DC", "URX", "SI", "IH", "DPE", "UMSDR", "RFCF", "NFCF",
+    "DT", "UPE", "NC", "OM", "DF", "DO", "DR",
+];
+
 /// AccessLogTypedConfig — the `@type`-tagged envelope for an AccessLog
 /// entry's `typed_config`. Single variant in 06.2 (file access logger);
 /// the enum exists so future observability phases can add stdout / gRPC /
@@ -5158,8 +5168,15 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
             {
                 return Err(crate::ConfigError::EmptyStatusCodeFilterRuntimeKey);
             }
-            // (Task 3 adds the `response_flag_filter` token validation here,
-            // using the `response_flag_filter` binding.)
+            if let Some(rff) = response_flag_filter {
+                for token in &rff.flags {
+                    if !RESPONSE_FLAG_TOKENS.contains(&token.as_str()) {
+                        return Err(crate::ConfigError::UnknownResponseFlag {
+                            token: token.clone(),
+                        });
+                    }
+                }
+            }
         }
         match &entry.typed_config {
             AccessLogTypedConfig::FileAccessLog(cfg) => {
@@ -13023,6 +13040,65 @@ static_resources:
             matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
             "got {err:?}"
         );
+    }
+
+    // --- phase 71 t3: response_flag_filter token validation (29-token in-list) ---
+
+    #[test]
+    fn rejects_response_flag_filter_unknown_token() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      response_flag_filter:
+                        flags: ["NR", "ZZZ_BOGUS"]
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("bogus token must be rejected");
+        assert!(
+            matches!(&err, crate::ConfigError::UnknownResponseFlag { token } if token == "ZZZ_BOGUS"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_response_flag_filter_lowercase_token() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      response_flag_filter:
+                        flags: ["nr"]
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("lowercase token must be rejected");
+        assert!(
+            matches!(&err, crate::ConfigError::UnknownResponseFlag { token } if token == "nr"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_response_flag_filter_empty_and_inert() {
+        // Empty flags, absent flags, and an inert-but-valid token all parse+validate
+        // (load-parity, ADR-0145 PV-6 / R-0.2). `DI` is a valid token envoy-rust
+        // never produces.
+        for filter_yaml in [
+            "                    filter:\n                      response_flag_filter:\n                        flags: []\n",
+            "                    filter:\n                      response_flag_filter: {}\n",
+            "                    filter:\n                      response_flag_filter:\n                        flags: [\"DI\"]\n",
+        ] {
+            let yaml = hcm_with_access_log_yaml(&format!(
+                "                access_log:\n                  - name: envoy.access_loggers.file\n                    typed_config:\n                      \"@type\": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog\n                      path: /tmp/al.log\n{filter_yaml}"
+            ));
+            crate::parse_bootstrap(&yaml).expect("empty/absent/inert flags must validate");
+        }
     }
 
     #[test]

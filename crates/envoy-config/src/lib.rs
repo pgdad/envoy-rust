@@ -464,6 +464,12 @@ pub enum ConfigError {
     #[error("status_code_filter runtime_key must be non-empty")]
     EmptyStatusCodeFilterRuntimeKey,
 
+    /// Phase 71: a `response_flag_filter.flags` entry is not one of the 29
+    /// v1.33.0 response-flag tokens (`BOGUS`, lowercase, etc.). Upstream's PGV
+    /// `in`-list rejects the same class; load-parity requires fail-loud here.
+    #[error("response_flag_filter flags must be a known response-flag token: {token}")]
+    UnknownResponseFlag { token: String },
+
     /// 06.3 D14.3: listener with codec_type HTTP1 or AUTO routes to a cluster
     /// whose typed_extension_protocol_options.HttpProtocolOptions.
     /// explicit_http_config.http2_protocol_options is set. Closes
