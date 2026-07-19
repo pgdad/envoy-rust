@@ -1132,7 +1132,7 @@ async fn finalize_h2_stream(
             // Phase 70: the per-sink emit gate. A sink with no filter always
             // logs, so unfiltered sinks (every H2 fixture today) behave exactly
             // as before this gate landed.
-            if !sink.should_log(record.response_code) {
+            if !sink.should_log(record.response_code, &record.response_flags) {
                 continue;
             }
             // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
@@ -3439,6 +3439,104 @@ static_resources:
             1,
             "the emitted record ticks access_logs_total"
         );
+    }
+
+    /// Phase 71 T6: the H2 sibling of the H1 `response_flag_filter` emit gate.
+    /// A sink carrying `ResponseFlag { flags: ["NR"] }` must KEEP a no-route
+    /// 404 (`response_flags == "NR"` → 1 line) and SUPPRESS a clean
+    /// direct-response 503 (`response_flags == "-"` → 0 lines). Exercises the
+    /// widened `should_log(record.response_code, &record.response_flags)` gate
+    /// at `hcm.rs:1135` end-to-end; `access_logs_total` counts emitted only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_response_flag_filter_suppresses_no_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let fmt = envoy_accesslog::CompiledFormat::from_inline("%RESPONSE_CODE% %RESPONSE_FLAGS%\n")
+            .expect("format parses");
+        let filter = envoy_accesslog::LogFilter::ResponseFlag {
+            flags: vec!["NR".to_string()],
+        };
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, Some(filter))
+                .await
+                .expect("open FileSink"),
+        );
+
+        // One direct-response route /err -> 503 (renders response_flags "-",
+        // dropped by flags:["NR"]). Any unmatched path (e.g. /nowhere) has no
+        // route -> synth 404 route_not_found -> response_flags "NR" (kept).
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "err".to_string(),
+                        r#match: RouteMatch {
+                            prefix: Some("/err".to_string()),
+                            path: None,
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 503,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("nope\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let stats = Arc::clone(&built.stats.access_logs_total);
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+
+        // The suppressed leg: a clean 503 direct-response -> response_flags "-"
+        // -> dropped by flags:["NR"].
+        h2_direct_response_roundtrip(addr, "/err", 503).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged.lines().count(),
+            0,
+            "flags:[NR] must suppress the clean 503 (rf=-): {logged:?}"
+        );
+        assert_eq!(
+            stats.value(),
+            0,
+            "a suppressed sink must not tick access_logs_total"
+        );
+
+        // The kept leg: a no-route 404 -> response_flags "NR" -> kept.
+        h2_direct_response_roundtrip(addr, "/nowhere", 404).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "404 NR\n",
+            "flags:[NR] must keep the no-route 404 (rf=NR): {logged:?}"
+        );
+        assert_eq!(stats.value(), 1, "the emitted record ticks access_logs_total");
     }
 
     /// Drive one H2 request to `path` against `addr`, assert the response
