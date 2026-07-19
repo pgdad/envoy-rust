@@ -1674,6 +1674,12 @@ async fn wait_file_nonempty(path: &std::path::Path, budget: Duration) -> bool {
 /// container is SIGKILLed. Sized to outlast Envoy's ~10s FileAccessLog flush timer.
 const ACCESS_LOG_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Phase 71 (CF-70-3): after the kept-line count is reached, a bounded settle
+/// during which a filter-DROPPED record that was merely un-flushed would still
+/// surface. Defense-in-depth behind the ordering witness (which is the primary
+/// soundness guarantee). Only paid by suppression fixtures.
+const CF70_3_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Poll `path` until it contains at least `want` lines or `budget` elapses.
 /// Returns true if the line count was reached. Mirrors `wait_file_nonempty`'s
 /// deadline/100ms-sleep skeleton, generalized from non-empty to a line-count
@@ -6257,6 +6263,21 @@ async fn run_http1_access_log_byte_exact_arm(
     // every `wait_file_lines` poll below for the full flush timeout.
     let expected_lines = expected_logged_count(probes);
 
+    // Phase 71 (CF-70-3) ordering witness (ADR-0145 PV-7): FileAccessLog
+    // flushes in request order, so a suppression fixture's LAST probe must be
+    // KEPT — once its line is on disk (which `wait_file_lines(expected_lines)`
+    // waits for below), every earlier non-suppressed record has ALSO flushed,
+    // making the exact count-equality assertions sound (they reject a leaked
+    // line instead of false-passing on an un-flushed one). Only suppression
+    // fixtures pay this; the all-kept fixtures see ZERO change.
+    let has_suppression = expected_lines < probes.len();
+    if has_suppression {
+        assert!(
+            probes.last().map(|p| p.expect_logged).unwrap_or(false),
+            "CF-70-3: a suppression fixture's LAST probe must have expect_logged=true (ordering witness)"
+        );
+    }
+
     // Drive each probe in order against BOTH proxies. Reuse the exact
     // request build (`drive_http1`) the `Http1WithAccessLog` arm uses;
     // assert each side's status matches the probe's `expected_status`.
@@ -6334,6 +6355,26 @@ async fn run_http1_access_log_byte_exact_arm(
         );
     }
 
+    if has_suppression {
+        // Phase 71 (CF-70-3) defense-in-depth: with both proxies still running,
+        // allow a bounded settle and confirm neither file grew past the
+        // kept-line count — a suppressed record that was merely un-flushed at
+        // the kept-count boundary would surface here.
+        tokio::time::sleep(CF70_3_SETTLE).await;
+        let rust_have = std::fs::read_to_string(&envoy_rust_path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        let envoy_have = std::fs::read_to_string(&envoy_path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if rust_have > expected_lines || envoy_have > expected_lines {
+            bail!(
+                "CF-70-3: an access log grew beyond {expected_lines} lines under a {CF70_3_SETTLE:?} \
+                 settle (envoy_rust={rust_have}, envoy={envoy_have}) — a suppressed record leaked"
+            );
+        }
+    }
+
     subject.shutdown(Duration::from_secs(5)).await.ok();
     drop(upstream);
 
@@ -6400,6 +6441,17 @@ async fn run_http2_access_log_byte_exact_arm(
     // every `wait_file_lines` poll below for the full flush timeout.
     let expected_lines = expected_logged_count(probes);
 
+    // Phase 71 (CF-70-3) ordering witness (ADR-0145 PV-7): see the H1 arm — a
+    // suppression fixture's LAST probe must be KEPT so the exact count-equality
+    // below is sound. Only suppression fixtures pay this.
+    let has_suppression = expected_lines < probes.len();
+    if has_suppression {
+        assert!(
+            probes.last().map(|p| p.expect_logged).unwrap_or(false),
+            "CF-70-3: a suppression fixture's LAST probe must have expect_logged=true (ordering witness)"
+        );
+    }
+
     for (idx, probe) in probes.iter().enumerate() {
         let upstream_resp = drive_http2(
             upstream_addr,
@@ -6455,6 +6507,23 @@ async fn run_http2_access_log_byte_exact_arm(
             expected_lines,
             ACCESS_LOG_FLUSH_WAIT,
         );
+    }
+
+    if has_suppression {
+        // Phase 71 (CF-70-3) defense-in-depth: see the H1 arm.
+        tokio::time::sleep(CF70_3_SETTLE).await;
+        let rust_have = std::fs::read_to_string(&envoy_rust_path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        let envoy_have = std::fs::read_to_string(&envoy_path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if rust_have > expected_lines || envoy_have > expected_lines {
+            bail!(
+                "CF-70-3: an access log grew beyond {expected_lines} lines under a {CF70_3_SETTLE:?} \
+                 settle (envoy_rust={rust_have}, envoy={envoy_have}) — a suppressed record leaked"
+            );
+        }
     }
 
     subject.shutdown(Duration::from_secs(5)).await.ok();
@@ -7323,6 +7392,27 @@ mod tests {
         };
         assert_eq!(expected_logged_count(&[p(true), p(false), p(true)]), 2);
         assert_eq!(expected_logged_count(&[p(true), p(true)]), 2);
+    }
+
+    /// Phase 71 (M70-R2 fold-in): the boundary cases the phase-70 witness above
+    /// omits — an all-suppressed sequence counts ZERO (so `wait_file_lines`
+    /// targets 0 and the byte-exact arm expects an empty file) and a lone kept
+    /// probe counts ONE. Pins the helper that drives fixture `0077`'s
+    /// suppression path (dropped `/direct` first, kept `/nowhere` last).
+    #[test]
+    fn expected_logged_count_counts_only_kept() {
+        let p = |expect_logged: bool| AccessLogByteExactProbe {
+            method: Http1Method::Get,
+            path: "/x".into(),
+            host: "h".into(),
+            extra_headers: vec![],
+            body: None,
+            expected_status: 200,
+            expect_logged,
+        };
+        assert_eq!(expected_logged_count(&[p(true), p(false), p(true)]), 2);
+        assert_eq!(expected_logged_count(&[p(false), p(false)]), 0);
+        assert_eq!(expected_logged_count(&[p(true)]), 1);
     }
 
     /// Phase 70 (ADR-0141): `expect_logged`'s serde default is load-bearing —
