@@ -12999,6 +12999,32 @@ static_resources:
         assert!(filter.status_code_filter.is_none());
     }
 
+    // --- phase 71 t2: both-arm rejection reachable (M70-R1 destructuring) ---
+
+    #[test]
+    fn rejects_access_log_filter_with_both_arms() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      status_code_filter:
+                        comparison:
+                          op: GE
+                          value: { default_value: 500, runtime_key: unused }
+                      response_flag_filter:
+                        flags: ["NR"]
+"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("both arms must be rejected");
+        assert!(
+            matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn rejects_status_code_filter_unknown_op() {
         let yaml = hcm_with_access_log_yaml(
