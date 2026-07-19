@@ -711,15 +711,20 @@ pub struct AccessLog {
 }
 
 /// Models `envoy.config.accesslog.v3.AccessLogFilter` — the per-record emission
-/// predicate carried by an `AccessLog` entry. This phase models ONLY the
-/// `status_code_filter` arm; future filter-family phases add further `Option`
-/// arms here rather than reshaping the type. Cardinality (exactly one arm set)
-/// is enforced by `validate_access_logs` (`ConfigError::AmbiguousAccessLogFilter`),
-/// NOT by serde — mirroring the `SubstitutionFormatString` oneof precedent above.
+/// predicate carried by an `AccessLog` entry. This type now models TWO oneof
+/// arms — `status_code_filter` (phase 70) and `response_flag_filter` (phase 71);
+/// future filter-family phases add further `Option` arms here rather than
+/// reshaping the type. Cardinality (exactly one arm set) is enforced by
+/// `validate_access_logs` (`ConfigError::AmbiguousAccessLogFilter`), NOT by
+/// serde — mirroring the `SubstitutionFormatString` oneof precedent above.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccessLogFilter {
     pub status_code_filter: Option<StatusCodeFilter>,
+    /// Phase 71: the SECOND `AccessLogFilter` arm — gates emission on the
+    /// record's response-flag token. Mutually exclusive with
+    /// `status_code_filter` (cardinality enforced by `validate_access_logs`).
+    pub response_flag_filter: Option<ResponseFlagFilter>,
 }
 
 /// Models `envoy.config.accesslog.v3.StatusCodeFilter` — the `AccessLogFilter`
@@ -762,6 +767,19 @@ pub enum ComparisonOp {
 pub struct RuntimeUInt32 {
     pub default_value: u32,
     pub runtime_key: String,
+}
+
+/// Models `envoy.config.accesslog.v3.ResponseFlagFilter` — the `AccessLogFilter`
+/// arm that emits a record only when its single `%RESPONSE_FLAGS%` token is one
+/// of `flags`. `flags` accepts the 29-token v1.33.0 PGV `in`-list (validated by
+/// `validate_access_logs`; unknown tokens are fail-loud). An EMPTY or absent
+/// `flags` matches any record that HAS a response flag set (MEASURED — ADR-0145
+/// PV-6). envoy-rust produces only `{NR, UH, UO, UC, UF, URX}`; the other 23
+/// tokens are parsed-but-inert (accepted for load-parity, never matched).
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResponseFlagFilter {
+    pub flags: Vec<String>,
 }
 
 /// AccessLogTypedConfig — the `@type`-tagged envelope for an AccessLog
@@ -5114,8 +5132,15 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
             });
         }
         if let Some(filter) = &entry.filter {
-            // Count the set oneof arms (this phase has exactly one arm).
-            let set_arms = [filter.status_code_filter.is_some()]
+            // Phase 71 (M70-R1): destructure ALL arms so a future arm cannot be
+            // added without updating this count (no `..` — the compiler forces
+            // it). With two arms the `> 1` (both-set) branch is now REACHABLE:
+            // upstream rejects a `filter` carrying both arms (ADR-0145 R-0.3).
+            let AccessLogFilter {
+                status_code_filter,
+                response_flag_filter,
+            } = filter;
+            let set_arms = [status_code_filter.is_some(), response_flag_filter.is_some()]
                 .iter()
                 .filter(|set| **set)
                 .count();
@@ -5128,11 +5153,13 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                     },
                 });
             }
-            if let Some(scf) = &filter.status_code_filter
+            if let Some(scf) = status_code_filter
                 && scf.comparison.value.runtime_key.is_empty()
             {
                 return Err(crate::ConfigError::EmptyStatusCodeFilterRuntimeKey);
             }
+            // (Task 3 adds the `response_flag_filter` token validation here,
+            // using the `response_flag_filter` binding.)
         }
         match &entry.typed_config {
             AccessLogTypedConfig::FileAccessLog(cfg) => {
@@ -12939,6 +12966,37 @@ static_resources:
         assert_eq!(scf.comparison.op, crate::bootstrap::ComparisonOp::Ge);
         assert_eq!(scf.comparison.value.default_value, 500);
         assert_eq!(scf.comparison.value.runtime_key, "unused");
+    }
+
+    // --- phase 71 t1: ResponseFlagFilter + response_flag_filter oneof arm ---
+
+    #[test]
+    fn parses_response_flag_filter_nr() {
+        let yaml = hcm_with_access_log_yaml(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      response_flag_filter:
+                        flags: ["NR"]
+"#,
+        );
+        let bootstrap = crate::parse_bootstrap(&yaml).expect("should parse");
+        let hcm = match &bootstrap.static_resources.listeners[0].filter_chains[0].filters[0]
+            .typed_config
+        {
+            Some(TypedConfig::HttpConnectionManager(h)) => h,
+            _ => panic!("expected HCM"),
+        };
+        let filter = hcm.access_log[0].filter.as_ref().expect("filter present");
+        let rff = filter
+            .response_flag_filter
+            .as_ref()
+            .expect("response_flag_filter present");
+        assert_eq!(rff.flags, vec!["NR".to_string()]);
+        assert!(filter.status_code_filter.is_none());
     }
 
     #[test]
