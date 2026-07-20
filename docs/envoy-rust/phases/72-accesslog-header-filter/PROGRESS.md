@@ -115,3 +115,21 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
 - **No Cargo.toml dependency added** — the trait seam is precisely what avoids the
   cycle. `envoy-http1`/`envoy-http2` `should_log` call sites now need the 3rd arg
   (T5/T6).
+
+### T5 — H1 compile 3-arm match + thread `req.headers` — DONE
+
+- Extended `compile_access_log_filter` to a 3-tuple match; the `(None, None,
+  Some(hf))` arm boxes `Arc::new(hf.header.clone())` into `LogFilter::Header`
+  (ADR-0150 seam). Threaded `&req.headers` at the H1 emit gate (the same
+  downstream-request-header snapshot that feeds forwarded_for/authority).
+- Fixed the H1 test call sites (perl regex; 0 residual 2-arg) + added
+  `header_filter: None` to both `AccessLogFilter` test constructions. New test
+  `compile_access_log_filter_builds_header_arm` (kept on match, dropped on
+  present-mismatch AND absent). `cargo test -p envoy-http1` = 180 pass.
+- **ADR-0150 "no `LogFilter` comparison consumer" correction:** the T4 grep
+  MISSED one — `runtime_key_is_rtds_inert` did `assert_eq!(inert, named)` on two
+  `LogFilter` values (variables, so no literal `LogFilter` on the line). The
+  ADR-0150 DECISION (drop `PartialEq`) still stands — a trait-object `Header` arm
+  can't be `PartialEq` and a hand-impl would be ill-defined. Reconciled by
+  comparing the inner `StatusCodeComparison` (still `PartialEq`/`Eq`) after
+  matching both arms — the structural-identity assertion is preserved exactly.

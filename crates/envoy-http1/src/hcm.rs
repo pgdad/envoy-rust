@@ -1509,7 +1509,10 @@ async fn serve_connection(
                 // Phase 70 Task 7: gate emission on the sink's compiled filter.
                 // A sink with no filter accepts every record, so the resulting
                 // access_logs_total is identical to the pre-70 bulk add(len).
-                if !sink.should_log(record.response_code, &record.response_flags) {
+                // Phase 72: the `header_filter` arm reads the downstream request
+                // headers in scope here (`req.headers`, the same snapshot that
+                // feeds forwarded_for/authority above). The other arms ignore it.
+                if !sink.should_log(record.response_code, &record.response_flags, &req.headers) {
                     continue;
                 }
                 // 06.3 D15.3.e: increment access_logs_total at queue-enter time
@@ -1733,15 +1736,19 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize
     Ok(seen.unwrap_or(0))
 }
 
-/// Phase 70/71 — translate a config-side `AccessLogFilter` into the runtime
+/// Phase 70/71/72 — translate a config-side `AccessLogFilter` into the runtime
 /// `LogFilter` predicate the sink evaluates per record. The envoy-config
 /// validator (`validate_access_logs`) already enforced that exactly one oneof
-/// arm is set, so the 0/2-arm cases are `unreachable!` (CF-70-1: the zero-arm
-/// `expect()` is gone). Two arms ship: `status_code_filter` (phase 70) and
-/// `response_flag_filter` (phase 71).
+/// arm is set, so the 0/multi-arm cases are `unreachable!` (CF-70-1: the
+/// zero-arm `expect()` is gone). Three arms ship: `status_code_filter` (phase
+/// 70), `response_flag_filter` (phase 71), and `header_filter` (phase 72).
 fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accesslog::LogFilter {
-    match (&f.status_code_filter, &f.response_flag_filter) {
-        (Some(scf), None) => {
+    match (
+        &f.status_code_filter,
+        &f.response_flag_filter,
+        &f.header_filter,
+    ) {
+        (Some(scf), None, None) => {
             let op = match scf.comparison.op {
                 envoy_config::ComparisonOp::Eq => envoy_accesslog::FilterOp::Eq,
                 envoy_config::ComparisonOp::Ge => envoy_accesslog::FilterOp::Ge,
@@ -1754,8 +1761,14 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
                 threshold: scf.comparison.value.default_value,
             })
         }
-        (None, Some(rff)) => envoy_accesslog::LogFilter::ResponseFlag {
+        (None, Some(rff), None) => envoy_accesslog::LogFilter::ResponseFlag {
             flags: rff.flags.clone(),
+        },
+        // Phase 72 (ADR-0150): box the config `HeaderMatcher` into the injected
+        // `HeaderMatch` seam. The validator already compiled its SafeRegex, so
+        // the runtime `matches` never hits its `.expect()`.
+        (None, None, Some(hf)) => envoy_accesslog::LogFilter::Header {
+            matcher: std::sync::Arc::new(hf.header.clone()),
         },
         _ => unreachable!("validated by validate_access_logs: exactly one filter arm is set"),
     }
@@ -4519,6 +4532,7 @@ static_resources:
                         },
                     }),
                     response_flag_filter: None,
+                    header_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -4622,7 +4636,7 @@ static_resources:
             let sink = &config.access_log[0];
             for (status, must_log) in *expectations {
                 assert_eq!(
-                    sink.should_log(*status, "-"),
+                    sink.should_log(*status, "-", &[]),
                     *must_log,
                     "{op:?} {threshold} filter on status {status}: expected should_log={must_log}",
                 );
@@ -4656,6 +4670,7 @@ static_resources:
                     response_flag_filter: Some(envoy_config::ResponseFlagFilter {
                         flags: flags.iter().map(|s| s.to_string()).collect(),
                     }),
+                    header_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -4713,9 +4728,32 @@ static_resources:
         let path = dir.path().join("rf.log");
         let config = hcm_config_with_response_flag_access_log(&["NR"], &path).await;
         let sink = &config.access_log[0];
-        assert!(sink.should_log(404, "NR")); // kept
-        assert!(!sink.should_log(503, "-")); // dropped (no flag)
-        assert!(!sink.should_log(200, "UH")); // dropped (UH ∉ ["NR"])
+        assert!(sink.should_log(404, "NR", &[])); // kept
+        assert!(!sink.should_log(503, "-", &[])); // dropped (no flag)
+        assert!(!sink.should_log(200, "UH", &[])); // dropped (UH ∉ ["NR"])
+    }
+
+    /// Phase 72 T5: `compile_access_log_filter` builds the `header_filter` arm
+    /// into `LogFilter::Header`, and the runtime gate keeps a matching request
+    /// header, drops a present-mismatch AND an absent one.
+    #[test]
+    fn compile_access_log_filter_builds_header_arm() {
+        let filter = envoy_config::AccessLogFilter {
+            status_code_filter: None,
+            response_flag_filter: None,
+            header_filter: Some(envoy_config::HeaderFilter {
+                header: envoy_config::HeaderMatcher {
+                    name: "x-log".into(),
+                    mode: envoy_config::HeaderMatcherMode::ExactMatch("yes".into()),
+                    invert_match: false,
+                },
+            }),
+        };
+        let compiled = compile_access_log_filter(&filter);
+        assert!(matches!(compiled, envoy_accesslog::LogFilter::Header { .. }));
+        assert!(compiled.should_log(200, "-", &[("x-log".into(), "yes".into())]));
+        assert!(!compiled.should_log(200, "-", &[("x-log".into(), "no".into())]));
+        assert!(!compiled.should_log(200, "-", &[])); // absent → drop
     }
 
     /// Phase-71 state-5 review probe (REVIEW.md §2): the H1 EMIT LOOP threads
@@ -4771,9 +4809,9 @@ static_resources:
         let config =
             hcm_config_with_filtered_access_log(None, &dir.path().join("plain.log"), 200).await;
         let sink = &config.access_log[0];
-        assert!(sink.should_log(200, "-"));
-        assert!(sink.should_log(503, "NR"));
-        assert!(sink.should_log(404, "UF"));
+        assert!(sink.should_log(200, "-", &[]));
+        assert!(sink.should_log(503, "NR", &[]));
+        assert!(sink.should_log(404, "UF", &[]));
     }
 
     /// Phase 71 Task 9: the phase-70 `status_code_filter` still gates PURELY on
@@ -4790,10 +4828,10 @@ static_resources:
         )
         .await;
         let sink = &config.access_log[0];
-        assert!(!sink.should_log(200, "NR")); // status-only: 200 < 500 drops
-        assert!(!sink.should_log(200, "-"));
-        assert!(sink.should_log(503, "-")); // 503 >= 500 keeps
-        assert!(sink.should_log(503, "NR"));
+        assert!(!sink.should_log(200, "NR", &[])); // status-only: 200 < 500 drops
+        assert!(!sink.should_log(200, "-", &[]));
+        assert!(sink.should_log(503, "-", &[])); // 503 >= 500 keeps
+        assert!(sink.should_log(503, "NR", &[]));
     }
 
     /// Phase 70 Task 7: the H1 emit loop gates each sink on `should_log` of the
@@ -4989,28 +5027,37 @@ static_resources:
 
         for status in [200u16, 499, 500, 503] {
             assert_eq!(
-                inert.should_log(status, "-"),
-                named.should_log(status, "-"),
+                inert.should_log(status, "-", &[]),
+                named.should_log(status, "-", &[]),
                 "runtime_key must not alter should_log({status}): \
                  runtime_key=unused -> {}, runtime_key=some.key -> {}",
-                inert.should_log(status, "-"),
-                named.should_log(status, "-"),
+                inert.should_log(status, "-", &[]),
+                named.should_log(status, "-", &[]),
             );
         }
 
         // The compiled filters are structurally identical too — the compiler
         // carries `default_value` through as the threshold and drops the key
         // entirely (it has nowhere to go: `StatusCodeComparison` has no
-        // runtime-key field).
+        // runtime-key field). Phase 72 dropped `LogFilter: PartialEq` (the
+        // `Header` arm holds a trait object — ADR-0150), so compare the inner
+        // `StatusCodeComparison` (still `PartialEq`) after asserting both arms.
+        let (
+            envoy_accesslog::LogFilter::StatusCode(inert_cmp),
+            envoy_accesslog::LogFilter::StatusCode(named_cmp),
+        ) = (&inert, &named)
+        else {
+            panic!("both runtime_key variants must compile to StatusCode filters");
+        };
         assert_eq!(
-            inert, named,
+            inert_cmp, named_cmp,
             "runtime_key must not survive compilation into the runtime filter"
         );
 
         // Sanity: the shared `GE 500` threshold really is the one in effect,
         // so the equality above is not two identically-vacuous filters.
-        assert!(!inert.should_log(499, "-"), "GE 500 must reject a 499");
-        assert!(inert.should_log(500, "-"), "GE 500 must accept a 500");
+        assert!(!inert.should_log(499, "-", &[]), "GE 500 must reject a 499");
+        assert!(inert.should_log(500, "-", &[]), "GE 500 must accept a 500");
     }
 
     /// Phase 70 Task 11: regression parity for the 29 pre-phase-70 access-log
@@ -5050,7 +5097,7 @@ static_resources:
         let sink = &config.access_log[0];
         for status in [200u16, 499, 500, 503] {
             assert!(
-                sink.should_log(status, "-"),
+                sink.should_log(status, "-", &[]),
                 "a sink with no filter must log every record; should_log({status}) was false"
             );
         }
@@ -5091,7 +5138,7 @@ static_resources:
             .expect("filter compiles");
             for (status, must_log) in *expectations {
                 assert_eq!(
-                    filter.should_log(*status, "-"),
+                    filter.should_log(*status, "-", &[]),
                     *must_log,
                     "op: {token} {threshold} on status {status}: expected should_log={must_log} \
                      (the YAML token compiled to the wrong FilterOp)",
