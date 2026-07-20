@@ -59,5 +59,6 @@ corpus/parse_bootstrap/*
 !corpus/parse_bootstrap/grpc_health_check_seed
 !corpus/parse_bootstrap/status_code_filter.yaml
 !corpus/parse_bootstrap/response_flag_filter.yaml
+!corpus/parse_bootstrap/header_filter.yaml
 artifacts/
 target/

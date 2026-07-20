@@ -192,3 +192,12 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
 - **Regressions:** the no-`filter`-logs-every-record (`no_filter_logs_every_record`),
   `status_code`/`response_flag` unchanged, and `runtime_key_is_rtds_inert`
   (adjusted in T5) tests all remain green.
+
+### T10 — `parse_bootstrap` corpus seed `header_filter.yaml` — DONE
+
+- Created `crates/envoy-config/fuzz/corpus/parse_bootstrap/header_filter.yaml`
+  (a full HCM bootstrap with an `access_log[].filter.header_filter`) + one
+  `!`-un-ignore line in the fuzz `.gitignore`. `git ls-files` confirms it is
+  tracked (memory `fuzz-corpus-seed-gitignored-by-default`). NO new fuzz target,
+  NO ci.yml edit (ADR-0137 config-only-sub-message precedent). Local smoke
+  `cargo +nightly fuzz run parse_bootstrap -- -runs=0` loaded the corpus clean.
