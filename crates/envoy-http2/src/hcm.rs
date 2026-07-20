@@ -1132,7 +1132,10 @@ async fn finalize_h2_stream(
             // Phase 70: the per-sink emit gate. A sink with no filter always
             // logs, so unfiltered sinks (every H2 fixture today) behave exactly
             // as before this gate landed.
-            if !sink.should_log(record.response_code, &record.response_flags) {
+            // Phase 72: thread the downstream request headers for the
+            // `header_filter` arm (same `envoy_req.headers` snapshot feeding
+            // forwarded_for/authority above); other arms ignore it.
+            if !sink.should_log(record.response_code, &record.response_flags, &envoy_req.headers) {
                 continue;
             }
             // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
@@ -3445,8 +3448,9 @@ static_resources:
     /// A sink carrying `ResponseFlag { flags: ["NR"] }` must KEEP a no-route
     /// 404 (`response_flags == "NR"` → 1 line) and SUPPRESS a clean
     /// direct-response 503 (`response_flags == "-"` → 0 lines). Exercises the
-    /// widened `should_log(record.response_code, &record.response_flags)` gate
-    /// at `hcm.rs:1135` end-to-end; `access_logs_total` counts emitted only.
+    /// widened `should_log(record.response_code, &record.response_flags,
+    /// &envoy_req.headers)` gate (phase 72 added the header slice) end-to-end;
+    /// `access_logs_total` counts emitted only.
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_response_flag_filter_suppresses_no_flag() {
         let tmp = tempfile::tempdir().unwrap();

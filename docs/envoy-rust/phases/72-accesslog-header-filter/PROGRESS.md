@@ -133,3 +133,11 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   can't be `PartialEq` and a hand-impl would be ill-defined. Reconciled by
   comparing the inner `StatusCodeComparison` (still `PartialEq`/`Eq`) after
   matching both arms — the structural-identity assertion is preserved exactly.
+
+### T6 — H2 emit gate threads `envoy_req.headers` — DONE
+
+- Threaded `&envoy_req.headers` at the H2 emit gate (`crates/envoy-http2/src/hcm.rs:1138`)
+  — the shared `compile_access_log_filter` (via `config.inner`) needs no H2
+  compile change. Updated a stale doc comment to the 3-arg signature. No H2 test
+  call sites of `should_log` (grep-confirmed). `cargo test -p envoy-http2` = 107
+  pass; `cargo build --workspace` clean (no stale 2-arg calls anywhere).
