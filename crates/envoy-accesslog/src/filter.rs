@@ -62,7 +62,12 @@ impl LogFilter {
     /// `StatusCode` arm reads only `status`; the `ResponseFlag` arm only
     /// `response_flags`; the `Header` arm only `headers`. The status comparison
     /// is widened to `u32` (lossless; status is always in `u16` range).
-    pub fn should_log(&self, status: u16, response_flags: &str, headers: &[(String, String)]) -> bool {
+    pub fn should_log(
+        &self,
+        status: u16,
+        response_flags: &str,
+        headers: &[(String, String)],
+    ) -> bool {
         match self {
             LogFilter::StatusCode(c) => {
                 let s = status as u32;

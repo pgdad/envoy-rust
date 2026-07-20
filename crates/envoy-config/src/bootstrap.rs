@@ -13121,8 +13121,9 @@ static_resources:
 
     #[test]
     fn header_filter_empty_name_rejected() {
-        let yaml =
-            access_log_filter_yaml(r#"header_filter: { header: { name: "", present_match: true } }"#);
+        let yaml = access_log_filter_yaml(
+            r#"header_filter: { header: { name: "", present_match: true } }"#,
+        );
         let err = crate::parse_bootstrap(&yaml).expect_err("empty header name must reject");
         assert!(
             matches!(err, crate::ConfigError::EmptyHeaderName),
@@ -13159,7 +13160,10 @@ static_resources:
         let crate::HeaderMatcherMode::SafeRegexMatch(sr) = &hf.header.mode else {
             panic!("expected SafeRegexMatch");
         };
-        assert!(sr.compiled.is_some(), "validator must compile the SafeRegex");
+        assert!(
+            sr.compiled.is_some(),
+            "validator must compile the SafeRegex"
+        );
     }
 
     // --- phase 72 t1: HeaderFilter + header_filter oneof arm ---

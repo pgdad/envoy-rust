@@ -99,7 +99,12 @@ impl FileSink {
     /// Phase 70/71/72: returns `true` iff a record with final response `status`,
     /// `response_flags` token, and request `headers` should be emitted to this
     /// sink. A sink with no filter always logs.
-    pub fn should_log(&self, status: u16, response_flags: &str, headers: &[(String, String)]) -> bool {
+    pub fn should_log(
+        &self,
+        status: u16,
+        response_flags: &str,
+        headers: &[(String, String)],
+    ) -> bool {
         match &self.filter {
             Some(f) => f.should_log(status, response_flags, headers),
             None => true,

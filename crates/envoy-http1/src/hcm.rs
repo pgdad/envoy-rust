@@ -4750,7 +4750,10 @@ static_resources:
             }),
         };
         let compiled = compile_access_log_filter(&filter);
-        assert!(matches!(compiled, envoy_accesslog::LogFilter::Header { .. }));
+        assert!(matches!(
+            compiled,
+            envoy_accesslog::LogFilter::Header { .. }
+        ));
         assert!(compiled.should_log(200, "-", &[("x-log".into(), "yes".into())]));
         assert!(!compiled.should_log(200, "-", &[("x-log".into(), "no".into())]));
         assert!(!compiled.should_log(200, "-", &[])); // absent → drop

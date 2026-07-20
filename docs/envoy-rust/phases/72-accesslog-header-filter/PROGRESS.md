@@ -210,3 +210,24 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   `%REQ(NAME)%` allow-list formatter boundary). Updated the phase-71 §E to the
   3-arm reality. Fixed M71-2 doc phrase #3 (the §F "CF-70-3 ordering witness"
   phrase → ADR-0146/0147 framing) — all three M71-2 phrases now consumed.
+
+### T12 — §7.5 pre-flight gate dry-run — DONE (all green)
+
+Self-check (NOT the authoritative state-4 gate — that is a SEPARATE session per §5.1):
+
+- `cargo fmt --all -- --check`: clean AFTER a fixup — rustfmt wrapped the widened
+  `should_log`/`FileSink::should_log` signatures (the per-task commits deferred
+  fmt; memory `envoy-rust-state4-ci-first-execution`). `cargo fmt --all` applied.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: clean
+  AFTER removing 2 unused `use envoy_accesslog::HeaderMatch as _;` imports in the
+  matcher.rs tests (trait-object/inherent calls need no import).
+- `cargo build --workspace --all-targets`: clean. `cargo build -p envoy-bin`: clean.
+- `cargo test --workspace --lib --bins --no-fail-fast`: ALL green (envoy-config
+  628, envoy-http1 181, envoy-http2 107, envoy-accesslog 108, +others; exit 0).
+- `cargo deny check`: `advisories ok, bans ok, licenses ok, sources ok`.
+- Differentials `0076`/`0077`/`0078`: all GREEN — `0076` (dropped-LAST) now pays
+  the 12s `CF71_1_SETTLE` (13.3s) with no regression; `0077`/`0078` (kept-LAST)
+  pay the cheap settle. Fuzz corpus loads clean (T10).
+
+The full Docker differential suite + conformance is the authoritative state-4
+run (a separate session); this dry-run exercised the touched surface only.

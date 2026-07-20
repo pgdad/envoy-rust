@@ -1135,7 +1135,11 @@ async fn finalize_h2_stream(
             // Phase 72: thread the downstream request headers for the
             // `header_filter` arm (same `envoy_req.headers` snapshot feeding
             // forwarded_for/authority above); other arms ignore it.
-            if !sink.should_log(record.response_code, &record.response_flags, &envoy_req.headers) {
+            if !sink.should_log(
+                record.response_code,
+                &record.response_flags,
+                &envoy_req.headers,
+            ) {
                 continue;
             }
             // 06.3 D15.3.e NEW: symmetric access-log counters on the H2 path.
