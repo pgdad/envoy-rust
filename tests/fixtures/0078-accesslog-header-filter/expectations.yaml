@@ -1,0 +1,39 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0078-envoy-mount/access.log
+    envoy_rust: /tmp/0078-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — DROPPED, and FIRST. `x-log: no` is PRESENT but mismatches
+    # `string_match.exact: "yes"` → the sink emits NOTHING on EITHER proxy.
+    # `expect_logged: false` removes it from the driver's line-count target.
+    # (Kept-LAST is the sound authoring convention — ADR-0147; ADR-0146 retired
+    # the hard ordering assertion, and the driver's ordering-aware bounded
+    # settle is the CF-70-3/CF-71-1 closure. This fixture pays the short settle.)
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-log", "no"]
+      expected_status: 200
+      expect_logged: false
+    # Probe 2 — KEPT, and LAST. `x-log: yes` matches `exact: "yes"` → the record
+    # IS emitted. Expected line (byte-identical on both sides):
+    #   STATUS=200 PATH=/x
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-log", "yes"]
+      expected_status: 200
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line `==`). NO static literal:
+  # the `http1_access_log_byte_exact` driver asserts each emitted line is
+  # byte-identical between upstream Envoy v1.33.0 and envoy-rust. Both proxies
+  # must agree on BOTH halves of the filter decision — the kept `x-log: yes`
+  # line AND the absence of any line for the present-mismatch `x-log: no` probe
+  # (a one-sided suppression fails the line-count assertion before the byte
+  # compare is reached). The file on each side holds EXACTLY ONE line (MEASURED,
+  # ADR-0149 R-0.4 live measurement, graceful-stop flush):
+  #   STATUS=200 PATH=/x
+  # The only route is a direct_response → `clusters: []`, no backend spawns.

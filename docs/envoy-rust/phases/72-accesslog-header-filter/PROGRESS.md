@@ -151,3 +151,22 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
 - M71-2 doc fixes #1 (the `CF70_3_SETTLE` doc — no longer calls the ordering
   witness the "primary soundness guarantee") + #2 (`access_log_response_flag_filter.rs:10`
   — ADR-0146 retirement). Fix #3 (BEHAVIOR_CONTRACT §F) lands in T11.
+
+### T8 — differential fixture `0078-accesslog-header-filter` — DONE (GREEN)
+
+- Created `envoy.yaml`/`envoy-rust.yaml`/`expectations.yaml`/`README.md` +
+  `access_log_header_filter.rs`. `header_filter { header: { name: x-log,
+  string_match: { exact: "yes" } } }`; probes dropped-FIRST (`x-log: no`)/
+  kept-LAST (`x-log: yes`). Built debug `envoy-bin`; `cargo test -p differential
+  --test access_log_header_filter` = **1 passed** (Docker up, no flake).
+- **Measured fixture-design correction (SPEC R-0.1/§2.2 boundary):** the PLAN's
+  format string `H=%REQ(X-LOG)%` is BOOT-FATAL on envoy-rust — its `%REQ(NAME)%`
+  operator supports only an allow-list (`:path`, `user-agent`, …) because the
+  `AccessLogRecord` carries no arbitrary request-header map (SPEC §2.2 — no new
+  record field this phase). Fixed by formatting only `STATUS=%RESPONSE_CODE%
+  PATH=%REQ(:PATH)%` (expected line `STATUS=200 PATH=/x`). The `header_filter`
+  still gates on `x-log` (it reads the raw request-header slice, NOT the record),
+  so the keep/drop differential witness is intact — echoing the header value is a
+  FORMATTER concern orthogonal to the FILTER this phase builds. No new ADR (this
+  is the already-documented SPEC §2.2 boundary, not a new decision); documented
+  in the fixture README + `.rs` doc.
