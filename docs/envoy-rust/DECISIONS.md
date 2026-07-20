@@ -2402,6 +2402,66 @@ The state-3 PLAN MAY enrich fixture `0047` with a `bool`/`null` literal leaf to 
 
 ---
 
+## ADR-0150: Phase-72 §5 state-3 implementation — the `LogFilter::Header` runtime seam is an injected **`HeaderMatch` trait object**, NOT a carried `envoy_config::HeaderMatcher` (the ADR-0149 default was a dependency CYCLE); `LogFilter` drops `PartialEq` as well as `Eq`
+
+**Context.** ADR-0149 (PV-3) deferred the `envoy-accesslog`↔`envoy-config`
+dependency posture to implementation time, with the stated DEFAULT: "add
+`envoy-config` to `envoy-accesslog` if absent" so `LogFilter::Header` could carry
+an `envoy_config::HeaderMatcher` directly. At implementation the ACTUAL
+dependency direction was measured: **`envoy-config` already depends on
+`envoy-accesslog`** (`crates/envoy-config/Cargo.toml:14`; load-bearing —
+`envoy_accesslog::parse_format` compiles access-log format strings at
+config-validation time, the ADR-0141 compiled-config posture). Therefore the
+ADR-0149 default is a **dependency CYCLE** (`envoy-config → envoy-accesslog →
+envoy-config`) and Cargo rejects it. ADR-0149 assumed the reverse edge.
+
+**Decision — a trait-object seam (the PLAN's "Preferred" accesslog-owned type,
+realized as a trait object, not a concrete re-model).**
+- `envoy-accesslog` defines `pub trait HeaderMatch: Debug + Send + Sync { fn
+  matches(&self, headers: &[(String, String)]) -> bool; }` and the arm
+  `LogFilter::Header { matcher: Arc<dyn HeaderMatch> }`.
+- `envoy-config` (which already depends on `envoy-accesslog`) provides `impl
+  envoy_accesslog::HeaderMatch for HeaderMatcher` in `matcher.rs`, delegating to
+  the inherent phase-04.2 `HeaderMatcher::matches` VERBATIM (method-call syntax
+  gives the inherent method priority over the trait method — no recursion). This
+  reuses the 7-mode engine with **ZERO matching duplication** and preserves PV-4
+  (`mode_result ^ invert_match`, incl. absent+invert = KEEP) identically across
+  the route and access-log paths.
+- `envoy-http1`'s `compile_access_log_filter` boxes it: `LogFilter::Header {
+  matcher: Arc::new(hf.header.clone()) }` (the matcher is cloned AFTER validate()
+  compiled its SafeRegex, so `matches` never hits its `.expect()`).
+- **`LogFilter` drops BOTH `Eq` AND `PartialEq`** (ADR-0149 PV-3 dropped only
+  `Eq`). A trait object is not `PartialEq`-derivable, and NOTHING compares
+  `LogFilter` values (grep-confirmed: no `==`/`assert_eq!`/set/map consumer;
+  `FileSink`, the sole container, derives only `Debug`).
+
+**Rejected alternatives.** (a) Add the reverse dep — a cycle, impossible. (b) A
+concrete accesslog-owned `HeaderPredicate` re-modeling all 7 modes + StringMatcher
++ SafeRegex — adds a `regex` dep to `envoy-accesslog` and ~80 lines of matcher
+duplication that must faithfully replicate the PV-4 XOR bug; strictly worse than
+the trait seam (more code, more risk, no behavioral gain). (c) A closure/`Arc<dyn
+Fn>` — same trait-object shape but less self-documenting; the named trait is
+clearer.
+
+**Consequences.** No new crate dependency (the trait seam is the whole point — it
+avoids the cycle without a re-model). The `HeaderMatch` trait + impl are the only
+net-new abstraction vs. ADR-0149's plan; every other PV-3 mechanic (widened
+`should_log`/`FileSink::should_log`, the 3-arm `compile_access_log_filter`, both
+HCM emit-gate threads, `&mut validate_access_logs`) lands unchanged. The
+accesslog-side `should_log` `Header` test uses a local `HeaderMatch` stub (the
+crate cannot construct a real `HeaderMatcher`); the real per-mode membership +
+absent-drop coverage lives in `envoy-http1` (T9) + the `HeaderMatcher::matches`
+engine's own phase-04.2 tests. `#![forbid(unsafe_code)]` holds. **DECISIONS.md
+ledger head: ADR-0150** (next-available **ADR-0151**). **Supersedes nothing;
+RESOLVES the ADR-0149 PV-3 implementation-time dependency-posture question,
+replacing its infeasible "add the dep" default.** ADR-0028 REMAINS OPEN; ADR-0049
+governs; ADR-0140–0149 are NOT reopened.
+
+- Date: 2026-07-20
+- Status: accepted (phase-72 §5 state-3 implementation; `superpowers:executing-plans`). Resolves the ADR-0149 PV-3 deferred dependency-posture decision.
+
+---
+
 ## ADR-0149: Phase-72 §5 state-2 PLAN-write — **§6.2 empirical reconciliation (PV-1..PV-7 resolutions)**; MEASURED that upstream drops absent+`invert_match` on BOTH the route AND access-log paths (a latent SHARED-engine bug → CF-72-1), name-only/`treat_missing_header_as_empty` inherited fail-loud boundaries (CF-72-2), and two implementation blockers the SPEC did not anticipate (the `LogFilter` `Eq` derive; the `&mut` compile path for the header_filter SafeRegex)
 
 **Context.** The state-2 PLAN-write re-confirmed SPEC §3's PLAN-VERIFY items (PV-1..PV-7) against the LIVE tree (three read-only recon fan-outs — an in-tree config/runtime/HCM survey, a live-Envoy `--mode validate` + port-mapped route/access-log measurement, a differential-driver/fuzz/docs survey) and LIVE-MEASURED the two items the state-1 recon left as open PLAN-VERIFY questions (PV-4 the invert+absent divergence on the ROUTE path; PV-5 the name-only/`treat_missing_header_as_empty` wire acceptance). Two implementation blockers the state-1 SPEC did not anticipate surfaced from the in-tree survey (recorded below). `PLAN.md` authored (`docs/envoy-rust/phases/72-accesslog-header-filter/PLAN.md`, 12 TDD tasks); no code-tree change this session.

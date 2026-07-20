@@ -52,6 +52,23 @@ impl HeaderMatcher {
     }
 }
 
+/// Phase 72 (ADR-0150): expose the phase-04.2 `HeaderMatcher` engine to the
+/// access-log crate as an injected trait object. `envoy-accesslog` cannot
+/// depend on `envoy-config` (the reverse edge already exists → cycle), so it
+/// defines the `HeaderMatch` seam and `envoy-config` — which DOES depend on
+/// `envoy-accesslog` — provides the impl here, reusing `HeaderMatcher::matches`
+/// VERBATIM. This keeps PV-4 (`mode_result ^ invert_match`, incl. absent+invert
+/// = keep) identical between route matching and access-log filtering with zero
+/// duplication.
+impl envoy_accesslog::HeaderMatch for HeaderMatcher {
+    fn matches(&self, headers: &[(String, String)]) -> bool {
+        // Method-call syntax gives the inherent `HeaderMatcher::matches` (the
+        // engine, above) priority over this trait method, so this delegates —
+        // it does NOT recurse.
+        self.matches(headers)
+    }
+}
+
 impl StringMatcher {
     /// Returns true iff this matcher matches the given value. Case sensitivity
     /// of value comparison follows `self.ignore_case` for Exact / Prefix /
@@ -374,6 +391,23 @@ mod tests {
         let m = hm_inverted("authorization", HeaderMatcherMode::PresentMatch(true));
         assert!(m.matches(&[]));
         assert!(!m.matches(&[h("authorization", "x")]));
+    }
+
+    #[test]
+    fn header_match_trait_delegates_to_inherent_engine() {
+        // Phase 72 (ADR-0150): the injected `HeaderMatch` trait impl must call
+        // the inherent engine (NOT recurse). Exercise it through the trait object.
+        use envoy_accesslog::HeaderMatch as _;
+        let m: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> =
+            std::sync::Arc::new(hm("x-log", HeaderMatcherMode::ExactMatch("yes".into())));
+        assert!(m.matches(&[h("x-log", "yes")]));
+        assert!(!m.matches(&[h("x-log", "no")]));
+        assert!(!m.matches(&[])); // absent → drop
+        // invert preserves PV-4 (absent+invert = KEEP, engine XOR).
+        let inv: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> = std::sync::Arc::new(
+            hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true)),
+        );
+        assert!(inv.matches(&[])); // absent + invert = keep (shared engine XOR)
     }
 
     #[test]

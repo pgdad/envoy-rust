@@ -96,12 +96,12 @@ impl FileSink {
         }
     }
 
-    /// Phase 70/71: returns `true` iff a record with final response `status`
-    /// and `response_flags` token should be emitted to this sink. A sink with
-    /// no filter always logs.
-    pub fn should_log(&self, status: u16, response_flags: &str) -> bool {
+    /// Phase 70/71/72: returns `true` iff a record with final response `status`,
+    /// `response_flags` token, and request `headers` should be emitted to this
+    /// sink. A sink with no filter always logs.
+    pub fn should_log(&self, status: u16, response_flags: &str, headers: &[(String, String)]) -> bool {
         match &self.filter {
-            Some(f) => f.should_log(status, response_flags),
+            Some(f) => f.should_log(status, response_flags, headers),
             None => true,
         }
     }
@@ -350,16 +350,16 @@ mod tests {
         let sink = FileSink::new(path, CompiledFormat::default(), filter)
             .await
             .expect("open");
-        assert!(!sink.should_log(200, "-"));
-        assert!(sink.should_log(503, "-"));
+        assert!(!sink.should_log(200, "-", &[]));
+        assert!(sink.should_log(503, "-", &[]));
 
         // A sink with no filter logs everything.
         let dir2 = tempdir().expect("tempdir");
         let sink2 = FileSink::new(dir2.path().join("al2.log"), CompiledFormat::default(), None)
             .await
             .expect("open");
-        assert!(sink2.should_log(200, "-"));
-        assert!(sink2.should_log(503, "NR"));
+        assert!(sink2.should_log(200, "-", &[]));
+        assert!(sink2.should_log(503, "NR", &[]));
     }
 
     #[tokio::test]

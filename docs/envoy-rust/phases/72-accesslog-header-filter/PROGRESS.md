@@ -95,3 +95,23 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   `header_filter_safe_regex_is_compiled` (`sr.compiled.is_some()`). All 20
   `header_filter`/`access_log` tests pass; clippy clean; grep-confirmed
   `validate_access_logs` has exactly one caller.
+
+### T4 — `LogFilter::Header` + 2nd `should_log` widening (trait-object seam) — DONE — **ADR-0150 fired**
+
+- Implemented the ADR-0150 trait-object seam (see the decision block above):
+  `HeaderMatch` trait + `LogFilter::Header { matcher: Arc<dyn HeaderMatch> }` in
+  `envoy-accesslog`; exported `HeaderMatch`; `envoy-config` impls it for
+  `HeaderMatcher` in `matcher.rs` (delegates to the inherent engine, no
+  recursion — confirmed by `header_match_trait_delegates_to_inherent_engine`,
+  incl. the PV-4 absent+invert=keep pin).
+- Widened `LogFilter::should_log` + `FileSink::should_log` to
+  `(&self, status, response_flags, headers: &[(String, String)])`; `Header` arm
+  = `matcher.matches(headers)`. Dropped BOTH `Eq` and `PartialEq` from
+  `LogFilter` (ADR-0150; no consumers).
+- Updated 22 `should_log` call sites in `filter.rs` + 4 in `file_sink.rs` to the
+  3-arg form (perl regex; verified 0 residual 2-arg calls). New accesslog test
+  `header_filter_should_log_delegates_to_matcher` (local stub). `cargo test -p
+  envoy-accesslog` = 108 pass; `envoy-config` matcher test passes.
+- **No Cargo.toml dependency added** — the trait seam is precisely what avoids the
+  cycle. `envoy-http1`/`envoy-http2` `should_log` call sites now need the 3rd arg
+  (T5/T6).
