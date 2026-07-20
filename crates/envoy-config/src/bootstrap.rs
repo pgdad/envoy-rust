@@ -711,12 +711,13 @@ pub struct AccessLog {
 }
 
 /// Models `envoy.config.accesslog.v3.AccessLogFilter` — the per-record emission
-/// predicate carried by an `AccessLog` entry. This type now models TWO oneof
-/// arms — `status_code_filter` (phase 70) and `response_flag_filter` (phase 71);
-/// future filter-family phases add further `Option` arms here rather than
-/// reshaping the type. Cardinality (exactly one arm set) is enforced by
-/// `validate_access_logs` (`ConfigError::AmbiguousAccessLogFilter`), NOT by
-/// serde — mirroring the `SubstitutionFormatString` oneof precedent above.
+/// predicate carried by an `AccessLog` entry. This type now models THREE oneof
+/// arms — `status_code_filter` (phase 70), `response_flag_filter` (phase 71),
+/// and `header_filter` (phase 72); future filter-family phases add further
+/// `Option` arms here rather than reshaping the type. Cardinality (exactly one
+/// arm set) is enforced by `validate_access_logs`
+/// (`ConfigError::AmbiguousAccessLogFilter`), NOT by serde — mirroring the
+/// `SubstitutionFormatString` oneof precedent above.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AccessLogFilter {
@@ -725,6 +726,24 @@ pub struct AccessLogFilter {
     /// record's response-flag token. Mutually exclusive with
     /// `status_code_filter` (cardinality enforced by `validate_access_logs`).
     pub response_flag_filter: Option<ResponseFlagFilter>,
+    /// Phase 72: the THIRD `AccessLogFilter` arm — gates emission on whether a
+    /// named request header matches `header`. Mutually exclusive with the other
+    /// two arms (cardinality enforced by `validate_access_logs`).
+    pub header_filter: Option<HeaderFilter>,
+}
+
+/// Models `envoy.config.accesslog.v3.HeaderFilter` — the THIRD `AccessLogFilter`
+/// arm (phase 72). Gates emission on whether a named REQUEST HEADER matches
+/// `header`. REUSES the phase-04.2 `HeaderMatcher` verbatim. `header` is
+/// PGV-required — an empty `header_filter: {}` is rejected fail-loud at
+/// deserialize (missing field → `ConfigError::Yaml`), matching upstream's
+/// `HeaderFilterValidationError.Header: value is required`. Mutually exclusive
+/// with `status_code_filter` / `response_flag_filter` (cardinality enforced by
+/// `validate_access_logs`).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderFilter {
+    pub header: HeaderMatcher,
 }
 
 /// Models `envoy.config.accesslog.v3.StatusCodeFilter` — the `AccessLogFilter`
@@ -5148,11 +5167,16 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
             let AccessLogFilter {
                 status_code_filter,
                 response_flag_filter,
+                header_filter,
             } = filter;
-            let set_arms = [status_code_filter.is_some(), response_flag_filter.is_some()]
-                .iter()
-                .filter(|set| **set)
-                .count();
+            let set_arms = [
+                status_code_filter.is_some(),
+                response_flag_filter.is_some(),
+                header_filter.is_some(),
+            ]
+            .iter()
+            .filter(|set| **set)
+            .count();
             if set_arms != 1 {
                 return Err(crate::ConfigError::AmbiguousAccessLogFilter {
                     detail: if set_arms == 0 {
@@ -12839,6 +12863,24 @@ static_resources:
         )
     }
 
+    /// Phase 72 helper: build a full HCM bootstrap whose single file access log
+    /// carries the given `filter:` arm (a flow-style YAML fragment, e.g.
+    /// `header_filter: { header: { name: "x-log", string_match: { exact: "yes" } } }`).
+    /// The fragment is placed under `filter:` at the correct indent; multi-arm
+    /// fragments pass their continuation lines pre-indented (22 spaces).
+    fn access_log_filter_yaml(filter_arm: &str) -> String {
+        hcm_with_access_log_yaml(&format!(
+            r#"                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/al.log
+                    filter:
+                      {filter_arm}
+"#,
+        ))
+    }
+
     #[test]
     fn parses_hcm_with_file_access_log() {
         let yaml = hcm_with_access_log_yaml(
@@ -13039,6 +13081,34 @@ static_resources:
             matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
             "got {err:?}"
         );
+    }
+
+    // --- phase 72 t1: HeaderFilter + header_filter oneof arm ---
+
+    #[test]
+    fn header_filter_parses_into_the_arm() {
+        let yaml = access_log_filter_yaml(
+            r#"header_filter: { header: { name: "x-log", string_match: { exact: "yes" } } }"#,
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("header_filter must parse");
+        let hcm = first_hcm(&bs);
+        let f = hcm.access_log[0].filter.as_ref().expect("filter present");
+        let hf = f.header_filter.as_ref().expect("header_filter arm set");
+        assert_eq!(hf.header.name, "x-log");
+        assert!(matches!(
+            hf.header.mode,
+            crate::HeaderMatcherMode::StringMatch(_)
+        ));
+    }
+
+    #[test]
+    fn empty_header_filter_is_rejected() {
+        let yaml = access_log_filter_yaml("header_filter: {}");
+        let err = crate::parse_bootstrap(&yaml).expect_err("empty header_filter must reject");
+        // A required `header` field is missing → serde surfaces `ConfigError::Yaml`
+        // (fail-loud; ADR-0049 waives error-message byte-parity vs upstream's
+        // `HeaderFilterValidationError.Header: value is required`).
+        assert!(matches!(err, crate::ConfigError::Yaml(_)), "got {err:?}");
     }
 
     // --- phase 71 t3: response_flag_filter token validation (29-token in-list) ---
