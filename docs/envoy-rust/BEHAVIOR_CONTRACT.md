@@ -2310,15 +2310,17 @@ NOT `-`. So an empty-`flags` sink keeps the no-route 404 `NR` and drops the
 clean 503 `-`. Load-parity forbids rejecting the upstream-accepted empty list;
 the runtime models it as `response_flags != "-"`.
 
-**§E — mutual exclusion.** `response_flag_filter` and `status_code_filter` are
-the two arms of the same oneof. Exactly one must be set: zero arms
-(`filter: {}`) and both arms are each `ConfigError::AmbiguousAccessLogFilter`.
+**§E — mutual exclusion.** `response_flag_filter`, `status_code_filter`, and
+`header_filter` (phase 72) are arms of the same oneof. Exactly one must be set:
+zero arms (`filter: {}`) and more-than-one arm are each
+`ConfigError::AmbiguousAccessLogFilter` (the `detail` distinguishes the two).
 
 **§F — authoritative fixture-0077 file** (two probes — `GET /direct` → 503
 DROPPED (renders `-`), `GET /nowhere` → no-route 404 KEPT (renders `NR`);
-dropped FIRST + kept LAST as the CF-70-3 ordering witness; same
-`text_format_source` as 0076; `flags: ["NR"]`). Each proxy's file holds EXACTLY
-ONE line:
+dropped FIRST + kept LAST per the ADR-0147 authoring convention (ADR-0146
+retired the hard ordering assertion; the driver's bounded settle is the CF-70-3
+closure); same `text_format_source` as 0076; `flags: ["NR"]`). Each proxy's file
+holds EXACTLY ONE line:
 
 ```
 STATUS=404 PATH=/nowhere FLAGS=NR
@@ -2326,6 +2328,61 @@ STATUS=404 PATH=/nowhere FLAGS=NR
 
 Pure cross-proxy equality — both proxies must agree on the KEPT half AND the
 DROPPED half. The line above documents the measured value; it is not the oracle.
+
+---
+
+### Phase 72 (ADR-0148/0149/0150): header_filter — the THIRD emission-gate arm
+
+> Fixture `0078-accesslog-header-filter`. `filter: { header_filter: { header:
+> <HeaderMatcher> } }` gates a sink: a record is emitted iff the named REQUEST
+> HEADER matches. Present-mismatch AND absent both DROP (MEASURED, graceful-stop
+> flush, `envoyproxy/envoy:v1.33.0`).
+
+**§A Schema.** `header_filter.header` is a `HeaderMatcher` (the phase-04.2 route
+type, reused verbatim: `name` + a mode oneof [`exact`/`prefix`/`suffix`/
+`safe_regex`/`range`/`present`/`string_match`, with `ignore_case`] + `invert_match`).
+`header` is PGV-required — empty `header_filter: {}` is fail-loud (envoy-rust:
+`ConfigError::Yaml` missing field; upstream: `HeaderFilterValidationError.Header:
+value is required`).
+
+**§B Decision.** Compiled to `LogFilter::Header { matcher }`; the runtime gate is
+`matcher.matches(&request_headers)` over the downstream request headers in scope
+at both HCM emit gates. Because `envoy-accesslog` cannot depend on `envoy-config`
+(the reverse edge exists → a cycle), the matcher is injected as a `HeaderMatch`
+trait object that `envoy-config` impls over its `HeaderMatcher` (ADR-0150),
+reusing the engine verbatim. Validation delegates to the phase-04.2
+`validate_header_matcher` (empty name → `EmptyHeaderName`; bad regex →
+`InvalidRegex`; bad range → `InvalidInt64Range`; SafeRegex compiled in place).
+
+**§C Invert + ABSENT (PV-4, MEASURED — inherited SHARED boundary).** Upstream
+DROPS an ABSENT header under `invert_match: true` on BOTH the route path (a
+`GET /` with an inverted route header matcher and no header falls through to the
+fallback route) AND the access-log path. The in-tree shared engine
+(`matcher.rs:51`) applies `mode_result ^ invert_match` UNCONDITIONALLY, so
+absent+invert = KEEP — a latent divergence shared by route matching and
+access-log filtering alike. Phase 72 reuses the engine verbatim (the opener uses
+a NON-inverted matcher) and does NOT fix it here; the shared-engine fix is
+carry-forward **CF-72-1**.
+
+**§D Name-only + treat_missing_header_as_empty (PV-5, MEASURED — inherited
+boundary).** Upstream accepts `header: { name }` (presence match) and
+`treat_missing_header_as_empty: true`; the in-tree `HeaderMatcher` deserializer
+REJECTS both (name-only → "missing mode key"; `treat_missing_header_as_empty` →
+unknown field). Kept fail-loud per ADR-0049; carry-forward **CF-72-2**.
+
+**§E Mutual exclusion.** `header_filter`, `status_code_filter`,
+`response_flag_filter` are mutually-exclusive `AccessLogFilter` arms — exactly
+one (`ConfigError::AmbiguousAccessLogFilter`).
+
+**§F Authoritative fixture.** `0078`: `GET /x` with `x-log: yes` → KEPT;
+`x-log: no` (present-mismatch) → DROPPED; a `direct_response` 200 (no backend).
+The log FORMAT renders only `STATUS=%RESPONSE_CODE% PATH=%REQ(:PATH)%` (line
+`STATUS=200 PATH=/x`) — envoy-rust's `%REQ(NAME)%` operator supports only an
+allow-list of headers (the record carries no arbitrary header map; no new record
+field this phase), so a `%REQ(X-LOG)%` format would be boot-fatal. The
+`header_filter` gates on `x-log` (read from the raw request-header slice), not
+from the record; echoing the header value is a FORMATTER concern orthogonal to
+the FILTER. Pure cross-proxy equality on the kept line AND the dropped absence.
 
 ---
 

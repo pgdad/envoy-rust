@@ -201,3 +201,12 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   tracked (memory `fuzz-corpus-seed-gitignored-by-default`). NO new fuzz target,
   NO ci.yml edit (ADR-0137 config-only-sub-message precedent). Local smoke
   `cargo +nightly fuzz run parse_bootstrap -- -runs=0` loaded the corpus clean.
+
+### T11 — BEHAVIOR_CONTRACT `header_filter` subsection + M71-2 §F — DONE
+
+- Added the phase-72 `header_filter` subsection (§A schema/§B decision incl. the
+  ADR-0150 trait-object seam/§C PV-4 CF-72-1/§D PV-5 CF-72-2/§E mutual exclusion/
+  §F fixture-0078 — documenting the actual `STATUS=200 PATH=/x` line + the
+  `%REQ(NAME)%` allow-list formatter boundary). Updated the phase-71 §E to the
+  3-arm reality. Fixed M71-2 doc phrase #3 (the §F "CF-70-3 ordering witness"
+  phrase → ADR-0146/0147 framing) — all three M71-2 phrases now consumed.
