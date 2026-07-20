@@ -3838,7 +3838,7 @@ fn validate_hcm(
     // 06.2 NEW — D2.2: validate access_log entries (name allow-list +
     // non-empty path). Hoisted to a free function for symmetry with the
     // http2_protocol_options pattern.
-    validate_access_logs(&hcm.access_log)?;
+    validate_access_logs(&mut hcm.access_log)?;
 
     // http_filters: cardinality + name + Router-terminal — 07.1 D4.1.
     validate_http_filters(&hcm.http_filters, listener_name)?;
@@ -5156,14 +5156,14 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 /// Returns the first error encountered (validator-wide convention). Phase 72
 /// makes this `&mut` so the `header_filter.header` SafeRegex is compiled in
 /// place (item 6); the status-code/response-flag arms are read-only.
-fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigError> {
-    for entry in access_logs {
+fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::ConfigError> {
+    for entry in access_logs.iter_mut() {
         if entry.name != "envoy.access_loggers.file" {
             return Err(crate::ConfigError::UnsupportedAccessLogType {
                 actual: entry.name.clone(),
             });
         }
-        if let Some(filter) = &entry.filter {
+        if let Some(filter) = &mut entry.filter {
             // Phase 71 (M70-R1): destructure ALL arms so a future arm cannot be
             // added without updating this count (no `..` — the compiler forces
             // it). With two arms the `> 1` (both-set) branch is now REACHABLE:
@@ -5203,6 +5203,13 @@ fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigEr
                         });
                     }
                 }
+            }
+            if let Some(hf) = header_filter {
+                // Phase 72: reuse the phase-04.2 HeaderMatcher validator verbatim
+                // — empty name → EmptyHeaderName; bad regex → InvalidRegex; bad
+                // range → InvalidInt64Range; compiles the SafeRegex in place so
+                // the runtime `matches` never hits its `.expect()`.
+                validate_header_matcher(&mut hf.header)?;
             }
         }
         match &entry.typed_config {
@@ -13108,6 +13115,51 @@ static_resources:
             matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
             "cardinality must precede per-arm validation, got {err:?}"
         );
+    }
+
+    // --- phase 72 t3: header_filter per-arm validation (delegate to validate_header_matcher) ---
+
+    #[test]
+    fn header_filter_empty_name_rejected() {
+        let yaml =
+            access_log_filter_yaml(r#"header_filter: { header: { name: "", present_match: true } }"#);
+        let err = crate::parse_bootstrap(&yaml).expect_err("empty header name must reject");
+        assert!(
+            matches!(err, crate::ConfigError::EmptyHeaderName),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_filter_bad_regex_rejected() {
+        let yaml = access_log_filter_yaml(
+            r#"header_filter: { header: { name: "x-log", safe_regex_match: { regex: "y(" } } }"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("bad regex must reject");
+        assert!(
+            matches!(err, crate::ConfigError::InvalidRegex { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn header_filter_safe_regex_is_compiled() {
+        let yaml = access_log_filter_yaml(
+            r#"header_filter: { header: { name: "x-log", safe_regex_match: { regex: "y.*" } } }"#,
+        );
+        let bs = crate::parse_bootstrap(&yaml).expect("valid regex must parse");
+        let hcm = first_hcm(&bs);
+        let hf = hcm.access_log[0]
+            .filter
+            .as_ref()
+            .unwrap()
+            .header_filter
+            .as_ref()
+            .unwrap();
+        let crate::HeaderMatcherMode::SafeRegexMatch(sr) = &hf.header.mode else {
+            panic!("expected SafeRegexMatch");
+        };
+        assert!(sr.compiled.is_some(), "validator must compile the SafeRegex");
     }
 
     // --- phase 72 t1: HeaderFilter + header_filter oneof arm ---

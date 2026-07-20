@@ -82,3 +82,16 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
 - **PLAN-example trap hit (memory `plan-md-example-code-trips-clippy`):** the
   plan's `matches!(err, ...{ detail } if ...)` guard binds `detail` by-move then
   reuses `err` in the panic message → E0382; fixed with `ref detail`.
+
+### T3 — `header_filter` validation delegation (`&mut` plumbing) — DONE
+
+- `validate_access_logs` → `&mut [AccessLog]` (iterates `.iter_mut()`, destructure
+  binds `&mut` fields); added the `if let Some(hf) = header_filter {
+  validate_header_matcher(&mut hf.header)? }` delegation AFTER the cardinality
+  block (so cardinality precedes per-arm, per T2's pin). Updated the sole caller
+  `validate_hcm` (already `&mut hcm`) to pass `&mut hcm.access_log`.
+- Tests (RED→GREEN): `header_filter_empty_name_rejected` (→ `EmptyHeaderName`),
+  `header_filter_bad_regex_rejected` (→ `InvalidRegex`),
+  `header_filter_safe_regex_is_compiled` (`sr.compiled.is_some()`). All 20
+  `header_filter`/`access_log` tests pass; clippy clean; grep-confirmed
+  `validate_access_logs` has exactly one caller.
