@@ -6,8 +6,10 @@
 //! route is probed twice: (1) `GET /direct` → 503, a HCM-authored direct_response
 //! whose `%RESPONSE_FLAGS%` is `-` (∉ [NR]) → SUPPRESSED (`expect_logged: false`);
 //! (2) `GET /nowhere` → 404, a no-route synth whose `%RESPONSE_FLAGS%` is `NR`
-//! (∈ [NR]) → KEPT. The suppressed probe is FIRST and the kept probe is LAST
-//! (CF-70-3 ordering witness). `clusters: []`; no backend spawns. Spawns Envoy
+//! (∈ [NR]) → KEPT. The suppressed probe is FIRST and the kept probe is LAST —
+//! the sound authoring convention (ADR-0147); ADR-0146 retired the hard ordering
+//! assertion, and the driver's ordering-aware bounded settle is the CF-70-3
+//! closure. `clusters: []`; no backend spawns. Spawns Envoy
 //! v1.33 in a container; spawns envoy-rust as a subprocess; drives
 //! `kind: http1_access_log_byte_exact`; reads each side's file access-log and
 //! asserts every emitted line is byte-identical. Each file holds EXACTLY ONE

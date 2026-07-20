@@ -1676,9 +1676,27 @@ const ACCESS_LOG_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_sec
 
 /// Phase 71 (CF-70-3): after the kept-line count is reached, a bounded settle
 /// during which a filter-DROPPED record that was merely un-flushed would still
-/// surface. Defense-in-depth behind the ordering witness (which is the primary
-/// soundness guarantee). Only paid by suppression fixtures.
+/// surface. ADR-0146 retired the earlier hard "last probe must be KEPT"
+/// ordering-witness precondition; this bounded settle is now the SOLE soundness
+/// closure. Only paid by suppression fixtures. Used for kept-LAST fixtures
+/// (0077/0078); dropped-LAST fixtures pay `CF71_1_SETTLE` (see `suppression_settle`).
 const CF70_3_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Phase 72 (CF-71-1): when a suppression fixture's LAST probe is DROPPED
+/// (e.g. fixture 0076), a bug-leaked line for that last record only flushes on
+/// Envoy's ~10s FileAccessLog timer — past the short `CF70_3_SETTLE`. For that
+/// ordering, settle past the flush interval so the reference side is covered.
+const CF71_1_SETTLE: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Pick the suppression settle from probe ORDERING: the long CF-71-1 settle when
+/// the last probe is dropped, else the cheap CF-70-3 settle. (Kept-LAST fixtures
+/// 0077/0078 pay only the short one; dropped-LAST 0076 pays the long one.)
+fn suppression_settle(probes: &[AccessLogByteExactProbe]) -> std::time::Duration {
+    match probes.last() {
+        Some(p) if !p.expect_logged => CF71_1_SETTLE,
+        _ => CF70_3_SETTLE,
+    }
+}
 
 /// Poll `path` until it contains at least `want` lines or `budget` elapses.
 /// Returns true if the line count was reached. Mirrors `wait_file_nonempty`'s
@@ -6355,11 +6373,13 @@ async fn run_http1_access_log_byte_exact_arm(
     }
 
     if has_suppression {
-        // Phase 71 (CF-70-3) defense-in-depth: with both proxies still running,
-        // allow a bounded settle and confirm neither file grew past the
-        // kept-line count — a suppressed record that was merely un-flushed at
-        // the kept-count boundary would surface here.
-        tokio::time::sleep(CF70_3_SETTLE).await;
+        // Phase 72 (CF-71-1): with both proxies still running, allow a bounded
+        // ORDERING-AWARE settle and confirm neither file grew past the kept-line
+        // count — a suppressed record that was merely un-flushed would surface
+        // here. Dropped-LAST fixtures (0076) wait past Envoy's ~10s flush timer;
+        // kept-LAST fixtures (0077/0078) pay only the short settle.
+        let settle = suppression_settle(probes);
+        tokio::time::sleep(settle).await;
         let rust_have = std::fs::read_to_string(&envoy_rust_path)
             .map(|s| s.lines().count())
             .unwrap_or(0);
@@ -6368,7 +6388,7 @@ async fn run_http1_access_log_byte_exact_arm(
             .unwrap_or(0);
         if rust_have > expected_lines || envoy_have > expected_lines {
             bail!(
-                "CF-70-3: an access log grew beyond {expected_lines} lines under a {CF70_3_SETTLE:?} \
+                "CF-71-1: an access log grew beyond {expected_lines} lines under a {settle:?} \
                  settle (envoy_rust={rust_have}, envoy={envoy_have}) — a suppressed record leaked"
             );
         }
@@ -6504,8 +6524,9 @@ async fn run_http2_access_log_byte_exact_arm(
     }
 
     if has_suppression {
-        // Phase 71 (CF-70-3) defense-in-depth: see the H1 arm.
-        tokio::time::sleep(CF70_3_SETTLE).await;
+        // Phase 72 (CF-71-1) ordering-aware settle: see the H1 arm.
+        let settle = suppression_settle(probes);
+        tokio::time::sleep(settle).await;
         let rust_have = std::fs::read_to_string(&envoy_rust_path)
             .map(|s| s.lines().count())
             .unwrap_or(0);
@@ -6514,7 +6535,7 @@ async fn run_http2_access_log_byte_exact_arm(
             .unwrap_or(0);
         if rust_have > expected_lines || envoy_have > expected_lines {
             bail!(
-                "CF-70-3: an access log grew beyond {expected_lines} lines under a {CF70_3_SETTLE:?} \
+                "CF-71-1: an access log grew beyond {expected_lines} lines under a {settle:?} \
                  settle (envoy_rust={rust_have}, envoy={envoy_have}) — a suppressed record leaked"
             );
         }
@@ -7407,6 +7428,28 @@ mod tests {
         assert_eq!(expected_logged_count(&[p(true), p(false), p(true)]), 2);
         assert_eq!(expected_logged_count(&[p(false), p(false)]), 0);
         assert_eq!(expected_logged_count(&[p(true)]), 1);
+    }
+
+    /// Phase 72 (CF-71-1): the byte-exact settle is ORDERING-aware — a fixture
+    /// whose LAST probe is DROPPED (0076's shape) pays the long settle (past
+    /// Envoy's ~10s flush timer, so a bug-leaked line for that last record would
+    /// surface); a kept-LAST fixture (0077/0078) pays only the cheap short settle.
+    #[test]
+    fn settle_is_ordering_aware() {
+        let p = |expect_logged: bool| AccessLogByteExactProbe {
+            method: Http1Method::Get,
+            path: "/x".into(),
+            host: "h".into(),
+            extra_headers: vec![],
+            body: None,
+            expected_status: 200,
+            expect_logged,
+        };
+        // kept-LAST (0077/0078 shape): cheap short settle.
+        assert_eq!(suppression_settle(&[p(false), p(true)]), CF70_3_SETTLE);
+        // dropped-LAST (0076 shape): long settle ≥ the flush interval.
+        assert_eq!(suppression_settle(&[p(true), p(false)]), CF71_1_SETTLE);
+        assert!(CF71_1_SETTLE >= std::time::Duration::from_secs(10));
     }
 
     /// Phase 70 (ADR-0141): `expect_logged`'s serde default is load-bearing —

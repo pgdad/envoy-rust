@@ -141,3 +141,13 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   compile change. Updated a stale doc comment to the 3-arg signature. No H2 test
   call sites of `should_log` (grep-confirmed). `cargo test -p envoy-http2` = 107
   pass; `cargo build --workspace` clean (no stale 2-arg calls anywhere).
+
+### T7 — CF-71-1 ordering-aware settle + M71-2 doc fixes — DONE
+
+- Added `CF71_1_SETTLE` (12s) + `suppression_settle(probes) -> Duration` (long
+  settle when the LAST probe is dropped, else the cheap `CF70_3_SETTLE`); wired it
+  into both `run_http1_/run_http2_access_log_byte_exact_arm` sleeps + bail
+  messages. New unit test `settle_is_ordering_aware`. Differential tests compile.
+- M71-2 doc fixes #1 (the `CF70_3_SETTLE` doc — no longer calls the ordering
+  witness the "primary soundness guarantee") + #2 (`access_log_response_flag_filter.rs:10`
+  — ADR-0146 retirement). Fix #3 (BEHAVIOR_CONTRACT §F) lands in T11.
