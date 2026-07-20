@@ -69,3 +69,16 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   was folded INTO T1 to keep the commit green (the PLAN placed it in T2, which
   would have left T1 non-compiling). T2 keeps the M71-1/M71-4 test + docstring
   work. The header_filter per-arm VALIDATION delegation still lands in T3.
+
+### T2 — M71-1 `detail` assert + header-inclusive cardinality + M71-4 docstring — DONE
+
+- Rewrote `rejects_access_log_filter_with_both_arms` to assert `detail.contains("more
+  than one")` (M71-1); added `rejects_header_filter_paired_with_another_arm` and
+  `cardinality_is_checked_before_per_arm_validation` (cardinality fires before
+  per-arm validation). All pass.
+- Refreshed the `validate_access_logs` docstring (M71-4): item 3 no longer calls
+  the >1 branch "unreachable"; added items 5 (response-flag tokens) + 6
+  (header_filter matcher via `validate_header_matcher`).
+- **PLAN-example trap hit (memory `plan-md-example-code-trips-clippy`):** the
+  plan's `matches!(err, ...{ detail } if ...)` guard binds `detail` by-move then
+  reuses `err` in the panic message → E0382; fixed with `ref detail`.

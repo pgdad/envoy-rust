@@ -5137,21 +5137,25 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 ///      Empty paths surface as `ConfigError::InvalidAccessLogPath`. The
 ///      sink-side `FileSink::new` would also fail on `""`, but rejecting
 ///      at parse time gives a clearer diagnostic.
-///   3. Phase 70 — `AccessLog.filter` (`AccessLogFilter` oneof) cardinality:
-///      when a `filter` is present it must set EXACTLY ONE arm. Zero arms
-///      (`filter: {}`) surfaces as `ConfigError::AmbiguousAccessLogFilter`;
-///      the >1 branch is unreachable while only one arm exists but is written
-///      to stay correct as future phases add arms. This mirrors the
-///      `SubstitutionFormatString` / `AmbiguousLogFormat` oneof precedent —
-///      the cardinality lives here, not in serde.
-///   4. Phase 70 — non-empty `runtime_key`: a `status_code_filter`'s
-///      `comparison.value.runtime_key` must not be `""`. Upstream enforces
-///      PGV `min_len 1`; the key is RTDS-inert here (the comparison always
-///      reads `default_value`), but load-time parity requires the rejection.
-///      Surfaces as `ConfigError::EmptyStatusCodeFilterRuntimeKey`.
+///   3. `AccessLog.filter` (`AccessLogFilter` oneof) cardinality: when a
+///      `filter` is present it must set EXACTLY ONE arm. Zero arms (`filter: {}`)
+///      and more-than-one arm BOTH surface as
+///      `ConfigError::AmbiguousAccessLogFilter { detail }` (the `detail`
+///      distinguishes the two). Phases 70/71/72 give three arms, so the
+///      more-than-one branch is REACHABLE. Cardinality lives here (mirroring the
+///      `SubstitutionFormatString` / `AmbiguousLogFormat` precedent), not serde.
+///   4. Phase 70 — non-empty `status_code_filter.comparison.value.runtime_key`
+///      (`ConfigError::EmptyStatusCodeFilterRuntimeKey`).
+///   5. Phase 71 — every `response_flag_filter.flags` token is a known
+///      response-flag token (`ConfigError::UnknownResponseFlag`).
+///   6. Phase 72 — the `header_filter.header` HeaderMatcher validates + its
+///      SafeRegex compiles, via `validate_header_matcher` (empty name →
+///      `EmptyHeaderName`; bad regex → `InvalidRegex`; bad range →
+///      `InvalidInt64Range`).
 ///
-/// Mutates nothing; returns the first error encountered (validator-wide
-/// convention).
+/// Returns the first error encountered (validator-wide convention). Phase 72
+/// makes this `&mut` so the `header_filter.header` SafeRegex is compiled in
+/// place (item 6); the status-code/response-flag arms are read-only.
 fn validate_access_logs(access_logs: &[AccessLog]) -> Result<(), crate::ConfigError> {
     for entry in access_logs {
         if entry.name != "envoy.access_loggers.file" {
@@ -13061,25 +13065,48 @@ static_resources:
 
     #[test]
     fn rejects_access_log_filter_with_both_arms() {
-        let yaml = hcm_with_access_log_yaml(
-            r#"                access_log:
-                  - name: envoy.access_loggers.file
-                    typed_config:
-                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
-                      path: /tmp/al.log
-                    filter:
-                      status_code_filter:
-                        comparison:
-                          op: GE
-                          value: { default_value: 500, runtime_key: unused }
-                      response_flag_filter:
-                        flags: ["NR"]
-"#,
+        // M71-1 (phase 72): assert `detail` distinguishes the >1 branch from the
+        // zero-arm branch.
+        let yaml = access_log_filter_yaml(
+            r#"status_code_filter: { comparison: { op: GE, value: { default_value: 500, runtime_key: k } } }
+                      response_flag_filter: { flags: ["NR"] }"#,
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("both arms must be rejected");
+        match err {
+            crate::ConfigError::AmbiguousAccessLogFilter { detail } => {
+                assert!(detail.contains("more than one"), "detail was {detail:?}");
+            }
+            other => panic!("expected AmbiguousAccessLogFilter, got {other:?}"),
+        }
+    }
+
+    // --- phase 72 t2: header-inclusive cardinality + precedence ---
+
+    #[test]
+    fn rejects_header_filter_paired_with_another_arm() {
+        let yaml = access_log_filter_yaml(
+            r#"header_filter: { header: { name: "x-log", present_match: true } }
+                      status_code_filter: { comparison: { op: GE, value: { default_value: 500, runtime_key: k } } }"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("two arms must be rejected");
+        assert!(
+            matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("more than one")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cardinality_is_checked_before_per_arm_validation() {
+        // A both-arms config where the header_filter ALSO has an empty header name:
+        // cardinality must fire FIRST (AmbiguousAccessLogFilter), not EmptyHeaderName.
+        let yaml = access_log_filter_yaml(
+            r#"header_filter: { header: { name: "", present_match: true } }
+                      response_flag_filter: { flags: ["NR"] }"#,
+        );
+        let err = crate::parse_bootstrap(&yaml).expect_err("must reject");
         assert!(
             matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
-            "got {err:?}"
+            "cardinality must precede per-arm validation, got {err:?}"
         );
     }
 
