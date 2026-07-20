@@ -13329,9 +13329,39 @@ static_resources:
 "#,
         );
         let err = crate::parse_bootstrap(&yaml).expect_err("empty filter must be rejected");
+        // M71-1 (phase 72): the `detail` distinguishes the zero-arm branch.
         assert!(
-            matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { .. }),
+            matches!(err, crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("no filter variant")),
             "got {err:?}"
+        );
+    }
+
+    // --- phase 72 t9: PV-5 pins (name-only + treat_missing inherited fail-loud) ---
+
+    #[test]
+    fn pv5_name_only_header_filter_is_rejected_inherited_boundary() {
+        // MEASURED (ADR-0149): upstream accepts `header: { name }` as a presence
+        // match; the in-tree HeaderMatcher deserializer REJECTS it ("missing mode
+        // key"). Inherited phase-04.2 boundary, kept fail-loud per ADR-0049.
+        // Deferred to carry-forward CF-72-2.
+        let yaml = access_log_filter_yaml(r#"header_filter: { header: { name: "x-log" } }"#);
+        assert!(
+            crate::parse_bootstrap(&yaml).is_err(),
+            "name-only must reject (CF-72-2)"
+        );
+    }
+
+    #[test]
+    fn pv5_treat_missing_header_as_empty_is_rejected_inherited_boundary() {
+        // MEASURED (ADR-0149): upstream accepts `treat_missing_header_as_empty`;
+        // the in-tree HeaderMatcher deserializer REJECTS it (unknown field).
+        // Inherited phase-04.2 boundary, fail-loud per ADR-0049 (CF-72-2).
+        let yaml = access_log_filter_yaml(
+            r#"header_filter: { header: { name: "x-log", string_match: { exact: "yes" }, treat_missing_header_as_empty: true } }"#,
+        );
+        assert!(
+            crate::parse_bootstrap(&yaml).is_err(),
+            "treat_missing must reject (CF-72-2)"
         );
     }
 

@@ -394,6 +394,31 @@ mod tests {
     }
 
     #[test]
+    fn pv4_absent_plus_invert_is_kept_inherited_shared_engine_boundary() {
+        // MEASURED (ADR-0149): upstream DROPS absent+invert on BOTH the route AND
+        // access-log paths. The in-tree shared engine (matcher.rs:51) does an
+        // UNCONDITIONAL `mode_result ^ invert_match`, so absent+invert = KEEP.
+        // This pins that INHERITED phase-04.2 boundary (shared with route
+        // matching); fixing it is carry-forward CF-72-1 (a cross-cutting
+        // route+access-log change), NOT phase 72. The access-log `header_filter`
+        // reuses this engine verbatim via the `HeaderMatch` impl, so the same
+        // divergence applies there; the opener fixture 0078 uses a NON-inverted
+        // matcher and does not exercise it. See `invert_match_inverts_present_match_result`.
+        use envoy_accesslog::HeaderMatch as _;
+        let hm = hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true));
+        // Direct engine:
+        assert!(
+            hm.matches(&[]),
+            "in-tree engine keeps absent+invert (diverges from upstream — CF-72-1)"
+        );
+        // Same divergence through the access-log `HeaderMatch` seam:
+        let via_trait: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> = std::sync::Arc::new(
+            hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true)),
+        );
+        assert!(via_trait.matches(&[]), "access-log path keeps absent+invert too (CF-72-1)");
+    }
+
+    #[test]
     fn header_match_trait_delegates_to_inherent_engine() {
         // Phase 72 (ADR-0150): the injected `HeaderMatch` trait impl must call
         // the inherent engine (NOT recurse). Exercise it through the trait object.

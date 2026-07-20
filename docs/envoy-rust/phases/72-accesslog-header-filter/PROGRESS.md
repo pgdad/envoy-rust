@@ -170,3 +170,25 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   FORMATTER concern orthogonal to the FILTER this phase builds. No new ADR (this
   is the already-documented SPEC §2.2 boundary, not a new decision); documented
   in the fixture README + `.rs` doc.
+
+### T9 — in-process coverage + PV-4/PV-5 pins + regressions — DONE
+
+- **Membership across modes + absent-drop** (envoy-http1
+  `header_filter_membership_across_modes_and_absent_drop`): exact/prefix/suffix/
+  present/string_match end-to-end through `compile_access_log_filter →
+  LogFilter::Header::should_log`; keep on match, drop on mismatch AND absent.
+  SafeRegex membership is covered on the shared engine (matcher.rs) which the
+  access-log path reuses verbatim (delegation test).
+- **PV-4 pin** (matcher.rs `pv4_absent_plus_invert_is_kept_inherited_shared_engine_boundary`):
+  absent+invert = KEEP (the shared-engine XOR), MEASURED-divergent from upstream
+  (drops on both route+access-log), deferred to CF-72-1; pinned on BOTH the
+  direct engine and the access-log `HeaderMatch` seam.
+- **PV-5 pins** (envoy-config `pv5_name_only_...` + `pv5_treat_missing_...`):
+  name-only `{name}` and `treat_missing_header_as_empty` both REJECTED fail-loud
+  (inherited phase-04.2 boundary, ADR-0049), deferred to CF-72-2.
+- **Cardinality/detail:** strengthened `rejects_access_log_filter_with_no_variant`
+  to assert `detail.contains("no filter variant")` (zero-arm branch). The both-arm
+  + precedence cases are pinned in T2.
+- **Regressions:** the no-`filter`-logs-every-record (`no_filter_logs_every_record`),
+  `status_code`/`response_flag` unchanged, and `runtime_key_is_rtds_inert`
+  (adjusted in T5) tests all remain green.

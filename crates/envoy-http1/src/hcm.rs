@@ -4756,6 +4756,58 @@ static_resources:
         assert!(!compiled.should_log(200, "-", &[])); // absent → drop
     }
 
+    /// Phase 72 T9 (SPEC §2.1 item 5): `header_filter` membership across the
+    /// supported modes + the absent-drop, end-to-end through
+    /// `compile_access_log_filter` → `LogFilter::Header::should_log`. SafeRegex
+    /// membership is covered on the shared engine in `envoy-config::matcher`
+    /// tests; the access-log path reuses it verbatim (proven by
+    /// `header_match_trait_delegates_to_inherent_engine`).
+    #[test]
+    fn header_filter_membership_across_modes_and_absent_drop() {
+        use envoy_config::HeaderMatcherMode as M;
+        let compile_mode = |mode: M| {
+            compile_access_log_filter(&envoy_config::AccessLogFilter {
+                status_code_filter: None,
+                response_flag_filter: None,
+                header_filter: Some(envoy_config::HeaderFilter {
+                    header: envoy_config::HeaderMatcher {
+                        name: "x-log".into(),
+                        mode,
+                        invert_match: false,
+                    },
+                }),
+            })
+        };
+        let yes = [("x-log".to_string(), "yes".to_string())];
+        let no = [("x-log".to_string(), "no".to_string())];
+        let absent: [(String, String); 0] = [];
+
+        // exact: keep "yes"; drop mismatch AND absent.
+        let f = compile_mode(M::ExactMatch("yes".into()));
+        assert!(f.should_log(200, "-", &yes));
+        assert!(!f.should_log(200, "-", &no));
+        assert!(!f.should_log(200, "-", &absent));
+
+        // prefix / suffix match on the value; drop absent.
+        assert!(compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &yes));
+        assert!(!compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &absent));
+        assert!(compile_mode(M::SuffixMatch("es".into())).should_log(200, "-", &yes));
+
+        // present: any value keeps; absent drops.
+        assert!(compile_mode(M::PresentMatch(true)).should_log(200, "-", &yes));
+        assert!(!compile_mode(M::PresentMatch(true)).should_log(200, "-", &absent));
+
+        // string_match { exact } — the fixture-0078 mode.
+        let sm = envoy_config::StringMatcher {
+            mode: envoy_config::StringMatcherMode::Exact("yes".into()),
+            ignore_case: false,
+        };
+        let f = compile_mode(M::StringMatch(sm));
+        assert!(f.should_log(200, "-", &yes));
+        assert!(!f.should_log(200, "-", &no));
+        assert!(!f.should_log(200, "-", &absent));
+    }
+
     /// Phase-71 state-5 review probe (REVIEW.md §2): the H1 EMIT LOOP threads
     /// the record's REAL `response_flags` token into the widened `should_log`
     /// gate. A mutation measurement showed every prior in-process H1 test stays
