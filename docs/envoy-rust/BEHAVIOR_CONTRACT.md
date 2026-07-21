@@ -2354,15 +2354,27 @@ reusing the engine verbatim. Validation delegates to the phase-04.2
 `validate_header_matcher` (empty name → `EmptyHeaderName`; bad regex →
 `InvalidRegex`; bad range → `InvalidInt64Range`; SafeRegex compiled in place).
 
-**§C Invert + ABSENT (PV-4, MEASURED — inherited SHARED boundary).** Upstream
-DROPS an ABSENT header under `invert_match: true` on BOTH the route path (a
-`GET /` with an inverted route header matcher and no header falls through to the
-fallback route) AND the access-log path. The in-tree shared engine
-(`matcher.rs:51`) applies `mode_result ^ invert_match` UNCONDITIONALLY, so
-absent+invert = KEEP — a latent divergence shared by route matching and
-access-log filtering alike. Phase 72 reuses the engine verbatim (the opener uses
-a NON-inverted matcher) and does NOT fix it here; the shared-engine fix is
-carry-forward **CF-72-1**.
+**§C Invert + ABSENT (PV-4, MEASURED — inherited SHARED boundary; MODE-DEPENDENT).**
+The `invert_match: true` + ABSENT-header interaction is **mode-dependent**
+(re-MEASURED at the phase-72 §5 state-5 LIVE-PROBE across BOTH proxies — envoy-rust
+DEBUG `envoy-bin` vs. `envoyproxy/envoy:v1.33.0`; **ADR-0151**, correcting the
+blanket "absent+invert = divergence" framing that ADR-0149 recorded):
+- A **VALUE-based matcher** (`exact`/`prefix`/`suffix`/`safe_regex`/`range`/
+  `string_match`) + invert + absent **DIVERGES** — envoy-rust KEEPS, upstream
+  DROPS. Upstream treats a missing header as an unconditional value no-match that
+  `invert_match` does NOT resurrect.
+- A **`present_match`** + invert + absent is **PARITY** — envoy-rust AND upstream
+  BOTH KEEP (upstream's present-check is `false`, which `invert_match` flips → KEEP).
+
+The in-tree shared engine (`matcher.rs:51`) applies `mode_result ^ invert_match`
+UNCONDITIONALLY, so absent (`mode_result = false`) → `false ^ true` = KEEP in BOTH
+modes — matching upstream for `present_match` (parity) but diverging for value
+matchers. Phase 72 reuses the engine verbatim (the opener 0078 uses a NON-inverted
+matcher) and does NOT fix it; the shared-engine fix is carry-forward **CF-72-1**,
+scoped to the **value-matcher** case — a future fixer MUST preserve the
+`present_match` KEEP (a naive uniform DROP would break that parity and introduce a
+NEW divergence). Pinned by `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream`
++ `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream` (`matcher.rs`).
 
 **§D Name-only + treat_missing_header_as_empty (PV-5, MEASURED — inherited
 boundary).** Upstream accepts `header: { name }` (presence match) and

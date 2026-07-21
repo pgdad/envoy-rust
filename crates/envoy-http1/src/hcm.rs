@@ -4869,6 +4869,148 @@ static_resources:
         assert!(sink.should_log(404, "UF", &[]));
     }
 
+    /// Phase 72 §5.2 state-3 (REVIEW.md F-3, closes M71-5): TWO sinks with
+    /// DIFFERENT filter arms on one HCM. Sink A gates on
+    /// `header_filter { exact "yes" on x-log }`; sink B gates on
+    /// `status_code_filter { EQ 200 }`. Three `GET /x` requests (`x-log: yes`,
+    /// `x-log: no`, no header) all return the direct-response 200. The state-5
+    /// LIVE-PROBE MEASURED byte-exact parity vs. `envoyproxy/envoy:v1.33.0` for
+    /// this exact shape (REVIEW.md Probe 1). This pins that the emit loop's
+    /// per-sink gate is INDEPENDENT — sink A keeps only the 1 matching request,
+    /// sink B keeps all 3 — with no cross-sink leakage of the `req.headers`
+    /// slice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_sinks_with_mixed_filters_gate_independently() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let path_a = dir.path().join("sink_a_header.log");
+        let path_b = dir.path().join("sink_b_status.log");
+
+        let file_sink_cfg = |path: &std::path::Path, filter: envoy_config::AccessLogFilter| {
+            envoy_config::AccessLog {
+                name: "envoy.access_loggers.file".to_string(),
+                typed_config: envoy_config::AccessLogTypedConfig::FileAccessLog(
+                    envoy_config::FileAccessLog {
+                        path: path.to_string_lossy().into_owned(),
+                        log_format: None,
+                    },
+                ),
+                filter: Some(filter),
+            }
+        };
+        let envoy_cfg = envoy_config::HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http".to_string(),
+            codec_type: envoy_config::CodecType::HTTP1,
+            http2_protocol_options: None,
+            access_log: vec![
+                // Sink A — header_filter { exact "yes" on x-log }.
+                file_sink_cfg(
+                    &path_a,
+                    envoy_config::AccessLogFilter {
+                        status_code_filter: None,
+                        response_flag_filter: None,
+                        header_filter: Some(envoy_config::HeaderFilter {
+                            header: envoy_config::HeaderMatcher {
+                                name: "x-log".to_string(),
+                                mode: envoy_config::HeaderMatcherMode::ExactMatch(
+                                    "yes".to_string(),
+                                ),
+                                invert_match: false,
+                            },
+                        }),
+                    },
+                ),
+                // Sink B — status_code_filter { EQ 200 }.
+                file_sink_cfg(
+                    &path_b,
+                    envoy_config::AccessLogFilter {
+                        status_code_filter: Some(envoy_config::StatusCodeFilter {
+                            comparison: envoy_config::ComparisonFilter {
+                                op: envoy_config::ComparisonOp::Eq,
+                                value: envoy_config::RuntimeUInt32 {
+                                    default_value: 200,
+                                    runtime_key: "access_log.status_code".to_string(),
+                                },
+                            },
+                        }),
+                        response_flag_filter: None,
+                        header_filter: None,
+                    },
+                ),
+            ],
+            route_config: Some(RouteConfiguration {
+                name: "r".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "default".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: String::new(),
+                        r#match: RouteMatch {
+                            prefix: None,
+                            path: Some("/x".to_string()),
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("hi\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![envoy_config::HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: envoy_config::HttpFilterTypedConfig::Router(
+                    envoy_config::RouterConfig {},
+                ),
+            }],
+        };
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let cluster_mgr = cluster_mgr_empty().await;
+        let config = Arc::new(
+            HCMConfig::from_config(&envoy_cfg, cluster_mgr, registry, None)
+                .await
+                .expect("HCMConfig builds"),
+        );
+
+        // Three requests, all → 200. Only the first carries the matching header.
+        let _ = drive(
+            config.clone(),
+            b"GET /x HTTP/1.1\r\nHost: x\r\nx-log: yes\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let _ = drive(
+            config.clone(),
+            b"GET /x HTTP/1.1\r\nHost: x\r\nx-log: no\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let _ = drive(
+            config,
+            b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let a = tokio::fs::read_to_string(&path_a).await.unwrap_or_default();
+        let b = tokio::fs::read_to_string(&path_b).await.unwrap_or_default();
+        assert_eq!(
+            a.lines().count(),
+            1,
+            "sink A (header_filter) keeps ONLY the x-log:yes request: {a:?}"
+        );
+        assert_eq!(
+            b.lines().count(),
+            3,
+            "sink B (status EQ 200) keeps all three 200s: {b:?}"
+        );
+    }
+
     /// Phase 71 Task 9: the phase-70 `status_code_filter` still gates PURELY on
     /// status, ignoring the newly-threaded `response_flags` arg — a GE-500 sink
     /// drops a 200 whatever its flag, keeps a 503 whatever its flag.

@@ -3552,6 +3552,148 @@ static_resources:
         );
     }
 
+    /// Phase 72 §5.2 state-3 (REVIEW.md F-2): the H2 sibling of the H1
+    /// `header_filter` emit gate. The H2 emit loop threads the post-decode
+    /// `&envoy_req.headers` snapshot into the widened
+    /// `should_log(status, flags, headers)` gate (hcm.rs ~1138); this test
+    /// exercises that threaded slice end-to-end. A sink carrying
+    /// `LogFilter::Header { exact "yes" on x-log }` must KEEP `GET /x` with
+    /// `x-log: yes` and DROP both the present-MISMATCH (`x-log: no`) and the
+    /// ABSENT-header requests. Without this test the threaded field is unasserted
+    /// on the H2 path (H1's equivalent is caught by differential fixture 0078;
+    /// the H2 differential stays deferred = M71-6). Mirrors
+    /// `h2_response_flag_filter_suppresses_no_flag`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h2_header_filter_keeps_match_drops_mismatch_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("access.log");
+        let fmt = envoy_accesslog::CompiledFormat::from_inline("%RESPONSE_CODE%\n")
+            .expect("format parses");
+        // Box the config `HeaderMatcher` into the ADR-0150 `HeaderMatch` seam,
+        // exactly as `compile_access_log_filter` does at runtime.
+        let filter = envoy_accesslog::LogFilter::Header {
+            matcher: Arc::new(HeaderMatcher {
+                name: "x-log".to_string(),
+                mode: HeaderMatcherMode::ExactMatch("yes".to_string()),
+                invert_match: false,
+            }),
+        };
+        let sink = Arc::new(
+            envoy_accesslog::FileSink::new(log_path.clone(), fmt, Some(filter))
+                .await
+                .expect("open FileSink"),
+        );
+
+        let cfg = HttpConnectionManagerConfig {
+            stat_prefix: "ingress_http_h2".to_string(),
+            codec_type: CodecType::HTTP2,
+            http2_protocol_options: None,
+            access_log: vec![],
+            route_config: Some(RouteConfiguration {
+                name: "local_route".to_string(),
+                validate_clusters: None,
+                virtual_hosts: vec![VirtualHost {
+                    name: "vh".to_string(),
+                    domains: vec!["*".to_string()],
+                    include_attempt_count_in_response: false,
+                    routes: vec![Route {
+                        name: "x".to_string(),
+                        r#match: RouteMatch {
+                            prefix: None,
+                            path: Some("/x".to_string()),
+                            headers: vec![],
+                        },
+                        action: RouteAction::DirectResponse(DirectResponse {
+                            status: 200,
+                            body: DataSource {
+                                filename: None,
+                                inline_string: Some("hi\n".to_string()),
+                            },
+                        }),
+                        typed_per_filter_config: Default::default(),
+                    }],
+                }],
+            }),
+            rds: None,
+            http_filters: vec![HttpFilter {
+                name: "envoy.filters.http.router".to_string(),
+                typed_config: HttpFilterTypedConfig::Router(RouterConfig {}),
+            }],
+        };
+        let cluster_mgr = Arc::new(envoy_cluster::ClusterManager::empty());
+        let registry = Arc::new(envoy_stats::StatsRegistry::new());
+        let mut built = Http1HCMConfig::from_config(&cfg, cluster_mgr, registry, None)
+            .await
+            .expect("build HCM config");
+        built.access_log = vec![sink];
+        let stats = Arc::clone(&built.stats.access_logs_total);
+        let config = Arc::new(built);
+
+        let (addr, _server) = spawn_h2_hcm(config).await;
+
+        // Drop leg 1 — present-MISMATCH: `x-log: no` ≠ exact "yes" → 0 lines.
+        h2_header_filter_roundtrip(addr, "/x", &[("x-log", "no")], 200).await;
+        // Drop leg 2 — ABSENT header → 0 lines (still).
+        h2_header_filter_roundtrip(addr, "/x", &[], 200).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged.lines().count(),
+            0,
+            "header_filter must suppress present-mismatch AND absent: {logged:?}"
+        );
+        assert_eq!(
+            stats.value(),
+            0,
+            "suppressed records must not tick access_logs_total"
+        );
+
+        // Keep leg — `x-log: yes` matches exact "yes" → exactly one 200 line.
+        h2_header_filter_roundtrip(addr, "/x", &[("x-log", "yes")], 200).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        assert_eq!(
+            logged, "200\n",
+            "header_filter must keep the x-log:yes request: {logged:?}"
+        );
+        assert_eq!(
+            stats.value(),
+            1,
+            "the single kept record ticks access_logs_total"
+        );
+    }
+
+    /// Drive one H2 request to `path` with the given extra request `headers`,
+    /// assert the response status, and drain the body (so the HCM reaches its
+    /// access-log dispatch before the caller samples the sink).
+    async fn h2_header_filter_roundtrip(
+        addr: std::net::SocketAddr,
+        path: &str,
+        headers: &[(&str, &str)],
+        expect: u16,
+    ) {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send_request, conn) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut builder = http::Request::builder()
+            .method("GET")
+            .uri(format!("http://any.test{path}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder.body(()).unwrap();
+        let (response_fut, _) = send_request.send_request(req, true).unwrap();
+        let resp = response_fut.await.expect("response");
+        assert_eq!(resp.status(), expect, "status for {path}");
+        let mut body = resp.into_body();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+    }
+
     /// Drive one H2 request to `path` against `addr`, assert the response
     /// status, and drain the body (so the HCM reaches its access-log dispatch
     /// before the caller samples the sink).

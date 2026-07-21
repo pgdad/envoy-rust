@@ -183,6 +183,13 @@ membership + absent-drop coverage lives in `envoy-http1` (Task 9), where
   absent+invert = KEEP (the shared-engine XOR), MEASURED-divergent from upstream
   (drops on both route+access-log), deferred to CF-72-1; pinned on BOTH the
   direct engine and the access-log `HeaderMatch` seam.
+  - **[CORRECTED at §5.2 state-3 — ADR-0151, D-3.5]:** this T9 pin used
+    `PresentMatch(true)` — the state-5 LIVE-PROBE MEASURED that mode is PARITY
+    (upstream ALSO keeps), so it mislabeled parity as divergence. Replaced by two
+    mode-scoped pins: `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream`
+    (the REAL divergence — value matcher `exact`+invert+absent → KEEP vs upstream
+    DROP = CF-72-1) + `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream`
+    (PARITY). See the §5.2 re-implementation log below.
 - **PV-5 pins** (envoy-config `pv5_name_only_...` + `pv5_treat_missing_...`):
   name-only `{name}` and `treat_missing_header_as_empty` both REJECTED fail-loud
   (inherited phase-04.2 boundary, ADR-0049), deferred to CF-72-2.
@@ -311,3 +318,102 @@ panics** (the new `header_filter.yaml` corpus seed rides the EXISTING
 (next-available ADR-0151 unspent). STATE advanced to §5 state-5; ROADMAP row `72`
 stays `in-progress` (no flip until state-6 close-out). Docs-only close (the gate
 needed no code fixups). Next: the §5 state-5 code-review.
+
+---
+
+## §5.2 STATE-3 RE-IMPLEMENTATION (`superpowers:systematic-debugging` → `test-driven-development`) — addresses `REVIEW.md` (NOT APPROVED)
+
+> Its OWN session per §5.1. `REVIEW.md` (state-5 code-review) was NOT APPROVED —
+> one Important MUST-FIX (F-1) + one Important (F-2). Per BOOTSTRAP §5.2 a review
+> with issues re-enters step 3 (implementation), so this is state-3, not a
+> re-verify. Base = the state-5 review commit `88dd2460e436f417eb935b7e15a79ab6de32c457`,
+> CI `completed`/`success` on the FULL 40-char SHA (run `29789909864`). `git
+> fetch` showed no sibling had advanced. **NO runtime code change** — F-1/F-2/F-3
+> are test-accuracy + coverage + documentation fixes on already-correct,
+> already-MEASURED behavior; TDD's RED step is honored via **mutation checks**
+> (each new/corrected pin is proven non-vacuous by breaking the underlying
+> engine/threading and watching the pin go RED, then reverting).
+
+### F-1 — [Important MUST-FIX] the PV-4 divergence pin exercised the NON-divergent mode — DONE
+
+The state-4 pin `pv4_absent_plus_invert_is_kept_inherited_shared_engine_boundary`
+(`matcher.rs:397`) used `PresentMatch(true)` and labeled it "diverges from
+upstream — CF-72-1". The state-5 LIVE-PROBE MEASURED that `present_match`+invert+
+absent is **PARITY** (upstream ALSO keeps); only a VALUE matcher (`exact`/`prefix`/
+`suffix`/`safe_regex`/`range`/`string_match`)+invert+absent diverges (envoy-rust
+KEEP vs upstream DROP). Fix:
+
+- **Replaced the mislabeled pin with two mode-scoped pins** (`matcher.rs`):
+  - `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream` — `exact`+
+    invert+absent → KEEP, commented as MEASURED-divergent (upstream DROPS) =
+    CF-72-1, on BOTH the direct engine and the `HeaderMatch` seam.
+  - `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream` —
+    `present_match`+invert+absent → KEEP, commented as PARITY (upstream keeps too);
+    a future CF-72-1 fixer MUST preserve this KEEP.
+  - The `header_match_trait_delegates_to_inherent_engine` invert leg now exercises
+    the VALUE-matcher divergence through the trait object (was `PresentMatch`).
+- **TDD RED-equivalent (mutation check):** applied the exact naive uniform
+  CF-72-1 "fix" the review warns about (`if value.is_none() && invert_match {
+  return false; }` at `matcher.rs:51`) with a FORCED rebuild (`Compiling
+  envoy-config` confirmed — memory `mutation-check-needs-forced-rebuild`). BOTH
+  new pins went **RED** — proving non-vacuity AND that the parity pin catches the
+  mode-breaking fix (its exact purpose). Reverted → both GREEN (`34 passed`).
+- **Docs:** fired **ADR-0151** (the corrected mode-scoped characterization — does
+  NOT supersede ADR-0149, whose decision stands; only its CF-72-1 *characterization*
+  is refined). Rewrote `BEHAVIOR_CONTRACT.md` §C to the mode-dependent truth.
+  Strike-corrected the historical `PLAN.md` PV-4 note + the T9 pin note above
+  (D-3.5). **CF-72-1 re-scoped** to "value-based matcher + invert + absent".
+- **NO runtime code change** — envoy-rust's value-matcher absent+invert = KEEP
+  stays the correctly-scoped CF-72-1 boundary; fixture `0078` (non-inverted) is
+  unaffected.
+
+### F-2 — [Important] H2 `header_filter` header-slice threading was UNASSERTED — DONE
+
+`crates/envoy-http2/src/hcm.rs:1138` threads `&envoy_req.headers` into the widened
+`should_log`, but no H2 test exercised `header_filter` keep/drop. Added
+`h2_header_filter_keeps_match_drops_mismatch_and_absent` (mirrors
+`h2_response_flag_filter_suppresses_no_flag`): a `LogFilter::Header { exact "yes"
+on x-log }` sink KEEPS `GET /x` with `x-log: yes` (1 line, `access_logs_total`
+ticks) and DROPS both present-mismatch (`x-log: no`) and absent-header requests
+(0 lines). A small `h2_header_filter_roundtrip` helper drives H2 requests with
+custom headers.
+
+- **TDD RED-equivalent (mutation check):** replaced `&envoy_req.headers` with
+  `&[]` at the H2 emit gate (forced rebuild confirmed) → the test went **RED**
+  (keep leg dropped: log `""`), proving it genuinely exercises the threaded slice
+  (F-2's exact concern). Reverted → GREEN (`1 passed`).
+- The full H2 differential fixture stays deferred = **M71-6** (unchanged).
+
+### F-3 — [Minor, opportunistic] multi-sink mixed-filter composition (M71-5) — DONE
+
+Added `two_sinks_with_mixed_filters_gate_independently` (`envoy-http1` hcm.rs):
+one HCM with TWO file sinks — sink A `header_filter { exact "yes" on x-log }`,
+sink B `status_code_filter { EQ 200 }`. Three `GET /x` requests (all → 200) drive
+sink A to KEEP only the 1 matching request and sink B to KEEP all 3 — the exact
+shape the state-5 LIVE-PROBE MEASURED byte-exact parity for (REVIEW.md Probe 1).
+The 1-vs-3 line-count distinction pins per-sink independence (no cross-sink
+leakage of the `req.headers` slice). **Closes M71-5** (was a live carry-forward).
+GREEN (`1 passed`).
+
+### F-4 — [Minor] stale "two arms" comment — DONE
+
+`crates/envoy-config/src/bootstrap.rs:5169` now reads "three arms (phase 72 added
+`header_filter`)".
+
+### F-5 / F-6 — no action (per REVIEW.md)
+
+F-5 (safe_regex/range through the access-log seam) is transitively covered (the
+inherent engine + the proven trait delegation); F-6 (SPEC/PLAN pre-change
+`H=%REQ(X-LOG)%` format string) is expected historical planning drift. Neither
+requires a change.
+
+### Local verification (before commit; the AUTHORITATIVE full §7.5 gate is the SEPARATE state-4 re-verification)
+
+- `cargo test -p envoy-config` (F-1 pins) — GREEN.
+- `cargo test -p envoy-http2` (F-2) — GREEN.
+- `cargo test -p envoy-http1` (F-3) — GREEN.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` + `cargo
+  fmt --all -- --check` — clean (outputs at commit time).
+
+Next: the §5 state-4 RE-VERIFICATION (re-run the full §7.5 gate — its OWN session
+per §5.1). ROADMAP row `72` stays `in-progress`.

@@ -5166,8 +5166,9 @@ fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::Conf
         if let Some(filter) = &mut entry.filter {
             // Phase 71 (M70-R1): destructure ALL arms so a future arm cannot be
             // added without updating this count (no `..` — the compiler forces
-            // it). With two arms the `> 1` (both-set) branch is now REACHABLE:
-            // upstream rejects a `filter` carrying both arms (ADR-0145 R-0.3).
+            // it). With three arms (phase 72 added `header_filter`) the `> 1`
+            // (more-than-one-set) branch is REACHABLE: upstream rejects a
+            // `filter` carrying multiple arms (ADR-0145 R-0.3).
             let AccessLogFilter {
                 status_code_filter,
                 response_flag_filter,

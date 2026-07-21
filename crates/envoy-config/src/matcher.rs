@@ -394,28 +394,59 @@ mod tests {
     }
 
     #[test]
-    fn pv4_absent_plus_invert_is_kept_inherited_shared_engine_boundary() {
-        // MEASURED (ADR-0149): upstream DROPS absent+invert on BOTH the route AND
-        // access-log paths. The in-tree shared engine (matcher.rs:51) does an
-        // UNCONDITIONAL `mode_result ^ invert_match`, so absent+invert = KEEP.
-        // This pins that INHERITED phase-04.2 boundary (shared with route
-        // matching); fixing it is carry-forward CF-72-1 (a cross-cutting
-        // route+access-log change), NOT phase 72. The access-log `header_filter`
-        // reuses this engine verbatim via the `HeaderMatch` impl, so the same
-        // divergence applies there; the opener fixture 0078 uses a NON-inverted
-        // matcher and does not exercise it. See `invert_match_inverts_present_match_result`.
-        let hm = hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true));
-        // Direct engine:
+    fn pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream() {
+        // MEASURED (ADR-0151; phase-72 §5 state-5 LIVE-PROBE, envoy-rust DEBUG
+        // `envoy-bin` vs. `envoyproxy/envoy:v1.33.0`, port-mapped): a VALUE-based
+        // matcher (exact/prefix/suffix/regex/range/string_match) with
+        // `invert_match` + an ABSENT header DIVERGES — envoy-rust KEEPS, upstream
+        // DROPS. Upstream treats a missing header as an unconditional value
+        // no-match that `invert_match` does NOT resurrect; the in-tree shared
+        // engine (matcher.rs:51) applies `mode_result ^ invert_match` UNIFORMLY,
+        // so absent (mode_result=false) XOR invert(true) = KEEP. This pins that
+        // INHERITED phase-04.2 boundary (shared with ROUTE header matching);
+        // fixing it is carry-forward CF-72-1 (a cross-cutting route+access-log
+        // change), NOT phase 72. The opener fixture 0078 uses a NON-inverted
+        // matcher and does not exercise it. Contrast the PARITY companion
+        // `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream`.
+        let hm = hm_inverted("x-log", HeaderMatcherMode::ExactMatch("yes".into()));
+        // Direct engine (route path):
         assert!(
             hm.matches(&[]),
-            "in-tree engine keeps absent+invert (diverges from upstream — CF-72-1)"
+            "in-tree engine keeps value-matcher absent+invert (upstream DROPS — CF-72-1)"
         );
         // Same divergence through the access-log `HeaderMatch` seam:
+        let via_trait: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> = std::sync::Arc::new(
+            hm_inverted("x-log", HeaderMatcherMode::ExactMatch("yes".into())),
+        );
+        assert!(
+            via_trait.matches(&[]),
+            "access-log path keeps value-matcher absent+invert too (upstream DROPS — CF-72-1)"
+        );
+    }
+
+    #[test]
+    fn pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream() {
+        // MEASURED (ADR-0151; phase-72 §5 state-5 LIVE-PROBE both proxies):
+        // `present_match` (the PRESENCE mode, NOT a value matcher) with
+        // `invert_match` + an ABSENT header is PARITY — envoy-rust AND upstream
+        // BOTH KEEP. Upstream's present-check is `false` for a missing header and
+        // `invert_match` DOES flip it (→ KEEP); the in-tree engine's `false ^
+        // true` also KEEPs. This mode does NOT diverge. A future CF-72-1 fixer
+        // MUST PRESERVE this KEEP — a naive uniform-DROP "fix" of the shared
+        // engine would BREAK this parity case and introduce a NEW divergence.
+        // Contrast the value-matcher divergence pin
+        // `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream`.
+        let hm = hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true));
+        assert!(
+            hm.matches(&[]),
+            "present_match absent+invert = KEEP on BOTH proxies (PARITY, not a divergence)"
+        );
+        // Same result through the access-log `HeaderMatch` seam.
         let via_trait: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> =
             std::sync::Arc::new(hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true)));
         assert!(
             via_trait.matches(&[]),
-            "access-log path keeps absent+invert too (CF-72-1)"
+            "access-log present_match absent+invert = KEEP (PARITY)"
         );
     }
 
@@ -428,10 +459,13 @@ mod tests {
         assert!(m.matches(&[h("x-log", "yes")]));
         assert!(!m.matches(&[h("x-log", "no")]));
         assert!(!m.matches(&[])); // absent → drop
-        // invert preserves PV-4 (absent+invert = KEEP, engine XOR).
-        let inv: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> =
-            std::sync::Arc::new(hm_inverted("x-log", HeaderMatcherMode::PresentMatch(true)));
-        assert!(inv.matches(&[])); // absent + invert = keep (shared engine XOR)
+        // invert preserves PV-4 through the seam: a VALUE matcher + invert +
+        // absent = KEEP (shared-engine XOR); upstream DROPS this — CF-72-1. See
+        // `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream`.
+        let inv: std::sync::Arc<dyn envoy_accesslog::HeaderMatch> = std::sync::Arc::new(
+            hm_inverted("x-log", HeaderMatcherMode::ExactMatch("yes".into())),
+        );
+        assert!(inv.matches(&[])); // value-matcher absent + invert = keep (upstream DROPS — CF-72-1)
     }
 
     #[test]
