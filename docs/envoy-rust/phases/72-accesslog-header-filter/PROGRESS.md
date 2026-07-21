@@ -417,3 +417,90 @@ requires a change.
 
 Next: the §5 state-4 RE-VERIFICATION (re-run the full §7.5 gate — its OWN session
 per §5.1). ROADMAP row `72` stays `in-progress`.
+
+---
+
+## §5.2 STATE-4 RE-VERIFICATION (`superpowers:verification-before-completion`) — GREEN
+
+> The AUTHORITATIVE full §7.5 gate re-run after the §5.2 state-3 re-implementation,
+> in its OWN session per §5.1 (the state-3 re-implementation ran only per-crate
+> local checks, NOT the gate). Base = the §5.2 state-3 re-implementation head commit
+> `b45ed9707c24a3ee8cdbd74bf6508c6a25e3c382`, CI-confirmed `completed`/`success` on
+> the FULL 40-char SHA (run `29791885514`, 7m41s). `git fetch` showed no sibling had
+> advanced; tree clean. DEBUG `envoy-bin` rebuilt FIRST (memory
+> `differential-harness-uses-debug-envoy-bin`; exit 0). Outputs quoted below (full
+> output redirected to files, never `tail` — memory
+> `never-pipe-verification-runs-through-tail`). The re-implementation added 3 net
+> tests (envoy-config net +1 mode-scoped PV-4 pins, envoy-http1 +1 F-3 multi-sink,
+> envoy-http2 +1 F-2 H2) and NO runtime code change.
+
+**Gate (e) — workspace static checks — all CLEAN (exit 0):**
+
+- `cargo fmt --all -- --check` → **exit 0** (no diff).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` → **exit 0**
+  (`Finished \`dev\` profile … in 0.10s`; zero warnings).
+- `cargo build --workspace --all-targets` → **exit 0**.
+- `cargo deny check` → **exit 0** — `advisories ok, bans ok, licenses ok, sources ok`
+  (the standing `Zlib` unmatched-license-allowance NOTE is a pre-existing
+  informational warning, not a failure).
+
+**Gate (e) — `cargo test --workspace --no-fail-fast` — adjudicated GREEN** (memory
+`local-red-set-varies-run-to-run` + `never-pipe-verification-runs-through-tail`;
+full output redirected, never `tail`):
+
+```
+2059 passed; 6 failed  (exit 101)
+```
+
+All **6 REDs are documented host-flakes** — CI-authoritative, NOT regressions; none
+touch the `header_filter` surface. Each adjudicated by signature and/or isolation
+naming the target binary (memory `cargo-test-p-name-false-green-filtered-out`):
+
+| Failing test | Documented family | Isolation / signature verdict |
+|---|---|---|
+| `access_log_rcd_upstream_reset` | `tcpclosebackend-ipv6-unreachable-host-flake` | deterministic environmental RED — real Envoy `rf:UF` `remote_address:[fdc4:f303:9324::254]` `immediate_connect_error:_Network_is_unreachable`; envoy-rust `rf:UC` `connection_termination` |
+| `access_log_rf_upstream_reset` | `tcpclosebackend-ipv6-unreachable-host-flake` | same IPv6-unreachable root cause (`rf:UF` vs `rf:UC`) |
+| `access_log_h2_rcd_upstream_reset` | `tcpclosebackend-ipv6-unreachable-host-flake` | same (H2 close-backend, `[fdc4:f303:9324::254]`) |
+| `access_log_h2_uc_upstream_reset` | `tcpclosebackend-ipv6-unreachable-host-flake` | same (H2 close-backend, `rf:UF` vs `rf:UC`) |
+| `admin_config_dump_server_info` (differential) | `differential-host-bridge-ip-192-168-65-2` | deterministic environmental RED — `/clusters` envoy-only per-host stats `backend::192.168.65.2:PORT::…` (this host's bridge IP, not allow-listed). The **in-process** sibling `admin_config_dump_server_info_in_process` PASSED. |
+| `admin_ready_returns_200_post_migration` (envoy-bin) | `local-red-set-varies-run-to-run` / parallel-load flake | `WouldBlock` (EAGAIN, `Os { code: 11 }`) on the client `/ready` read under full parallel load; **flips GREEN in isolation** (`cargo test -p envoy-bin --test admin_ready` → exit 0, `1 passed`). |
+
+Cross-check (memory `local-red-set-varies-run-to-run`): local `2059 passed + 6
+failed = 2065`; the prior state-4 gate had `2056 passed + 6 failed = 2062`, and the
+§5.2 re-implementation added exactly 3 net tests → `2065`. CI is `success` on this
+exact SHA (all pass in CI's env) → `local passed+failed == CI passed` = `2065`.
+Consistent. (Note the local RED **set** varied from state-4's — `admin_ready_…` and
+`wait_accept_ready_…` swapped as the parallel-load member; both flip GREEN in
+isolation, per the documented flake behavior.)
+
+**Gate (a) — new/changed differential fixtures — GREEN (isolation):** NO new fixture
+this state-3 re-implementation (F-1..F-4 are in-process tests + docs). Re-confirmed:
+
+- `access_log_header_filter` (**fixture 0078**, the header_filter witness) →
+  **exit 0** (`test result: ok. 1 passed`).
+- `access_log_response_flag_filter` (**0076 dropped-LAST / 0077 kept-LAST**, the
+  CF-71-1-touched pair) → **exit 0** (`1 passed`).
+
+**Gate (b) — pre-existing differentials still green:** the full-suite run above
+(2059 passed) IS the pre-existing suite; no runtime code changed this state-3, and
+the only REDs are the 6 documented host-flakes.
+
+**Gate (c) — conformance at threshold:** NO protocol-conformance surface this phase;
+`tests/conformance/h2spec/known-failures.txt` UNTOUCHED (still at commit `dac3f8b`,
+tree clean — memory `h2spec-3-5-2-preface-host-sensitive`). CI job `build + test +
+lint` (which runs conformance) = `success` on `b45ed97`.
+
+**Gate (d) — fuzz short-budget run — CLEAN:** `cd crates/envoy-config && cargo
++nightly fuzz run parse_bootstrap -- -max_total_time=30` → **exit 0** — `Done 50957
+runs in 94 second(s)`, `cov: 16414`, **no crashes / no leaks / no panics** (the
+`header_filter.yaml` corpus seed rides the EXISTING `parse_bootstrap` target — NO
+new target, NO ci.yml edit).
+
+**Gate (f) — `REVIEW.md`:** NOT this session — that is the §5 state-5 RE-REVIEW (a
+SEPARATE session per §5.1).
+
+**Verdict:** the phase-72 §5 gate is **GREEN** after the §5.2 state-3
+re-implementation. No MEASURED surprise → no new ADR (next-available ADR-0152
+unspent). STATE advanced to §5 state-5 RE-REVIEW; ROADMAP row `72` stays
+`in-progress` (no flip until state-6 close-out). Docs-only close (the gate needed no
+code fixups). Next: the §5 state-5 RE-REVIEW.
