@@ -200,3 +200,117 @@ docs, and fire **ADR-0151** (the corrected mode-scoped PV-4 divergence). F-3/F-4
 optional. NO runtime behavior change — the value-matcher `absent+invert`
 divergence stays the correctly-scoped CF-72-1 boundary; the fix is to pin and
 document it ACCURATELY. ROADMAP row `72` stays `in-progress`.
+
+---
+
+# Phase 72 — access-log `header_filter` — §5 state-5 RE-REVIEW (2nd pass)
+
+> `superpowers:requesting-code-review`, run in its OWN session per §5.1. Re-reviews
+> the §5.2 state-3 re-implementation's fixes to F-1/F-2/F-3/F-4 (commit `b45ed97`,
+> diff `9529a91..b45ed97`) on top of the original phase-72 diff. Base = the §5.2
+> state-4 re-verification commit `3c05ef5fbcc7f5715f3dae960ad1297b4e8bd43d`, CI
+> `completed`/`success` on the FULL 40-char SHA (run `29847854909`). The prior
+> state-5 review above (NOT APPROVED) is preserved verbatim as a phase artifact.
+
+## Verdict: **APPROVED** — F-1 (MUST-FIX) + F-2 + F-3 + F-4 all resolved; no new findings; STATE → §5 state-6 close-out
+
+The §5.2 state-3 re-implementation changed **NO runtime code** (confirmed: the
+only non-test change is the `bootstrap.rs:5169` "two arms → three arms" comment;
+every other hunk is inside a `mod tests` / `#[tokio::test]` block). It corrects the
+test surface and docs to the MEASURED mode-scope of the headline PV-4 divergence,
+adds the two missing coverage pins, and fixes the stale comment. Every finding the
+prior review raised is resolved; re-verification surfaced no new Important or
+Critical issue. Per BOOTSTRAP §5 a review APPROVED advances to step 6 — a SEPARATE
+close-out session. ROADMAP row `72` stays `in-progress` until that close-out.
+
+---
+
+## Re-verification (MEASURED / first-hand this session)
+
+### F-1 — [was Important MUST-FIX] → **RESOLVED**
+
+The mislabeled `pv4_absent_plus_invert_is_kept_inherited_shared_engine_boundary`
+pin (which used `PresentMatch(true)` and documented that PARITY case as the
+divergence) is **replaced** — not merely supplemented — by two mode-scoped pins in
+`crates/envoy-config/src/matcher.rs`. Verified `grep -rn` for the old pin name over
+`crates/` returns **0 hits** (it survives only in historical narrative: the PROGRESS
+re-impl log, ADR-0151's description of what it corrected, the prior REVIEW finding,
+and the D-3.5-strike-corrected PLAN §2 example — all correct).
+
+- `pv4_value_matcher_absent_plus_invert_kept_diverges_from_upstream` — uses
+  `ExactMatch("yes")` + `invert` + ABSENT, asserts KEEP on **both** the direct
+  engine and the `Arc<dyn HeaderMatch>` seam, commented as the MEASURED divergence
+  (upstream DROPS) = CF-72-1.
+- `pv4_present_match_absent_plus_invert_kept_is_parity_with_upstream` — uses
+  `PresentMatch(true)` + `invert` + ABSENT, asserts KEEP, commented as PARITY (a
+  future CF-72-1 fixer MUST preserve this KEEP).
+
+**Engine trace (first-hand):** `matcher.rs:21-52` computes `mode_result` then
+`mode_result ^ invert_match` UNIFORMLY. For an absent header both `ExactMatch`
+(`value == Some(..)` → `false`) and `PresentMatch(true)` (`value.is_some()` →
+`false`) give `mode_result = false`, so `false ^ true = KEEP` in both modes — the
+pins encode exactly what the engine does. Ran the two pins first-hand:
+`cargo test -p envoy-config --lib matcher::tests::pv4` → `2 passed; 0 failed`.
+
+**Decisive mutation check (first-hand, scratch worktree, forced rebuild
+`Compiling envoy-config` observed — memory `mutation-check-needs-forced-rebuild` +
+`mutation-checks-collide-with-parallel-subagents`):** applied the exact naive
+uniform-DROP "fix" the prior review warned about
+(`if value.is_none() && self.invert_match { return false; }` at `matcher.rs:51`) →
+**BOTH pins went RED** (`0 passed; 2 failed`). This is the crux: it proves the pins
+are non-vacuous AND that the `present_match` PARITY pin is precisely the guard that
+catches the mode-breaking uniform-DROP fix. Reverted (worktree removed); main tree
+clean. The measured mode-dependence independently matches memory
+`envoy-headermatcher-invert-absent-is-mode-dependent`, so no fresh docker LIVE-PROBE
+was needed — the finding is corroborated three ways (prior-review Probe 2,
+this session's engine trace + mutation, and standing memory).
+
+`ADR-0151` (CORRECTS, does not supersede, ADR-0149), `BEHAVIOR_CONTRACT.md` §C
+(lines ~2357-2377), the PLAN §2 strike-correction, PROGRESS, and STATE all state
+the mode-dependent truth consistently; CF-72-1 is re-scoped to the value-matcher
+case everywhere it appears.
+
+### F-2 — [was Important] → **RESOLVED**
+
+`h2_header_filter_keeps_match_drops_mismatch_and_absent` (envoy-http2 `hcm.rs`)
+drives real H2 roundtrips through `spawn_h2_hcm`, so it exercises the threaded
+`&envoy_req.headers` end-to-end (not a synthetic `should_log` call): KEEP on
+`x-log: yes`, DROP on present-mismatch (`x-log: no`) AND absent, with
+`access_logs_total` asserted 1 vs 0. PROGRESS documents the RED-via-mutation
+(replacing `&envoy_req.headers` with `&[]` drops the keep leg). The full H2
+differential remains deferred = M71-6 (unchanged, correct).
+
+### F-3 — [was Minor] → **RESOLVED, closes M71-5**
+
+`two_sinks_with_mixed_filters_gate_independently` (envoy-http1 `hcm.rs`) pins
+per-sink independence (sink A `header_filter` keeps 1, sink B `status_code_filter`
+keeps 3) — the exact shape the prior review's Probe 1 MEASURED byte-exact parity
+for. M71-5 marked CLOSED consistently in STATE/DECISIONS/PROGRESS.
+
+### F-4 — [was Minor] → **RESOLVED**
+
+`bootstrap.rs:5169` now reads "three arms (phase 72 added `header_filter`)".
+
+### F-5 / F-6 — no action (correct)
+
+F-5 (safe_regex/range through the seam) stays transitively covered; F-6 (stale
+SPEC/PLAN `H=%REQ(X-LOG)%`) is expected historical planning drift, and the PLAN PV-4
+note carries a proper D-3.5 strike-correction. Neither needs a change.
+
+## Standing invariants re-checked (all held)
+
+- No runtime behavior change; the ADR-0150 trait-object seam is untouched
+  (`LogFilter::Header` still carries `Arc<dyn HeaderMatch>`; no `Eq`/`PartialEq`).
+- Fixture `0078` (non-inverted) is unaffected; the 32 access-log fixtures and
+  `known-failures.txt` are undisturbed.
+- The §5.2 state-4 re-verification §7.5 gate was GREEN (2059 passed / 6 documented
+  host-flakes, none touching `header_filter`; CI `success` on the base SHA) — trusted
+  per the review/verify separation, not re-run this session.
+
+## Disposition
+
+**APPROVED.** Advance to **§5 state-6 close-out** (a SEPARATE session per §5.1 +
+memory `closeout-and-pick-are-separate-sessions`): flip ROADMAP row `72` → `done`,
+relocate the phase-72 Notes, STATE → awaiting next planning. No re-entry to state-3.
+No new ADR (next-available ADR-0152 unspent). ROADMAP row `72` stays `in-progress`
+until the close-out.
