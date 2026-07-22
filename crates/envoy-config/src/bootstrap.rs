@@ -13309,8 +13309,7 @@ or_filter: null
             }),
             ..AccessLogFilter::default()
         };
-        let err =
-            validate_access_logs(&mut file_log_with_filter(f)).expect_err("nested bad leaf");
+        let err = validate_access_logs(&mut file_log_with_filter(f)).expect_err("nested bad leaf");
         assert!(matches!(err, crate::ConfigError::EmptyHeaderName));
     }
 
