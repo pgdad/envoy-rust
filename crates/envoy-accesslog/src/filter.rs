@@ -54,6 +54,12 @@ pub enum LogFilter {
     Header {
         matcher: Arc<dyn HeaderMatch>,
     },
+    /// Phase 73: emit iff ALL nested child predicates match (`and_filter`).
+    /// Recurses through `Vec<LogFilter>` (NO `Box`). Introduces no `Eq`/`PartialEq`
+    /// and no `envoy-config` dep (ADR-0150 holds).
+    And(Vec<LogFilter>),
+    /// Phase 73: emit iff ANY nested child predicate matches (`or_filter`).
+    Or(Vec<LogFilter>),
 }
 
 impl LogFilter {
@@ -92,6 +98,16 @@ impl LogFilter {
             // `mode_result ^ invert_match` is preserved because the injected impl
             // calls `HeaderMatcher::matches` verbatim.
             LogFilter::Header { matcher } => matcher.matches(headers),
+            // Phase 73: boolean composition over the nested predicates. The
+            // config validator's `min_items = 2` makes the empty-vec edge
+            // (all→true, any→false) unreachable at runtime; the semantics are
+            // pinned in-process regardless.
+            LogFilter::And(filters) => filters
+                .iter()
+                .all(|f| f.should_log(status, response_flags, headers)),
+            LogFilter::Or(filters) => filters
+                .iter()
+                .any(|f| f.should_log(status, response_flags, headers)),
         }
     }
 }
@@ -130,6 +146,32 @@ mod tests {
         assert!(!ge(500).should_log(499, "-", &[]));
         assert!(ge(500).should_log(500, "-", &[]));
         assert!(ge(500).should_log(503, "-", &[]));
+    }
+
+    #[test]
+    fn and_or_should_log_all_any_and_empty_boundary() {
+        // AND = all children match; OR = any child matches. Uses status-code
+        // children (ge/le) so the test needs no header stub.
+        let and = LogFilter::And(vec![ge(200), le(299)]); // 2xx band
+        assert!(and.should_log(200, "-", &[])); // both true
+        assert!(and.should_log(299, "-", &[]));
+        assert!(!and.should_log(500, "-", &[])); // le(299) false → AND false
+
+        let or = LogFilter::Or(vec![le(199), ge(500)]); // 1xx OR 5xx
+        assert!(or.should_log(100, "-", &[])); // le(199) true
+        assert!(or.should_log(503, "-", &[])); // ge(500) true
+        assert!(!or.should_log(200, "-", &[])); // neither → OR false
+
+        // Nested composition recurses.
+        let nested = LogFilter::Or(vec![LogFilter::And(vec![ge(200), le(299)]), ge(500)]);
+        assert!(nested.should_log(204, "-", &[])); // AND-child true
+        assert!(nested.should_log(500, "-", &[])); // leaf true
+        assert!(!nested.should_log(404, "-", &[])); // AND-child false, leaf false
+
+        // Empty-vec boundary (unreachable via config's min_items=2, pinned as a
+        // semantic invariant): all([]) = true, any([]) = false.
+        assert!(LogFilter::And(vec![]).should_log(200, "-", &[]));
+        assert!(!LogFilter::Or(vec![]).should_log(200, "-", &[]));
     }
 
     #[test]
