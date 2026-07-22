@@ -1736,19 +1736,23 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize
     Ok(seen.unwrap_or(0))
 }
 
-/// Phase 70/71/72 — translate a config-side `AccessLogFilter` into the runtime
+/// Phase 70/71/72/73 — translate a config-side `AccessLogFilter` into the runtime
 /// `LogFilter` predicate the sink evaluates per record. The envoy-config
 /// validator (`validate_access_logs`) already enforced that exactly one oneof
 /// arm is set, so the 0/multi-arm cases are `unreachable!` (CF-70-1: the
-/// zero-arm `expect()` is gone). Three arms ship: `status_code_filter` (phase
-/// 70), `response_flag_filter` (phase 71), and `header_filter` (phase 72).
+/// zero-arm `expect()` is gone). Five arms ship: `status_code_filter` (phase
+/// 70), `response_flag_filter` (phase 71), `header_filter` (phase 72), and the
+/// recursive `and_filter`/`or_filter` composition arms (phase 73), which map
+/// each nested child via `.iter().map(compile_access_log_filter)`.
 fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accesslog::LogFilter {
     match (
         &f.status_code_filter,
         &f.response_flag_filter,
         &f.header_filter,
+        &f.and_filter,
+        &f.or_filter,
     ) {
-        (Some(scf), None, None) => {
+        (Some(scf), None, None, None, None) => {
             let op = match scf.comparison.op {
                 envoy_config::ComparisonOp::Eq => envoy_accesslog::FilterOp::Eq,
                 envoy_config::ComparisonOp::Ge => envoy_accesslog::FilterOp::Ge,
@@ -1761,15 +1765,22 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
                 threshold: scf.comparison.value.default_value,
             })
         }
-        (None, Some(rff), None) => envoy_accesslog::LogFilter::ResponseFlag {
+        (None, Some(rff), None, None, None) => envoy_accesslog::LogFilter::ResponseFlag {
             flags: rff.flags.clone(),
         },
         // Phase 72 (ADR-0150): box the config `HeaderMatcher` into the injected
         // `HeaderMatch` seam. The validator already compiled its SafeRegex, so
         // the runtime `matches` never hits its `.expect()`.
-        (None, None, Some(hf)) => envoy_accesslog::LogFilter::Header {
+        (None, None, Some(hf), None, None) => envoy_accesslog::LogFilter::Header {
             matcher: std::sync::Arc::new(hf.header.clone()),
         },
+        // Phase 73: the two composition arms map each child recursively.
+        (None, None, None, Some(af), None) => envoy_accesslog::LogFilter::And(
+            af.filters.iter().map(compile_access_log_filter).collect(),
+        ),
+        (None, None, None, None, Some(of)) => envoy_accesslog::LogFilter::Or(
+            of.filters.iter().map(compile_access_log_filter).collect(),
+        ),
         _ => unreachable!("validated by validate_access_logs: exactly one filter arm is set"),
     }
 }
@@ -4763,6 +4774,75 @@ static_resources:
         assert!(compiled.should_log(200, "-", &[("x-log".into(), "yes".into())]));
         assert!(!compiled.should_log(200, "-", &[("x-log".into(), "no".into())]));
         assert!(!compiled.should_log(200, "-", &[])); // absent → drop
+    }
+
+    /// Phase 73 T4: `compile_access_log_filter` builds the `and_filter`/`or_filter`
+    /// arms recursively. The and-fixture (0079) keeps only the both-match probe;
+    /// the depth-2 or-fixture (0080) keeps the AND-child-true and the leaf-true
+    /// probes and drops the rest.
+    #[test]
+    fn compile_access_log_filter_builds_composition_arms_recursively() {
+        let hdr = |name: &str, val: &str| envoy_config::AccessLogFilter {
+            status_code_filter: None,
+            response_flag_filter: None,
+            header_filter: Some(envoy_config::HeaderFilter {
+                header: envoy_config::HeaderMatcher {
+                    name: name.into(),
+                    mode: envoy_config::HeaderMatcherMode::ExactMatch(val.into()),
+                    invert_match: false,
+                },
+            }),
+            and_filter: None,
+            or_filter: None,
+        };
+
+        // and_filter { [x-a=1, x-b=1] } → LogFilter::And([Header, Header]).
+        let and = envoy_config::AccessLogFilter {
+            status_code_filter: None,
+            response_flag_filter: None,
+            header_filter: None,
+            and_filter: Some(envoy_config::AndFilter {
+                filters: vec![hdr("x-a", "1"), hdr("x-b", "1")],
+            }),
+            or_filter: None,
+        };
+        let compiled = compile_access_log_filter(&and);
+        assert!(matches!(compiled, envoy_accesslog::LogFilter::And(ref v) if v.len() == 2));
+        let a = [("x-a".to_string(), "1".to_string())];
+        let ab = [
+            ("x-a".to_string(), "1".to_string()),
+            ("x-b".to_string(), "1".to_string()),
+        ];
+        assert!(!compiled.should_log(200, "-", &a)); // only x-a → AND false → drop
+        assert!(compiled.should_log(200, "-", &ab)); // both → AND true → keep
+
+        // or_filter { [ and_filter{[x-a,x-b]}, header{x-c} ] } (depth-2).
+        let or = envoy_config::AccessLogFilter {
+            status_code_filter: None,
+            response_flag_filter: None,
+            header_filter: None,
+            and_filter: None,
+            or_filter: Some(envoy_config::OrFilter {
+                filters: vec![
+                    envoy_config::AccessLogFilter {
+                        status_code_filter: None,
+                        response_flag_filter: None,
+                        header_filter: None,
+                        and_filter: Some(envoy_config::AndFilter {
+                            filters: vec![hdr("x-a", "1"), hdr("x-b", "1")],
+                        }),
+                        or_filter: None,
+                    },
+                    hdr("x-c", "1"),
+                ],
+            }),
+        };
+        let compiled = compile_access_log_filter(&or);
+        assert!(matches!(compiled, envoy_accesslog::LogFilter::Or(ref v) if v.len() == 2));
+        let c = [("x-c".to_string(), "1".to_string())];
+        assert!(compiled.should_log(200, "-", &ab)); // AND-child true → OR keep
+        assert!(compiled.should_log(200, "-", &c)); // leaf true → OR keep
+        assert!(!compiled.should_log(200, "-", &a)); // AND-child false, leaf false → drop
     }
 
     /// Phase 72 T9 (SPEC §2.1 item 5): `header_filter` membership across the
