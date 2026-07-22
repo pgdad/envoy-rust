@@ -2398,6 +2398,54 @@ the FILTER. Pure cross-proxy equality on the kept line AND the dropped absence.
 
 ---
 
+### Phase 73 (ADR-0152/0153): `and_filter` / `or_filter` — the FOURTH & FIFTH emission-gate arms (recursive composition)
+
+> Fixtures `0079-accesslog-and-filter` + `0080-accesslog-or-filter` (depth-2).
+> `filter: { and_filter: { filters: [<AccessLogFilter>, …] } }` (and `or_filter`
+> likewise) gates a sink: a record is emitted iff **all** (`and_filter`) / **any**
+> (`or_filter`) of the nested child predicates match (MEASURED, graceful-stop
+> flush, `envoyproxy/envoy:v1.33.0`).
+
+**§A Schema.** `and_filter`/`or_filter` are `{ filters: repeated AccessLogFilter }`.
+`filters` is PGV `min_items = 2` — fewer than 2 (including empty `and_filter: {}`
+→ `filters: []`) is fail-loud (envoy-rust: `ConfigError::InsufficientCompositeFilters`;
+upstream: `AndFilterValidationError.Filters: value must contain at least 2 item(s)`).
+Children may be ANY `AccessLogFilter` — a leaf (`status_code_filter`/
+`response_flag_filter`/`header_filter`) OR another composition — to arbitrary
+depth (NO depth guard, matching upstream; carry-forward CF-73-1).
+
+**§B Decision.** Compiled to `LogFilter::And(Vec<LogFilter>)` /
+`LogFilter::Or(Vec<LogFilter>)`; the runtime gate is `filters.iter().all(…)` /
+`filters.iter().any(…)` over the same `should_log(status, response_flags, headers)`
+already threaded at the HCM emit gates (no signature change). Both the config
+`AccessLogFilter` and the runtime `LogFilter` recurse through `Vec<_>` (NO `Box`);
+the runtime variants introduce NO `Eq`/`PartialEq` and NO `envoy-config`
+dependency (ADR-0150 holds). Validation recurses via `validate_access_log_filter`
+(the extracted `&mut` helper): the min-items check + a descent into every child
+(so a nested `header_filter` SafeRegex compiles in place and a nested bad leaf /
+nested under-2 composition fails-loud).
+
+**§C Mutual exclusion.** `and_filter`, `or_filter`, `header_filter`,
+`status_code_filter`, `response_flag_filter` are the five mutually-exclusive
+`AccessLogFilter` oneof arms — exactly one may be set at each level
+(`ConfigError::AmbiguousAccessLogFilter`).
+
+**§D Format-allow-list note.** As with `0078` (§F above), the fixtures render only
+`STATUS=%RESPONSE_CODE% PATH=%REQ(:PATH)%` — the composition gates on the `x-a`/
+`x-b`/`x-c` request headers (read from the raw request-header slice at the emit
+gate), but the LINE does not echo them, because envoy-rust's `%REQ(NAME)%` supports
+only an allow-list (`%REQ(X-A)%` is boot-fatal). The keep/drop line COUNT + the
+byte-identical content are the differential witnesses.
+
+**§E Authoritative fixtures.** `0079`: `and_filter{[x-a=1, x-b=1]}` — `GET /x`
+with `x-a:1` only → DROPPED, with `x-a:1 x-b:1` → KEPT (one line
+`STATUS=200 PATH=/x`). `0080` (depth-2): `or_filter{[ and_filter{[x-a,x-b]},
+header_filter{x-c} ]}` — `x-a:1` only → DROPPED, `x-a:1 x-b:1` → KEPT (AND-child
+true), `x-c:1` → KEPT (leaf true) (two lines). Both `direct_response` 200, no
+backend. Pure cross-proxy equality on the kept lines AND the dropped absences.
+
+---
+
 ## xDS wire state machine
 
 > **To be filled per-phase as needed.**
