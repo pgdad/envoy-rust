@@ -1,0 +1,34 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0079-envoy-mount/access.log
+    envoy_rust: /tmp/0079-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — DROPPED, and FIRST. Only `x-a:1` is present; `x-b` is absent →
+    # the second nested header_filter is false → AND false → the sink emits
+    # NOTHING on EITHER proxy. `expect_logged: false` removes it from the line
+    # count. (Kept-LAST is the sound convention — ADR-0147; this fixture pays the
+    # short settle because the LAST probe is KEPT.)
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "1"]
+      expected_status: 200
+      expect_logged: false
+    # Probe 2 — KEPT, and LAST. Both `x-a:1` AND `x-b:1` → AND true → the record
+    # IS emitted. Expected line (byte-identical on both sides): STATUS=200 PATH=/x
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "1"]
+        - ["x-b", "1"]
+      expected_status: 200
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line ==). Each side's file holds
+  # EXACTLY ONE line (MEASURED, SPEC §0 R-0.3, graceful-stop flush):
+  #   STATUS=200 PATH=/x
+  # Both proxies must agree on the kept `x-a:1 x-b:1` line AND the absence of any
+  # line for the AND-false `x-a:1`-only probe. The only route is a
+  # direct_response → clusters: [], no backend spawns.
