@@ -5163,13 +5163,20 @@ fn validate_retry_policy(_route: &Route) -> Result<(), crate::ConfigError> {
 ///      Empty paths surface as `ConfigError::InvalidAccessLogPath`. The
 ///      sink-side `FileSink::new` would also fail on `""`, but rejecting
 ///      at parse time gives a clearer diagnostic.
-///   3. `AccessLog.filter` (`AccessLogFilter` oneof) cardinality: when a
-///      `filter` is present it must set EXACTLY ONE arm. Zero arms (`filter: {}`)
-///      and more-than-one arm BOTH surface as
+///   3. `AccessLog.filter` (`AccessLogFilter` oneof) cardinality + per-arm
+///      checks: delegated to the recursive `validate_access_log_filter` helper
+///      below. When a `filter` is present it must set EXACTLY ONE arm. Zero arms
+///      (`filter: {}`) and more-than-one arm BOTH surface as
 ///      `ConfigError::AmbiguousAccessLogFilter { detail }` (the `detail`
-///      distinguishes the two). Phases 70/71/72 give three arms, so the
-///      more-than-one branch is REACHABLE. Cardinality lives here (mirroring the
-///      `SubstitutionFormatString` / `AmbiguousLogFormat` precedent), not serde.
+///      distinguishes the two). Phases 70/71/72/73 give FIVE arms, so the
+///      more-than-one branch is REACHABLE. Cardinality lives in the helper
+///      (mirroring the `SubstitutionFormatString` / `AmbiguousLogFormat`
+///      precedent), not serde. Phase 73's composition arms (`and_filter`/
+///      `or_filter`) additionally enforce `filters.len() >= 2`
+///      (`ConfigError::InsufficientCompositeFilters`) and RECURSE into every
+///      nested child (so a nested bad leaf / nested under-2 composition still
+///      fails-loud, and a nested `header_filter` SafeRegex still compiles in
+///      place).
 ///   4. Phase 70 — non-empty `status_code_filter.comparison.value.runtime_key`
 ///      (`ConfigError::EmptyStatusCodeFilterRuntimeKey`).
 ///   5. Phase 71 — every `response_flag_filter.flags` token is a known
@@ -5190,58 +5197,11 @@ fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::Conf
             });
         }
         if let Some(filter) = &mut entry.filter {
-            // Phase 71 (M70-R1): destructure ALL arms so a future arm cannot be
-            // added without updating this count (no `..` — the compiler forces
-            // it). With three arms (phase 72 added `header_filter`) the `> 1`
-            // (more-than-one-set) branch is REACHABLE: upstream rejects a
-            // `filter` carrying multiple arms (ADR-0145 R-0.3).
-            let AccessLogFilter {
-                status_code_filter,
-                response_flag_filter,
-                header_filter,
-                and_filter,
-                or_filter,
-            } = filter;
-            let set_arms = [
-                status_code_filter.is_some(),
-                response_flag_filter.is_some(),
-                header_filter.is_some(),
-                and_filter.is_some(),
-                or_filter.is_some(),
-            ]
-            .iter()
-            .filter(|set| **set)
-            .count();
-            if set_arms != 1 {
-                return Err(crate::ConfigError::AmbiguousAccessLogFilter {
-                    detail: if set_arms == 0 {
-                        "no filter variant is set".into()
-                    } else {
-                        "more than one filter variant is set".into()
-                    },
-                });
-            }
-            if let Some(scf) = status_code_filter
-                && scf.comparison.value.runtime_key.is_empty()
-            {
-                return Err(crate::ConfigError::EmptyStatusCodeFilterRuntimeKey);
-            }
-            if let Some(rff) = response_flag_filter {
-                for token in &rff.flags {
-                    if !RESPONSE_FLAG_TOKENS.contains(&token.as_str()) {
-                        return Err(crate::ConfigError::UnknownResponseFlag {
-                            token: token.clone(),
-                        });
-                    }
-                }
-            }
-            if let Some(hf) = header_filter {
-                // Phase 72: reuse the phase-04.2 HeaderMatcher validator verbatim
-                // — empty name → EmptyHeaderName; bad regex → InvalidRegex; bad
-                // range → InvalidInt64Range; compiles the SafeRegex in place so
-                // the runtime `matches` never hits its `.expect()`.
-                validate_header_matcher(&mut hf.header)?;
-            }
+            // Phase 73: per-filter validation (cardinality + per-leaf checks +
+            // the composition-arm min_items + recursive descent) is delegated to
+            // the recursive `validate_access_log_filter` helper below, so a
+            // nested `and_filter`/`or_filter` child is validated identically.
+            validate_access_log_filter(filter)?;
         }
         match &entry.typed_config {
             AccessLogTypedConfig::FileAccessLog(cfg) => {
@@ -5278,6 +5238,84 @@ fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::Conf
                     }
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Phase 73: recursively validate one `AccessLogFilter` oneof. Enforces exactly
+/// one arm is set (cardinality, all FIVE arms — no `..`, so a future arm cannot
+/// be added without updating this [M70-R1]), the per-leaf checks (status-code
+/// runtime_key, response-flag token membership, header-matcher compile-in-place),
+/// and — for the composition arms — `filters.len() >= 2` plus a recursive descent
+/// into every nested child (so a nested `header_filter` SafeRegex still compiles
+/// in place and a nested bad leaf / nested under-2 composition still fails-loud).
+fn validate_access_log_filter(filter: &mut AccessLogFilter) -> Result<(), crate::ConfigError> {
+    let AccessLogFilter {
+        status_code_filter,
+        response_flag_filter,
+        header_filter,
+        and_filter,
+        or_filter,
+    } = filter;
+    let set_arms = [
+        status_code_filter.is_some(),
+        response_flag_filter.is_some(),
+        header_filter.is_some(),
+        and_filter.is_some(),
+        or_filter.is_some(),
+    ]
+    .iter()
+    .filter(|set| **set)
+    .count();
+    if set_arms != 1 {
+        return Err(crate::ConfigError::AmbiguousAccessLogFilter {
+            detail: if set_arms == 0 {
+                "no filter variant is set".into()
+            } else {
+                "more than one filter variant is set".into()
+            },
+        });
+    }
+    if let Some(scf) = status_code_filter
+        && scf.comparison.value.runtime_key.is_empty()
+    {
+        return Err(crate::ConfigError::EmptyStatusCodeFilterRuntimeKey);
+    }
+    if let Some(rff) = response_flag_filter {
+        for token in &rff.flags {
+            if !RESPONSE_FLAG_TOKENS.contains(&token.as_str()) {
+                return Err(crate::ConfigError::UnknownResponseFlag {
+                    token: token.clone(),
+                });
+            }
+        }
+    }
+    if let Some(hf) = header_filter {
+        // Phase 72: reuse the phase-04.2 HeaderMatcher validator verbatim — empty
+        // name → EmptyHeaderName; bad regex → InvalidRegex; bad range →
+        // InvalidInt64Range; compiles the SafeRegex in place so the runtime
+        // `matches` never hits its `.expect()`.
+        validate_header_matcher(&mut hf.header)?;
+    }
+    if let Some(af) = and_filter {
+        if af.filters.len() < 2 {
+            return Err(crate::ConfigError::InsufficientCompositeFilters {
+                count: af.filters.len(),
+            });
+        }
+        for child in af.filters.iter_mut() {
+            validate_access_log_filter(child)?;
+        }
+    }
+    if let Some(of) = or_filter {
+        if of.filters.len() < 2 {
+            return Err(crate::ConfigError::InsufficientCompositeFilters {
+                count: of.filters.len(),
+            });
+        }
+        for child in of.filters.iter_mut() {
+            validate_access_log_filter(child)?;
         }
     }
     Ok(())
@@ -13176,6 +13214,127 @@ or_filter: null
         assert!(matches!(
             err,
             crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("more than one")
+        ));
+    }
+
+    // --- phase 73 t2: recursive validate_access_log_filter + filters.len() >= 2 ---
+
+    fn file_log_with_filter(filter: AccessLogFilter) -> Vec<AccessLog> {
+        vec![AccessLog {
+            name: "envoy.access_loggers.file".into(),
+            typed_config: AccessLogTypedConfig::FileAccessLog(FileAccessLog {
+                path: "/tmp/x.log".into(),
+                log_format: None,
+            }),
+            filter: Some(filter),
+        }]
+    }
+
+    fn exact_header(name: &str, val: &str) -> AccessLogFilter {
+        AccessLogFilter {
+            status_code_filter: None,
+            response_flag_filter: None,
+            header_filter: Some(HeaderFilter {
+                header: HeaderMatcher {
+                    name: name.into(),
+                    mode: HeaderMatcherMode::ExactMatch(val.into()),
+                    invert_match: false,
+                },
+            }),
+            and_filter: None,
+            or_filter: None,
+        }
+    }
+
+    #[test]
+    fn and_filter_with_one_child_is_rejected() {
+        let f = AccessLogFilter {
+            and_filter: Some(AndFilter {
+                filters: vec![exact_header("x-a", "1")],
+            }),
+            ..AccessLogFilter::default()
+        };
+        let err = validate_access_logs(&mut file_log_with_filter(f)).expect_err("min_items");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InsufficientCompositeFilters { count: 1 }
+        ));
+    }
+
+    #[test]
+    fn empty_and_filter_is_rejected() {
+        // `and_filter: {}` → `filters: []` (len 0) via serde default → reject.
+        let f = AccessLogFilter {
+            and_filter: Some(AndFilter::default()),
+            ..AccessLogFilter::default()
+        };
+        let err = validate_access_logs(&mut file_log_with_filter(f)).expect_err("min_items");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InsufficientCompositeFilters { count: 0 }
+        ));
+    }
+
+    #[test]
+    fn or_filter_with_two_children_is_accepted() {
+        let f = AccessLogFilter {
+            or_filter: Some(OrFilter {
+                filters: vec![exact_header("x-a", "1"), exact_header("x-b", "1")],
+            }),
+            ..AccessLogFilter::default()
+        };
+        validate_access_logs(&mut file_log_with_filter(f)).expect("valid");
+    }
+
+    #[test]
+    fn nested_bad_leaf_surfaces_through_recursion() {
+        // A nested `header_filter` with an EMPTY name must fail-loud via the
+        // recursion (EmptyHeaderName), proving the descent into children.
+        let bad = AccessLogFilter {
+            status_code_filter: None,
+            response_flag_filter: None,
+            header_filter: Some(HeaderFilter {
+                header: HeaderMatcher {
+                    name: "".into(),
+                    mode: HeaderMatcherMode::ExactMatch("1".into()),
+                    invert_match: false,
+                },
+            }),
+            and_filter: None,
+            or_filter: None,
+        };
+        let f = AccessLogFilter {
+            or_filter: Some(OrFilter {
+                filters: vec![exact_header("x-a", "1"), bad],
+            }),
+            ..AccessLogFilter::default()
+        };
+        let err =
+            validate_access_logs(&mut file_log_with_filter(f)).expect_err("nested bad leaf");
+        assert!(matches!(err, crate::ConfigError::EmptyHeaderName));
+    }
+
+    #[test]
+    fn nested_composition_cardinality_surfaces_through_recursion() {
+        // A nested `and_filter` whose child has fewer than 2 filters fails-loud
+        // through the recursion.
+        let inner = AccessLogFilter {
+            and_filter: Some(AndFilter {
+                filters: vec![exact_header("x-a", "1")],
+            }),
+            ..AccessLogFilter::default()
+        };
+        let f = AccessLogFilter {
+            or_filter: Some(OrFilter {
+                filters: vec![exact_header("x-b", "1"), inner],
+            }),
+            ..AccessLogFilter::default()
+        };
+        let err =
+            validate_access_logs(&mut file_log_with_filter(f)).expect_err("nested cardinality");
+        assert!(matches!(
+            err,
+            crate::ConfigError::InsufficientCompositeFilters { count: 1 }
         ));
     }
 

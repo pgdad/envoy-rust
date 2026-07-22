@@ -459,6 +459,14 @@ pub enum ConfigError {
     #[error("access_log filter must set exactly one filter variant: {detail}")]
     AmbiguousAccessLogFilter { detail: String },
 
+    /// Phase 73: an `and_filter`/`or_filter` (`AndFilter`/`OrFilter`) `filters`
+    /// list has fewer than 2 entries. Upstream enforces PGV `min_items = 2`
+    /// (`AndFilterValidationError.Filters: value must contain at least 2
+    /// item(s)`). Our text differs (ADR-0049 fail-loud class parity) but the
+    /// rejection is mandatory.
+    #[error("and_filter/or_filter must have at least 2 filters, got {count}")]
+    InsufficientCompositeFilters { count: usize },
+
     /// Phase 70: a `status_code_filter.comparison.value.runtime_key` is present
     /// but empty. Upstream enforces `min_len 1` (`RuntimeUInt32ValidationError`).
     /// The key is RTDS-inert here (the comparison always uses `default_value`),
