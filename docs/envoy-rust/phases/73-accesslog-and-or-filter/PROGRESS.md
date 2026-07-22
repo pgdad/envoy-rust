@@ -188,3 +188,76 @@ matched `PLAN.md` at start (struct ~723, destructure 5172, `validate_header_matc
 All 8 `PLAN.md` tasks implemented (each RED-first, unit tests green); both new
 differentials pass locally in isolation; fmt + touched-crate clippy clean. Next:
 the §5 state-4 verification (a SEPARATE session — do NOT chain).
+
+## §5 state-4 verification (2026-07-22, this session)
+
+Full §7.5 (a)-(f) gate run SOLO-SERIAL on `HEAD == f1d4c1a` (the state-3 ledger
+commit; docs-only session, no code change — the gate grades the state-3 code).
+Every command's raw output quoted below. **VERDICT: GREEN** — every local RED
+adjudicated to a documented host-flake or a pass-in-isolation parallel-load flake.
+
+**STEP 0/0.5 — state + CI confirmation:**
+- `git status --porcelain` → clean; branch `main`; `HEAD f1d4c1a7ca51d5d821be37faa61b09a8c8ccaeb2`.
+- `git fetch origin --prune` → no sibling advance; `REVIEW.md` still ABSENT (genuinely state-4).
+- `gh run list --commit f1d4c1a7ca51d5d821be37faa61b09a8c8ccaeb2` →
+  `completed  success  ci  main  push  29880724936  8m4s` — the authoritative
+  full-workspace + Docker-differential run for the state-3 code is GREEN on CI.
+
+**(a) `cargo fmt --all -- --check`** → exit 0 (no diff).
+
+**(e) `cargo clippy --workspace --all-targets --all-features -- -D warnings`** →
+exit 0. `Finished dev profile … in 4.10s` (all crates checked, zero warnings).
+
+**(e) `cargo build --workspace --all-targets`** → exit 0. `Finished dev profile … in 8.57s`.
+
+**`cargo build -p envoy-bin`** (debug binary the differential runs, memory
+`differential-harness-uses-debug-envoy-bin`) → exit 0. `Finished dev profile … in 1.76s`.
+
+**(e) `cargo deny check`** → exit 0. `advisories ok, bans ok, licenses ok, sources ok`
+(3 benign `license-not-encountered` warnings for unmatched allowances — pre-existing).
+
+**(a)(b)(c) `cargo test --workspace --no-fail-fast`** — run twice (diff-the-set,
+memory `local-red-set-varies-run-to-run`). Stable total **2076** both runs:
+- RUN 1: exit 101 — **2069 passed; 7 failed**. Failing set:
+  `access_log_h2_rcd_upstream_reset`, `access_log_h2_uc_upstream_reset`,
+  `access_log_rcd_upstream_reset`, `access_log_rf_upstream_reset`,
+  `access_log_json_nested`, `admin_config_dump_server_info`, `admin_ready_fixture`.
+- RUN 2: exit 101 — **2070 passed; 6 failed**. Failing set:
+  the 4× `*_upstream_reset`, `admin_config_dump_server_info`,
+  `outlier_detection_ejects_then_un_ejects`
+  (`access_log_json_nested`/`admin_ready_fixture` GREEN this run; `outlier_detection` NEW).
+
+Adjudication (each RED = documented host-flake, CI-authoritative, NOT a regression):
+- **4× `access_log_*_upstream_reset`** — deterministic in both runs → documented
+  `tcpclosebackend-ipv6-unreachable-host-flake` (real Envoy can't reach the
+  host-spawned close backend on this host; reports UF instead of a reset).
+- **`admin_config_dump_server_info`** — deterministic (run1+run2+2× isolation, exit 101);
+  the `/clusters` diff shows all 18 `envoy-only` backend rows keyed on
+  `backend::192.168.65.2:…` → documented `differential-host-bridge-ip-192-168-65-2`
+  flake (this host routes the backend via 192.168.65.2, not the allow-listed IP).
+- **`access_log_json_nested`** (`--test access_log_json_nested`) → exit 0, 1 passed —
+  parallel-load flake (run1 symptom "upstream Envoy never became accept-ready").
+- **`admin_ready_fixture`** lives in binary `admin_ready` (NOT its own target —
+  `--test admin_ready_fixture` merely lists targets, memory
+  `cargo-test-p-name-false-green-filtered-out`). `--test admin_ready` → exit 0, 1 passed —
+  parallel-load startup-race flake.
+- **`outlier_detection_ejects_then_un_ejects`** lives in `crates/envoy-bin/tests/upstream_outlier_detection.rs`.
+  `cargo test -p envoy-bin --test upstream_outlier_detection …` → exit 0, 1 passed — parallel-load flake.
+- **NEW fixtures GREEN in isolation:** `--test access_log_and_filter` (0079) → exit 0, 1 passed;
+  `--test access_log_or_filter` (0080) → exit 0, 1 passed.
+- Cross-check (memory `local-red-set-varies-run-to-run`): total 2076 is stable; only
+  the pass/fail split shifts; the deterministic core (4 reset + admin_config_dump) is
+  documented-environmental; the variable tail each passes in isolation; and CI is GREEN
+  on the identical state-3 code (run `29880724936`). No real regression.
+
+**(d) `cargo +nightly fuzz run parse_bootstrap -- -max_total_time=60`** (from
+`crates/envoy-config`, memory `cargo-fuzz-runs-from-crate-dir-not-repo-root`) →
+exit 0. `Done 180100 runs in 102 second(s)` — no crash. The new
+`fuzz/corpus/parse_bootstrap/and_or_filter.yaml` seed is git-tracked (`git ls-files`
+confirms) and exercised by the existing CI fuzz step (ADR-0137, no new target).
+
+**(c)** no new conformance suite this phase. **(f)** `REVIEW.md` is the state-5 gate
+(next session).
+
+**Result:** §7.5 (a)-(e) VERIFIED GREEN. No §5.2 re-entry needed. Advance STATE to
+phase-73 state-4 complete; next = §5 state-5 code-review (a SEPARATE session).
