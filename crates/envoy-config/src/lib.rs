@@ -12,7 +12,8 @@ pub mod matcher;
 pub mod rds;
 
 pub use bootstrap::{
-    AccessLog, AccessLogFilter, AccessLogTypedConfig, Action, Address, Admin, AppendAction,
+    AccessLog, AccessLogFilter, AccessLogTypedConfig, Action, Address, Admin, AndFilter,
+    AppendAction,
     AttemptOutcome, Bootstrap, Buffer, BufferPerRoute, CdnLoopConfig, CertificateValidationContext,
     CidrRange, CircuitBreakers, Cluster, ClusterType, CodecType, CommonLbConfig, CommonTlsContext,
     ComparisonFilter, ComparisonOp, ConfigSource, CorsConfig, CorsPolicy, CsrfPolicy, DataSource,
@@ -27,7 +28,8 @@ pub use bootstrap::{
     Int64Range, JsonFormatValue, JwtAuthnConfig, JwtProvider, JwtRequirement, LbEndpoint,
     LbMetadata, LbPolicy, LbSubsetConfig, LbSubsetFallbackPolicy, LbSubsetSelector, Listener,
     LoadAssignment, LocalRateLimitConfig, LocalityLbEndpoints, MetadataEntry, MetadataMatcher,
-    MetadataPathSegment, Mutations, NetworkFilter, NetworkRbacConfig, Node, OutlierDetection,
+    MetadataPathSegment, Mutations, NetworkFilter, NetworkRbacConfig, Node, OrFilter,
+    OutlierDetection,
     PathConfigSource, PathMatcher, PayloadDecodeError, PerFilterConfig, Percent, Permission,
     PermissionSet, Policy, Principal, PrincipalSet, RbacConfig, Rds, RequirementRule,
     ResponseFlagFilter, RetryConfig, RetryOn, RetryPolicy, Route, RouteAction, RouteAction_Route,

@@ -730,6 +730,32 @@ pub struct AccessLogFilter {
     /// named request header matches `header`. Mutually exclusive with the other
     /// two arms (cardinality enforced by `validate_access_logs`).
     pub header_filter: Option<HeaderFilter>,
+    /// Phase 73: the FOURTH `AccessLogFilter` arm — the recursive AND
+    /// composition. Emit iff ALL nested child predicates match. `filters` is
+    /// PGV `min_items = 2` (enforced by `validate_access_logs`). Mutually
+    /// exclusive with the other four arms.
+    pub and_filter: Option<AndFilter>,
+    /// Phase 73: the FIFTH `AccessLogFilter` arm — the recursive OR composition.
+    /// Emit iff ANY nested child predicate matches. `min_items = 2`. Mutually
+    /// exclusive with the other four arms.
+    pub or_filter: Option<OrFilter>,
+}
+
+/// Phase 73: `and_filter` — a boolean-AND composition of nested `AccessLogFilter`
+/// predicates. Recurses through `Vec` (a fixed-size pointer → NO `Box`). No
+/// `Clone` (all consumers take `&AccessLogFilter`).
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AndFilter {
+    pub filters: Vec<AccessLogFilter>,
+}
+
+/// Phase 73: `or_filter` — a boolean-OR composition of nested `AccessLogFilter`
+/// predicates. Same shape as `AndFilter`.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OrFilter {
+    pub filters: Vec<AccessLogFilter>,
 }
 
 /// Models `envoy.config.accesslog.v3.HeaderFilter` — the THIRD `AccessLogFilter`
@@ -5173,11 +5199,15 @@ fn validate_access_logs(access_logs: &mut [AccessLog]) -> Result<(), crate::Conf
                 status_code_filter,
                 response_flag_filter,
                 header_filter,
+                and_filter,
+                or_filter,
             } = filter;
             let set_arms = [
                 status_code_filter.is_some(),
                 response_flag_filter.is_some(),
                 header_filter.is_some(),
+                and_filter.is_some(),
+                or_filter.is_some(),
             ]
             .iter()
             .filter(|set| **set)
@@ -13086,6 +13116,67 @@ static_resources:
             }
             other => panic!("expected AmbiguousAccessLogFilter, got {other:?}"),
         }
+    }
+
+    // --- phase 73 t1: AndFilter/OrFilter config structs + 5-arm cardinality ---
+
+    #[test]
+    fn and_or_filter_deserialize_round_trip_and_default() {
+        // `and_filter`/`or_filter` deserialize as `{ filters: [<AccessLogFilter>, …] }`
+        // (no Box; the recursion runs through Vec). An empty `and_filter: {}` yields
+        // `filters: []` via `#[serde(default)]` (Task 2 rejects len < 2).
+        let yaml = r#"
+status_code_filter: null
+response_flag_filter: null
+header_filter: null
+and_filter:
+  filters:
+    - header_filter: { header: { name: x-a, string_match: { exact: "1" } } }
+    - header_filter: { header: { name: x-b, string_match: { exact: "1" } } }
+or_filter: null
+"#;
+        let f: AccessLogFilter = serde_yaml::from_str(yaml).expect("deserializes");
+        let af = f.and_filter.as_ref().expect("and_filter present");
+        assert_eq!(af.filters.len(), 2);
+        // recursive PartialEq composes across Vec<AccessLogFilter>.
+        assert_eq!(f, f);
+        // empty `{}` → Default filters (empty vec).
+        let empty: AndFilter = serde_yaml::from_str("{}").expect("empty and_filter");
+        assert_eq!(empty, AndFilter::default());
+        assert!(empty.filters.is_empty());
+    }
+
+    #[test]
+    fn and_filter_alongside_header_filter_is_ambiguous() {
+        // A composition arm set alongside a leaf arm violates the oneof cardinality
+        // (exactly one across all FIVE arms).
+        let mut logs = vec![AccessLog {
+            name: "envoy.access_loggers.file".into(),
+            typed_config: AccessLogTypedConfig::FileAccessLog(FileAccessLog {
+                path: "/tmp/x.log".into(),
+                log_format: None,
+            }),
+            filter: Some(AccessLogFilter {
+                status_code_filter: None,
+                response_flag_filter: None,
+                header_filter: Some(HeaderFilter {
+                    header: HeaderMatcher {
+                        name: "x-log".into(),
+                        mode: HeaderMatcherMode::ExactMatch("yes".into()),
+                        invert_match: false,
+                    },
+                }),
+                and_filter: Some(AndFilter {
+                    filters: vec![AccessLogFilter::default(), AccessLogFilter::default()],
+                }),
+                or_filter: None,
+            }),
+        }];
+        let err = validate_access_logs(&mut logs).expect_err("ambiguous");
+        assert!(matches!(
+            err,
+            crate::ConfigError::AmbiguousAccessLogFilter { ref detail } if detail.contains("more than one")
+        ));
     }
 
     // --- phase 72 t2: header-inclusive cardinality + precedence ---

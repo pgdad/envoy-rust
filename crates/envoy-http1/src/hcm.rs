@@ -4533,6 +4533,8 @@ static_resources:
                     }),
                     response_flag_filter: None,
                     header_filter: None,
+                    and_filter: None,
+                    or_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -4671,6 +4673,8 @@ static_resources:
                         flags: flags.iter().map(|s| s.to_string()).collect(),
                     }),
                     header_filter: None,
+                    and_filter: None,
+                    or_filter: None,
                 }),
             }],
             route_config: Some(RouteConfiguration {
@@ -4748,6 +4752,8 @@ static_resources:
                     invert_match: false,
                 },
             }),
+            and_filter: None,
+            or_filter: None,
         };
         let compiled = compile_access_log_filter(&filter);
         assert!(matches!(
@@ -4779,6 +4785,8 @@ static_resources:
                         invert_match: false,
                     },
                 }),
+                and_filter: None,
+                or_filter: None,
             })
         };
         let yes = [("x-log".to_string(), "yes".to_string())];
@@ -4918,6 +4926,8 @@ static_resources:
                                 invert_match: false,
                             },
                         }),
+                        and_filter: None,
+                        or_filter: None,
                     },
                 ),
                 // Sink B — status_code_filter { EQ 200 }.
@@ -4935,6 +4945,8 @@ static_resources:
                         }),
                         response_flag_filter: None,
                         header_filter: None,
+                        and_filter: None,
+                        or_filter: None,
                     },
                 ),
             ],
