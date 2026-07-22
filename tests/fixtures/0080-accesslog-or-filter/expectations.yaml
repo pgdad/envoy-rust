@@ -1,0 +1,39 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0080-envoy-mount/access.log
+    envoy_rust: /tmp/0080-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — DROPPED, and FIRST. `x-a:1` only: the nested and_filter is false
+    # (x-b absent) AND the leaf header_filter{x-c} is false (x-c absent) → OR
+    # false → SUPPRESSED on both proxies.
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "1"]
+      expected_status: 200
+      expect_logged: false
+    # Probe 2 — KEPT. `x-a:1 x-b:1`: the nested and_filter is TRUE → OR true → KEPT.
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "1"]
+        - ["x-b", "1"]
+      expected_status: 200
+      expect_logged: true
+    # Probe 3 — KEPT, and LAST. `x-c:1`: the leaf header_filter{x-c} is TRUE → OR
+    # true → KEPT. (Last probe kept → short settle, ADR-0147.)
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-c", "1"]
+      expected_status: 200
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY. Each side's file holds EXACTLY TWO
+  # byte-identical lines (MEASURED, SPEC §0 R-0.5, graceful-stop flush):
+  #   STATUS=200 PATH=/x
+  #   STATUS=200 PATH=/x
+  # Witnesses OR-of-(nested-AND, leaf) recursion depth-2. clusters: [], no backend.
