@@ -1139,6 +1139,7 @@ async fn finalize_h2_stream(
                 record.response_code,
                 &record.response_flags,
                 &envoy_req.headers,
+                &record.dynamic_metadata,
             ) {
                 continue;
             }
@@ -3453,7 +3454,7 @@ static_resources:
     /// 404 (`response_flags == "NR"` → 1 line) and SUPPRESS a clean
     /// direct-response 503 (`response_flags == "-"` → 0 lines). Exercises the
     /// widened `should_log(record.response_code, &record.response_flags,
-    /// &envoy_req.headers)` gate (phase 72 added the header slice) end-to-end;
+    /// &envoy_req.headers, &Default::default())` gate (phase 72 added the header slice) end-to-end;
     /// `access_logs_total` counts emitted only.
     #[tokio::test(flavor = "multi_thread")]
     async fn h2_response_flag_filter_suppresses_no_flag() {
@@ -3555,7 +3556,7 @@ static_resources:
     /// Phase 72 §5.2 state-3 (REVIEW.md F-2): the H2 sibling of the H1
     /// `header_filter` emit gate. The H2 emit loop threads the post-decode
     /// `&envoy_req.headers` snapshot into the widened
-    /// `should_log(status, flags, headers)` gate (hcm.rs ~1138); this test
+    /// `should_log(status, flags, headers, &Default::default())` gate (hcm.rs ~1138); this test
     /// exercises that threaded slice end-to-end. A sink carrying
     /// `LogFilter::Header { exact "yes" on x-log }` must KEEP `GET /x` with
     /// `x-log: yes` and DROP both the present-MISMATCH (`x-log: no`) and the

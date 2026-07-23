@@ -3,6 +3,7 @@
 //! `status_code_filter`; phase 71 added `response_flag_filter`; phase 72 adds
 //! `header_filter` (the `LogFilter::Header` arm).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The comparison operator (`ComparisonFilter.Op`): exactly `{EQ, GE, LE}`.
@@ -64,15 +65,24 @@ pub enum LogFilter {
 
 impl LogFilter {
     /// Returns `true` iff a record with the given final response `status`,
-    /// `response_flags` token, and request `headers` should be emitted. The
-    /// `StatusCode` arm reads only `status`; the `ResponseFlag` arm only
-    /// `response_flags`; the `Header` arm only `headers`. The status comparison
-    /// is widened to `u32` (lossless; status is always in `u16` range).
+    /// `response_flags` token, request `headers`, and per-request
+    /// `dynamic_metadata` should be emitted. The `StatusCode` arm reads only
+    /// `status`; the `ResponseFlag` arm only `response_flags`; the `Header` arm
+    /// only `headers`; the phase-74 `Metadata` arm only `dynamic_metadata`. The
+    /// status comparison is widened to `u32` (lossless; status is always in
+    /// `u16` range).
+    // Phase 74 T3 (TRANSIENT): until T4 lands the `Metadata` arm, the new
+    // `dynamic_metadata` parameter is threaded through the `And`/`Or` recursion
+    // but consumed by no arm, which trips `only_used_in_recursion`. T3 is a
+    // deliberately behavior-neutral refactor, so the allow is scoped here and
+    // REMOVED in T4 when the consuming arm lands.
+    #[allow(clippy::only_used_in_recursion)]
     pub fn should_log(
         &self,
         status: u16,
         response_flags: &str,
         headers: &[(String, String)],
+        dynamic_metadata: &BTreeMap<String, BTreeMap<String, String>>,
     ) -> bool {
         match self {
             LogFilter::StatusCode(c) => {
@@ -104,10 +114,10 @@ impl LogFilter {
             // pinned in-process regardless.
             LogFilter::And(filters) => filters
                 .iter()
-                .all(|f| f.should_log(status, response_flags, headers)),
+                .all(|f| f.should_log(status, response_flags, headers, dynamic_metadata)),
             LogFilter::Or(filters) => filters
                 .iter()
-                .any(|f| f.should_log(status, response_flags, headers)),
+                .any(|f| f.should_log(status, response_flags, headers, dynamic_metadata)),
         }
     }
 }
@@ -143,9 +153,9 @@ mod tests {
 
     #[test]
     fn ge_500_boundary() {
-        assert!(!ge(500).should_log(499, "-", &[]));
-        assert!(ge(500).should_log(500, "-", &[]));
-        assert!(ge(500).should_log(503, "-", &[]));
+        assert!(!ge(500).should_log(499, "-", &[], &Default::default()));
+        assert!(ge(500).should_log(500, "-", &[], &Default::default()));
+        assert!(ge(500).should_log(503, "-", &[], &Default::default()));
     }
 
     #[test]
@@ -153,70 +163,70 @@ mod tests {
         // AND = all children match; OR = any child matches. Uses status-code
         // children (ge/le) so the test needs no header stub.
         let and = LogFilter::And(vec![ge(200), le(299)]); // 2xx band
-        assert!(and.should_log(200, "-", &[])); // both true
-        assert!(and.should_log(299, "-", &[]));
-        assert!(!and.should_log(500, "-", &[])); // le(299) false → AND false
+        assert!(and.should_log(200, "-", &[], &Default::default())); // both true
+        assert!(and.should_log(299, "-", &[], &Default::default()));
+        assert!(!and.should_log(500, "-", &[], &Default::default())); // le(299) false → AND false
 
         let or = LogFilter::Or(vec![le(199), ge(500)]); // 1xx OR 5xx
-        assert!(or.should_log(100, "-", &[])); // le(199) true
-        assert!(or.should_log(503, "-", &[])); // ge(500) true
-        assert!(!or.should_log(200, "-", &[])); // neither → OR false
+        assert!(or.should_log(100, "-", &[], &Default::default())); // le(199) true
+        assert!(or.should_log(503, "-", &[], &Default::default())); // ge(500) true
+        assert!(!or.should_log(200, "-", &[], &Default::default())); // neither → OR false
 
         // Nested composition recurses.
         let nested = LogFilter::Or(vec![LogFilter::And(vec![ge(200), le(299)]), ge(500)]);
-        assert!(nested.should_log(204, "-", &[])); // AND-child true
-        assert!(nested.should_log(500, "-", &[])); // leaf true
-        assert!(!nested.should_log(404, "-", &[])); // AND-child false, leaf false
+        assert!(nested.should_log(204, "-", &[], &Default::default())); // AND-child true
+        assert!(nested.should_log(500, "-", &[], &Default::default())); // leaf true
+        assert!(!nested.should_log(404, "-", &[], &Default::default())); // AND-child false, leaf false
 
         // Empty-vec boundary (unreachable via config's min_items=2, pinned as a
         // semantic invariant): all([]) = true, any([]) = false.
-        assert!(LogFilter::And(vec![]).should_log(200, "-", &[]));
-        assert!(!LogFilter::Or(vec![]).should_log(200, "-", &[]));
+        assert!(LogFilter::And(vec![]).should_log(200, "-", &[], &Default::default()));
+        assert!(!LogFilter::Or(vec![]).should_log(200, "-", &[], &Default::default()));
     }
 
     #[test]
     fn eq_404_boundary() {
-        assert!(!eq(404).should_log(403, "-", &[]));
-        assert!(eq(404).should_log(404, "NR", &[]));
-        assert!(!eq(404).should_log(405, "-", &[]));
+        assert!(!eq(404).should_log(403, "-", &[], &Default::default()));
+        assert!(eq(404).should_log(404, "NR", &[], &Default::default()));
+        assert!(!eq(404).should_log(405, "-", &[], &Default::default()));
     }
 
     #[test]
     fn le_200_boundary() {
-        assert!(le(200).should_log(200, "-", &[]));
-        assert!(!le(200).should_log(201, "-", &[]));
-        assert!(le(200).should_log(100, "-", &[]));
+        assert!(le(200).should_log(200, "-", &[], &Default::default()));
+        assert!(!le(200).should_log(201, "-", &[], &Default::default()));
+        assert!(le(200).should_log(100, "-", &[], &Default::default()));
     }
 
     #[test]
     fn response_flag_membership() {
         // The ResponseFlag arm ignores `status`; pass any value.
-        assert!(rf(&["NR"]).should_log(404, "NR", &[]));
-        assert!(rf(&["UH", "NR"]).should_log(404, "NR", &[]));
-        assert!(!rf(&["UH"]).should_log(404, "NR", &[]));
+        assert!(rf(&["NR"]).should_log(404, "NR", &[], &Default::default()));
+        assert!(rf(&["UH", "NR"]).should_log(404, "NR", &[], &Default::default()));
+        assert!(!rf(&["UH"]).should_log(404, "NR", &[], &Default::default()));
     }
 
     #[test]
     fn response_flag_dash_sentinel_never_matches_nonempty() {
         // "-" ∉ the 29-token set, so a non-empty `flags` never matches it.
-        assert!(!rf(&["NR"]).should_log(503, "-", &[]));
-        assert!(!rf(&["UH", "UF"]).should_log(503, "-", &[]));
+        assert!(!rf(&["NR"]).should_log(503, "-", &[], &Default::default()));
+        assert!(!rf(&["UH", "UF"]).should_log(503, "-", &[], &Default::default()));
     }
 
     #[test]
     fn response_flag_empty_matches_any_flag_set() {
         // MEASURED (ADR-0145 PV-6): empty `flags` keeps records WITH a flag,
         // drops the "-" no-flag sentinel.
-        assert!(rf(&[]).should_log(404, "NR", &[]));
-        assert!(rf(&[]).should_log(503, "UF", &[]));
-        assert!(!rf(&[]).should_log(503, "-", &[]));
+        assert!(rf(&[]).should_log(404, "NR", &[], &Default::default()));
+        assert!(rf(&[]).should_log(503, "UF", &[], &Default::default()));
+        assert!(!rf(&[]).should_log(503, "-", &[], &Default::default()));
     }
 
     #[test]
     fn response_flag_inert_token_never_matches_produced() {
         // A config may carry an inert token (`DI`); envoy-rust never renders it.
-        assert!(!rf(&["DI"]).should_log(404, "NR", &[]));
-        assert!(!rf(&["DI"]).should_log(503, "-", &[]));
+        assert!(!rf(&["DI"]).should_log(404, "NR", &[], &Default::default()));
+        assert!(!rf(&["DI"]).should_log(503, "-", &[], &Default::default()));
     }
 
     #[test]
@@ -225,9 +235,9 @@ mod tests {
             op: FilterOp::Ge,
             threshold: 500,
         });
-        assert!(f.should_log(503, "-", &[]));
-        assert!(f.should_log(503, "NR", &[]));
-        assert!(!f.should_log(200, "NR", &[]));
+        assert!(f.should_log(503, "-", &[], &Default::default()));
+        assert!(f.should_log(503, "NR", &[], &Default::default()));
+        assert!(!f.should_log(200, "NR", &[], &Default::default()));
     }
 
     // --- phase 72: LogFilter::Header delegates to the injected HeaderMatch ---
@@ -252,8 +262,45 @@ mod tests {
             matcher: std::sync::Arc::new(HasHeaderValue("x-log", "yes")),
         };
         // The `Header` arm ignores `status`/`response_flags`; it gates on headers.
-        assert!(f.should_log(200, "-", &[("x-log".to_string(), "yes".to_string())]));
-        assert!(!f.should_log(200, "-", &[("x-log".to_string(), "no".to_string())]));
-        assert!(!f.should_log(200, "-", &[]));
+        assert!(f.should_log(200, "-", &[("x-log".to_string(), "yes".to_string())], &Default::default()));
+        assert!(!f.should_log(200, "-", &[("x-log".to_string(), "no".to_string())], &Default::default()));
+        assert!(!f.should_log(200, "-", &[], &Default::default()));
+    }
+
+    /// Phase 74 T3: `should_log` carries the per-request dynamic-metadata store
+    /// as a 4th argument. Every PRE-74 arm ignores it — this pins that the
+    /// widening is behavior-neutral.
+    #[test]
+    fn existing_arms_ignore_the_dynamic_metadata_argument() {
+        use std::collections::BTreeMap;
+        let mut md: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        md.entry("com.example".into())
+            .or_default()
+            .insert("k".into(), "1".into());
+        let empty: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+
+        // StatusCode arm: identical verdict with and without metadata.
+        assert!(ge(500).should_log(503, "-", &[], &md));
+        assert!(ge(500).should_log(503, "-", &[], &empty));
+        assert!(!ge(500).should_log(499, "-", &[], &md));
+
+        // ResponseFlag arm.
+        assert!(rf(&["NR"]).should_log(404, "NR", &[], &md));
+        assert!(!rf(&["UH"]).should_log(404, "NR", &[], &md));
+
+        // Header arm (via the local stub).
+        let h = LogFilter::Header {
+            matcher: std::sync::Arc::new(HasHeaderValue("x-log", "yes")),
+        };
+        assert!(h.should_log(200, "-", &[("x-log".to_string(), "yes".to_string())], &md));
+        assert!(!h.should_log(200, "-", &[], &md));
+
+        // Composition arms thread the new argument through the recursion.
+        let and = LogFilter::And(vec![ge(200), le(299)]);
+        assert!(and.should_log(204, "-", &[], &md));
+        assert!(!and.should_log(500, "-", &[], &md));
+        let or = LogFilter::Or(vec![le(199), ge(500)]);
+        assert!(or.should_log(503, "-", &[], &md));
+        assert!(!or.should_log(200, "-", &[], &md));
     }
 }

@@ -1512,7 +1512,15 @@ async fn serve_connection(
                 // Phase 72: the `header_filter` arm reads the downstream request
                 // headers in scope here (`req.headers`, the same snapshot that
                 // feeds forwarded_for/authority above). The other arms ignore it.
-                if !sink.should_log(record.response_code, &record.response_flags, &req.headers) {
+                // Phase 74: thread the record's dynamic-metadata store for the
+                // `metadata_filter` arm (already built above — the record is
+                // constructed BEFORE this loop). The other arms ignore it.
+                if !sink.should_log(
+                    record.response_code,
+                    &record.response_flags,
+                    &req.headers,
+                    &record.dynamic_metadata,
+                ) {
                     continue;
                 }
                 // 06.3 D15.3.e: increment access_logs_total at queue-enter time
@@ -4650,7 +4658,7 @@ static_resources:
             let sink = &config.access_log[0];
             for (status, must_log) in *expectations {
                 assert_eq!(
-                    sink.should_log(*status, "-", &[]),
+                    sink.should_log(*status, "-", &[], &Default::default()),
                     *must_log,
                     "{op:?} {threshold} filter on status {status}: expected should_log={must_log}",
                 );
@@ -4745,9 +4753,9 @@ static_resources:
         let path = dir.path().join("rf.log");
         let config = hcm_config_with_response_flag_access_log(&["NR"], &path).await;
         let sink = &config.access_log[0];
-        assert!(sink.should_log(404, "NR", &[])); // kept
-        assert!(!sink.should_log(503, "-", &[])); // dropped (no flag)
-        assert!(!sink.should_log(200, "UH", &[])); // dropped (UH ∉ ["NR"])
+        assert!(sink.should_log(404, "NR", &[], &Default::default())); // kept
+        assert!(!sink.should_log(503, "-", &[], &Default::default())); // dropped (no flag)
+        assert!(!sink.should_log(200, "UH", &[], &Default::default())); // dropped (UH ∉ ["NR"])
     }
 
     /// Phase 72 T5: `compile_access_log_filter` builds the `header_filter` arm
@@ -4774,9 +4782,9 @@ static_resources:
             compiled,
             envoy_accesslog::LogFilter::Header { .. }
         ));
-        assert!(compiled.should_log(200, "-", &[("x-log".into(), "yes".into())]));
-        assert!(!compiled.should_log(200, "-", &[("x-log".into(), "no".into())]));
-        assert!(!compiled.should_log(200, "-", &[])); // absent → drop
+        assert!(compiled.should_log(200, "-", &[("x-log".into(), "yes".into())], &Default::default()));
+        assert!(!compiled.should_log(200, "-", &[("x-log".into(), "no".into())], &Default::default()));
+        assert!(!compiled.should_log(200, "-", &[], &Default::default())); // absent → drop
     }
 
     /// Phase 73 T4: `compile_access_log_filter` builds the `and_filter`/`or_filter`
@@ -4818,8 +4826,8 @@ static_resources:
             ("x-a".to_string(), "1".to_string()),
             ("x-b".to_string(), "1".to_string()),
         ];
-        assert!(!compiled.should_log(200, "-", &a)); // only x-a → AND false → drop
-        assert!(compiled.should_log(200, "-", &ab)); // both → AND true → keep
+        assert!(!compiled.should_log(200, "-", &a, &Default::default())); // only x-a → AND false → drop
+        assert!(compiled.should_log(200, "-", &ab, &Default::default())); // both → AND true → keep
 
         // or_filter { [ and_filter{[x-a,x-b]}, header{x-c} ] } (depth-2).
         let or = envoy_config::AccessLogFilter {
@@ -4847,9 +4855,9 @@ static_resources:
         let compiled = compile_access_log_filter(&or);
         assert!(matches!(compiled, envoy_accesslog::LogFilter::Or(ref v) if v.len() == 2));
         let c = [("x-c".to_string(), "1".to_string())];
-        assert!(compiled.should_log(200, "-", &ab)); // AND-child true → OR keep
-        assert!(compiled.should_log(200, "-", &c)); // leaf true → OR keep
-        assert!(!compiled.should_log(200, "-", &a)); // AND-child false, leaf false → drop
+        assert!(compiled.should_log(200, "-", &ab, &Default::default())); // AND-child true → OR keep
+        assert!(compiled.should_log(200, "-", &c, &Default::default())); // leaf true → OR keep
+        assert!(!compiled.should_log(200, "-", &a, &Default::default())); // AND-child false, leaf false → drop
     }
 
     /// Phase 72 T9 (SPEC §2.1 item 5): `header_filter` membership across the
@@ -4883,18 +4891,18 @@ static_resources:
 
         // exact: keep "yes"; drop mismatch AND absent.
         let f = compile_mode(M::ExactMatch("yes".into()));
-        assert!(f.should_log(200, "-", &yes));
-        assert!(!f.should_log(200, "-", &no));
-        assert!(!f.should_log(200, "-", &absent));
+        assert!(f.should_log(200, "-", &yes, &Default::default()));
+        assert!(!f.should_log(200, "-", &no, &Default::default()));
+        assert!(!f.should_log(200, "-", &absent, &Default::default()));
 
         // prefix / suffix match on the value; drop absent.
-        assert!(compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &yes));
-        assert!(!compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &absent));
-        assert!(compile_mode(M::SuffixMatch("es".into())).should_log(200, "-", &yes));
+        assert!(compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &yes, &Default::default()));
+        assert!(!compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &absent, &Default::default()));
+        assert!(compile_mode(M::SuffixMatch("es".into())).should_log(200, "-", &yes, &Default::default()));
 
         // present: any value keeps; absent drops.
-        assert!(compile_mode(M::PresentMatch(true)).should_log(200, "-", &yes));
-        assert!(!compile_mode(M::PresentMatch(true)).should_log(200, "-", &absent));
+        assert!(compile_mode(M::PresentMatch(true)).should_log(200, "-", &yes, &Default::default()));
+        assert!(!compile_mode(M::PresentMatch(true)).should_log(200, "-", &absent, &Default::default()));
 
         // string_match { exact } — the fixture-0078 mode.
         let sm = envoy_config::StringMatcher {
@@ -4902,9 +4910,9 @@ static_resources:
             ignore_case: false,
         };
         let f = compile_mode(M::StringMatch(sm));
-        assert!(f.should_log(200, "-", &yes));
-        assert!(!f.should_log(200, "-", &no));
-        assert!(!f.should_log(200, "-", &absent));
+        assert!(f.should_log(200, "-", &yes, &Default::default()));
+        assert!(!f.should_log(200, "-", &no, &Default::default()));
+        assert!(!f.should_log(200, "-", &absent, &Default::default()));
     }
 
     /// Phase-71 state-5 review probe (REVIEW.md §2): the H1 EMIT LOOP threads
@@ -4960,9 +4968,9 @@ static_resources:
         let config =
             hcm_config_with_filtered_access_log(None, &dir.path().join("plain.log"), 200).await;
         let sink = &config.access_log[0];
-        assert!(sink.should_log(200, "-", &[]));
-        assert!(sink.should_log(503, "NR", &[]));
-        assert!(sink.should_log(404, "UF", &[]));
+        assert!(sink.should_log(200, "-", &[], &Default::default()));
+        assert!(sink.should_log(503, "NR", &[], &Default::default()));
+        assert!(sink.should_log(404, "UF", &[], &Default::default()));
     }
 
     /// Phase 72 §5.2 state-3 (REVIEW.md F-3, closes M71-5): TWO sinks with
@@ -5127,10 +5135,10 @@ static_resources:
         )
         .await;
         let sink = &config.access_log[0];
-        assert!(!sink.should_log(200, "NR", &[])); // status-only: 200 < 500 drops
-        assert!(!sink.should_log(200, "-", &[]));
-        assert!(sink.should_log(503, "-", &[])); // 503 >= 500 keeps
-        assert!(sink.should_log(503, "NR", &[]));
+        assert!(!sink.should_log(200, "NR", &[], &Default::default())); // status-only: 200 < 500 drops
+        assert!(!sink.should_log(200, "-", &[], &Default::default()));
+        assert!(sink.should_log(503, "-", &[], &Default::default())); // 503 >= 500 keeps
+        assert!(sink.should_log(503, "NR", &[], &Default::default()));
     }
 
     /// Phase 70 Task 7: the H1 emit loop gates each sink on `should_log` of the
@@ -5326,12 +5334,12 @@ static_resources:
 
         for status in [200u16, 499, 500, 503] {
             assert_eq!(
-                inert.should_log(status, "-", &[]),
-                named.should_log(status, "-", &[]),
+                inert.should_log(status, "-", &[], &Default::default()),
+                named.should_log(status, "-", &[], &Default::default()),
                 "runtime_key must not alter should_log({status}): \
                  runtime_key=unused -> {}, runtime_key=some.key -> {}",
-                inert.should_log(status, "-", &[]),
-                named.should_log(status, "-", &[]),
+                inert.should_log(status, "-", &[], &Default::default()),
+                named.should_log(status, "-", &[], &Default::default()),
             );
         }
 
@@ -5355,8 +5363,8 @@ static_resources:
 
         // Sanity: the shared `GE 500` threshold really is the one in effect,
         // so the equality above is not two identically-vacuous filters.
-        assert!(!inert.should_log(499, "-", &[]), "GE 500 must reject a 499");
-        assert!(inert.should_log(500, "-", &[]), "GE 500 must accept a 500");
+        assert!(!inert.should_log(499, "-", &[], &Default::default()), "GE 500 must reject a 499");
+        assert!(inert.should_log(500, "-", &[], &Default::default()), "GE 500 must accept a 500");
     }
 
     /// Phase 70 Task 11: regression parity for the 29 pre-phase-70 access-log
@@ -5396,7 +5404,7 @@ static_resources:
         let sink = &config.access_log[0];
         for status in [200u16, 499, 500, 503] {
             assert!(
-                sink.should_log(status, "-", &[]),
+                sink.should_log(status, "-", &[], &Default::default()),
                 "a sink with no filter must log every record; should_log({status}) was false"
             );
         }
@@ -5437,7 +5445,7 @@ static_resources:
             .expect("filter compiles");
             for (status, must_log) in *expectations {
                 assert_eq!(
-                    filter.should_log(*status, "-", &[]),
+                    filter.should_log(*status, "-", &[], &Default::default()),
                     *must_log,
                     "op: {token} {threshold} on status {status}: expected should_log={must_log} \
                      (the YAML token compiled to the wrong FilterOp)",
