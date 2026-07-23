@@ -4798,8 +4798,18 @@ static_resources:
             compiled,
             envoy_accesslog::LogFilter::Header { .. }
         ));
-        assert!(compiled.should_log(200, "-", &[("x-log".into(), "yes".into())], &Default::default()));
-        assert!(!compiled.should_log(200, "-", &[("x-log".into(), "no".into())], &Default::default()));
+        assert!(compiled.should_log(
+            200,
+            "-",
+            &[("x-log".into(), "yes".into())],
+            &Default::default()
+        ));
+        assert!(!compiled.should_log(
+            200,
+            "-",
+            &[("x-log".into(), "no".into())],
+            &Default::default()
+        ));
         assert!(!compiled.should_log(200, "-", &[], &Default::default())); // absent → drop
     }
 
@@ -5019,13 +5029,38 @@ static_resources:
         assert!(!f.should_log(200, "-", &absent, &Default::default()));
 
         // prefix / suffix match on the value; drop absent.
-        assert!(compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &yes, &Default::default()));
-        assert!(!compile_mode(M::PrefixMatch("ye".into())).should_log(200, "-", &absent, &Default::default()));
-        assert!(compile_mode(M::SuffixMatch("es".into())).should_log(200, "-", &yes, &Default::default()));
+        assert!(compile_mode(M::PrefixMatch("ye".into())).should_log(
+            200,
+            "-",
+            &yes,
+            &Default::default()
+        ));
+        assert!(!compile_mode(M::PrefixMatch("ye".into())).should_log(
+            200,
+            "-",
+            &absent,
+            &Default::default()
+        ));
+        assert!(compile_mode(M::SuffixMatch("es".into())).should_log(
+            200,
+            "-",
+            &yes,
+            &Default::default()
+        ));
 
         // present: any value keeps; absent drops.
-        assert!(compile_mode(M::PresentMatch(true)).should_log(200, "-", &yes, &Default::default()));
-        assert!(!compile_mode(M::PresentMatch(true)).should_log(200, "-", &absent, &Default::default()));
+        assert!(compile_mode(M::PresentMatch(true)).should_log(
+            200,
+            "-",
+            &yes,
+            &Default::default()
+        ));
+        assert!(!compile_mode(M::PresentMatch(true)).should_log(
+            200,
+            "-",
+            &absent,
+            &Default::default()
+        ));
 
         // string_match { exact } — the fixture-0078 mode.
         let sm = envoy_config::StringMatcher {
@@ -5486,8 +5521,14 @@ static_resources:
 
         // Sanity: the shared `GE 500` threshold really is the one in effect,
         // so the equality above is not two identically-vacuous filters.
-        assert!(!inert.should_log(499, "-", &[], &Default::default()), "GE 500 must reject a 499");
-        assert!(inert.should_log(500, "-", &[], &Default::default()), "GE 500 must accept a 500");
+        assert!(
+            !inert.should_log(499, "-", &[], &Default::default()),
+            "GE 500 must reject a 499"
+        );
+        assert!(
+            inert.should_log(500, "-", &[], &Default::default()),
+            "GE 500 must accept a 500"
+        );
     }
 
     /// Phase 70 Task 11: regression parity for the 29 pre-phase-70 access-log

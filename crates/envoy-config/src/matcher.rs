@@ -578,7 +578,11 @@ mod metadata_match_tests {
         // Every modelled StringMatcher mode routes through ValueMatcher::matches.
         let md = store(&[("com.example", "k", "prod-1")]);
         let case = |mode: StringMatcherMode, ignore_case: bool| {
-            matcher(ValueMatcher::StringMatch(StringMatcher { mode, ignore_case })).matches(&md)
+            matcher(ValueMatcher::StringMatch(StringMatcher {
+                mode,
+                ignore_case,
+            }))
+            .matches(&md)
         };
         assert_eq!(
             case(StringMatcherMode::Exact("prod-1".into()), false),

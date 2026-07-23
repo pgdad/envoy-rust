@@ -5396,7 +5396,7 @@ fn validate_access_log_metadata_matcher(m: &mut MetadataMatcher) -> Result<(), c
     }
     if m.path[0].key.is_empty() {
         return Err(bad(
-            "metadata matcher path segment `key` must not be empty".into(),
+            "metadata matcher path segment `key` must not be empty".into()
         ));
     }
     m.value.compile_safe_regexes()?;

@@ -305,8 +305,18 @@ mod tests {
             matcher: std::sync::Arc::new(HasHeaderValue("x-log", "yes")),
         };
         // The `Header` arm ignores `status`/`response_flags`; it gates on headers.
-        assert!(f.should_log(200, "-", &[("x-log".to_string(), "yes".to_string())], &Default::default()));
-        assert!(!f.should_log(200, "-", &[("x-log".to_string(), "no".to_string())], &Default::default()));
+        assert!(f.should_log(
+            200,
+            "-",
+            &[("x-log".to_string(), "yes".to_string())],
+            &Default::default()
+        ));
+        assert!(!f.should_log(
+            200,
+            "-",
+            &[("x-log".to_string(), "no".to_string())],
+            &Default::default()
+        ));
         assert!(!f.should_log(200, "-", &[], &Default::default()));
     }
 
