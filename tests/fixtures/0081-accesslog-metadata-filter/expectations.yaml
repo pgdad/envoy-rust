@@ -1,0 +1,35 @@
+driver:
+  kind: http1_access_log_byte_exact
+  expected_access_log_paths:
+    envoy: /tmp/0081-envoy-mount/access.log
+    envoy_rust: /tmp/0081-envoy-rust-mount/access.log
+  probes:
+    # Probe 1 — DROPPED, and FIRST. `x-a: 2` → header_to_metadata writes
+    # com.example:k = "2" → the metadata path RESOLVES but the value matcher
+    # (`exact: "1"`) says no → the sink emits NOTHING on EITHER proxy.
+    # `expect_logged: false` removes it from the line count. (Kept-LAST is the
+    # sound convention — ADR-0147; this fixture pays the short 2s settle
+    # because the LAST probe is KEPT.)
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "2"]
+      expected_status: 200
+      expect_logged: false
+    # Probe 2 — KEPT, and LAST. `x-a: 1` → com.example:k = "1" → the value
+    # matcher matches → the record IS emitted. Expected line (byte-identical on
+    # both sides): STATUS=200 PATH=/x M=1
+    - method: get
+      path: /x
+      host: envoy-rust.test
+      extra_headers:
+        - ["x-a", "1"]
+      expected_status: 200
+      expect_logged: true
+  # ASSERTION = PURE CROSS-PROXY EQUALITY (whole-line ==). Each side's file
+  # holds EXACTLY ONE line (MEASURED, SPEC §0 R-0.3, graceful-stop flush):
+  #   STATUS=200 PATH=/x M=1
+  # Both proxies must agree on the kept `x-a: 1` line AND on the absence of any
+  # line for the value-mismatching `x-a: 2` probe. The only route is a
+  # direct_response → clusters: [], no backend spawns.
