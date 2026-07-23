@@ -1744,14 +1744,15 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<usize
     Ok(seen.unwrap_or(0))
 }
 
-/// Phase 70/71/72/73 — translate a config-side `AccessLogFilter` into the runtime
-/// `LogFilter` predicate the sink evaluates per record. The envoy-config
+/// Phase 70/71/72/73/74 — translate a config-side `AccessLogFilter` into the
+/// runtime `LogFilter` predicate the sink evaluates per record. The envoy-config
 /// validator (`validate_access_logs`) already enforced that exactly one oneof
 /// arm is set, so the 0/multi-arm cases are `unreachable!` (CF-70-1: the
-/// zero-arm `expect()` is gone). Five arms ship: `status_code_filter` (phase
-/// 70), `response_flag_filter` (phase 71), `header_filter` (phase 72), and the
+/// zero-arm `expect()` is gone). SIX arms ship: `status_code_filter` (phase
+/// 70), `response_flag_filter` (phase 71), `header_filter` (phase 72), the
 /// recursive `and_filter`/`or_filter` composition arms (phase 73), which map
-/// each nested child via `.iter().map(compile_access_log_filter)`.
+/// each nested child via `.iter().map(compile_access_log_filter)`, and
+/// `metadata_filter` (phase 74).
 fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accesslog::LogFilter {
     match (
         &f.status_code_filter,
@@ -1759,8 +1760,9 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
         &f.header_filter,
         &f.and_filter,
         &f.or_filter,
+        &f.metadata_filter,
     ) {
-        (Some(scf), None, None, None, None) => {
+        (Some(scf), None, None, None, None, None) => {
             let op = match scf.comparison.op {
                 envoy_config::ComparisonOp::Eq => envoy_accesslog::FilterOp::Eq,
                 envoy_config::ComparisonOp::Ge => envoy_accesslog::FilterOp::Ge,
@@ -1773,22 +1775,36 @@ fn compile_access_log_filter(f: &envoy_config::AccessLogFilter) -> envoy_accessl
                 threshold: scf.comparison.value.default_value,
             })
         }
-        (None, Some(rff), None, None, None) => envoy_accesslog::LogFilter::ResponseFlag {
+        (None, Some(rff), None, None, None, None) => envoy_accesslog::LogFilter::ResponseFlag {
             flags: rff.flags.clone(),
         },
         // Phase 72 (ADR-0150): box the config `HeaderMatcher` into the injected
         // `HeaderMatch` seam. The validator already compiled its SafeRegex, so
         // the runtime `matches` never hits its `.expect()`.
-        (None, None, Some(hf), None, None) => envoy_accesslog::LogFilter::Header {
+        (None, None, Some(hf), None, None, None) => envoy_accesslog::LogFilter::Header {
             matcher: std::sync::Arc::new(hf.header.clone()),
         },
         // Phase 73: the two composition arms map each child recursively.
-        (None, None, None, Some(af), None) => envoy_accesslog::LogFilter::And(
+        (None, None, None, Some(af), None, None) => envoy_accesslog::LogFilter::And(
             af.filters.iter().map(compile_access_log_filter).collect(),
         ),
-        (None, None, None, None, Some(of)) => envoy_accesslog::LogFilter::Or(
+        (None, None, None, None, Some(of), None) => envoy_accesslog::LogFilter::Or(
             of.filters.iter().map(compile_access_log_filter).collect(),
         ),
+        // Phase 74 (ADR-0150/ADR-0155): box the config `MetadataMatcher` into
+        // the injected `MetadataMatch` seam (the validator already compiled its
+        // SafeRegex, so the runtime `matches` never hits its `.expect()`), and
+        // resolve the `google.protobuf.BoolValue` wrapper default — absent means
+        // `true` (MEASURED, SPEC §0 R-0.4; `--mode validate` provably cannot
+        // reach this). A matcher-less `metadata_filter` (accepted upstream,
+        // R-0.2) compiles to `matcher: None`, so every record takes the
+        // not-found policy.
+        (None, None, None, None, None, Some(mf)) => envoy_accesslog::LogFilter::Metadata {
+            matcher: mf.matcher.as_ref().map(|m| {
+                std::sync::Arc::new(m.clone()) as std::sync::Arc<dyn envoy_accesslog::MetadataMatch>
+            }),
+            match_if_key_not_found: mf.match_if_key_not_found.unwrap_or(true),
+        },
         _ => unreachable!("validated by validate_access_logs: exactly one filter arm is set"),
     }
 }
@@ -4858,6 +4874,113 @@ static_resources:
         assert!(compiled.should_log(200, "-", &ab, &Default::default())); // AND-child true → OR keep
         assert!(compiled.should_log(200, "-", &c, &Default::default())); // leaf true → OR keep
         assert!(!compiled.should_log(200, "-", &a, &Default::default())); // AND-child false, leaf false → drop
+    }
+
+    /// Phase 74 T6: `compile_access_log_filter` builds the `metadata_filter`
+    /// arm — boxing the config `MetadataMatcher` into the injected
+    /// `MetadataMatch` seam and resolving the BoolValue-wrapper default
+    /// (`match_if_key_not_found: None` → `true`, MEASURED SPEC §0 R-0.4).
+    #[test]
+    fn compile_access_log_filter_builds_metadata_arm_with_wrapper_default() {
+        use std::collections::BTreeMap;
+
+        let md = |ns: &str, k: &str, v: &str| {
+            let mut m: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+            m.entry(ns.to_string())
+                .or_default()
+                .insert(k.to_string(), v.to_string());
+            m
+        };
+        let empty: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+
+        let matcher = envoy_config::MetadataMatcher {
+            filter: "com.example".into(),
+            path: vec![envoy_config::MetadataPathSegment { key: "k".into() }],
+            value: envoy_config::ValueMatcher::StringMatch(envoy_config::StringMatcher {
+                mode: envoy_config::StringMatcherMode::Exact("1".into()),
+                ignore_case: false,
+            }),
+        };
+
+        // (a) `match_if_key_not_found` ABSENT → compiled to `true` (the MEASURED
+        //     BoolValue-wrapper default). Key-absent records are KEPT.
+        let default_cfg = envoy_config::AccessLogFilter {
+            metadata_filter: Some(envoy_config::MetadataFilter {
+                matcher: Some(matcher.clone()),
+                match_if_key_not_found: None,
+            }),
+            ..Default::default()
+        };
+        let compiled = compile_access_log_filter(&default_cfg);
+        assert!(matches!(
+            compiled,
+            envoy_accesslog::LogFilter::Metadata {
+                matcher: Some(_),
+                match_if_key_not_found: true
+            }
+        ));
+        assert!(compiled.should_log(200, "-", &[], &md("com.example", "k", "1"))); // match
+        assert!(!compiled.should_log(200, "-", &[], &md("com.example", "k", "2"))); // mismatch
+        assert!(compiled.should_log(200, "-", &[], &empty)); // absent → default true
+
+        // (b) explicit `false` → key-absent records are DROPPED (the R-0.4
+        //     polarity flip that `--mode validate` cannot reach).
+        let explicit_false = envoy_config::AccessLogFilter {
+            metadata_filter: Some(envoy_config::MetadataFilter {
+                matcher: Some(matcher),
+                match_if_key_not_found: Some(false),
+            }),
+            ..Default::default()
+        };
+        let compiled = compile_access_log_filter(&explicit_false);
+        assert!(matches!(
+            compiled,
+            envoy_accesslog::LogFilter::Metadata {
+                match_if_key_not_found: false,
+                ..
+            }
+        ));
+        assert!(compiled.should_log(200, "-", &[], &md("com.example", "k", "1")));
+        assert!(!compiled.should_log(200, "-", &[], &empty)); // absent → drop
+
+        // (c) MATCHER-LESS (upstream accepts `metadata_filter: {}`, R-0.2) →
+        //     `matcher: None`, every record takes the not-found policy.
+        let matcher_less = envoy_config::AccessLogFilter {
+            metadata_filter: Some(envoy_config::MetadataFilter::default()),
+            ..Default::default()
+        };
+        let compiled = compile_access_log_filter(&matcher_less);
+        assert!(matches!(
+            compiled,
+            envoy_accesslog::LogFilter::Metadata {
+                matcher: None,
+                match_if_key_not_found: true
+            }
+        ));
+        assert!(compiled.should_log(200, "-", &[], &empty));
+
+        // (d) nested inside a composition arm (phase-73 recursion).
+        let nested = envoy_config::AccessLogFilter {
+            or_filter: Some(envoy_config::OrFilter {
+                filters: vec![
+                    envoy_config::AccessLogFilter {
+                        metadata_filter: Some(envoy_config::MetadataFilter {
+                            matcher: None,
+                            match_if_key_not_found: Some(false),
+                        }),
+                        ..Default::default()
+                    },
+                    envoy_config::AccessLogFilter {
+                        metadata_filter: Some(envoy_config::MetadataFilter::default()),
+                        ..Default::default()
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let compiled = compile_access_log_filter(&nested);
+        assert!(matches!(compiled, envoy_accesslog::LogFilter::Or(ref v) if v.len() == 2));
+        assert!(compiled.should_log(200, "-", &[], &empty)); // second child keeps
     }
 
     /// Phase 72 T9 (SPEC §2.1 item 5): `header_filter` membership across the
